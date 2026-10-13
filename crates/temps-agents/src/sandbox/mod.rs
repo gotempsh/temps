@@ -6,7 +6,10 @@ pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod local;
 pub mod managed;
+pub mod microsandbox;
+pub mod node_routing;
 pub mod pty_agent_bundle;
+pub mod remote;
 pub mod routing;
 pub mod user;
 
@@ -66,7 +69,10 @@ pub type OnStreamEventCallback =
 /// after a grace period). Passing arbitrary integers across the provider
 /// boundary would invite untrusted callers to stuff anything from SIGSTOP
 /// to SIGUSR1 into the sandbox exec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum KillSignal {
     /// SIGTERM (15) — graceful termination. The process may trap it.
     Term,
@@ -84,15 +90,20 @@ impl KillSignal {
     }
 }
 
-/// Which isolation backend a sandbox runs on (ADR-029). Docker containers
-/// and Firecracker microVMs coexist on the same host behind the same
-/// `SandboxProvider` seam; `routing::RoutingSandboxProvider` dispatches
-/// between them. `Local` is the dev-only fork-exec fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker
+/// containers, Firecracker microVMs and microsandbox (libkrun) microVMs
+/// coexist on the same host behind the same `SandboxProvider` seam;
+/// `routing::RoutingSandboxProvider` dispatches between them. `Local` is the
+/// dev-only fork-exec fallback.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxBackend {
     Docker,
     Firecracker,
+    /// Experimental libkrun microVM backend (ADR-050).
+    Microsandbox,
     Local,
 }
 
@@ -102,6 +113,7 @@ impl std::str::FromStr for SandboxBackend {
         match s {
             "docker" => Ok(Self::Docker),
             "firecracker" => Ok(Self::Firecracker),
+            "microsandbox" => Ok(Self::Microsandbox),
             "local" => Ok(Self::Local),
             other => Err(format!("unknown sandbox backend '{}'", other)),
         }
@@ -113,6 +125,7 @@ impl std::fmt::Display for SandboxBackend {
         f.write_str(match self {
             Self::Docker => "docker",
             Self::Firecracker => "firecracker",
+            Self::Microsandbox => "microsandbox",
             Self::Local => "local",
         })
     }
@@ -120,13 +133,20 @@ impl std::fmt::Display for SandboxBackend {
 
 /// A handle to an active sandbox. Opaque to callers — the internal fields
 /// are provider-specific (Docker container ID, Vercel sandbox ID, etc.).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SandboxHandle {
+    /// Worker node that hosts this sandbox (ADR-048). `None` = the local
+    /// host (control plane). Stamped by [`node_routing::NodeRoutingSandboxProvider`]
+    /// so every handle-based call is dispatched to the node that owns the
+    /// sandbox; concrete providers always leave it `None`.
+    #[serde(default)]
+    pub node_id: Option<i32>,
     /// Provider-specific identifier (container ID, Vercel sandbox ID, etc.)
     pub sandbox_id: String,
     /// Human-readable name for logging (e.g. `temps-sandbox-42`)
     pub sandbox_name: String,
     /// Path to the repository inside the sandbox. See `sandbox::user::SANDBOX_WORK_DIR`.
+    #[schema(value_type = String)]
     pub work_dir: PathBuf,
     /// Which backend owns this sandbox, stamped by the concrete provider
     /// that created or recovered it. Callers read this instead of parsing
@@ -198,6 +218,24 @@ pub struct SandboxCreateConfig {
     /// ([`managed::RunSandboxService`]); providers ignore it. `None` for
     /// webhook-triggered runs with no acting user.
     pub owner_user_id: Option<i32>,
+    /// Worker node to create the sandbox on (ADR-048). `None` = the local
+    /// host. Only read by [`node_routing::NodeRoutingSandboxProvider`];
+    /// concrete providers ignore it.
+    pub node_id: Option<i32>,
+}
+
+/// The error [`SandboxProvider::read_file_bounded`] returns for a file over
+/// its limit.
+pub(crate) fn file_too_large(handle: &SandboxHandle, path: &str, max_bytes: u64) -> AgentError {
+    AgentError::Validation {
+        message: format!(
+            "read_file: '{}' in sandbox {} is larger than the {} byte ({} MiB) limit for this read",
+            path,
+            handle.sandbox_name,
+            max_bytes,
+            max_bytes / (1024 * 1024)
+        ),
+    }
 }
 
 fn direct_model_relay_base_url(control_plane_url: &str) -> String {
@@ -606,6 +644,27 @@ pub trait SandboxProvider: Send + Sync {
     /// Returns an error if the file does not exist.
     async fn read_file(&self, handle: &SandboxHandle, path: &str) -> Result<Vec<u8>, AgentError>;
 
+    /// [`read_file`](Self::read_file), refusing files larger than
+    /// `max_bytes` with [`AgentError::Validation`] naming the sandbox, the
+    /// path and the limit.
+    ///
+    /// Used where the caller must bound its memory (a worker node answering
+    /// the control plane, ADR-048). The default checks after reading;
+    /// providers that can stop early (Docker) override it so an oversized
+    /// file is never buffered.
+    async fn read_file_bounded(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        let contents = self.read_file(handle, path).await?;
+        if contents.len() as u64 > max_bytes {
+            return Err(file_too_large(handle, path, max_bytes));
+        }
+        Ok(contents)
+    }
+
     /// Write an entire local directory tree into the sandbox at `target_path`.
     ///
     /// Builds a single tar archive from `local_dir` and uploads in one shot,
@@ -618,6 +677,22 @@ pub trait SandboxProvider: Send + Sync {
         local_dir: &std::path::Path,
         target_path: &str,
     ) -> Result<(), AgentError>;
+
+    /// Bring the sandbox's work dir back into `host_dir`, the host checkout
+    /// it was created from, so callers that read a run's results from the
+    /// host (change detection, PR file collection) see the agent's edits.
+    ///
+    /// The default does nothing: it is correct for backends whose work dir
+    /// *is* `host_dir` (Docker bind-mounts it). Backends that copy the
+    /// workspace into a guest override it.
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        let _ = (handle, host_dir);
+        Ok(())
+    }
 
     /// Kill processes inside the sandbox matching a pgrep/pkill pattern.
     ///
@@ -860,6 +935,20 @@ done
         Ok(None)
     }
 
+    /// Recover a sandbox by container name on a specific node (ADR-048).
+    /// `None` = the local host. Single-host providers only know the local
+    /// host, so the default ignores `node_id`;
+    /// [`node_routing::NodeRoutingSandboxProvider`] overrides it to ask the
+    /// owning worker.
+    async fn recover_by_name_on(
+        &self,
+        node_id: Option<i32>,
+        container_name: &str,
+    ) -> Result<Option<SandboxHandle>, AgentError> {
+        let _ = node_id;
+        self.recover_by_name(container_name).await
+    }
+
     /// Whether this provider can create sandboxes on `backend`. Consumers
     /// call this before create so a request for an unprovisioned backend
     /// (e.g. `firecracker` on a Docker-only host) fails with a clear error
@@ -1032,6 +1121,31 @@ mod tests {
     use tokio::process::Command;
 
     #[test]
+    fn sandbox_backend_round_trips_through_its_string_form() {
+        for backend in [
+            SandboxBackend::Docker,
+            SandboxBackend::Firecracker,
+            SandboxBackend::Microsandbox,
+            SandboxBackend::Local,
+        ] {
+            let text = backend.to_string();
+            assert_eq!(text.parse::<SandboxBackend>().unwrap(), backend);
+            // serde and Display/FromStr must agree: the API persists one
+            // and parses the other.
+            assert_eq!(
+                serde_json::to_value(backend).unwrap(),
+                serde_json::Value::String(text)
+            );
+        }
+        assert_eq!(
+            "microsandbox".parse::<SandboxBackend>().unwrap(),
+            SandboxBackend::Microsandbox
+        );
+        let err = "libkrun".parse::<SandboxBackend>().unwrap_err();
+        assert!(err.contains("libkrun"), "{err}");
+    }
+
+    #[test]
     fn kill_signal_term_is_15() {
         assert_eq!(KillSignal::Term.as_number(), 15);
     }
@@ -1117,6 +1231,7 @@ mod tests {
         }
 
         let handle = SandboxHandle {
+            node_id: None,
             sandbox_id: marker.clone(),
             sandbox_name: marker.clone(),
             work_dir: std::env::current_dir().expect("current directory"),

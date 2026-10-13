@@ -24,9 +24,11 @@ testcontainers = { workspace = true }
 once_cell = "1.19"
 
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

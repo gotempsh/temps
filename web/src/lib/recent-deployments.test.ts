@@ -3,7 +3,10 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
-import { recentDeploymentsRefetchInterval } from './recent-deployments'
+import {
+  isActiveDeploymentStatus,
+  recentDeploymentsRefetchInterval,
+} from './recent-deployments'
 
 function deployment(status: string): DeploymentResponse {
   return { status } as DeploymentResponse
@@ -28,4 +31,13 @@ describe('recent deployments refresh behavior', () => {
     ).toBe(false)
     expect(recentDeploymentsRefetchInterval(undefined)).toBe(false)
   })
+})
+
+test('only building and rolling-out deployments count as active', () => {
+  for (const status of ['pending', 'queued', 'building', 'running']) {
+    expect(isActiveDeploymentStatus(status)).toBe(true)
+  }
+  for (const status of ['completed', 'failed', 'cancelled', 'stopped']) {
+    expect(isActiveDeploymentStatus(status)).toBe(false)
+  }
 })

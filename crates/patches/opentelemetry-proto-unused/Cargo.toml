@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Empty stand-in for `opentelemetry-proto` 0.30, wired in through
+# `[patch.crates-io]` in the workspace Cargo.toml.
+#
+# The only crate in our graph that depends on `opentelemetry-proto` is
+# `relay-event-schema` (git pin of getsentry/relay). It declares the
+# dependency with `features = ["gen-tonic", "trace"]` but never imports
+# `opentelemetry_proto` anywhere in its source. The real crate depends
+# unconditionally on `opentelemetry_sdk` 0.30, which carries
+# GHSA-w9wp-h8wv-79jx (unbounded allocation in W3C Baggage extraction,
+# fixed in 0.32.1). No relay release depends on an `opentelemetry-proto`
+# new enough to pull the fixed SDK, so the vulnerable SDK -- plus
+# `opentelemetry` 0.30 and `tonic` 0.13 -- stayed in the build only to
+# satisfy a dependency nobody calls.
+#
+# If relay ever starts using `opentelemetry_proto`, the build fails at
+# compile time with unresolved imports in relay-event-schema; that is
+# the signal to drop this patch and take the real crate at a fixed
+# version. If relay instead moves to a requirement this version cannot
+# satisfy (e.g. 0.31), Cargo silently stops applying the patch; the
+# dependency_guard_tests in crates/temps-error-tracking/src/lib.rs fail
+# in that case, because Cargo.lock then holds the registry crate and a
+# vulnerable opentelemetry_sdk again.
+
+[package]
+name = "opentelemetry-proto"
+# Must stay semver-compatible with relay's `opentelemetry-proto = "0.30"`
+# requirement or the patch is ignored with a warning.
+version = "0.30.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Empty placeholder for an unused opentelemetry-proto dependency of relay-event-schema."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# The exact features relay-event-schema enables. Cargo rejects a patch
+# that lacks a feature a dependent asks for, so these must exist even
+# though they turn nothing on.
+gen-tonic = []
+trace = []
+
+[dependencies]

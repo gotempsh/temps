@@ -157,3 +157,13 @@ export function NamecheapIcon({ className }: IconProps) {
     </svg>
   )
 }
+
+export function BunnyIcon({ className }: IconProps) {
+  return (
+    <img
+      src="/providers/bunny-official.svg"
+      alt="bunny.net"
+      className={className}
+    />
+  )
+}

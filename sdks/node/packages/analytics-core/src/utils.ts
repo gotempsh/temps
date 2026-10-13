@@ -81,6 +81,25 @@ export function withIngestKey(url: string, ingestKey?: string): string {
   return `${url}${separator}${INGEST_KEY_QUERY_PARAM}=${encodeURIComponent(ingestKey)}`;
 }
 
+/**
+ * Wraps a JSON payload for `navigator.sendBeacon`.
+ *
+ * Beacons always use credentials mode `include`. A beacon whose Blob type is
+ * not CORS-safelisted (`application/json` is not) is preflighted, and a
+ * cross-origin preflight for a credentialed request fails unless the server
+ * answers with a credentialed grant — so on keyed, cross-origin ingest the
+ * unload events (`page_leave`, late Web Vitals, the final replay batch) were
+ * silently dropped. `text/plain` is safelisted: the beacon goes out with no
+ * preflight, and the server parses its body as JSON exactly as before.
+ *
+ * Only keyed requests are sent as `text/plain`. The server accepts that type
+ * on the keyed path alone, and an app without a key is served by Temps on its
+ * own origin, where `application/json` was never a problem.
+ */
+export function beaconBlob(payload: string, ingestKey?: string): Blob {
+  return new Blob([payload], { type: ingestKey ? "text/plain" : "application/json" });
+}
+
 export async function sendAnalytics(
   endpoint: string,
   data: Record<string, JsonValue>,
@@ -115,14 +134,20 @@ export function sendAnalyticsReliable(
     const url = withIngestKey(`${basePath}/${endpoint}`, ingestKey);
     const payload = JSON.stringify(enrich(data));
 
-    // Try sendBeacon first (most reliable for page unload)
+    // Try sendBeacon first (most reliable for page unload). It returns false
+    // when the browser refuses to queue the request (its beacon quota is full)
+    // and can throw (e.g. in a context where beacons are not allowed); either
+    // way the event would be lost, so fall through to fetch.
     if (
       typeof navigator !== "undefined" &&
       navigator.sendBeacon &&
       typeof navigator.sendBeacon === "function"
     ) {
-      const blob = new Blob([payload], { type: "application/json" });
-      return navigator.sendBeacon(url, blob);
+      try {
+        if (navigator.sendBeacon(url, beaconBlob(payload, ingestKey))) return true;
+      } catch {
+        // fall through to fetch
+      }
     }
 
     // Fallback to fetch with keepalive

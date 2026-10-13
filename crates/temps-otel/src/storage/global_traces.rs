@@ -16,6 +16,16 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 use utoipa::ToSchema;
 
+mod local_clickhouse;
+
+/// The hard per-statement memory cap every local ClickHouse global trace read
+/// runs under. Public so a regression test can hold the old query shape to the
+/// very same budget.
+pub use local_clickhouse::MAX_MEMORY_BYTES as LOCAL_READ_MEMORY_BUDGET_BYTES;
+
+/// Attribute key -> facet slot (1..=20), as cached by `FacetService`.
+pub type Facets = std::collections::HashMap<String, u8>;
+
 #[derive(Debug, Clone)]
 pub struct TraceReadScope {
     pub project_id: i32,
@@ -265,10 +275,11 @@ fn compare(a: &GlobalTraceRow, b: &GlobalTraceRow, q: &TraceQuery) -> std::cmp::
         .then(a.span_id.cmp(&b.span_id))
 }
 
+/// Dialects served by the single-stage [`build`]. Local ClickHouse is not one
+/// of them: it reads page-first through `local_clickhouse`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Dialect {
     Postgres,
-    ClickHouse,
     Cloud,
 }
 #[derive(Clone)]
@@ -286,7 +297,6 @@ struct Sql {
 /// The proxy separately caps rows read, memory, results, and execution time;
 /// this client-side gate makes the fan-out explicit before the historical join.
 pub(crate) const MAX_LIFETIME_CANDIDATES: u64 = 5_000;
-const LOCAL_LIFETIME_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build the indexed Postgres trace-summary query.
 ///
@@ -361,14 +371,14 @@ fn can_use_lifetime_summaries(q: &GlobalTraceQuery) -> bool {
         && q.filter.name_pattern.as_ref().is_none_or(String::is_empty)
 }
 
-/// Build local or Cloud ClickHouse summaries with window membership and
-/// lifetime values. Cloud supplies pseudonymous project references; local
-/// ClickHouse uses numeric project IDs and deduplicates span versions.
+/// Build Cloud ClickHouse summaries with window membership and lifetime
+/// values. Cloud supplies pseudonymous project references and has no span
+/// versions to deduplicate. (Local ClickHouse reads page-first; see
+/// `local_clickhouse`.)
 fn build_clickhouse_lifetime_summaries(
     q: &GlobalTraceQuery,
-    refs: Option<&BTreeMap<i32, String>>,
+    refs: &BTreeMap<i32, String>,
 ) -> StorageResult<Sql> {
-    let cloud = refs.is_some();
     let mut binds = Vec::new();
     let mut bind = |value: Bind| {
         binds.push(value);
@@ -376,22 +386,13 @@ fn build_clickhouse_lifetime_summaries(
     };
     let mut membership = Vec::with_capacity(q.scopes.len());
     for scope in &q.scopes {
-        let id = if let Some(refs) = refs {
-            Bind::Text(
-                refs.get(&scope.project_id)
-                    .ok_or_else(|| invalid("Missing Cloud project scope"))?
-                    .clone(),
-            )
-        } else {
-            Bind::Int(scope.project_id as i64)
-        };
+        let project_ref = refs
+            .get(&scope.project_id)
+            .ok_or_else(|| invalid("Missing Cloud project scope"))?;
         membership.push(format!(
-            "({} = {} AND toUnixTimestamp64Milli({}) >= {} AND toUnixTimestamp64Milli({}) <= {})",
-            if cloud { "project_ref" } else { "project_id" },
-            bind(id),
-            if cloud { "ts" } else { "start_time" },
+            "(project_ref = {} AND toUnixTimestamp64Milli(ts) >= {} AND toUnixTimestamp64Milli(ts) <= {})",
+            bind(Bind::Text(project_ref.clone())),
             bind(Bind::Int(scope.from.timestamp_millis())),
-            if cloud { "ts" } else { "start_time" },
             bind(Bind::Int(scope.to.timestamp_millis()))
         ));
     }
@@ -404,45 +405,25 @@ fn build_clickhouse_lifetime_summaries(
     // bound before the project mapping used by the following raw CTE. The
     // ClickHouse client resolves anonymous placeholders in SQL order.
     let mut mapping = Vec::new();
-    if let Some(refs) = refs {
-        for scope in &q.scopes {
-            let project_ref = refs
-                .get(&scope.project_id)
-                .ok_or_else(|| invalid("Missing Cloud project scope"))?;
-            mapping.push(format!(
-                "WHEN {} THEN {}",
-                bind(Bind::Text(project_ref.clone())),
-                scope.project_id
-            ));
-        }
+    for scope in &q.scopes {
+        let project_ref = refs
+            .get(&scope.project_id)
+            .ok_or_else(|| invalid("Missing Cloud project scope"))?;
+        mapping.push(format!(
+            "WHEN {} THEN {}",
+            bind(Bind::Text(project_ref.clone())),
+            scope.project_id
+        ));
     }
     let pick = |field: &str| {
         format!("argMax(raw.{field}, tuple(raw.parent_span_id = '', raw.duration, raw.span_id))")
     };
-    let key = if cloud { "project_ref" } else { "project_id" };
-    let table = if cloud { "telemetry_spans" } else { "spans" };
-    let project = if cloud {
-        format!(
-            "toInt32(CASE span.project_ref {} ELSE 0 END)",
-            mapping.join(" ")
-        )
-    } else {
-        "span.project_id".to_string()
-    };
-    let timestamp = if cloud { "span.ts" } else { "span.start_time" };
-    let environment = if cloud {
-        "span.environment"
-    } else {
-        "span.deployment_environment"
-    };
-    let kind = if cloud { "span.span_kind" } else { "span.kind" };
-    let deduplicate = if cloud {
-        ""
-    } else {
-        " ORDER BY span._version DESC LIMIT 1 BY project_id, trace_id, span_id"
-    };
+    let project = format!(
+        "toInt32(CASE span.project_ref {} ELSE 0 END)",
+        mapping.join(" ")
+    );
     let body = format!(
-        "WITH candidates AS (SELECT {key}, trace_id FROM {table} WHERE {membership} GROUP BY {key}, trace_id), raw AS (SELECT {project} AS project_id, span.trace_id, span.span_id, COALESCE(span.parent_span_id, '') AS parent_span_id, span.name, span.service_name, COALESCE({environment}, '') AS environment, {kind} AS kind, upper(span.status_code) AS status, toUnixTimestamp64Milli({timestamp}) AS start_ms, span.duration_ms AS duration FROM {table} AS span INNER JOIN candidates AS candidate ON candidate.{key} = span.{key} AND candidate.trace_id = span.trace_id{deduplicate}), grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, {} AS name, {} AS service_name, {} AS environment, {} AS kind, CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status, MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, toInt64(count()) AS span_count, toInt64(countIf(raw.status = 'ERROR')) AS error_count, '{{}}' AS attributes, '[]' AS events, '' AS status_message FROM raw GROUP BY project_id, trace_id) SELECT * FROM grouped",
+        "WITH candidates AS (SELECT project_ref, trace_id FROM telemetry_spans WHERE {membership} GROUP BY project_ref, trace_id), raw AS (SELECT {project} AS project_id, span.trace_id, span.span_id, COALESCE(span.parent_span_id, '') AS parent_span_id, span.name, span.service_name, COALESCE(span.environment, '') AS environment, span.span_kind AS kind, upper(span.status_code) AS status, toUnixTimestamp64Milli(span.ts) AS start_ms, span.duration_ms AS duration FROM telemetry_spans AS span INNER JOIN candidates AS candidate ON candidate.project_ref = span.project_ref AND candidate.trace_id = span.trace_id), grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, {} AS name, {} AS service_name, {} AS environment, {} AS kind, CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status, MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, toInt64(count()) AS span_count, toInt64(countIf(raw.status = 'ERROR')) AS error_count, '{{}}' AS attributes, '[]' AS events, '' AS status_message FROM raw GROUP BY project_id, trace_id) SELECT * FROM grouped",
         pick("name"),
         pick("service_name"),
         pick("environment"),
@@ -453,9 +434,8 @@ fn build_clickhouse_lifetime_summaries(
 
 fn build_clickhouse_lifetime_candidate_count(
     q: &GlobalTraceQuery,
-    refs: Option<&BTreeMap<i32, String>>,
+    refs: &BTreeMap<i32, String>,
 ) -> StorageResult<Sql> {
-    let cloud = refs.is_some();
     let mut binds = Vec::new();
     let mut bind = |value: Bind| {
         binds.push(value);
@@ -465,22 +445,13 @@ fn build_clickhouse_lifetime_candidate_count(
         .scopes
         .iter()
         .map(|scope| {
-            let id = if let Some(refs) = refs {
-                Bind::Text(
-                    refs.get(&scope.project_id)
-                        .ok_or_else(|| invalid("Missing Cloud project scope"))?
-                        .clone(),
-                )
-            } else {
-                Bind::Int(scope.project_id as i64)
-            };
+            let project_ref = refs
+                .get(&scope.project_id)
+                .ok_or_else(|| invalid("Missing Cloud project scope"))?;
             Ok(format!(
-                "({} = {} AND toUnixTimestamp64Milli({}) >= {} AND toUnixTimestamp64Milli({}) <= {})",
-                if cloud { "project_ref" } else { "project_id" },
-                bind(id),
-                if cloud { "ts" } else { "start_time" },
+                "(project_ref = {} AND toUnixTimestamp64Milli(ts) >= {} AND toUnixTimestamp64Milli(ts) <= {})",
+                bind(Bind::Text(project_ref.clone())),
                 bind(Bind::Int(scope.from.timestamp_millis())),
-                if cloud { "ts" } else { "start_time" },
                 bind(Bind::Int(scope.to.timestamp_millis()))
             ))
         })
@@ -488,9 +459,7 @@ fn build_clickhouse_lifetime_candidate_count(
         .join(" OR ");
     Ok(Sql {
         body: format!(
-            "SELECT uniqExact(tuple({}, trace_id)) FROM {} WHERE {membership}",
-            if cloud { "project_ref" } else { "project_id" },
-            if cloud { "telemetry_spans" } else { "spans" }
+            "SELECT uniqExact(tuple(project_ref, trace_id)) FROM telemetry_spans WHERE {membership}"
         ),
         binds,
     })
@@ -501,7 +470,7 @@ pub(crate) async fn cloud_lifetime_candidate_count(
     q: &GlobalTraceQuery,
     refs: &BTreeMap<i32, String>,
 ) -> StorageResult<u64> {
-    let count = build_clickhouse_lifetime_candidate_count(q, Some(refs))?;
+    let count = build_clickhouse_lifetime_candidate_count(q, refs)?;
     temps_cloud_client::query::within_query_budget(
         ch_query(client, &count.body, &count.binds).fetch_one::<u64>(),
     )
@@ -584,10 +553,8 @@ fn build(
         let col = if cloud { "project_ref" } else { "project_id" };
         let ts = if cloud {
             "toUnixTimestamp64Milli(ts)"
-        } else if pg {
-            "FLOOR(EXTRACT(EPOCH FROM start_time) * 1000)::bigint"
         } else {
-            "toUnixTimestamp64Milli(start_time)"
+            "FLOOR(EXTRACT(EPOCH FROM start_time) * 1000)::bigint"
         };
         scope_sql.push(format!(
             "({col} = {id} AND {ts} >= {} AND {ts} <= {})",
@@ -602,10 +569,8 @@ fn build(
     };
     let ts = if cloud {
         "toUnixTimestamp64Milli(ts)"
-    } else if pg {
-        "FLOOR(EXTRACT(EPOCH FROM start_time) * 1000)::bigint"
     } else {
-        "toUnixTimestamp64Milli(start_time)"
+        "FLOOR(EXTRACT(EPOCH FROM start_time) * 1000)::bigint"
     };
     let env = if cloud {
         "environment"
@@ -613,27 +578,13 @@ fn build(
         "deployment_environment"
     };
     let kind = if cloud { "span_kind" } else { "kind" };
-    let attrs = if cloud {
-        "'{}'"
-    } else if pg {
-        "attributes::text"
-    } else {
-        "attributes"
-    };
-    let events = if cloud {
-        "'[]'"
-    } else if pg {
-        "events::text"
-    } else {
-        "events"
-    };
+    let attrs = if cloud { "'{}'" } else { "attributes::text" };
+    let events = if cloud { "'[]'" } else { "events::text" };
     let message = if cloud { "''" } else { "status_message" };
     let table = if cloud {
         "telemetry_spans"
-    } else if pg {
-        "otel_spans"
     } else {
-        "spans"
+        "otel_spans"
     };
     let mut predicates = vec![format!("({scope})")];
     let f = &q.filter;
@@ -667,17 +618,10 @@ fn build(
             }
             let key = bind(Bind::Text(k.clone()));
             let value = bind(Bind::Text(v.clone()));
-            predicates.push(if pg {
-                format!("attributes->>{key} = {value}")
-            } else {
-                format!("JSONExtractString(attributes, {key}) = {value}")
-            });
+            predicates.push(format!("attributes->>{key} = {value}"));
         }
     }
-    let mut projection = format!("SELECT {project} AS project_id, trace_id, span_id, COALESCE(parent_span_id, '') AS parent_span_id, name, service_name, COALESCE({env}, '') AS environment, {kind} AS kind, upper(status_code) AS status, {ts} AS start_ms, duration_ms AS duration, {attrs} AS attributes, {events} AS events, {message} AS status_message FROM {table} WHERE {}", predicates.join(" AND "));
-    if dialect == Dialect::ClickHouse {
-        projection.push_str(" ORDER BY _version DESC LIMIT 1 BY project_id, trace_id, span_id");
-    }
+    let projection = format!("SELECT {project} AS project_id, trace_id, span_id, COALESCE(parent_span_id, '') AS parent_span_id, name, service_name, COALESCE({env}, '') AS environment, {kind} AS kind, upper(status_code) AS status, {ts} AS start_ms, duration_ms AS duration, {attrs} AS attributes, {events} AS events, {message} AS status_message FROM {table} WHERE {}", predicates.join(" AND "));
     let mut having = Vec::new();
     if let Some(v) = f.min_duration_ms {
         having.push(format!("duration >= {}", bind(Bind::Float(v))));
@@ -734,27 +678,6 @@ fn ordered(sql: &Sql, q: &GlobalTraceQuery) -> String {
     )
 }
 
-fn ordered_with_row_cap(sql: &Sql, q: &GlobalTraceQuery, row_cap: u64) -> String {
-    let field = if q.filter.sort_by == TraceSortField::Duration {
-        "duration"
-    } else {
-        "start_ms"
-    };
-    let requested = q
-        .filter
-        .offset
-        .unwrap_or(0)
-        .saturating_add(q.filter.limit.unwrap_or(20).clamp(1, 100))
-        .saturating_sub(q.source_offset);
-    format!(
-        "{} ORDER BY {field} {}, project_id, trace_id, span_id LIMIT {} OFFSET {}",
-        sql.body,
-        q.filter.sort_order.as_sql(),
-        requested.min(row_cap),
-        q.source_offset
-    )
-}
-
 fn cloud_ordered_with_total(sql: &Sql, q: &GlobalTraceQuery) -> String {
     let field = if q.filter.sort_by == TraceSortField::Duration {
         "duration"
@@ -784,6 +707,8 @@ fn ch_query(client: &clickhouse::Client, sql: &str, binds: &[Bind]) -> clickhous
     }
     query
 }
+/// One ordered, page-bounded cursor from ClickHouse: the local `spans` table
+/// (`refs = None`) or the Cloud-held `telemetry_spans` (`refs = Some`).
 pub async fn clickhouse(
     client: &clickhouse::Client,
     q: &GlobalTraceQuery,
@@ -792,49 +717,47 @@ pub async fn clickhouse(
     if q.scopes.is_empty() {
         return Ok(GlobalTraceStream::empty());
     }
+    match refs {
+        Some(refs) => cloud_clickhouse(client, q, refs).await,
+        None => local_clickhouse::read(client, q, &Facets::new()).await,
+    }
+}
+
+/// [`clickhouse`] for the local `spans` table, filtering faceted attribute keys
+/// on their indexed slot column. `facets` is the `FacetService` key -> slot
+/// snapshot; the same mapping the project trace list uses.
+pub async fn clickhouse_local(
+    client: &clickhouse::Client,
+    q: &GlobalTraceQuery,
+    facets: &Facets,
+) -> StorageResult<GlobalTraceStream> {
+    if q.scopes.is_empty() {
+        return Ok(GlobalTraceStream::empty());
+    }
+    local_clickhouse::read(client, q, facets).await
+}
+
+async fn cloud_clickhouse(
+    client: &clickhouse::Client,
+    q: &GlobalTraceQuery,
+    refs: &BTreeMap<i32, String>,
+) -> StorageResult<GlobalTraceStream> {
     let candidate_total = if can_use_lifetime_summaries(q) {
-        let total = if let Some(refs) = refs {
-            if let Some(total) = q.lifetime_candidate_total {
-                total
-            } else {
-                cloud_lifetime_candidate_count(client, q, refs).await?
-            }
+        Some(if let Some(total) = q.lifetime_candidate_total {
+            total
         } else {
-            let count = build_clickhouse_lifetime_candidate_count(q, None)?;
-            tokio::time::timeout(
-                LOCAL_LIFETIME_QUERY_BUDGET,
-                ch_query(client, &count.body, &count.binds).fetch_one::<u64>(),
-            )
-            .await
-            .map_err(|_| OtelError::Storage {
-                message: format!(
-                    "Local ClickHouse trace-candidate count exceeded its {:?} budget",
-                    LOCAL_LIFETIME_QUERY_BUDGET
-                ),
-                kind: StorageErrorKind::ClickHouseTimeout,
-            })?
-            .map_err(storage)?
-        };
-        Some(total)
+            cloud_lifetime_candidate_count(client, q, refs).await?
+        })
     } else {
         None
     };
-    let use_lifetime_values = candidate_total.is_some_and(|total| total <= MAX_LIFETIME_CANDIDATES);
-    let empty = BTreeMap::new();
-    let sql = if use_lifetime_values {
+    let lifetime_total = candidate_total.filter(|total| *total <= MAX_LIFETIME_CANDIDATES);
+    let sql = if lifetime_total.is_some() {
         build_clickhouse_lifetime_summaries(q, refs)?
     } else {
-        build(
-            q,
-            if refs.is_some() {
-                Dialect::Cloud
-            } else {
-                Dialect::ClickHouse
-            },
-            refs.unwrap_or(&empty),
-        )?
+        build(q, Dialect::Cloud, refs)?
     };
-    if let (Some(total), Some(_)) = (candidate_total.filter(|_| use_lifetime_values), refs) {
+    if let Some(total) = lifetime_total {
         let page_sql = ordered(&sql, q);
         let rows = temps_cloud_client::query::within_query_budget(
             ch_query(client, &page_sql, &sql.binds).fetch_all::<GlobalTraceRow>(),
@@ -855,95 +778,46 @@ pub async fn clickhouse(
             rows: Box::pin(futures::stream::iter(rows)),
         });
     }
-    if let Some(total) = candidate_total.filter(|_| refs.is_none() && use_lifetime_values) {
-        // This path buffers to put the entire decode under the timeout. Even
-        // if a caller bypasses CloudRouted's source-offset negotiation, the
-        // allocation cannot exceed the independently counted candidate cap.
-        let page_sql = ordered_with_row_cap(&sql, q, MAX_LIFETIME_CANDIDATES);
-        let rows = tokio::time::timeout(
-            LOCAL_LIFETIME_QUERY_BUDGET,
-            ch_query(client, &page_sql, &sql.binds).fetch_all::<GlobalTraceRow>(),
-        )
-        .await
-        .map_err(|_| OtelError::Storage {
-            message: format!(
-                "Local ClickHouse lifetime trace page exceeded its {:?} budget",
-                LOCAL_LIFETIME_QUERY_BUDGET
-            ),
-            kind: StorageErrorKind::ClickHouseTimeout,
-        })?
-        .map_err(storage)?
+    let page_sql = cloud_ordered_with_total(&sql, q);
+    let fetched = temps_cloud_client::query::within_query_budget(
+        ch_query(client, &page_sql, &sql.binds).fetch_all::<CloudGlobalTraceRow>(),
+    )
+    .await
+    .map_err(|error| OtelError::Storage {
+        message: format!("Temps Cloud global trace query exceeded its wall-clock budget: {error}"),
+        kind: StorageErrorKind::ClickHouseTimeout,
+    })?
+    .map_err(storage)?;
+    let mut total = None;
+    let rows = fetched
         .into_iter()
-        .map(Ok)
+        .map(|row| {
+            let (row, row_total) = row.into_parts();
+            total = Some(row_total);
+            Ok(row)
+        })
         .collect::<Vec<_>>();
-        return Ok(GlobalTraceStream {
-            total,
-            rows: Box::pin(futures::stream::iter(rows)),
-        });
-    }
-    if refs.is_some() {
-        let page_sql = cloud_ordered_with_total(&sql, q);
-        let fetched = temps_cloud_client::query::within_query_budget(
-            ch_query(client, &page_sql, &sql.binds).fetch_all::<CloudGlobalTraceRow>(),
+    let total = if let Some(total) = total {
+        total
+    } else {
+        // An offset beyond the final row carries no window-count value.
+        // Keep exact totals for that rare page, under the same hard budget.
+        let count_sql = format!("SELECT count() FROM ({})", sql.body);
+        temps_cloud_client::query::within_query_budget(
+            ch_query(client, &count_sql, &sql.binds).fetch_one::<u64>(),
         )
         .await
         .map_err(|error| OtelError::Storage {
             message: format!(
-                "Temps Cloud global trace query exceeded its wall-clock budget: {error}"
+                "Temps Cloud global trace count exceeded its wall-clock budget: {error}"
             ),
             kind: StorageErrorKind::ClickHouseTimeout,
         })?
-        .map_err(storage)?;
-        let mut total = None;
-        let rows = fetched
-            .into_iter()
-            .map(|row| {
-                let (row, row_total) = row.into_parts();
-                total = Some(row_total);
-                Ok(row)
-            })
-            .collect::<Vec<_>>();
-        let total = if let Some(total) = total {
-            total
-        } else {
-            // An offset beyond the final row carries no window-count value.
-            // Keep exact totals for that rare page, under the same hard budget.
-            let count_sql = format!("SELECT count() FROM ({})", sql.body);
-            temps_cloud_client::query::within_query_budget(
-                ch_query(client, &count_sql, &sql.binds).fetch_one::<u64>(),
-            )
-            .await
-            .map_err(|error| OtelError::Storage {
-                message: format!(
-                    "Temps Cloud global trace count exceeded its wall-clock budget: {error}"
-                ),
-                kind: StorageErrorKind::ClickHouseTimeout,
-            })?
-            .map_err(storage)?
-        };
-        return Ok(GlobalTraceStream {
-            total,
-            rows: Box::pin(futures::stream::iter(rows)),
-        });
-    }
-    let count_sql = format!("SELECT count() FROM ({})", sql.body);
-    let total = ch_query(client, &count_sql, &sql.binds)
-        .fetch_one::<u64>()
-        .await
-        .map_err(storage)?;
-    let cursor = ch_query(client, &ordered(&sql, q), &sql.binds)
-        .fetch::<GlobalTraceRow>()
-        .map_err(storage)?;
-    let rows = futures::stream::try_unfold(cursor, |mut cursor| async move {
-        Ok(cursor
-            .next()
-            .await
-            .map_err(storage)?
-            .map(|row| (row, cursor)))
-    });
+        .map_err(storage)?
+    };
     Ok(GlobalTraceStream {
         total,
-        rows: Box::pin(rows),
+        rows: Box::pin(futures::stream::iter(rows)),
     })
 }
 pub async fn postgres(
@@ -1114,12 +988,19 @@ mod tests {
                 window_clamped_at: None,
             })
             .collect();
-        let sql = build(&q, Dialect::ClickHouse, &BTreeMap::new()).unwrap();
-        assert_eq!(sql.binds.len(), 315);
-        assert_eq!(sql.body.matches('?').count(), 315);
-        assert!(ordered(&sql, &q).ends_with("LIMIT 20 OFFSET 800"));
-        assert!(sql.body.contains("GROUP BY project_id, trace_id"));
-        assert!(!sql.body.contains("FINAL"));
+        let plan = local_clickhouse::plan(&q, false, &Facets::new()).unwrap();
+        let (page, binds) = (&plan.page.sql, &plan.page.binds);
+        // The scope is rendered once for the hydration and once for the page
+        // selection; every value is bound, none interpolated.
+        assert_eq!(binds.len(), 630);
+        assert_eq!(page.matches('?').count(), 630);
+        assert!(page.contains("project_id, trace_id LIMIT 20 OFFSET 800"));
+        assert!(page.contains("GROUP BY project_id, trace_id ORDER BY min(start_time) ASC"));
+        assert!(!page.contains("FINAL"));
+        let total = plan.total.unwrap();
+        let (total, total_binds) = (total.sql, total.binds);
+        assert_eq!(total_binds.len(), 315);
+        assert_eq!(total.matches('?').count(), 315);
     }
 
     #[test]
@@ -1172,13 +1053,13 @@ mod tests {
             .collect();
         let refs = BTreeMap::from([(1, "project-a".into()), (2, "project-b".into())]);
 
-        let count = build_clickhouse_lifetime_candidate_count(&q, Some(&refs)).unwrap();
+        let count = build_clickhouse_lifetime_candidate_count(&q, &refs).unwrap();
         assert_eq!(count.binds.len(), 6);
         assert!(count
             .body
             .starts_with("SELECT uniqExact(tuple(project_ref, trace_id))"));
 
-        let sql = build_clickhouse_lifetime_summaries(&q, Some(&refs)).unwrap();
+        let sql = build_clickhouse_lifetime_summaries(&q, &refs).unwrap();
 
         assert_eq!(sql.binds.len(), 8);
         match sql.binds.as_slice() {
@@ -1211,22 +1092,6 @@ mod tests {
         let page = cloud_ordered_with_total(&sql, &q);
         assert!(page.contains("count() OVER () AS total"));
         assert!(page.ends_with("LIMIT 820 OFFSET 0"));
-
-        let local_count = build_clickhouse_lifetime_candidate_count(&q, None).unwrap();
-        assert_eq!(local_count.binds.len(), 6);
-        assert!(local_count
-            .body
-            .starts_with("SELECT uniqExact(tuple(project_id, trace_id)) FROM spans"));
-        let local = build_clickhouse_lifetime_summaries(&q, None).unwrap();
-        assert!(local
-            .body
-            .contains("candidates AS (SELECT project_id, trace_id FROM spans"));
-        assert!(local
-            .body
-            .contains("ORDER BY span._version DESC LIMIT 1 BY project_id, trace_id, span_id"));
-        q.filter.offset = Some(1_000_000);
-        assert!(ordered_with_row_cap(&local, &q, MAX_LIFETIME_CANDIDATES)
-            .ends_with("LIMIT 5000 OFFSET 0"));
     }
 
     #[test]

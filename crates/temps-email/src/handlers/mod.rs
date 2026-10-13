@@ -64,6 +64,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         emails::send_email,
         emails::list_emails,
         emails::get_email,
+        emails::resend_email,
         emails::get_email_stats,
         // Tracking
         tracking::track_open,

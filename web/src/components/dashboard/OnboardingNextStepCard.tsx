@@ -14,6 +14,7 @@ import {
   DatabaseBackup,
   GitBranch,
   Globe,
+  Rocket,
   ShieldCheck,
   Sparkles,
   Users,
@@ -28,6 +29,7 @@ import {
 } from './onboarding-next-step'
 
 const STEP_ICONS: Record<string, LucideIcon> = {
+  deploy: Rocket,
   ai: Bot,
   git: GitBranch,
   domain: Globe,
@@ -80,7 +82,7 @@ export function OnboardingNextStepCard() {
                 {selectedStep.label}
               </h2>
               {selectedStep.done && (
-                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
                   <Check className="size-3" />
                   Complete
                 </span>

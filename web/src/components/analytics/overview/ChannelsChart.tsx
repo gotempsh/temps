@@ -147,6 +147,7 @@ export function ChannelsChart({
             <CardTitle className="flex items-center gap-2">
               {selectedChannel && (
                 <Button
+                  aria-label="Back to all channels"
                   variant="ghost"
                   size="icon"
                   className="h-6 w-6"

@@ -177,7 +177,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
       )}
 
       {servicesQuery.isPending || linkedQuery.isPending ? (
-        <div className="space-y-2" aria-label="Loading databases">
+        <div role="status" className="space-y-2" aria-label="Loading databases">
           {Array.from({ length: 2 }).map((_, index) => (
             <div
               className="h-14 animate-pulse rounded-lg bg-muted"

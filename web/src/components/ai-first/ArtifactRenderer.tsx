@@ -59,13 +59,13 @@ function statusClassName(status: unknown): string {
       'healthy',
     ].includes(value)
   ) {
-    return 'text-emerald-600 dark:text-emerald-400'
+    return 'text-emerald-700 dark:text-emerald-400'
   }
   if (['warning', 'pending', 'queued', 'running', 'starting'].includes(value)) {
-    return 'text-amber-600 dark:text-amber-400'
+    return 'text-amber-700 dark:text-amber-400'
   }
   if (['error', 'failed', 'failure', 'down', 'unhealthy'].includes(value)) {
-    return 'text-red-600 dark:text-red-400'
+    return 'text-red-700 dark:text-red-400'
   }
   return 'text-muted-foreground'
 }
@@ -80,13 +80,13 @@ function CredentialRequestArtifact({
   const requirements = rows(payload.requirements ?? payload.rows)
   const projectId = positiveInteger(payload.project_id)
   const destination = projectId
-    ? `/projects/${projectId}/settings/environment-variables`
+    ? `/projects/${projectId}/environment-variables`
     : '/projects'
 
   return (
     <section className="rounded-lg border border-border bg-background p-4">
       <div className="flex items-center gap-2">
-        <KeyRound className="size-4 text-amber-600 dark:text-amber-400" />
+        <KeyRound className="size-4 text-amber-700 dark:text-amber-400" />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">
             {artifact.title ?? 'Credentials required'}
@@ -167,7 +167,7 @@ function FormArtifact({
         {submitted && (
           <p
             role="status"
-            className="text-xs text-emerald-600 dark:text-emerald-400"
+            className="text-xs text-emerald-700 dark:text-emerald-400"
           >
             Form response captured for this view.
           </p>

@@ -18,13 +18,13 @@ export const sections = [
 
 # Data Ownership & Privacy
 
-When you self-host Temps, every byte of your data — analytics events, error reports, session recordings, database backups, application logs — stays on your infrastructure. None of it is sent to Temps (the company), third-party analytics services, or any external server. The only thing the binary reports is [anonymous product telemetry](#anonymous-telemetry) — event names, counts, and coarse internal labels (Temps module names, route templates) under a random instance ID. Set `TEMPS_TELEMETRY=0` and nothing is sent. {{ className: 'lead' }}
+When you self-host Temps, every byte of your data — analytics events, error reports, session recordings, database backups, application logs — stays on your infrastructure. None of it is sent to Temps (the company), third-party analytics services, or any external server. The only thing the binary reports is [anonymous product telemetry](#anonymous-telemetry) — event names, counts, and coarse internal labels (Temps module names, route templates) under a random instance ID. An admin can turn it off in **Settings › Telemetry**, or set `TEMPS_TELEMETRY=0`, and nothing is sent. {{ className: 'lead' }}
 
 ---
 
 ## Your server, your data {{ anchor: true, id: 'your-server-your-data' }}
 
-Temps is a binary you run on your own server. It stores data in a PostgreSQL database (with TimescaleDB extension) running on that same server. There is no cloud backend, and none of your data — analytics, recordings, errors, logs, backups, credentials — ever leaves your infrastructure. The binary does send [anonymous product telemetry](#anonymous-telemetry) (event names and counts under a random instance ID, disable with `TEMPS_TELEMETRY=0`), described in full below.
+Temps is a binary you run on your own server. It stores data in a PostgreSQL database (with TimescaleDB extension) running on that same server. There is no cloud backend, and none of your data — analytics, recordings, errors, logs, backups, credentials — ever leaves your infrastructure. The binary does send [anonymous product telemetry](#anonymous-telemetry) (event names and counts under a random instance ID, disable in **Settings › Telemetry** or with `TEMPS_TELEMETRY=0`), described in full below.
 
 This means:
 
@@ -59,7 +59,7 @@ All data lives in one PostgreSQL database:
 - No data is sent to Google, Facebook, or any advertising network
 - No data is shared with analytics aggregators
 - The `temps upgrade` command checks GitHub for new releases (a public API call with no user data)
-- The binary sends anonymous product telemetry to `telemetry.temps.sh` — event names, counts, and coarse labels only, detailed in the next section. Set `TEMPS_TELEMETRY=0` and nothing is sent.
+- The binary sends anonymous product telemetry to `telemetry.temps.sh` — event names, counts, and coarse labels only, detailed in the next section. Turn it off in **Settings › Telemetry** or set `TEMPS_TELEMETRY=0` and nothing is sent.
 
 ---
 
@@ -72,6 +72,10 @@ Temps reports anonymous usage events so the maintainers can tell whether the pro
 - A small bag of **non-identifying properties**: counts, enum labels (build preset, source type), and coarse buckets (RAM tier — never exact specs)
 
 What is **never** sent: emails, IPs, repo names, domains, URLs, environment variables, error messages, stack traces, file paths from your projects, or any free-form user text.
+
+Like any HTTPS request, the ingest server sees the public IP address your server connects from. It looks up a two-letter country code from it, stores only that code, and never stores or logs the IP.
+
+**Settings › Telemetry** in the console shows whether telemetry is on and why, your instance ID, the destination host, and the full list of event types this version can send.
 
 ### Error summary
 
@@ -91,7 +95,12 @@ These events carry only coarse labels: the engine or provider type (`postgres_pg
 
 ### Opting out
 
-Set `TEMPS_TELEMETRY=0` (also accepts `false`, `off`, `no`, `disabled`) in the server's environment and restart. Nothing is sent while opted out — no events, no error summaries. Two things still happen locally: the instance ID file is created (so re-enabling later doesn't churn identity), and error counts are tallied in a small fixed-size in-process buffer that is never read or transmitted while opted out.
+Telemetry is on by default. Two ways to turn it off:
+
+- **From the console (instance admins):** open **Settings › Telemetry** and switch off *Send anonymous usage data*. The choice is stored in the database, takes effect immediately without a restart (other processes sharing the database pick it up within 30 seconds), and every change is recorded in the audit log as `TELEMETRY_SETTING_UPDATED`. You can turn it back on the same way.
+- **For a whole host:** set `TEMPS_TELEMETRY=0` (also accepts `false`, `off`, `no`, `disabled`) in the server's environment and restart. This overrides the console setting, which then shows that telemetry is forced off by the environment.
+
+Nothing is sent while opted out — no events, no daily heartbeat, no error summaries. Two things still happen locally: the instance ID file is created (so re-enabling later doesn't churn identity), and error counts are tallied in a small fixed-size in-process buffer that is never read or transmitted while opted out.
 
 ---
 

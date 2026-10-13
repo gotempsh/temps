@@ -86,7 +86,11 @@ function Breakdown({
         empty={!query.data?.rows.length}
         retry={() => void query.refetch()}
       >
-        <div className="space-y-1" aria-label={`${title} by visitors`}>
+        <div
+          role="group"
+          className="space-y-1"
+          aria-label={`${title} by visitors`}
+        >
           {(query.data?.rows ?? []).map((row) => (
             <AnalyticsBreakdownRow
               key={`${row.project_id}:${row.key}`}

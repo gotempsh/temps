@@ -1233,6 +1233,7 @@ mod tests {
             telemetry: true,
             backups: false,
             notifications: false,
+            console_access: false,
         })
         .expect("apply feature switches");
         assert_eq!(index.unavailable_reason(), None);

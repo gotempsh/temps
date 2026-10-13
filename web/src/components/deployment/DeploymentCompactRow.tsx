@@ -27,6 +27,8 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo } from 'react'
+import { failureStageLabel } from '@/lib/deployment-failure-guidance'
+import { canRollbackTo } from '@/lib/deployment-rollback'
 import { deploymentSourceSummary } from '@/lib/deployment-source-summary'
 import { TimeAgo } from '../utils/TimeAgo'
 import { DeploymentStatusBadge } from './DeploymentStatusBadge'
@@ -115,6 +117,15 @@ export default function DeploymentCompactRow({
             </Badge>
           )}
         </div>
+        {deployment.status === 'failed' && deployment.failure && (
+          <p
+            className="mt-1 truncate text-xs text-destructive"
+            title={deployment.failure.remediation}
+          >
+            {failureStageLabel(deployment.failure.stage)} ·{' '}
+            {deployment.failure.title}
+          </p>
+        )}
       </div>
 
       {/* Meta line: source info — takes remaining space, truncates */}
@@ -228,28 +239,28 @@ export default function DeploymentCompactRow({
               <RefreshCw className="mr-2 h-4 w-4" />
               Redeploy
             </DropdownMenuItem>
+            {canRollbackTo(deployment) && (
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.preventDefault()
+                  onRollback?.()
+                }}
+              >
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Rollback to this
+              </DropdownMenuItem>
+            )}
             {(deployment.status === 'superseded' ||
               deployment.status === 'completed') && (
-              <>
-                <DropdownMenuItem
-                  onClick={(e) => {
-                    e.preventDefault()
-                    onRollback?.()
-                  }}
-                >
-                  <RotateCcw className="mr-2 h-4 w-4" />
-                  Rollback to this
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={(e) => {
-                    e.preventDefault()
-                    onPromote?.()
-                  }}
-                >
-                  <ArrowUpRight className="mr-2 h-4 w-4" />
-                  Promote to...
-                </DropdownMenuItem>
-              </>
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.preventDefault()
+                  onPromote?.()
+                }}
+              >
+                <ArrowUpRight className="mr-2 h-4 w-4" />
+                Promote to...
+              </DropdownMenuItem>
             )}
           </DropdownMenuContent>
         </DropdownMenu>

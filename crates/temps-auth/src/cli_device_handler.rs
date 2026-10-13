@@ -30,11 +30,15 @@
 //!   pending -> denied   (terminal)
 //!   any     -> expired  (passive, observed when expires_at < now)
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Query, State},
-    http::StatusCode,
+    body::Body,
+    extract::{ConnectInfo, Extension, Query, State},
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{Duration, Utc};
@@ -54,8 +58,9 @@ use crate::apikey_service::{ApiKeyServiceError, CreateApiKeyRequest};
 use crate::audit::LoginAudit;
 use crate::permission_guard;
 use crate::permissions::Role;
+use crate::rate_limit::{AuthRateLimitConfig, AuthRateLimiter};
 use crate::state::AuthState;
-use crate::RequireAuth;
+use crate::{resolve_client_ip, RequireAuth};
 
 /// How long a device-code session is valid before it auto-expires.
 const DEVICE_SESSION_TTL_SECS: i64 = 15 * 60;
@@ -63,6 +68,10 @@ const DEVICE_SESSION_TTL_SECS: i64 = 15 * 60;
 const POLL_INTERVAL_SECS: i64 = 2;
 /// Minimum spacing between polls. Anything tighter triggers `slow_down`.
 const MIN_POLL_SPACING_MS: i64 = 750;
+/// Concurrent device logins one IP may poll for (several terminals, or
+/// several machines behind one NAT) before `/auth/cli/device/poll` answers
+/// `slow_down` without looking the session up.
+const POLL_SESSIONS_PER_IP: u32 = 4;
 /// Lifetime for the API key minted by an approved device-code session.
 const CLI_KEY_TTL_DAYS: i64 = 90;
 /// Audit `login_method` value for device-code approvals.
@@ -294,6 +303,60 @@ pub async fn cli_device_start(
         )
     });
     Err(CliDeviceFlowError::Database(err).into())
+}
+
+/// Per-IP limiter for `/auth/cli/device/poll`.
+///
+/// Polling must not share the brute-force limiter used by login, MFA and
+/// password reset: that one allows 10 requests a minute, while a single
+/// login polls every [`POLL_INTERVAL_SECS`] (30 a minute), so `temps login`
+/// was rejected with a 429 about 20 seconds in, and the polls also spent the
+/// budget the browser needs to log in and approve. Polling needs no
+/// brute-force protection (the device code is 256 random bits); this limiter
+/// only bounds the database lookups one IP can cause.
+#[derive(Debug, Clone)]
+pub struct DevicePollRateLimiter(AuthRateLimiter);
+
+impl DevicePollRateLimiter {
+    pub fn new() -> Self {
+        let polls_per_minute_per_session = (60 / POLL_INTERVAL_SECS) as u32;
+        Self(AuthRateLimiter::new(AuthRateLimitConfig {
+            max_requests: polls_per_minute_per_session * POLL_SESSIONS_PER_IP,
+            window: std::time::Duration::from_secs(60),
+            ..Default::default()
+        }))
+    }
+}
+
+impl Default for DevicePollRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Answers an over-budget poll with the RFC 8628 `slow_down` status instead
+/// of a 429, so a client keeps waiting with a longer interval rather than
+/// aborting the login.
+pub async fn device_poll_rate_limit_middleware(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(limiter) = request.extensions().get::<DevicePollRateLimiter>().cloned() else {
+        return next.run(request).await;
+    };
+
+    let ip = resolve_client_ip(request.headers(), Some(peer));
+    match limiter.0.check(&ip).await {
+        Ok(()) => next.run(request).await,
+        Err(()) => {
+            debug!(
+                "cli device poll: per-IP budget exceeded for {}, answering slow_down",
+                ip
+            );
+            Json(CliDevicePollResponse::SlowDown).into_response()
+        }
+    }
 }
 
 #[utoipa::path(

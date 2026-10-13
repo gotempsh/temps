@@ -36,6 +36,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 const formSchema = z.object({
   url: z.string().min(1, 'URL is required').url('Must be a valid URL'),
@@ -76,7 +77,7 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
     ...createWebhookMutation(),
     onSuccess: () => {
       toast.success('Webhook created successfully')
-      navigate(`/projects/${project.slug}/settings/webhooks`)
+      navigate(settingsSectionHref(project.slug, 'integrations', 'webhooks'))
     },
     onError: (error: any) => {
       toast.error(error?.message || 'Failed to create webhook')
@@ -101,10 +102,13 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
     <div className="space-y-6">
       <div className="flex items-center gap-4">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>
-            navigate(`/projects/${project.slug}/settings/webhooks`)
+            navigate(
+              settingsSectionHref(project.slug, 'integrations', 'webhooks')
+            )
           }
         >
           <ArrowLeft className="h-4 w-4" />
@@ -327,7 +331,9 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
               type="button"
               variant="outline"
               onClick={() =>
-                navigate(`/projects/${project.slug}/settings/webhooks`)
+                navigate(
+                  settingsSectionHref(project.slug, 'integrations', 'webhooks')
+                )
               }
               disabled={createWebhook.isPending}
             >

@@ -15,7 +15,9 @@
 //! 2. Validate the configured S3 source.
 //! 3. Run `pg_dumpall | gzip` in a one-shot sidecar container attached to
 //!    the temps-app bridge network so it can reach the target Postgres
-//!    container at `postgres-<service_name>:5432`.
+//!    container at `postgres-<service_name>:5432`. The dump stays in the
+//!    sidecar's own filesystem and is streamed out through the Docker archive
+//!    API into an attempt-scoped host dir (see `dump_capture`).
 //! 4. Upload the resulting `.sql.gz` to S3.
 //! 5. Write the `metadata.json` companion.
 
@@ -26,12 +28,19 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::info;
 
-use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
+use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
+use super::oneshot::OneShotSpec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "postgres_pgdump";
 const DUMP_FILE_SUFFIX: &str = "dump.sql.gz";
+/// Database name used in user-facing dump errors.
+const POSTGRES_TOOL: &str = "PostgreSQL";
+/// File names inside the sidecar's attempt directory.
+const SIDECAR_DUMP_SQL: &str = "dump.sql";
+const SIDECAR_DUMP_GZ: &str = "dump.sql.gz";
+const SIDECAR_STDERR: &str = "pg_dumpall.stderr";
 
 pub struct PostgresPgDumpDeps {
     pub db: Arc<DatabaseConnection>,
@@ -109,106 +118,41 @@ impl BackupEngine for PostgresPgDumpEngine {
         let pg = load_postgres_params(&config_json);
 
         // ── One-shot pg_dumpall container ────────────────────────────────────
-        let backup_dir = std::env::temp_dir().join("temps-extpg-backup");
-        tokio::fs::create_dir_all(&backup_dir)
-            .await
-            .map_err(|e| BackupError::Failed {
-                reason: format!(
-                    "failed to create backup tmpdir {}: {}",
-                    backup_dir.display(),
-                    e
-                ),
-            })?;
-        let dump_filename = format!("{}.sql.gz", backup_uuid);
-        let host_dump_path = backup_dir.join(&dump_filename);
-        let container_dump_path = format!("/backup/{}", dump_filename);
-        let uncompressed = container_dump_path
-            .strip_suffix(".gz")
-            .unwrap_or(&container_dump_path)
-            .to_string();
-        let stderr_filename = format!("{}.stderr", backup_uuid);
-        let stderr_in_container = format!("/backup/{}", stderr_filename);
-        let host_stderr_path = backup_dir.join(&stderr_filename);
-
-        let db_container = format!("postgres-{}", service.name);
-        let dump_cmd = format!(
-            "pg_dumpall --clean --if-exists --no-password \
-             --host={} --port=5432 --username={} --database={} \
-             2>{} > {} && gzip {}",
-            v2_common::shell_escape(&db_container),
-            v2_common::shell_escape(&pg.username),
-            v2_common::shell_escape(&pg.database),
-            stderr_in_container,
-            v2_common::shell_escape(&uncompressed),
-            v2_common::shell_escape(&uncompressed),
-        );
+        //
+        // The sidecar writes into its own filesystem and the dump is streamed
+        // out through the Docker archive API (see `dump_capture`): no host
+        // bind mount, so Docker in a VM or on another host works, and every
+        // name is scoped to this attempt so retries never collide.
+        let attempt = DumpAttempt::new(POSTGRES_TOOL, ENGINE_KEY, &backup_uuid)?;
+        let spec = pgdump_spec(&attempt, backup_id, &service.name, &pg);
+        let host_dump_path = attempt.host_path(SIDECAR_DUMP_GZ);
 
         super::image_pull::ensure_image_pulled_v2(&pg.docker_image, ENGINE_KEY).await?;
 
-        let spec = OneShotSpec {
-            image: pg.docker_image.clone(),
-            name: format!("temps-pgdump-{}", backup_uuid),
-            engine: ENGINE_KEY,
-            backup_id,
-            entrypoint: vec!["sh".to_string(), "-c".to_string()],
-            cmd: vec![dump_cmd],
-            env: vec![format!("PGPASSWORD={}", pg.password)],
-            binds: vec![format!("{}:/backup:rw", backup_dir.display())],
-            // Same user-defined bridge the target Postgres container is on so
-            // `postgres-{service_name}` resolves.
-            network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-            user: Some("root".to_string()),
-            stderr_watch: None,
-        };
-
-        let result = match run_one_shot(&deps.docker, spec, &ctx.cancel).await {
-            Ok(r) => r,
-            Err(OneShotError::Cancelled) => return Err(BackupError::Cancelled),
-            Err(e) => {
-                v2_common::best_effort_remove(&host_dump_path).await;
-                v2_common::best_effort_remove(&host_stderr_path).await;
-                return Err(BackupError::Failed {
-                    reason: format!("pg_dumpall one-shot failed: {}", e),
-                });
-            }
-        };
-        if result.exit_code != 0 {
-            let file_stderr = tokio::fs::read(&host_stderr_path).await.unwrap_or_default();
-            v2_common::best_effort_remove(&host_stderr_path).await;
-            v2_common::best_effort_remove(&host_dump_path).await;
-            return Err(BackupError::Failed {
-                reason: format!(
-                    "pg_dumpall exited with code {}. file-stderr: {}. container-stderr: {}",
-                    result.exit_code,
-                    String::from_utf8_lossy(&file_stderr),
-                    result.stderr_tail.trim(),
-                ),
-            });
-        }
-        v2_common::best_effort_remove(&host_stderr_path).await;
-
-        let dump_meta =
-            tokio::fs::metadata(&host_dump_path)
-                .await
-                .map_err(|e| BackupError::Failed {
-                    reason: format!(
-                        "dump file not found at {} after pg_dumpall exited 0: {}",
-                        host_dump_path.display(),
-                        e
-                    ),
-                })?;
-        if dump_meta.len() == 0 {
-            v2_common::best_effort_remove(&host_dump_path).await;
-            return Err(BackupError::Failed {
-                reason: "pg_dumpall produced an empty file".into(),
-            });
-        }
-        let file_size = dump_meta.len() as i64;
-        let host_dump_path_str = host_dump_path.to_str().unwrap_or("").to_string();
+        let file_size = capture_dump(
+            &deps.docker,
+            CaptureRequest {
+                tool: POSTGRES_TOOL,
+                spec,
+                container_path: attempt.container_path(SIDECAR_DUMP_GZ),
+                host_path: host_dump_path.clone(),
+                failure_log: Some((
+                    attempt.container_path(SIDECAR_STDERR),
+                    attempt.host_path(SIDECAR_STDERR),
+                )),
+            },
+            &ctx.cancel,
+        )
+        .await?;
+        let file_size = i64::try_from(file_size).map_err(|_| BackupError::Failed {
+            reason: format!(
+                "pg_dumpall output for backup {backup_id} is larger than i64::MAX bytes"
+            ),
+        })?;
+        let host_dump_path_str = host_dump_path.to_string_lossy().into_owned();
 
         // ── Upload ───────────────────────────────────────────────────────────
         if ctx.cancel.is_cancelled() {
-            v2_common::best_effort_remove(&host_dump_path).await;
             return Err(BackupError::Cancelled);
         }
         let tags = v2_common::BackupTags::load_for_backup(&ctx.db, ctx.backup_id).await;
@@ -222,8 +166,13 @@ impl BackupEngine for PostgresPgDumpEngine {
             Some(&tags),
             &ctx.cancel,
         )
-        .await?;
-        v2_common::best_effort_remove(&host_dump_path).await;
+        .await
+        .map_err(|error| {
+            DumpCaptureError::upload(POSTGRES_TOOL, &s3_source.bucket_name, &s3_key, error)
+        })?;
+        // Deletes this attempt's host dir (and the dump in it); every early
+        // return above does the same when `attempt` drops.
+        drop(attempt);
 
         // ── Metadata ─────────────────────────────────────────────────────────
         let metadata_key = v2_common::derive_metadata_key(&s3_key);
@@ -264,6 +213,44 @@ impl BackupEngine for PostgresPgDumpEngine {
 
 // ── Local helpers ────────────────────────────────────────────────────────────
 
+/// `pg_dumpall | gzip` into the attempt's directory inside the sidecar's own
+/// filesystem; stderr goes to a file next to it, copied out on failure.
+fn pgdump_spec(
+    attempt: &DumpAttempt,
+    backup_id: i32,
+    service_name: &str,
+    pg: &PgParams,
+) -> OneShotSpec {
+    let uncompressed = attempt.container_path(SIDECAR_DUMP_SQL);
+    let db_container = format!("postgres-{}", service_name);
+    let dump_cmd = format!(
+        "mkdir -p {dir} && pg_dumpall --clean --if-exists --no-password \
+         --host={host} --port=5432 --username={user} --database={db} \
+         2>{stderr} > {out} && gzip {out}",
+        dir = v2_common::shell_escape(&attempt.container_dir()),
+        host = v2_common::shell_escape(&db_container),
+        user = v2_common::shell_escape(&pg.username),
+        db = v2_common::shell_escape(&pg.database),
+        stderr = v2_common::shell_escape(&attempt.container_path(SIDECAR_STDERR)),
+        out = v2_common::shell_escape(&uncompressed),
+    );
+    OneShotSpec {
+        image: pg.docker_image.clone(),
+        name: attempt.container_name("temps-pgdump"),
+        engine: ENGINE_KEY,
+        backup_id,
+        entrypoint: vec!["sh".to_string(), "-c".to_string()],
+        cmd: vec![dump_cmd],
+        env: vec![format!("PGPASSWORD={}", pg.password)],
+        binds: vec![],
+        // Same user-defined bridge the target Postgres container is on so
+        // `postgres-{service_name}` resolves.
+        network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+        user: Some("root".to_string()),
+        stderr_watch: None,
+    }
+}
+
 struct PgParams {
     username: String,
     password: String,
@@ -295,5 +282,39 @@ fn load_postgres_params(config_json: &str) -> PgParams {
             .and_then(|v| v.as_str())
             .unwrap_or("gotempsh/postgres-walg:18-bookworm")
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pgdump_spec_has_no_bind_mount_and_is_attempt_scoped() {
+        let parent = tempfile::tempdir().expect("parent");
+        let first =
+            DumpAttempt::new_in(parent.path(), POSTGRES_TOOL, ENGINE_KEY, "b-uuid").expect("first");
+        let retry =
+            DumpAttempt::new_in(parent.path(), POSTGRES_TOOL, ENGINE_KEY, "b-uuid").expect("retry");
+        let pg = load_postgres_params(r#"{"username":"u","password":"p","database":"d"}"#);
+
+        let spec = pgdump_spec(&first, 9, "orders", &pg);
+        let retry_spec = pgdump_spec(&retry, 9, "orders", &pg);
+
+        assert!(
+            spec.binds.is_empty(),
+            "output must not depend on a host bind"
+        );
+        assert_ne!(spec.name, retry_spec.name);
+        assert!(spec.name.starts_with("temps-pgdump-b-uuid-"));
+        let cmd = &spec.cmd[0];
+        assert!(
+            cmd.contains(&first.container_path(SIDECAR_DUMP_SQL)),
+            "{cmd}"
+        );
+        assert!(cmd.contains(&first.container_path(SIDECAR_STDERR)), "{cmd}");
+        assert!(cmd.contains("'postgres-orders'"), "{cmd}");
+        assert!(!cmd.contains(&retry.container_dir()), "{cmd}");
+        assert_eq!(spec.env, vec!["PGPASSWORD=p".to_string()]);
     }
 }

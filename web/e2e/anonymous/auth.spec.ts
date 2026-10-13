@@ -30,7 +30,7 @@ test.describe('authentication', () => {
     await page.waitForURL(URL_PROJECTS, { timeout: 30_000 })
     await expectAppMounted(page)
     await expect(
-      page.getByRole('heading', { name: 'Projects', exact: true })
+      page.getByRole('heading', { name: /^(Projects|Deploy your first application)$/, exact: true })
     ).toBeVisible()
 
     expect(consoleErrors).toEqual([])
@@ -90,7 +90,7 @@ test.describe('authentication', () => {
 
     await page.waitForURL(URL_PROJECTS, { timeout: 30_000 })
     await expect(
-      page.getByRole('heading', { name: 'Projects', exact: true })
+      page.getByRole('heading', { name: /^(Projects|Deploy your first application)$/, exact: true })
     ).toBeVisible()
     await expect(page.getByText(/404\s*-\s*Page Not Found/i)).toHaveCount(0)
   })

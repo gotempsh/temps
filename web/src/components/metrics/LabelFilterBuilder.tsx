@@ -491,7 +491,7 @@ function GroupByCardinalityWarning({
     count >= GROUP_BY_CARDINALITY_VALUES_CAP ? `${count}+` : `${count}`
 
   return (
-    <p className="flex items-center gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+    <p className="flex items-center gap-1.5 text-[11px] text-amber-700 dark:text-amber-400">
       <AlertTriangle className="size-3 shrink-0" />
       {countLabel} distinct values for{' '}
       <span className="font-mono">{labelKey}</span> — {hint}

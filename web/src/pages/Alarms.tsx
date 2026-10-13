@@ -10,6 +10,7 @@ import {
   listProjectAlarmsQueryKey,
   resolveAlarmMutation,
   silenceAlarmMutation,
+  unsilenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { bulkUpdateProjectAlarms } from '@/api/client'
 import type {
@@ -35,9 +36,11 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RecoveryActionDialog } from '@/components/monitoring/RecoveryActionDialog'
 import {
   Select,
   SelectContent,
@@ -56,13 +59,27 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  alarmQuickAction,
+  alarmScopeLinks,
+  type AlarmQuickAction,
+} from '@/lib/alarm-actions'
+import type { RecoveryAction } from '@/lib/recovery-actions'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { AlarmClock, BellOff, Check, CheckCircle2, X } from 'lucide-react'
+import {
+  AlarmClock,
+  BellOff,
+  Check,
+  CheckCircle2,
+  RotateCw,
+  Sparkles,
+  X,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   actionAppliesTo,
@@ -138,7 +155,7 @@ function severityBadge(severity: string) {
       return <Badge variant="destructive">Critical</Badge>
     case 'warning':
       return (
-        <Badge className="border-transparent bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400">
+        <Badge className="border-transparent bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-400">
           Warning
         </Badge>
       )
@@ -167,20 +184,94 @@ function statusBadge(status: string) {
   }
 }
 
+// A silence only mutes an alarm that is still open: once it is resolved the
+// backend lets the next breach alarm again, so don't advertise a mute that no
+// longer applies.
 function isSilenced(alarm: AlarmResponse): boolean {
   return (
+    alarm.status !== 'resolved' &&
     !!alarm.silenced_until &&
     new Date(alarm.silenced_until).getTime() > Date.now()
   )
 }
 
-function scopeLabel(alarm: AlarmResponse): string {
-  const parts: string[] = []
-  if (alarm.environment_id != null) parts.push(`env #${alarm.environment_id}`)
-  if (alarm.deployment_id != null) parts.push(`deploy #${alarm.deployment_id}`)
-  if (alarm.service_id != null) parts.push(`service #${alarm.service_id}`)
-  if (alarm.container_id != null) parts.push(`container #${alarm.container_id}`)
-  return parts.length > 0 ? parts.join(' · ') : 'service-wide'
+/** The alarm's scope, each part linked to the resource that fired. */
+function AlarmScope({
+  alarm,
+  projectSlug,
+}: {
+  alarm: AlarmResponse
+  projectSlug: string | undefined
+}) {
+  const links = alarmScopeLinks(alarm, projectSlug)
+  return (
+    <span className="flex flex-wrap gap-x-1.5 gap-y-0.5">
+      {links.map((link, index) => (
+        <span key={link.label} className="inline-flex items-center gap-1.5">
+          {index > 0 && <span aria-hidden="true">·</span>}
+          {link.href ? (
+            <Link
+              to={link.href}
+              className="underline-offset-2 hover:text-foreground hover:underline"
+            >
+              {link.label}
+            </Link>
+          ) : (
+            link.label
+          )}
+        </span>
+      ))}
+    </span>
+  )
+}
+
+function AlarmRowQuickAction({
+  alarm,
+  projectSlug,
+  disabled,
+  onRun,
+}: {
+  alarm: AlarmResponse
+  projectSlug: string | undefined
+  disabled: boolean
+  onRun: (action: Exclude<AlarmQuickAction, { kind: 'autofix' }>) => void
+}) {
+  const action = alarmQuickAction(alarm, projectSlug)
+  if (!action) return null
+  return <QuickActionButton action={action} disabled={disabled} onRun={onRun} />
+}
+
+/** The type-specific fix for an alarm row (restart, redeploy, autofix). */
+function QuickActionButton({
+  action,
+  disabled,
+  onRun,
+}: {
+  action: AlarmQuickAction
+  disabled: boolean
+  onRun: (action: Exclude<AlarmQuickAction, { kind: 'autofix' }>) => void
+}) {
+  if (action.kind === 'autofix') {
+    return (
+      <Button variant="outline" size="sm" asChild>
+        <Link to={action.href}>
+          <Sparkles className="mr-1 h-3.5 w-3.5" />
+          Autofix
+        </Link>
+      </Button>
+    )
+  }
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={disabled}
+      onClick={() => onRun(action)}
+    >
+      <RotateCw className="mr-1 h-3.5 w-3.5" />
+      {action.kind === 'restart_container' ? 'Restart' : 'Redeploy'}
+    </Button>
+  )
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────
@@ -226,6 +317,34 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   )
   const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
   const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
+  const effectiveProject = projects.find(
+    (project) => project.id === effectiveProjectId
+  )
+  // The confirmation for a row's restart/redeploy action, if one is open.
+  const [recoveryAction, setRecoveryAction] = useState<RecoveryAction | null>(
+    null
+  )
+  const runQuickAction = (
+    action: Exclude<AlarmQuickAction, { kind: 'autofix' }>
+  ) => {
+    if (!effectiveProject) return
+    setRecoveryAction(
+      action.kind === 'restart_container'
+        ? {
+            kind: 'restart_container',
+            projectId: effectiveProject.id,
+            environmentId: action.environmentId,
+            containerId: action.containerId,
+            containerName: action.containerName,
+          }
+        : {
+            kind: 'redeploy',
+            projectId: effectiveProject.id,
+            sourceType: effectiveProject.source_type,
+            deploymentId: action.deploymentId,
+          }
+    )
+  }
   const hasProject = effectiveProjectId != null
   const projectPath = { project_id: effectiveProjectId ?? 0 }
 
@@ -317,6 +436,15 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
   })
 
+  const unsilence = useMutation({
+    ...unsilenceAlarmMutation(),
+    onSuccess: () => {
+      toast.success('Alarm silence lifted')
+      invalidate()
+    },
+    onError: (err: Error) => toast.error(`Failed to unsilence: ${err.message}`),
+  })
+
   const bulk = useMutation({
     // The project is part of the variables so a project switch mid-request
     // can't redirect later rounds or the cache invalidation elsewhere.
@@ -343,7 +471,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           // Earlier rounds already committed; say how far it got.
           if (totals.updated === 0) throw error
           throw new Error(
-            `${bulkSuccessMessage(body.action, totals)}, then failed: ${getErrorMessage(error)}`
+            `${bulkSuccessMessage(body.action, totals)}, then failed: ${getErrorMessage(error)}`,
+            { cause: error }
           )
         }
       }
@@ -369,6 +498,14 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onSettled: (_data, _error, { path }) => invalidate(path),
   })
 
+  const items = useMemo(() => data?.items ?? [], [data])
+  // Rows resolved in the meantime (their own row action, or a refetch that
+  // picked up someone else's change) drop out of the selection.
+  const selection = useMemo(
+    () => pruneSelection(rawSelection, items),
+    [rawSelection, items]
+  )
+
   const runBulk = (action: BulkAlarmActionRequest) => {
     if (selection.kind === 'all-matching') {
       setConfirmAction(action)
@@ -393,18 +530,22 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     setConfirmAction(null)
   }
 
-  // A selection only makes sense for the list it was made on.
-  useEffect(() => {
+  // A selection only makes sense for the list it was made on. Cleared during
+  // render when the list changes, so bulk actions never see (or briefly show)
+  // a selection from the previous page or filter.
+  const listKey = JSON.stringify([
+    effectiveProjectId,
+    status,
+    severity,
+    alarmType,
+    page,
+  ])
+  const [selectionListKey, setSelectionListKey] = useState(listKey)
+  if (listKey !== selectionListKey) {
+    setSelectionListKey(listKey)
     setSelection(EMPTY_SELECTION)
-  }, [effectiveProjectId, status, severity, alarmType, page])
+  }
 
-  const items = useMemo(() => data?.items ?? [], [data])
-  // Rows resolved in the meantime (their own row action, or a refetch that
-  // picked up someone else's change) drop out of the selection.
-  const selection = useMemo(
-    () => pruneSelection(rawSelection, items),
-    [rawSelection, items]
-  )
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
@@ -412,6 +553,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     acknowledge.isPending ||
     resolve.isPending ||
     silence.isPending ||
+    unsilence.isPending ||
     bulk.isPending
   const hasSelection = selectionCount(selection) !== 0
   const pageSelectable = selectableIds(items).length > 0
@@ -446,7 +588,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     {
       label: 'Warning',
       value: summary?.warning ?? 0,
-      tone: 'text-amber-600 dark:text-amber-400',
+      tone: 'text-amber-700 dark:text-amber-400',
     },
   ]
 
@@ -758,7 +900,10 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       </div>
                     </TableCell>
                     <TableCell className="hidden text-xs text-muted-foreground lg:table-cell">
-                      {scopeLabel(alarm)}
+                      <AlarmScope
+                        alarm={alarm}
+                        projectSlug={effectiveProject?.slug}
+                      />
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-col gap-1">
@@ -791,6 +936,12 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
+                        <AlarmRowQuickAction
+                          alarm={alarm}
+                          projectSlug={effectiveProject?.slug}
+                          disabled={isMutating || !effectiveProject}
+                          onRun={runQuickAction}
+                        />
                         {alarm.status === 'firing' && (
                           <Button
                             variant="outline"
@@ -856,6 +1007,23 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                                   {opt.label}
                                 </DropdownMenuItem>
                               ))}
+                              {isSilenced(alarm) && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    onClick={() =>
+                                      unsilence.mutate({
+                                        path: {
+                                          project_id: effectiveProjectId ?? 0,
+                                          alarm_id: alarm.id,
+                                        },
+                                      })
+                                    }
+                                  >
+                                    Unsilence now
+                                  </DropdownMenuItem>
+                                </>
+                              )}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         )}
@@ -898,6 +1066,11 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         </div>
       )}
+
+      <RecoveryActionDialog
+        action={recoveryAction}
+        onClose={() => setRecoveryAction(null)}
+      />
 
       <AlertDialog
         open={confirmAction != null}

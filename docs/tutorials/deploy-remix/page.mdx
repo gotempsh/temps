@@ -1,162 +1,118 @@
 export const metadata = {
-  title: 'Deploy a Remix App',
-  description: 'Deploy a Remix application on Temps with SSR, loaders, actions, and automatic HTTPS.',
+  title: "Deploy Remix With SSR and Nested Routes",
+  description: "Deploy Remix with SSR and nested routes on your own VPS, with automatic HTTPS, preview deployments and no cold starts. A self-hosted alternative to Vercel.",
   alternates: {
-    canonical: '/docs/deploy-remix',
+    canonical: "/docs/deploy-remix",
   },
-}
-
-# Deploy a Remix App
-
-This tutorial walks you through deploying a Remix application on Temps. Remix runs on a Node.js server with full SSR, loaders, and actions. {{ className: 'lead' }}
-
----
-
-## What you will build {{ anchor: true, id: 'what-you-will-build' }}
-
-- A Remix app deployed from a Git repository
-- Server-side rendering with loaders and actions
-- Automatic HTTPS and deployment on every push
-
-**Time required:** 10 minutes.
-
-**Prerequisites:**
-- A running Temps instance ([install guide](/docs/your-first-deployment))
-- A Remix app in a Git repository
-- (Optional) A custom domain
-
----
-
-## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
-
-### Verify your package.json
-
-Remix v2+ uses Vite as the build tool:
-
-```json {{ title: 'package.json' }}
-{
-  "scripts": {
-    "dev": "remix vite:dev",
-    "build": "remix vite:build",
-    "start": "remix-serve ./build/server/index.js"
+  openGraph: {
+    title: "Deploy Remix With SSR and Nested Routes",
+    description: "Deploy Remix with SSR and nested routes on your own VPS, with automatic HTTPS, preview deployments and no cold starts. A self-hosted alternative to Vercel.",
+    images: [{ url: "/og/docs/deploy-remix.png", width: 1200, height: 630, alt: "Deploy Remix" }],
   },
-  "dependencies": {
-    "@remix-run/node": "^2.0",
-    "@remix-run/react": "^2.0",
-    "@remix-run/serve": "^2.0"
+  twitter: {
+    card: "summary_large_image",
+    title: "Deploy Remix With SSR and Nested Routes",
+    description: "Deploy Remix with SSR and nested routes on your own VPS, with automatic HTTPS, preview deployments and no cold starts. A self-hosted alternative to Vercel.",
+    images: ["/og/docs/deploy-remix.png"],
   }
-}
-```
+};
 
-### Add a health check
+export const sections = [
+  { title: 'Quickstart', id: 'quickstart' },
+  { title: 'What Temps handles automatically', id: 'what-temps-handles-automatically' },
+  { title: 'Managed PostgreSQL', id: 'managed-postgresql' },
+  { title: 'Environment variables', id: 'environment-variables' },
+  { title: 'Platform behavior', id: 'platform-behavior' },
+]
 
-```typescript {{ title: 'app/routes/health.tsx' }}
-import { json } from '@remix-run/node';
+# Deploy Remix on Your Own Server
 
-export function loader() {
-  return json({ status: 'ok' });
-}
-```
-
----
-
-## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
-
-1. Open the Temps dashboard
-2. Click **New Project**
-3. Connect your repository
-4. Temps detects Remix automatically
-
-Or via CLI:
-
-```bash
-bunx @temps-sdk/cli projects create -n "my-remix-app" -d "Remix application"
-bunx @temps-sdk/cli projects git -p my-remix-app --owner yourorg --repo my-remix-app --branch main -y
-```
+**Deploy Remix and your loaders, actions, and server rendering run without cold starts** — Temps runs your app as a persistent Node.js process with automatic HTTPS on infrastructure you own. {{ className: 'lead' }}
 
 ---
 
-## Step 3: Create a Dockerfile (optional) {{ anchor: true, id: 'dockerfile' }}
+## Quickstart {{ anchor: true, id: 'quickstart' }}
 
-Temps auto-detects Remix, but you can customize:
+From your project root, deploy with your preferred package manager:
 
-```dockerfile {{ title: 'Dockerfile' }}
-FROM node:22-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
+<CliCommands commands={[
+  { args: "up" },
+]} />
 
-FROM node:22-alpine
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=builder /app/build ./build
-COPY --from=builder /app/package.json .
-COPY --from=builder /app/node_modules ./node_modules
-EXPOSE 3000
-CMD ["npm", "run", "start"]
-```
+Remix needs the **Autopack (Node.js)** preset (`nixpacks-node`), which runs your app as a Node.js server:
 
----
+<CliCommands commands={[
+  { args: "up --preset nixpacks-node" },
+]} />
 
-## Step 4: Configure environment variables {{ anchor: true, id: 'env-vars' }}
+Or pick it under **Project → Settings → Build & deploy → Build → Framework**.
 
-Remix loads environment variables on the server. Access them in loaders and actions:
+<Note>
+A Vite-based Remix app has a `vite.config.js` or `vite.config.ts`, so Temps detects it as the static **Vite** preset. That preset only serves files from `dist/` and can't run the Remix server, so switch the project to Autopack (Node.js). A classic `remix.config.js` project isn't detected at all and needs the same preset.
+</Note>
 
-```typescript
-// Available in loaders and actions
-export function loader() {
-  const apiKey = process.env.API_KEY;
-  // ...
-}
-```
-
-To expose variables to the client, pass them through a root loader.
-
-Set variables in the Temps dashboard under **Environment Variables**.
+With Autopack (Node.js), Temps runs your `build` script, then starts the app with your `start` script (for example `remix-serve ./build/server/index.js`). A `web:` line in a `Procfile` takes priority over the `start` script. The Node.js version comes from `.nvmrc`, `.node-version` or `engines.node` in `package.json`, and defaults to 24.
 
 ---
 
-## Step 5: Deploy {{ anchor: true, id: 'deploy' }}
+## What Temps handles automatically {{ anchor: true, id: 'what-temps-handles-automatically' }}
 
-Push to your connected branch, or deploy manually:
-
-```bash
-bunx @temps-sdk/cli deploy my-remix-app -b main -e production -y
-```
-
-Temps will:
-1. Detect your Remix project
-2. Build the Docker image
-3. Run `remix vite:build`
-4. Start `remix-serve` on the configured port
-5. Run health checks and route traffic
+| Feature | How Temps handles it |
+| ------- | -------------------- |
+| Build | Your `build` script (for example `npm run build`) |
+| Start | Your `start` script, or a `Procfile` `web:` line |
+| HTTPS | Let's Encrypt, auto-renewed |
+| Port | `PORT` env var injected, defaults to 3000 |
+| Loaders and actions | Fully supported via Node.js runtime |
+| No cold starts | Persistent Node.js process |
+| Preview deployments | Opt-in; once enabled, each branch gets its own preview environment |
 
 ---
 
-## Database integration {{ anchor: true, id: 'database' }}
+## Managed PostgreSQL {{ anchor: true, id: 'managed-postgresql' }}
 
-If your Remix app needs a database, provision one in Temps:
+Remix apps need a database for session storage and application data. Create a PostgreSQL database under **Databases → Create database**, then link it from your project's **Databases** page. Temps injects the connection string as `POSTGRES_URL`, so point Prisma or Drizzle at that variable (for Prisma, `url = env("POSTGRES_URL")`). See [Deploy with a Database](/docs/deploy-with-database).
 
-```bash
-bunx @temps-sdk/cli services create -p my-remix-app -t postgres -n "remix-db"
-```
+Temps doesn't run migrations for you. Run them yourself, for example from CI, or as part of your `start` script:
 
-The `DATABASE_URL` is automatically injected. Use Prisma or Drizzle to connect:
-
-```typescript {{ title: 'app/db.server.ts' }}
-import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
-
-const client = postgres(process.env.DATABASE_URL!);
-export const db = drizzle(client);
-```
+<CliCommands pkg="prisma" commands={[{ args: "migrate deploy" }]} />
 
 ---
 
-## What to do next {{ anchor: true, id: 'next-steps' }}
+## Environment variables {{ anchor: true, id: 'environment-variables' }}
 
-- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
-- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
-- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+<CliCommands commands={[
+  { args: "environments vars set SESSION_SECRET \"your-secret\" -e production" },
+]} />
+
+---
+
+## Platform behavior {{ anchor: true, id: 'platform-behavior' }}
+
+These rules apply to every app deployed on Temps, regardless of framework.
+
+<PortBinding />
+
+### Health checks
+
+<HealthChecks />
+
+### Auto-injected environment variables
+
+<InjectedEnvVars />
+
+---
+
+## Next Steps
+
+<div className="not-prose">
+  <Button href="/docs/deploy-with-database" variant="text" arrow="right">
+    Deploy with a database
+  </Button>
+  <Button href="/docs/set-up-preview-deployments" variant="text" arrow="right">
+    Preview deployments
+  </Button>
+  <Button href="/docs/environment-variables" variant="text" arrow="right">
+    Environment variables
+  </Button>
+</div>

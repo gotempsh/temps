@@ -39,6 +39,33 @@ pub struct BatchWriteEntry {
     pub mode: Option<u32>,
 }
 
+/// Map a provider error from a filesystem operation. Errors that already
+/// carry a precise meaning keep it — a rejected request (400, e.g. a file
+/// over a worker node's read limit), a feature a worker node can't serve
+/// (422), an unreachable node (503), a missing container (404) — and
+/// everything else is a failed file operation naming the path.
+fn file_op_err(
+    public_id: &str,
+    op: &str,
+    path: impl Into<String>,
+    err: temps_agents::error::AgentError,
+) -> SandboxError {
+    use temps_agents::error::AgentError;
+    match err {
+        AgentError::Validation { .. }
+        | AgentError::SandboxUnsupportedOnNode { .. }
+        | AgentError::SandboxNodeUnavailable { .. }
+        | AgentError::SandboxProviderUnavailable { .. }
+        | AgentError::SandboxNotFound { .. } => crate::error::from_agent_error(public_id, err),
+        other => SandboxError::FileOp {
+            sandbox_id: public_id.to_string(),
+            op: op.to_string(),
+            path: path.into(),
+            reason: other.to_string(),
+        },
+    }
+}
+
 impl SandboxService {
     /// Read a file from inside the sandbox.
     pub async fn fs_read(
@@ -60,12 +87,7 @@ impl SandboxService {
             .provider()
             .read_file(&handle, path)
             .await
-            .map_err(|e| SandboxError::FileOp {
-                sandbox_id: public_id.to_string(),
-                op: "read".into(),
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| file_op_err(public_id, "read", path.to_string(), e))?;
         Ok(bytes)
     }
 
@@ -92,12 +114,7 @@ impl SandboxService {
             .provider()
             .write_file(&handle, path, contents, mode)
             .await
-            .map_err(|e| SandboxError::FileOp {
-                sandbox_id: public_id.to_string(),
-                op: "write".into(),
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| file_op_err(public_id, "write", path.to_string(), e))?;
         Ok(())
     }
 
@@ -132,12 +149,7 @@ impl SandboxService {
             .provider()
             .exec(&handle, cmd, HashMap::new(), None)
             .await
-            .map_err(|e| SandboxError::FileOp {
-                sandbox_id: public_id.to_string(),
-                op: "stat".into(),
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| file_op_err(public_id, "stat", path.to_string(), e))?;
 
         if result.exit_code != 0 {
             return Err(SandboxError::FileOp {
@@ -229,12 +241,7 @@ impl SandboxService {
                 .provider()
                 .write_file(&handle, &entry.path, &entry.contents, mode)
                 .await
-                .map_err(|e| SandboxError::FileOp {
-                    sandbox_id: public_id.to_string(),
-                    op: "write_batch".into(),
-                    path: entry.path.clone(),
-                    reason: e.to_string(),
-                })?;
+                .map_err(|e| file_op_err(public_id, "write_batch", entry.path.clone(), e))?;
             written += 1;
         }
         Ok(written)
@@ -262,12 +269,7 @@ impl SandboxService {
             .provider()
             .exec(&handle, cmd, HashMap::new(), None)
             .await
-            .map_err(|e| SandboxError::FileOp {
-                sandbox_id: public_id.to_string(),
-                op: "mkdir".into(),
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| file_op_err(public_id, "mkdir", path.to_string(), e))?;
         if result.exit_code != 0 {
             return Err(SandboxError::FileOp {
                 sandbox_id: public_id.to_string(),
@@ -333,6 +335,65 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_agents::error::AgentError;
+
+    #[test]
+    fn file_op_errors_keep_precise_provider_meanings() {
+        // A file over a worker node's read limit is the caller's error (400).
+        let err = file_op_err(
+            "sbx_1",
+            "read",
+            "/big.bin",
+            AgentError::Validation {
+                message: "file /big.bin is larger than 104857600 bytes".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Validation { .. }), "{err:?}");
+
+        let err = file_op_err(
+            "sbx_1",
+            "write",
+            "/a",
+            AgentError::SandboxNodeUnavailable {
+                node_id: 3,
+                node_name: "worker-1".into(),
+                reason: "offline".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Unavailable { .. }), "{err:?}");
+
+        let err = file_op_err(
+            "sbx_1",
+            "read",
+            "/a",
+            AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: "temps-sandbox-1".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn other_provider_failures_are_file_op_errors_naming_the_path() {
+        let err = file_op_err(
+            "sbx_1",
+            "mkdir",
+            "/workspace/x",
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: "temps-sandbox-1".into(),
+                reason: "boom".into(),
+            },
+        );
+        match err {
+            SandboxError::FileOp { op, path, .. } => {
+                assert_eq!(op, "mkdir");
+                assert_eq!(path, "/workspace/x");
+            }
+            other => panic!("expected FileOp, got {other:?}"),
+        }
+    }
 
     #[test]
     fn validate_absolute_rejects_empty() {

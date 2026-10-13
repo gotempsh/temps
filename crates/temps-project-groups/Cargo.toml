@@ -37,4 +37,4 @@ temps-database = { path = "../temps-database" }
 temps-environments = { path = "../temps-environments" }
 bollard = { workspace = true }
 async-trait = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }

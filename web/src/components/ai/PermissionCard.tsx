@@ -309,7 +309,10 @@ function PlanApprovalVariant({
   return (
     <div className="space-y-3">
       {plan ? (
-        <div className={cn(proseClasses, 'max-h-72 overflow-auto')}>
+        <div
+          tabIndex={0}
+          className={cn(proseClasses, 'max-h-72 overflow-auto')}
+        >
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={markdownComponents}
@@ -472,7 +475,7 @@ function ToolApprovalVariant({
                 : undefined
             }
             statusLabel="Awaiting your approval"
-            statusClassName="text-amber-600 dark:text-amber-400"
+            statusClassName="text-amber-700 dark:text-amber-400"
             projectId={targetProjectId}
           />
         </div>
@@ -714,7 +717,7 @@ export function PermissionCard({
       ? 'text-blue-600 dark:text-blue-400'
       : permission.kind === 'plan_approval'
         ? 'text-violet-600 dark:text-violet-400'
-        : 'text-amber-600 dark:text-amber-400'
+        : 'text-amber-700 dark:text-amber-400'
 
   return (
     <div

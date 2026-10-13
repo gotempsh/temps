@@ -8,13 +8,16 @@
 //! (not the regular user auth) — the node presents the registration token
 //! which is verified against the hashed token stored in the nodes table.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -25,16 +28,19 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
+use crate::handlers::audit::{
+    NodeArchitectureChangedAudit, NodeDrainAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
+};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodePlacementReference,
+    NodeService, RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
 };
-use crate::services::CONTROL_PLANE_NODE_ID;
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
+use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
 use temps_core::problemdetails::{self, Problem};
-use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
+use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -347,6 +353,27 @@ pub struct DrainNodeResponse {
 pub struct RemoveNodeResponse {
     pub id: i32,
     pub message: String,
+    /// Containers Temps could not confirm were removed from the node before
+    /// it was removed (only with `force=true`). They are recorded as
+    /// orphaned; remove them on that host by hand if it still exists.
+    #[serde(default)]
+    pub orphaned_containers: Vec<String>,
+    /// Environments (and project defaults) whose target nodes listed the
+    /// removed node. Its ID was taken out of each; `target_nodes` holds the
+    /// nodes they still target.
+    #[serde(default)]
+    pub placements_updated: Vec<NodePlacementReference>,
+}
+
+/// Query parameters for removing a node.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RemoveNodeQuery {
+    /// Remove the node even if containers Temps placed on it could not be
+    /// confirmed removed (e.g. the host is gone for good). Those containers
+    /// are recorded as orphaned instead of being re-homed.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Progress of a node drain operation.
@@ -357,6 +384,9 @@ pub struct DrainStatusResponse {
     pub status: String,
     /// Number of containers still on this node
     pub remaining_containers: usize,
+    /// Sandboxes (any owner) still on this node. Draining does not move
+    /// sandboxes; evict them before removing the node (ADR-048).
+    pub remaining_sandboxes: u64,
     /// Whether the source node is empty and safe to remove. Replacement
     /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
@@ -475,6 +505,8 @@ pub struct ClusterDnsStatusResponse {
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
+        crate::handlers::network::register_mesh,
+        crate::handlers::network::report_mesh_handshakes,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -486,6 +518,16 @@ pub struct ClusterDnsStatusResponse {
         cluster_dns_status,
         node_docker_disk_usage,
         node_capability,
+        crate::handlers::wireguard_mesh::wireguard_mesh_status,
+        crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
+        crate::handlers::node_pairings::create_node_pairing,
+        crate::handlers::node_pairings::list_node_pairings,
+        crate::handlers::node_pairings::cancel_node_pairing,
+        crate::handlers::node_ssh::node_ssh_host_key,
+        crate::handlers::node_ssh::create_node_ssh_enrollment,
+        crate::handlers::node_ssh::list_node_ssh_enrollments,
+        crate::handlers::node_ssh::get_node_ssh_enrollment,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -497,6 +539,13 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
+        crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::WireguardMeshSelfEntry,
+        crate::handlers::network::WireguardMeshPeerEntry,
+        crate::handlers::network::RegisterWireguardMeshRequest,
+        crate::handlers::network::RegisterWireguardMeshResponse,
+        crate::handlers::network::ReportWireguardHandshakesRequest,
+        crate::handlers::network::WireguardHandshakeReport,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -504,12 +553,36 @@ pub struct ClusterDnsStatusResponse {
         DrainNodeResponse,
         UndrainNodeResponse,
         RemoveNodeResponse,
+        NodePlacementReference,
         DrainStatusResponse,
         NodeDnsStatusEntry,
         ClusterDnsStatusResponse,
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
+        crate::handlers::wireguard_mesh::WireguardMeshState,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
+        crate::handlers::wireguard_mesh::WireguardMeshControlPlaneEntry,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshCheck,
+        crate::handlers::wireguard_mesh::WireguardMeshCheckStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
+        crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
+        crate::handlers::wireguard_mesh::SetWireguardMeshHubRequest,
+        crate::handlers::wireguard_mesh::WireguardMeshHubTarget,
+        crate::handlers::wireguard_mesh::WireguardMeshHub,
+        crate::handlers::wireguard_mesh::WireguardMeshLink,
+        crate::handlers::wireguard_mesh::WireguardMeshLinkState,
+        crate::handlers::node_pairings::CreateNodePairingRequest,
+        crate::handlers::node_pairings::CreateNodePairingResponse,
+        crate::handlers::node_pairings::NodePairingResponse,
+        crate::handlers::node_pairings::NodePairingListResponse,
+        crate::handlers::node_ssh::SshHostKeyRequest,
+        crate::handlers::node_ssh::SshHostKeyResponse,
+        crate::handlers::node_ssh::SshCredentials,
+        crate::handlers::node_ssh::CreateSshEnrollmentRequest,
+        crate::handlers::node_ssh::NodeSshEnrollmentResponse,
+        crate::handlers::node_ssh::NodeSshEnrollmentListResponse,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
     )),
@@ -534,6 +607,14 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         .route(
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard",
+            put(crate::handlers::network::register_mesh),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard/handshakes",
+            put(crate::handlers::network::report_mesh_handshakes),
         )
         .route("/internal/edge/routes", get(edge_routes))
 }
@@ -583,6 +664,37 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         // Literal segment, so it can never be shadowed by the `{node_id}`
         // routes below it.
         .route("/nodes/capability", get(node_capability))
+        .route(
+            "/nodes/wireguard",
+            get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
+        .route(
+            "/nodes/wireguard/hub",
+            put(crate::handlers::wireguard_mesh::set_wireguard_mesh_hub),
+        )
+        .route(
+            "/nodes/pairings",
+            get(crate::handlers::node_pairings::list_node_pairings)
+                .post(crate::handlers::node_pairings::create_node_pairing),
+        )
+        .route(
+            "/nodes/pairings/{pairing_id}",
+            delete(crate::handlers::node_pairings::cancel_node_pairing),
+        )
+        .route(
+            "/nodes/ssh/host-key",
+            post(crate::handlers::node_ssh::node_ssh_host_key),
+        )
+        .route(
+            "/nodes/ssh/enrollments",
+            get(crate::handlers::node_ssh::list_node_ssh_enrollments)
+                .post(crate::handlers::node_ssh::create_node_ssh_enrollment),
+        )
+        .route(
+            "/nodes/ssh/enrollments/{enrollment_id}",
+            get(crate::handlers::node_ssh::get_node_ssh_enrollment),
+        )
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),
@@ -824,30 +936,6 @@ pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, Nod
     Ok(ip)
 }
 
-/// Extract the host from a validated node agent URL or private address for use
-/// as a server-authoritative certificate SAN.
-fn node_address_host(address: &str) -> String {
-    let address = address.trim();
-    let authority = address
-        .strip_prefix("https://")
-        .or_else(|| address.strip_prefix("http://"))
-        .unwrap_or(address)
-        .split('/')
-        .next()
-        .unwrap_or(address);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        if let Some(end) = bracketed.find(']') {
-            return bracketed[..end].to_string();
-        }
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            host.to_string()
-        }
-        _ => authority.to_string(),
-    }
-}
-
 fn mtls_agent_address(address: &str) -> String {
     let address = address.trim();
     if address.starts_with("https://") {
@@ -939,6 +1027,15 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
     Ok(token.to_string())
 }
 
+/// Request extension set by the control plane's mesh node-API listener
+/// (ADR 048 D3, `temps serve`'s `node_api` module) on every request it
+/// serves: the TCP peer the connection came from. It is inserted by the
+/// listener from the accepted socket, never derived from anything the client
+/// sends (headers, body), so its presence proves the request arrived over the
+/// mesh listener. The public listeners never set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeApiPeer(pub std::net::SocketAddr);
+
 /// Register a new worker node or reconnect an existing one
 #[utoipa::path(
     tag = "Nodes",
@@ -958,12 +1055,14 @@ async fn register_node(
     // peer address is always present in production; unit tests inject it via a
     // `MockConnectInfo` layer.
     connect_info: ConnectInfo<std::net::SocketAddr>,
+    node_api_peer: Option<axum::Extension<NodeApiPeer>>,
     request: Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     // Every rejection below returns early, so the outcome is reported once
     // here rather than at each exit.
     let telemetry = app_state.telemetry.clone();
-    let result = register_node_inner(State(app_state), connect_info, request).await;
+    let node_api_peer = node_api_peer.map(|axum::Extension(NodeApiPeer(peer))| peer);
+    let result = register_node_inner(State(app_state), connect_info, node_api_peer, request).await;
     if let Err(problem) = &result {
         let title = problem.body.get("title").and_then(|t| t.as_str());
         if let Some(code) = node_join_failure_code(problem.status_code, title) {
@@ -1015,9 +1114,75 @@ fn node_join_failure_code(
     }
 }
 
+/// Give the enrollment token back the use a registration that was refused
+/// or undone consumed. Best effort: a failure only means the operator needs a
+/// new pairing.
+async fn release_token_use(app_state: &NodeAppState, token_id: i32) {
+    if let Err(error) = app_state
+        .enrollment_token_service
+        .release_use(token_id)
+        .await
+    {
+        error!(token_id, %error, "could not give the enrollment token its use back");
+    }
+}
+
+async fn claim_token_use(
+    app_state: &NodeAppState,
+    token: &str,
+    token_id: Option<i32>,
+) -> Result<(), Problem> {
+    if token_id.is_some() {
+        app_state
+            .enrollment_token_service
+            .validate_and_consume(token)
+            .await
+            .map_err(|error| {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Enrollment Token Not Usable")
+                    .with_detail(error.to_string())
+            })?;
+    }
+    Ok(())
+}
+
+/// Why a paired node could not complete its registration, and what to do.
+fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
+    use temps_network::mesh::MeshError;
+    match error {
+        MeshError::PairingClosed => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Pairing Closed")
+            .with_detail(
+                "This pairing is no longer waiting for this node (it was cancelled, expired or \
+                 already used). Create a new pairing: bunx @temps-sdk/cli nodes pair create \
+                 --address <node-ip>",
+            ),
+        MeshError::PublicKeyInUse => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Key In Use")
+            .with_detail(
+                "Another cluster member already uses this node's WireGuard key, usually because \
+                 the key file was copied from another machine. Delete the node's mesh key, \
+                 then create a new pairing.",
+            ),
+        MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Off")
+            .with_detail("The WireGuard mesh was turned off while this node was pairing."),
+        other => {
+            error!(error = %other, "could not complete a node pairing");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(
+                    "Failed to complete the node's pairing; nothing was registered, so running \
+                     `temps join --pair` again retries it. See the server logs.",
+                )
+        }
+    }
+}
+
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    node_api_peer: Option<std::net::SocketAddr>,
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     // Rate-limit enrollment (ADR-020 WS-1.3 / enroll-3) before doing any work:
@@ -1059,12 +1224,24 @@ async fn register_node_inner(
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
+    // The enrollment token this node registered with, when it was one: a
+    // token minted for a node pairing links the pairing to the node.
+    let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
-        .validate_and_consume(provided_token)
+        .validate(provided_token)
         .await
     {
         Ok(token_row) => {
+            app_state
+                .node_service
+                .assert_pairing_source(
+                    request.name.trim(),
+                    token_row.id,
+                    node_api_peer.map(|peer| peer.ip()),
+                )
+                .await
+                .map_err(Problem::from)?;
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
                 if bound != request.name.trim() {
@@ -1104,6 +1281,7 @@ async fn register_node_inner(
                         ));
                 }
             }
+            enrollment_token_id = Some(token_row.id);
             info!(node = %request.name, "Node authorized via enrollment token");
         }
         Err(temps_config::EnrollmentError::InvalidToken) => {
@@ -1265,10 +1443,27 @@ async fn register_node_inner(
                         .with_title("Invalid CSR")
                         .with_detail(format!("Failed to sign certificate signing request: {}", e))
                 })?;
+        // Claim the token after CSR validation but before reserving addresses.
+        // A losing concurrent claim must never create certificate history.
+        claim_token_use(&app_state, provided_token, enrollment_token_id).await?;
+        if let Err(error) = app_state
+            .node_service
+            .reserve_certificate_addresses(&ca.cert_pem, &allowed_sans, request.name.trim())
+            .await
+        {
+            if let Some(token_id) = enrollment_token_id {
+                release_token_use(&app_state, token_id).await;
+            }
+            return Err(Problem::from(error));
+        }
         (Some(signed.cert_pem), Some(ca.cert_pem))
     } else {
         (None, None)
     };
+
+    if request.csr_pem.is_none() {
+        claim_token_use(&app_state, provided_token, enrollment_token_id).await?;
+    }
 
     let register_request = RegisterNodeRequest {
         name: request.name.trim().to_string(),
@@ -1287,11 +1482,34 @@ async fn register_node_inner(
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
-    let node = app_state
+    // The service refuses a node claiming the control plane's own identity
+    // and links a paired node (ADR 048 D2b) to its pairing, undoing the
+    // registration if that fails.
+    let context = RegistrationContext {
+        pairing_token_id: enrollment_token_id,
+        control_plane_hosts: settings
+            .external_url
+            .as_deref()
+            .map(node_address_host)
+            .into_iter()
+            .collect(),
+        node_api_peer: node_api_peer.map(|peer| peer.ip()),
+    };
+    let node = match app_state
         .node_service
-        .register(register_request)
+        .register_with_context(register_request, &context)
         .await
-        .map_err(Problem::from)?;
+    {
+        Ok(node) => node,
+        Err(error) => {
+            // No certificate is returned on registration failure. Restore
+            // the token claim so a corrected request can retry enrollment.
+            if let Some(token_id) = enrollment_token_id {
+                release_token_use(&app_state, token_id).await;
+            }
+            return Err(Problem::from(error));
+        }
+    };
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
 
@@ -1342,10 +1560,14 @@ async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
 
+    // A node on the WireGuard mesh keeps its mesh address as underlay across
+    // re-registration; the address it joined with is only its endpoint.
+    // Decided in the UPDATE itself so a concurrent mesh registration can't be
+    // overwritten from a stale read.
     let result = nodes::Entity::update_many()
         .col_expr(
             nodes::Column::UnderlayAddress,
-            Expr::value(Some(underlay.to_string())),
+            Expr::cust_with_values("COALESCE(mesh_wg_address, $1)", [underlay.to_string()]),
         )
         .filter(nodes::Column::Id.eq(node_id))
         .exec(db)
@@ -2588,6 +2810,124 @@ async fn create_remote_deployer(
     Some(Arc::new(deployer))
 }
 
+/// 409 for a node removal refused because containers Temps placed on it may
+/// still exist there, and removing the node would lose track of them.
+fn node_holds_containers_problem(
+    node_id: i32,
+    node_name: &str,
+    unremoved_count: usize,
+    unremoved: &[String],
+) -> Problem {
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Node Still Holds Containers")
+        .with_detail(format!(
+            "Node '{node_name}' was not removed: Temps could not confirm that {} container(s) it \
+             placed there are gone ({}). Start `temps agent` on the node so Temps can remove them, \
+             or remove them on that host with `docker rm -f`, then retry. If the host is gone for \
+             good, retry with DELETE /internal/nodes/{node_id}?force=true: the containers are then \
+             recorded as orphaned on '{node_name}' and are not touched again.",
+            unremoved_count,
+            unremoved.join("; ")
+        ))
+        .with_value("node_id", node_id)
+        .with_value("node_name", node_name.to_string())
+        .with_value("unremoved_count", unremoved_count)
+        .with_value("unremoved_containers", unremoved.to_vec())
+}
+
+/// 409 for a drain refused before it changed anything, because at least one
+/// workload that only runs on this node has nothing to be rebuilt from.
+fn drain_refused_problem(node_name: &str, unmovable: &BoundedReport) -> Problem {
+    let lines = unmovable.report();
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Node Cannot Be Drained")
+        .with_detail(format!(
+            "Node '{node_name}' was not drained and is unchanged: {} workload(s) running only on \
+             it cannot be redeployed to another node: {}. Move or delete these workloads, then \
+             drain again.",
+            unmovable.count(),
+            lines.join("; ")
+        ))
+        .with_value("node_name", node_name.to_string())
+        .with_value("unmovable_count", unmovable.count())
+        .with_value("unmovable_workloads", lines)
+}
+
+/// Failure descriptions with a fixed memory bound: every failure is counted,
+/// the first [`MAX_DESCRIBED_UNREMOVED`] are described, and the report ends
+/// with a line counting the rest.
+#[derive(Debug, Default)]
+struct BoundedReport {
+    count: usize,
+    lines: Vec<String>,
+}
+
+impl BoundedReport {
+    fn push(&mut self, line: String) {
+        self.count += 1;
+        if self.lines.len() < MAX_DESCRIBED_UNREMOVED {
+            self.lines.push(line);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn report(&self) -> Vec<String> {
+        let mut lines = self.lines.clone();
+        let undescribed = self.count.saturating_sub(lines.len());
+        if undescribed > 0 {
+            lines.push(format!("and {undescribed} more not listed here"));
+        }
+        lines
+    }
+}
+
+/// Write an audit record for a node operation. A failure is logged and never
+/// fails the operation, which has already happened.
+async fn record_audit(app_state: &AppState, audit: &dyn AuditOperation, node_id: i32) {
+    if let Err(error) = app_state.audit_service.create_audit_log(audit).await {
+        error!(node_id, %error, "node operation succeeded but its audit record failed");
+    }
+}
+
+/// 500 for a drain whose redeploys could not all be queued after the
+/// pre-check passed. States exactly what already happened, so the operator
+/// does not have to guess whether to retry.
+fn drain_incomplete_problem(
+    node_id: i32,
+    node_name: &str,
+    failed_redeploys: &BoundedReport,
+    retired_count: usize,
+    redeployed_count: usize,
+    reactivated: bool,
+) -> Problem {
+    let node_state = if reactivated {
+        "The node was set back to active; retry the drain once the cause is fixed.".to_string()
+    } else {
+        format!(
+            "The node remains draining; undrain it (DELETE /internal/nodes/{node_id}/drain) and \
+             retry once the cause is fixed."
+        )
+    };
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title("Node Drain Incomplete")
+        .with_detail(format!(
+            "Drain of node '{node_name}' did not complete: {} redeploy(s) could not be queued, so \
+             those workloads are still on the node ({}). {redeployed_count} environment(s) were \
+             redeployed and {retired_count} container(s) retired before the failure. {node_state}",
+            failed_redeploys.count(),
+            failed_redeploys.report().join("; ")
+        ))
+        .with_value("node_name", node_name.to_string())
+        .with_value("failed_redeploys", failed_redeploys.report())
+}
+
 /// Drain a node: mark it as "draining" so no new replicas are scheduled on it,
 /// and trigger redeployment of all affected environments so their containers
 /// are rescheduled to healthy nodes.
@@ -2602,13 +2942,15 @@ async fn create_remote_deployer(
         (status = 200, description = "Node drain initiated", body = DrainNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 500, description = "Internal server error")
+        (status = 409, description = "Node already draining, or a workload only on this node cannot be redeployed elsewhere; the node is unchanged"),
+        (status = 500, description = "Internal server error, or a redeploy could not be queued (the response says what already happened)")
     ),
     security(("bearer_auth" = []))
 )]
 async fn admin_drain_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
@@ -2638,6 +2980,32 @@ async fn admin_drain_node(
         .await
         .map_err(Problem::from)?;
 
+    // Every workload that has to move must be rebuildable somewhere else.
+    // Check them all before changing anything: a drain that cannot move a
+    // workload would otherwise stay "draining" forever with the container
+    // still on the node, after reporting success. Planned a batch at a time,
+    // keeping only what failed, so memory does not grow with the workloads.
+    let mut unmovable = BoundedReport::default();
+    for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
+        let plans = app_state
+            .deployment_service
+            .plan_drain_redeploys(batch)
+            .await
+            .map_err(Problem::from)?;
+        for (deployment_id, plan) in plans {
+            if let Err(e) = plan {
+                warn!(
+                    node_id,
+                    deployment_id, "Drain refused: workload cannot be redeployed elsewhere: {}", e
+                );
+                unmovable.push(e.to_string());
+            }
+        }
+    }
+    if !unmovable.is_empty() {
+        return Err(drain_refused_problem(&node.name, &unmovable));
+    }
+
     // Mark the node as draining — scheduler will exclude it from new assignments
     app_state
         .node_service
@@ -2648,113 +3016,222 @@ async fn admin_drain_node(
     let mut retired_count = 0usize;
     let mut redeployed_count = 0usize;
     let mut redeployed_environments = HashSet::new();
+    let mut failed_redeploys = BoundedReport::default();
 
-    for dep in &affected {
-        if dep.is_current && dep.needs_redeploy() {
-            if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
-                info!(
-                    node_id,
-                    project_id = dep.project_id,
-                    environment_id = dep.environment_id,
-                    deployment_id = dep.deployment_id,
-                    "Drain: redeploy already queued for environment in this drain pass"
-                );
-                continue;
+    for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
+        // Planned again for this batch: the redeploys use these plans, and
+        // holding every plan from the check above would grow with the node.
+        // The node is already draining, so a failure here must not return
+        // early: this batch's moves are reported as failed below, which sets
+        // an active node back to active and says what already happened.
+        let mut planning_error = None;
+        let mut sources = match app_state
+            .deployment_service
+            .plan_drain_redeploys(batch)
+            .await
+        {
+            Ok(sources) => sources,
+            Err(e) => {
+                error!(node_id, "Drain: could not plan a batch of redeploys: {}", e);
+                planning_error = Some(e.to_string());
+                HashMap::new()
             }
-
-            // All replicas are on this node — must redeploy to maintain availability
-            match app_state
-                .deployment_service
-                .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
-                .await
-            {
-                Ok(_) => {
-                    redeployed_count += 1;
+        };
+        for dep in batch {
+            if dep.is_current && dep.needs_redeploy() {
+                if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
                     info!(
                         node_id,
                         project_id = dep.project_id,
                         environment_id = dep.environment_id,
                         deployment_id = dep.deployment_id,
-                        "Drain: triggered full redeploy (no healthy replicas on other nodes)"
+                        "Drain: redeploy already queued for environment in this drain pass"
                     );
+                    continue;
                 }
-                Err(e) => {
-                    redeployed_environments.remove(&(dep.project_id, dep.environment_id));
-                    error!(
-                        node_id,
-                        project_id = dep.project_id,
-                        environment_id = dep.environment_id,
-                        deployment_id = dep.deployment_id,
-                        "Drain: failed to trigger redeploy: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            // Historical deployments are never redeployed. Current deployments
-            // reach this branch only when another node still has a healthy
-            // replica. In both cases, stop and retire this node's containers.
-            // First, stop containers on the agent (best-effort)
-            let containers = app_state
-                .node_service
-                .list_containers_for_node_deployment(node_id, dep.deployment_id)
-                .await
-                .unwrap_or_default();
 
-            if let Some(remote_deployer) = create_remote_deployer(
-                &node,
-                &app_state.config_service,
-                &app_state.encryption_service,
-            )
-            .await
-            {
-                for container in &containers {
-                    if let Err(e) = remote_deployer
-                        .stop_container(&container.container_id)
-                        .await
-                    {
-                        warn!(
+                // All replicas are on this node — must redeploy to maintain availability
+                let source = match sources.remove(&dep.deployment_id) {
+                    Some(Ok(source)) => source,
+                    // Changed since the check above (e.g. its archive was
+                    // deleted in between).
+                    Some(Err(e)) => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        failed_redeploys.push(e.to_string());
+                        continue;
+                    }
+                    None => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        failed_redeploys.push(match &planning_error {
+                            Some(reason) => format!(
+                                "deployment {} of project {} could not be planned: {reason}",
+                                dep.deployment_id, dep.project_id
+                            ),
+                            None => format!(
+                                "deployment {} of project {} was not planned",
+                                dep.deployment_id, dep.project_id
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                match app_state
+                    .deployment_service
+                    .redeploy_environment_from(
+                        dep.project_id,
+                        dep.environment_id,
+                        dep.deployment_id,
+                        source,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        redeployed_count += 1;
+                        info!(
                             node_id,
-                            container_id = %container.container_id,
-                            "Drain: failed to stop container on agent (will still retire): {}", e
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
+                            "Drain: triggered full redeploy (no healthy replicas on other nodes)"
                         );
                     }
+                    Err(e) => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        error!(
+                            node_id,
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
+                            "Drain: failed to trigger redeploy: {}",
+                            e
+                        );
+                        failed_redeploys.push(e.to_string());
+                    }
                 }
-            }
+            } else {
+                // Historical deployments (including failed ones whose container
+                // still exists) are never redeployed. Current deployments reach
+                // this branch only when another node still has a healthy replica.
+                // In both cases, remove and retire this node's containers. Only a
+                // removal the agent confirmed is recorded as `removed`; anything
+                // else stays `retired` so cleanup still knows it may exist on
+                // this node.
+                let containers = app_state
+                    .node_service
+                    .list_containers_for_node_deployment(node_id, dep.deployment_id)
+                    .await
+                    .unwrap_or_default();
 
-            // Then soft-delete in DB so the proxy stops routing to them
-            match app_state
-                .node_service
-                .retire_containers_on_node(node_id, dep.deployment_id)
+                let mut confirmed_removed = HashSet::new();
+                if let Some(remote_deployer) = create_remote_deployer(
+                    &node,
+                    &app_state.config_service,
+                    &app_state.encryption_service,
+                )
                 .await
-            {
-                Ok(count) => {
-                    retired_count += count;
-                    info!(
-                        node_id,
-                        deployment_id = dep.deployment_id,
-                        project_id = dep.project_id,
-                        environment_id = dep.environment_id,
-                        is_current = dep.is_current,
-                        retired = count,
-                        remaining = dep
-                            .total_active_containers
-                            .saturating_sub(dep.containers_on_node),
-                        "Drain: retired containers without starting another deployment"
-                    );
+                {
+                    for container in &containers {
+                        match remove_owned_container(
+                            remote_deployer.as_ref(),
+                            &container.container_id,
+                            dep.project_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                confirmed_removed.insert(container.container_id.clone());
+                            }
+                            Err(error) => warn!(
+                                node_id,
+                                container_id = %container.container_id,
+                                "Drain: could not remove container on agent (retiring it; cleanup will retry): {}",
+                                error
+                            ),
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!(
+
+                // Then soft-delete in DB so the proxy stops routing to them
+                match app_state
+                    .node_service
+                    .retire_containers_on_node(
                         node_id,
-                        deployment_id = dep.deployment_id,
-                        "Drain: failed to retire containers: {}",
-                        e
-                    );
+                        dep.deployment_id,
+                        &confirmed_removed,
+                        crate::services::node_service::RetireReason::Drain,
+                    )
+                    .await
+                {
+                    Ok(count) => {
+                        retired_count += count;
+                        info!(
+                            node_id,
+                            deployment_id = dep.deployment_id,
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            is_current = dep.is_current,
+                            retired = count,
+                            remaining = dep
+                                .total_active_containers
+                                .saturating_sub(dep.containers_on_node),
+                            "Drain: retired containers without starting another deployment"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            node_id,
+                            deployment_id = dep.deployment_id,
+                            "Drain: failed to retire containers: {}",
+                            e
+                        );
+                    }
                 }
             }
         }
     }
 
+    let audit_drain = |outcome: &str| NodeDrainAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        node_id,
+        node_name: node.name.clone(),
+        outcome: outcome.to_string(),
+        redeployed_environments: redeployed_count,
+        retired_containers: retired_count,
+        failed_redeploys: failed_redeploys.count(),
+    };
+    if !failed_redeploys.is_empty() {
+        record_audit(&app_state, &audit_drain("incomplete"), node_id).await;
+        // The pre-check passed, so this is a transient failure (queue,
+        // database). Put an active node back so the drain can simply be
+        // retried; leaving it "draining" would strand the workloads that never
+        // moved. Any other prior status (e.g. offline) is not restored to
+        // "active" here — the operator undrains it explicitly.
+        let reactivated = node.status == "active"
+            && match app_state.node_service.mark_active(node_id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    error!(
+                        node_id,
+                        "Drain: failed to reactivate node after a failed redeploy: {}", e
+                    );
+                    false
+                }
+            };
+        return Err(drain_incomplete_problem(
+            node_id,
+            &node.name,
+            &failed_redeploys,
+            retired_count,
+            redeployed_count,
+            reactivated,
+        ));
+    }
+
+    record_audit(&app_state, &audit_drain("draining"), node_id).await;
     info!(
         node_id,
         node_name = %node.name,
@@ -2825,21 +3302,30 @@ async fn admin_undrain_node(
     }))
 }
 
-/// Remove a node from the cluster entirely. The node should be drained first
-/// to ensure containers have been rescheduled. If the node still has active
-/// containers, it will be drained automatically before removal.
+/// Remove a node from the cluster entirely. The node must be drained first so
+/// its current containers have been rescheduled. Containers no deployment needs
+/// that may still exist on the node (a failed deployment's, ones retired while
+/// it was offline, or ones a redeploy replaced while it was unreachable) are
+/// removed first; if any cannot be, the removal is refused unless `force=true`,
+/// which records them as orphaned.
+///
+/// The node's ID is taken out of every environment's (and project default's)
+/// target nodes, and the response lists them in `placements_updated`. When the
+/// node is the only target of a placement the removal is refused with `409`
+/// naming those environments, since emptying it would let them run anywhere.
 #[utoipa::path(
     tag = "Nodes",
     delete,
     path = "/internal/nodes/{node_id}",
     params(
-        ("node_id" = i32, Path, description = "Node ID")
+        ("node_id" = i32, Path, description = "Node ID"),
+        RemoveNodeQuery
     ),
     responses(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers"),
+        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2847,44 +3333,182 @@ async fn admin_undrain_node(
 async fn admin_remove_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
+    Query(query): Query<RemoveNodeQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::RemoveNode { node_id },
+    )
+    .await?;
     let node = app_state
         .node_service
         .get_by_id(node_id)
         .await
         .map_err(Problem::from)?;
 
-    // Check if node still has active containers
-    let containers = app_state
+    // Containers no deployment needs may still exist on the node: a failed
+    // deployment's container, one retired while the node was offline, or one
+    // superseded by a redeploy whose teardown could not reach the node.
+    // Remove the ones Temps owns while the node is still reachable; after the
+    // node row is gone nothing could address them. Containers a deployment
+    // still uses refuse the removal: moving them is the drain's job.
+    let remote_deployer = create_remote_deployer(
+        &node,
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await;
+    let audit_removal =
+        |outcome: &str, confirmed_gone: usize, unconfirmed: usize| NodeRemovalAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            node_id,
+            node_name: node.name.clone(),
+            force: query.force,
+            outcome: outcome.to_string(),
+            containers_confirmed_gone: confirmed_gone,
+            containers_unconfirmed: unconfirmed,
+            placements_updated: Vec::new(),
+        };
+    // Refused before anything is removed from the host: a placement that
+    // names only this node would be left with none. `remove` checks again
+    // under the node's row lock.
+    let pinned_only_here = app_state
         .node_service
-        .list_containers_for_node(node_id)
+        .placements_pinned_only_to(node_id)
         .await
         .map_err(Problem::from)?;
+    if !pinned_only_here.is_empty() {
+        record_audit(
+            &app_state,
+            &audit_removal("refused_only_placement_target", 0, 0),
+            node_id,
+        )
+        .await;
+        return Err(Problem::from(NodeError::OnlyPlacementTarget {
+            node_id,
+            node_name: node.name.clone(),
+            placements: pinned_only_here,
+        }));
+    }
 
-    if !containers.is_empty() {
-        return Err(problemdetails::new(StatusCode::CONFLICT)
-            .with_title("Node Has Active Containers")
-            .with_detail(format!(
-                "Node '{}' still has {} active container(s). Drain the node first with POST /internal/nodes/{}/drain",
-                node.name, containers.len(), node_id
-            )));
+    let leftovers = match app_state
+        .node_service
+        .remove_leftover_containers(&node, remote_deployer.as_deref())
+        .await
+    {
+        Ok(leftovers) => leftovers,
+        Err(error) => {
+            // A cleanup that stopped partway may already have removed
+            // containers from the host; a refusal before it started records
+            // zero of each.
+            let (outcome, confirmed_gone, unconfirmed) = match &error {
+                NodeError::LeftoverCleanupInterrupted {
+                    confirmed_gone,
+                    unremoved_count,
+                    ..
+                } => ("cleanup_interrupted", *confirmed_gone, *unremoved_count),
+                NodeError::StillServing { .. } => ("refused_still_serving", 0, 0),
+                _ => ("cleanup_failed", 0, 0),
+            };
+            record_audit(
+                &app_state,
+                &audit_removal(outcome, confirmed_gone, unconfirmed),
+                node_id,
+            )
+            .await;
+            return Err(Problem::from(error));
+        }
+    };
+    let unremoved_count = leftovers.unremoved_count;
+    let confirmed_gone = leftovers.confirmed_gone;
+    let unremoved = leftovers.unremoved_report();
+    if unremoved_count > 0 && !query.force {
+        // Containers may already have been removed from the host above.
+        record_audit(
+            &app_state,
+            &audit_removal(
+                "refused_unconfirmed_containers",
+                confirmed_gone,
+                unremoved_count,
+            ),
+            node_id,
+        )
+        .await;
+        return Err(node_holds_containers_problem(
+            node_id,
+            &node.name,
+            unremoved_count,
+            &unremoved,
+        ));
     }
 
     let node_name = node.name.clone();
 
-    app_state
-        .node_service
-        .remove(node_id)
-        .await
-        .map_err(Problem::from)?;
+    let removal = match app_state.node_service.remove(node_id).await {
+        Ok(removal) => removal,
+        Err(error) => {
+            let outcome = match &error {
+                NodeError::OnlyPlacementTarget { .. } => "refused_only_placement_target",
+                _ => "failed",
+            };
+            record_audit(
+                &app_state,
+                &audit_removal(outcome, confirmed_gone, unremoved_count),
+                node_id,
+            )
+            .await;
+            return Err(Problem::from(error));
+        }
+    };
+    let placement_notes: Vec<String> = removal
+        .placements_updated
+        .iter()
+        .map(|placement| format!("{placement} now targets {:?}", placement.target_nodes))
+        .collect();
+    let mut removed_audit = audit_removal("removed", confirmed_gone, unremoved_count);
+    removed_audit.placements_updated = placement_notes.clone();
+    record_audit(&app_state, &removed_audit, node_id).await;
 
-    info!(node_id, node_name = %node_name, "Node removed from cluster");
+    info!(
+        node_id,
+        node_name = %node_name,
+        orphaned_containers = unremoved_count,
+        "Node removed from cluster"
+    );
 
+    let mut message = if unremoved_count == 0 {
+        format!("Node '{}' removed from cluster", node_name)
+    } else {
+        format!(
+            "Node '{}' removed from cluster. {} container(s) could not be removed and were \
+             recorded as orphaned on it; if the host still exists, remove them there with \
+             `docker rm -f`: {}",
+            node_name,
+            unremoved_count,
+            unremoved.join("; ")
+        )
+    };
+    if !placement_notes.is_empty() {
+        message.push_str(&format!(
+            ". Its ID was removed from the target nodes of {} placement(s): {}. A machine \
+             that rejoins gets a new node ID; add it to these placements if they should use it",
+            placement_notes.len(),
+            placement_notes.join("; ")
+        ));
+    }
     Ok(Json(RemoveNodeResponse {
         id: node_id,
-        message: format!("Node '{}' removed from cluster", node_name),
+        message,
+        orphaned_containers: unremoved,
+        placements_updated: removal.placements_updated,
     }))
 }
 
@@ -2933,35 +3557,67 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
-    let remaining = containers.len();
-    let is_draining = node.status == "draining";
-    let is_drained = node.status == "drained";
-    let drain_complete = is_drained || (is_draining && remaining == 0);
-    let can_remove = drain_complete || (node.status == "offline" && remaining == 0);
+    let remaining_sandboxes = app_state
+        .node_service
+        .live_sandbox_count(node_id)
+        .await
+        .map_err(Problem::from)?;
 
-    let message = if is_drained || (is_draining && remaining == 0) {
+    Ok(Json(drain_status(
+        node_id,
+        node.name,
+        node.status,
+        containers.len(),
+        remaining_sandboxes,
+    )))
+}
+
+/// Drain progress of a node from what is still on it. Draining moves
+/// containers, never sandboxes (ADR-048): a node still hosting sandboxes
+/// cannot be removed, and the message says how to clear them.
+fn drain_status(
+    node_id: i32,
+    node_name: String,
+    status: String,
+    remaining_containers: usize,
+    remaining_sandboxes: u64,
+) -> DrainStatusResponse {
+    let is_draining = status == "draining";
+    let is_drained = status == "drained";
+    let drain_complete = is_drained || (is_draining && remaining_containers == 0);
+    let can_remove = remaining_sandboxes == 0
+        && (drain_complete || (status == "offline" && remaining_containers == 0));
+
+    let message = if remaining_sandboxes > 0 && (drain_complete || status == "offline") {
         format!(
-            "Drain complete. Node '{}' has no remaining containers and can be safely removed.",
-            node.name
+            "Node '{node_name}' still hosts {remaining_sandboxes} sandbox(es). Draining does \
+             not move sandboxes: destroy them from the node's Sandboxes tab or with \
+             `bunx @temps-sdk/cli sandbox nodes evict {node_name}`, then remove the node."
+        )
+    } else if drain_complete {
+        format!(
+            "Drain complete. Node '{node_name}' has no remaining containers and can be safely \
+             removed."
         )
     } else if is_draining {
         format!(
-            "Draining: {} container(s) still on node '{}'. Workloads are being migrated.",
-            remaining, node.name
+            "Draining: {remaining_containers} container(s) still on node '{node_name}'. \
+             Workloads are being migrated."
         )
     } else {
-        format!("Node '{}' is {} (not draining)", node.name, node.status)
+        format!("Node '{node_name}' is {status} (not draining)")
     };
 
-    Ok(Json(DrainStatusResponse {
+    DrainStatusResponse {
         node_id,
-        node_name: node.name,
-        status: node.status,
-        remaining_containers: remaining,
+        node_name,
+        status,
+        remaining_containers,
+        remaining_sandboxes,
         drain_complete,
         can_remove,
         message,
-    }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3213,9 +3869,36 @@ async fn proxy_edge_analytics_timeseries(
     Ok(Json(results))
 }
 
+/// Problem type of the `409` refusing to remove a node that still hosts
+/// sandboxes (ADR-048).
+pub const NODE_HOSTS_SANDBOXES_PROBLEM_TYPE: &str = "https://temps.sh/probs/node-hosts-sandboxes";
+
+/// Detail for [`NodeError::HasLiveSandboxes`], with copy-pasteable commands
+/// for the node in question.
+fn node_hosts_sandboxes_detail(error: &NodeError, node_name: &str) -> String {
+    format!(
+        "{error}. See them on the node's Sandboxes tab or with \
+         `bunx @temps-sdk/cli sandbox nodes show {node_name}`; destroy them all with \
+         `bunx @temps-sdk/cli sandbox nodes evict {node_name}`."
+    )
+}
+
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
+            NodeError::OnlyPlacementTarget {
+                node_id,
+                ref node_name,
+                ref placements,
+            } => {
+                let placements = serde_json::to_value(placements).unwrap_or_default();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Node Is The Only Target Of A Placement")
+                    .with_detail(error.to_string())
+                    .with_value("node_id", node_id)
+                    .with_value("node_name", node_name.clone())
+                    .with_value("placements", placements)
+            }
             NodeError::NotFound { ref name } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Node Not Found")
                 .with_detail(format!("Node '{}' not found", name)),
@@ -3225,6 +3908,40 @@ impl From<NodeError> for Problem {
             NodeError::AlreadyExists { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Already Exists")
                 .with_detail(format!("Node '{}' already exists", name)),
+            NodeError::HasLiveSandboxes {
+                node_id,
+                ref node_name,
+                count,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(NODE_HOSTS_SANDBOXES_PROBLEM_TYPE)
+                .with_title("Node Hosts Sandboxes")
+                .with_detail(node_hosts_sandboxes_detail(&error, node_name))
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("live_sandboxes", count),
+            NodeError::LeftoverCleanupInterrupted {
+                node_id,
+                ref node_name,
+                confirmed_gone,
+                unremoved_count,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Node Container Cleanup Interrupted")
+                .with_detail(error.to_string())
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("containers_confirmed_gone", confirmed_gone)
+                .with_value("containers_unconfirmed", unremoved_count),
+            NodeError::StillServing {
+                node_id,
+                ref node_name,
+                count,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Has Active Containers")
+                .with_detail(error.to_string())
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("serving_containers", count),
             NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Identity Conflict")
                 .with_detail(format!(
@@ -3264,12 +3981,31 @@ impl From<NodeError> for Problem {
                     .with_title("Placement Constraints Unsatisfied")
                     .with_detail(error.to_string())
             }
+            NodeError::DedicatedNodesNotPinned { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Only Dedicated Nodes Available")
+                .with_detail(error.to_string()),
             // Reuses the platform's existing worker-node problem rather than
             // inventing a second "nowhere to put this" shape: the remedy is
             // the same page, and the console already renders this error code
             // as an actionable onboarding state.
             NodeError::DockerSocketNotSchedulable { .. } => {
                 temps_core::worker_node_required_problem(error.to_string())
+            }
+            NodeError::ControlPlaneIdentity { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Control Plane Identity")
+                .with_detail(error.to_string()),
+            NodeError::MeshIdentityReserved { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Mesh Address Reserved")
+                .with_detail(error.to_string()),
+            NodeError::PairingSourceRefused { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Pairing Token Outside The Mesh")
+                .with_detail(error.to_string()),
+            NodeError::Pairing { ref source, .. } => pairing_problem(source),
+            NodeError::MeshSettings { ref source, .. } => {
+                error!("Failed to read mesh settings in node operation: {}", source);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
             }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
@@ -3337,6 +4073,318 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    // ── Removing containers a node removal would lose track of ──────────
+
+    mod container_removal {
+        use super::super::node_holds_containers_problem;
+        use crate::services::node_service::{
+            describe_unremoved_container, remove_owned_container, ContainerRemovalError,
+        };
+        use axum::http::StatusCode;
+        use mockall::mock;
+        use std::collections::HashMap;
+
+        mock! {
+            Deployer {}
+            #[async_trait::async_trait]
+            impl temps_deployer::ContainerDeployer for Deployer {
+                async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
+                async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn pause_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn resume_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn remove_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn get_container_info(&self, container_id: &str) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError>;
+                async fn get_container_stats(&self, container_id: &str) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError>;
+                async fn list_containers(&self) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError>;
+                async fn get_container_logs(&self, container_id: &str) -> Result<String, temps_deployer::DeployerError>;
+                async fn stream_container_logs(&self, container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, temps_deployer::DeployerError>;
+                async fn image_exists(&self, image_name: &str) -> Result<bool, temps_deployer::DeployerError>;
+            }
+        }
+
+        fn labelled(project_id: &str) -> temps_deployer::ContainerInfo {
+            temps_deployer::ContainerInfo {
+                labels: HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                ]),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn an_owned_container_is_removed() {
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|_| Ok(labelled("7")));
+            deployer
+                .expect_remove_container()
+                .withf(|id| id == "failed-app")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            assert!(remove_owned_container(&deployer, "failed-app", 7)
+                .await
+                .is_ok());
+        }
+
+        #[tokio::test]
+        async fn a_container_already_gone_counts_as_removed() {
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning(|id| {
+                Err(temps_deployer::DeployerError::ContainerNotFound(
+                    id.to_string(),
+                ))
+            });
+            deployer.expect_remove_container().never();
+
+            assert!(remove_owned_container(&deployer, "gone", 7).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn a_container_of_another_project_is_left_in_place() {
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|_| Ok(labelled("8")));
+            deployer.expect_remove_container().never();
+
+            let error = remove_owned_container(&deployer, "reused-id", 7)
+                .await
+                .expect_err("ownership mismatch must refuse");
+            assert!(
+                matches!(
+                    &error,
+                    ContainerRemovalError::NotOwned { container_id, project_id: 7 }
+                        if container_id == "reused-id"
+                ),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("project 7"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_agent_is_reported_not_assumed() {
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning(|_| {
+                Err(temps_deployer::DeployerError::NetworkError(
+                    "connection refused".to_string(),
+                ))
+            });
+            deployer.expect_remove_container().never();
+
+            let error = remove_owned_container(&deployer, "stranded", 7)
+                .await
+                .expect_err("an unreachable agent confirms nothing");
+            assert!(
+                matches!(&error, ContainerRemovalError::Inspect { container_id, .. } if container_id == "stranded"),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("connection refused"), "{error}");
+        }
+
+        #[test]
+        fn refusing_removal_names_each_container_and_both_remedies() {
+            let container = temps_entities::deployment_containers::Model {
+                id: 1,
+                deployment_id: 42,
+                container_id: "abc123".to_string(),
+                container_name: "app-42".to_string(),
+                container_port: 3000,
+                host_port: None,
+                image_name: None,
+                status: Some("retired".to_string()),
+                service_name: None,
+                created_at: chrono::Utc::now(),
+                deployed_at: chrono::Utc::now(),
+                ready_at: None,
+                deleted_at: Some(chrono::Utc::now()),
+                node_id: Some(5),
+                exit_code: None,
+                exit_reason: None,
+                oom_killed: None,
+                error_message: None,
+                finished_at: None,
+                started_at: None,
+                cpu_limit_cores: None,
+                port_bindings: None,
+            };
+            let line =
+                describe_unremoved_container(&container, 9, "the node's agent cannot be reached");
+            assert!(line.contains("'app-42' (abc123)"), "{line}");
+            assert!(line.contains("deployment 42 in project 9"), "{line}");
+            assert!(line.contains("status retired"), "{line}");
+
+            let problem =
+                node_holds_containers_problem(5, "worker-b", 1, std::slice::from_ref(&line));
+            assert_eq!(problem.status_code, StatusCode::CONFLICT);
+            let body = serde_json::to_string(&problem.body).unwrap();
+            assert!(body.contains("was not removed"), "{body}");
+            assert!(body.contains("temps agent"), "{body}");
+            assert!(body.contains("force=true"), "{body}");
+            assert_eq!(
+                problem.body.get("unremoved_containers"),
+                Some(&serde_json::json!([line]))
+            );
+        }
+    }
+
+    // ── Drain refusals for workloads that cannot move ───────────────────
+
+    #[test]
+    fn a_drain_with_an_unmovable_workload_is_refused_with_its_details() {
+        let reason = "Invalid deployment state: Deployment 12 of project 3, environment 4 was \
+                      built from uploaded source 'source-bundles/a.zip', which is no longer \
+                      retained on this server. Upload the source again so it is built on an \
+                      eligible node";
+        let mut unmovable = BoundedReport::default();
+        unmovable.push(reason.to_string());
+        let problem = drain_refused_problem("worker-a", &unmovable);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("was not drained and is unchanged"), "{body}");
+        assert!(
+            body.contains("Deployment 12 of project 3, environment 4"),
+            "{body}"
+        );
+        // The reason and the advice are separate sentences.
+        assert!(body.contains("eligible node. Move or delete"), "{body}");
+        assert!(body.contains("drain again"), "{body}");
+        assert_eq!(
+            problem.body.get("unmovable_workloads"),
+            Some(&serde_json::json!([reason]))
+        );
+    }
+
+    /// However many workloads cannot move, the refusal counts them all but
+    /// describes a bounded number.
+    #[test]
+    fn a_drain_refusal_stays_bounded() {
+        let mut unmovable = BoundedReport::default();
+        for id in 0..MAX_DESCRIBED_UNREMOVED + 25 {
+            unmovable.push(format!("Deployment {id} cannot be rebuilt"));
+        }
+        let problem = drain_refused_problem("worker-a", &unmovable);
+        assert_eq!(
+            problem.body.get("unmovable_count"),
+            Some(&serde_json::json!(MAX_DESCRIBED_UNREMOVED + 25))
+        );
+        let listed = problem
+            .body
+            .get("unmovable_workloads")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(listed.len(), MAX_DESCRIBED_UNREMOVED + 1);
+        assert_eq!(
+            listed.last(),
+            Some(&serde_json::json!("and 25 more not listed here"))
+        );
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(
+            body.contains(&format!("{} workload(s)", MAX_DESCRIBED_UNREMOVED + 25)),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_drain_says_what_happened_and_how_to_retry() {
+        let mut failed = BoundedReport::default();
+        failed.push("Queue error: queue closed".to_string());
+        let reactivated = drain_incomplete_problem(7, "worker-a", &failed, 2, 1, true);
+        assert_eq!(reactivated.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&reactivated.body).unwrap();
+        assert!(body.contains("1 redeploy(s) could not be queued"), "{body}");
+        assert!(
+            body.contains("1 environment(s) were redeployed and 2 container(s) retired"),
+            "{body}"
+        );
+        assert!(body.contains("set back to active"), "{body}");
+        assert!(!body.contains("Node drain initiated"), "{body}");
+
+        let still_draining = drain_incomplete_problem(7, "worker-a", &failed, 0, 0, false);
+        let body = serde_json::to_string(&still_draining.body).unwrap();
+        assert!(body.contains("remains draining"), "{body}");
+        // The undrain path names this node, not a placeholder.
+        assert!(body.contains("DELETE /internal/nodes/7/drain"), "{body}");
+        assert!(!body.contains("{node_id}"), "{body}");
+    }
+
+    // ── Drain status and node removal with sandboxes (ADR-048) ──────────
+
+    #[test]
+    fn a_drained_node_with_sandboxes_cannot_be_removed() {
+        let status = drain_status(4, "worker-4".into(), "drained".into(), 0, 2);
+        assert!(status.drain_complete);
+        assert!(!status.can_remove);
+        assert_eq!(status.remaining_sandboxes, 2);
+        assert!(
+            status
+                .message
+                .contains("`bunx @temps-sdk/cli sandbox nodes evict worker-4`"),
+            "{}",
+            status.message
+        );
+    }
+
+    #[test]
+    fn an_offline_node_with_sandboxes_cannot_be_removed() {
+        let status = drain_status(4, "worker-4".into(), "offline".into(), 0, 1);
+        assert!(!status.can_remove);
+        assert!(status.message.contains("still hosts 1 sandbox(es)"));
+    }
+
+    #[test]
+    fn an_empty_drained_or_offline_node_can_be_removed() {
+        for node_status in ["drained", "offline"] {
+            let status = drain_status(4, "worker-4".into(), node_status.into(), 0, 0);
+            assert!(status.can_remove, "{node_status}");
+        }
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 0, 0);
+        assert!(draining.drain_complete && draining.can_remove);
+    }
+
+    #[test]
+    fn a_node_still_draining_or_active_cannot_be_removed() {
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 3, 0);
+        assert!(!draining.drain_complete && !draining.can_remove);
+        assert!(draining.message.contains("3 container(s)"));
+        let active = drain_status(4, "worker-4".into(), "active".into(), 0, 0);
+        assert!(!active.can_remove);
+        assert!(active.message.contains("not draining"));
+    }
+
+    #[tokio::test]
+    async fn removing_a_node_with_sandboxes_is_a_typed_conflict_naming_the_node() {
+        let problem = Problem::from(NodeError::HasLiveSandboxes {
+            node_id: 4,
+            node_name: "worker-4".into(),
+            count: 2,
+        });
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["type"], NODE_HOSTS_SANDBOXES_PROBLEM_TYPE);
+        assert_eq!(body["node_id"], 4);
+        assert_eq!(body["node_name"], "worker-4");
+        assert_eq!(body["live_sandboxes"], 2);
+        let detail = body["detail"].as_str().expect("detail");
+        assert!(
+            detail.contains("`bunx @temps-sdk/cli sandbox nodes evict worker-4`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`bunx @temps-sdk/cli sandbox nodes show worker-4`"),
+            "{detail}"
+        );
+        assert!(!detail.contains("<node>"), "{detail}");
+    }
 
     // ── Capability: who can act on the advertised remedy ────────────────
 
@@ -3433,6 +4481,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
@@ -3461,6 +4512,31 @@ mod tests {
         settings: temps_core::AppSettings,
     ) -> axum::Router {
         let db = Arc::new(db);
+        let config_service = config_service_with(settings);
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        // The enrollment-token service gets its OWN mock DB that returns no
+        // matching token (-> InvalidToken), so the register tests exercise the
+        // legacy-shared-token fallback path while the main `db` keeps its own
+        // node-flow query sequence intact.
+        let test_db_for_enrollment = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    Vec::<temps_entities::node_enrollment_tokens::Model>::new(),
+                ])
+                .into_connection(),
+        );
+        make_app_with_enrollment(
+            db,
+            config_service,
+            encryption_service,
+            test_db_for_enrollment,
+        )
+    }
+
+    /// A `ConfigService` whose settings are `settings`.
+    fn config_service_with(settings: temps_core::AppSettings) -> Arc<temps_config::ConfigService> {
         // Create a separate mock DB for ConfigService that returns settings
         let settings_json = settings.to_json();
         let config_db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -3477,6 +4553,7 @@ mod tests {
             tls_address: None,
             console_address: "127.0.0.1:0".to_string(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,
@@ -3496,25 +4573,21 @@ mod tests {
             clickhouse_password: None,
             docker_extra_networks: Vec::new(),
         });
-        let config_service = Arc::new(temps_config::ConfigService::new(
+        Arc::new(temps_config::ConfigService::new(
             server_config,
             Arc::new(config_db),
-        ));
+        ))
+    }
+
+    /// [`make_app_with_settings`] with the enrollment-token service on
+    /// `enrollment_db`, for tests that register with an enrollment token.
+    fn make_app_with_enrollment(
+        db: Arc<sea_orm::DatabaseConnection>,
+        config_service: Arc<temps_config::ConfigService>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        test_db_for_enrollment: Arc<sea_orm::DatabaseConnection>,
+    ) -> axum::Router {
         let node_service = Arc::new(NodeService::new(db.clone()));
-        let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
-        );
-        // The enrollment-token service gets its OWN mock DB that returns no
-        // matching token (-> InvalidToken), so the register tests exercise the
-        // legacy-shared-token fallback path while the main `db` keeps its own
-        // node-flow query sequence intact.
-        let test_db_for_enrollment = Arc::new(
-            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                .append_query_results(vec![
-                    Vec::<temps_entities::node_enrollment_tokens::Model>::new(),
-                ])
-                .into_connection(),
-        );
         let app_state = Arc::new(NodeAppState {
             node_service,
             db,
@@ -3763,10 +4836,364 @@ mod tests {
         assert!(rl.check(ip2).is_ok());
     }
 
+    /// A registration request body for `name` at `private_address`.
+    fn register_body(name: &str, private_address: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": format!("https://{private_address}:3100"),
+            "private_address": private_address,
+        })
+    }
+
+    async fn post_register(app: Router, body: &serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/nodes/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_external_host_as_name() {
+        // A worker named after the control plane's host would get a cluster-CA
+        // leaf valid for it. Refused before any database work.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.external_url = Some("https://Temps.Example.com/".to_string());
+        let app = make_app_with_settings(db, settings);
+
+        let response = post_register(app, &register_body("temps.example.com", "10.100.0.2")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "Control Plane Identity");
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'temps.example.com' is the control plane's host"));
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_mesh_address() {
+        // Mesh-paired nodes verify the control plane at its mesh address
+        // against the cluster CA, so no worker may hold that address as a SAN.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true),
+            ]])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let response = post_register(app, &register_body("worker-9", "10.201.0.1")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'10.201.0.1' is the control plane's mesh address"));
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_an_address_in_the_mesh_pool_while_the_mesh_is_off() {
+        // The pool is reserved before the mesh exists: a leaf signed now for
+        // 10.201.x.x would still be valid once those addresses are assigned.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let response = post_register(app, &register_body("worker-9", "10.201.7.7")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "Mesh Address Reserved");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("'10.201.7.7'"), "{detail}");
+        assert!(detail.contains("10.201.0.0/16"), "{detail}");
+    }
+
+    /// An enrollment token row for a pairing of the node `name`.
+    fn pairing_token(id: i32, name: &str) -> temps_entities::node_enrollment_tokens::Model {
+        let now = chrono::Utc::now();
+        temps_entities::node_enrollment_tokens::Model {
+            id,
+            token_hash: sha256_hash("pairing-join-token"),
+            max_uses: 1,
+            used_count: 0,
+            expires_at: now + chrono::Duration::minutes(30),
+            bound_node_name: Some(name.to_string()),
+            bound_labels: None,
+            created_by_user_id: None,
+            revoked_at: None,
+            ca_fingerprint: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A registration of `edge-1` redeeming a pairing's enrollment token,
+    /// arriving with `node_api_peer` (as the mesh listener sets it) or
+    /// without it (any other listener). Returns the response and the SQL the
+    /// enrollment-token service ran.
+    async fn register_with_pairing_token(
+        node_api_peer: Option<std::net::SocketAddr>,
+        node_name: &str,
+    ) -> (axum::response::Response, Vec<String>) {
+        let token_id = 41;
+        let now = chrono::Utc::now();
+        let pairing = temps_entities::node_pairings::Model {
+            id: 5,
+            pairing_id: "pairing-id".into(),
+            name: "edge-1".into(),
+            node_endpoint: "10.100.0.2:51820".into(),
+            mesh_address: "10.201.0.7".into(),
+            secret_encrypted: "secret".into(),
+            enrollment_token_id: token_id,
+            public_key: Some("a2V5LWZvci10aGUtcGFpcmVkLW5vZGUtMzItYnl0ZXM=".into()),
+            status: "key_received".into(),
+            last_error: None,
+            last_rejection: None,
+            last_attempt_at: None,
+            key_received_at: Some(now),
+            expires_at: now + chrono::Duration::minutes(30),
+            node_id: None,
+            created_by_user_id: None,
+            dialing_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![pairing]])
+            .into_connection();
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(token_id, "edge-1")]])
+                .into_connection(),
+        );
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let mut app = make_app_with_enrollment(
+            Arc::new(db),
+            config_service_with(settings_with_join_token()),
+            encryption_service,
+            enrollment_db.clone(),
+        );
+        if let Some(peer) = node_api_peer {
+            app = app.layer(axum::Extension(NodeApiPeer(peer)));
+        }
+        let mut body = register_body(node_name, "10.100.0.2");
+        body["join_token"] = serde_json::json!("pairing-join-token");
+        let response = post_register(app, &body).await;
+        let log = Arc::try_unwrap(enrollment_db)
+            .map(|db| {
+                db.into_transaction_log()
+                    .into_iter()
+                    .map(|transaction| format!("{transaction:?}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (response, log)
+    }
+
+    async fn problem_of(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_a_pairing_token_is_refused_on_the_public_api() {
+        // ADR 048: a leaked pairing code only pairs from the pairing's
+        // address. Its token reaching the public register endpoint, from
+        // anywhere, is refused before consumption, so the real node can still pair.
+        let (response, log) = register_with_pairing_token(None, "edge-1").await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "Pairing Token Outside The Mesh");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("pairing 'edge-1' (id 5)"), "{detail}");
+        assert!(detail.contains("outside the mesh node API"), "{detail}");
+        assert!(detail.contains("10.201.0.7"), "{detail}");
+        assert!(
+            log.iter().all(|sql| !sql.contains("UPDATE")),
+            "a refused source must never consume a token: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_name_from_a_leaked_pairing_code_does_not_consume_it() {
+        for peer in [None, Some("10.201.0.7:40100".parse().unwrap())] {
+            let (response, log) = register_with_pairing_token(peer, "wrong-name").await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!log.is_empty());
+            assert!(log.iter().all(|sql| !sql.contains("UPDATE")), "{log:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_pairing_token_is_refused_from_another_mesh_member() {
+        let peer: std::net::SocketAddr = "10.201.0.9:40100".parse().unwrap();
+        let (response, _) = register_with_pairing_token(Some(peer), "edge-1").await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let problem = problem_of(response).await;
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("from mesh address 10.201.0.9"), "{detail}");
+        assert!(detail.contains("(10.201.0.7)"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn certificate_reservation_failure_restores_enrollment_token() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let mut settings = settings_with_join_token();
+        settings.multi_node.cluster_ca_cert_pem = Some(ca.cert_pem);
+        settings.multi_node.cluster_ca_key_encrypted =
+            Some(encryption.encrypt(ca.key_pem.as_bytes()).unwrap());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
+                // A pool change has reserved the address before the certificate
+                // reservation obtains its lock. No certificate can leave the request.
+                .append_query_results(vec![vec![
+                    crate::handlers::wireguard_mesh::admin_test_support::network_config(
+                        false, false,
+                    ),
+                ]])
+                .into_connection(),
+        );
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1
+                    };
+                    2
+                ])
+                .into_connection(),
+        );
+        let app = make_app_with_enrollment(
+            db,
+            config_service_with(settings),
+            encryption,
+            enrollment_db.clone(),
+        );
+        let csr = temps_core::node_pki::generate_node_keypair_csr("edge-1", &["10.201.7.7".into()])
+            .unwrap();
+        let mut body = register_body("edge-1", "10.201.7.7");
+        body["join_token"] = serde_json::json!("pairing-join-token");
+        body["csr_pem"] = serde_json::json!(csr.csr_pem);
+        let response = post_register(app, &body).await;
+        assert!(!response.status().is_success());
+        let problem = problem_of(response).await;
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("reserved mesh pool"),
+            "{problem}"
+        );
+        let log = Arc::try_unwrap(enrollment_db)
+            .unwrap()
+            .into_transaction_log();
+        assert!(!log.is_empty());
+        assert!(
+            log.iter()
+                .any(|sql| format!("{sql:?}").contains("used_count = used_count - 1")),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_losing_token_claim_never_reserves_certificate_addresses() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let mut settings = settings_with_join_token();
+        settings.multi_node.cluster_ca_cert_pem = Some(ca.cert_pem);
+        settings.multi_node.cluster_ca_key_encrypted =
+            Some(encryption.encrypt(ca.key_pem.as_bytes()).unwrap());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
+                .into_connection(),
+        );
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let app = make_app_with_enrollment(
+            db.clone(),
+            config_service_with(settings),
+            encryption,
+            enrollment_db,
+        );
+        let csr = temps_core::node_pki::generate_node_keypair_csr("edge-1", &["10.100.0.2".into()])
+            .unwrap();
+        let mut body = register_body("edge-1", "10.100.0.2");
+        body["join_token"] = serde_json::json!("pairing-join-token");
+        body["csr_pem"] = serde_json::json!(csr.csr_pem);
+        let response = post_register(app, &body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem_of(response).await["title"],
+            "Enrollment Token Not Usable"
+        );
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "only the source check may reach the node DB: {log:?}"
+        );
+        assert!(!format!("{log:?}").contains("cluster_certificate_addresses"));
+    }
+
     #[tokio::test]
     async fn test_register_node_success() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Control-plane identity guard: the mesh is off, the addresses
+            // are outside its pool, and no member or pairing holds them
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
             // Check for duplicate name (returns empty)
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Identity guard: name/address not claimed by another node
@@ -4006,6 +5433,13 @@ mod tests {
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Control-plane identity guard: the mesh is off, the addresses
+            // are outside its pool, and no member or pairing holds them
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])

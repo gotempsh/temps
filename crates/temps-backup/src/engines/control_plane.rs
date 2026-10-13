@@ -8,8 +8,11 @@
 //!
 //! 1. Validate S3 source + bucket reachability.
 //! 2. Run `pg_dumpall --globals-only` + `pg_dump | gzip` as a one-shot Docker
-//!    container whose entrypoint is the backup command itself. The container
-//!    exits when the dump exits; `auto_remove=true` reaps it.
+//!    container (host networking) whose entrypoint is the backup command
+//!    itself. The dump stays in the sidecar's own filesystem and is streamed
+//!    out through the Docker archive API into an attempt-scoped host dir
+//!    under `<data_dir>/backups/tmp` (see `dump_capture`); the sidecar is
+//!    removed on every path.
 //! 3. Upload the resulting `.sql.gz` to S3 (single-part or multipart).
 //! 4. Write a `metadata.json` companion object.
 //!
@@ -25,11 +28,12 @@
 //!
 //! ## Retry semantics
 //!
-//! Each attempt allocates a fresh UUID for the dump file + S3 key, so
-//! partial artefacts from a failed attempt are orphaned harmlessly rather
-//! than racing the next attempt. No explicit cleanup hook is needed —
-//! `auto_remove` reaps containers, and the bounded attempt count caps the
-//! wasted disk/S3 cost.
+//! Every attempt gets a fresh [`DumpAttempt`]: its own sidecar container
+//! name, its own directory inside the sidecar and its own host directory.
+//! A container or file left behind by a failed (or crashed) attempt can
+//! therefore never block the next one, and an attempt deletes only what it
+//! created. The S3 key is per backup, so a retried upload replaces the
+//! object instead of adding a second one.
 
 use std::sync::Arc;
 
@@ -37,12 +41,21 @@ use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
 use tracing::{info, warn};
 
-use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
+use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
+use super::oneshot::OneShotSpec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "control_plane";
 const DUMP_FILE_SUFFIX: &str = "backup.sql.gz";
+/// Database name used in user-facing dump errors.
+const CONTROL_PLANE_TOOL: &str = "Control-plane PostgreSQL";
+/// Prefix of the attempt-scoped sidecar container name.
+const CONTAINER_NAME_PREFIX: &str = "temps-cp-backup";
+/// File names inside the sidecar's attempt directory.
+const SIDECAR_DUMP_SQL: &str = "backup.sql";
+const SIDECAR_DUMP_GZ: &str = "backup.sql.gz";
+const SIDECAR_STDERR: &str = "pg_dump.stderr";
 
 /// High-volume observability/analytics tables backed up schema-only.
 ///
@@ -138,17 +151,8 @@ impl BackupEngine for ControlPlaneEngine {
         );
 
         // ── Resolve DB connection params ─────────────────────────────────────
-        let database_url = deps.config_service.get_database_url();
-        let url = url::Url::parse(&database_url).map_err(|e| BackupError::PermanentFailure {
-            reason: format!("invalid DATABASE_URL: {}", e),
-        })?;
-        let host = url.host_str().unwrap_or("localhost").to_string();
-        let port = url.port().unwrap_or(5432);
-        let database = url.path().trim_start_matches('/').to_string();
-        let username = url.username().to_string();
-        let password = urlencoding::decode(url.password().unwrap_or(""))
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        let target =
+            ControlPlaneTarget::from_database_url(&deps.config_service.get_database_url())?;
 
         // Match the running server's major so pg_dumpall is version-compatible.
         let pg_tag = detect_postgres_version(&deps).await;
@@ -156,19 +160,19 @@ impl BackupEngine for ControlPlaneEngine {
         let image_tag = format!("postgres:{}", major);
         super::image_pull::ensure_image_pulled_v2(&image_tag, ENGINE_KEY).await?;
 
-        // ── Bind-mount + container command ───────────────────────────────────
+        // ── Attempt-scoped working dir + container command ───────────────────
+        //
+        // The sidecar writes into its own filesystem and the dump is streamed
+        // out through the Docker archive API (see `dump_capture`): no bind
+        // mount, so Docker in a VM or on another host works, and the
+        // container name and every path are scoped to this attempt, so a
+        // retry never collides with what a failed attempt left behind. The
+        // host copy still lives under `<data_dir>/backups/tmp`, which is
+        // sized for control-plane dumps, unlike a possibly small `/tmp`.
         let backup_dir = v2_common::ensure_backup_tmpdir(&deps.config_service).await?;
-        let dump_filename = format!("{}.sql.gz", backup_uuid);
-        let host_dump_path = backup_dir.join(&dump_filename);
-        let container_dump_path = format!("/backup/{}", dump_filename);
-        let uncompressed_in_container = container_dump_path
-            .strip_suffix(".gz")
-            .unwrap_or(&container_dump_path)
-            .to_string();
-
-        let stderr_filename = format!("{}.stderr", backup_uuid);
-        let stderr_path_in_container = format!("/backup/{}", stderr_filename);
-        let host_stderr_path = backup_dir.join(&stderr_filename);
+        let attempt =
+            DumpAttempt::new_in(&backup_dir, CONTROL_PLANE_TOOL, ENGINE_KEY, &backup_uuid)?;
+        let host_dump_path = attempt.host_path(SIDECAR_DUMP_GZ);
 
         let excluded = resolve_excluded_data(deps.db.as_ref()).await?;
         info!(
@@ -177,104 +181,35 @@ impl BackupEngine for ControlPlaneEngine {
             patterns = excluded.patterns.len(),
             "ControlPlaneEngine: dumping schema-only for high-volume tables",
         );
-        let exclude_flags = excluded
-            .patterns
-            .iter()
-            .map(|p| format!("--exclude-table-data={}", v2_common::shell_escape(p)))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Globals (roles) via pg_dumpall, then a single-database pg_dump with
-        // the heavy tables dumped schema-only. Both restore through the same
-        // `psql --dbname=<cp-db> --file=dump.sql` path as the old pg_dumpall
-        // format.
-        let pg_dump_cmd = format!(
-            "pg_dumpall --globals-only --clean --if-exists --no-password \
-             --host={host} --port={port} --username={user} --database={db} \
-             2>{stderr} > {out} \
-             && pg_dump --clean --if-exists --no-password \
-             --host={host} --port={port} --username={user} {excludes} --dbname={db} \
-             2>>{stderr} >> {out} && gzip {out}",
-            host = v2_common::shell_escape(&host),
-            port = v2_common::shell_escape(&port.to_string()),
-            user = v2_common::shell_escape(&username),
-            db = v2_common::shell_escape(&database),
-            excludes = exclude_flags,
-            stderr = stderr_path_in_container,
-            out = v2_common::shell_escape(&uncompressed_in_container),
-        );
+        let spec =
+            control_plane_dump_spec(&attempt, backup_id, &image_tag, &target, &excluded.patterns);
 
         let docker =
             bollard::Docker::connect_with_local_defaults().map_err(|e| BackupError::Failed {
                 reason: format!("failed to connect to Docker: {}", e),
             })?;
 
-        let spec = OneShotSpec {
-            image: image_tag,
-            name: format!("temps-cp-backup-{}", backup_uuid),
-            engine: ENGINE_KEY,
-            backup_id,
-            entrypoint: vec!["sh".to_string(), "-c".to_string()],
-            cmd: vec![pg_dump_cmd],
-            env: vec![format!("PGPASSWORD={}", password)],
-            binds: vec![format!("{}:/backup:rw", backup_dir.display())],
-            // `host` mode so the container can reach 127.0.0.1:5432 where the
-            // control-plane Postgres binds under `temps serve`.
-            network_mode: Some("host".to_string()),
-            user: Some("root".to_string()),
-            stderr_watch: None,
-        };
-
-        let result = match run_one_shot(&docker, spec, &ctx.cancel).await {
-            Ok(r) => r,
-            Err(OneShotError::Cancelled) => return Err(BackupError::Cancelled),
-            Err(e) => {
-                v2_common::best_effort_remove(&host_dump_path).await;
-                v2_common::best_effort_remove(&host_stderr_path).await;
-                return Err(BackupError::Failed {
-                    reason: format!("control-plane dump one-shot failed: {}", e),
-                });
-            }
-        };
-
-        if result.exit_code != 0 {
-            let file_stderr = tokio::fs::read(&host_stderr_path).await.unwrap_or_default();
-            v2_common::best_effort_remove(&host_stderr_path).await;
-            v2_common::best_effort_remove(&host_dump_path).await;
-            return Err(BackupError::Failed {
-                reason: format!(
-                    "control-plane dump exited with code {}. file-stderr: {}{}",
-                    result.exit_code,
-                    String::from_utf8_lossy(&file_stderr),
-                    if result.stderr_tail.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(". container-stderr: {}", result.stderr_tail.trim())
-                    },
-                ),
-            });
-        }
-
-        v2_common::best_effort_remove(&host_stderr_path).await;
-
-        let dump_meta =
-            tokio::fs::metadata(&host_dump_path)
-                .await
-                .map_err(|e| BackupError::Failed {
-                    reason: format!(
-                        "dump file not found at {} after dump exited 0: {}",
-                        host_dump_path.display(),
-                        e
-                    ),
-                })?;
-        if dump_meta.len() == 0 {
-            v2_common::best_effort_remove(&host_dump_path).await;
-            return Err(BackupError::Failed {
-                reason: "control-plane dump produced an empty file".into(),
-            });
-        }
-        let file_size = dump_meta.len() as i64;
-        let host_dump_path_str = host_dump_path.to_str().unwrap_or("").to_string();
+        let file_size = capture_dump(
+            &docker,
+            CaptureRequest {
+                tool: CONTROL_PLANE_TOOL,
+                spec,
+                container_path: attempt.container_path(SIDECAR_DUMP_GZ),
+                host_path: host_dump_path.clone(),
+                failure_log: Some((
+                    attempt.container_path(SIDECAR_STDERR),
+                    attempt.host_path(SIDECAR_STDERR),
+                )),
+            },
+            &ctx.cancel,
+        )
+        .await?;
+        let file_size = i64::try_from(file_size).map_err(|_| BackupError::Failed {
+            reason: format!(
+                "control-plane dump for backup {backup_id} is larger than i64::MAX bytes"
+            ),
+        })?;
+        let host_dump_path_str = host_dump_path.to_string_lossy().into_owned();
 
         info!(
             backup_id,
@@ -285,7 +220,6 @@ impl BackupEngine for ControlPlaneEngine {
 
         // ── Upload dump ──────────────────────────────────────────────────────
         if ctx.cancel.is_cancelled() {
-            v2_common::best_effort_remove(&host_dump_path).await;
             return Err(BackupError::Cancelled);
         }
         let tags = v2_common::BackupTags::load_for_backup(&ctx.db, ctx.backup_id).await;
@@ -299,8 +233,13 @@ impl BackupEngine for ControlPlaneEngine {
             Some(&tags),
             &ctx.cancel,
         )
-        .await?;
-        v2_common::best_effort_remove(&host_dump_path).await;
+        .await
+        .map_err(|error| {
+            DumpCaptureError::upload(CONTROL_PLANE_TOOL, &s3_source.bucket_name, &s3_key, error)
+        })?;
+        // Deletes this attempt's host dir (and the dump in it); every early
+        // return above does the same when `attempt` drops.
+        drop(attempt);
 
         info!(
             backup_id,
@@ -343,6 +282,86 @@ impl BackupEngine for ControlPlaneEngine {
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
+
+/// Where the control-plane dump connects, parsed from `DATABASE_URL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlPlaneTarget {
+    host: String,
+    port: u16,
+    database: String,
+    username: String,
+    password: String,
+}
+
+impl ControlPlaneTarget {
+    fn from_database_url(database_url: &str) -> Result<Self, BackupError> {
+        let url = url::Url::parse(database_url).map_err(|e| BackupError::PermanentFailure {
+            reason: format!("invalid DATABASE_URL: {}", e),
+        })?;
+        Ok(Self {
+            host: url.host_str().unwrap_or("localhost").to_string(),
+            port: url.port().unwrap_or(5432),
+            database: url.path().trim_start_matches('/').to_string(),
+            username: url.username().to_string(),
+            password: urlencoding::decode(url.password().unwrap_or(""))
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// The control-plane dump sidecar.
+///
+/// Globals (roles) via `pg_dumpall`, then a single-database `pg_dump` with
+/// the heavy tables dumped schema-only. Both restore through the same
+/// `psql --dbname=<cp-db> --file=dump.sql` path as the old `pg_dumpall`
+/// format. Everything is written into this attempt's directory inside the
+/// sidecar's own filesystem; stderr goes to a file next to the dump and is
+/// copied out only when the command fails.
+fn control_plane_dump_spec(
+    attempt: &DumpAttempt,
+    backup_id: i32,
+    image: &str,
+    target: &ControlPlaneTarget,
+    exclude_patterns: &[String],
+) -> OneShotSpec {
+    let exclude_flags = exclude_patterns
+        .iter()
+        .map(|p| format!("--exclude-table-data={}", v2_common::shell_escape(p)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pg_dump_cmd = format!(
+        "mkdir -p {dir} && pg_dumpall --globals-only --clean --if-exists --no-password \
+         --host={host} --port={port} --username={user} --database={db} \
+         2>{stderr} > {out} \
+         && pg_dump --clean --if-exists --no-password \
+         --host={host} --port={port} --username={user} {excludes} --dbname={db} \
+         2>>{stderr} >> {out} && gzip {out}",
+        dir = v2_common::shell_escape(&attempt.container_dir()),
+        host = v2_common::shell_escape(&target.host),
+        port = v2_common::shell_escape(&target.port.to_string()),
+        user = v2_common::shell_escape(&target.username),
+        db = v2_common::shell_escape(&target.database),
+        excludes = exclude_flags,
+        stderr = v2_common::shell_escape(&attempt.container_path(SIDECAR_STDERR)),
+        out = v2_common::shell_escape(&attempt.container_path(SIDECAR_DUMP_SQL)),
+    );
+    OneShotSpec {
+        image: image.to_string(),
+        name: attempt.container_name(CONTAINER_NAME_PREFIX),
+        engine: ENGINE_KEY,
+        backup_id,
+        entrypoint: vec!["sh".to_string(), "-c".to_string()],
+        cmd: vec![pg_dump_cmd],
+        env: vec![format!("PGPASSWORD={}", target.password)],
+        binds: vec![],
+        // `host` mode so the container can reach 127.0.0.1:5432 where the
+        // control-plane Postgres binds under `temps serve`.
+        network_mode: Some("host".to_string()),
+        user: Some("root".to_string()),
+        stderr_watch: None,
+    }
+}
 
 /// What a control-plane dump leaves schema-only: the table names, and the
 /// `--exclude-table-data` patterns that implement them.
@@ -649,5 +668,700 @@ mod tests {
             excluded.patterns
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    //! The control-plane dump runs in an attempt-scoped sidecar with host
+    //! networking and is read back through the Docker archive API. The unit
+    //! tests pin the spec and the error classification; the Docker-backed
+    //! tests run the real `pg_dumpall` + `pg_dump` command against a real
+    //! PostgreSQL reached over host networking, and skip (with a message)
+    //! only when no Docker daemon answers or the images cannot be pulled.
+
+    use super::*;
+    use std::time::Duration;
+
+    const TEST_PASSWORD: &str = "test-pass";
+
+    fn target(host: &str, port: u16, password: &str) -> ControlPlaneTarget {
+        ControlPlaneTarget {
+            host: host.to_string(),
+            port,
+            database: "temps".to_string(),
+            username: "postgres".to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    // ── Spec + attempt scoping ───────────────────────────────────────────
+
+    #[test]
+    fn dump_spec_is_attempt_scoped_and_has_no_bind_mount() {
+        let parent = tempfile::tempdir().expect("parent");
+        let first = DumpAttempt::new_in(parent.path(), CONTROL_PLANE_TOOL, ENGINE_KEY, "b-uuid")
+            .expect("first attempt");
+        let retry = DumpAttempt::new_in(parent.path(), CONTROL_PLANE_TOOL, ENGINE_KEY, "b-uuid")
+            .expect("retry attempt");
+        let excludes = vec![
+            "public.proxy_logs".to_string(),
+            "_timescaledb_internal._hyper_3_*".to_string(),
+        ];
+        let target = target("127.0.0.1", 5432, "pa's$word");
+
+        let spec = control_plane_dump_spec(&first, 7, "postgres:18", &target, &excludes);
+        let retry_spec = control_plane_dump_spec(&retry, 7, "postgres:18", &target, &excludes);
+
+        assert!(
+            spec.binds.is_empty(),
+            "output must not depend on a host bind: {:?}",
+            spec.binds
+        );
+        assert_eq!(spec.network_mode.as_deref(), Some("host"));
+        assert_eq!(spec.image, "postgres:18");
+        assert_eq!(spec.backup_id, 7);
+        assert_ne!(spec.name, retry_spec.name, "a retry gets its own container");
+        assert!(
+            spec.name.starts_with("temps-cp-backup-b-uuid-"),
+            "{}",
+            spec.name
+        );
+        assert_ne!(
+            spec.name, "temps-cp-backup-b-uuid",
+            "the per-backup name an older binary used must never be reused"
+        );
+
+        let cmd = &spec.cmd[0];
+        for path in [
+            first.container_path(SIDECAR_DUMP_SQL),
+            first.container_path(SIDECAR_STDERR),
+            first.container_dir(),
+        ] {
+            assert!(cmd.contains(&path), "missing {path}: {cmd}");
+        }
+        assert!(!cmd.contains(&retry.container_dir()), "{cmd}");
+        assert!(!cmd.contains("/backup/"), "no bind-mount path: {cmd}");
+
+        // Dump semantics: globals first, then the single-database dump with
+        // the exclusions, appended to the same file, then gzip.
+        let globals = cmd.find("pg_dumpall --globals-only").expect("globals");
+        let database = cmd.find("&& pg_dump --clean").expect("pg_dump");
+        assert!(globals < database, "{cmd}");
+        assert!(cmd.contains("--exclude-table-data='public.proxy_logs'"));
+        assert!(cmd.contains("--exclude-table-data='_timescaledb_internal._hyper_3_*'"));
+        assert!(cmd.contains("--host='127.0.0.1' --port='5432' --username='postgres'"));
+        assert!(cmd.contains("--dbname='temps'"));
+        assert!(cmd.contains(&format!(
+            "2>>'{}' >> '{}'",
+            first.container_path(SIDECAR_STDERR),
+            first.container_path(SIDECAR_DUMP_SQL)
+        )));
+        assert!(cmd.ends_with(&format!(
+            "gzip '{}'",
+            first.container_path(SIDECAR_DUMP_SQL)
+        )));
+        assert!(
+            !cmd.contains("pa's"),
+            "the password must stay out of argv: {cmd}"
+        );
+        assert_eq!(spec.env, vec!["PGPASSWORD=pa's$word".to_string()]);
+    }
+
+    #[test]
+    fn leftovers_of_earlier_attempts_in_the_backup_tmpdir_are_neither_reused_nor_deleted() {
+        // `<data_dir>/backups/tmp` as an older binary (bind-mount layout) and
+        // an earlier attempt of this binary left it.
+        let backup_dir = tempfile::tempdir().expect("backup tmpdir");
+        let legacy_dump = backup_dir.path().join("b-uuid.sql.gz");
+        let legacy_stderr = backup_dir.path().join("b-uuid.stderr");
+        std::fs::write(&legacy_dump, b"stale dump").expect("legacy dump");
+        std::fs::write(&legacy_stderr, b"stale stderr").expect("legacy stderr");
+        let earlier =
+            DumpAttempt::new_in(backup_dir.path(), CONTROL_PLANE_TOOL, ENGINE_KEY, "b-uuid")
+                .expect("earlier attempt");
+        std::fs::write(earlier.host_path(SIDECAR_DUMP_GZ), b"earlier").expect("earlier dump");
+
+        let retry =
+            DumpAttempt::new_in(backup_dir.path(), CONTROL_PLANE_TOOL, ENGINE_KEY, "b-uuid")
+                .expect("retry attempt");
+        let retry_dump = retry.host_path(SIDECAR_DUMP_GZ);
+        assert!(retry.host_dir().starts_with(backup_dir.path()));
+        assert!(!retry_dump.exists(), "a retry starts from a clean path");
+        assert_ne!(retry_dump, legacy_dump);
+        assert_ne!(retry_dump, earlier.host_path(SIDECAR_DUMP_GZ));
+        std::fs::write(&retry_dump, b"retry").expect("retry dump");
+        let retry_dir = retry.host_dir().to_path_buf();
+        drop(retry);
+
+        assert!(!retry_dir.exists(), "the attempt removes its own directory");
+        assert_eq!(std::fs::read(&legacy_dump).expect("kept"), b"stale dump");
+        assert_eq!(
+            std::fs::read(&legacy_stderr).expect("kept"),
+            b"stale stderr"
+        );
+        assert_eq!(
+            std::fs::read(earlier.host_path(SIDECAR_DUMP_GZ)).expect("kept"),
+            b"earlier"
+        );
+    }
+
+    #[test]
+    fn target_is_parsed_from_the_database_url_with_the_old_defaults() {
+        let parsed = ControlPlaneTarget::from_database_url(
+            "postgres://temps_user:p%40ss%2Fw@db.internal:6543/temps_cp",
+        )
+        .expect("valid url");
+        assert_eq!(
+            parsed,
+            ControlPlaneTarget {
+                host: "db.internal".into(),
+                port: 6543,
+                database: "temps_cp".into(),
+                username: "temps_user".into(),
+                password: "p@ss/w".into(),
+            }
+        );
+
+        let defaults =
+            ControlPlaneTarget::from_database_url("postgres://u@localhost/db").expect("valid");
+        assert_eq!(defaults.port, 5432);
+        assert_eq!(defaults.password, "");
+
+        let error = ControlPlaneTarget::from_database_url("not a url").expect_err("invalid");
+        assert!(
+            matches!(&error, BackupError::PermanentFailure { reason } if reason.starts_with("invalid DATABASE_URL")),
+            "{error:?}"
+        );
+    }
+
+    // ── Error classification ─────────────────────────────────────────────
+
+    #[test]
+    fn dump_failures_are_classified_by_where_they_happened() {
+        let export = DumpCaptureError::Export {
+            tool: CONTROL_PLANE_TOOL,
+            container: "temps-cp-backup-b-a".into(),
+            exit_code: 1,
+            stderr: "pg_dumpall: error: connection to server failed".into(),
+        };
+        let message = export.to_string();
+        assert!(
+            message.starts_with("Control-plane PostgreSQL export failed in backup container 'temps-cp-backup-b-a' with exit code 1"),
+            "{message}"
+        );
+        assert!(matches!(
+            BackupError::from(export),
+            BackupError::Failed { .. }
+        ));
+
+        let unreadable = DumpCaptureError::DumpUnreadable {
+            tool: CONTROL_PLANE_TOOL,
+            container: "temps-cp-backup-b-a".into(),
+            container_path: "/tmp/temps-backup/a/backup.sql.gz".into(),
+            host_path: "/data/backups/tmp/x/backup.sql.gz".into(),
+            reason: "the Docker archive download failed: 404".into(),
+        };
+        assert!(unreadable.to_string().starts_with(
+            "Control-plane PostgreSQL exported the backup, but Temps could not read the temporary file"
+        ));
+        assert!(matches!(
+            BackupError::from(unreadable),
+            BackupError::Failed { .. }
+        ));
+
+        let transient_upload = DumpCaptureError::upload(
+            CONTROL_PLANE_TOOL,
+            "bucket",
+            "cp/backup.sql.gz",
+            BackupError::Failed {
+                reason: "503 Slow Down".into(),
+            },
+        );
+        assert!(transient_upload
+            .to_string()
+            .contains("uploading it to s3://bucket/cp/backup.sql.gz failed: 503 Slow Down"));
+        assert!(matches!(
+            BackupError::from(transient_upload),
+            BackupError::Failed { .. }
+        ));
+        let permanent_upload = DumpCaptureError::upload(
+            CONTROL_PLANE_TOOL,
+            "bucket",
+            "key",
+            BackupError::PermanentFailure {
+                reason: "AccessDenied".into(),
+            },
+        );
+        assert!(matches!(
+            BackupError::from(permanent_upload),
+            BackupError::PermanentFailure { .. }
+        ));
+    }
+
+    // ── Docker-backed tests ──────────────────────────────────────────────
+
+    const TARGET_IMAGE: &str = "postgres:18-alpine";
+    const SIDECAR_IMAGE: &str = "postgres:18";
+
+    async fn docker_or_skip(test: &str) -> Option<bollard::Docker> {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping {test}: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping {test}: {e}");
+            return None;
+        }
+        for image in [TARGET_IMAGE, SIDECAR_IMAGE] {
+            if let Err(e) =
+                super::super::image_pull::ensure_image_pulled_v2(image, ENGINE_KEY).await
+            {
+                println!("Could not pull {image}, skipping {test}: {e}");
+                return None;
+            }
+        }
+        Some(docker)
+    }
+
+    /// Run a command in a container; return its exit code and output.
+    async fn exec_in(docker: &bollard::Docker, container: &str, cmd: &[&str]) -> (i64, String) {
+        use bollard::exec::{CreateExecOptions, StartExecResults};
+        use futures::StreamExt;
+        let exec = docker
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    cmd: Some(cmd.iter().map(|part| part.to_string()).collect()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create exec");
+        let mut text = String::new();
+        if let StartExecResults::Attached { mut output, .. } =
+            docker.start_exec(&exec.id, None).await.expect("start exec")
+        {
+            while let Some(Ok(chunk)) = output.next().await {
+                text.push_str(&chunk.to_string());
+            }
+        }
+        let code = docker
+            .inspect_exec(&exec.id)
+            .await
+            .expect("inspect exec")
+            .exit_code
+            .unwrap_or(-1);
+        (code, text)
+    }
+
+    async fn container_is_gone(docker: &bollard::Docker, name: &str) -> bool {
+        for _ in 0..60 {
+            match docker
+                .inspect_container(
+                    name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => return true,
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        false
+    }
+
+    async fn container_exists(docker: &bollard::Docker, name: &str) -> bool {
+        docker
+            .inspect_container(
+                name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_ok()
+    }
+
+    /// Containers a test created, force-removed by name on drop (also on
+    /// panic) from a dedicated thread with its own runtime.
+    struct DockerLeftovers {
+        containers: Vec<String>,
+    }
+
+    impl Drop for DockerLeftovers {
+        fn drop(&mut self) {
+            let containers = std::mem::take(&mut self.containers);
+            let cleanup = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async move {
+                    let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+                        return;
+                    };
+                    for name in containers {
+                        let _ = docker
+                            .remove_container(
+                                &name,
+                                Some(bollard::query_parameters::RemoveContainerOptions {
+                                    force: true,
+                                    v: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                    }
+                });
+            });
+            let _ = cleanup.join();
+        }
+    }
+
+    /// A password-protected PostgreSQL standing in for the control plane,
+    /// published on the Docker host's loopback so a host-network sidecar
+    /// reaches it at `127.0.0.1:<port>` exactly as it reaches the real
+    /// control plane under `temps serve`. Seeded with a role, a kept table
+    /// and a table whose data the dump excludes.
+    struct SeededControlPlane {
+        port: u16,
+        _leftovers: DockerLeftovers,
+    }
+
+    async fn seeded_control_plane(docker: &bollard::Docker, run_id: &str) -> SeededControlPlane {
+        use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+        let name = format!("temps-test-cp-pg-{run_id}");
+        let leftovers = DockerLeftovers {
+            containers: vec![name.clone()],
+        };
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(TARGET_IMAGE.to_string()),
+                    env: Some(vec![
+                        format!("POSTGRES_PASSWORD={TEST_PASSWORD}"),
+                        "POSTGRES_DB=temps".to_string(),
+                    ]),
+                    exposed_ports: Some(vec!["5432/tcp".to_string()]),
+                    host_config: Some(HostConfig {
+                        port_bindings: Some(std::collections::HashMap::from([(
+                            "5432/tcp".to_string(),
+                            Some(vec![PortBinding {
+                                host_ip: Some("127.0.0.1".to_string()),
+                                host_port: Some(String::new()),
+                            }]),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create test control-plane postgres");
+        docker
+            .start_container(
+                &name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("start test control-plane postgres");
+
+        let inspect = docker
+            .inspect_container(
+                &name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("inspect test postgres");
+        let port = inspect
+            .network_settings
+            .and_then(|settings| settings.ports)
+            .and_then(|ports| ports.get("5432/tcp").cloned().flatten())
+            .and_then(|bindings| bindings.into_iter().find_map(|b| b.host_port))
+            .and_then(|port| port.parse::<u16>().ok())
+            .expect("published port");
+
+        // TCP readiness: the init-time temporary server listens on the unix
+        // socket only, so this succeeds once the real server is up.
+        let mut ready = false;
+        for _ in 0..120 {
+            let (code, _) = exec_in(
+                docker,
+                &name,
+                &["pg_isready", "-h", "127.0.0.1", "-U", "postgres"],
+            )
+            .await;
+            if code == 0 {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(ready, "test postgres {name} never became ready");
+
+        let (code, output) = exec_in(
+            docker,
+            &name,
+            &[
+                "psql",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+                "-d",
+                "temps",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "CREATE ROLE temps_test_reader LOGIN; \
+                 CREATE TABLE projects (id int PRIMARY KEY, name text); \
+                 INSERT INTO projects VALUES (1, 'kept-project-row'); \
+                 CREATE TABLE proxy_logs (id int, path text); \
+                 INSERT INTO proxy_logs VALUES (1, '/excluded-telemetry-row');",
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "seeding failed: {output}");
+
+        SeededControlPlane {
+            port,
+            _leftovers: leftovers,
+        }
+    }
+
+    fn gunzip_to_string(path: &std::path::Path) -> String {
+        use std::io::Read;
+        let mut sql = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(path).expect("open dump"))
+            .read_to_string(&mut sql)
+            .expect("gunzip dump");
+        sql
+    }
+
+    fn request(attempt: &DumpAttempt, spec: OneShotSpec) -> CaptureRequest {
+        CaptureRequest {
+            tool: CONTROL_PLANE_TOOL,
+            spec,
+            container_path: attempt.container_path(SIDECAR_DUMP_GZ),
+            host_path: attempt.host_path(SIDECAR_DUMP_GZ),
+            failure_log: Some((
+                attempt.container_path(SIDECAR_STDERR),
+                attempt.host_path(SIDECAR_STDERR),
+            )),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_dump_round_trips_over_host_networking_without_a_bind_mount() {
+        let Some(docker) = docker_or_skip(
+            "control_plane_dump_round_trips_over_host_networking_without_a_bind_mount",
+        )
+        .await
+        else {
+            return;
+        };
+        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let cp = seeded_control_plane(&docker, &run_id).await;
+
+        // The OS temp dir, whatever TMPDIR says: on macOS it is not shared
+        // with the Colima / Docker Desktop VM, which the old bind mount
+        // needed. Nothing here depends on it being shared.
+        let backup_dir = tempfile::tempdir().expect("backup tmpdir");
+        println!(
+            "control-plane attempt parent dir: {}",
+            backup_dir.path().display()
+        );
+        let attempt = DumpAttempt::new_in(
+            backup_dir.path(),
+            CONTROL_PLANE_TOOL,
+            ENGINE_KEY,
+            &format!("roundtrip-{run_id}"),
+        )
+        .expect("attempt");
+        let spec = control_plane_dump_spec(
+            &attempt,
+            0,
+            SIDECAR_IMAGE,
+            &target("127.0.0.1", cp.port, TEST_PASSWORD),
+            &["public.proxy_logs".to_string()],
+        );
+        let sidecar = spec.name.clone();
+        let _sidecar_leftover = DockerLeftovers {
+            containers: vec![sidecar.clone()],
+        };
+
+        let size = capture_dump(
+            &docker,
+            request(&attempt, spec),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("capture the control-plane dump through the Docker API");
+
+        let host_path = attempt.host_path(SIDECAR_DUMP_GZ);
+        assert!(size > 0);
+        assert_eq!(std::fs::metadata(&host_path).expect("dump").len(), size);
+        assert!(
+            container_is_gone(&docker, &sidecar).await,
+            "sidecar {sidecar} was not removed"
+        );
+
+        let sql = gunzip_to_string(&host_path);
+        assert!(
+            sql.contains("CREATE ROLE temps_test_reader"),
+            "globals (roles) missing from the dump"
+        );
+        assert!(sql.contains("CREATE TABLE public.projects"));
+        assert!(sql.contains("kept-project-row"), "kept table data missing");
+        assert!(
+            sql.contains("CREATE TABLE public.proxy_logs"),
+            "excluded tables keep their schema"
+        );
+        assert!(
+            !sql.contains("/excluded-telemetry-row"),
+            "excluded table data must not be dumped"
+        );
+        let globals = sql
+            .find("PostgreSQL database cluster dump")
+            .expect("pg_dumpall header");
+        let database = sql
+            .find("CREATE TABLE public.projects")
+            .expect("pg_dump body");
+        assert!(globals < database, "globals must come first");
+
+        let host_dir = attempt.host_dir().to_path_buf();
+        drop(attempt);
+        assert!(!host_dir.exists(), "attempt dir not cleaned up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_retry_after_a_failed_attempt_ignores_its_leftovers() {
+        let Some(docker) =
+            docker_or_skip("control_plane_retry_after_a_failed_attempt_ignores_its_leftovers")
+                .await
+        else {
+            return;
+        };
+        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let cp = seeded_control_plane(&docker, &run_id).await;
+        let backup_uuid = format!("retry-{run_id}");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let backup_dir = tempfile::tempdir().expect("backup tmpdir");
+
+        // What an older binary left after a failed run: the per-backup
+        // container name and the per-backup files in the shared tmpdir.
+        let legacy_container = format!("temps-cp-backup-{backup_uuid}");
+        let mut leftovers = DockerLeftovers {
+            containers: vec![legacy_container.clone()],
+        };
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&legacy_container)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(SIDECAR_IMAGE.to_string()),
+                    cmd: Some(vec!["true".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create legacy leftover container");
+        let legacy_dump = backup_dir.path().join(format!("{backup_uuid}.sql.gz"));
+        let legacy_stderr = backup_dir.path().join(format!("{backup_uuid}.stderr"));
+        std::fs::write(&legacy_dump, b"stale dump").expect("legacy dump");
+        std::fs::write(&legacy_stderr, b"stale stderr").expect("legacy stderr");
+
+        // Attempt 1: the database is unreachable (nothing listens on port 1).
+        let first = DumpAttempt::new_in(
+            backup_dir.path(),
+            CONTROL_PLANE_TOOL,
+            ENGINE_KEY,
+            &backup_uuid,
+        )
+        .expect("attempt 1");
+        let spec = control_plane_dump_spec(
+            &first,
+            0,
+            SIDECAR_IMAGE,
+            &target("127.0.0.1", 1, TEST_PASSWORD),
+            &[],
+        );
+        let first_sidecar = spec.name.clone();
+        leftovers.containers.push(first_sidecar.clone());
+        let error = capture_dump(&docker, request(&first, spec), &cancel)
+            .await
+            .expect_err("unreachable database");
+        match &error {
+            DumpCaptureError::Export {
+                exit_code, stderr, ..
+            } => {
+                assert_ne!(*exit_code, 0);
+                assert!(
+                    stderr.contains("pg_dumpall: error: could not connect"),
+                    "the redirected pg_dumpall stderr must reach the error: {stderr}"
+                );
+            }
+            other => panic!("expected an export failure, got {other}"),
+        }
+        assert!(matches!(
+            BackupError::from(error),
+            BackupError::Failed { .. }
+        ));
+        assert!(container_is_gone(&docker, &first_sidecar).await);
+        let first_dir = first.host_dir().to_path_buf();
+        drop(first);
+        assert!(!first_dir.exists(), "failed attempt dir not cleaned up");
+
+        // Attempt 2: same backup, reachable database. Neither the legacy
+        // container name nor the legacy files get in the way.
+        let second = DumpAttempt::new_in(
+            backup_dir.path(),
+            CONTROL_PLANE_TOOL,
+            ENGINE_KEY,
+            &backup_uuid,
+        )
+        .expect("attempt 2");
+        let spec = control_plane_dump_spec(
+            &second,
+            0,
+            SIDECAR_IMAGE,
+            &target("127.0.0.1", cp.port, TEST_PASSWORD),
+            &[],
+        );
+        let second_sidecar = spec.name.clone();
+        leftovers.containers.push(second_sidecar.clone());
+        let size = capture_dump(&docker, request(&second, spec), &cancel)
+            .await
+            .expect("retry succeeds");
+        assert!(size > 0);
+        assert!(gunzip_to_string(&second.host_path(SIDECAR_DUMP_GZ)).contains("kept-project-row"));
+        assert!(container_is_gone(&docker, &second_sidecar).await);
+        drop(second);
+
+        assert!(
+            container_exists(&docker, &legacy_container).await,
+            "an attempt must not remove a container it did not create"
+        );
+        assert_eq!(std::fs::read(&legacy_dump).expect("kept"), b"stale dump");
+        assert_eq!(
+            std::fs::read(&legacy_stderr).expect("kept"),
+            b"stale stderr"
+        );
     }
 }

@@ -20,6 +20,7 @@ import {
   formatChartTick,
   formatChartTooltipLabel,
 } from '@/lib/chart-tooltip'
+import { yAxisTickProps } from '@/lib/chart-axis-ticks'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
@@ -729,7 +730,10 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
                 ? 70
                 : 44
           }
-          tickFormatter={(v: number) => formatMetricValue(metricName, v)}
+          {...yAxisTickProps(
+            chartData.map((p) => p.value),
+            { format: (v) => formatMetricValue(metricName, v) }
+          )}
         />
         <Tooltip
           wrapperStyle={{ zIndex: 50 }}
@@ -1011,7 +1015,7 @@ function DatabasesSection({
       {PG_PER_DATABASE_GROUPS.map((group) => (
         <div key={group.title}>
           <div className="mb-2">
-            <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground/70">
+            <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
               {group.title}
             </h3>
           </div>
@@ -1163,6 +1167,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                     </TableCell>
                     <TableCell>
                       <Button
+                        aria-label="Delete alert rule"
                         variant="ghost"
                         size="icon"
                         className="size-7 text-muted-foreground hover:text-destructive"
@@ -1486,6 +1491,7 @@ export function ServiceMonitoring() {
               {/* Breadcrumb */}
               <div className="flex min-w-0 items-center gap-1.5 mb-1">
                 <button
+                  aria-label="Back"
                   type="button"
                   onClick={() => navigate(`/storage/${id}`)}
                   className="text-muted-foreground hover:text-foreground transition-colors"

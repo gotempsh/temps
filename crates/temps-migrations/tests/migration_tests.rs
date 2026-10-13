@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use testcontainers::{
     core::{ContainerPort, WaitFor},
@@ -59,6 +59,65 @@ fn steps_back_to(name: &str) -> u32 {
             )
         });
     (migrations.len() - position) as u32
+}
+
+#[tokio::test]
+async fn test_bunny_delivery_downgrade_preserves_active_profiles() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping Bunny migration downgrade test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared(
+        "INSERT INTO delivery_profiles (name, provider_kind, bunny_pull_zone_id, bunny_hostname, bunny_api_key_encrypted) \
+         VALUES ('Bunny profile', 'bunny', 42, 'example.b-cdn.net', 'encrypted')",
+    )
+    .await?;
+
+    let error = Migrator::down(
+        &db,
+        Some(steps_back_to("m20260929_000001_add_bunny_delivery")),
+    )
+    .await
+    .expect_err("downgrade must refuse to discard an active Bunny profile");
+    assert!(error
+        .to_string()
+        .contains("remove their bindings and profiles first"));
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM delivery_profiles WHERE provider_kind = 'bunny'"
+                .to_string(),
+        ))
+        .await?
+        .expect("profile count row");
+    assert_eq!(row.try_get::<i32>("", "count")?, 1);
+    Ok(())
 }
 
 async fn env_var_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
@@ -1029,6 +1088,210 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
     Ok(())
 }
 
+/// Re-pointing a duplicate monitor's checks at the canonical monitor updates
+/// `status_checks` rows that live in compressed chunks once they are older
+/// than the 30-day compression policy. TimescaleDB aborts DML that
+/// decompresses more than `max_tuples_decompressed_per_dml_transaction`
+/// tuples, so on an install with long uptime history the migration failed and
+/// blocked the upgrade. The server here runs with that cap at 1 so a handful
+/// of compressed rows reproduces the failure; the migration must lift the cap
+/// for its own work and still re-point every check.
+#[tokio::test]
+async fn test_legacy_monitor_reconciliation_rewrites_compressed_status_checks() -> anyhow::Result<()>
+{
+    if external_db_configured() {
+        println!(
+            "Skipping compressed legacy-monitor reconciliation test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+            "-c",
+            "timescaledb.max_tuples_decompressed_per_dml_transaction=1",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping compressed legacy-monitor reconciliation test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260908_000001_reconcile_legacy_status_monitors";
+    let target_position = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(target_position as u32)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-compressed-test', 'repo', 'owner', '.', 'main', 'nodejs', \
+                 now(), now(), 'monitor-compressed-test'); \
+         INSERT INTO environments \
+         (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-compressed-production', \
+                'monitor-compressed.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-compressed-test'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/health', \
+                60, true, false, now() - interval '90 days', now() - interval '90 days' \
+         FROM environments WHERE subdomain = 'monitor-compressed-production'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/health', \
+                60, true, true, now() - interval '60 days', now() - interval '60 days' \
+         FROM environments WHERE subdomain = 'monitor-compressed-production'",
+    )
+    .await?;
+    let monitor_rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM status_monitors ORDER BY id".to_string(),
+        ))
+        .await?;
+    let canonical_id = monitor_rows[0].try_get::<i32>("", "id")?;
+    let duplicate_id = monitor_rows[1].try_get::<i32>("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO status_checks (monitor_id, status, checked_at, created_at) \
+         SELECT {duplicate_id}, 'operational', \
+                now() - interval '40 days' - (s * interval '1 minute'), \
+                now() - interval '40 days' - (s * interval '1 minute') \
+         FROM generate_series(1, 20) s; \
+         SELECT compress_chunk(c, if_not_compressed => TRUE) \
+         FROM show_chunks('status_checks', older_than => now() - interval '30 days') c"
+    ))
+    .await?;
+    recompress_old_status_checks(&db).await?;
+
+    // SeaORM runs every pending migration in one shared transaction, so the
+    // lifted cap must already be back to the server value when up() returns,
+    // before that transaction commits. Run up() on a transaction this test
+    // owns to read the cap there, then roll back so the real run below still
+    // starts from compressed history.
+    let reconcile = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    let txn = db.begin().await?;
+    reconcile.up(&SchemaManager::new(&txn)).await?;
+    assert_eq!(
+        decompression_cap(&txn).await?,
+        "1",
+        "up() must reset the decompression cap before later migrations share its transaction"
+    );
+    txn.rollback().await?;
+
+    Migrator::up(&db, Some(1)).await?;
+
+    let owners = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) FILTER (WHERE monitor_id = {canonical_id}) AS canonical, \
+                        count(*) FILTER (WHERE monitor_id = {duplicate_id}) AS duplicate \
+                 FROM status_checks"
+            ),
+        ))
+        .await?
+        .expect("status_checks owner counts");
+    assert_eq!(owners.try_get::<i64>("", "canonical")?, 20);
+    assert_eq!(owners.try_get::<i64>("", "duplicate")?, 0);
+
+    // up() decompressed the rows it rewrote. Compress them again so down()
+    // also has to rewrite compressed history, as it would on a real install
+    // where the compression policy ran between upgrade and rollback.
+    recompress_old_status_checks(&db).await?;
+    let txn = db.begin().await?;
+    reconcile.down(&SchemaManager::new(&txn)).await?;
+    assert_eq!(
+        decompression_cap(&txn).await?,
+        "1",
+        "down() must reset the decompression cap before later rollbacks share its transaction"
+    );
+    txn.rollback().await?;
+
+    Migrator::down(&db, Some(1)).await?;
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) AS count FROM status_checks WHERE monitor_id = {duplicate_id}"
+            ),
+        ))
+        .await?
+        .expect("restored duplicate check count");
+    assert_eq!(restored.try_get::<i64>("", "count")?, 20);
+
+    Ok(())
+}
+
+/// Fully compress every `status_checks` chunk older than the compression
+/// policy. Decompressing first turns a partially compressed chunk (one that
+/// DML has already touched) back into a fully compressed one.
+async fn recompress_old_status_checks(db: &DatabaseConnection) -> anyhow::Result<()> {
+    db.execute_unprepared(
+        "SELECT decompress_chunk(c, if_compressed => TRUE) \
+         FROM show_chunks('status_checks', older_than => now() - interval '30 days') c; \
+         SELECT compress_chunk(c) \
+         FROM show_chunks('status_checks', older_than => now() - interval '30 days') c",
+    )
+    .await?;
+    let compressed = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) FILTER (WHERE is_compressed) AS compressed \
+             FROM timescaledb_information.chunks WHERE hypertable_name = 'status_checks'"
+                .to_string(),
+        ))
+        .await?
+        .expect("status_checks chunk count");
+    assert!(
+        compressed.try_get::<i64>("", "compressed")? > 0,
+        "test setup must compress at least one status_checks chunk, otherwise the \
+         decompression cap is never exercised"
+    );
+    Ok(())
+}
+
+async fn decompression_cap(conn: &impl ConnectionTrait) -> anyhow::Result<String> {
+    let row = conn
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current_setting('timescaledb.max_tuples_decompressed_per_dml_transaction') \
+             AS cap"
+                .to_string(),
+        ))
+        .await?
+        .expect("decompression cap lookup");
+    Ok(row.try_get::<String>("", "cap")?)
+}
+
 #[tokio::test]
 async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Result<()> {
     if external_db_configured() {
@@ -1796,21 +2059,13 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
     let count: i32 = scoped_count.try_get("", "count")?;
     assert_eq!(count, 2);
 
-    // Roll back exactly through the secure-sns migration, wherever it sits
-    // in the chain. A hardcoded step count breaks every time a newer
-    // migration lands after it (versions sort lexicographically ==
-    // chronologically under the mYYYYMMDD naming scheme).
-    let after = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*)::int AS n FROM seaql_migrations \
-             WHERE version > 'm20260714_000001_secure_sns_email_events'"
-                .to_string(),
-        ))
-        .await?
-        .expect("seaql_migrations count");
-    let steps_after: i32 = after.try_get("", "n")?;
-    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+    // Registry order is authoritative. Older-named migrations can be appended
+    // after a shipped migration, so lexical version comparisons are unsafe.
+    Migrator::down(
+        &db,
+        Some(steps_back_to("m20260714_000001_secure_sns_email_events")),
+    )
+    .await?;
 
     let rollback_counts = db
         .query_one(sea_orm::Statement::from_string(
@@ -2183,6 +2438,32 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
             let exists: bool = row.try_get("", "exists")?;
             assert!(exists, "Table {} should exist after migration up", table);
         }
+    }
+
+    for (column, default_fragment) in [
+        ("proxied_by_default", "false"),
+        ("generated_hostname_mode", "standard"),
+        ("sync_generated_records", "false"),
+    ] {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT is_nullable, column_default FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                       AND table_name = 'dns_managed_domains' \
+                       AND column_name = '{column}'"
+                ),
+            ))
+            .await?
+            .unwrap_or_else(|| panic!("dns_managed_domains.{column} should exist"));
+        let nullable: String = row.try_get("", "is_nullable")?;
+        let default: String = row.try_get("", "column_default")?;
+        assert_eq!(nullable, "NO", "{column} must be non-null");
+        assert!(
+            default.contains(default_fragment),
+            "{column} default {default:?} should contain {default_fragment:?}"
+        );
     }
 
     println!("✅ All expected tables exist");
@@ -3717,20 +3998,10 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
         "both feature-flag tables must exist after `up`"
     );
 
-    // Roll back exactly through the feature-flag migration, wherever it sits
-    // in the chain — a hardcoded step count breaks the moment a newer
-    // migration lands after it.
+    // Roll back exactly through the feature-flag migration in registry order.
+    // Older-named migrations may be appended later to preserve upgrade order.
     let target = "m20260802_000002_create_feature_flags";
-    let after = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT count(*)::int AS n FROM seaql_migrations WHERE version > '{target}'"),
-        ))
-        .await?
-        .expect("seaql_migrations count");
-    let steps_after: i32 = after.try_get("", "n")?;
-
-    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
     assert_eq!(
         feature_flag_table_count(&db).await?,
         0,
@@ -6191,5 +6462,120 @@ async fn test_project_instantiation_token_migration_up_down_up() -> anyhow::Resu
     assert!(column_exists(&db, "projects", "instantiation_token").await?);
     assert_eq!(project_instantiation_token(&db, "owned").await?, None);
 
+    Ok(())
+}
+
+/// ADR 048's migrations (mesh, pairings, SSH enrollments, hubs) roll back to
+/// the schema before them and apply again, and the hub tables keep the
+/// constraints the control plane relies on.
+#[tokio::test]
+async fn test_node_mesh_migrations_down_and_reup() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping node mesh migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping node mesh migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+
+    let tables = [
+        "node_pairings",
+        "node_ssh_enrollments",
+        "node_mesh_reports",
+        "mesh_links",
+    ];
+    let exists = |table: &'static str| {
+        let db = &db;
+        async move {
+            let row = db
+                .query_one(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!("SELECT to_regclass('public.{table}') IS NOT NULL AS present"),
+                ))
+                .await?
+                .expect("one row");
+            anyhow::Ok(row.try_get::<bool>("", "present")?)
+        }
+    };
+    for table in tables {
+        assert!(exists(table).await?, "{table} after up");
+    }
+
+    // The routing table orders keys by bytes, not by the database locale.
+    let collation = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT collation_name FROM information_schema.columns \
+             WHERE table_name = 'mesh_links' AND column_name = 'key_a'"
+                .to_string(),
+        ))
+        .await?
+        .expect("key_a column");
+    assert_eq!(
+        collation
+            .try_get::<Option<String>>("", "collation_name")?
+            .as_deref(),
+        Some("C")
+    );
+    // At most one hub.
+    let both = db
+        .execute_unprepared(
+            "UPDATE network_config SET mesh_hub_control_plane = TRUE, \
+             mesh_hub_node_id = (SELECT id FROM nodes LIMIT 1)",
+        )
+        .await;
+    assert!(
+        both.is_ok(),
+        "no node exists, so the node id is NULL and the update is allowed"
+    );
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address, role, status, labels, \
+         capacity, created_at, updated_at) VALUES ('hub-check', 'h', 'https://127.0.0.1:3100', \
+         '10.0.0.1', 'worker', 'active', '{}', '{}', NOW(), NOW())",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared(
+            "UPDATE network_config SET mesh_hub_control_plane = TRUE, \
+             mesh_hub_node_id = (SELECT id FROM nodes WHERE name = 'hub-check')",
+        )
+        .await
+        .is_err(),
+        "the control plane and a node cannot both be the hub"
+    );
+
+    Migrator::down(&db, Some(steps_back_to("m20260928_000001_wireguard_mesh"))).await?;
+    for table in tables {
+        assert!(!exists(table).await?, "{table} after down");
+    }
+    Migrator::up(&db, None).await?;
+    for table in tables {
+        assert!(exists(table).await?, "{table} after re-up");
+    }
     Ok(())
 }

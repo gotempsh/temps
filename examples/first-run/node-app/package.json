@@ -1,0 +1,18 @@
+{
+  "name": "first-run-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Managed-service authentication app used by the Temps first-run scenario suite.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {
+    "pg": "^8.23.1",
+    "redis": "^6.3.0"
+  }
+}

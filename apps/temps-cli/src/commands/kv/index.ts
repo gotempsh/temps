@@ -8,7 +8,9 @@ import { newline, header, icons, info, colors } from '../../ui/output.js'
 
 export function registerKvCommands(program: Command): void {
   const kv = program
-    .command('kv')
+    // Not implemented yet: registered (so `temps kv` explains itself) but
+    // hidden from help, so the CLI does not advertise a missing command.
+    .command('kv', { hidden: true })
     .description('KV store commands (coming soon)')
 
   kv

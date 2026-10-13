@@ -18,13 +18,20 @@ use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 
 use temps_entities::metric_alert_rules::{ActiveModel, Column, Entity, Model};
 
 use crate::detectors::DetectionConfig;
 use crate::error::OtelError;
+
+/// Metric alert rules one project may create through the API (#1210). Each
+/// rule is a recurring query against the metrics store, so the count is a
+/// cost an API caller controls. Rules declared in `.temps.yaml` (non-null
+/// `environment_id`) are bounded per file by the deployment reconciler and
+/// are not counted here.
+pub const MAX_METRIC_ALERT_RULES_PER_PROJECT: u64 = 100;
 
 pub const MAX_LABEL_FILTERS: usize = 10;
 const MAX_LABEL_VALUE_LEN: usize = 500;
@@ -322,9 +329,35 @@ impl MetricAlertService {
             max_series: Set(max_series),
             grouped_notification_threshold: Set(grouped_notification_threshold),
             ..Default::default()
+        };
+
+        // Count and insert under a lock on the project row so concurrent
+        // creations for one project serialize and cannot overshoot the limit.
+        let txn = self.db.begin().await?;
+        if temps_entities::projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            txn.rollback().await?;
+            return Err(OtelError::ProjectNotFound { project_id });
         }
-        .insert(self.db.as_ref())
-        .await?;
+        let existing = Entity::find()
+            .filter(Column::ProjectId.eq(project_id))
+            .filter(Column::EnvironmentId.is_null())
+            .count(&txn)
+            .await?;
+        if existing >= MAX_METRIC_ALERT_RULES_PER_PROJECT {
+            txn.rollback().await?;
+            return Err(OtelError::MetricAlertLimitReached {
+                project_id,
+                existing,
+                limit: MAX_METRIC_ALERT_RULES_PER_PROJECT,
+            });
+        }
+        let model = model.insert(&txn).await?;
+        txn.commit().await?;
         Ok(model)
     }
 
@@ -590,17 +623,26 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_create_success() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
-        let service = MetricAlertService::new(Arc::new(db));
+    /// The input clears validation. Persisting needs a real project row,
+    /// which the mock database does not provide, so only a validation
+    /// rejection counts as failure here; persistence and the per-project limit
+    /// are covered by `create_persists_and_stops_at_the_per_project_limit`.
+    fn assert_passes_validation(result: Result<Model, OtelError>) {
+        assert!(
+            !matches!(result, Err(OtelError::Validation { .. })),
+            "rejected by validation: {result:?}"
+        );
+    }
 
-        let result = service
+    async fn create_rule(
+        service: &MetricAlertService,
+        project_id: i32,
+        name: &str,
+    ) -> Result<Model, OtelError> {
+        service
             .create(
-                7,
-                "High latency".to_string(),
+                project_id,
+                name.to_string(),
                 "http.server.duration".to_string(),
                 "p95".to_string(),
                 static_cfg(),
@@ -614,13 +656,94 @@ mod tests {
                 20,
                 5,
             )
-            .await;
+            .await
+    }
 
-        assert!(result.is_ok());
-        let model = result.unwrap();
-        assert_eq!(model.id, 1);
-        assert_eq!(model.project_id, 7);
-        assert_eq!(model.detection_kind, "static");
+    /// Creation persists a valid rule, stops at the per-project limit for
+    /// API-created rules (#1210), ignores `.temps.yaml` rules in that count,
+    /// and reports a missing project as not found.
+    #[tokio::test]
+    async fn create_persists_and_stops_at_the_per_project_limit() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping metric alert limit test: {error}");
+                return;
+            }
+            Err(error) => panic!("metric alert limit test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Metric alerts".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("metric-alerts-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let environment = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(format!("metric-alerts-{}", project.id)),
+            host: Set(format!("metric-alerts-{}.local", project.id)),
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert environment");
+        let service = MetricAlertService::new(db.clone());
+
+        let first = create_rule(&service, project.id, "High latency")
+            .await
+            .expect("valid rule is created");
+        assert_eq!(first.project_id, project.id);
+        assert_eq!(first.detection_kind, "static");
+        assert_eq!(first.environment_id, None);
+
+        for n in 1..MAX_METRIC_ALERT_RULES_PER_PROJECT {
+            create_rule(&service, project.id, &format!("Rule {n}"))
+                .await
+                .expect("rules under the limit are created");
+        }
+        // A config-as-code rule is bounded by the reconciler, not this limit.
+        let mut yaml_rule: ActiveModel = first.clone().into();
+        yaml_rule.id = sea_orm::ActiveValue::NotSet;
+        yaml_rule.environment_id = Set(Some(environment.id));
+        yaml_rule.name = Set("From .temps.yaml".to_string());
+        yaml_rule
+            .insert(db.as_ref())
+            .await
+            .expect("insert yaml rule");
+
+        let over = create_rule(&service, project.id, "One too many").await;
+        assert!(
+            matches!(
+                over,
+                Err(OtelError::MetricAlertLimitReached {
+                    project_id,
+                    existing: 100,
+                    limit: 100,
+                }) if project_id == project.id
+            ),
+            "{over:?}"
+        );
+
+        let missing = create_rule(&service, project.id + 100_000, "Orphan").await;
+        assert!(
+            matches!(missing, Err(OtelError::ProjectNotFound { .. })),
+            "{missing:?}"
+        );
     }
 
     #[tokio::test]
@@ -962,7 +1085,7 @@ mod tests {
                 5,
             )
             .await;
-        assert!(result.is_ok());
+        assert_passes_validation(result);
     }
 
     #[tokio::test]
@@ -1097,7 +1220,7 @@ mod tests {
                 5,
             )
             .await;
-        assert!(result.is_ok(), "anomaly + dynamic should now be accepted");
+        assert_passes_validation(result);
     }
 
     #[tokio::test]
@@ -1157,7 +1280,7 @@ mod tests {
                 5,
             )
             .await;
-        assert!(result.is_ok());
+        assert_passes_validation(result);
     }
 
     #[tokio::test]
@@ -1186,7 +1309,7 @@ mod tests {
                 250,
             )
             .await;
-        assert!(result.is_ok());
+        assert_passes_validation(result);
     }
 
     #[tokio::test]

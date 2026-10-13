@@ -6,6 +6,7 @@ import {
   listConnectionsOptions,
   listDomainsOptions,
   getProjectsOptions,
+  getProjectStatisticsOptions,
   listNotificationProvidersOptions,
   listServicesOptions,
   listBackupSchedulesOptions,
@@ -15,8 +16,10 @@ import {
   listApiKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
+import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { hasCompletedDeployment } from '@/lib/first-deploy'
 
 export interface ActivationSignals {
   /** Dedicated active admin key has authenticated an external AI harness */
@@ -29,6 +32,8 @@ export interface ActivationSignals {
   wildcardDomainReady: boolean
   /** At least one project created */
   hasProject: boolean
+  /** At least one deployment has completed (an app went live) */
+  firstDeploySucceeded: boolean
   /** external_url is configured in settings */
   externalUrlSet: boolean
   /** At least one enabled notification provider */
@@ -48,9 +53,14 @@ export interface ActivationSignals {
   totalCount: number
 }
 
-const TOTAL = 10
+const TOTAL = 11
 
 export function useActivationSignals(): ActivationSignals {
+  // Platform settings, DNS providers and the user list are readable by
+  // instance administrators only. Every other role would be refused on every
+  // page that shows the checklist, so those reads are skipped for them (a
+  // disabled query is not loading, so `isLoaded` is unaffected).
+  const isAdmin = useIsInstanceAdmin()
   const { data: settings, isLoading: settingsLoading } = useSettings()
 
   const { data: connections, isLoading: connectionsLoading } = useQuery({
@@ -67,6 +77,12 @@ export function useActivationSignals(): ActivationSignals {
     ...getProjectsOptions({ query: { page: 1, per_page: 1 } }),
     retry: false,
   })
+
+  const { data: projectStatistics, isLoading: projectStatisticsLoading } =
+    useQuery({
+      ...getProjectStatisticsOptions(),
+      retry: false,
+    })
 
   const { data: providersData, isLoading: providersLoading } = useQuery({
     ...listNotificationProvidersOptions({}),
@@ -87,11 +103,13 @@ export function useActivationSignals(): ActivationSignals {
   const { data: dnsProvidersData, isLoading: dnsProvidersLoading } = useQuery({
     ...listDnsProvidersOptions({}),
     retry: false,
+    enabled: isAdmin,
   })
 
   const { data: usersData, isLoading: usersLoading } = useQuery({
     ...listUsersOptions({ query: { include_deleted: false } }),
     retry: false,
+    enabled: isAdmin,
   })
 
   const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =
@@ -115,6 +133,7 @@ export function useActivationSignals(): ActivationSignals {
       gitConnected: false,
       wildcardDomainReady: false,
       hasProject: false,
+      firstDeploySucceeded: false,
       externalUrlSet: false,
       notificationsConfigured: false,
       hasDatabase: false,
@@ -132,6 +151,7 @@ export function useActivationSignals(): ActivationSignals {
     !connectionsLoading &&
     !domainsLoading &&
     !projectsLoading &&
+    !projectStatisticsLoading &&
     !providersLoading &&
     !servicesLoading &&
     !backupSchedulesLoading &&
@@ -152,6 +172,7 @@ export function useActivationSignals(): ActivationSignals {
     false
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
+  const firstDeploySucceeded = hasCompletedDeployment(projectStatistics)
 
   const externalUrlSet = !!settings?.external_url
 
@@ -173,6 +194,7 @@ export function useActivationSignals(): ActivationSignals {
     gitConnected,
     wildcardDomainReady,
     hasProject,
+    firstDeploySucceeded,
     externalUrlSet,
     notificationsConfigured,
     hasDatabase,
@@ -187,6 +209,7 @@ export function useActivationSignals(): ActivationSignals {
     gitConnected,
     wildcardDomainReady,
     hasProject,
+    firstDeploySucceeded,
     externalUrlSet,
     notificationsConfigured,
     hasDatabase,

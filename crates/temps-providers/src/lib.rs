@@ -3,16 +3,20 @@
 
 //! providers services and utilities
 
+mod alert_rule_service;
 pub mod continuous_archive;
+pub mod data_import;
 pub mod env_vars_provider_impl;
 pub mod externalsvc;
 pub mod health_monitor;
+pub mod managed_names;
 pub mod mariadb_query;
 pub mod parameter_strategies;
 pub mod pg_stat_statements;
 pub mod postgres_lifecycle;
 pub mod postgres_upgrade_service;
 pub mod query_service;
+pub mod readiness;
 pub mod remote_service_client;
 pub mod service_dns;
 pub mod services;

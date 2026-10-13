@@ -231,6 +231,10 @@ Daily buckets with `new_customers` and `churned_customers`. The dashboard render
 
 A feed of the most recent billing events: type, customer reference, amount, currency, and the MRR contribution. Use it to debug webhook delivery or spot anomalies.
 
+### Revenue Across Projects
+
+To see revenue for every project in one place, open **Revenue** from the **All tools** page (Observe group) or search for "revenue" in the command palette (`⌘K`). It is also available directly at `https://<temps_app>/revenue`, with a project filter to narrow the events table.
+
 <Note>
 All monetary values are stored and returned in the **minor unit** of the currency — Temps never does floating-point math on money. Format on the client with `Intl.NumberFormat`.
 </Note>

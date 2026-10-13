@@ -52,7 +52,7 @@ import {
   formatBytesBinary,
   formatBytesDecimal,
   formatBytesPerSecond,
-  formatDays,
+  diskProjectionCaption,
   formatPercent,
   formatRateTick,
   isMetricsUnavailable,
@@ -112,9 +112,9 @@ const lastValue = (points: MetricDataPoint[] | undefined) =>
 // ---------------------------------------------------------------------------
 
 const TONE_TEXT: Record<UsageTone, string> = {
-  good: 'text-emerald-600 dark:text-emerald-400',
-  warn: 'text-amber-600 dark:text-amber-400',
-  poor: 'text-rose-600 dark:text-rose-400',
+  good: 'text-emerald-700 dark:text-emerald-400',
+  warn: 'text-amber-700 dark:text-amber-400',
+  poor: 'text-rose-700 dark:text-rose-400',
 }
 const TONE_BAR: Record<UsageTone, string> = {
   good: '[&>div]:bg-primary',
@@ -338,7 +338,9 @@ function DockerDiskUsageCard() {
           </div>
         ) : q.isError || !usage ? (
           <div className="space-y-2 text-sm">
-            <p className="text-rose-500">docker system df did not answer.</p>
+            <p className="text-rose-700 dark:text-rose-500">
+              docker system df did not answer.
+            </p>
             <p className="text-xs text-muted-foreground">
               {(q.error as { detail?: string } | null)?.detail ??
                 'Docker walks every image layer and volume for this figure; it can take up to a minute on a busy host.'}
@@ -474,6 +476,13 @@ export function ServerMonitoring() {
   const cpu = useNodeSeries('node.cpu_percent', range, refetchInterval)
   const memory = useNodeSeries('node.memory_percent', range, refetchInterval)
   const disk = useNodeSeries('node.disk_used_bytes', range, refetchInterval)
+  // The projection always reads the longest window: extrapolating a fill
+  // date from the last hour turns one image pull into "full in 3 days".
+  const diskHistory = useNodeSeries(
+    'node.disk_used_bytes',
+    '7d',
+    refetchInterval
+  )
   const rx = useNodeSeries(
     'node.network_rx_bytes_total',
     range,
@@ -509,7 +518,7 @@ export function ServerMonitoring() {
 
   const cpuPeak = peakOf(cpu.data)
   const memPeak = peakOf(memory.data)
-  const projection = projectDisk(disk.data, diskTotal)
+  const projection = projectDisk(diskHistory.data, diskTotal)
 
   const rxRate = toRatePerSecond(rx.data, step)
   const txRate = toRatePerSecond(tx.data, step)
@@ -690,9 +699,7 @@ export function ServerMonitoring() {
           thresholds={DISK_THRESHOLDS}
           sub={
             diskTotal != null && diskUsed != null
-              ? projection && projection.bytesPerDay > 0
-                ? `${formatBytesDecimal(diskTotal - diskUsed)} free · growing ${formatBytesDecimal(projection.bytesPerDay)}/day, full in ${formatDays(projection.daysToFull)}`
-                : `${formatBytesDecimal(diskTotal - diskUsed)} free · not growing over the last ${range}`
+              ? diskProjectionCaption(diskTotal - diskUsed, projection)
               : null
           }
           isPending={latest.isPending && disk.isPending}

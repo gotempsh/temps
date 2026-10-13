@@ -26,6 +26,7 @@ pub type ImageImportStream =
     Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
 
 pub mod build_protocol;
+pub mod build_timings;
 pub mod compose;
 mod compose_remote;
 
@@ -175,8 +176,7 @@ pub enum BuilderError {
     BuildFailed(String),
 
     /// A build step failed and the host or builder showed the step ran out
-    /// of memory. `message` is the builder's own error text, including the
-    /// `Build failed:` prefix when it came from the build stream.
+    /// of memory. `message` is the builder's own error text.
     #[error("{message}. {diagnosis}")]
     BuildOutOfMemory {
         message: String,
@@ -253,6 +253,9 @@ pub enum DeployerError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildRequest {
+    /// Images whose layers may be reused by the local Docker builder.
+    #[serde(default)]
+    pub cache_from: Vec<String>,
     pub image_name: String,
     pub context_path: PathBuf,
     pub dockerfile_path: Option<PathBuf>,
@@ -861,6 +864,23 @@ pub trait ImageBuilder: Send + Sync {
         )))
     }
 
+    /// Stream `source_path` inside `image_name` out as the raw tar Docker's
+    /// container-archive API produces, without unpacking it.
+    ///
+    /// This is how a worker hands the files of an image it built (a static
+    /// site's output directory, immutable assets) to the control plane, which
+    /// validates and unpacks them itself. Builders that cannot serve it keep
+    /// the default, which refuses with a message naming the image and path.
+    async fn export_path_stream(
+        &self,
+        image_name: &str,
+        source_path: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        Err(BuilderError::Other(format!(
+            "This image builder cannot export path '{source_path}' from image '{image_name}'"
+        )))
+    }
+
     /// Extract files from an image to a destination path
     async fn extract_from_image(
         &self,
@@ -1276,6 +1296,7 @@ mod tests {
         build_args.insert("ENV".to_string(), "production".to_string());
 
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "test-image:latest".to_string(),
             context_path: context_path.clone(),
             dockerfile_path: Some(context_path.join("Dockerfile")),
@@ -1508,6 +1529,7 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "test:latest".to_string(),
             context_path: PathBuf::from("/tmp/build"),
             dockerfile_path: None,
@@ -1579,6 +1601,7 @@ CMD ["echo", "Hello from container"]
         build_args.insert("RUST_VERSION".to_string(), "1.70".to_string());
 
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "test-app:v1.0".to_string(),
             context_path: temp_dir.path().to_path_buf(),
             dockerfile_path: Some(dockerfile_path.clone()),

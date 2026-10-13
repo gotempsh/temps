@@ -24,6 +24,7 @@ use temps_file_store::{FileStore, FileStoreError};
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
+use crate::jobs::builder_node::{image_builder_for_build, BuilderNodeResolver};
 use crate::jobs::ImageOutput;
 
 /// Output from PersistStaticAssetsJob
@@ -49,6 +50,8 @@ pub struct PersistStaticAssetsJob {
     /// so they match browser request URLs.
     path_rewrites: Vec<(String, String)>,
     image_builder: Arc<dyn ImageBuilder>,
+    /// Reaches the worker that built the image, when the build ran on one
+    builder_node_resolver: Option<Arc<dyn BuilderNodeResolver>>,
     /// Legacy chunks directory (backward compat, will be removed).
     chunks_dir: PathBuf,
     /// Content-addressable blob store for persisting assets.
@@ -172,12 +175,19 @@ impl PersistStaticAssetsJob {
             search_paths,
             path_rewrites,
             image_builder,
+            builder_node_resolver: None,
             chunks_dir,
             file_store: None,
             db: None,
             log_id: None,
             log_service: None,
         }
+    }
+
+    /// Read worker-built images from the node that built them.
+    pub fn with_builder_node_resolver(mut self, resolver: Arc<dyn BuilderNodeResolver>) -> Self {
+        self.builder_node_resolver = Some(resolver);
+        self
     }
 
     pub fn with_file_store(mut self, file_store: Arc<dyn FileStore>) -> Self {
@@ -313,8 +323,36 @@ impl WorkflowTask for PersistStaticAssetsJob {
         let image_output = ImageOutput::from_context(&context, &self.build_job_id)?;
         let image_tag = &image_output.image_tag;
 
+        // A worker-built image is only readable on the node that built it.
+        let image_builder = match image_builder_for_build(
+            &context,
+            &self.build_job_id,
+            &self.image_builder,
+            self.builder_node_resolver.as_ref(),
+        )
+        .await
+        {
+            Ok((image_builder, _)) => image_builder,
+            Err(error) => {
+                // Best effort like every other step of this job: the
+                // deployment still serves, only stale-chunk fallback is lost.
+                warn!(
+                    deployment_id = self.deployment_id,
+                    "Cannot reach the node that built image {}: {}", image_tag, error
+                );
+                self.log(format!(
+                    "⚠️ Skipping static asset persistence: cannot reach the node that built image {image_tag}: {error}"
+                ))
+                .await?;
+                let mut updated_context = context.clone();
+                updated_context.set_output(&self.job_id, "assets_persisted", 0u32)?;
+                updated_context.set_output(&self.job_id, "total_size_bytes", 0u64)?;
+                return Ok(JobResult::success(updated_context));
+            }
+        };
+
         // Detect the image's WORKDIR to resolve relative search paths
-        let workdir = match self.image_builder.inspect_image(image_tag).await {
+        let workdir = match image_builder.inspect_image(image_tag).await {
             Ok(info) => {
                 let wd = info.working_dir.unwrap_or_else(|| "/app".to_string());
                 self.log(format!("Detected image WORKDIR: {}", wd)).await?;
@@ -414,8 +452,7 @@ impl WorkflowTask for PersistStaticAssetsJob {
             ))
             .await?;
 
-            let extraction_result = self
-                .image_builder
+            let extraction_result = image_builder
                 .extract_from_image(image_tag, &absolute_search_path, temp_dir.path())
                 .await;
             match extraction_result {
@@ -983,6 +1020,91 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(store.put_blob_calls.load(Ordering::Relaxed), 0);
+    }
+
+    fn worker_build_context(node_id: i32) -> WorkflowContext {
+        let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        for (key, value) in [
+            ("image_tag", "temps-app:abc"),
+            ("image_id", "sha256:abc"),
+            ("build_context", "/tmp/build"),
+            ("dockerfile_path", "/tmp/build/Dockerfile"),
+        ] {
+            context.set_output("build", key, value).unwrap();
+        }
+        context.set_output("build", "size_bytes", 1u64).unwrap();
+        context
+            .set_output(
+                "build",
+                "image_tags_by_platform",
+                std::collections::HashMap::from([(
+                    "linux/amd64".to_string(),
+                    "temps-app:abc".to_string(),
+                )]),
+            )
+            .unwrap();
+        context
+            .set_output("build", "builder_node_id", Some(node_id))
+            .unwrap();
+        context
+    }
+
+    #[tokio::test]
+    async fn unreachable_build_node_skips_persistence_without_reading_locally() {
+        // MockImageBuilder panics on extraction, so success proves the job
+        // never fell back to a builder that does not have the image.
+        let temporary = tempfile::tempdir().unwrap();
+        let job = PersistStaticAssetsJob::new(
+            "persist".to_string(),
+            1,
+            1,
+            1,
+            "build".to_string(),
+            vec!["/app/.next/static".to_string()],
+            vec![],
+            Arc::new(MockImageBuilder),
+            temporary.path().join("chunks"),
+        );
+
+        let result = job
+            .execute(worker_build_context(7))
+            .await
+            .expect("persistence is best effort");
+
+        let persisted: u32 = result
+            .context
+            .get_output("persist", "assets_persisted")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, 0);
+    }
+
+    #[tokio::test]
+    async fn worker_built_image_is_inspected_on_the_build_node() {
+        let temporary = tempfile::tempdir().unwrap();
+        let resolver = Arc::new(crate::jobs::builder_node::tests::StaticResolver::new(
+            7,
+            Arc::new(MockImageBuilder),
+        ));
+        // No search paths: only the build-node lookup and WORKDIR inspection run.
+        let job = PersistStaticAssetsJob::new(
+            "persist".to_string(),
+            1,
+            1,
+            1,
+            "build".to_string(),
+            vec![],
+            vec![],
+            Arc::new(MockImageBuilder),
+            temporary.path().join("chunks"),
+        )
+        .with_builder_node_resolver(resolver.clone());
+
+        job.execute(worker_build_context(7))
+            .await
+            .expect("persistence completes");
+
+        assert_eq!(*resolver.lookups.lock().unwrap(), vec![7]);
     }
 
     // Minimal mock for tests that don't need real image extraction

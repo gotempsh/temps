@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use clap::Args;
+use clap::{Args, Subcommand};
 use colored::Colorize;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,16 @@ use tokio::time::timeout;
 
 use super::upgrade;
 
+mod mesh;
+pub use mesh::MeshDoctorArgs;
+
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What to do when the daemon is unreachable; `temps serve` refuses to start
+/// the console in that state (the `full` profile).
+const DOCKER_REMEDIATION: &str = "Start the Docker daemon, or point DOCKER_HOST (or `docker \
+     context use`) at the socket it listens on; `temps serve --profile control-plane` runs \
+     without a local daemon";
 
 /// Diagnose the temps installation and check system health
 #[derive(Args)]
@@ -23,6 +32,16 @@ pub struct DoctorCommand {
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub scope: Option<DoctorScope>,
+}
+
+#[derive(Subcommand)]
+pub enum DoctorScope {
+    /// Check this host's end of the WireGuard mesh (a node or the control
+    /// plane), with the fix for each failing check
+    Mesh(MeshDoctorArgs),
 }
 
 /// Result of a single diagnostic check
@@ -36,7 +55,7 @@ enum CheckResult {
 
 /// Tracks overall diagnostic state
 struct DiagnosticReport {
-    checks: Vec<(&'static str, CheckResult)>,
+    checks: Vec<(String, CheckResult)>,
     pass_count: u32,
     warn_count: u32,
     fail_count: u32,
@@ -52,14 +71,14 @@ impl DiagnosticReport {
         }
     }
 
-    fn add(&mut self, label: &'static str, result: CheckResult) {
+    fn add(&mut self, label: impl Into<String>, result: CheckResult) {
         match &result {
             CheckResult::Pass(_) => self.pass_count += 1,
             CheckResult::Warn(_) => self.warn_count += 1,
             CheckResult::Fail(_) => self.fail_count += 1,
             CheckResult::Info(_) => {}
         }
-        self.checks.push((label, result));
+        self.checks.push((label.into(), result));
     }
 
     fn print(&self) {
@@ -124,6 +143,9 @@ impl DoctorCommand {
     }
 
     async fn run(self) -> anyhow::Result<()> {
+        if let Some(DoctorScope::Mesh(args)) = &self.scope {
+            return mesh::run(args, self.database_url.as_deref(), &self.resolve_data_dir()).await;
+        }
         println!();
         println!(
             "{}",
@@ -163,6 +185,12 @@ impl DoctorCommand {
         report.checks.clear();
 
         // -- Application Settings (requires DB) --
+        println!();
+        println!("{}", "  Initial admin".bright_yellow().bold());
+        self.check_initial_admin(db.as_ref(), &mut report).await;
+        report.print();
+        report.checks.clear();
+
         if let Some(ref db) = db {
             println!();
             println!("{}", "  Application".bright_yellow().bold());
@@ -175,6 +203,13 @@ impl DoctorCommand {
             println!();
             println!("{}", "  Multi-node networking".bright_yellow().bold());
             self.check_multi_node_networking(db, &mut report).await;
+            report.print();
+            report.checks.clear();
+
+            println!();
+            println!("{}", "  WireGuard mesh".bright_yellow().bold());
+            let checks = mesh::control_plane_checks(db, &self.resolve_data_dir()).await;
+            mesh::add_to_report(&checks, &mut report);
             report.print();
             report.checks.clear();
         }
@@ -207,32 +242,33 @@ impl DoctorCommand {
     async fn check_version(&self, report: &mut DiagnosticReport) {
         let current = upgrade::current_version_tag();
         report.add("Current version", CheckResult::Info(current.clone()));
+        // The exact string `temps --version` prints, so the two are visibly
+        // the same build (tag, commit, build time).
+        report.add(
+            "Build",
+            CheckResult::Info(env!("TEMPS_VERSION").to_string()),
+        );
 
-        // Doctor wants visibility into "is anything newer out there?"
-        // regardless of channel — `Beta` includes both stable and beta
-        // releases, so it gives the absolute latest tag. The label below
-        // surfaces `(prerelease)` if the newest happens to be a beta.
-        match upgrade::fetch_latest_release_in_channel(upgrade::UpgradeChannel::Beta).await {
+        // Compare within the channel this build came from -- a nightly
+        // against nightlies, a beta against betas (and stable), stable
+        // against stable -- the same inference the server's update notifier
+        // uses when no channel is pinned in Settings.
+        let channel = upgrade::UpgradeChannel::for_installed_version(&current);
+        match upgrade::fetch_latest_release_in_channel(channel).await {
             Ok(release) => {
-                let latest = &release.tag_name;
-                if latest == &current {
-                    report.add("Update", CheckResult::Pass("Up to date".to_string()));
-                } else {
-                    let label = if release.prerelease {
-                        format!("{} available (prerelease)", latest)
-                    } else {
-                        format!("{} available", latest)
-                    };
-                    report.add(
-                        "Update",
-                        CheckResult::Warn(format!("{} - run `temps upgrade` to update", label)),
-                    );
-                }
+                report.add(
+                    "Update",
+                    update_check_result(&current, channel, &release.tag_name),
+                );
             }
             Err(e) => {
                 report.add(
                     "Update check",
-                    CheckResult::Warn(format!("Could not check for updates: {}", e)),
+                    CheckResult::Warn(format!(
+                        "Could not check the {} channel for updates: {}",
+                        channel.as_str(),
+                        e
+                    )),
                 );
             }
         }
@@ -394,12 +430,22 @@ impl DoctorCommand {
     // ── Docker checks ───────────────────────────────────────────────
 
     async fn check_docker(&self, report: &mut DiagnosticReport) {
-        let docker = match bollard::Docker::connect_with_local_defaults() {
+        // Same endpoint resolution as `temps serve`: DOCKER_HOST (including
+        // tcp:// and ssh:// endpoints), else the active Docker context adopted
+        // at startup, else the default socket. A doctor that probed a
+        // different endpoint than the server would report the wrong answer.
+        let endpoint = crate::docker_context::docker_endpoint();
+        report.add("Endpoint", CheckResult::Info(endpoint.describe()));
+
+        let docker = match bollard::Docker::connect_with_defaults() {
             Ok(d) => d,
             Err(e) => {
                 report.add(
                     "Daemon",
-                    CheckResult::Fail(format!("Cannot connect: {}", e)),
+                    CheckResult::Fail(format!(
+                        "Cannot connect to {}: {}. {}",
+                        endpoint.host, e, DOCKER_REMEDIATION
+                    )),
                 );
                 return;
             }
@@ -416,13 +462,24 @@ impl DoctorCommand {
                 );
             }
             Ok(Err(e)) => {
-                report.add("Daemon", CheckResult::Fail(format!("Error: {}", e)));
+                report.add(
+                    "Daemon",
+                    CheckResult::Fail(format!(
+                        "Not reachable at {}: {}. {}",
+                        endpoint.host, e, DOCKER_REMEDIATION
+                    )),
+                );
                 return;
             }
             Err(_) => {
                 report.add(
                     "Daemon",
-                    CheckResult::Fail("Connection timed out".to_string()),
+                    CheckResult::Fail(format!(
+                        "No answer from {} within {}s. {}",
+                        endpoint.host,
+                        CHECK_TIMEOUT.as_secs(),
+                        DOCKER_REMEDIATION
+                    )),
                 );
                 return;
             }
@@ -718,6 +775,35 @@ impl DoctorCommand {
         }
 
         Some(db)
+    }
+
+    // ── Initial admin bootstrap ─────────────────────────────────────
+
+    /// `temps serve` creates the first admin from TEMPS_ADMIN_EMAIL and
+    /// TEMPS_ADMIN_PASSWORD_FILE when no users exist. Doctor checks persisted
+    /// bootstrap state without rereading these one-shot input secrets.
+    async fn check_initial_admin(
+        &self,
+        db: Option<&sea_orm::DatabaseConnection>,
+        report: &mut DiagnosticReport,
+    ) {
+        let users: Option<i64> = if let Some(db) = db {
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*) AS count FROM users WHERE deleted_at IS NULL AND id <> 0"
+                    .to_string(),
+            ))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| {
+                use sea_orm::TryGetable;
+                i64::try_get_by(&row, "count").ok()
+            })
+        } else {
+            None
+        };
+        report.add("Initial admin", initial_admin_result(users));
     }
 
     // ── App settings checks ─────────────────────────────────────────
@@ -1133,6 +1219,22 @@ impl DoctorCommand {
     }
 }
 
+/// Assess persisted bootstrap state without reading first-boot inputs.
+fn initial_admin_result(users: Option<i64>) -> CheckResult {
+    match users {
+        Some(count) if count > 0 => CheckResult::Pass(format!(
+            "{count} user(s) exist; initial user bootstrap has completed"
+        )),
+        Some(0) => CheckResult::Warn(
+            "No users exist yet. Run `temps serve` to complete initial admin setup; \
+             unattended first boot requires TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE".to_string()
+        ),
+        _ => CheckResult::Warn(
+            "Could not determine whether users exist. Restore database connectivity to check persisted initial admin setup".to_string()
+        ),
+    }
+}
+
 /// Resolve the default installation layout without overriding an explicit
 /// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
 /// older deployment scripts placed runtime secrets in `~/.temps/data`.
@@ -1278,9 +1380,89 @@ fn mask_database_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Turn "newest release on the channel" into a doctor line. Only a strictly
+/// newer release is reported as an update, and the suggested command names
+/// the channel so it installs what was suggested (plain `temps upgrade`
+/// tracks stable).
+fn update_check_result(
+    current: &str,
+    channel: upgrade::UpgradeChannel,
+    latest: &str,
+) -> CheckResult {
+    let channel_name = channel.as_str();
+    match upgrade::update_verdict(current, latest) {
+        upgrade::UpdateVerdict::UpToDate => {
+            CheckResult::Pass(format!("Up to date on the {channel_name} channel"))
+        }
+        upgrade::UpdateVerdict::Available => CheckResult::Warn(format!(
+            "{latest} available on the {channel_name} channel - run \
+             `temps upgrade --channel {channel_name}` to update"
+        )),
+        upgrade::UpdateVerdict::AheadOfChannel => CheckResult::Pass(format!(
+            "Up to date on the {channel_name} channel ({current} is newer than the newest \
+             published {channel_name} release, {latest})"
+        )),
+        upgrade::UpdateVerdict::Incomparable => CheckResult::Info(format!(
+            "Newest {channel_name} release is {latest}; this build ({current}) is not a \
+             release tag, so it cannot be compared"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_check_nightly_is_not_offered_an_older_beta() {
+        // Previously: "v0.1.0-beta.56 available (prerelease) - run `temps upgrade`".
+        let current = "v0.1.0-nightly.20261004.32a8e9c1";
+        let channel = upgrade::UpgradeChannel::for_installed_version(current);
+        assert_eq!(channel, upgrade::UpgradeChannel::Nightly);
+        match update_check_result(current, channel, "v0.1.0-beta.56") {
+            CheckResult::Pass(msg) => assert!(msg.contains("nightly channel"), "{msg}"),
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_check_suggests_channel_specific_upgrade() {
+        match update_check_result(
+            "v0.1.0-nightly.20261003.6f74680e",
+            upgrade::UpgradeChannel::Nightly,
+            "v0.1.0-nightly.20261004.32a8e9c1",
+        ) {
+            CheckResult::Warn(msg) => {
+                assert!(msg.contains("v0.1.0-nightly.20261004.32a8e9c1"), "{msg}");
+                assert!(msg.contains("temps upgrade --channel nightly"), "{msg}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+        match update_check_result(
+            "v0.1.0-beta.55",
+            upgrade::UpgradeChannel::Beta,
+            "v0.1.0-beta.56",
+        ) {
+            CheckResult::Warn(msg) => assert!(msg.contains("--channel beta"), "{msg}"),
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_check_same_version_is_up_to_date() {
+        assert!(matches!(
+            update_check_result("v0.1.0", upgrade::UpgradeChannel::Stable, "v0.1.0"),
+            CheckResult::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn test_update_check_dev_build_is_informational() {
+        assert!(matches!(
+            update_check_result("dev", upgrade::UpgradeChannel::Stable, "v0.1.0"),
+            CheckResult::Info(_)
+        ));
+    }
 
     #[test]
     fn test_mask_database_url_with_password() {
@@ -1352,6 +1534,30 @@ mod tests {
     fn test_parse_pg_url_invalid_scheme() {
         let result = parse_pg_url("mysql://u:p@localhost:3306/db");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn initial_admin_does_not_treat_a_failed_query_as_an_empty_database() {
+        assert!(
+            matches!(initial_admin_result(None), CheckResult::Warn(message)
+            if message.contains("Could not determine") && message.contains("database connectivity"))
+        );
+    }
+
+    #[test]
+    fn initial_admin_reports_completed_bootstrap_from_persisted_users() {
+        assert!(
+            matches!(initial_admin_result(Some(2)), CheckResult::Pass(message)
+            if message.contains("bootstrap has completed"))
+        );
+    }
+
+    #[test]
+    fn initial_admin_reports_the_required_first_boot_step() {
+        assert!(
+            matches!(initial_admin_result(Some(0)), CheckResult::Warn(message)
+            if message.contains("temps serve") && message.contains("unattended first boot"))
+        );
     }
 
     #[test]

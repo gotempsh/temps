@@ -18,7 +18,7 @@ import {
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import { Button } from '@/components/ui/button'
-import { PageHeader, Status } from '@temps-sdk/ds'
+import { PageHeader, Status, useUrlState } from '@temps-sdk/ds'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -88,7 +88,13 @@ export function PluginsPage() {
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
   )
-  const [tab, setTab] = useState('browse')
+  // The active tab lives in the URL (RULES.md "the URL is the state") so a
+  // refresh, a shared link, or Back keeps the same view. Browse is the
+  // default and is left out of the URL.
+  const { get: getUrlState, patch: patchUrlState } = useUrlState<'tab'>()
+  const tab = getUrlState('tab') === 'running' ? 'running' : 'browse'
+  const setTab = (value: string) =>
+    patchUrlState({ tab: value === 'browse' ? undefined : value })
   const managementPending = requiresPersistentStorage || reloadPlugins.isPending || uninstallPlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()

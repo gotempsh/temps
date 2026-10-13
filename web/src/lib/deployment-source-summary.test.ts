@@ -196,3 +196,10 @@ describe('deploymentSourceSummary', () => {
     ).toEqual({ kind: 'docker_image' })
   })
 })
+
+test('monitoring-only projects cannot be redeployed', () => {
+  expect(deploymentRedeployPlan(deployment(), 'external')).toEqual({
+    kind: 'unsupported',
+    sourceType: 'external',
+  })
+})

@@ -31,6 +31,7 @@ import {
   Radio,
   Bot,
   Plug,
+  Route,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -48,6 +49,9 @@ const sectionIcons: Record<string, LucideIcon> = {
   'errors/alert-rules': Bell,
   analytics: BarChart3,
   'analytics/visitors': Users,
+  'analytics/live-visitors': Radio,
+  'analytics/live': Globe,
+  'analytics/journey': Route,
   'analytics/activity': Activity,
   'analytics/pages': FileText,
   'analytics/replays': Play,
@@ -74,6 +78,7 @@ const sectionIcons: Record<string, LucideIcon> = {
 
 import {
   PROJECT_SECTION_LINKS,
+  type ProjectSectionLink,
   resolveProjectPrimaryRoute,
   resolveProjectSectionLink,
 } from '@/lib/project-navigation'
@@ -91,7 +96,29 @@ export function ProjectSectionLayout({
   const section = resolveProjectPrimaryRoute(route)
   const { projectNavEntries } = usePluginsContext()
   const { projectToolLinks } = useConsoleExtensions()
-  const base = PROJECT_SECTION_LINKS[section]
+  if (
+    project.source_type === 'external' &&
+    ['integrations', 'hosting', 'connect-repository', 'setup'].some(
+      (path) => route === path || route.startsWith(path + '/')
+    )
+  )
+    return <>{children}</>
+  const base: ProjectSectionLink[] | undefined =
+    project.source_type === 'external'
+      ? section === 'project'
+        ? undefined
+        : section === 'settings'
+          ? [
+              { title: 'General', url: 'settings/general' },
+              { title: 'Telemetry', url: 'settings/telemetry' },
+            ]
+          : section === 'logs'
+            ? undefined
+            : PROJECT_SECTION_LINKS[section]?.filter(
+                (link) =>
+                  !['analytics/api-traffic', 'ai-crawlers'].includes(link.url)
+              )
+      : PROJECT_SECTION_LINKS[section]
   if (!base || base.length < 2) return <>{children}</>
   const title =
     section === 'project'
@@ -115,10 +142,10 @@ export function ProjectSectionLayout({
     return {
       key: link.url,
       title: link.title,
+      keywords: link.keywords,
       to: href,
       icon: sectionIcons[link.url] ?? Plug,
-      active:
-        active === link.url || (!active && location.pathname === href),
+      active: active === link.url || (!active && location.pathname === href),
     }
   })
   // Keyed by section so the page filter starts empty in each section.

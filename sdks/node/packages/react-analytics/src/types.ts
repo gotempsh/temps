@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type React from "react";
-import type {
-  JsonValue,
-  AnalyticsClientOptions,
-  SessionRecordingConfig,
-} from "@temps-sdk/analytics-core";
+import type { JsonValue, AnalyticsClientOptions } from "@temps-sdk/analytics-core";
+import type { SessionRecorderConfig } from "./SessionRecorder";
 
 export type {
   JsonPrimitive,
@@ -47,8 +44,12 @@ export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {
   engagementThreshold?: number;
   /** Enable session recording. Defaults to false. */
   enableSessionRecording?: boolean;
-  /** Session recording configuration. */
-  sessionRecordingConfig?: SessionRecordingConfig;
+  /**
+   * Session recording configuration, forwarded to the recorder in full
+   * (including `idleTimeout`, `useDefaultExcludedPaths`, `debug` and the
+   * rrweb-level options).
+   */
+  sessionRecordingConfig?: SessionRecorderConfig;
   /** Children to render inside the provider. */
   children: React.ReactNode;
 }

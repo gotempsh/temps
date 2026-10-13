@@ -15,6 +15,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`cloud backup-schedule`](#cloud-backup-schedule)
 - [`cloud vps`](#cloud-vps)
 - [`cloud billing`](#cloud-billing)
+- [`cloud console-access`](#cloud-console-access)
 - [`cloud telemetry`](#cloud-telemetry)
 
 ## `cloud`
@@ -32,6 +33,7 @@ Temps Cloud
 - `backup-schedule` - The backup schedule that writes to the Temps Cloud destination
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
+- `console-access` - Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
 
 ### `cloud login`
@@ -233,6 +235,46 @@ Upgrade your plan
 |------|-------------|---------|----------|
 | `--yearly` | Use yearly billing cycle (default: monthly) | - | No |
 | `--no-browser` | Don't open browser, just show the URL | - | No |
+
+### `cloud console-access`
+
+Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
+
+**Subcommands:**
+
+- `status` - Show whether Temps Cloud can open this console
+- `enable` - Allow Temps Cloud to open this console
+- `disable` - Stop Temps Cloud from opening this console (revokes its sign-in provider and sessions immediately)
+
+#### `cloud console-access status`
+
+Show whether Temps Cloud can open this console
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+#### `cloud console-access enable`
+
+Allow Temps Cloud to open this console
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+#### `cloud console-access disable`
+
+Stop Temps Cloud from opening this console (revokes its sign-in provider and sessions immediately)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
 
 ### `cloud telemetry`
 

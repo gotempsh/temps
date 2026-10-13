@@ -1,15 +1,138 @@
 export const metadata = {
   title: 'Teams & Collaboration',
-  description: 'Set up team collaboration on Temps with role-based permissions, project sharing, team invitations, and audit logs. Unlimited seats included.',
+  description: 'Give people access to Temps with user accounts, teams, project-level roles, single sign-on and audit logs.',
   alternates: {
     canonical: '/docs/teams',
   },
 }
 
+export const sections = [
+  { title: 'How access works', id: 'how-access-works' },
+  { title: 'Add people', id: 'add-people' },
+  { title: 'Create a team', id: 'create-a-team' },
+  { title: 'Restrict a project to teams', id: 'restrict-a-project' },
+  { title: 'Team roles', id: 'team-roles' },
+  { title: 'Single sign-on', id: 'sso' },
+  { title: 'Audit logs', id: 'audit-logs' },
+  { title: 'Limitations', id: 'limitations' },
+]
 
 # Teams & Collaboration
-## Page Goal
-Enable team collaboration with proper access controls.
-## Target Persona
-**Team Lead Terry** - Managing multiple developers, needs access control, wants collaboration features.
-## Key Content: Team invitations, role-based permissions, project sharing, audit logs, SSO (if applicable)
+
+Every person who uses Temps gets their own account. Teams let you decide which projects each person can change, and what they can do in them. There is no limit on the number of users. {{ className: 'lead' }}
+
+<Note>
+Teams are a **Beta** feature: they work and are tested, but the data model may still change between releases. See [Feature maturity](/docs/feature-maturity).
+</Note>
+
+---
+
+## How access works {{ anchor: true, id: 'how-access-works' }}
+
+Access is decided at two levels:
+
+1. **Instance role.** Every account is either an **Admin** or a **User**.
+   - Admins can do everything, including managing users, teams, settings and backups.
+   - Users can create, deploy and operate projects, but cannot manage users or platform settings, and cannot delete projects, deployments or domains.
+2. **Project access.** A project that has no team grants is open to every User account. Once you grant a project to one or more teams, only members of those teams can work on it, with the permissions of their [team role](#team-roles).
+
+The two levels only ever narrow each other. A team role cannot give a User account a permission its instance role does not have, and team roles do not apply to Admins.
+
+API keys have their own roles, described in [Manage team access](/docs/manage-team-access) and [API](/docs/api-overview).
+
+---
+
+## Add people {{ anchor: true, id: 'add-people' }}
+
+Temps does not send email invitations. An admin creates each account:
+
+1. Go to **Settings → Users** and click to add a user.
+2. Enter the person's name and email, and set a temporary password (the form can generate one).
+3. Choose the **User** or **Admin** role.
+4. Optionally add them to a team with a team role.
+5. Keep **must change password** on, so they choose their own password at first sign-in.
+
+Send the temporary password to the person through a channel you trust.
+
+If someone forgets their password, an admin can reset it from the user's page. Temps shows a new temporary password once, and the user must change it at their next sign-in. With [single sign-on](#sso), accounts can instead be created automatically the first time someone signs in.
+
+---
+
+## Create a team {{ anchor: true, id: 'create-a-team' }}
+
+Only admins can create teams and manage their members.
+
+1. Go to **Settings → Teams** and create a team.
+2. Open the team and add members, choosing a role for each.
+
+From the CLI:
+
+```bash
+bunx @temps-sdk/cli teams create
+bunx @temps-sdk/cli teams members add <team> -u <user-email> -r deployer
+bunx @temps-sdk/cli teams members set-role <team> -u <user-email> -r admin
+```
+
+---
+
+## Restrict a project to teams {{ anchor: true, id: 'restrict-a-project' }}
+
+1. Open the project and go to **Settings → Access**.
+2. Grant access to a team and choose the role the team has on this project.
+
+Or from the CLI:
+
+```bash
+bunx @temps-sdk/cli access grant <team> -p my-app -r deployer
+bunx @temps-sdk/cli access list -p my-app
+bunx @temps-sdk/cli access revoke <team> -p my-app
+```
+
+Granting the first team, or revoking the last one, changes the project from open to restricted or back, so only an admin can do it. Other people with access can add or change grants, but never above their own role on the project.
+
+A member's permissions on a project are the lower of their role in the team and the team's role on the project. If they belong to several teams with access, they get the combined permissions.
+
+New projects are not granted to any team automatically, so they start open to all User accounts. Changes can take up to a minute to apply.
+
+---
+
+## Team roles {{ anchor: true, id: 'team-roles' }}
+
+Each role includes everything the role below it can do.
+
+| Role | Can do on the project |
+|------|------------------------|
+| **Viewer** | See the project and its deployments, environments, domains, logs, metrics, analytics, backups, cron jobs, services and errors |
+| **Deployer** | Viewer, plus deploy, create and change environments, and run pipelines |
+| **Admin** | Deployer, plus change project settings, manage domains, backups, cron jobs, linked services, deployment tokens and storage, and delete deployments and environments |
+| **Owner** | Admin, plus delete the project |
+
+Team roles never include user, settings, API key or audit log permissions. Those are for instance Admins only.
+
+---
+
+## Single sign-on {{ anchor: true, id: 'sso' }}
+
+Temps supports any OpenID Connect provider. Configure it under **Settings → Authentication**. The callback URL to register with your provider is `https://<your-temps-host>/api/auth/oidc/callback`.
+
+- **Automatic accounts.** With just-in-time provisioning (on by default), an account is created the first time someone signs in. Turn it off to allow only people who already have an account.
+- **Roles from groups.** Role mappings assign **Admin** or **User** from the groups in the identity token. Mappings are checked in priority order and the first match wins; `*` matches everyone. Without a match, Temps uses the token's role claim, then the provider's default role (**User**). The role is updated on every sign-in.
+- **Email verification.** By default Temps only links a sign-in to an existing account when the provider reports the email as verified. Enable **trust IdP email** only for providers that always verify email addresses.
+
+Team membership is managed in Temps, not mapped from the identity provider.
+
+---
+
+## Audit logs {{ anchor: true, id: 'audit-logs' }}
+
+Admins can review who did what under **Audit Logs**. Entries record the user, the operation (for example user creation, role changes, team and project access changes, API key creation, settings changes, revealed environment variable values, failed logins and denied requests), the IP address and its location, and the time. Filter by operation, user or date, or query `GET /api/audit/logs`.
+
+Audit entries are kept indefinitely, except denied-request entries, which are removed after 90 days.
+
+---
+
+## Limitations {{ anchor: true, id: 'limitations' }}
+
+- Team admins cannot add or remove team members. An instance Admin manages membership.
+- Accounts with the **User** role cannot enroll in MFA in the current release.
+- There are no email invitations; accounts are created by an admin or through SSO.

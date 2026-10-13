@@ -39,24 +39,29 @@ Create a new DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Provider name | - | No |
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
 | `-d, --description <description>` | Provider description | - | No |
-| `--api-token <token>` | API token (Cloudflare, DigitalOcean) | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
 | `--access-key-id <key>` | AWS access key ID | - | No |
-| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | No |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | Namecheap API key | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |
 | `--service-account-email <email>` | GCP service account email | - | No |
 | `--private-key-id <id>` | GCP private key ID | - | No |
-| `--private-key <key>` | GCP private key | - | No |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | No |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | No |
 | `--client-id <id>` | Azure client ID | - | No |
-| `--client-secret <secret>` | Azure client secret | - | No |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | No |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | No |
 | `--resource-group <name>` | Azure resource group | - | No |
 | `--management-url <url>` | pebble-challtestsrv management API URL (local ACME test server only) | - | No |
@@ -84,7 +89,8 @@ Update a DNS provider
 | `--id <id>` | Provider ID | - | Yes |
 | `-n, --name <name>` | New provider name | - | No |
 | `-d, --description <description>` | New description | - | No |
-| `--api-key <key>` | New API key/token | - | No |
+| `--api-key <key>` | New API key/token (prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the new API key/token from stdin | - | No |
 | `--active <boolean>` | Set active status (true/false) | - | No |
 
 ### `dns-provider remove` (alias: `rm`)

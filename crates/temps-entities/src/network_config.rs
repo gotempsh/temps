@@ -43,6 +43,27 @@ pub struct Model {
     /// Monotonic fencing token for control-plane setup attempts. A stale
     /// attempt may only publish or withdraw the exact generation it reserved.
     pub control_plane_setup_generation: i64,
+    /// Run the overlay over a managed WireGuard mesh: every node gets a mesh
+    /// address from `wireguard_cidr` as its underlay, so nodes that only share
+    /// public IPs can form the overlay.
+    pub wireguard_enabled: bool,
+    /// Mesh address pool. The control plane takes the first host address.
+    pub wireguard_cidr: String,
+    /// UDP port every node's WireGuard interface listens on.
+    pub wireguard_port: i32,
+    /// Control plane's mesh public key; its private key stays on the host.
+    pub control_plane_wg_public_key: Option<String>,
+    /// `ip:port` workers dial to reach the control plane's WireGuard socket.
+    pub control_plane_wg_endpoint: Option<String>,
+    /// TCP port of the node API on the control plane's mesh address; `None`
+    /// means the mesh port number.
+    pub node_api_port: Option<i32>,
+    /// The node that is the mesh hub (ADR 048 D4), relaying traffic between
+    /// members that cannot reach each other.
+    pub mesh_hub_node_id: Option<i32>,
+    /// The control plane is the mesh hub. Never set together with
+    /// `mesh_hub_node_id`.
+    pub mesh_hub_control_plane: bool,
     pub updated_at: DBDateTime,
 }
 

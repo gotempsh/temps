@@ -199,6 +199,135 @@ pub async fn run_one_shot(
     spec: OneShotSpec,
     cancel: &CancellationToken,
 ) -> Result<OneShotResult, OneShotError> {
+    run_one_shot_inner(docker, spec, cancel, false)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// A one-shot run whose container is kept after it exits, so the caller
+/// can copy files out of the container's own filesystem through the Docker
+/// archive API (see [`super::dump_capture`]).
+#[derive(Debug)]
+pub struct RetainedOneShot {
+    /// Exit code and log tails, exactly as [`run_one_shot`] reports them.
+    pub result: OneShotResult,
+    /// Owner of the exited container. Call [`RetainedContainer::remove`]
+    /// when done; dropping it removes the container in the background.
+    pub container: RetainedContainer,
+}
+
+/// Like [`run_one_shot`], but the container is created WITHOUT
+/// `auto_remove`, so its filesystem outlives the command and can be read
+/// back with `download_from_container`.
+///
+/// Ownership of the container is tracked by a [`RetainedContainer`] guard
+/// from the moment `create_container` succeeds: every error path inside
+/// this function (start failure, cancellation, a failed wait), and a caller
+/// that drops the future mid-run, removes the container. On success the
+/// guard is handed to the caller.
+pub async fn run_retained_one_shot(
+    docker: &Docker,
+    spec: OneShotSpec,
+    cancel: &CancellationToken,
+) -> Result<RetainedOneShot, OneShotError> {
+    let name = spec.name.clone();
+    let (result, container) = run_one_shot_inner(docker, spec, cancel, true).await?;
+    let container = container.ok_or(OneShotError::NoExitCode { name })?;
+    Ok(RetainedOneShot { result, container })
+}
+
+/// Owns an exited (or still running) one-shot container that was created
+/// without `auto_remove`, and force-removes it exactly once: explicitly via
+/// [`RetainedContainer::remove`], or from `Drop` as a backstop for early
+/// returns, panics and cancelled futures.
+#[derive(Debug)]
+pub struct RetainedContainer {
+    docker: Docker,
+    name: String,
+    armed: bool,
+}
+
+impl RetainedContainer {
+    fn new(docker: Docker, name: String) -> Self {
+        Self {
+            docker,
+            name,
+            armed: true,
+        }
+    }
+
+    /// Container name (also accepted by every Docker API that takes an id).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Force-remove the container now and wait for the daemon to confirm.
+    pub async fn remove(mut self) {
+        self.armed = false;
+        force_remove_container(&self.docker, &self.name).await;
+    }
+
+    /// Forget the container without removing it. Only for paths that have
+    /// already removed it by other means.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetainedContainer {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let docker = self.docker.clone();
+        let name = std::mem::take(&mut self.name);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { force_remove_container(&docker, &name).await });
+            }
+            Err(_) => warn!(
+                container = %name,
+                "one_shot: no Tokio runtime to remove retained container; it is labelled \
+                 sh.temps.kind=backup and must be removed with `docker rm -f`",
+            ),
+        }
+    }
+}
+
+/// `docker rm --force --volumes`. A container that is already gone is not
+/// an error; anything else is logged, because a leftover retained
+/// container keeps the dump on the Docker host's disk.
+async fn force_remove_container(docker: &Docker, name: &str) {
+    match docker
+        .remove_container(
+            name,
+            Some(
+                RemoveContainerOptionsBuilder::new()
+                    .force(true)
+                    .v(true)
+                    .build(),
+            ),
+        )
+        .await
+    {
+        Ok(()) => debug!(container = %name, "one_shot: retained container removed"),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(e) => warn!(
+            container = %name,
+            error = %e,
+            "one_shot: failed to remove retained container",
+        ),
+    }
+}
+
+async fn run_one_shot_inner(
+    docker: &Docker,
+    spec: OneShotSpec,
+    cancel: &CancellationToken,
+    retain: bool,
+) -> Result<(OneShotResult, Option<RetainedContainer>), OneShotError> {
     let mut labels: HashMap<String, String> = HashMap::new();
     labels.insert("sh.temps.kind".to_string(), "backup".to_string());
     labels.insert("sh.temps.engine".to_string(), spec.engine.to_string());
@@ -209,7 +338,9 @@ pub async fn run_one_shot(
     );
 
     let host_config = bollard::models::HostConfig {
-        auto_remove: Some(true),
+        // A retained container must outlive its command so the caller can
+        // copy its output out; its `RetainedContainer` guard removes it.
+        auto_remove: Some(!retain),
         oom_score_adj: Some(-500),
         network_mode: spec.network_mode.clone(),
         binds: if spec.binds.is_empty() {
@@ -262,6 +393,9 @@ pub async fn run_one_shot(
         image = %spec.image,
         "one_shot: container created"
     );
+    // From here on, a retained container is owned by this guard: any early
+    // return below (or the caller dropping this future) removes it.
+    let mut retained = retain.then(|| RetainedContainer::new(docker.clone(), spec.name.clone()));
 
     // Begin attaching to logs BEFORE starting so we don't miss early output.
     let attach = docker
@@ -292,6 +426,9 @@ pub async fn run_one_shot(
                 Some(RemoveContainerOptionsBuilder::new().force(true).build()),
             )
             .await;
+        if let Some(guard) = retained.as_mut() {
+            guard.disarm();
+        }
         return Err(OneShotError::StartFailed {
             name: spec.name.clone(),
             source: e,
@@ -454,12 +591,15 @@ pub async fn run_one_shot(
         "one_shot: container exited",
     );
 
-    Ok(OneShotResult {
-        exit_code,
-        stdout_tail: stdout_tail.into_string_lossy(),
-        stderr_tail: stderr_tail.into_string_lossy(),
-        stderr_watch_matched,
-    })
+    Ok((
+        OneShotResult {
+            exit_code,
+            stdout_tail: stdout_tail.into_string_lossy(),
+            stderr_tail: stderr_tail.into_string_lossy(),
+            stderr_watch_matched,
+        },
+        retained,
+    ))
 }
 
 /// Drain a container's attached log stream into bounded tails.

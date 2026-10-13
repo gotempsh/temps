@@ -785,7 +785,10 @@ confirmed live that a deleted session's direct-by-ID playback now 404s.
 3. trigger a real backup (`POST /backups/external-services/{id}/run`) --
    202 + async job, per ADR-014 -- and poll `GET /backups/{backup_id}` to a
    real `completed` state (a real `wal-g backup-push`, a real S3 upload --
-   the postgres backup engine is WAL-G, not pg_dump)
+   the postgres backup engine is WAL-G, not pg_dump). The first WAL-G backup
+   restarts a service whose archiving is off, so the request sends
+   `confirm_restart: true`; without it the server answers `409
+   RESTART_CONFIRMATION_REQUIRED` and starts nothing
 4. write 2 MORE rows (count now 7) -- data the backup does NOT contain
 5. start an in-place restore from the backup taken at step 3
    (`POST /external-services/{id}/restore`) and poll
@@ -1247,8 +1250,9 @@ at an already-running `temps serve` (started via the `start-temps` skill)
 and drives it over HTTP. Multi-node clustering can't be proven that way:
 it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
 its own network identity — registering into the first node's mesh over
-single-use enrollment and real mTLS. WireGuard relay enrollment is a separate
-topology and is not claimed by this scenario. `tls-scenario` already established the precedent that a
+single-use enrollment and real mTLS. Built-in WireGuard relay enrollment is not
+claimed by this scenario (no relay ships with Temps); `--topology wireguard`
+covers the supported alternative, described below. `tls-scenario` already established the precedent that a
 scenario can need "a dedicated instance on a fixed port, not a normal dev
 slot" (see that section above) because of Pebble's hardcoded port; this
 scenario takes the same idea further: it brings up its own 2-node
@@ -1310,9 +1314,71 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     container migrated off the worker. In this 2-node cluster it has
     nowhere to go but the control plane, so this step also implicitly
     re-tests the `Local` scheduling fallback path.
-13. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+13. sandboxes on the worker (ADR-048 §13,
+    `src/commands/multinode-sandbox-phases.ts`). This runs after the drain
+    because the worker then hosts no deployment containers, so only
+    sandboxes can block its removal. The worker is reactivated first, then:
+    - `GET /v1/sandboxes/placement` lists it as eligible;
+      `PUT allowed_node_ids` `[worker]` and back to `null`.
+    - The sandbox image the control plane reports is pre-pulled on the
+      worker. This is best effort: a build without a release manifest names
+      an unpublished tag, so the first create builds the image on the worker
+      from the embedded Dockerfile. That create gets 15 minutes.
+    - Create with `node: worker-1`. The response must carry the worker's
+      `node_id`/`node_name`. `temps-sandbox-<label>` must be in the worker's
+      `docker ps` and not in the control plane's, and its work dir must exist
+      under the agent's `<data dir>/sandboxes/<label>`.
+    - exec `echo` + `hostname`; the hostname must match the container's own.
+    - Write a file, read it back, and find it in the worker's work dir.
+    - pause (stop) and then resume (start); exec works and the file is still
+      there.
+    - `docker restart` the control plane. Exec must work again once the
+      worker has sent a fresh heartbeat (lazy recovery).
+    - A snapshot is refused with `422`, and the sandbox keeps running.
+    - Allow-list `[0]` + `node: worker-1` returns
+      `422 sandbox-node-not-allowed`. Allow-list `[worker]` with no `node`
+      lands on the worker.
+    - `docker pause` the worker until it is marked offline. Exec must return
+      `503` naming it. Then unpause and wait for it to come back.
+    - `DELETE /internal/nodes/{id}` returns `409`, and the drain status
+      reports `remaining_sandboxes >= 2`.
+    - Destroying the second sandbox removes its container and work dir.
+      Evicting the worker destroys the rest with no unconfirmed containers,
+      leaves no `temps-sandbox-` containers on the worker, and brings
+      `remaining_sandboxes` to 0.
+    - Drain again; the drain status must allow removal.
+
+    Cleanup always unpauses the worker, destroys leftover sandboxes and
+    restores `allowed_node_ids` to `null`.
+14. dedicated nodes (`src/commands/multinode-dedicated-phases.ts`). The
+    drained worker hosts nothing at this point, so its agent can be
+    restarted safely:
+    - add `temps.sh/role=dedicated` to the worker's `/root/.temps/agent.json`
+      labels and `docker restart` it; wait until `GET /internal/nodes`
+      reports the label on a fresh heartbeat, then reactivate the worker.
+    - an **unpinned** application with 2 replicas and anti-affinity: both
+      replicas must be on the control plane's `docker ps` and none on the
+      worker's (without the role, anti-affinity would put one replica on the
+      worker), and the deploy log must say `'worker-1' is dedicated
+      (temps.sh/role=dedicated)`.
+    - a **selector-only** application (`target_labels`
+      `temps.sh/role=dedicated`, no `target_nodes`) must fail with `No
+      eligible node for this deployment: node <id> (worker-1) is dedicated
+      ...` before any of its jobs runs (every job `cancelled`, so nothing is
+      pulled or built) and start nothing on the worker.
+    - the same environment **pinned** with `target_nodes: [worker]` (selector
+      kept) must land on the worker and not on the control plane.
+    - `GET /v1/sandboxes/placement` lists the worker with `dedicated: true`;
+      with the allow-list set to `[worker]`, a sandbox created without `node`
+      is refused with `422 sandbox-dedicated-node-only`.
+    - tear those applications down and drain the worker again.
+
+    Cleanup always restores the sandbox allow-list to `null` and removes the
+    applications this phase created, retrying any the last step failed to
+    remove.
+15. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-14. teardown (in a `finally`, same discipline as every other scenario):
+16. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres
@@ -1342,6 +1408,32 @@ bun run src/index.ts multinode-join-scenario --keep --json    # inspect the runn
 bun run src/index.ts multinode-join-scenario --build-timeout 2400000   # more generous on a slow machine
 ```
 
+
+#### `--topology wireguard`
+
+Runs every step above against `tools/e2e-wireguard-cluster/docker-compose.yml`
+instead: the nodes share no network. The worker sits alone on its LAN behind a
+NAT router with no port forwards, the control plane's "public" interface
+accepts only WireGuard (UDP 51820), and the two are joined by a kernel
+WireGuard tunnel (`wg-node.sh`). The worker joins with its tunnel address
+`10.57.0.11` as `--private-address`, and the control plane sets up its overlay
+with `--private-address 10.57.0.1 --underlay-dev wg0`. On top of the steps
+above it asserts:
+
+- before the tunnel exists, the worker cannot reach the control plane's public
+  address, API, LAN or database (`wg-node.sh` exits otherwise);
+- after the join, each node reaches the other only at its tunnel address (the
+  worker's agent port is unreachable on its LAN address), and a handshake
+  happened;
+- both VXLAN overlays fit inside the tunnel (MTU at most 1370), and each
+  node's largest unfragmentable overlay packet reaches the other node;
+- a 1 MiB response proxied by the control plane from the app on the worker
+  grows the worker's WireGuard send counter by at least 1 MiB.
+
+It uses host port 18280 and its own `temps-e2e-wg-*` names, subnets and
+volumes, so it can run next to the bridge topology. The how-to is
+`docs/howto/test-multi-node-wireguard/page.mdx`.
+
 ### `deploy-lifecycle-scenario` steps
 
 Rollback / pause / resume / promote are the platform's primary safety valve
@@ -1361,9 +1453,8 @@ row's status field flipped".
 4. `POST .../deployments/{A}/rollback`; assert live traffic reverts to
    `"version A"` byte-for-byte -- proves a real rollback, not just a state
    transition
-5. `POST .../deployments/{current}/pause`; assert the live URL genuinely
-   stops serving the app -- see the real-bug note below for what "paused"
-   actually renders as and why
+5. `POST .../deployments/{current}/pause`; assert the live URL returns HTTP
+   503 without the Temps console HTML
 6. `POST .../deployments/{current}/resume`; assert live traffic serves
    `"version A"` again
 7. create a second environment, `POST .../deployments/{B}/promote` into it;
@@ -1418,22 +1509,19 @@ yet to assert a body against.
    proxy kept retrying the OLD (still "valid-looking") container address and
    returned Pingora's own `503 Service Unavailable` ("Fail to connect ...
    Connection refused") -- not a clean "paused" signal, just an accident of
-   a stale cached route; the "an untested guess would reach for a 503"
-   sentence that used to be here was itself exactly that untested guess,
-   and turned out to be the pre-fix bug, not the fixed behavior. Fixed by
+   a stale cached route. Fixed by
    (a) filtering `route_table::load_routes` to `status IS NULL OR status =
    'running'`, so a stopped container's route is skipped once reloaded, and
    (b) having pause/resume publish `Job::ForceRouteReload` (the same
    in-process broadcast `mark_deployment_complete.rs` already uses after a
-   normal deploy) so the reload happens immediately. With both fixes,
-   pausing makes the route disappear entirely and the proxy falls through to
-   its existing unknown-host console-fallback response (HTTP 200,
-   `<title>Temps</title>`) -- that fallback is the real, asserted "paused"
-   behavior in step 5 above.
+   normal deploy) so the reload happens immediately. Known application
+   hosts now remain recorded as unavailable without a live backend, and the
+   proxy returns HTTP 503 instead of serving the console HTML. Step 5 asserts
+   both the status and absence of console HTML; resume must restore the exact
+   application body.
 
-Confirmed live 3x back to back (after the environment-flakiness note below),
-including that resume correctly restarts the SAME container (not a rebuild)
-and traffic recovers within ~1.5s of the resume call.
+Resume coverage requires the exact application version served before pause
+to return through the same live URL.
 
 Also worth noting for anyone re-running this: the local dev instance used to
 verify this crashed several times mid-run with no panic/error logged (just
@@ -1575,6 +1663,29 @@ couldn't express. Fixed by adding both to the params list. This scenario
 doesn't depend on the fix (it filters the quota canary span by `trace_id`,
 which was already typed correctly) -- found while checking why `name_pattern`
 wasn't available on the typed client during development.
+
+### `first-run-scenario` and `quiet-logs-fixture`
+
+The nightly first-run suite (`.github/workflows/first-run.yml`, documented in
+[`scripts/first-run/README.md`](../../scripts/first-run/README.md)) is built on
+two commands here:
+
+```bash
+# A new operator's first hour, each step timed to its first proxied response:
+# public image, git URL + Dockerfile, Node preset upload, compose upload,
+# static bundle, managed Postgres + Redis linked and reaching the app.
+bun run src/index.ts first-run-scenario --report /tmp/first-run.json
+bun run src/index.ts first-run-scenario --only compose static-site
+bun run src/index.ts first-run-scenario --git-url https://github.com/<you>/temps.git --git-branch my-branch
+
+# The quiet-logs soak workload (app + linked Postgres + alert rule + monitor)
+bun run src/index.ts quiet-logs-fixture --state /tmp/soak.json
+bun run src/index.ts quiet-logs-fixture --state /tmp/soak.json --teardown
+```
+
+The sample apps are in `examples/first-run/`. A failed step records the
+deployment's classified failure (`build_error`, `health_check`, ...), the job
+that failed and its last 40 log lines, then the suite continues.
 
 ## External-service test infra (TLS, DNS, email, backups)
 

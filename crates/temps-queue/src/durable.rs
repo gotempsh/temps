@@ -57,9 +57,10 @@ impl DurableBroadcastQueue {
 
     fn consumers(job: &Job) -> &'static [&'static str] {
         match job {
-            Job::GitPushEvent(_) | Job::DeployImageRequested(_) | Job::DeploymentGateRecheck(_) => {
-                &[DEPLOYMENT_CONSUMER]
-            }
+            Job::GitPushEvent(_)
+            | Job::DeployImageRequested(_)
+            | Job::RedeploySourceBundleRequested(_)
+            | Job::DeploymentGateRecheck(_) => &[DEPLOYMENT_CONSUMER],
             Job::CustomDomainAdded(_)
             | Job::CustomDomainRemoved(_)
             | Job::CustomRouteAdded(_)

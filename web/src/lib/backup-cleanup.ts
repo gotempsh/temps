@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { client } from '@/api/client/client.gen'
+import { deleteBackup as deleteBackupRequest } from '@/api/client/sdk.gen'
 
 export interface RetentionCleanupFailure {
   backup_id: string
@@ -22,9 +23,7 @@ export interface RetentionCleanupReport {
 const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
 
 export async function deleteBackup(backupId: string): Promise<void> {
-  await client.delete<unknown, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/backups/{id}',
+  await deleteBackupRequest({
     path: { id: backupId },
     throwOnError: true,
   })

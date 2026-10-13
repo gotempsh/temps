@@ -55,7 +55,7 @@ async fn setup_storage_with_facets(
         std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(map));
 
     let storage =
-        TimescaleDbStorage::with_config(test_db.db.clone(), None, 7, None, Some(facet_cache));
+        TimescaleDbStorage::with_config(test_db.db.clone(), None, None, Some(facet_cache));
     Some((test_db, storage))
 }
 
@@ -1272,13 +1272,8 @@ async fn test_storage_quota() {
     assert!(!exceeded);
 
     // With an explicit quota, the check runs for real against a fresh DB.
-    let storage_with_quota = TimescaleDbStorage::with_config(
-        _db.db.clone(),
-        None,
-        7,
-        Some(10 * 1024 * 1024 * 1024),
-        None,
-    );
+    let storage_with_quota =
+        TimescaleDbStorage::with_config(_db.db.clone(), None, Some(10 * 1024 * 1024 * 1024), None);
     let quota = storage_with_quota.get_storage_quota(1).await.unwrap();
     assert_eq!(quota.limit_bytes, 10 * 1024 * 1024 * 1024);
     let exceeded = storage_with_quota.check_quota(1).await.unwrap();
@@ -1352,13 +1347,8 @@ async fn test_storage_quota_tracks_real_ingested_span_volume() {
     // 200KB sits with wide margin between the two, so this assertion is
     // only satisfied by a formula that actually accounts for chunk storage.
     const TEST_QUOTA_LIMIT_BYTES: u64 = 200 * 1024;
-    let storage_with_tiny_quota = TimescaleDbStorage::with_config(
-        _db.db.clone(),
-        None,
-        7,
-        Some(TEST_QUOTA_LIMIT_BYTES),
-        None,
-    );
+    let storage_with_tiny_quota =
+        TimescaleDbStorage::with_config(_db.db.clone(), None, Some(TEST_QUOTA_LIMIT_BYTES), None);
     let quota = storage_with_tiny_quota
         .get_storage_quota(project_id)
         .await
@@ -1390,13 +1380,8 @@ async fn test_storage_quota_tracks_real_ingested_span_volume() {
     // Sanity check in the other direction: a generous limit against the
     // same real data must NOT report exceeded, proving usage_pct is a real
     // proportional measurement and not just pegged to 100%.
-    let storage_with_generous_quota = TimescaleDbStorage::with_config(
-        _db.db.clone(),
-        None,
-        7,
-        Some(10 * 1024 * 1024 * 1024),
-        None,
-    );
+    let storage_with_generous_quota =
+        TimescaleDbStorage::with_config(_db.db.clone(), None, Some(10 * 1024 * 1024 * 1024), None);
     let generous_quota = storage_with_generous_quota
         .get_storage_quota(project_id)
         .await

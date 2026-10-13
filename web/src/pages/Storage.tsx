@@ -284,6 +284,7 @@ function HealthDot({
         : 'Down'
   return (
     <span
+      role="img"
       className={cn('inline-block size-2 rounded-full', tone, className)}
       title={label}
       aria-label={label}
@@ -297,7 +298,10 @@ function ServiceStatusDot({ status }: { status: string }) {
       ? 'bg-success'
       : status === 'error' || status === 'failed'
         ? 'bg-destructive'
-        : status === 'pending' || status === 'initializing'
+        : status === 'pending' ||
+            status === 'initializing' ||
+            status === 'creating' ||
+            status === 'starting'
           ? 'bg-warning'
           : 'bg-muted-foreground/40'
   return (
@@ -554,7 +558,7 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
           <MemoryStick className="size-3.5" />
           <span>{formatBytes(memBytes, 1)}</span>
           {hasMemCap && (
-            <span className="text-muted-foreground/60">
+            <span className="text-muted-foreground">
               / {formatBytes(memLimitBytes!, 0)}
             </span>
           )}

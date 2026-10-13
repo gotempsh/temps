@@ -115,16 +115,16 @@ function hashString(str: string): number {
 }
 
 const EVENT_COLORS = [
-  'text-blue-400',
-  'text-emerald-400',
-  'text-violet-400',
-  'text-amber-400',
-  'text-cyan-400',
-  'text-pink-400',
-  'text-lime-400',
-  'text-orange-400',
-  'text-indigo-400',
-  'text-teal-400',
+  'text-blue-600 dark:text-blue-400',
+  'text-emerald-700 dark:text-emerald-400',
+  'text-violet-600 dark:text-violet-400',
+  'text-amber-700 dark:text-amber-400',
+  'text-cyan-700 dark:text-cyan-400',
+  'text-pink-700 dark:text-pink-400',
+  'text-lime-700 dark:text-lime-400',
+  'text-orange-700 dark:text-orange-400',
+  'text-indigo-600 dark:text-indigo-400',
+  'text-teal-700 dark:text-teal-400',
 ]
 
 function getVisitorColor(visitorId: number | null | undefined): string {
@@ -357,6 +357,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate(`/projects/${project.slug}/analytics`)}
@@ -420,7 +421,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
           {liveCount > 0 && (
             <Badge
               variant="outline"
-              className="gap-1.5 border-green-500/50 text-green-500"
+              className="gap-1.5 border-green-500/50 text-green-700 dark:text-green-500"
             >
               <span className="relative flex h-2 w-2">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />

@@ -348,11 +348,11 @@ registry.example.com:5000/app:latest
 
 ## Resource limits {{ anchor: true, id: 'resource-limits' }}
 
-Every container runs with default resource limits:
+New projects start with these resource limits:
 
 | Resource | Default | Description |
 |----------|---------|-------------|
-| CPU | 1 core | Maximum CPU allocation |
+| CPU | No limit | Maximum CPU allocation, if you set one |
 | Memory | 512 MB | Maximum memory allocation |
 | PIDs | 512 | Maximum number of processes |
 

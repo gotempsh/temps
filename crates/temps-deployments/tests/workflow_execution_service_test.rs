@@ -471,6 +471,7 @@ async fn test_workflow_execution_service_with_real_jobs() {
             as Arc<dyn temps_deployments::jobs::AgentSyncService>,
         config_service.clone(),
         screenshot_service.clone(),
+        Arc::new(temps_deployments::jobs::DeploymentCaptureGuard::default()),
         docker,
     ));
 

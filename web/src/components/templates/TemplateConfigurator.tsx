@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -280,6 +281,9 @@ function SingleServiceTemplateConfigurator({
     finish,
     joinGroupDialog,
   } = useJoinGroupAfterCreate()
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
 
   // State
   const [showSecrets, setShowSecrets] = useState<Record<number, boolean>>({})
@@ -367,9 +371,9 @@ function SingleServiceTemplateConfigurator({
   const schema = useMemo(
     () =>
       formSchema.extend({
-        runtime: createTemplateRuntimeDefaultsSchema(template.kind).optional(),
+        runtime: createTemplateRuntimeDefaultsSchema().optional(),
       }),
-    [template.kind]
+    []
   )
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
@@ -686,6 +690,7 @@ function SingleServiceTemplateConfigurator({
 
     createFromTemplateMutation.mutate({
       body: {
+        delivery_provider: deliveryProvider,
         template_slug: template.slug,
         project_name: data.projectName,
         git_provider_connection_id: data.gitProviderConnectionId ?? undefined,
@@ -2039,6 +2044,10 @@ function SingleServiceTemplateConfigurator({
           </Card>
 
           {/* Actions */}
+          <DeliveryProjectOption
+            value={deliveryProvider}
+            onChange={setDeliveryProvider}
+          />
           <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-end">
             {targetGroup && (
               <p className="text-sm text-muted-foreground sm:mr-auto">

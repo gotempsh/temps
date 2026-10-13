@@ -23,8 +23,6 @@ JOIN_TOKEN_FILE="$STATE_DIR/join_token.txt"
 JOIN_MARKER="/var/lib/temps/.dev-cluster-join-done"
 
 WORKER_NAME="${WORKER_NAME:?WORKER_NAME env var required}"
-WORKER_UNDERLAY_IP="${WORKER_UNDERLAY_IP:?WORKER_UNDERLAY_IP env var required}"
-CONTROL_PLANE_URL="${CONTROL_PLANE_URL:?CONTROL_PLANE_URL env var required}"
 
 log() { printf '\033[1;33m[%s]\033[0m %s\n' "$WORKER_NAME" "$*"; }
 
@@ -51,6 +49,17 @@ else
   cargo build --bin temps >&2
   install -m 0755 "$WORKSPACE/target/debug/temps" "$BIN"
 fi
+
+# A worker enrolled by pairing (ADR 048 D2b) runs the `temps join --pair`
+# command the control plane's Worker Nodes page prints, then `temps agent`,
+# by hand (docker exec): this container only provides dockerd and the binary.
+if [[ "${WORKER_JOIN:-auto}" == "pair" ]]; then
+  log "WORKER_JOIN=pair: run 'temps join --pair <code>' and then 'temps agent' here"
+  exec sleep infinity
+fi
+
+WORKER_UNDERLAY_IP="${WORKER_UNDERLAY_IP:?WORKER_UNDERLAY_IP env var required}"
+CONTROL_PLANE_URL="${CONTROL_PLANE_URL:?CONTROL_PLANE_URL env var required}"
 
 # 3. wait for join token (control plane writes it during its first boot)
 log "waiting for join token at ${JOIN_TOKEN_FILE#"$WORKSPACE"/}"
@@ -139,5 +148,8 @@ else
 fi
 
 # 5. run the agent. Reads ~/.temps/agent.json that `temps join` wrote.
-log "starting temps agent"
-exec "$BIN" agent
+# WORKER_AGENT_ARGS: extra `temps agent` flags, e.g.
+# "--public-ingress-address 10.62.0.21" to serve public app traffic.
+read -r -a AGENT_ARGS <<< "${WORKER_AGENT_ARGS:-}"
+log "starting temps agent ${AGENT_ARGS[*]:-}"
+exec "$BIN" agent "${AGENT_ARGS[@]}"

@@ -19,7 +19,8 @@ async function runCommand(
   const saved = { url: process.env.TEMPS_API_URL, token: process.env.TEMPS_TOKEN, exitCode: process.exitCode }
   process.env.TEMPS_API_URL = 'http://127.0.0.1:9'
   process.env.TEMPS_TOKEN = 'test-token-never-sent'
-  process.exitCode = undefined
+  // Bun ignores undefined; explicitly clear validation failures between runs.
+  process.exitCode = 0
   const stderr: string[] = []
   const errSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
     stderr.push(args.join(' '))
@@ -39,7 +40,7 @@ async function runCommand(
     logSpy.mockRestore()
     exitSpy.mockRestore()
     fetchSpy.mockRestore()
-    process.exitCode = saved.exitCode
+    process.exitCode = saved.exitCode ?? 0
     if (saved.url === undefined) delete process.env.TEMPS_API_URL
     else process.env.TEMPS_API_URL = saved.url
     if (saved.token === undefined) delete process.env.TEMPS_TOKEN

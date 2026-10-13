@@ -66,6 +66,8 @@ export interface ImportEnvDialogProps {
    * @default true if allEnvironments is provided
    */
   showEnvironmentSelection?: boolean
+  /** Why importing is currently unavailable. Keeps entered data for retry. */
+  disabledReason?: string
 }
 
 /**
@@ -102,6 +104,7 @@ export function ImportEnvDialog({
   title = 'Import Environment Variables',
   description = 'Upload a .env file or paste its contents to import multiple variables at once.',
   showEnvironmentSelection = !!allEnvironments,
+  disabledReason,
 }: ImportEnvDialogProps) {
   const [parsedVariables, setParsedVariables] = useState<ParsedEnvVariable[]>(
     []
@@ -236,6 +239,10 @@ export function ImportEnvDialog({
    * Handle import action
    */
   const handleImport = async () => {
+    if (disabledReason) {
+      toast.error(disabledReason)
+      return
+    }
     const selectedVars = parsedVariables.filter((v) => v.selected)
 
     if (selectedVars.length === 0) {
@@ -400,6 +407,7 @@ export function ImportEnvDialog({
                       <Button
                         type="button"
                         key={env.id}
+                        disabled={Boolean(disabledReason)}
                         variant={
                           selectedEnvironments.includes(env.id)
                             ? 'default'
@@ -424,6 +432,11 @@ export function ImportEnvDialog({
           )}
         </div>
 
+        {disabledReason && (
+          <p role="alert" className="text-sm text-muted-foreground">
+            {disabledReason}
+          </p>
+        )}
         <DialogFooter>
           <Button
             type="button"
@@ -444,6 +457,7 @@ export function ImportEnvDialog({
             type="button"
             onClick={handleImport}
             disabled={
+              Boolean(disabledReason) ||
               selectedCount === 0 ||
               (showEnvironmentSelection &&
                 allEnvironments &&

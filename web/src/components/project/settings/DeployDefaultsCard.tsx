@@ -19,9 +19,18 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { BUILD_LOCATION_LABELS } from '@/lib/build-location'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
@@ -35,7 +44,20 @@ const schema = z.object({
   memoryLimit: z.string().optional(),
   replicas: z.string().optional(),
   port: z.string().optional(),
+  healthCheckTimeout: z
+    .string()
+    .optional()
+    .refine(
+      (value) =>
+        !value ||
+        value.trim() === '' ||
+        (Number.isInteger(Number(value)) &&
+          Number(value) >= 30 &&
+          Number(value) <= 3600),
+      { message: 'Enter a whole number of seconds between 30 and 3600' }
+    ),
   automaticDeploy: z.boolean(),
+  buildLocation: z.enum(['control_plane', 'node']),
 })
 
 type FormValues = z.infer<typeof schema>
@@ -88,7 +110,11 @@ export function DeployDefaultsCard({
       memoryLimit: project?.deployment_config?.memoryLimit?.toString() ?? '',
       replicas: project?.deployment_config?.replicas?.toString() ?? '',
       port: project?.deployment_config?.exposedPort?.toString() ?? '',
+      healthCheckTimeout:
+        project?.deployment_config?.healthCheckTimeoutSeconds?.toString() ?? '',
       automaticDeploy: project?.deployment_config?.automaticDeploy ?? false,
+      buildLocation:
+        project?.deployment_config?.buildLocation ?? 'control_plane',
     },
   })
 
@@ -104,7 +130,10 @@ export function DeployDefaultsCard({
           memoryLimit: optionalInt(values.memoryLimit),
           replicas: optionalInt(values.replicas),
           exposedPort: optionalInt(values.port),
+          healthCheckTimeoutSeconds:
+            optionalInt(values.healthCheckTimeout) ?? 300,
           automaticDeploy: values.automaticDeploy,
+          buildLocation: values.buildLocation,
         },
       }),
       {
@@ -260,7 +289,71 @@ export function DeployDefaultsCard({
                     </FormItem>
                   )}
                 />
+
+                <FormField
+                  control={form.control}
+                  name="healthCheckTimeout"
+                  render={({ field }) => (
+                    <FormItem id="startup-timeout">
+                      <FormLabel>Startup timeout (seconds)</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="number"
+                          min="30"
+                          max="3600"
+                          placeholder="300"
+                        />
+                      </FormControl>
+                      <FormDescription className="text-muted-foreground">
+                        How long a new deployment may take to start and pass its
+                        health check before it fails. Raise it for apps that run
+                        migrations or warm caches on boot. Default 300.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
               </div>
+            </div>
+
+            <div className="space-y-4">
+              <h3 className="text-sm font-medium">Builds</h3>
+              <FormField
+                control={form.control}
+                name="buildLocation"
+                render={({ field }) => (
+                  <FormItem className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="space-y-0.5">
+                      <FormLabel className="text-base">
+                        Build location
+                      </FormLabel>
+                      <FormDescription>
+                        Build images on a worker node to keep build CPU and
+                        memory away from the proxy and running apps on the
+                        control plane. When no worker can take a build, it runs
+                        on the control plane and the build log says why.
+                        Environments can override this.
+                      </FormDescription>
+                    </div>
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <FormControl>
+                        <SelectTrigger className="w-full sm:w-[200px]">
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="control_plane">
+                          {BUILD_LOCATION_LABELS.control_plane}
+                        </SelectItem>
+                        <SelectItem value="node">
+                          {BUILD_LOCATION_LABELS.node}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </FormItem>
+                )}
+              />
             </div>
 
             <div className="space-y-4">

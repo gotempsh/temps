@@ -62,34 +62,58 @@ Temps provides several types of logs to help you understand what's happening wit
 
 ### Via CLI
 
+The CLI has three log commands. `runtime-logs` (alias `rlogs`) reads a running container, `deployments logs` reads a deployment's build and deploy steps, and `logs` searches collected logs across every project you can access.
+
 ```bash
-# View application logs
-temps logs my-project --environment production --tail 100
+# Last 100 lines from the production container of a project
+temps runtime-logs --project my-project --environment production --tail 100
 
-# Follow logs in real-time
-temps logs my-project --environment production --follow
+# Follow container logs in real time (Ctrl+C to stop)
+temps rlogs -p my-project -e production -f
 
-# View build logs for a deployment
-temps deployment logs my-project --deployment 123
+# Build and deploy step logs for a specific deployment
+temps deployments logs --project my-project --deployment 123
 
-# Filter logs by level
-temps logs my-project --level error
+# Search the last 6 hours of collected logs for errors in one project
+temps logs search --project my-project --level ERROR --since 6h
 ```
+
+If `runtime-logs` reports **No running containers found**, the environment has no live container: check `temps deployments list --project my-project` for a failed or stopped deployment. To read a container that belonged to a failed deployment, pass its ID with `--deployment`. If `logs search` returns nothing, run `temps logs capabilities` to check whether container logs are being collected.
 
 ### Via API
 
+Live container logs are streamed over a **WebSocket**, not plain HTTP, so `curl` cannot read them. Use a WebSocket client and send your API key in the `Authorization` header:
+
 ```bash
-# Get container logs
+# List the containers of an environment to get a container_id
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs?tail=100"
+  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers"
 
-# Stream logs (Server-Sent Events)
-curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs/stream"
+# Read the last 100 lines and close (follow=false), using websocat
+websocat -H "Authorization: Bearer YOUR_TOKEN" \
+  "wss://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs?tail=100&follow=false"
+```
 
-# Get deployment logs
+Build and deploy step logs are plain text, one file per deployment job:
+
+```bash
+# List the jobs (build, deploy, …) of a deployment to get a job_id
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/logs"
+  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/jobs"
+
+# Read the last 500 lines of one job's log
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs?tail=500"
+```
+
+When a deployment is replaced, Temps saves the logs of its containers before removing them. List and read those saved logs with:
+
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/container-logs"
+
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/container-logs/{log_id}"
 ```
 
 ---
@@ -174,22 +198,50 @@ Stream logs in real-time to see events as they happen:
 
 ### Via API
 
-```javascript
-// JavaScript example - Server-Sent Events
-const eventSource = new EventSource(
-  `/api/projects/${projectId}/environments/${environmentId}/containers/${containerId}/logs/stream`,
-  {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  },
-);
+Container logs stream over a WebSocket. Each message is one log line as raw text. The stream stays open while `follow=true` (the default) and closes with code `1000` when it ends normally. Code `1011` means the stream failed after it started: the close reason says why. Do not parse the message payload to detect errors, because your application's own log lines can contain JSON with an `error` field.
 
-eventSource.onmessage = (event) => {
-  const logEntry = JSON.parse(event.data);
-  console.log(logEntry.message);
+Browsers cannot set the `Authorization` header on a WebSocket (the console uses its session cookie instead), so connect from a server-side runtime:
+
+```javascript {{ title: 'Bun' }}
+// Bun's built-in WebSocket accepts request headers.
+const url =
+  `wss://your-temps-instance.com/api/projects/${projectId}` +
+  `/environments/${environmentId}/containers/${containerId}/logs?tail=100&follow=true`;
+
+const socket = new WebSocket(url, {
+  headers: { Authorization: `Bearer ${token}` },
+});
+
+socket.onmessage = (event) => console.log(String(event.data).trimEnd());
+socket.onclose = (event) => {
+  if (event.code !== 1000) {
+    console.error(`Log stream closed (${event.code}): ${event.reason}`);
+  }
 };
 ```
+
+```javascript {{ title: 'Node.js' }}
+// Node's built-in WebSocket cannot send headers; use the `ws` package
+// (npm install ws).
+import WebSocket from "ws";
+
+const url =
+  `wss://your-temps-instance.com/api/projects/${projectId}` +
+  `/environments/${environmentId}/containers/${containerId}/logs?tail=100&follow=true`;
+
+const socket = new WebSocket(url, {
+  headers: { Authorization: `Bearer ${token}` },
+});
+
+socket.on("message", (data) => console.log(data.toString().trimEnd()));
+socket.on("close", (code, reason) => {
+  if (code !== 1000) {
+    console.error(`Log stream closed (${code}): ${reason.toString()}`);
+  }
+});
+```
+
+To stream a deployment's build log while it runs, connect to `/api/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs/tail` the same way.
 
 ---
 
@@ -294,28 +346,26 @@ console.error("Payment failed");
 
 ## Downloading Logs
 
-Download logs for offline analysis or archival:
+Save logs for offline analysis or archival:
 
 ### Via Dashboard
 
-1. Open the **Logs** tab
-2. Apply any filters you need
-3. Click **Download** button
-4. Choose format (text or JSON)
-5. Save to your computer
+Logs saved from a replaced deployment's containers have a **Download** button. Open the deployment, find the saved container logs, and click **Download** to save them as a `.log` text file.
 
 ### Via API
 
-```bash
-# Download container logs
-curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs/download" \
-  -o logs.txt
+There is no separate download endpoint. Save the response of the endpoints above to a file:
 
-# Download deployment logs
+```bash
+# A saved container log from a replaced deployment (JSON with the log content)
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/logs/download" \
-  -o deployment-logs.txt
+  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/container-logs/{log_id}" \
+  -o container-log.json
+
+# One deployment job's build or deploy log (plain text)
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs" \
+  -o deployment-job.log
 ```
 
 ---

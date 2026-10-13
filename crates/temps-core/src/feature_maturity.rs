@@ -39,7 +39,7 @@ pub struct FeatureMaturity {
 }
 
 const STABLE_REASON: &str =
-    "Verified end to end. Its public surface will remain compatible within 0.1.x.";
+    "Its public surface is intended to remain compatible within 0.1.x; release qualification is recorded separately.";
 
 const fn feature(key: &'static str, maturity: Maturity, reason: &'static str) -> FeatureMaturity {
     FeatureMaturity {
@@ -292,7 +292,11 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/dashboards") {
         return Some("dashboards-metrics-explorer");
     }
-    if path.starts_with("/status-pages") || path.starts_with("/incidents") {
+    if path.starts_with("/status-pages")
+        || path.starts_with("/status/")
+        || path.contains("/status-pages")
+        || path.starts_with("/incidents")
+    {
         return Some("status-pages");
     }
     if path.starts_with("/screenshots") {
@@ -433,6 +437,19 @@ mod tests {
             Some("service-template-catalog")
         );
         assert_eq!(feature_key_for_api_path("/projects"), None);
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/status-pages"),
+            Some("status-pages")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/status/{slug}/summary.json"),
+            Some("status-pages")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/status"),
+            None,
+            "the authenticated project status overview keeps its own maturity"
+        );
     }
 
     #[test]

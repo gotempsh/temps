@@ -365,6 +365,7 @@ impl FirecrackerSandboxProvider {
 
     fn handle_with_image(&self, name: &str, image: String) -> SandboxHandle {
         SandboxHandle {
+            node_id: None,
             sandbox_id: name.to_string(),
             sandbox_name: name.to_string(),
             work_dir: PathBuf::from(WORK_DIR),
@@ -2339,6 +2340,7 @@ mod tests {
     fn resolve_name_prefers_override() {
         let p = provider();
         let mut config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 7,
             container_name_override: Some("abc123".to_string()),
@@ -2603,6 +2605,7 @@ mod tests {
         };
         let label = "failed-restore-cleanup";
         let config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 17,
             container_name_override: Some(label.to_string()),

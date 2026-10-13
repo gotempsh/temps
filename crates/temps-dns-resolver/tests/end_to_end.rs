@@ -51,6 +51,8 @@ fn make_resolver_config(
         // exercises in-zone (`*.temps.local`) lookups.
         upstream_resolvers: vec![],
         disable_sync: false,
+        control_plane_ca_pem: None,
+        control_plane_legacy_cert_pem: None,
     };
     (cfg, listen)
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import {
   createProjectMutation,
   getRepositoryBranchesOptions,
@@ -417,7 +418,7 @@ function ComposeFileSelector({
                 {service.looksLikeDatabase && (
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+                      <span className="flex items-center gap-1 text-xs text-amber-700 dark:text-amber-500">
                         <Database className="h-3 w-3" />
                         <Info className="h-3 w-3" />
                       </span>
@@ -589,7 +590,10 @@ interface ProjectConfiguratorProps {
   mode?: 'wizard' | 'inline' | 'compact'
 
   // Behavior
-  onSubmit?: (data: ProjectFormValues) => Promise<void>
+  onSubmit?: (
+    data: ProjectFormValues,
+    deliveryProvider?: 'none' | 'cloudflare' | 'bunny'
+  ) => Promise<void>
   onCancel?: () => void
   showSteps?: boolean
   /**
@@ -620,6 +624,9 @@ export function ProjectConfigurator({
   className,
 }: ProjectConfiguratorProps) {
   const queryClient = useQueryClient()
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
 
   // State management
   const [_currentStep, _setCurrentStep] = useState<WizardStep>('repo-config')
@@ -1319,11 +1326,12 @@ export function ProjectConfigurator({
       }
 
       if (onSubmit) {
-        await onSubmit(finalData)
+        await onSubmit(finalData, deliveryProvider)
       } else {
         // Use default mutation
         await projectMutation.mutateAsync({
           body: {
+            delivery_provider: deliveryProvider,
             name: finalData.name,
             preset: finalData.preset,
             directory: finalData.rootDirectory,
@@ -1772,6 +1780,7 @@ export function ProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -1939,6 +1948,7 @@ export function ProjectConfigurator({
                       : 'Select all'}
                   </Button>
                   <Button
+                    aria-label="Dismiss"
                     type="button"
                     variant="ghost"
                     size="sm"
@@ -1955,6 +1965,7 @@ export function ProjectConfigurator({
                   <div key={v.key} className="flex items-start gap-2">
                     <Checkbox
                       className="mt-2.5"
+                      aria-label={`Import ${v.key}`}
                       checked={selectedEnvExampleKeys.has(v.key)}
                       onCheckedChange={(checked) => {
                         setSelectedEnvExampleKeys((prev) => {
@@ -2514,6 +2525,10 @@ export function ProjectConfigurator({
             <CardContent>{renderEnvVars()}</CardContent>
           </Card>
 
+          <DeliveryProjectOption
+            value={deliveryProvider}
+            onChange={setDeliveryProvider}
+          />
           <div className="flex justify-end gap-3">
             {onCancel && (
               <Button

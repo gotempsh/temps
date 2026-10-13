@@ -359,6 +359,23 @@ where
     }
 }
 
+fn deserialize_optional_optional_build_location<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<temps_entities::deployment_config::BuildLocation>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Same present-`null` contract as the helpers above: `null` clears the
+    // override so the environment inherits the project's build location.
+    let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(Some(None)),
+        v => serde_json::from_value(v)
+            .map(|location| Some(Some(location)))
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateEnvironmentSettingsRequest {
     /// Minimum (request) CPU in microcores. Send JSON `null` to clear (no request).
@@ -422,6 +439,16 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// opted into per environment rather than triggered by cluster topology.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_architecture_builds: Option<bool>,
+    /// Where this environment's source images are built (overrides the
+    /// project-level setting): `control_plane` or `node`. Send JSON `null`
+    /// to inherit the project's setting; absent leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_build_location",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<temps_entities::deployment_config::BuildLocation>)]
+    pub build_location: Option<Option<temps_entities::deployment_config::BuildLocation>>,
     /// When true, git pushes do NOT auto-deploy to this environment.
     /// Deployments must be promoted from another environment.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -677,6 +704,41 @@ mod tests {
         let disabled: UpdateEnvironmentSettingsRequest =
             serde_json::from_str(r#"{"attack_mode":false}"#).unwrap();
         assert_eq!(disabled.attack_mode, Some(Some(false)));
+    }
+
+    /// `build_location` is tri-state too: `null` must clear the override so
+    /// the environment follows the project again, which a plain `Option`
+    /// could not express once an environment had pinned a location.
+    #[test]
+    fn build_location_distinguishes_absent_null_and_value() {
+        use temps_entities::deployment_config::BuildLocation;
+
+        let absent: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"branch":"main"}"#).unwrap();
+        assert_eq!(absent.build_location, None);
+
+        let cleared: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"build_location":null}"#).unwrap();
+        assert_eq!(cleared.build_location, Some(None));
+
+        let node: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"build_location":"node"}"#).unwrap();
+        assert_eq!(node.build_location, Some(Some(BuildLocation::Node)));
+
+        let control_plane: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"build_location":"control_plane"}"#).unwrap();
+        assert_eq!(
+            control_plane.build_location,
+            Some(Some(BuildLocation::ControlPlane))
+        );
+
+        assert!(
+            serde_json::from_str::<UpdateEnvironmentSettingsRequest>(
+                r#"{"build_location":"somewhere"}"#
+            )
+            .is_err(),
+            "an unknown location must be rejected, not silently ignored"
+        );
     }
 
     /// `force_https` is the same tri-state shape as `attack_mode`. The `null`

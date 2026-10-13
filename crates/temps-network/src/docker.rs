@@ -10,8 +10,13 @@
 
 use crate::config::{NetworkConfig, NodeAlloc};
 use crate::error::NetworkError;
-use bollard::models::{Ipam, IpamConfig, NetworkCreateRequest};
-use bollard::query_parameters::{InspectNetworkOptions, ListNetworksOptions};
+use bollard::models::{
+    EndpointIpamConfig, EndpointSettings, Ipam, IpamConfig, NetworkConnectRequest,
+    NetworkCreateRequest, NetworkDisconnectRequest,
+};
+use bollard::query_parameters::{
+    InspectContainerOptions, InspectNetworkOptions, ListContainersOptions, ListNetworksOptions,
+};
 use bollard::Docker;
 use ipnet::Ipv4Net;
 use std::collections::HashMap;
@@ -243,6 +248,16 @@ pub async fn ensure_network_for_pool(
             });
         }
 
+        let want_mtu = config.transport.bridge_mtu(config.underlay_mtu).to_string();
+        let got_mtu = inspect
+            .options
+            .as_ref()
+            .and_then(|options| options.get(MTU_OPTION))
+            .cloned();
+        if got_mtu.as_deref() != Some(want_mtu.as_str()) {
+            return recreate_for_new_mtu(docker, config, alloc, got_mtu).await;
+        }
+
         debug!(
             network = %config.docker_network_name,
             id = %id,
@@ -251,14 +266,24 @@ pub async fn ensure_network_for_pool(
         return Ok(id);
     }
 
-    // 2. Create a new bridge network pinned to our br-temps0 bridge.
+    create_owned_network(docker, config, alloc).await
+}
+
+const MTU_OPTION: &str = "com.docker.network.driver.mtu";
+
+/// Create our bridge network, pinned to the overlay bridge.
+async fn create_owned_network(
+    docker: &Docker,
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+) -> crate::Result<String> {
     let mtu = config.transport.bridge_mtu(config.underlay_mtu);
     let mut driver_opts: HashMap<String, String> = HashMap::new();
     driver_opts.insert(
         "com.docker.network.bridge.name".into(),
         config.bridge_name.clone(),
     );
-    driver_opts.insert("com.docker.network.driver.mtu".into(), mtu.to_string());
+    driver_opts.insert(MTU_OPTION.into(), mtu.to_string());
     // We handle masquerading ourselves via nftables so that the rules survive
     // a Docker daemon restart and we have a single source of truth.
     driver_opts.insert(
@@ -302,6 +327,115 @@ pub async fn ensure_network_for_pool(
         cidr = %alloc.compute_cidr,
         "created docker bridge network"
     );
+    Ok(id)
+}
+
+/// Docker can't change a network's MTU in place, and containers keep the MTU
+/// they were attached with. After the overlay's MTU drops (its underlay moved
+/// onto the WireGuard mesh, whose MTU is lower), the bridge drops every frame
+/// above the new MTU without an ICMP error, so large transfers stall while
+/// small ones work. Recreate the network with the new MTU and reattach every
+/// member, running or stopped, with its address and aliases.
+async fn recreate_for_new_mtu(
+    docker: &Docker,
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+    previous_mtu: Option<String>,
+) -> crate::Result<String> {
+    let name = config.docker_network_name.as_str();
+    let docker_error = |op: &'static str| {
+        move |error: bollard::errors::Error| NetworkError::Docker {
+            op,
+            network: name.to_string(),
+            reason: error.to_string(),
+        }
+    };
+    let members = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "network".to_string(),
+                vec![name.to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .map_err(docker_error("list_containers"))?;
+    let mut attachments: Vec<(String, EndpointSettings)> = Vec::new();
+    for member in members {
+        let Some(id) = member.id else { continue };
+        let endpoint = docker
+            .inspect_container(&id, None::<InspectContainerOptions>)
+            .await
+            .map_err(docker_error("inspect_container"))?
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .and_then(|mut networks| networks.remove(name))
+            .unwrap_or_default();
+        attachments.push((id, endpoint));
+    }
+    let want_mtu = config.transport.bridge_mtu(config.underlay_mtu);
+    warn!(
+        network = %name,
+        previous_mtu = previous_mtu.as_deref().unwrap_or("unset"),
+        mtu = want_mtu,
+        containers = attachments.len(),
+        "overlay MTU changed; recreating the Docker network and reattaching its containers"
+    );
+    for (container, _) in &attachments {
+        docker
+            .disconnect_network(
+                name,
+                NetworkDisconnectRequest {
+                    container: container.clone(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .map_err(docker_error("disconnect_network"))?;
+    }
+    docker
+        .remove_network(name)
+        .await
+        .map_err(docker_error("remove_network"))?;
+    let id = create_owned_network(docker, config, alloc).await?;
+
+    let mut failed = Vec::new();
+    for (container, previous) in attachments {
+        let address = previous
+            .ipam_config
+            .as_ref()
+            .and_then(|ipam| ipam.ipv4_address.clone())
+            .or(previous.ip_address.clone())
+            .filter(|address| !address.is_empty());
+        let request = NetworkConnectRequest {
+            container: container.clone(),
+            endpoint_config: Some(EndpointSettings {
+                ipam_config: address.map(|address| EndpointIpamConfig {
+                    ipv4_address: Some(address),
+                    ..Default::default()
+                }),
+                aliases: previous.aliases.clone(),
+                ..Default::default()
+            }),
+        };
+        if let Err(error) = docker.connect_network(name, request).await {
+            warn!(network = %name, container = %container, error = %error, "could not reattach container to the recreated overlay network");
+            failed.push(container);
+        }
+    }
+    if !failed.is_empty() {
+        return Err(NetworkError::Docker {
+            op: "connect_network",
+            network: name.to_string(),
+            reason: format!(
+                "recreated the network for MTU {want_mtu} but could not reattach {} container(s): {}; redeploy them",
+                failed.len(),
+                failed.join(", ")
+            ),
+        });
+    }
+    info!(network = %name, mtu = want_mtu, "overlay Docker network recreated with the new MTU");
     Ok(id)
 }
 

@@ -19,6 +19,8 @@ import {
 } from '@/components/ui/sidebar'
 import {
   Activity,
+  Plug,
+  Rocket,
   ArrowLeft,
   BadgeCheck,
   BarChart3,
@@ -105,9 +107,17 @@ interface PlatformNavGroup {
 // on /tools and in Cmd+K.
 const primaryPlatformGroups: PlatformNavGroup[] = [
   {
-    label: 'Build & deliver',
+    label: 'Applications',
     items: [
-      { title: 'AI workspace', url: '/ai-first', icon: Sparkles },
+      // Experimental: the badge and page header carry the maturity promise
+      // (see `featureKeyForPath`), so the entry stays discoverable without
+      // presenting a prototype as a finished product.
+      {
+        title: 'AI workspace',
+        url: '/ai-first',
+        icon: Sparkles,
+        featureKey: 'ai-chat',
+      },
       {
         title: 'Projects',
         url: '/projects',
@@ -118,7 +128,7 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
           path.startsWith('/projects/') ||
           path.startsWith('/p/'),
       },
-      { title: 'Git providers', url: '/git-providers', icon: GitBranch },
+      { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       // Lives under the /settings/nodes URL for historical reasons, but it is
       // a build-and-deliver capability: without a worker node a control plane
@@ -126,7 +136,7 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
       // WORKER_NODES_URL below for why the sidebar does not treat it as a
       // settings route.
       {
-        title: 'Worker Nodes',
+        title: 'Worker nodes',
         url: WORKER_NODES_URL,
         icon: Network,
         featureKey: 'multi-node-worker-join',
@@ -134,21 +144,21 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     ],
   },
   {
-    label: 'Data',
+    label: 'Storage',
     items: [
       { title: 'Databases', url: '/storage', icon: Database },
       { title: 'Backups', url: '/backups', icon: DatabaseBackup },
     ],
   },
   {
-    label: 'Observe',
+    label: 'Observability',
     items: [
       { title: 'Analytics', url: '/analytics', icon: BarChart3 },
       { title: 'Traces', url: '/traces', icon: GitFork },
       { title: 'Logs', url: '/logs', icon: ScrollText },
       { title: 'Errors', url: '/errors', icon: ShieldAlert },
       {
-        title: 'Server',
+        title: 'Server metrics',
         url: '/monitoring/server',
         icon: Cpu,
         activeWhen: (pathname) => pathname.startsWith('/monitoring/server'),
@@ -166,10 +176,10 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     ],
   },
   {
-    label: 'More',
+    label: 'Administration',
     items: [
       {
-        title: 'All platform tools',
+        title: 'All tools',
         url: '/tools',
         icon: Boxes,
         activeWhen: isPlatformToolsRoute,
@@ -365,7 +375,7 @@ export default function AppSidebar() {
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
   // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
-  // page ("Build & deliver"). Swapping to the settings sidebar there would
+  // page ("Applications"). Swapping to the settings sidebar there would
   // hide the entry that is currently active and highlight nothing, so the
   // route is explicitly excluded from the settings swap.
   const settingsMode =
@@ -1018,6 +1028,38 @@ const projectPrimaryItems = [
   },
 ] as const
 
+const monitoringProjectItems = [
+  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
+  {
+    title: 'Analytics',
+    url: 'analytics',
+    icon: BarChart3,
+    section: 'analytics',
+  },
+  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
+  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
+  {
+    title: 'Telemetry logs',
+    url: 'telemetry-logs',
+    icon: ScrollText,
+    section: 'logs',
+  },
+  { title: 'Monitoring', url: 'metrics', icon: Gauge, section: 'monitoring' },
+  {
+    title: 'Integrations',
+    url: 'integrations',
+    icon: Plug,
+    section: 'integrations',
+  },
+  {
+    title: 'Settings',
+    url: 'settings/general',
+    icon: Settings,
+    section: 'settings',
+  },
+  { title: 'Add hosting', url: 'hosting', icon: Rocket, section: 'hosting' },
+] as const
+
 function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery(
     getProjectBySlugOptions({ path: { slug } })
@@ -1025,9 +1067,16 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const active = resolveProjectPrimaryRoute(
-    location.pathname.slice(`/projects/${slug}/`.length)
-  )
+  const route = location.pathname.slice(`/projects/${slug}/`.length)
+  const active =
+    project?.source_type === 'external' &&
+    ['hosting', 'integrations'].includes(route)
+      ? route
+      : resolveProjectPrimaryRoute(route)
+  const items =
+    project?.source_type === 'external'
+      ? monitoringProjectItems
+      : projectPrimaryItems
   return (
     <>
       <SwapHeader
@@ -1037,7 +1086,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
       />
       <SidebarGroup className="py-2">
         <SidebarMenu aria-label="Service navigation">
-          {projectPrimaryItems.map((item) => (
+          {items.map((item) => (
             <SidebarMenuItem key={item.section} data-tour={item.section}>
               <SidebarMenuButton
                 asChild

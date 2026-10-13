@@ -13,8 +13,10 @@ const PLATFORM_TOOL_PREFIXES = [
   '/skills',
   '/mcp-servers',
   '/dns-providers',
+  '/delivery-profiles',
   '/proxy-logs',
   '/audit-logs',
+  '/revenue',
 ] as const
 
 export function isPlatformToolsRoute(pathname: string): boolean {

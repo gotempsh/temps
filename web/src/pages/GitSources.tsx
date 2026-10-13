@@ -49,7 +49,7 @@ import {
 import GithubIcon from '@/icons/Github'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 // Helper function to check if provider is GitHub App
@@ -60,7 +60,7 @@ const isGitHubApp = (provider: ProviderResponse) =>
 export function GitSources() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
-  const { feedback, showSuccess, clearFeedback } = useFeedback()
+  const { feedback, clearFeedback } = useFeedback()
   const queryClient = useQueryClient()
   const [providerToDelete, setProviderToDelete] =
     useState<ProviderResponse | null>(null)
@@ -99,7 +99,7 @@ export function GitSources() {
       const installUrl = `${baseUrl}/installations/new`
       window.open(installUrl, '_blank', 'noopener,noreferrer')
 
-      showSuccess('Opening GitHub App installation in new tab')
+      navigate(`/git-providers/${provider.id}`)
     }
   }
 
@@ -238,8 +238,6 @@ export function GitSources() {
           </EmptyPlaceholder>
         ) : (
           (() => {
-            const goToDetail = (id: number) => navigate(`/git-providers/${id}`)
-
             const ProviderIcon = ({
               provider,
               className = 'size-4 text-muted-foreground',
@@ -276,7 +274,12 @@ export function GitSources() {
                 )}
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="icon" className="h-8 w-8">
+                    <Button
+                      aria-label="Open menu"
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                    >
                       <EllipsisVertical className="h-4 w-4" />
                     </Button>
                   </DropdownMenuTrigger>
@@ -321,16 +324,7 @@ export function GitSources() {
                   {gitProviders.map((provider: ProviderResponse) => (
                     <li
                       key={provider.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => goToDetail(provider.id)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          goToDetail(provider.id)
-                        }
-                      }}
-                      className="flex cursor-pointer items-center gap-3 px-3 py-3 sm:gap-4 sm:px-4 hover:bg-muted/40 transition-colors focus:outline-none focus:bg-muted/40"
+                      className="relative flex items-center gap-3 px-3 py-3 sm:gap-4 sm:px-4 hover:bg-muted/40 transition-colors focus-within:bg-muted/40"
                     >
                       <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
                         <ProviderIcon provider={provider} />
@@ -338,7 +332,15 @@ export function GitSources() {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2 flex-wrap">
                           <p className="truncate text-sm font-medium">
-                            {provider.name}
+                            {/* Stretched link: the whole row opens the
+                                provider, while the actions menu stays a
+                                separate control above it. */}
+                            <Link
+                              to={`/git-providers/${provider.id}`}
+                              className="after:absolute after:inset-0 focus-visible:outline-none focus-visible:underline"
+                            >
+                              {provider.name}
+                            </Link>
                           </p>
                           <Badge
                             variant="secondary"
@@ -364,7 +366,9 @@ export function GitSources() {
                           <TimeAgo date={provider.created_at} />
                         </p>
                       </div>
-                      <ActionsMenu provider={provider} />
+                      <div className="relative z-10">
+                        <ActionsMenu provider={provider} />
+                      </div>
                       <ChevronRight className="hidden size-4 shrink-0 text-muted-foreground/50 sm:block" />
                     </li>
                   ))}

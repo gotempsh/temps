@@ -61,6 +61,8 @@ pub struct RepositoryFilter {
     pub owner: Option<String>,
     pub language: Option<String>,
     pub private: Option<bool>,
+    pub preset: Option<String>,
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
     pub sort: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -128,6 +130,25 @@ impl RepositoryService {
 
         if let Some(private) = filter.private {
             query = query.filter(repositories::Column::Private.eq(private));
+        }
+
+        if let Some(updated_after) = filter.updated_after {
+            query = query.filter(repositories::Column::UpdatedAt.gte(updated_after));
+        }
+        if let Some(preset) = &filter.preset {
+            // Cached detection belongs to a branch. Never mix feature-branch
+            // results into the default-branch list or initiate remote detection.
+            let presets = "repositories.preset::jsonb -> repositories.default_branch -> 'presets'";
+            if preset == "__undetected__" {
+                query = query.filter(Expr::cust(format!(
+                    "COALESCE(jsonb_typeof({presets}), 'null') <> 'array'"
+                )));
+            } else {
+                query = query.filter(Expr::cust_with_values(
+                    format!("EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof({presets}) = 'array' THEN {presets} ELSE '[]'::jsonb END) AS detected WHERE detected ->> 'preset' = $1)"),
+                    [preset.clone()],
+                ));
+            }
         }
 
         query
@@ -648,6 +669,16 @@ mod tests {
     /// page itself, and never include another connection's repositories.
     #[tokio::test]
     async fn count_repositories_matches_filters_across_pages() {
+        if !std::process::Command::new("docker")
+            .args(["info"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("Skipping repository filter integration test: Docker unavailable");
+            return;
+        }
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
         let now = Utc::now();
@@ -747,6 +778,8 @@ mod tests {
             owner: None,
             language: None,
             private,
+            preset: None,
+            updated_after: None,
             sort: Some("name".to_string()),
             limit: Some(2),
             offset: Some(4),
@@ -786,5 +819,59 @@ mod tests {
             1,
             "another connection's matching repository must not be counted"
         );
+        // Preset filtering is branch-specific and happens before pagination.
+        for (name, cache) in [
+            (
+                "api",
+                serde_json::json!({"main": {"presets": [{"preset": "nextjs"}]}}),
+            ),
+            (
+                "web",
+                serde_json::json!({"main": {"presets": [{"preset": "nextjs"}, {"preset": "dockerfile"}]}}),
+            ),
+            (
+                "worker",
+                serde_json::json!({"feature": {"presets": [{"preset": "nextjs"}]}}),
+            ),
+            ("docs", serde_json::json!({"main": {"presets": []}})),
+        ] {
+            repositories::Entity::update_many()
+                .col_expr(repositories::Column::Preset, Expr::value(cache))
+                .filter(repositories::Column::GitProviderConnectionId.eq(connection.id))
+                .filter(repositories::Column::Name.eq(name))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+        }
+        let mut selected = filter(None, None);
+        selected.preset = Some("nextjs".into());
+        selected.limit = Some(1);
+        selected.offset = Some(1);
+        selected.updated_after = Some(now - chrono::Duration::seconds(1));
+        assert_eq!(
+            service.count_repositories(selected.clone()).await.unwrap(),
+            2
+        );
+        let page = service.list_repositories(selected.clone()).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].name, "web");
+        selected.updated_after = Some(now + chrono::Duration::seconds(1));
+        assert_eq!(
+            service.count_repositories(selected.clone()).await.unwrap(),
+            0
+        );
+        assert!(service
+            .list_repositories(selected.clone())
+            .await
+            .unwrap()
+            .is_empty());
+        selected.updated_after = None;
+        selected.preset = Some("__undetected__".into());
+        assert_eq!(
+            service.count_repositories(selected.clone()).await.unwrap(),
+            2
+        );
+        selected.preset = Some("nextjs' OR TRUE --".into());
+        assert_eq!(service.count_repositories(selected).await.unwrap(), 0);
     }
 }

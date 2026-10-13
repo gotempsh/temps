@@ -7,6 +7,7 @@
 //! for various DNS providers including Cloudflare, Namecheap, Route53, etc.
 
 pub mod azure;
+pub mod bunny;
 pub mod cloudflare;
 pub mod credentials;
 pub mod digitalocean;
@@ -18,10 +19,12 @@ pub mod traits;
 
 // Re-export commonly used types
 pub use azure::AzureProvider;
+pub use bunny::BunnyProvider;
 pub use cloudflare::CloudflareProvider;
 pub use credentials::{
-    AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
-    NamecheapCredentials, PebbleCredentials, ProviderCredentials, Route53Credentials,
+    AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
+    GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
+    Route53Credentials,
 };
 pub use digitalocean::DigitalOceanProvider;
 pub use gcp::GcpProvider;

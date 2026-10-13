@@ -63,6 +63,27 @@ function GeminiMark(props: IconBaseProps) {
   )
 }
 
+function SelfHostedMark(props: IconBaseProps) {
+  // A server rack: a self-hosted model server has no vendor brand.
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+      {...props}
+    >
+      <rect x="3" y="3" width="18" height="7" rx="1.5" />
+      <rect x="3" y="14" width="18" height="7" rx="1.5" />
+      <path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6" />
+    </svg>
+  )
+}
+
 function GenericProviderMark(props: IconBaseProps) {
   // Fallback for provider ids we don't have a branded glyph for yet — a
   // neutral diamond so we never render a broken surface.
@@ -133,7 +154,9 @@ export function AiProviderIcon({
           ? XAIMark
           : provider === 'gemini'
             ? GeminiMark
-            : GenericProviderMark
+            : provider === 'openai_compatible'
+              ? SelfHostedMark
+              : GenericProviderMark
 
   if (!tinted) {
     return (

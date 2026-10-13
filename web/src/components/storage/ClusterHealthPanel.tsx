@@ -16,7 +16,10 @@
  */
 
 import { useQuery } from '@tanstack/react-query'
-import { Loader2, RefreshCw } from 'lucide-react'
+import { Loader2, RefreshCw, ShieldAlert, ShieldCheck } from 'lucide-react'
+
+import { getClusterHealthOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { ClusterProtectionResponse } from '@/api/client'
 
 import {
   Card,
@@ -27,16 +30,16 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   bucketMemberHealth,
-  ClusterMemberHealth,
-  getClusterHealth,
+  describeProtection,
   isTransitioning,
-  type ClusterHealthReport,
+  type ClusterMemberHealth,
   type MemberHealthBucket,
 } from '@/lib/cluster-health'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 
 interface Props {
   serviceId: number
@@ -70,7 +73,7 @@ function formatLastSeen(seconds: number): string {
 }
 
 /** Format `replay_lag_ms` for the "Lag" column. */
-function formatLag(lagMs: number | null): string {
+function formatLag(lagMs?: number | null): string {
   if (lagMs == null) return '—'
   if (lagMs < 1) return '<1 ms'
   if (lagMs < 1000) return `${Math.round(lagMs)} ms`
@@ -78,7 +81,7 @@ function formatLag(lagMs: number | null): string {
 }
 
 function syncStateBadgeVariant(
-  syncState: string | null
+  syncState?: string | null
 ): 'default' | 'secondary' | 'outline' {
   switch (syncState) {
     case 'sync':
@@ -120,9 +123,8 @@ export function ClusterHealthPanel({
     isFetching,
     refetch,
     dataUpdatedAt,
-  } = useQuery<ClusterHealthReport, Error>({
-    queryKey: ['cluster-health', serviceId],
-    queryFn: () => getClusterHealth(serviceId),
+  } = useQuery({
+    ...getClusterHealthOptions({ path: { id: serviceId } }),
     // Poll every `refetchInterval` ms regardless of focus. The cluster's
     // role can flip mid-failover and ops needs to see it immediately.
     refetchInterval,
@@ -158,7 +160,7 @@ export function ClusterHealthPanel({
         <CardContent>
           <Alert variant="destructive">
             <AlertDescription>
-              Failed to load cluster health: {error.message}
+              Failed to load cluster health: {clusterHealthErrorMessage(error)}
             </AlertDescription>
           </Alert>
         </CardContent>
@@ -210,7 +212,10 @@ export function ClusterHealthPanel({
           </div>
         </div>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-4">
+        {report.protection && (
+          <ProtectionBanner protection={report.protection} />
+        )}
         {report.monitor_error ? (
           <Alert variant="destructive">
             <AlertDescription>
@@ -222,7 +227,7 @@ export function ClusterHealthPanel({
             Monitor reports zero data nodes registered yet.
           </p>
         ) : (
-          <div className="overflow-x-auto">
+          <ScrollRegion regionLabel="Cluster members, scrollable">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
@@ -241,10 +246,49 @@ export function ClusterHealthPanel({
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollRegion>
         )}
       </CardContent>
     </Card>
+  )
+}
+
+/** The API's problem detail, or the thrown error's message. */
+function clusterHealthErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  if (error && typeof error === 'object') {
+    const problem = error as { detail?: unknown; title?: unknown }
+    if (typeof problem.detail === 'string') return problem.detail
+    if (typeof problem.title === 'string') return problem.title
+  }
+  return 'unknown error'
+}
+
+/**
+ * Whether a standby could take over now. A new cluster accepts SQL before
+ * its first standby is `secondary`; this keeps it from looking ready.
+ */
+function ProtectionBanner({
+  protection,
+}: {
+  protection: ClusterProtectionResponse
+}) {
+  const { tone, title, body } = describeProtection(protection)
+  if (tone === 'unknown') return null
+  if (tone === 'protected') {
+    return (
+      <p className="flex items-center gap-1.5 text-sm text-success-strong">
+        <ShieldCheck className="h-4 w-4 shrink-0" aria-hidden="true" />
+        <span>{protection.detail}</span>
+      </p>
+    )
+  }
+  return (
+    <Alert variant="warning">
+      <ShieldAlert className="h-4 w-4" aria-hidden="true" />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>{body}</AlertDescription>
+    </Alert>
   )
 }
 
@@ -260,6 +304,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
       <td className="py-2.5 pr-3">
         <div className="flex items-center gap-2">
           <span
+            role="img"
             className={`h-2.5 w-2.5 rounded-full ${DOT_CLASS[bucket]}`}
             aria-label={dotTitle}
             title={dotTitle}
@@ -275,7 +320,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
             {bucket === 'unreachable' && (
               <>
                 {' · '}
-                <span className="text-rose-400">
+                <span className="text-rose-700 dark:text-rose-400">
                   no report {formatLastSeen(member.seconds_since_report)}
                 </span>
               </>
@@ -298,6 +343,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
           {transitioning && (
             <>
               <span
+                role="img"
                 className="text-muted-foreground"
                 aria-label="transitioning to"
               >
@@ -343,7 +389,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
           </span>
         ) : member.replication_quorum ? (
           <span
-            className="text-emerald-500"
+            className="text-emerald-700 dark:text-emerald-500"
             title="Member of the synchronous quorum"
           >
             ●

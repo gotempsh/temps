@@ -149,6 +149,7 @@ export function EnvironmentDashboard({
 export function EnvironmentDashboardSkeleton() {
   return (
     <div
+      role="status"
       className="grid min-w-0 flex-1 content-start lg:grid-cols-[200px_minmax(0,1fr)] lg:content-stretch"
       aria-label="Loading environment"
     >

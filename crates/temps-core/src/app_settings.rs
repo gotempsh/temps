@@ -21,12 +21,26 @@ pub struct AppSettings {
     /// mapping (which Temps adds to provisioned containers). Distinct from
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
+    /// Base URL handed to third parties that call back into Temps: email
+    /// open/click tracking, git provider webhooks, SES/SNS events, revenue
+    /// webhooks, the Sentry DSN (ADR-051). `None` (the default) falls back to
+    /// `external_url`, which is right whenever the console is publicly
+    /// reachable. Set it when the console host is restricted (VPN, firewall,
+    /// identity-aware proxy) so only this hostname has to be public: the proxy
+    /// serves nothing but the public callback routes on it. Read it through
+    /// [`AppSettings::effective_public_ingress_url`].
+    #[serde(default)]
+    pub public_ingress_url: Option<String>,
     pub preview_domain: String,
     /// Public edge target that generated DNS records point at when a managed
     /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
+    /// Enable Cloudflare delivery by default for projects created after this is set.
+    pub cloudflare_new_projects: bool,
+    /// Enable Bunny delivery by default only for projects created after this is set.
+    pub bunny_new_projects: bool,
 
     /// Managed control-plane connection. Credentials are deliberately not
     /// stored here; they live in the owner-only cloud-link state file.
@@ -100,8 +114,21 @@ pub struct AppSettings {
     // Agent sandbox settings (global defaults)
     pub agent_sandbox: AgentSandboxSettings,
 
-    // Workspace preview gateway settings (single shared container per node)
+    /// Workspace preview gateway settings (single shared container per node).
+    /// Owned by `PATCH /preview-gateway/settings` and
+    /// `POST /preview-gateway/upgrade`, which change the gateway's containers
+    /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
+
+    /// Managed KV service (Redis container) settings. Owned by
+    /// `PATCH /kv/settings`; the generic settings update preserves the stored
+    /// value.
+    pub kv: KvSettings,
+
+    /// Managed Blob service (RustFS container) settings. Owned by
+    /// `PATCH /blob/settings`; the generic settings update preserves the
+    /// stored value.
+    pub blob: BlobSettings,
 
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
     // auto-enabled by `temps setup` for QuickStart (sslip.io) installs.
@@ -148,6 +175,16 @@ pub struct AppSettings {
     /// internet must keep this `false` — otherwise a MitM steals the join token.
     #[serde(default)]
     pub insecure_tls: bool,
+
+    /// Private networks (CIDRs or single addresses) that user-configured
+    /// outbound requests may reach: webhooks, notification channels, uptime
+    /// checks, AI gateway providers, self-hosted git, importers. Empty by
+    /// default, which keeps the SSRF guard blocking every private, loopback
+    /// and CGNAT destination. Only private ranges are accepted, and cloud
+    /// metadata endpoints stay blocked regardless. Published process-wide via
+    /// `url_validation::set_trusted_private_networks`.
+    #[serde(default)]
+    pub trusted_private_networks: Vec<String>,
 
     /// Build-time resource limits applied on the control plane to prevent
     /// `docker build` from saturating host CPU/RAM. Worker nodes are
@@ -210,6 +247,23 @@ pub struct AppSettings {
     #[serde(default)]
     pub plugin_installation_reporting_enabled: bool,
 
+    /// Admin preference for anonymous product telemetry (the events sent to
+    /// the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+    /// mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+    ///
+    /// - `None` (default) — the operator has not chosen; the built-in default
+    ///   applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+    /// - `Some(true)` / `Some(false)` — an admin turned it on/off from
+    ///   Settings › Telemetry. Applied at runtime without a restart.
+    ///
+    /// The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+    /// switch that wins over this value unconditionally. The dedicated
+    /// `PATCH /settings/telemetry` endpoint is the only write path: the
+    /// generic settings save restores the stored value under the row lock, so
+    /// an older client round-tripping the whole document cannot flip it.
+    #[serde(default)]
+    pub anonymous_telemetry_enabled: Option<bool>,
+
     /// One-click "Update now" from the console. Enabled by default; an admin
     /// can turn it off here to keep upgrades on the CLI/config-management path.
     ///
@@ -263,6 +317,14 @@ pub struct CloudSettings {
     pub backups_enabled: bool,
     /// Explicit consent to send notifications through managed providers.
     pub notifications_enabled: bool,
+
+    /// Explicit operator consent to let Temps Cloud open this instance's
+    /// console over the outbound relay, using managed OIDC authentication.
+    /// Default off for every enrollment path. Linking, including unattended
+    /// bootstrap, never enables console access; enable it explicitly in
+    /// Settings > Temps Cloud or with `temps cloud console-access enable`.
+    #[serde(default)]
+    pub console_access_enabled: bool,
 
     /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
     /// backs Cloud-primary telemetry writes.
@@ -428,6 +490,8 @@ impl Default for CloudSettings {
             telemetry_enabled: false,
             backups_enabled: false,
             notifications_enabled: false,
+            // Linking never changes this explicit operator consent.
+            console_access_enabled: false,
             telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
             // ADR-042 §3: unthrottled by default. "Activate now" is what the
             // customer paid for, and a throttle nobody asked for makes a long
@@ -1003,7 +1067,7 @@ pub struct ProviderConfig {
     /// Auth flavor for this provider. Valid values depend on the provider:
     ///   - `claude_cli`: "subscription" (OAuth token) | "api_key"
     ///   - `codex_cli`: "api_key"
-    ///   - `opencode`:  "config_file"
+    ///   - `opencode`:  "config_file" | "openai_compatible"
     pub auth_type: String,
     /// Encrypted credential payload. The decrypted bytes are interpreted
     /// according to the catalog entry's `credential_format`:
@@ -1084,13 +1148,21 @@ pub struct AgentSandboxSettings {
     /// Network access level: "full" (unrestricted), "restricted" (Temps network only), "none" (no network)
     #[schema(example = "full")]
     pub network_mode: String,
-    /// Default isolation backend for sandboxes: "docker" (default) or
-    /// "firecracker" (ADR-029; requires `temps firecracker setup`). Only
-    /// consulted when the Firecracker backend probes available — otherwise
-    /// Docker is used regardless.
+    /// Default isolation backend for sandboxes: "docker" (default),
+    /// "firecracker" (ADR-029; requires `temps firecracker setup`) or
+    /// "microsandbox" (ADR-050, experimental; requires `temps microsandbox
+    /// setup`). Only consulted when the selected microVM backend probes
+    /// available — otherwise Docker is used.
     #[serde(default)]
     #[schema(example = "docker")]
     pub sandbox_backend: Option<String>,
+    /// Nodes allowed to run sandboxes (ADR-048). `None` (the default) =
+    /// every node, including the control plane. `Some(ids)` = only those
+    /// nodes; the control plane is id `0`. `Some([])` disables sandbox
+    /// creation. Owned by `PUT /sandboxes/placement`; the generic settings
+    /// update preserves the stored value.
+    #[serde(default)]
+    pub allowed_node_ids: Option<Vec<i32>>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -1139,6 +1211,7 @@ impl Default for AgentSandboxSettings {
             memory_limit_mb: 8192,
             network_mode: "full".to_string(),
             sandbox_backend: None,
+            allowed_node_ids: None,
         }
     }
 }
@@ -1359,8 +1432,12 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Docker image reference for the gateway. Empty follows this Temps
-    /// release's digest; any nonempty value is an explicit operator pin.
+    /// Whether Temps runs the shared preview gateway. While false its
+    /// containers are removed, so workspace preview URLs are not served.
+    #[schema(example = true)]
+    pub enabled: bool,
+    /// Docker image reference. Empty follows this Temps release's digest;
+    /// a nonempty value is an explicit operator pin.
     #[schema(
         example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
     )]
@@ -1413,6 +1490,7 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             image: String::new(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
@@ -1420,6 +1498,35 @@ impl Default for PreviewGatewaySettings {
             shared_secret: String::new(),
         }
     }
+}
+
+/// Settings of the managed KV service (the Redis container behind `/kv`).
+///
+/// The Docker container is named `redis-<service name>`, so two Temps
+/// instances sharing one Docker daemon collide unless each has its own name.
+/// An unset value follows the per-instance default (the pre-existing
+/// `redis-temps-kv` for an install that already enabled KV, a name derived
+/// from this instance otherwise).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct KvSettings {
+    /// Docker container name of the KV Redis container. Empty means the
+    /// per-instance default. A custom value must start with `redis-`.
+    #[schema(example = "redis-temps-kv-staging")]
+    pub container_name: String,
+}
+
+/// Settings of the managed Blob service (the RustFS container behind `/blob`).
+///
+/// Same reasoning as [`KvSettings`]: the container is named
+/// `rustfs-<service name>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BlobSettings {
+    /// Docker container name of the Blob RustFS container. Empty means the
+    /// per-instance default. A custom value must start with `rustfs-`.
+    #[schema(example = "rustfs-temps-blob-staging")]
+    pub container_name: String,
 }
 
 /// On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
@@ -1943,8 +2050,11 @@ impl Default for AppSettings {
         Self {
             external_url: None,
             internal_url: None,
+            public_ingress_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            cloudflare_new_projects: false,
+            bunny_new_projects: false,
             cloud: CloudSettings::default(),
             console_force_https: None,
             screenshots: ScreenshotSettings::default(),
@@ -1961,9 +2071,12 @@ impl Default for AppSettings {
             multi_node: MultiNodeSettings::default(),
             agent_sandbox: AgentSandboxSettings::default(),
             preview_gateway: PreviewGatewaySettings::default(),
+            kv: KvSettings::default(),
+            blob: BlobSettings::default(),
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            trusted_private_networks: Vec::new(),
             ai_chat_limits: AiChatLimitsSettings::default(),
             ai_workspace_file_limits: AiWorkspaceFileLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
@@ -1979,6 +2092,7 @@ impl Default for AppSettings {
             setup_complete: false,
             require_mfa_for_admins: false,
             plugin_installation_reporting_enabled: false,
+            anonymous_telemetry_enabled: None,
             self_update: None,
             console_version: None,
         }
@@ -2181,7 +2295,19 @@ impl SecurityHeadersSettings {
 impl AppSettings {
     /// Create settings from JSON value, using defaults for missing fields
     pub fn from_json(value: serde_json::Value) -> Self {
-        serde_json::from_value(value).unwrap_or_default()
+        serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+            // Unrelated malformed sections must never turn a saved opt-out
+            // into the opt-in default during an unrelated settings write.
+            let anonymous_telemetry_enabled = match value.get("anonymous_telemetry_enabled") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
+                Some(_) => Some(false),
+            };
+            Self {
+                anonymous_telemetry_enabled,
+                ..Self::default()
+            }
+        })
     }
 
     /// Convert settings to JSON value
@@ -2273,9 +2399,10 @@ impl AppSettings {
     /// True when `host` is owned by the platform itself and must never be
     /// claimed by a project domain.
     ///
-    /// Reserved hosts are the console hostname (`external_url`) and the
-    /// preview domain apex — routing either of them at a project makes the
-    /// console or every generated preview URL unreachable, and recovering
+    /// Reserved hosts are the console hostname (`external_url`), the public
+    /// ingress hostname (`public_ingress_url`) and the preview domain apex —
+    /// routing any of them at a project makes the console, every third-party
+    /// callback or every generated preview URL unreachable, and recovering
     /// requires shell/IP access to the box (issue #478).
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -2283,6 +2410,9 @@ impl AppSettings {
             return false;
         }
         if self.console_hostname().as_deref() == Some(host.as_str()) {
+            return true;
+        }
+        if self.public_ingress_hostname().as_deref() == Some(host.as_str()) {
             return true;
         }
         let preview = self
@@ -2514,6 +2644,36 @@ mod tests {
             ..Default::default()
         };
         assert!(!s.is_reserved_hostname("anything.example.com"));
+    }
+
+    // ADR-051: the public ingress hostname is a platform host, exactly like
+    // the console hostname. A project that claimed it would swallow every
+    // third-party callback.
+    #[test]
+    fn reserved_hostname_covers_the_public_ingress_host() {
+        let s = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            public_ingress_url: Some("https://Hooks.example.com/".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(s.is_reserved_hostname("hooks.example.com"));
+        assert!(s.is_reserved_hostname("HOOKS.example.com."));
+        assert!(s.is_reserved_hostname("console.example.com"));
+        assert!(!s.is_reserved_hostname("other.example.com"));
+    }
+
+    #[test]
+    fn settings_stored_before_public_ingress_existed_still_load() {
+        let s = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://console.example.com",
+            "preview_domain": "apps.example.com"
+        }));
+        assert_eq!(s.public_ingress_url, None);
+        assert_eq!(
+            s.effective_public_ingress_url(),
+            "https://console.example.com"
+        );
     }
 
     // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
@@ -2978,6 +3138,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_preview_gateway_settings_default_to_enabled() {
+        let legacy = serde_json::json!({
+            "image": "ghcr.io/gotempsh/temps-preview-gateway:latest",
+            "host_port": 8090,
+            "auto_upgrade": true
+        });
+
+        let parsed: PreviewGatewaySettings =
+            serde_json::from_value(legacy).expect("legacy preview gateway settings should parse");
+
+        assert!(
+            parsed.enabled,
+            "legacy settings must keep preview gateway reconciliation enabled"
+        );
+    }
+
+    #[test]
     fn on_demand_tls_round_trips_through_json() {
         let mut s = AppSettings::default();
         s.on_demand_tls.enabled = true;
@@ -3043,6 +3220,10 @@ mod tests {
         assert!(!defaults.telemetry_enabled);
         assert!(!defaults.backups_enabled);
         assert!(!defaults.notifications_enabled);
+        // ADR-045 §5: console access defaults off just like the other three
+        // consent flags -- an instance never gets it merely by loading
+        // settings. Every enrollment path preserves explicit operator consent.
+        assert!(!defaults.console_access_enabled);
 
         let parsed = AppSettings::from_json(serde_json::json!({
             "cloud": {"backend_url": "https://cloud.example.com"}
@@ -3050,6 +3231,21 @@ mod tests {
         assert!(!parsed.cloud.telemetry_enabled);
         assert!(!parsed.cloud.backups_enabled);
         assert!(!parsed.cloud.notifications_enabled);
+        assert!(!parsed.cloud.console_access_enabled);
+
+        // A settings row written before this field existed (no `cloud.
+        // console_access_enabled` key at all) must deserialize as off
+        // rather than failing the whole settings read.
+        let legacy = AppSettings::from_json(serde_json::json!({
+            "cloud": {
+                "backend_url": "https://cloud.example.com",
+                "telemetry_enabled": true,
+                "backups_enabled": false,
+                "notifications_enabled": false
+            }
+        }));
+        assert!(!legacy.cloud.console_access_enabled);
+        assert!(legacy.cloud.telemetry_enabled);
     }
 
     #[test]
@@ -3271,5 +3467,39 @@ mod tests {
         });
         let parsed = AppSettings::from_json(legacy);
         assert!(!parsed.multi_node.require_mtls);
+    }
+}
+
+#[cfg(test)]
+mod cloudflare_new_project_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn legacy_settings_keep_future_projects_opted_out() {
+        let settings =
+            AppSettings::from_json(serde_json::json!({"preview_domain": "example.test"}));
+        assert!(!settings.cloudflare_new_projects);
+        assert!(!settings.bunny_new_projects);
+    }
+
+    #[test]
+    fn cloudflare_default_round_trips_without_retroactive_state() {
+        let settings = AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(settings.to_json());
+        assert!(restored.cloudflare_new_projects);
+    }
+
+    #[test]
+    fn bunny_default_round_trips_without_retroactive_state() {
+        let settings = AppSettings {
+            bunny_new_projects: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(settings.to_json());
+        assert!(restored.bunny_new_projects);
+        assert!(!restored.cloudflare_new_projects);
     }
 }

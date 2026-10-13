@@ -13,6 +13,12 @@ pub struct ProjectContext {
     pub project: Arc<projects::Model>,
     pub environment: Arc<environments::Model>,
     pub deployment: Arc<deployments::Model>,
+    /// The host belongs to this deployment but it has no live upstream right
+    /// now (stopped or crashed containers, or a paused deployment). The
+    /// request is still attributed and policed, but the upstream resolver
+    /// fails it with a 503 instead of proxying it anywhere.
+    #[serde(default)]
+    pub upstream_unavailable: bool,
 }
 
 /// Visitor information resolved from the stateless cookie codec.
@@ -116,6 +122,29 @@ pub trait UpstreamResolver: Send + Sync {
     /// mocks that don't override it keep the normal hot-path timeout.
     fn console_address(&self) -> &str {
         ""
+    }
+
+    /// Address of the listener that serves only the console's public routes
+    /// (ADR-051), when one exists. `None` keeps the earlier behaviour: a
+    /// gate-denied request is answered with a 404 by the proxy itself.
+    fn console_ingress_address(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether `host` is the dedicated public ingress hostname. Such a
+    /// request may only ever reach the public-only listener. Must not block
+    /// or allocate: it runs for every request that falls through to the
+    /// console.
+    fn is_public_ingress_host(&self, _host: &str) -> bool {
+        false
+    }
+
+    /// The status-page binding for `host` when it is a status page's custom
+    /// hostname (#1412). Such a host may only ever reach the two status-page
+    /// routes on the public-only listener. Must not block: it runs for every
+    /// request.
+    fn status_page_host(&self, _host: &str) -> Option<temps_routes::StatusPageHostRoute> {
+        None
     }
 }
 

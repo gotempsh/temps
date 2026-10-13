@@ -36,6 +36,15 @@ export function registerDocsCommand(program: Command): void {
     .action(generateDocs)
 }
 
+/**
+ * Hidden commands (registered but not implemented yet) are left out of the
+ * docs for the same reason they are left out of `--help`: a reference must
+ * not advertise a command that only prints "coming soon".
+ */
+function isDocumented(cmd: Command): boolean {
+  return !(cmd as Command & { _hidden?: boolean })._hidden
+}
+
 function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
   const name = parentName ? `${parentName} ${cmd.name()}` : cmd.name()
   const aliases = cmd.aliases()
@@ -52,6 +61,7 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
 
   const subcommands: CommandInfo[] = cmd.commands
     .filter((sub: Command) => sub.name() !== 'docs') // Exclude docs command from docs
+    .filter(isDocumented)
     .map((sub: Command) => extractCommandInfo(sub, name))
 
   return {
@@ -223,8 +233,8 @@ bunx @temps-sdk/cli@${version} containers list --project-id 1 --environment-id 1
 # List environments
 bunx @temps-sdk/cli@${version} environments list --project my-app
 
-# Set environment variables on the intended server
-bunx @temps-sdk/cli@${version} --target-context production environments vars set --project my-app --key DATABASE_URL
+# Set an environment variable on the intended server (prompts for the value)
+bunx @temps-sdk/cli@${version} --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
 bunx @temps-sdk/cli@${version} environments vars list --project my-app
@@ -233,14 +243,17 @@ bunx @temps-sdk/cli@${version} environments vars list --project my-app
 ### Managing Domains
 
 \`\`\`bash
-# Add a custom domain on the intended server
-bunx @temps-sdk/cli@${version} --target-context production domains add --project my-app --domain app.example.com
+# Request a certificate for a domain on the intended server
+bunx @temps-sdk/cli@${version} --target-context production domains add --domain app.example.com
+
+# Route the domain to a project environment
+bunx @temps-sdk/cli@${version} --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@${version} domains list --project my-app
+bunx @temps-sdk/cli@${version} domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@${version} --target-context production domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@${version} --target-context production domains remove --domain app.example.com
 \`\`\`
 
 ## Environment Variables
@@ -276,6 +289,7 @@ export async function generateDocs(options: DocsOptions): Promise<void> {
   // Extract command information (excluding docs command itself)
   const commands: CommandInfo[] = program.commands
     .filter((cmd: Command) => cmd.name() !== 'docs')
+    .filter(isDocumented)
     .map((cmd: Command) => extractCommandInfo(cmd))
 
   let output: string

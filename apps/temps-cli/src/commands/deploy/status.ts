@@ -97,9 +97,20 @@ export async function status(options: StatusOptions): Promise<void> {
     }
   }
 
+  if (deployment.failure) {
+    newline()
+    console.log(
+      colors.error(
+        `Failed in ${deployment.failure.stage} stage: ${deployment.failure.title} (${deployment.failure.code})`
+      )
+    )
+    console.log(`${colors.bold('How to fix:')} ${deployment.failure.remediation}`)
+  }
+
   if (deployment.cancelled_reason) {
     newline()
-    console.log(colors.error(`Cancelled: ${deployment.cancelled_reason}`))
+    const label = deployment.status === 'failed' ? 'Error' : 'Cancelled'
+    console.log(colors.error(`${label}: ${deployment.cancelled_reason}`))
   }
 
   newline()

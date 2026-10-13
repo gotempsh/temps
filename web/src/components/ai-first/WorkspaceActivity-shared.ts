@@ -20,7 +20,7 @@ export const states = [
     key: 'pending',
     label: 'Pending',
     Icon: Clock3,
-    className: 'text-amber-600 dark:text-amber-400',
+    className: 'text-amber-700 dark:text-amber-400',
   },
   {
     key: 'completed',

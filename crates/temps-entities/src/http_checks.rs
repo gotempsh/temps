@@ -9,6 +9,9 @@ pub struct Model {
     pub id: i32,
     pub project_id: i32,
     pub env_var_id: Option<i32>,
+    pub secret_id: Option<i32>,
+    /// `http` or `local`; see `temps_credential_checks::CheckKind`.
+    pub kind: String,
     pub name: String,
     pub automatic_provider: Option<String>,
     pub encrypted_spec: String,

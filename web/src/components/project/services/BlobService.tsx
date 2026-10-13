@@ -153,7 +153,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Status</p>
                       <p
-                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}
+                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-700 dark:text-green-600' : 'text-red-700 dark:text-red-600'}`}
                       >
                         {status?.healthy ? (
                           <CheckCircle2 className="h-4 w-4" />
@@ -673,7 +673,10 @@ function ApiMethod({
       </div>
       <div>
         <p className="text-xs text-muted-foreground mb-1">Signature</p>
-        <pre className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
+        <pre
+          tabIndex={0}
+          className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap"
+        >
           <HighlightedCode code={signature} language="typescript" />
         </pre>
       </div>

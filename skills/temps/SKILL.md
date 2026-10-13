@@ -1,6 +1,6 @@
 ---
 name: temps
-description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.36`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
+description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.37`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
 ---
 
 # Temps
@@ -73,6 +73,7 @@ When the user opts in:
 | Group services into a project (the console's "Project"), import apps from a monorepo, share variables, or route `/api` to another service | [howtos/projects-and-monorepos.md](howtos/projects-and-monorepos.md) |
 | Create a multi-service app from a template, or follow/retry an import | [howtos/projects-and-monorepos.md](howtos/projects-and-monorepos.md), then [references/commands/templates.md](references/commands/templates.md) or [references/commands/instantiations.md](references/commands/instantiations.md) |
 | Configure a database, cache, or object store | [howtos/managed-services.md](howtos/managed-services.md) |
+| Copy an existing database into a managed service | [howtos/managed-services.md](howtos/managed-services.md#import-an-existing-database-into-a-managed-service) |
 | Configure, verify, or restore backups | [howtos/backup-recovery.md](howtos/backup-recovery.md) |
 | Diagnose an unhealthy deployment | [howtos/diagnose-deployment.md](howtos/diagnose-deployment.md) |
 | Automate Temps from CI | [howtos/ci-automation.md](howtos/ci-automation.md) |
@@ -95,10 +96,10 @@ Do not read a monolithic CLI manual. Open
 command-group file, and confirm uncertain syntax with runtime help:
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 <group> <command> --help
+bunx @temps-sdk/cli@0.1.37 <group> <command> --help
 ```
 
-Use `npx @temps-sdk/cli@0.1.36` only when Bun is unavailable. Never omit the
+Use `npx @temps-sdk/cli@0.1.37` only when Bun is unavailable. Never omit the
 reviewed version and never assume a global `temps` binary exists.
 
 For Performance Insights, confirm `analytics performance --help` exists in the

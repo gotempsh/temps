@@ -4,6 +4,7 @@
 "use client";
 import { useState, useEffect, useCallback, createContext, useContext, useMemo } from "react";
 import type React from "react";
+import type { ReactElement } from "react";
 
 interface SessionRecordingContextValue {
   isRecordingEnabled: boolean;
@@ -15,6 +16,35 @@ interface SessionRecordingContextValue {
 
 const SessionRecordingContext = createContext<SessionRecordingContextValue | undefined>(undefined);
 
+const PREFERENCE_KEY = "temps_session_recording_enabled";
+
+/**
+ * `localStorage` access that cannot throw. Storage may be blocked (site data
+ * disabled, sandboxed iframe: merely reading `localStorage` throws) or full;
+ * the recording preference is a convenience and must never take the host
+ * app's render or event handler down with it.
+ */
+function readStorage(key: string): string | null {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key: string, value: string): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
+  } catch (error) {
+    console.warn("[SessionRecording] could not persist the recording preference:", error);
+  }
+}
+
+function readPreference(defaultEnabled: boolean): boolean {
+  const stored = readStorage(PREFERENCE_KEY);
+  return stored === null ? defaultEnabled : stored === "true";
+}
+
 interface SessionRecordingProviderProps {
   children: React.ReactNode;
   defaultEnabled?: boolean;
@@ -25,48 +55,31 @@ export function SessionRecordingProvider({
   children,
   defaultEnabled = false,
   persistPreference = true
-}: SessionRecordingProviderProps) {
-  const [isRecordingEnabled, setIsRecordingEnabled] = useState<boolean>(() => {
-    if (!persistPreference) return defaultEnabled;
-
-    if (typeof window !== "undefined" && typeof localStorage !== "undefined") {
-      const stored = localStorage.getItem("temps_session_recording_enabled");
-      if (stored !== null) {
-        return stored === "true";
-      }
-    }
-    return defaultEnabled;
-  });
+}: SessionRecordingProviderProps): ReactElement {
+  const [isRecordingEnabled, setIsRecordingEnabled] = useState<boolean>(() =>
+    persistPreference ? readPreference(defaultEnabled) : defaultEnabled
+  );
 
   const [sessionId, setSessionId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (typeof localStorage !== "undefined") {
-      const storedSessionId = localStorage.getItem("currentRecordingSessionId");
-      setSessionId(storedSessionId);
-    }
+    setSessionId(readStorage("currentRecordingSessionId"));
   }, [isRecordingEnabled]);
 
   const enableRecording = useCallback(() => {
     setIsRecordingEnabled(true);
-    if (persistPreference && typeof localStorage !== "undefined") {
-      localStorage.setItem("temps_session_recording_enabled", "true");
-    }
+    if (persistPreference) writeStorage(PREFERENCE_KEY, "true");
   }, [persistPreference]);
 
   const disableRecording = useCallback(() => {
     setIsRecordingEnabled(false);
-    if (persistPreference && typeof localStorage !== "undefined") {
-      localStorage.setItem("temps_session_recording_enabled", "false");
-    }
+    if (persistPreference) writeStorage(PREFERENCE_KEY, "false");
   }, [persistPreference]);
 
   const toggleRecording = useCallback(() => {
     setIsRecordingEnabled(prev => {
       const newValue = !prev;
-      if (persistPreference && typeof localStorage !== "undefined") {
-        localStorage.setItem("temps_session_recording_enabled", String(newValue));
-      }
+      if (persistPreference) writeStorage(PREFERENCE_KEY, String(newValue));
       return newValue;
     });
   }, [persistPreference]);
@@ -97,38 +110,31 @@ export function useSessionRecording(): SessionRecordingContextValue {
   return context;
 }
 
+export interface SessionRecordingControl {
+  isEnabled: boolean;
+  enable: () => void;
+  disable: () => void;
+  toggle: () => void;
+}
+
 // Standalone hook for controlling session recording without provider
-export function useSessionRecordingControl(defaultEnabled = false) {
-  const [isEnabled, setIsEnabled] = useState<boolean>(() => {
-    if (typeof window !== "undefined" && typeof localStorage !== "undefined") {
-      const stored = localStorage.getItem("temps_session_recording_enabled");
-      if (stored !== null) {
-        return stored === "true";
-      }
-    }
-    return defaultEnabled;
-  });
+export function useSessionRecordingControl(defaultEnabled = false): SessionRecordingControl {
+  const [isEnabled, setIsEnabled] = useState<boolean>(() => readPreference(defaultEnabled));
 
   const enable = useCallback(() => {
     setIsEnabled(true);
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem("temps_session_recording_enabled", "true");
-    }
+    writeStorage(PREFERENCE_KEY, "true");
   }, []);
 
   const disable = useCallback(() => {
     setIsEnabled(false);
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem("temps_session_recording_enabled", "false");
-    }
+    writeStorage(PREFERENCE_KEY, "false");
   }, []);
 
   const toggle = useCallback(() => {
     setIsEnabled(prev => {
       const newValue = !prev;
-      if (typeof localStorage !== "undefined") {
-        localStorage.setItem("temps_session_recording_enabled", String(newValue));
-      }
+      writeStorage(PREFERENCE_KEY, String(newValue));
       return newValue;
     });
   }, []);

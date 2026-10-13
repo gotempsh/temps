@@ -1033,7 +1033,7 @@ impl OutageDetectionService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::alarm_service::AlarmService;
     use async_trait::async_trait;
@@ -1352,7 +1352,7 @@ mod tests {
         }
     }
 
-    fn make_project_model(id: i32, slug: &str) -> temps_entities::projects::Model {
+    pub(crate) fn make_project_model(id: i32, slug: &str) -> temps_entities::projects::Model {
         let now = Utc::now();
         temps_entities::projects::Model {
             id,

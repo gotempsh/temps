@@ -274,11 +274,11 @@ export function ImportService() {
       <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Header */}
         <div className="flex items-center gap-3">
-          <Link to="/storage">
-            <Button variant="ghost" size="icon">
+          <Button asChild variant="ghost" size="icon">
+            <Link to="/storage" aria-label="Back to storage">
               <ArrowLeft className="h-4 w-4" />
-            </Button>
-          </Link>
+            </Link>
+          </Button>
           <div>
             <h1 className="text-2xl font-semibold">Import database</h1>
             <p className="text-sm text-muted-foreground">

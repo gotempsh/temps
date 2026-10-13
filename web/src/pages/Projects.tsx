@@ -20,10 +20,7 @@ import { ListToolbar } from '@/components/layout/ListToolbar'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
-import {
-  getProjectsOptions,
-  listGitProvidersOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import {
@@ -34,7 +31,8 @@ import {
   RefreshCw,
   X,
 } from 'lucide-react'
-import { Link, useSearchParams } from 'react-router'
+import { Link } from 'react-router'
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
@@ -73,13 +71,11 @@ function groupMatches(group: ProjectGroupResponse, needle: string): boolean {
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
   const { page, pageSize } = readProjectPagination(searchParams)
   const projectSearch = searchParams.get('q') ?? ''
   const setProjectSearch = (value: string) => {
-    setSearchParams((current) => withProjectSearch(current, value), {
-      replace: true,
-    })
+    updateSearchParams((current) => withProjectSearch(current, value))
   }
   const normalizedProjectSearch = projectSearch.trim().toLowerCase()
   const [creatingGroup, setCreatingGroup] = useState(false)
@@ -95,12 +91,15 @@ export function Projects() {
     }
   }
 
-  // Opened from elsewhere (the command palette's "New project").
+  // Opened from elsewhere (the command palette's "New project"): the request
+  // lives in the URL, so the dialog is open while it is there and the
+  // parameter is dropped when the dialog closes.
   const createRequested = searchParams.get(CREATE_PARAM) === 'project'
-  useEffect(() => {
-    if (!createRequested) return
-    setCreatingGroup(true)
-    setSearchParams(
+  const createDialogOpen = creatingGroup || createRequested
+  const setCreateDialogOpen = (open: boolean) => {
+    setCreatingGroup(open)
+    if (open || !createRequested) return
+    updateSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
         next.delete(CREATE_PARAM)
@@ -108,11 +107,15 @@ export function Projects() {
       },
       { replace: true }
     )
-  }, [createRequested, setSearchParams])
+  }
 
   const groupsQuery = useProjectGroups()
   const groupsLoaded = groupsQuery.isSuccess
   const groups = groupsQuery.groups
+  const visibleAllGroups = useMemo(
+    () => (SIMULATE_EMPTY_INSTALL ? [] : groups),
+    [groups]
+  )
   // With at least one project (group), its services show inside its card
   // and only the rest are listed (and paged) on their own.
   const grouped = groupsLoaded && groups.length > 0
@@ -138,25 +141,18 @@ export function Projects() {
     enabled: !groupsQuery.isLoading,
   })
 
-  const { data: rawGitProviders, isLoading: gitProvidersLoading } = useQuery({
-    ...listGitProvidersOptions({}),
-    retry: false,
-  })
-
   // TEMP: force an empty (brand-new install) dashboard while iterating on the
   // first-run experience. See lib/devSimulate.ts.
   const projectsData = SIMULATE_EMPTY_INSTALL
     ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
     : rawProjectsData
-  const visibleAllGroups = SIMULATE_EMPTY_INSTALL ? [] : groups
-  const gitProviders = SIMULATE_EMPTY_INSTALL ? [] : rawGitProviders
   const standaloneTotal = projectsData?.total ?? 0
   const totalPages = projectPageCount(standaloneTotal, pageSize)
   const isPageOutOfRange = Boolean(standaloneTotal) && page > totalPages
 
   const setPagination = useCallback(
     (nextPage: number, nextPageSize = pageSize, replace = false) => {
-      setSearchParams(
+      updateSearchParams(
         (current) =>
           withProjectPagination(current, {
             page: nextPage,
@@ -165,7 +161,7 @@ export function Projects() {
         { replace }
       )
     },
-    [pageSize, setSearchParams]
+    [pageSize, updateSearchParams]
   )
 
   useEffect(() => {
@@ -245,11 +241,23 @@ export function Projects() {
     endDate
   )
 
-  const dashboardHealth = useDashboardHealth(projectIds, startDate, endDate)
+  // External (telemetry-only) projects have no deployments to report on.
+  const hostedProjectIds = useMemo(
+    () =>
+      standaloneProjects
+        .filter((project) => project.source_type !== 'external')
+        .map((project) => project.id),
+    [standaloneProjects]
+  )
+  const dashboardHealth = useDashboardHealth(
+    hostedProjectIds,
+    startDate,
+    endDate
+  )
   // Uptime monitors answer for services that simply had no visitors, which
   // traffic-derived health cannot. See project-card-health.ts.
   const monitorHealth = useProjectsMonitorHealth(projectIds)
-  const latestDeploymentMedia = useLatestDeploymentMedia(projectIds)
+  const latestDeploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
 
   const renderProjectCard = (project: ProjectResponse) => (
     <ProjectCard
@@ -283,30 +291,27 @@ export function Projects() {
     serviceTotal,
   })
 
-  const isLoading =
-    groupsQuery.isLoading ||
-    servicesLoading ||
-    (isEmptyInstall && gitProvidersLoading) ||
-    isPageOutOfRange
+  const isLoading = groupsQuery.isLoading || servicesLoading || isPageOutOfRange
 
   return (
     <PageContainer innerClassName="space-y-6">
       {/* Header */}
       <ProjectsHeader
+        firstProject={!isLoading && !isError && isEmptyInstall}
         actions={
           <>
-            <PlatformStrip />
+            {serviceTotal > 0 && <PlatformStrip />}
             <Button variant="outline" onClick={() => setCreatingGroup(true)}>
               <Boxes className="size-4" />
               New project
             </Button>
-            <CreateActionButton to="/projects/new" label="New service" />
+            <CreateActionButton to="/projects/new" label="Create service" />
           </>
         }
       />
       <CreateProjectGroupDialog
-        open={creatingGroup}
-        onOpenChange={setCreatingGroup}
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
       />
 
       {/* Nothing here can be built or deployed until something can run it. */}
@@ -391,6 +396,7 @@ export function Projects() {
 
       {isLoading ? (
         <div
+          role="status"
           className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
           aria-label="Loading projects and services"
           aria-busy="true"
@@ -400,14 +406,10 @@ export function Projects() {
           ))}
         </div>
       ) : isError && !projectsData ? null : isEmptyInstall ? (
-        // First-run onboarding: no services and no projects. The component
-        // is context-aware: when a Git provider is already connected it
-        // routes straight into the import wizard (skipping the connect
-        // step), and it always surfaces the "deploy a service with a
-        // database" and CLI paths. An empty project still shows as a card.
-        <FirstProjectOnboarding
-          gitConnected={!!gitProviders && gitProviders.length > 0}
-        />
+        // First-run entry point: no services and no projects. Choose a
+        // deployment or migration before asking for credentials. The creation
+        // flow owns configuration. An empty project still shows as a card.
+        <FirstProjectOnboarding />
       ) : listItems.length === 0 ? (
         normalizedProjectSearch ? (
           <div className="rounded-xl border border-dashed px-6 py-12 text-center">
@@ -554,11 +556,21 @@ function ServicesRenameNotice({
  * Projects page header. The title block is fixed; `actions` is what the
  * migration-entry-point variants swap out.
  */
-function ProjectsHeader({ actions }: { actions: React.ReactNode }) {
+function ProjectsHeader({
+  actions,
+  firstProject = false,
+}: {
+  actions?: React.ReactNode
+  firstProject?: boolean
+}) {
   return (
     <PageHeader
-      title="Projects"
-      description="Your services, grouped into the projects they ship as"
+      title={firstProject ? 'Deploy your first application' : 'Projects'}
+      description={
+        firstProject
+          ? 'Bring your code. Add a database if you need one. Get a working URL.'
+          : 'Your services, grouped into the projects they ship as'
+      }
       actions={actions}
     />
   )

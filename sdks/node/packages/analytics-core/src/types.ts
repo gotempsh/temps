@@ -39,11 +39,14 @@ export interface SessionRecordingConfig {
   maskTextClass?: string;
   /** Record canvas elements. Defaults to false. */
   recordCanvas?: boolean;
-  /** Collect fonts. Defaults to false. */
+  /**
+   * Capture fonts loaded through the FontFace API so replays render with the
+   * page's own fonts. Defaults to true.
+   */
   collectFonts?: boolean;
   /** Number of events to batch before sending. Defaults to 100. */
   batchSize?: number;
-  /** Interval in ms to flush events. Defaults to 5000. */
+  /** Interval in ms to flush events. Defaults to 10000. */
   flushInterval?: number;
   /**
    * Milliseconds of no user interaction after which recording pauses. A paused
@@ -72,6 +75,13 @@ export interface SessionRecordingConfig {
    * memory rather than growing until the tab dies. Defaults to 5000.
    */
   maxBufferedEvents?: number;
+  /**
+   * Log every failed session-replay request, plus diagnostics: session start,
+   * why a page is not recorded (excluded path, sampled out), pauses and
+   * resumes. Without it, each kind of failure (init, upload) is reported once
+   * per page as a console warning. Defaults to false.
+   */
+  debug?: boolean;
 }
 
 export interface AnalyticsClientOptions {

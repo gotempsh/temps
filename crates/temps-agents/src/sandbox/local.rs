@@ -33,6 +33,7 @@ impl SandboxProvider for LocalSandboxProvider {
         );
 
         Ok(SandboxHandle {
+            node_id: None,
             sandbox_id: sandbox_name.clone(),
             sandbox_name,
             work_dir: config.host_work_dir,
@@ -249,6 +250,7 @@ impl SandboxProvider for LocalSandboxProvider {
         let autopilot_dir = std::env::temp_dir().join(format!("autopilot-run-{}", run_id));
         if autopilot_dir.exists() {
             return Ok(Some(SandboxHandle {
+                node_id: None,
                 sandbox_id: format!("local-sandbox-{}", run_id),
                 sandbox_name: format!("local-sandbox-{}", run_id),
                 work_dir: autopilot_dir,
@@ -260,6 +262,7 @@ impl SandboxProvider for LocalSandboxProvider {
         let autofixer_dir = std::env::temp_dir().join(format!("autofixer-{}", run_id));
         if autofixer_dir.exists() {
             return Ok(Some(SandboxHandle {
+                node_id: None,
                 sandbox_id: format!("local-sandbox-{}", run_id),
                 sandbox_name: format!("local-sandbox-{}", run_id),
                 work_dir: autofixer_dir,
@@ -300,6 +303,7 @@ mod tests {
 
     fn test_config(run_id: i32, work_dir: PathBuf) -> SandboxCreateConfig {
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,
@@ -365,6 +369,7 @@ mod tests {
     async fn test_local_provider_exec_empty_command_fails() {
         let provider = LocalSandboxProvider::new();
         let handle = SandboxHandle {
+            node_id: None,
             sandbox_id: "test".to_string(),
             sandbox_name: "test".to_string(),
             work_dir: std::env::temp_dir(),
@@ -383,6 +388,7 @@ mod tests {
         tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
         let handle = SandboxHandle {
+            node_id: None,
             sandbox_id: "test".to_string(),
             sandbox_name: "test".to_string(),
             work_dir: work_dir.clone(),

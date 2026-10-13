@@ -37,7 +37,6 @@ import {
   ChartTooltip,
   ChartTooltipContent,
 } from '@/components/ui/chart'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
   DialogContent,
@@ -91,6 +90,7 @@ import {
   YAxis,
 } from 'recharts'
 import { toast } from 'sonner'
+import { PublicCallbackUrl } from '@/components/settings/PublicCallbackUrl'
 
 interface ProjectRevenueProps {
   project: ProjectResponse
@@ -483,12 +483,13 @@ function TrendChip({ trend }: { trend: NonNullable<SummaryCard['trend']> }) {
         : Minus
   const toneClass =
     trend.tone === 'positive'
-      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
       : trend.tone === 'negative'
-        ? 'bg-red-500/10 text-red-600 dark:text-red-400'
+        ? 'bg-red-500/10 text-red-700 dark:text-red-400'
         : 'bg-muted text-muted-foreground'
   return (
     <span
+      role="img"
       className={`inline-flex items-center rounded-full px-1.5 py-0.5 ${toneClass}`}
       aria-label={trend.label}
       title={trend.label}
@@ -734,7 +735,6 @@ function IntegrationRow({
   integration: IntegrationResponse
 }) {
   const queryClient = useQueryClient()
-  const fullUrl = absoluteWebhookUrl(integration.webhook_path)
   const integrationsKey = revenueListIntegrationsQueryKey({
     path: { project_id: projectId },
   })
@@ -800,13 +800,22 @@ function IntegrationRow({
           )}
         </div>
         <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
-          <code className="truncate">{fullUrl}</code>
-          <CopyButton value={fullUrl} />
+          <PublicCallbackUrl
+            path={revenueWebhookPath(integration.webhook_path)}
+            label="Copy webhook URL"
+            className="flex-1"
+            codeClassName="truncate bg-transparent p-0"
+          />
         </div>
       </div>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon" className="h-8 w-8">
+          <Button
+            aria-label="Open menu"
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+          >
             <MoreVertical className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
@@ -1693,7 +1702,6 @@ function SuccessStep({
   integration: IntegrationResponse
   onClose: () => void
 }) {
-  const url = absoluteWebhookUrl(integration.webhook_path)
   return (
     <>
       <DialogHeader>
@@ -1708,8 +1716,12 @@ function SuccessStep({
         <div className="flex flex-col gap-1.5">
           <Label>Webhook URL</Label>
           <div className="flex w-full min-w-0 items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-            <code className="min-w-0 flex-1 truncate text-xs">{url}</code>
-            <CopyButton value={url} />
+            <PublicCallbackUrl
+              path={revenueWebhookPath(integration.webhook_path)}
+              label="Copy webhook URL"
+              className="flex-1"
+              codeClassName="truncate bg-transparent p-0"
+            />
           </div>
         </div>
         <p className="text-xs text-muted-foreground">
@@ -1765,7 +1777,12 @@ function formatBucketLabel(bucket: string): string {
   })
 }
 
-function absoluteWebhookUrl(relativePath: string): string {
-  if (typeof window === 'undefined') return relativePath
-  return `${window.location.origin}/api${relativePath}`
+/**
+ * Path of a revenue webhook below the public ingress URL. The provider calls
+ * from its own servers, so `PublicCallbackUrl` joins this to the ingress URL
+ * the API reports rather than to the address being browsed, which may be a
+ * console restricted to an allowlist.
+ */
+function revenueWebhookPath(relativePath: string): string {
+  return `/api${relativePath}`
 }

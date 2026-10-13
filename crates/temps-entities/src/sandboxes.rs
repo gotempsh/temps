@@ -87,6 +87,11 @@ pub struct Model {
     /// omitted one). `None` on rows created before this column existed.
     pub backend: Option<String>,
 
+    /// Worker node hosting the sandbox (ADR-048). `None` = the control
+    /// plane. Set at create time and never changed — a sandbox is pinned to
+    /// its node for its whole lifetime.
+    pub node_id: Option<i32>,
+
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,
     pub expires_at: DBDateTime,

@@ -136,7 +136,12 @@ export function RepositorySelector({
           <Button variant="ghost" size="sm" onClick={handleChangeSelection}>
             Change
           </Button>
-          <Button variant="ghost" size="icon" onClick={handleClearSelection}>
+          <Button
+            aria-label="Clear selection"
+            variant="ghost"
+            size="icon"
+            onClick={handleClearSelection}
+          >
             <X className="h-4 w-4" />
           </Button>
         </div>

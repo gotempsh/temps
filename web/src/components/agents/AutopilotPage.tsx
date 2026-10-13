@@ -56,8 +56,25 @@ import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 
 type AgentRun = AgentRunResponse
 
+/** Where harness (AI CLI) credentials are added. */
+export const HARNESSES_PATH = '/agent-sandbox/providers'
+
 interface AutopilotPageProps {
   project: ProjectResponse
+}
+
+/**
+ * Absolute URLs for the agent pages. AutopilotPage is mounted both at
+ * /projects/:slug/agents and inside Settings → Automation, so relative paths
+ * would resolve against whichever mount rendered it.
+ */
+export function autopilotPaths(projectSlug: string) {
+  const base = `/projects/${projectSlug}/agents`
+  return {
+    agent: (agentSlug: string) => `${base}/detail/${agentSlug}`,
+    editAgent: (agentSlug: string) => `${base}/detail/${agentSlug}/edit`,
+    run: (runId: number) => `${base}/${runId}`,
+  }
 }
 
 function formatTimeAgo(dateStr: string): string {
@@ -120,14 +137,16 @@ function TriggerBadges({
     badges.push({
       key: 'error-new',
       label: 'New errors',
-      color: 'bg-red-500/10 text-red-400 border border-red-500/20',
+      color:
+        'bg-red-500/10 text-red-700 dark:text-red-400 border border-red-500/20',
     })
   }
   if (triggers.error?.regression) {
     badges.push({
       key: 'error-reg',
       label: 'Error regressions',
-      color: 'bg-red-500/10 text-red-400 border border-red-500/20',
+      color:
+        'bg-red-500/10 text-red-700 dark:text-red-400 border border-red-500/20',
     })
   }
 
@@ -136,14 +155,16 @@ function TriggerBadges({
     badges.push({
       key: 'deploy-prod',
       label: 'Production deploys',
-      color: 'bg-purple-500/10 text-purple-400 border border-purple-500/20',
+      color:
+        'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20',
     })
   }
   if (triggers.deploy?.preview) {
     badges.push({
       key: 'deploy-prev',
       label: 'Preview deploys',
-      color: 'bg-purple-500/10 text-purple-400 border border-purple-500/20',
+      color:
+        'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20',
     })
   }
 
@@ -152,14 +173,16 @@ function TriggerBadges({
     badges.push({
       key: 'mon-down',
       label: 'Downtime',
-      color: 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20',
+      color:
+        'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border border-yellow-500/20',
     })
   }
   if (triggers.monitoring?.latency_spike) {
     badges.push({
       key: 'mon-lat',
       label: 'Latency spikes',
-      color: 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20',
+      color:
+        'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border border-yellow-500/20',
     })
   }
 
@@ -168,7 +191,8 @@ function TriggerBadges({
     badges.push({
       key: 'schedule',
       label: `Schedule: ${nextRun}`,
-      color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20',
+      color:
+        'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20',
     })
   }
 
@@ -266,13 +290,14 @@ function AgentCard({
                 {agent.name}
               </button>
               {agent.source === 'yaml' && (
-                <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">
+                <span className="text-xs bg-blue-500/10 text-blue-600 dark:text-blue-400 px-1.5 py-0.5 rounded">
                   YAML
                 </span>
               )}
             </div>
             <div className="flex items-center gap-2">
               <Switch
+                aria-label={`Enable agent ${agent.name}`}
                 checked={agent.enabled}
                 onCheckedChange={() =>
                   toggleEnabled.mutate({
@@ -282,7 +307,12 @@ function AgentCard({
                 }
                 disabled={toggleEnabled.isPending}
               />
-              <Button variant="ghost" size="sm" onClick={() => onEdit(agent)}>
+              <Button
+                aria-label="Edit agent"
+                variant="ghost"
+                size="sm"
+                onClick={() => onEdit(agent)}
+              >
                 <Pencil className="h-3 w-3" />
               </Button>
               {agent.trigger_config?.manual && (
@@ -309,7 +339,7 @@ function AgentCard({
               {aiHarnessName(agent.ai_provider)}
             </span>
             {agent.ai_model && (
-              <span className="bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-mono">
+              <span className="bg-blue-500/10 text-blue-600 dark:text-blue-400 px-1.5 py-0.5 rounded font-mono">
                 {agent.ai_model}
               </span>
             )}
@@ -377,6 +407,7 @@ function AgentCard({
 
 export function AutopilotPage({ project }: AutopilotPageProps) {
   const navigate = useNavigate()
+  const paths = autopilotPaths(project.slug)
   const queryClient = useQueryClient()
 
   const { data: agentsData, isLoading: isLoadingAgents } = useQuery({
@@ -437,8 +468,8 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                 className={cn(
                   'flex size-8 shrink-0 items-center justify-center rounded-md text-sm font-medium',
                   hasCredential
-                    ? 'bg-emerald-500/10 text-emerald-500'
-                    : 'bg-amber-500/10 text-amber-500'
+                    ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-500'
+                    : 'bg-amber-500/10 text-amber-700 dark:text-amber-500'
                 )}
               >
                 {hasCredential ? <CheckCircle2 className="size-4" /> : '1'}
@@ -449,26 +480,26 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                     Configure an AI provider
                   </h3>
                   {hasCredential ? (
-                    <span className="text-xs text-emerald-500 font-medium">
+                    <span className="text-xs text-emerald-700 dark:text-emerald-500 font-medium">
                       {defaultProviderName} configured
                     </span>
                   ) : (
-                    <span className="text-xs text-amber-500 font-medium">
+                    <span className="text-xs text-amber-700 dark:text-amber-500 font-medium">
                       Not configured
                     </span>
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Workflows need an AI CLI (Claude Code, Codex, or OpenCode) to
-                  run. Add credentials once in{' '}
-                  <Link to="/agent-sandbox" className="underline font-medium">
-                    Settings &gt; AI Workflows
+                  run. Add credentials once under{' '}
+                  <Link to={HARNESSES_PATH} className="underline font-medium">
+                    AI runtime settings &gt; Harnesses
                   </Link>
                   .
                 </p>
                 {!hasCredential && (
                   <Button size="sm" variant="outline" asChild>
-                    <Link to="/agent-sandbox">Configure AI provider</Link>
+                    <Link to={HARNESSES_PATH}>Configure AI provider</Link>
                   </Button>
                 )}
               </div>
@@ -544,10 +575,6 @@ prompt: |
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-xl font-semibold">Workflows</h1>
-      </div>
-
       {/* AI provider credential banner */}
       {providerCatalog && !hasCredential && (
         <Alert variant="destructive">
@@ -558,9 +585,9 @@ prompt: |
                 {defaultProviderName} is not configured
               </p>
               <p className="text-sm opacity-90">
-                Add credentials in{' '}
-                <Link to="/agent-sandbox" className="underline font-medium">
-                  Settings &gt; AI Workflows
+                Add credentials under{' '}
+                <Link to={HARNESSES_PATH} className="underline font-medium">
+                  AI runtime settings &gt; Harnesses
                 </Link>
               </p>
             </div>
@@ -584,8 +611,8 @@ prompt: |
               agent={agent}
               projectId={project.id}
               queryClient={queryClient}
-              onEdit={(a) => navigate(`detail/${a.slug}/edit`)}
-              onNavigate={(slug) => navigate(`detail/${slug}`)}
+              onEdit={(a) => navigate(paths.editAgent(a.slug))}
+              onNavigate={(slug) => navigate(paths.agent(slug))}
             />
           ))}
         </div>
@@ -637,7 +664,7 @@ prompt: |
                           `/projects/${project.slug}/errors/${run.trigger_source_id}/autofix`
                         )
                       } else {
-                        navigate(`${run.id}`)
+                        navigate(paths.run(run.id))
                       }
                     }}
                   >
@@ -654,7 +681,7 @@ prompt: |
                         </span>
                         {run.source === 'cli_ephemeral' && (
                           <span
-                            className="text-[10px] uppercase tracking-wide bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-medium"
+                            className="text-[10px] uppercase tracking-wide bg-blue-500/10 text-blue-600 dark:text-blue-400 px-1.5 py-0.5 rounded font-medium"
                             title="Triggered from the CLI with --from-file. Not stored in the service's workflows."
                           >
                             Ephemeral

@@ -13,6 +13,8 @@ homepage.workspace = true
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
 bollard = { workspace = true }
+tower = { workspace = true }
+mockito = "1.5"
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }

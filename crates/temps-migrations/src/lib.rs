@@ -28,3 +28,4 @@ pub use migration::m20260921_000003_detection_retry::Migration as DetectionRetry
 
 pub use migration::m20260921_000004_credential_catalog::Migration as CredentialCatalogMigration;
 pub use migration::m20260922_000001_stateless_control_plane_jobs::Migration as StatelessControlPlaneJobsMigration;
+pub use migration::m20261002_000001_secret_checks_and_history::Migration as SecretChecksAndHistoryMigration;

@@ -6,6 +6,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import React from "react";
 import { TempsAnalyticsProvider } from "../Provider";
 import { useTrackEvent } from "../useTrackEvent";
+import { DEFAULT_BASE_PATH } from "./test-constants";
 
 describe("useTrackEvent", () => {
   beforeEach(() => {

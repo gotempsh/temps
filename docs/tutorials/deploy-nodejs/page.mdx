@@ -1,334 +1,119 @@
 export const metadata = {
-  title: 'Deploy a Node.js API',
-  description: 'Deploy an Express, Fastify, or NestJS API on Temps with environment variables, health checks, and automatic HTTPS.',
+  title: "Deploy Node.js: Express, Fastify or Hono",
+  description: "Deploy Node.js apps built on Express, Fastify or Hono with automatic HTTPS, zero-downtime deploys and managed databases on your own VPS. No cold starts.",
   alternates: {
-    canonical: '/docs/deploy-nodejs',
+    canonical: "/docs/deploy-nodejs",
   },
-}
-
-# Deploy a Node.js API
-
-This tutorial walks you through deploying a Node.js backend — Express, Fastify, or NestJS — on Temps. By the end, you will have a production API with environment variables, health checks, and automatic HTTPS. {{ className: 'lead' }}
-
----
-
-## What you will build {{ anchor: true, id: 'what-you-will-build' }}
-
-- A Node.js API deployed from a Git repository
-- Environment variables for database connections and secrets
-- A health check endpoint for zero-downtime deployments
-- Automatic HTTPS and deployment on every push
-
-**Time required:** 10 minutes.
-
-**Prerequisites:**
-- A running Temps instance ([install guide](/docs/your-first-deployment))
-- A Node.js API in a Git repository
-- (Optional) A database connection string
-
----
-
-## Step 1: Prepare your API {{ anchor: true, id: 'prepare' }}
-
-Your Node.js API needs two things to work on Temps: listen on the `PORT` environment variable and bind to `0.0.0.0`.
-
-<CodeGroup>
-
-```javascript {{ title: 'Express' }}
-import express from 'express';
-
-const app = express();
-app.use(express.json());
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-app.get('/api/users', async (req, res) => {
-  // Your business logic
-  res.json([]);
-});
-
-const port = process.env.PORT || 3000;
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Server running on port ${port}`);
-});
-```
-
-```javascript {{ title: 'Fastify' }}
-import Fastify from 'fastify';
-
-const fastify = Fastify({ logger: true });
-
-fastify.get('/health', async () => {
-  return { status: 'ok' };
-});
-
-fastify.get('/api/users', async () => {
-  return [];
-});
-
-const port = process.env.PORT || 3000;
-fastify.listen({ port: Number(port), host: '0.0.0.0' });
-```
-
-```typescript {{ title: 'NestJS (main.ts)' }}
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module';
-
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  const port = process.env.PORT || 3000;
-  await app.listen(port, '0.0.0.0');
-}
-bootstrap();
-```
-
-</CodeGroup>
-
-### package.json
-
-Make sure you have `start` and `build` scripts (build is needed for TypeScript projects):
-
-```json {{ title: 'package.json' }}
-{
-  "name": "my-api",
-  "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js"
+  openGraph: {
+    title: "Deploy Node.js: Express, Fastify or Hono",
+    description: "Deploy Node.js apps built on Express, Fastify or Hono with automatic HTTPS, zero-downtime deploys and managed databases on your own VPS. No cold starts.",
+    images: [{ url: "/og/docs/deploy-nodejs.png", width: 1200, height: 630, alt: "Deploy Node.js" }],
   },
-  "dependencies": {
-    "express": "^5.0.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.7.0",
-    "tsx": "^4.0.0"
+  twitter: {
+    card: "summary_large_image",
+    title: "Deploy Node.js: Express, Fastify or Hono",
+    description: "Deploy Node.js apps built on Express, Fastify or Hono with automatic HTTPS, zero-downtime deploys and managed databases on your own VPS. No cold starts.",
+    images: ["/og/docs/deploy-nodejs.png"],
   }
-}
-```
+};
 
-<Note>
-  Temps detects `express`, `fastify`, or `@nestjs/core` in your dependencies and generates an appropriate Dockerfile. For NestJS, the `dist/` output directory is used automatically. For plain Express or Fastify, Temps runs `npm start`.
-</Note>
+export const sections = [
+  { title: 'Quickstart', id: 'quickstart' },
+  { title: 'What Temps handles automatically', id: 'what-temps-handles-automatically' },
+  { title: 'Managed services', id: 'managed-services' },
+  { title: 'Environment variables', id: 'environment-variables' },
+  { title: 'Platform behavior', id: 'platform-behavior' },
+]
 
-### Add a health check endpoint
+# Deploy Node.js on Your Own Server
 
-Temps checks `/` by default to verify your app is healthy. Adding a dedicated `/health` endpoint is better practice — it responds quickly and does not trigger business logic:
-
-```javascript
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-```
-
-Configure it in `.temps.yaml`:
-
-```yaml {{ title: '.temps.yaml' }}
-health:
-  path: /health
-```
+**Deploy any Node.js application and Temps handles the rest** — installing dependencies, running your build and start scripts, and keeping it live with automatic HTTPS and zero-downtime deploys on a VPS you own. {{ className: 'lead' }}
 
 ---
 
-## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+## Quickstart {{ anchor: true, id: 'quickstart' }}
 
-1. Open the Temps dashboard
-2. Click **New Project**
-3. Select your Git provider and repository
-4. Choose the branch to deploy
+From your project root, deploy with your preferred package manager:
 
-Temps detects your Node.js framework automatically. You will see it listed in the project configuration.
+<CliCommands commands={[
+  { args: "up --preset nixpacks-node" },
+]} />
 
----
+Temps doesn't detect a plain Node.js service from its `package.json`, so choose the **Autopack (Node.js)** preset (`nixpacks-node`), as above or under **Project → Settings → Build & deploy → Build → Framework**.
 
-## Step 3: Configure environment variables {{ anchor: true, id: 'environment-variables' }}
+With that preset, Temps installs dependencies with the package manager your lockfile or `packageManager` field points to, runs your `build` script if there is one, and starts the app. Your app is live with HTTPS in a few minutes.
 
-Add environment variables in the project settings. Common ones for APIs:
+The start command is the first of these that exists:
 
-```bash
-# Database
-DATABASE_URL=postgres://user:password@db-host:5432/mydb
+1. The `web:` line in a `Procfile`
+2. Your `start` script
+3. The `main` file in `package.json`, run with `node`
+4. A common entry file, run with `node`: `server.js`, `server.mjs`, `index.js`, `index.mjs`, `app.js`, `src/index.js`, `dist/index.js` or `build/index.js`
 
-# Secrets
-JWT_SECRET=your-jwt-secret
-API_KEY=your-api-key
-
-# Application
-NODE_ENV=production
-LOG_LEVEL=info
-```
-
-All variables are available at runtime via `process.env`. They are injected when the container starts — not baked into the image.
+If none of them exists, the build stops and asks for a start command. The Node.js version comes from `.nvmrc`, `.node-version` or `engines.node` in `package.json`, and defaults to 24. Temps sets `NODE_ENV=production` for you.
 
 ---
 
-## Step 4: Deploy {{ anchor: true, id: 'deploy' }}
+## What Temps handles automatically {{ anchor: true, id: 'what-temps-handles-automatically' }}
 
-Push a commit or click **Deploy** in the dashboard. Temps:
-
-1. Clones your repository
-2. Detects Node.js and your framework
-3. Installs dependencies (detected from your lockfile)
-4. Runs `npm run build` if a build script exists
-5. Starts the container with `npm start`
-6. Sends health check requests until the API responds
-
-A typical Node.js API builds in under a minute.
-
----
-
-## Step 5: Test your API {{ anchor: true, id: 'test' }}
-
-Once deployed, test your endpoints:
-
-```bash
-# Health check
-curl https://your-api.your-domain.com/health
-
-# API endpoint
-curl https://your-api.your-domain.com/api/users
-
-# POST request
-curl -X POST https://your-api.your-domain.com/api/users \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Alice", "email": "alice@example.com"}'
-```
+| Feature | How Temps handles it |
+| ------- | -------------------- |
+| Build | Installs dependencies, then runs your `build` script if there is one |
+| Start | `Procfile` `web:` line, `start` script, `main` or a common entry file |
+| HTTPS | Let's Encrypt certificate, auto-renewed |
+| Port | Your app reads `PORT`, which Temps sets (3000 unless you change the project's port) |
+| WebSockets | Fully supported via reverse proxy |
+| Health checks | HTTP check on `/` at deploy time, or the path set in `.temps.yaml` |
+| Preview deployments | Opt-in; once enabled, each branch gets its own preview environment |
 
 ---
 
-## Connecting to a database {{ anchor: true, id: 'database' }}
+## Managed services {{ anchor: true, id: 'managed-services' }}
 
-### Using a Temps-managed database
+Create PostgreSQL or Redis under **Databases → Create database**, then link it from your project's **Databases** page. Temps injects the connection details into your app, such as `POSTGRES_URL` for PostgreSQL and `REDIS_URL` for Redis. It doesn't inject `DATABASE_URL`, so read `POSTGRES_URL` in your code or set `DATABASE_URL` yourself.
 
-If you added a PostgreSQL or MySQL service through Temps, the connection details are available as environment variables. Use them in your database client:
-
-```javascript {{ title: 'Database connection' }}
-import pg from 'pg';
-
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-```
-
-### Using an external database
-
-Set the connection string as an environment variable in the dashboard. If the database requires SSL, most clients accept an `?sslmode=require` query parameter:
-
-```bash
-DATABASE_URL=postgres://user:pass@external-host:5432/db?sslmode=require
-```
-
-### Connection pooling
-
-Always configure connection pool limits. A single container with 20-50 connections is typical. Set `max` in your pool configuration to avoid exhausting database connections.
+See [Deploy with a Database](/docs/deploy-with-database) for the full guide.
 
 ---
 
-## TypeScript projects {{ anchor: true, id: 'typescript' }}
+## Environment variables {{ anchor: true, id: 'environment-variables' }}
 
-For TypeScript APIs, Temps runs `npm run build` during the build step and `npm start` to run the compiled output.
+Set your own variables per environment:
 
-Make sure your `tsconfig.json` outputs to a directory that your `start` script references:
+<CliCommands commands={[
+  { args: "environments vars set API_KEY \"your-api-key\" -e production" },
+]} />
 
-```json {{ title: 'tsconfig.json' }}
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "Node16",
-    "moduleResolution": "Node16",
-    "outDir": "dist",
-    "rootDir": "src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true
-  },
-  "include": ["src/**/*"]
-}
-```
-
-```json {{ title: 'package.json scripts' }}
-{
-  "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js"
-  }
-}
-```
+Changing a variable doesn't redeploy the app; deploy again for the new value to take effect.
 
 ---
 
-## Production best practices {{ anchor: true, id: 'best-practices' }}
+## Platform behavior {{ anchor: true, id: 'platform-behavior' }}
 
-### CORS
+These rules apply to every app deployed on Temps, regardless of framework.
 
-If your API is called from a different domain (e.g. a frontend on a different subdomain), configure CORS:
+<PortBinding />
 
-```javascript
-import cors from 'cors';
+### Health checks
 
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || 'https://your-frontend.com',
-  credentials: true,
-}));
-```
+<HealthChecks />
 
-### Error handling
+### Auto-injected environment variables
 
-Add a global error handler to prevent unhandled errors from crashing the process:
-
-```javascript
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection:', reason);
-});
-```
-
-### Graceful shutdown
-
-Handle `SIGTERM` to close connections cleanly during deployments:
-
-```javascript
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  await pool.end(); // Close database connections
-  server.close(() => {
-    process.exit(0);
-  });
-});
-```
+<InjectedEnvVars />
 
 ---
 
-## Troubleshooting {{ anchor: true, id: 'troubleshooting' }}
+## Next Steps
 
-### "Cannot find module" at startup
-
-Your `start` script points to a file that does not exist. For TypeScript projects, verify that `npm run build` produces output in the expected directory. Check that `outDir` in `tsconfig.json` matches the path in your `start` script.
-
-### Health check times out
-
-Your API is starting but Temps cannot reach it. Common causes:
-- Binding to `localhost` instead of `0.0.0.0`
-- The port in your code does not match what Temps expects — use `process.env.PORT`
-- A database migration or seed step is blocking startup — move these to a build script or separate endpoint
-
-### Database connection refused
-
-The database host is unreachable from the container. For Temps-managed databases, use the service name as the hostname (visible in the dashboard). For external databases, ensure the database allows connections from your server's IP.
-
----
-
-## What to explore next {{ anchor: true, id: 'next-steps' }}
-
-<Button href="/docs/deploy-with-database">Deploy with a database</Button>
-<Button href="/docs/environment-variables">Manage environment variables</Button>
-<Button href="/docs/add-observability">Add monitoring and tracing</Button>
-<Button href="/docs/ci-cd-setup">Set up CI/CD</Button>
+<div className="not-prose">
+  <Button href="/docs/deploy-with-database" variant="text" arrow="right">
+    Add PostgreSQL or Redis
+  </Button>
+  <Button href="/docs/environment-variables" variant="text" arrow="right">
+    Environment variables
+  </Button>
+  <Button href="/docs/ci-cd-setup" variant="text" arrow="right">
+    Set up CI/CD
+  </Button>
+</div>

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod agent;
+pub mod agent_service;
 pub mod api_key;
 mod api_url;
 pub mod backfill;
@@ -15,12 +16,14 @@ pub mod domain;
 pub mod edge;
 pub mod firecracker;
 pub mod join;
+pub mod microsandbox;
 pub mod migrate;
 pub mod network;
 pub mod node;
 pub mod proxy;
 pub mod reset_password;
 pub mod sandbox;
+pub mod schema_upgrade;
 pub mod serve;
 pub mod services;
 pub mod setup;
@@ -37,6 +40,7 @@ pub use domain::DomainCommand;
 pub use edge::EdgeCommand;
 pub use firecracker::FirecrackerCommand;
 pub use join::JoinCommand;
+pub use microsandbox::MicrosandboxCommand;
 pub use migrate::MigrateCommand;
 pub use network::NetworkCommand;
 pub use node::NodeCommand;

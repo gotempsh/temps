@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import { createProjectMutation } from '@/api/client/@tanstack/react-query.gen'
+import { deployFromImage, getEnvironments } from '@/api/client'
 import type {
   CreatableServiceTypeRoute,
   ExternalServiceInfo,
@@ -38,6 +40,12 @@ import { Input } from '@/components/ui/input'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
+import { problemDetail } from '@/lib/api-problem'
+import { startFirstImageDeploy } from '@/lib/first-image-deploy'
+import {
+  deploymentsAfterStartPath,
+  imageDeployRetryPath,
+} from '@/lib/project-deploy-action'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -139,6 +147,9 @@ export function ManualProjectConfigurator({
   className,
 }: ManualProjectConfiguratorProps) {
   const queryClient = useQueryClient()
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
 
   // State management
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -211,6 +222,54 @@ export function ManualProjectConfigurator({
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
       toast.success('Service created')
+
+      // Deploy the image entered on this form. Without this the image was
+      // dropped and the service had nothing to deploy.
+      const imageRef = form.getValues('imageUrl')?.trim()
+      if (sourceType !== 'static_files' && imageRef) {
+        try {
+          const firstDeploy = await startFirstImageDeploy(data.id, imageRef, {
+            listEnvironments: async (projectId) => {
+              const { data: environments } = await getEnvironments({
+                path: { project_id: projectId },
+                throwOnError: true,
+              })
+              return environments
+            },
+            deployImage: ({ projectId, environmentId, imageRef }) =>
+              deployFromImage({
+                path: {
+                  project_id: projectId,
+                  environment_id: environmentId,
+                },
+                body: { image_ref: imageRef },
+                throwOnError: true,
+              }),
+          })
+          if (firstDeploy.status === 'started') {
+            toast.success(`Deploying to ${firstDeploy.environmentName}`)
+            await finish(data, deploymentsAfterStartPath(data.slug))
+            return
+          }
+          if (firstDeploy.status === 'no_environment') {
+            toast.error(
+              'The service has no environment to deploy the image to. Create one, then deploy from the Deployments tab.'
+            )
+          }
+        } catch (error) {
+          toast.error(
+            `Service created, but the image deployment did not start: ${problemDetail(
+              error,
+              'unknown error'
+            )}`
+          )
+          // Service creation does not store the image, so hand it to the
+          // deploy dialog rather than making the user retype it.
+          await finish(data, imageDeployRetryPath(data.slug, imageRef))
+          return
+        }
+      }
+
       await finish(data, `/projects/${data.slug}?new=true&source=${sourceType}`)
     },
   })
@@ -309,6 +368,7 @@ export function ManualProjectConfigurator({
           finalData.sourceType === 'static_files' ? 'static' : 'docker'
         await projectMutation.mutateAsync({
           body: {
+            delivery_provider: deliveryProvider,
             name: finalData.name,
             preset: 'dockerfile', // Use dockerfile preset for manual projects
             directory: './',
@@ -580,6 +640,7 @@ export function ManualProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -984,6 +1045,10 @@ export function ManualProjectConfigurator({
           </Card>
 
           {/* Submit */}
+          <DeliveryProjectOption
+            value={deliveryProvider}
+            onChange={setDeliveryProvider}
+          />
           <div className="flex justify-end gap-3">
             {onCancel && (
               <Button

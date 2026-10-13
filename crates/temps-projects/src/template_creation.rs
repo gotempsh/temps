@@ -360,15 +360,6 @@ pub fn has_template_runtime_overrides(request: &TemplateRuntimeOverrides) -> boo
         || request.health_check_path.is_some()
 }
 
-pub fn is_pinned_sha256_image_reference(image: &str) -> bool {
-    image.rsplit_once('@').is_some_and(|(name, digest)| {
-        !name.trim().is_empty()
-            && digest.strip_prefix("sha256:").is_some_and(|hash| {
-                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
-            })
-    })
-}
-
 pub fn resolve_image_template_runtime(
     template: &temps_core::templates::TemplateServiceSpec,
     request: &TemplateRuntimeOverrides,
@@ -400,7 +391,7 @@ pub fn resolve_image_template_runtime(
                 .to_string(),
         });
     }
-    if !is_pinned_sha256_image_reference(image_ref) {
+    if !temps_core::templates::is_pinned_image_reference(image_ref) {
         return Err(TemplateRuntimeOverrideError::InvalidImage {
             reason: "use an immutable image reference ending in @sha256:<64 hex characters>"
                 .to_string(),
@@ -859,6 +850,12 @@ pub struct TemplateServiceRequest {
     /// Label for telemetry and messages: `image`, `fork`, `public_repo` or
     /// `repository`.
     pub deploy_mode: &'static str,
+    /// Legacy Cloudflare opt-in/out for the created project; `None` defers
+    /// to `delivery_provider` and the instance default.
+    pub cloudflare_enabled: Option<bool>,
+    /// CDN delivery provider (`none`, `cloudflare`, `bunny`) the project
+    /// starts with; `None` inherits the instance default.
+    pub delivery_provider: Option<String>,
 }
 
 /// A service created from a template.
@@ -939,6 +936,8 @@ impl TemplateServiceCreator {
                             .build()
                     })?;
                 CreateProjectRequest {
+                    cloudflare_enabled: request.cloudflare_enabled,
+                    delivery_provider: request.delivery_provider.clone(),
                     name: request.project_name.clone(),
                     expected_slug: Some(request.project_slug.clone()),
                     // No Git source — the image is pulled from its registry.
@@ -971,6 +970,8 @@ impl TemplateServiceCreator {
             (None, Some(repository)) => {
                 let resources = service.resources.clone().unwrap_or_default();
                 CreateProjectRequest {
+                    cloudflare_enabled: request.cloudflare_enabled,
+                    delivery_provider: request.delivery_provider.clone(),
                     name: request.project_name.clone(),
                     expected_slug: Some(request.project_slug.clone()),
                     repo_name: Some(repository.repo_name.clone()),

@@ -93,6 +93,8 @@ function SessionDiagnosticsDialog({ publicId }: { publicId: string }) {
         )}
         {json && (
           <pre
+            role="region"
+            tabIndex={0}
             aria-label="Session JSON"
             className="min-h-0 overflow-auto rounded-md border p-3 text-xs"
           >

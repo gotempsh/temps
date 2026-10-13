@@ -22,12 +22,11 @@ pub struct Model {
     /// Until this instant the session may perform sensitive actions. `NULL`
     /// means the session has not completed recent step-up verification.
     pub step_up_expires_at: Option<DBDateTime>,
-    /// Which login method created this pending MFA challenge (e.g.
-    /// `"password"`, `"oidc"`, `"saml"`). Only ever set while `mfa_pending`
-    /// is true -- a fully authenticated session leaves this `NULL`. Lets SSO
-    /// enforcement distinguish a password-originated challenge (must stay
-    /// blocked) from an SSO-originated one (already completed at the IdP,
-    /// must be allowed to finish `verify-mfa`).
+    /// Login origin for a pending challenge. OIDC uses `oidc:<provider_id>`
+    /// to bind the immutable issuing provider, and retains that binding on
+    /// the full session so revocation still works after a user is relinked.
+    /// Password/SAML origins remain pending-only. SSO enforcement reads the
+    /// normalized method through `AuthService::mfa_session_origin`.
     pub mfa_pending_origin: Option<String>,
 }
 

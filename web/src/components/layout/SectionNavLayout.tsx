@@ -14,10 +14,13 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
+import { projectSectionLinkMatches } from '@/lib/project-section-search'
 
 export interface SectionNavLink {
   key: string
   title: string
+  /** Extra terms the page finder matches besides the title and key. */
+  keywords?: string[]
   to: To
   icon: LucideIcon
   active: boolean
@@ -40,7 +43,10 @@ export function SectionNavLayout({
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState(false)
   const visible = links.filter((link) =>
-    `${link.title} ${link.key}`.toLowerCase().includes(search.toLowerCase())
+    projectSectionLinkMatches(
+      { title: link.title, url: link.key, keywords: link.keywords },
+      search
+    )
   )
   const navigation = (
     <>

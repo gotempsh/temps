@@ -11,6 +11,12 @@ pub use container_operations::*;
 pub mod types;
 pub use types::*;
 
+pub mod node_pairing;
+pub mod node_pairing_admin;
+pub mod node_ssh;
+pub mod node_ssh_enrollment;
+pub mod wireguard_mesh;
+
 pub mod job_processor;
 pub use job_processor::*;
 
@@ -47,6 +53,9 @@ pub use database_metric_alert_service::*;
 pub mod external_deployment;
 pub use external_deployment::*;
 
+pub mod screenshot_operation;
+pub use screenshot_operation::*;
+
 pub mod docker_cleanup_service;
 pub use docker_cleanup_service::*;
 
@@ -74,6 +83,12 @@ pub use sensitive_envelope::*;
 pub mod log_redaction;
 pub use log_redaction::*;
 
+pub mod failure_classifier;
+pub use failure_classifier::{
+    describe_failure, DeploymentFailureCode, DeploymentFailureInfo, DeploymentFailureStage,
+    FailureSettingsSection,
+};
+
 pub mod failure_report_service;
 pub use failure_report_service::*;
 
@@ -85,3 +100,5 @@ pub use cert_validator::*;
 
 pub mod source_drop_service;
 pub use source_drop_service::*;
+
+pub(crate) mod deployment_commit;

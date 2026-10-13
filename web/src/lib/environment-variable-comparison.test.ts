@@ -8,6 +8,7 @@ import type {
 } from '@/api/client/types.gen'
 import {
   compareEnvironmentVariableKeys,
+  variableAppliesToEnvironment,
   orderEnvironments,
   orderVariableEnvironments,
 } from './environment-variable-comparison'
@@ -57,4 +58,25 @@ describe('environment variable comparison', () => {
       missingInSecond: ['PROD_ONLY', 'SHARED'],
     })
   })
+})
+
+test('environment filtering includes explicit bindings and preview inheritance only', () => {
+  const prod = environment(1, 'production')
+  const preview = environment(3, 'preview', true)
+  expect(variableAppliesToEnvironment(variable('PROD', [1]), prod)).toBe(true)
+  expect(variableAppliesToEnvironment(variable('PROD', [1]), preview)).toBe(
+    false
+  )
+  expect(
+    variableAppliesToEnvironment(variable('PREVIEW', [], true), preview)
+  ).toBe(true)
+  expect(
+    variableAppliesToEnvironment(variable('PREVIEW', [], true), prod)
+  ).toBe(false)
+  expect(variableAppliesToEnvironment(variable('UNBOUND', []), prod)).toBe(
+    false
+  )
+  expect(variableAppliesToEnvironment(variable('UNBOUND', []), undefined)).toBe(
+    true
+  )
 })

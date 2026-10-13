@@ -8,7 +8,9 @@ import { newline, header, icons, info, colors } from '../../ui/output.js'
 
 export function registerBlobCommands(program: Command): void {
   const blob = program
-    .command('blob')
+    // Not implemented yet: registered (so `temps blob` explains itself) but
+    // hidden from help, so the CLI does not advertise a missing command.
+    .command('blob', { hidden: true })
     .description('Blob storage commands (coming soon)')
 
   blob

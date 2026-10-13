@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, type ReactNode } from 'react'
+import { useCallback, useEffect, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -26,6 +26,7 @@ import {
 } from '@/lib/global-observability'
 import { RefreshCw, Search, X } from 'lucide-react'
 import type { GlobalView } from '@/hooks/useGlobalView'
+import { useUrlBoundText } from '@temps-sdk/ds'
 
 export function FilterSelect({
   label,
@@ -87,6 +88,7 @@ export function GlobalPage({
   refresh,
   searchLabel,
   filters,
+  filterNotice,
   projectScopeDisabled,
   children,
 }: {
@@ -97,10 +99,18 @@ export function GlobalPage({
   refresh: () => void
   searchLabel: string
   filters?: ReactNode
+  /** Explains a filter's effect (cost, completeness) under the filter row. */
+  filterNotice?: ReactNode
   projectScopeDisabled?: boolean
   children: ReactNode
 }) {
   usePageTitle(title)
+  const { patch: patchView } = view
+  const commitSearch = useCallback(
+    (value: string) => patchView({ q: value || undefined }),
+    [patchView]
+  )
+  const [searchText, setSearchText] = useUrlBoundText(view.search, commitSearch)
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => setBreadcrumbs([{ label: title }]), [title, setBreadcrumbs])
   return (
@@ -136,22 +146,22 @@ export function GlobalPage({
           />
           <Input
             className="h-9 ps-8 pe-8 text-sm"
-            value={view.search}
-            onChange={(event) => view.patch({ q: event.target.value })}
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') view.patch({ q: undefined })
+              if (event.key === 'Escape') setSearchText('')
             }}
             aria-label={searchLabel}
             placeholder={searchLabel}
           />
-          {view.search && (
+          {searchText && (
             <Button
               type="button"
               variant="ghost"
               size="icon"
               className="absolute end-1 top-1/2 size-7 -translate-y-1/2"
               aria-label="Clear search"
-              onClick={() => view.patch({ q: undefined })}
+              onClick={() => setSearchText('')}
             >
               <X className="size-3.5" />
             </Button>
@@ -166,6 +176,7 @@ export function GlobalPage({
           />
         </div>
       </div>
+      {filterNotice}
       {children}
     </PageContainer>
   )

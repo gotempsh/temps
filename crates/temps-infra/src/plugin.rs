@@ -216,6 +216,7 @@ mod tests {
             tls_address: None,
             console_address: "127.0.0.1:0".into(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: vec![],
             admin_allowed_hosts: vec![],
             admin_trust_forwarded_for: false,

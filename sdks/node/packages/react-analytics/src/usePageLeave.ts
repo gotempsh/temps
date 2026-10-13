@@ -17,7 +17,12 @@ export interface UsePageLeaveOptions {
   enabled?: boolean;
 }
 
-export function usePageLeave(options: UsePageLeaveOptions = {}) {
+export interface UsePageLeaveResult {
+  /** Send the page-leave event now; resolves once sent, `undefined` if skipped. */
+  triggerPageLeave: () => Promise<void> | undefined;
+}
+
+export function usePageLeave(options: UsePageLeaveOptions = {}): UsePageLeaveResult {
   const {
     eventName = "page_leave",
     eventData = {},
@@ -36,7 +41,7 @@ export function usePageLeave(options: UsePageLeaveOptions = {}) {
   useEffect(() => {
     if (!enabled || !analyticsEnabled) return;
 
-    const trackPageLeave = () => {
+    const trackPageLeave = (): void => {
       if (hasTrackedRef.current) return;
       hasTrackedRef.current = true;
 
@@ -61,7 +66,7 @@ export function usePageLeave(options: UsePageLeaveOptions = {}) {
     };
 
     // Use pagehide as primary (most reliable), with beforeunload as fallback
-    const handlePageLeave = () => trackPageLeave();
+    const handlePageLeave = (): void => trackPageLeave();
 
     // pagehide is the most reliable for modern browsers
     window.addEventListener("pagehide", handlePageLeave);
@@ -75,7 +80,7 @@ export function usePageLeave(options: UsePageLeaveOptions = {}) {
   }, [enabled, analyticsEnabled, eventName, eventData]);
 
   // Manual trigger function
-  const triggerPageLeave = () => {
+  const triggerPageLeave = (): Promise<void> | undefined => {
     if (!enabled || !analyticsEnabled || hasTrackedRef.current) return;
 
     hasTrackedRef.current = true;

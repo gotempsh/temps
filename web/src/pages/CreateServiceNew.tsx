@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { createAndLinkDescription } from '@/lib/service-link-copy'
 import {
   adminListNodesOptions,
   createServiceMutation,
@@ -31,6 +32,7 @@ import {
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
+import { problemDetail } from '@/lib/api-problem'
 import {
   serviceCreateHref,
   serviceProjectId,
@@ -45,7 +47,7 @@ import {
   Server,
   Trash2,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -230,6 +232,7 @@ function ClusterMemberConfig({
             </div>
 
             <Button
+              aria-label="Remove member"
               type="button"
               variant="ghost"
               size="icon"
@@ -301,6 +304,8 @@ export function CreateService() {
   const [serviceNameOverride, setServiceNameOverride] = useState<string | null>(
     null
   )
+  const [nameError, setNameError] = useState<string | null>(null)
+  const nameInput = useRef<HTMLInputElement>(null)
   const supportsCluster = useMemo(
     () =>
       serviceType !== null &&
@@ -396,6 +401,17 @@ export function CreateService() {
     ...createServiceMutation(),
     meta: {
       errorTitle: 'Failed to create service',
+    },
+    onError: (error) => {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'error_code' in error &&
+        error.error_code === 'SERVICE_NAME_CONFLICT'
+      ) {
+        setNameError(problemDetail(error, 'Choose a unique service name.'))
+        nameInput.current?.focus()
+      }
     },
     onSuccess: (data) => {
       if (data.status === 'creating') {
@@ -597,9 +613,7 @@ export function CreateService() {
               {projectQuery.data?.name ?? `service ${projectId}`}
             </AlertTitle>
             <AlertDescription>
-              Temps will create it, provision this service&apos;s database and
-              runtime variables, and update its application sandbox network as
-              one operation.
+              {createAndLinkDescription(serviceType ?? '')}
             </AlertDescription>
           </Alert>
         )}
@@ -612,13 +626,25 @@ export function CreateService() {
           </Label>
           <Input
             id="serviceName"
+            ref={nameInput}
             value={serviceName}
-            onChange={(e) => setServiceNameOverride(e.target.value)}
+            onChange={(e) => {
+              setServiceNameOverride(e.target.value)
+              setNameError(null)
+            }}
             placeholder={`my-${serviceType}`}
-            aria-invalid={!serviceName.trim()}
+            aria-invalid={!!nameError || !serviceName.trim()}
             aria-describedby="serviceName-description"
           />
-          {serviceName.trim() ? (
+          {nameError ? (
+            <p
+              id="serviceName-description"
+              role="alert"
+              className="text-sm text-destructive"
+            >
+              {nameError}
+            </p>
+          ) : serviceName.trim() ? (
             <p
               id="serviceName-description"
               className="text-sm text-muted-foreground"

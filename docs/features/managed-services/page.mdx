@@ -43,23 +43,25 @@ Temps provides fully managed database and storage services that you can provisio
   </Col>
   <Col>
     ```bash {{ title: 'Quick provision via CLI' }}
-    # Create a PostgreSQL database
-    temps service create postgres my-db \
-      --version 16 \
-      --storage 10GB
+    # Service types this server offers, and the parameters of one
+    temps services types
+    temps services types info postgres
+
+    # Create a PostgreSQL database with default settings
+    temps services create --type postgres --name my-db --yes
 
     # Create a MariaDB database
-    temps service create mariadb my-mysql-db
+    temps services create --type mariadb --name my-mysql-db --yes
 
     # Create a Redis instance
-    temps service create redis my-cache \
-      --version 7 \
-      --memory 512MB
+    temps services create --type redis --name my-cache --yes
 
-    # Create S3 storage
-    temps service create s3 my-storage \
-      --size 50GB
+    # Create S3-compatible storage
+    temps services create --type s3 --name my-storage --yes
     ```
+
+    Override a default with `--set key=value` (repeatable). The keys are the
+    parameters listed by `temps services types info <type>`.
   </Col>
 </Row>
 
@@ -82,23 +84,26 @@ Provision a production-ready PostgreSQL database with automatic backups and high
 
     **Via CLI:**
     ```bash
-    temps service create postgres production-db \
-      --version 16 \
-      --storage 20GB \
-      --memory 2GB \
-      --replicas 2
+    temps services create --type postgres --name production-db \
+      --set database=app \
+      --set username=app \
+      --set max_connections=200
     ```
+
+    Passing `--set` creates the service without prompting. A password is
+    generated when you don't set one.
   </Col>
   <Col>
     **Configuration Options:**
 
     | Option | Description | Default |
     |--------|-------------|---------|
-    | `version` | PostgreSQL version (13-16) | 16 |
-    | `storage` | Disk space allocation | 10GB |
-    | `memory` | RAM allocation | 1GB |
-    | `replicas` | Number of read replicas | 1 |
-    | `backups` | Automatic daily backups | Enabled |
+    | `docker_image` | PostgreSQL image | `gotempsh/postgres-walg:18-bookworm` |
+    | `database` | Initial database name | see `services types info postgres` |
+    | `username` | Database user | see `services types info postgres` |
+    | `password` | Database password | Generated |
+    | `port` | Host port | Auto-assigned from 5432 |
+    | `max_connections` | Maximum connections | see `services types info postgres` |
   </Col>
 </Row>
 
@@ -144,13 +149,14 @@ Link your PostgreSQL database to one or more projects:
 
 <CodeGroup title="Link database to project">
 ```bash {{ title: 'CLI' }}
-# Link database to project
-temps service link production-db --project my-app
+# Find the service ID
+temps services list
 
-# Link to specific environment
-temps service link production-db \
-  --project my-app \
-  --environment production
+# Link the database to a project (all of its environments)
+temps services link --id 12 --project my-app
+
+# Show the variables the project receives from it
+temps services env --id 12 --project my-app
 ```
 
 ```javascript {{ title: 'Access in your app' }}
@@ -194,7 +200,7 @@ Create a MariaDB service when your application expects a MySQL-compatible databa
 
     **Via CLI:**
     ```bash
-    temps service create mariadb app-db
+    temps services create --type mariadb --name app-db --yes
     ```
   </Col>
   <Col>
@@ -237,10 +243,7 @@ Provision a high-performance Redis instance for caching, sessions, or pub/sub:
 
     **Via CLI:**
     ```bash
-    temps service create redis session-store \
-      --version 7 \
-      --memory 1GB \
-      --persistence enabled
+    temps services create --type redis --name session-store --yes
     ```
   </Col>
   <Col>
@@ -248,11 +251,9 @@ Provision a high-performance Redis instance for caching, sessions, or pub/sub:
 
     | Option | Description | Default |
     |--------|-------------|---------|
-    | `version` | Redis version (6-7) | 7 |
-    | `memory` | RAM allocation | 512MB |
-    | `persistence` | Enable RDB/AOF | Disabled |
-    | `eviction` | Eviction policy | allkeys-lru |
-    | `maxclients` | Max connections | 10000 |
+    | `docker_image` | Redis image | `gotempsh/redis-walg:8-bookworm` |
+    | `password` | Redis password | Generated |
+    | `port` | Host port | Auto-assigned from 6379 |
   </Col>
 </Row>
 
@@ -349,9 +350,7 @@ Provision S3-compatible object storage for files, backups, and assets:
 
     **Via CLI:**
     ```bash
-    temps service create s3 media-storage \
-      --size 100GB \
-      --public-read false
+    temps services create --type s3 --name media-storage --yes
     ```
   </Col>
   <Col>
@@ -359,11 +358,11 @@ Provision S3-compatible object storage for files, backups, and assets:
 
     | Option | Description | Default |
     |--------|-------------|---------|
-    | `backend` | Storage backend: `rustfs`, `garage`, or `minio` | `rustfs` |
-    | `size` | Storage allocation | 50GB |
-    | `public-read` | Public read access | false |
-    | `versioning` | Object versioning | Disabled |
-    | `lifecycle` | Auto-delete rules | None |
+    | `server` | S3 server: `rustfs` or `minio` | `rustfs` |
+    | `docker_image` | Image for the selected server | RustFS image |
+    | `access_key` / `secret_key` | Credentials | Generated |
+    | `region` | Region reported to clients | see `services types info s3` |
+    | `port` | Host port | Auto-assigned |
   </Col>
 </Row>
 
@@ -457,58 +456,55 @@ const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
   </Col>
   <Col>
     ```bash {{ title: 'CLI monitoring' }}
-    # View service status
-    temps service status production-db
+    # Service details and state
+    temps services show --id 12
 
-    # View service logs
-    temps service logs production-db --tail 100
+    # Last 100 log lines from the past hour
+    temps services logs --id 12 --tail 100 --from 1h
 
-    # View connection count
-    temps service stats production-db
+    # Latest metrics (connections, memory, …)
+    temps services metrics latest --id 12
+
+    # Slowest PostgreSQL queries
+    temps services slow-queries --id 12
     ```
+
+    If `metrics latest` returns nothing, check collection with
+    `temps services metrics status --id 12` and turn it on with
+    `temps services metrics enable --id 12`. `slow-queries` needs
+    `pg_stat_statements`; `temps services enable-pg-stat-statements --id 12`
+    turns it on (it restarts the container briefly).
   </Col>
 </Row>
 
 ### Backups
 
-All services include automatic daily backups retained for 7 days (configurable up to 90 days):
-
+Services are backed up to an S3-compatible destination on the schedules you configure; see [Backups](/docs/backups) for setting up destinations and schedules.
 
 ```bash {{ title: 'Backup management' }}
-# List backups
-temps service backup list production-db
+# Back up one service now, to S3 source 1
+temps backups run-service --id 12 --s3-source-id 1
 
-# Create manual backup
-temps service backup create production-db --name "pre-migration"
+# Backups stored on that source
+temps services list-backups --s3-source-id 1
 
-# Restore from backup
-temps service restore production-db --backup backup-20240115-120000
-
-# Download backup
-temps service backup download production-db \
-  --backup backup-20240115-120000 \
-  --output backup.sql.gz
+# Restore a backup into a new service, leaving the original untouched
+temps services restore --id 12 --backup-id <backup-id> --new-service
 ```
 
-### Scaling Services
+There is no download command; backups are objects in your bucket, and `temps backups show --id <backup-id>` prints where.
 
-Scale your services as your needs grow:
+### Upgrading Services
 
+Move a service to a newer image:
 
-```bash {{ title: 'Scale services' }}
-# Scale PostgreSQL storage
-temps service scale production-db --storage 50GB
-
-# Scale Redis memory
-temps service scale session-store --memory 2GB
-
-# Add read replicas
-temps service scale production-db --replicas 3
+```bash {{ title: 'Upgrade a service' }}
+temps services upgrade --id 12 --version <newer-image>
 ```
 
-<Note>
-Scaling operations are performed with zero downtime. Your applications remain connected during the scaling process.
-</Note>
+For PostgreSQL the server only accepts images on its allowlist, and it rejects an upgrade to the image the service already runs; the error message gives the reason.
+
+Managed services run as a single container. Changing storage size, memory limits or replica counts from the CLI is not supported.
 
 ---
 
@@ -526,14 +522,9 @@ Scaling operations are performed with zero downtime. Your applications remain co
     - Use private networking for service-to-service communication
   </Property>
   <Property name="Credential Rotation">
-    ```bash
-    # Rotate database password
-    temps service rotate-password production-db
-
-    # Rotate S3 access keys
-    temps service rotate-keys media-storage
-    ```
-    Connection strings are automatically updated in linked projects.
+    The CLI has no credential-rotation command. Keep service credentials
+    out of source control and read them from the variables Temps injects
+    into linked projects.
   </Property>
   <Property name="Audit Logging">
     All service access is logged for security auditing:

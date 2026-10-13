@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ProjectResponse } from '@/api/client'
+import type { ProjectResponse, ProjectSecretResponse } from '@/api/client'
 import {
   createProjectSecretMutation,
   deleteProjectSecretMutation,
@@ -36,10 +36,21 @@ import { Label } from '@/components/ui/label'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FileLock2, Plus, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { FileLock2, Pencil, Plus, Trash2 } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { Link, useLocation, useNavigate } from 'react-router'
+import { detailReturnState } from '@/lib/detail-return-path'
+import { useVariableChangeRedeploy } from '@/hooks/useVariableChangeRedeploy'
+import type { VariableChangeScope } from '@/lib/variable-change-redeploy'
 import { toast } from 'sonner'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
+import {
+  EnvironmentVariableChecks,
+  type EnvironmentVariableCheck,
+} from './EnvironmentVariableChecks'
+import { indicatorsBySubject, useHttpChecks } from './http-checks'
+import { SecretEditDialog } from './SecretEditDialog'
+import { composeServiceNamesFor } from './secret-form'
 
 interface SecretsSettingsProps {
   project: ProjectResponse
@@ -52,6 +63,16 @@ const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,254}$/
 
 export function SecretsSettings({ project }: SecretsSettingsProps) {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const notifyChange = useVariableChangeRedeploy(project)
+  const checksQuery = useHttpChecks(project.id)
+  const checksBySecret = useMemo(
+    () => indicatorsBySubject(checksQuery.data ?? [], 'secret'),
+    [checksQuery.data]
+  )
+  const secretPath = (id: number) =>
+    `/projects/${project.slug}/settings/secrets/${id}`
 
   const secretsQuery = useQuery({
     ...listProjectSecretsOptions({
@@ -67,6 +88,9 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   })
 
   const [isCreateOpen, setIsCreateOpen] = useState(false)
+  // The id outlives the dialog so its content stays put while it fades out.
+  const [editingSecretId, setEditingSecretId] = useState<number | null>(null)
+  const [isEditOpen, setIsEditOpen] = useState(false)
 
   useKeyboardShortcut({
     key: 'n',
@@ -83,6 +107,8 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   }
 
   const secrets = secretsQuery.data ?? []
+  const editingSecret: ProjectSecretResponse | null =
+    secrets.find((s) => s.id === editingSecretId) ?? null
   const environments = environmentsQuery.data ?? []
   const composeServiceNames = composeServiceNamesFor(project)
   const isComposeProject = project.preset === 'docker-compose'
@@ -91,10 +117,6 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
     <div className="space-y-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="text-lg font-semibold flex items-center gap-2">
-            <FileLock2 className="h-5 w-5" />
-            Secrets
-          </h2>
           <p className="text-sm text-muted-foreground max-w-2xl">
             Secrets are mounted into your containers as files at{' '}
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
@@ -145,11 +167,35 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               key={s.id}
               secret={s}
               projectId={project.id}
-              onDeleted={refetchSecrets}
+              detailPath={secretPath(s.id)}
+              checks={checksBySecret.get(s.id) ?? []}
+              onEdit={() => {
+                setEditingSecretId(s.id)
+                setIsEditOpen(true)
+              }}
+              onManageChecks={() =>
+                navigate(secretPath(s.id), {
+                  state: detailReturnState(location),
+                })
+              }
+              onDeleted={() => {
+                refetchSecrets()
+                void notifyChange(
+                  `Secret ${s.key} deleted`,
+                  secretScope(s.environments)
+                )
+              }}
             />
           ))}
         </div>
       )}
+
+      <SecretEditDialog
+        open={isEditOpen && editingSecret !== null}
+        onOpenChange={setIsEditOpen}
+        project={project}
+        secret={editingSecret}
+      />
 
       <CreateSecretDialog
         open={isCreateOpen}
@@ -158,31 +204,23 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
         environments={environments}
         composeServiceNames={composeServiceNames}
         isComposeProject={isComposeProject}
-        onCreated={refetchSecrets}
+        onCreated={(key, environmentIds) => {
+          refetchSecrets()
+          void notifyChange(
+            `Secret ${key} created`,
+            secretScope(environmentIds.map((id) => ({ id })))
+          )
+        }}
       />
     </div>
   )
 }
 
-/** Compose service names the project last synced from its compose file.
- *  Empty for non-Compose presets, which deploy a single container. */
-function composeServiceNamesFor(project: {
-  preset?: string | null
-  preset_config?: unknown
-}): string[] {
-  const cfg = (project.preset_config ?? {}) as Record<string, unknown>
-  const services = (cfg.composeServices ??
-    cfg.compose_services ??
-    []) as Array<{
-    name?: string
-  }>
-  return Array.from(
-    new Set(
-      services
-        .map((service) => service?.name)
-        .filter((name): name is string => typeof name === 'string' && !!name)
-    )
-  ).sort()
+/** A secret with no environments is mounted in every environment. */
+function secretScope(environments: Array<{ id: number }>): VariableChangeScope {
+  return environments.length === 0
+    ? 'all'
+    : environments.map((environment) => environment.id)
 }
 
 interface SecretRowProps {
@@ -196,14 +234,26 @@ interface SecretRowProps {
     compose_services?: string[]
   }
   projectId: number
+  detailPath: string
+  checks: EnvironmentVariableCheck[]
+  onEdit: () => void
+  onManageChecks: () => void
   onDeleted: () => void
 }
 
-function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
+function SecretRow({
+  secret,
+  projectId,
+  detailPath,
+  checks,
+  onEdit,
+  onManageChecks,
+  onDeleted,
+}: SecretRowProps) {
+  const location = useLocation()
   const deleteMutation = useMutation({
     ...deleteProjectSecretMutation(),
     onSuccess: () => {
-      toast.success(`Secret ${secret.key} deleted. Redeploy to take effect.`)
       onDeleted()
     },
     onError: (err: Error) => {
@@ -217,7 +267,13 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
     <div className="flex items-center gap-3 px-4 py-3">
       <FileLock2 className="h-4 w-4 text-muted-foreground shrink-0" />
       <div className="min-w-0 flex-1">
-        <div className="font-mono text-sm truncate">{secret.key}</div>
+        <Link
+          to={detailPath}
+          state={detailReturnState(location)}
+          className="block font-mono text-sm truncate underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        >
+          {secret.key}
+        </Link>
         <div className="text-xs text-muted-foreground">
           {secret.environments.length === 0
             ? 'All environments'
@@ -228,7 +284,19 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
             : ''}
         </div>
       </div>
-      <span className="text-xs text-muted-foreground font-mono">••••••••</span>
+      <span className="hidden text-xs text-muted-foreground font-mono sm:inline">
+        ••••••••
+      </span>
+      <EnvironmentVariableChecks checks={checks} onManage={onManageChecks} />
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground"
+        aria-label={`Edit secret ${secret.key}`}
+        onClick={onEdit}
+      >
+        <Pencil className="h-4 w-4" />
+      </Button>
       <AlertDialog>
         <AlertDialogTrigger asChild>
           <Button
@@ -274,7 +342,8 @@ interface CreateSecretDialogProps {
   environments: Array<{ id: number; name: string }>
   composeServiceNames: string[]
   isComposeProject: boolean
-  onCreated: () => void
+  /** Called with the new secret's key and the environments it was scoped to. */
+  onCreated: (key: string, environmentIds: number[]) => void
 }
 
 // Default-select environments whose name matches production or preview.
@@ -321,11 +390,8 @@ function CreateSecretDialog({
 
   const createMutation = useMutation({
     ...createProjectSecretMutation(),
-    onSuccess: () => {
-      toast.success(
-        `Secret ${key} created. Redeploy to mount it at /run/secrets/${key}.`
-      )
-      onCreated()
+    onSuccess: (_data, request) => {
+      onCreated(request.body.key, request.body.environment_ids ?? [])
       setKey('')
       setValue('')
       setEnvironmentIds(defaultEnvironmentSelection(environments))

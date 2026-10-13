@@ -44,7 +44,9 @@ axum-macros = { workspace = true }
 url = "2"
 urlencoding = "2"
 moka = { version = "0.12", features = ["future"] }
+tower-http = { workspace = true }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 testcontainers = { workspace = true }

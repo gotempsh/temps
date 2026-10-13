@@ -263,6 +263,7 @@ export function Revenue() {
               className="w-full sm:w-[260px]"
             />
             <SearchableSelect
+              label="Project"
               value={projectFilter}
               onValueChange={setProjectFilter}
               options={projectOptions}
@@ -273,6 +274,7 @@ export function Revenue() {
               disabled={projectsQuery.isLoading}
             />
             <SearchableSelect
+              label="Event type"
               value={typeFilter}
               onValueChange={setTypeFilter}
               options={typeOptions}
@@ -416,7 +418,7 @@ function StatBlock({
 }) {
   const valueClass =
     tone === 'warn'
-      ? 'text-2xl font-semibold tracking-tight tabular-nums text-amber-600 dark:text-amber-400'
+      ? 'text-2xl font-semibold tracking-tight tabular-nums text-amber-700 dark:text-amber-400'
       : 'text-2xl font-semibold tracking-tight tabular-nums'
   return (
     <Card>
@@ -445,11 +447,11 @@ function EventBadge({ type }: { type: string }) {
         : 'muted'
   const className =
     tone === 'emerald'
-      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
+      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20'
       : tone === 'blue'
         ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20'
         : tone === 'red'
-          ? 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20'
+          ? 'bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20'
           : 'bg-muted text-muted-foreground border-border'
   return (
     <Badge variant="outline" className={`font-mono text-[11px] ${className}`}>
@@ -469,8 +471,8 @@ function MrrDelta({
     return <span className="text-muted-foreground">—</span>
   const positive = minor > 0
   const cls = positive
-    ? 'text-emerald-600 dark:text-emerald-400'
-    : 'text-red-600 dark:text-red-400'
+    ? 'text-emerald-700 dark:text-emerald-400'
+    : 'text-red-700 dark:text-red-400'
   return (
     <span className={cls}>
       {positive ? '+' : ''}

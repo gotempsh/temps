@@ -10,11 +10,16 @@ const ACTIVE_DEPLOYMENT_STATUSES = new Set([
   'queued',
 ])
 
+/** Whether a deployment with this status is still building or rolling out. */
+export function isActiveDeploymentStatus(status: string): boolean {
+  return ACTIVE_DEPLOYMENT_STATUSES.has(status)
+}
+
 export function recentDeploymentsRefetchInterval(
   deployments: DeploymentResponse[] | undefined
 ): number | false {
   return deployments?.some((deployment) =>
-    ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)
+    isActiveDeploymentStatus(deployment.status)
   )
     ? 2500
     : false

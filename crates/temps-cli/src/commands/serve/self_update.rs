@@ -40,10 +40,10 @@ use temps_core::{
 use tracing::{error, info, warn};
 
 use crate::commands::upgrade::{
-    check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_text,
-    download_asset_to_file, extract_binary_from_tarball_file, fetch_latest_release_in_channel,
-    fetch_specific_release, finalize_staged_binary, is_newer_version, platform_target,
-    seal_staged_binary, verify_computed_checksum, GitHubRelease, UpgradeChannel,
+    check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_to_file,
+    extract_binary_from_tarball_file, fetch_expected_checksum, fetch_latest_release_in_channel,
+    fetch_specific_release, finalize_staged_binary, is_newer_version, is_older_version,
+    platform_target, seal_staged_binary, verify_computed_checksum, GitHubRelease, UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -90,6 +90,8 @@ pub struct BinarySelfUpdater {
     /// Database URL passed explicitly to the migrate child process so it works
     /// even when the parent was started with `--database-url` (not the env var).
     database_url: String,
+    /// `temps serve --pre-migration-backup`, forwarded to the migrate child.
+    pre_migration_backup: bool,
 }
 
 impl BinarySelfUpdater {
@@ -108,6 +110,7 @@ impl BinarySelfUpdater {
         topology_caveat: Option<String>,
         update_status: Arc<UpdateStatusSlot>,
         database_url: String,
+        pre_migration_backup: bool,
     ) -> Self {
         let binary_path = std::env::current_exe()
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
@@ -133,6 +136,7 @@ impl BinarySelfUpdater {
             update_status,
             state: Arc::new(RwLock::new(UpdaterState::default())),
             database_url,
+            pre_migration_backup,
         };
 
         let last_attempt = updater.reconcile_journal();
@@ -361,6 +365,27 @@ impl BinarySelfUpdater {
     }
 }
 
+/// Refuse to install an older release just because it is the newest on the
+/// tracked channel -- e.g. a nightly install whose channel was switched to
+/// beta, where the newest beta predates the running nightly. Rolling back is
+/// still possible, but only by pinning the version explicitly.
+fn ensure_not_implicit_downgrade(
+    target_version: Option<&str>,
+    channel: UpgradeChannel,
+    from_version: &str,
+    to_version: &str,
+) -> anyhow::Result<()> {
+    if target_version.is_none() && is_older_version(to_version, from_version) {
+        return Err(anyhow::anyhow!(
+            "Refusing to downgrade from {from_version} to {to_version}: {to_version} is the \
+             newest release on the '{}' channel, but it is older than the running build. \
+             Pin {to_version} explicitly to roll back on purpose.",
+            channel.as_str()
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the channel to track: the operator's explicit setting, else the one
 /// implied by the running version tag. An unparsable setting falls back to
 /// inference rather than erroring, so a bad value can never wedge the checker.
@@ -486,6 +511,7 @@ impl SelfUpdater for BinarySelfUpdater {
             channel,
             state: self.state.clone(),
             database_url: self.database_url.clone(),
+            pre_migration_backup: self.pre_migration_backup.then(|| self.data_dir.clone()),
         };
         tokio::spawn(job.run());
 
@@ -579,6 +605,9 @@ struct UpdateJob {
     /// guaranteed to be in its environment regardless of how the parent
     /// received it (flag vs env var).
     database_url: String,
+    /// Data dir to pass with `--pre-migration-backup` to the migrate child,
+    /// when `temps serve` was started with that flag.
+    pre_migration_backup: Option<PathBuf>,
 }
 
 /// Failure discriminator for `UpdateJob::execute`.
@@ -855,6 +884,12 @@ impl UpdateJob {
                 self.from_version
             ));
         }
+        ensure_not_implicit_downgrade(
+            self.target_version.as_deref(),
+            self.channel,
+            &self.from_version,
+            &to_version,
+        )?;
 
         let tarball_name = format!("temps-{}.tar.gz", target);
         let asset = release
@@ -903,23 +938,9 @@ impl UpdateJob {
         .await?;
 
         self.set_phase(SelfUpdatePhase::Verifying, None);
-        // Fail closed on a missing checksum. `temps upgrade` merely warns
-        // because a human is watching the terminal and can judge; a background
-        // job triggered from a browser has nobody to make that call, so it must
-        // never install bytes it could not verify.
-        let checksum_asset = release
-            .assets
-            .iter()
-            .find(|a| a.name == format!("{}.sha256", tarball_name))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Release {} publishes no SHA-256 for {}, so the download cannot be verified. \
-                     Upgrade from the command line if you want to install it anyway.",
-                    to_version,
-                    tarball_name
-                )
-            })?;
-        let expected = download_asset_text(&checksum_asset.browser_download_url).await?;
+        // Fail closed on a missing checksum, exactly like `temps upgrade` and
+        // install.sh: never install bytes that could not be verified.
+        let expected = fetch_expected_checksum(&release, &tarball_name).await?;
         verify_computed_checksum(&computed, &expected)?;
 
         let mut staged_file = create_upgrade_temp_file(&parent, ".temps-selfupdate-bin.")?;
@@ -978,9 +999,7 @@ impl UpdateJob {
         };
 
         let mut child = tokio::process::Command::new(&self.binary_path)
-            .arg("migrate")
-            .arg("--yes")
-            .arg("--progress-format=json")
+            .args(migrate_child_args(self.pre_migration_backup.as_deref()))
             // Explicit env set: if the parent received the DB URL as a
             // `--database-url` flag it is not in the environment, so a naive
             // child spawn would fail clap's required-arg check.
@@ -1269,6 +1288,24 @@ fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Arguments for the `temps migrate` child of an update. With
+/// `pre_migration_backup` (the data dir of a `temps serve
+/// --pre-migration-backup`), the child takes the backup into that same data
+/// dir.
+pub(crate) fn migrate_child_args(pre_migration_backup: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "migrate".into(),
+        "--yes".into(),
+        "--progress-format=json".into(),
+    ];
+    if let Some(data_dir) = pre_migration_backup {
+        args.push(crate::commands::schema_upgrade::BACKUP_FLAG.into());
+        args.push("--data-dir".into());
+        args.push(data_dir.as_os_str().to_owned());
+    }
+    args
+}
+
 /// Copy the current binary aside as `<binary>.bak`, returning where it went.
 ///
 /// A copy (not a rename) so the target is never momentarily absent — if the
@@ -1325,6 +1362,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_implicit_downgrade_across_channels_is_refused() {
+        let err = ensure_not_implicit_downgrade(
+            None,
+            UpgradeChannel::Beta,
+            "v0.1.0-nightly.20261004.32a8e9c1",
+            "v0.1.0-beta.56",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Refusing to downgrade"), "{err}");
+        assert!(err.contains("'beta' channel"), "{err}");
+    }
+
+    #[test]
+    fn test_pinned_rollback_and_real_upgrades_are_allowed() {
+        assert!(ensure_not_implicit_downgrade(
+            Some("v0.1.0-beta.56"),
+            UpgradeChannel::Beta,
+            "v0.1.0-nightly.20261004.32a8e9c1",
+            "v0.1.0-beta.56",
+        )
+        .is_ok());
+        assert!(ensure_not_implicit_downgrade(
+            None,
+            UpgradeChannel::Nightly,
+            "v0.1.0-nightly.20261003.6f74680e",
+            "v0.1.0-nightly.20261004.32a8e9c1",
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_redact_dsn_strips_credentials() {
         let line = "error connecting to postgresql://app:hunter2@db:5432/temps: connection refused";
         let redacted = redact_dsn(line);
@@ -1375,6 +1444,7 @@ mod tests {
             // Tests don't exercise the migrate subprocess, so the URL value
             // doesn't matter — it only needs to be present in the struct.
             database_url: String::new(),
+            pre_migration_backup: false,
         }
     }
 
@@ -1789,6 +1859,25 @@ mod tests {
 
         drop(staged_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_child_takes_the_backup_only_when_serve_was_started_with_it() {
+        assert_eq!(
+            migrate_child_args(None),
+            vec!["migrate", "--yes", "--progress-format=json"]
+        );
+        assert_eq!(
+            migrate_child_args(Some(Path::new("/srv/temps-data"))),
+            vec![
+                "migrate",
+                "--yes",
+                "--progress-format=json",
+                "--pre-migration-backup",
+                "--data-dir",
+                "/srv/temps-data",
+            ]
+        );
     }
 
     #[test]

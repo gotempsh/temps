@@ -8,3 +8,5 @@ export { AzureIcon } from './DnsProviderIcons-components'
 export { DigitalOceanIcon } from './DnsProviderIcons-components'
 export { NamecheapIcon } from './DnsProviderIcons-components'
 export { getDnsProviderIcon } from './DnsProviderIcons-shared'
+
+export { BunnyIcon } from './DnsProviderIcons-components'

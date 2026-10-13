@@ -3,6 +3,7 @@
 
 import {
   getServiceHealthStatus,
+  serviceFailureSummary,
   triggerServiceHealthCheck,
   type HealthStatus,
   type ServiceHealthResponse,
@@ -12,6 +13,7 @@ import { Button } from '@/components/ui/button'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, Loader2, RefreshCcw } from 'lucide-react'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 
 /**
@@ -35,6 +37,17 @@ function statusLabel(status?: HealthStatus | null): string {
   if (status === 'operational') return 'Operational'
   if (status === 'degraded') return 'Degraded'
   return 'Down'
+}
+
+/**
+ * Toast for a manual check. No status means the service is not expected to
+ * answer yet (still starting, or stopped), which is not a failure.
+ */
+function manualCheckMessage(status?: HealthStatus | null): string {
+  if (!status) return 'No result yet: the service is not running'
+  if (status === 'operational') return 'Service is operational'
+  if (status === 'degraded') return 'Service is degraded'
+  return 'Service is down'
 }
 
 /**
@@ -100,13 +113,7 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
     onSuccess: (snapshot) => {
       queryClient.setQueryData(['service-health', serviceId], snapshot)
       queryClient.invalidateQueries({ queryKey: ['service-health-batch'] })
-      toast.success(
-        snapshot.status === 'operational'
-          ? 'Service is operational'
-          : snapshot.status === 'degraded'
-            ? 'Service is degraded'
-            : 'Service is down'
-      )
+      toast.success(manualCheckMessage(snapshot.status))
     },
     onError: (err: Error) => {
       toast.error('Health check failed', { description: err.message })
@@ -134,6 +141,7 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
   // responded in 10007ms (>2000ms)". Surface it as an amber notice so the
   // bare "Degraded" badge in the header is no longer unexplained.
   const isDegraded = !hasFailure && data.status === 'degraded'
+  const failure = serviceFailureSummary(data, serviceId)
 
   return (
     <div className="space-y-3">
@@ -158,6 +166,7 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
 
         {data.recent_checks.length > 0 ? (
           <div
+            role="group"
             className="ml-auto flex h-5 items-stretch gap-px overflow-hidden rounded-sm"
             aria-label={`Last ${data.recent_checks.length} health checks`}
           >
@@ -197,14 +206,37 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
           <AlertDescription className="space-y-1">
-            <p className="font-medium">
-              {data.consecutive_failures >= 3
-                ? `Service has failed ${data.consecutive_failures} consecutive checks — an alert has been sent.`
-                : `Service has failed ${data.consecutive_failures} check(s) in a row.`}
-            </p>
+            <p className="font-medium">{failure.headline}</p>
             {data.last_error ? (
               <p className="break-words text-xs opacity-80">
                 {data.last_error}
+              </p>
+            ) : null}
+            {failure.alertNote ? (
+              <p className="text-xs">
+                {failure.alertNote}
+                {failure.setupHref ? (
+                  <>
+                    {' '}
+                    <Link
+                      to={failure.setupHref}
+                      className="font-medium underline underline-offset-2"
+                    >
+                      Set up notifications
+                    </Link>
+                  </>
+                ) : null}
+                {failure.alarmHref ? (
+                  <>
+                    {' '}
+                    <Link
+                      to={failure.alarmHref}
+                      className="font-medium underline underline-offset-2"
+                    >
+                      View alarms
+                    </Link>
+                  </>
+                ) : null}
               </p>
             ) : null}
           </AlertDescription>

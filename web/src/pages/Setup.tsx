@@ -14,6 +14,7 @@ import {
   Globe,
   Lightbulb,
   PartyPopper,
+  Rocket,
   ShieldCheck,
   Sparkles,
   Bot,
@@ -36,6 +37,7 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 
 // Per-step icon so the checklist reads visually, not just as text rows.
 const STEP_ICONS: Record<string, LucideIcon> = {
+  deploy: Rocket,
   ai: Bot,
   git: GitBranch,
   domain: Globe,
@@ -224,7 +226,7 @@ export function Setup() {
                           className={cn(
                             'flex items-center gap-4 rounded-lg px-3 py-3.5 transition-colors',
                             item.done
-                              ? 'opacity-60 cursor-default'
+                              ? 'cursor-default'
                               : 'hover:bg-muted/50 cursor-pointer',
                             isNext && 'bg-primary/5'
                           )}
@@ -233,7 +235,7 @@ export function Setup() {
                             className={cn(
                               'flex size-9 shrink-0 items-center justify-center rounded-lg border',
                               item.done
-                                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
+                                ? 'border-success/30 bg-success/10 text-success-strong'
                                 : 'bg-muted text-muted-foreground'
                             )}
                           >
@@ -269,7 +271,7 @@ export function Setup() {
                           </div>
 
                           {item.done ? (
-                            <span className="shrink-0 text-xs text-emerald-500">
+                            <span className="shrink-0 text-xs font-medium text-success-strong">
                               Done
                             </span>
                           ) : (
@@ -305,7 +307,7 @@ export function Setup() {
                           className={cn(
                             'flex size-8 shrink-0 items-center justify-center rounded-lg',
                             rec.tone === 'warning'
-                              ? 'bg-amber-500/10 text-amber-500'
+                              ? 'bg-amber-500/10 text-amber-700 dark:text-amber-500'
                               : 'bg-primary/10 text-primary'
                           )}
                         >

@@ -97,6 +97,10 @@ pub fn is_container_runtime_unavailable(error: &str) -> bool {
         "docker socket",
         // testcontainers when no runtime is installed or running, e.g.
         // "failed to initialize a docker client: Socket not found: /var/run/docker.sock"
+        // (also Colima/Rancher Desktop without DOCKER_HOST set). A bare
+        // "socket not found" is deliberately not a marker: it is only a
+        // missing runtime when it names a Docker socket, see
+        // `is_missing_docker_socket`.
         "failed to initialize a docker client",
         "cannot connect to the docker daemon",
         "is the docker daemon running",
@@ -1156,6 +1160,9 @@ mod tests {
         ));
         assert!(is_container_runtime_unavailable(
             "Docker daemon is unavailable: connection refused"
+        ));
+        assert!(is_container_runtime_unavailable(
+            "failed to initialize a docker client: Socket not found: /var/run/docker.sock"
         ));
         assert!(!is_container_runtime_unavailable(
             "Failed to run migrations: column does not exist"

@@ -31,19 +31,37 @@
   --secondary-foreground: oklch(0.145 0 0);
   /* gray-100 (#f5f5f5) — muted surface for sidebar and inset areas */
   --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0); /* #8f8f8f — geist gray-700 */
+  /* #696969. Darker than Geist's gray-700 (#737373), which fell just short of
+     4.5:1 (WCAG 1.4.3) on the muted and accent surfaces it often sits on. */
+  --muted-foreground: oklch(0.52 0 0);
   /* gray-100 (#f2f2f2) — accent hover */
   --accent: oklch(0.955 0 0);
   --accent-foreground: oklch(0.145 0 0);
-  /* Vercel red (#e5484d) */
-  --destructive: oklch(0.627 0.2193 23.03);
+  /* #d00021. Dark enough for 4.5:1 (WCAG 1.4.3) both as text on white or a
+     destructive/10 tint and behind white text in a filled badge or button;
+     the brighter chart red (#f03744) managed only 3.8:1. */
+  --destructive: oklch(0.54 0.22 25);
   --destructive-foreground: oklch(0.985 0 0);
   /* Status semantics — success (green) + warning (amber), matching the chart
      tones. Used by AlertStateBadge (ok/warn) and the metrics health surfaces. */
-  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with white text */
+  /* #0f813d. White text on the previous, brighter green (#0da34d) measured
+     3.16:1, below the 4.5:1 WCAG 1.4.3 floor for badges and buttons; this
+     reaches 4.74:1 and, used as text on white, 4.95:1. */
+  --success: oklch(
+    0.53 0.14 150.31
+  ); /* green — solid fill paired with white text */
   --success-foreground: oklch(0.985 0 0);
+  /* Green *text* on light surfaces. --success is a fill colour: as text it
+     falls short of 4.5:1 (WCAG 1.4.3), and Tailwind's green-700 on a green
+     tint measured 4.32:1. This (#197037) reaches 6.2:1 on white and 5.5:1 on
+     a success/10 tint. */
+  --success-strong: oklch(0.48 0.12 150);
   --warning: oklch(0.773 0.1776 69.61); /* amber */
   --warning-foreground: oklch(0.145 0 0);
+  /* Amber *text* on light surfaces. --warning is a fill colour: as text on
+     white or a warning/10 tint it reaches only ~2:1. This darker amber
+     (#994a00) clears 4.5:1 on both (WCAG 1.4.3). */
+  --warning-strong: oklch(0.5 0.13 55);
   /* gray-200 borders (#eaeaea) — Vercel's signature subtle border */
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
@@ -118,15 +136,26 @@
   /* gray-300 (#3a3a3a) — accent hover */
   --accent: oklch(0.322 0 0);
   --accent-foreground: oklch(0.985 0 0);
-  /* Vercel red (#e5484d / error) */
-  --destructive: oklch(0.627 0.2193 23.03);
-  --destructive-foreground: oklch(0.985 0 0);
+  /* #f45055. As text it is 5.2:1 on the card colour and 4.7:1 on a
+     destructive/10 tint (the previous #f03744 managed 4.2:1 there). White
+     text on a red this light is only 3.3:1, so the foreground is the same
+     near-black as --warning-foreground (5.8:1). */
+  --destructive: oklch(0.66 0.2 23);
+  --destructive-foreground: oklch(0.145 0 0);
   /* Status semantics — same green/amber as light (chart tones are mode-stable);
      dark foreground reads well on both. */
-  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with white text */
-  --success-foreground: oklch(0.985 0 0);
+  /* Bright green fill: white text on it is 3.16:1, so the foreground is the
+     near-black used by --warning-foreground (6.0:1). */
+  --success: oklch(
+    0.627 0.1684 150.31
+  ); /* green — solid fill paired with dark text */
+  --success-foreground: oklch(0.145 0 0);
+  /* Green text on dark surfaces: ~9.9:1 on the card colour. */
+  --success-strong: oklch(0.79 0.17 150);
   --warning: oklch(0.773 0.1776 69.61); /* amber */
   --warning-foreground: oklch(0.145 0 0);
+  /* On dark surfaces the fill amber already reads at ~9:1. */
+  --warning-strong: oklch(0.773 0.1776 69.61);
   /* gray-300 (#3a3a3a) — matches --accent; restores the pre-Geist-palette
      border/input contrast against --card (0.205) that the Vercel rewrite
      (6b4859637) collapsed from a 0.144 lightness delta down to 0.064,
@@ -200,8 +229,10 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-success: var(--success);
   --color-success-foreground: var(--success-foreground);
+  --color-success-strong: var(--success-strong);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
+  --color-warning-strong: var(--warning-strong);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);

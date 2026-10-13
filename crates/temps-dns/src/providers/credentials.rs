@@ -27,6 +27,20 @@ pub struct CloudflareCredentials {
     pub account_id: Option<String>,
 }
 
+/// Bunny DNS account credentials, encrypted at rest.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+pub struct BunnyCredentials {
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for BunnyCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BunnyCredentials")
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Namecheap credentials
 ///
 /// Namecheap requires:
@@ -154,6 +168,7 @@ pub struct PebbleCredentials {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderCredentials {
     Cloudflare(CloudflareCredentials),
+    Bunny(BunnyCredentials),
     Namecheap(NamecheapCredentials),
     Route53(Route53Credentials),
     DigitalOcean(DigitalOceanCredentials),
@@ -166,6 +181,7 @@ impl ProviderCredentials {
     /// Get a masked representation of credentials for display
     pub fn masked(&self) -> serde_json::Value {
         match self {
+            ProviderCredentials::Bunny(_) => serde_json::json!({"type": "bunny", "api_key": "***"}),
             ProviderCredentials::Cloudflare(c) => {
                 serde_json::json!({
                     "type": "cloudflare",
@@ -228,10 +244,17 @@ impl ProviderCredentials {
 
 /// Mask a string, showing only first 4 and last 4 characters
 fn mask_string(s: &str) -> String {
-    if s.len() <= 8 {
+    let characters: Vec<char> = s.chars().collect();
+    if characters.len() <= 8 {
         "***".to_string()
     } else {
-        format!("{}...{}", &s[..4], &s[s.len() - 4..])
+        format!(
+            "{}...{}",
+            characters[..4].iter().collect::<String>(),
+            characters[characters.len() - 4..]
+                .iter()
+                .collect::<String>()
+        )
     }
 }
 
@@ -242,6 +265,8 @@ mod tests {
     #[test]
     fn test_mask_string() {
         assert_eq!(mask_string("short"), "***");
+        assert_eq!(mask_string("🔐🔐🔐"), "***");
+        assert_eq!(mask_string("🔐🔐🔐🔐12345"), "🔐🔐🔐🔐...2345");
         assert_eq!(mask_string("12345678"), "***");
         assert_eq!(mask_string("123456789"), "1234...6789");
         assert_eq!(mask_string("AKIAIOSFODNN7EXAMPLE"), "AKIA...MPLE");

@@ -41,6 +41,8 @@ await sandbox.stop();
 ## API
 
 - `Sandbox.create(opts)` — create a new sandbox, optionally seeded from a git repo or tarball.
+  Pass `node` (a worker node name, id, or `'control-plane'`) to choose where it runs;
+  omit it to let Temps place it. `sandbox.info.nodeName` reports where it landed.
 - `Sandbox.get(id, config)` — rehydrate an existing sandbox by ID.
 - `Sandbox.list(config)` — paginate the caller's sandboxes.
 - `sandbox.exec(cmd, opts?)` — synchronous exec; returns stdout/stderr/exitCode.

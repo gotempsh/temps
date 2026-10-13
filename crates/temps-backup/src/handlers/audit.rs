@@ -112,6 +112,33 @@ pub struct RestoreRunAudit {
     pub source_backup_id: i32,
     pub mode: String,
     pub target_service_name: Option<String>,
+    /// Services recorded as having produced the backup (empty when unknown).
+    pub backup_origin_service_ids: Vec<i32>,
+    /// Whether the restore targets a service other than the backup's origin.
+    pub cross_service: bool,
+    /// Whether the caller explicitly confirmed a cross-service restore.
+    pub cross_service_confirmed: bool,
+}
+
+/// A restore run cancelled before it wrote to an existing service.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreRunCancelledAudit {
+    pub context: AuditContext,
+    pub restore_run_id: i32,
+    /// The service the restore targeted (overwritten in place, or the
+    /// template for a new service).
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+    /// `0` for a restore from a raw S3 location.
+    pub source_backup_id: i32,
+    pub mode: String,
+    /// Name of the service a new-service restore would have created.
+    pub target_service_name: Option<String>,
+    /// Phase the run was in when the cancellation was accepted: `prepare` or
+    /// `download` for an in-place restore, up to `provision`/`recover` for one
+    /// creating a new service.
+    pub phase: String,
 }
 
 /// Security audit record for a PostgreSQL major-upgrade mutation.
@@ -471,6 +498,29 @@ impl AuditOperation for ScheduleRunNowAudit {
 impl AuditOperation for RestoreRunAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_RESTORE_RUN".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for RestoreRunCancelledAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_RESTORE_RUN_CANCELLED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

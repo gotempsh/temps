@@ -20,9 +20,11 @@ use temps_core::{
     JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
 };
 use temps_database::DbConnection;
-use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor, EnvFileSource};
+use temps_deployer::compose::{
+    ComposeDeployRequest, ComposeExecutor, ComposeOutputSink, EnvFileSource,
+};
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 use tracing::debug;
 
 fn route_binding_for_service<'a>(
@@ -162,6 +164,8 @@ pub struct DeployComposeJob {
     relaxed_capability_services: Vec<String>,
     /// Compose services explicitly exempted from Temps' runtime sandbox.
     unsandboxed_services: Vec<String>,
+    /// Readiness budget for the stack; `None` keeps the executor default.
+    ready_timeout_secs: Option<u64>,
     /// Explicit public service/target selections. These disambiguate services
     /// that publish multiple ports (for example GitLab HTTP and SSH).
     public_ports: Vec<ComposePublicPort>,
@@ -192,6 +196,7 @@ pub struct DeployComposeJobBuilder {
     excluded_services: Vec<String>,
     relaxed_capability_services: Vec<String>,
     unsandboxed_services: Vec<String>,
+    ready_timeout_secs: Option<u64>,
     public_ports: Vec<ComposePublicPort>,
     environment_vars: HashMap<String, String>,
     secrets: HashMap<String, String>,
@@ -224,6 +229,7 @@ impl DeployComposeJobBuilder {
             excluded_services: Vec::new(),
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
+            ready_timeout_secs: None,
             public_ports: Vec::new(),
             environment_vars: HashMap::new(),
             secrets: HashMap::new(),
@@ -283,6 +289,13 @@ impl DeployComposeJobBuilder {
         self.relaxed_capability_services = services;
         self
     }
+    /// Readiness budget for the whole stack, in seconds (the project's
+    /// startup-timeout setting).
+    pub fn ready_timeout_secs(mut self, secs: u64) -> Self {
+        self.ready_timeout_secs = Some(secs);
+        self
+    }
+
     pub fn unsandboxed_services(mut self, services: Vec<String>) -> Self {
         self.unsandboxed_services = services;
         self
@@ -351,6 +364,7 @@ impl DeployComposeJobBuilder {
             excluded_services: self.excluded_services,
             relaxed_capability_services: self.relaxed_capability_services,
             unsandboxed_services: self.unsandboxed_services,
+            ready_timeout_secs: self.ready_timeout_secs,
             public_ports: self.public_ports,
             environment_vars: self.environment_vars,
             secrets: self.secrets,
@@ -372,7 +386,68 @@ impl DeployComposeJobBuilder {
     }
 }
 
+/// Log level for one line of `docker compose` output. BuildKit marks a
+/// failing step `ERROR` and ends with `failed to solve`; Compose prefixes its
+/// own failures with `Error`/`error`. Everything else is progress.
+fn compose_output_level(line: &str) -> LogLevel {
+    let trimmed = line.trim_start();
+    if trimmed.contains("ERROR")
+        || trimmed.starts_with("Error")
+        || trimmed.starts_with("error")
+        || trimmed.starts_with("failed to solve")
+    {
+        LogLevel::Error
+    } else if trimmed.starts_with("WARN") || trimmed.contains(" WARN") {
+        LogLevel::Warning
+    } else {
+        LogLevel::Info
+    }
+}
+
+/// Split a batch of output lines into runs of consecutive lines sharing a
+/// log level, preserving order, so an error line is never filed as info.
+fn group_compose_output(batch: Vec<String>) -> Vec<(LogLevel, Vec<String>)> {
+    let mut groups: Vec<(LogLevel, Vec<String>)> = Vec::new();
+    for line in batch {
+        let level = compose_output_level(&line);
+        match groups.last_mut() {
+            Some((last_level, lines)) if *last_level == level => lines.push(line),
+            _ => groups.push((level, vec![line])),
+        }
+    }
+    groups
+}
+
 impl DeployComposeJob {
+    /// Stream `docker compose build`/`pull`/`up` output into this job's log
+    /// as it happens, so a failing build shows the step that broke and its
+    /// full error rather than only the tail attached to the job failure.
+    /// Lines arrive already redacted, in batches from a single forwarder, so
+    /// appends never race each other for a line number. Each run of
+    /// consecutive same-level lines becomes one entry, which keeps a verbose
+    /// build to a handful of log writes per batch instead of one per line.
+    fn compose_output_sink(&self) -> Option<ComposeOutputSink> {
+        let log_id = self.log_id.clone()?;
+        let log_service = self.log_service.clone();
+        Some(ComposeOutputSink(Arc::new(move |batch: Vec<String>| {
+            let log_service = log_service.clone();
+            let log_id = log_id.clone();
+            Box::pin(async move {
+                for (level, lines) in group_compose_output(batch) {
+                    if let Err(error) = log_service
+                        .append_structured_log(&log_id, level, lines.join("\n"))
+                        .await
+                    {
+                        tracing::warn!(
+                            log_id = %log_id,
+                            "Failed to append docker compose output to deployment log: {error}"
+                        );
+                    }
+                }
+            })
+        })))
+    }
+
     /// Mark any prior Compose container rows for this environment as replaced.
     /// The runtime stack uses one deterministic Compose project name per
     /// environment, so `docker compose up` cannot leave more than one candidate
@@ -664,11 +739,11 @@ impl DeployComposeJob {
         );
         labels.insert("sh.temps.managed".to_string(), "true".to_string());
 
-        // Read compose file from repo checkout or inline content
-        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
         // Confine user-supplied paths to the repo checkout / project directory
         // so a project writer cannot escape the intended work directory.
-        validate_relative_path(compose_file_name, "compose_path")?;
+        if let Some(compose_path) = self.compose_path.as_deref() {
+            validate_relative_path(compose_path, "compose_path")?;
+        }
         validate_relative_path(&self.directory, "directory")?;
 
         // Resolve the selected repository subdirectory once and carry the
@@ -698,6 +773,27 @@ impl DeployComposeJob {
         } else {
             None
         };
+
+        // Read compose file from repo checkout or inline content. With no
+        // configured path, use the first standard name the checkout has.
+        let compose_file_name_owned =
+            resolve_compose_file_name(self.compose_path.as_deref(), repo_path.as_deref());
+        let compose_file_name = compose_file_name_owned.as_str();
+        validate_relative_path(compose_file_name, "compose_path")?;
+        if self.compose_path.is_none() {
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "No compose file path configured; using '{compose_file_name}' (first of {} found)",
+                            STANDARD_COMPOSE_FILE_NAMES.join(", ")
+                        ),
+                    )
+                    .await;
+            }
+        }
 
         let compose_content = if let Some(ref inline) = self.compose_content {
             // Inline compose content (manual project, no git repo)
@@ -894,7 +990,11 @@ impl DeployComposeJob {
         // an empty DATABASE_URL and fails later with something unrelated — the
         // person debugging this has no support channel, so the deployment log
         // has to say what was created and where it came from.
-        for plan in ComposeExecutor::plan_env_files(&compose_content, repo_path.as_deref()) {
+        for plan in ComposeExecutor::plan_env_files_for_compose_file(
+            &compose_content,
+            compose_file_name,
+            repo_path.as_deref(),
+        ) {
             let message = match plan.source {
                 EnvFileSource::Repository(_) => format!(
                     "Compose references env file '{}' — copied from the repository",
@@ -942,7 +1042,7 @@ impl DeployComposeJob {
                     keys.sort();
                     let message = if keys.is_empty() {
                         format!(
-                            "Service '{service}' receives no secrets                              (every secret is scoped to other services)"
+                            "Service '{service}' receives no secrets (every secret is scoped to other services)"
                         )
                     } else {
                         format!(
@@ -963,7 +1063,7 @@ impl DeployComposeJob {
                         .log_warning(
                             log_id,
                             &format!(
-                                "Service(s) {} already define their own /run/secrets mount or                                  compose `secrets:` entry — Temps secrets are NOT mounted there.                                  Remove that mount if you want Temps to deliver them.",
+                                "Service(s) {} already define their own /run/secrets mount or compose `secrets:` entry — Temps secrets are NOT mounted there. Remove that mount if you want Temps to deliver them.",
                                 skipped.join(", ")
                             ),
                         )
@@ -982,7 +1082,7 @@ impl DeployComposeJob {
                         .log_warning(
                             log_id,
                             &format!(
-                                "Secret '{}' is scoped to compose service '{}', which does not                                  exist in this stack (services: {}). It was not delivered to that                                  service. Update the secret's scope or the compose file.",
+                                "Secret '{}' is scoped to compose service '{}', which does not exist in this stack (services: {}). It was not delivered to that service. Update the secret's scope or the compose file.",
                                 key,
                                 missing,
                                 if services.is_empty() {
@@ -1036,7 +1136,7 @@ impl DeployComposeJob {
             compose_content,
             env_content,
             work_dir: PathBuf::from("/tmp"),
-            compose_path: self.compose_path.clone(),
+            compose_path: Some(compose_file_name.to_string()),
             environment_vars: self.environment_vars.clone(),
             secrets: self.secrets.clone(),
             secret_compose_services: self.secret_compose_services.clone(),
@@ -1046,6 +1146,13 @@ impl DeployComposeJob {
             compose_override: compose_override.clone(),
             relaxed_capability_services: self.relaxed_capability_services.clone(),
             unsandboxed_services: self.unsandboxed_services.clone(),
+            ready_timeout: self.ready_timeout_secs.map(std::time::Duration::from_secs),
+            routed_services: self
+                .public_ports
+                .iter()
+                .map(|port| port.service.clone())
+                .collect(),
+            output_sink: self.compose_output_sink(),
         };
 
         // Prepare compose files, build (if needed), and pull images BEFORE
@@ -1611,8 +1718,9 @@ impl WorkflowTask for DeployComposeJob {
     /// Docker keeps crash-looping the containers forever on the node.
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
-        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
-        validate_relative_path(compose_file_name, "compose_path")?;
+        if let Some(compose_path) = self.compose_path.as_deref() {
+            validate_relative_path(compose_path, "compose_path")?;
+        }
         validate_relative_path(&self.directory, "directory")?;
 
         let cleanup_repo_path = if self.compose_content.is_none() {
@@ -1631,6 +1739,10 @@ impl WorkflowTask for DeployComposeJob {
         } else {
             None
         };
+        let compose_file_name_owned =
+            resolve_compose_file_name(self.compose_path.as_deref(), cleanup_repo_path.as_deref());
+        let compose_file_name = compose_file_name_owned.as_str();
+        validate_relative_path(compose_file_name, "compose_path")?;
 
         if let Some(ref log_id) = self.log_id {
             let _ = self
@@ -1662,6 +1774,34 @@ impl WorkflowTask for DeployComposeJob {
                 ))
             })
     }
+}
+
+/// Compose file names Docker Compose itself looks for, in its precedence order.
+const STANDARD_COMPOSE_FILE_NAMES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
+
+/// The compose file to deploy: the configured path, else the first standard
+/// name present as a regular file in the selected repository directory, else
+/// `docker-compose.yml` (inline compose content and projects that predate
+/// auto-detection keep their historical default).
+fn resolve_compose_file_name(configured: Option<&str>, repo_dir: Option<&Path>) -> String {
+    if let Some(configured) = configured {
+        return configured.to_string();
+    }
+    repo_dir
+        .and_then(|dir| {
+            STANDARD_COMPOSE_FILE_NAMES.iter().find(|name| {
+                std::fs::symlink_metadata(dir.join(name)).is_ok_and(|metadata| metadata.is_file())
+            })
+        })
+        .map_or_else(
+            || "docker-compose.yml".to_string(),
+            |name| (*name).to_string(),
+        )
 }
 
 /// Confine a user-supplied path (`compose_path`, `directory`) to the repo
@@ -1731,6 +1871,48 @@ pub(crate) fn canonicalize_confined_repo_path(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn group_compose_output_keeps_order_and_separates_error_runs() {
+        let groups = group_compose_output(vec![
+            "#1 [internal] load build definition".to_string(),
+            "#2 [build 1/3] FROM alpine".to_string(),
+            "#3 ERROR: process did not complete successfully".to_string(),
+            "failed to solve: exit code: 1".to_string(),
+            "#4 DONE".to_string(),
+        ]);
+        let shape: Vec<(LogLevel, usize)> = groups
+            .iter()
+            .map(|(level, lines)| (*level, lines.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (LogLevel::Info, 2),
+                (LogLevel::Error, 2),
+                (LogLevel::Info, 1)
+            ]
+        );
+        assert_eq!(groups[1].1[1], "failed to solve: exit code: 1");
+    }
+
+    #[test]
+    fn compose_output_level_marks_build_failures_as_errors() {
+        for line in [
+            "#9 ERROR: process \"/bin/sh -c npm run build\" did not complete successfully",
+            "failed to solve: process \"/bin/sh -c npm run build\" did not complete successfully",
+            "Error response from daemon: pull access denied",
+        ] {
+            assert!(
+                matches!(compose_output_level(line), LogLevel::Error),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            compose_output_level("#4 [build 1/6] FROM docker.io/library/node:22-alpine"),
+            LogLevel::Info
+        ));
+    }
 
     fn test_db() -> Arc<DbConnection> {
         Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
@@ -2381,17 +2563,17 @@ services:
         // `ComposeExecutor::write_compose_files` performs this same rewrite
         // before layering an override that defines `ports`, preventing Compose
         // from retaining both the base and override port mappings.
-        let mut prepared: serde_yaml::Value = serde_yaml::from_str(&stripped).unwrap();
+        let mut prepared: yaml_serde::Value = yaml_serde::from_str(&stripped).unwrap();
         prepared["services"]["web"]
             .as_mapping_mut()
             .expect("web service should be a mapping")
             .remove("ports");
-        let prepared = serde_yaml::to_string(&prepared).unwrap();
+        let prepared = yaml_serde::to_string(&prepared).unwrap();
 
         let preview =
             temps_presets::render_effective_compose_preview(base, Some(override_yaml), &excluded)
                 .expect("preview should render");
-        let preview_value: serde_yaml::Value = serde_yaml::from_str(&preview.yaml).unwrap();
+        let preview_value: yaml_serde::Value = yaml_serde::from_str(&preview.yaml).unwrap();
 
         let temp = tempfile::tempdir().unwrap();
         let base_path = temp.path().join("compose.yml");
@@ -2454,5 +2636,50 @@ services:
         assert_eq!(deployed_dependencies.len(), 1);
         assert!(preview_dependencies.contains_key("web"));
         assert!(deployed_dependencies.contains_key("web"));
+    }
+
+    #[test]
+    fn default_compose_file_follows_docker_compose_precedence() {
+        let repo = tempfile::tempdir().unwrap();
+        // Nothing present: keep the historical default.
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "docker-compose.yml"
+        );
+        assert_eq!(resolve_compose_file_name(None, None), "docker-compose.yml");
+
+        std::fs::write(repo.path().join("docker-compose.yml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "docker-compose.yml"
+        );
+        std::fs::write(repo.path().join("compose.yml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "compose.yml"
+        );
+        std::fs::write(repo.path().join("compose.yaml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "compose.yaml"
+        );
+        // A configured path always wins, even when it does not exist yet.
+        assert_eq!(
+            resolve_compose_file_name(Some("deploy/stack.yml"), Some(repo.path())),
+            "deploy/stack.yml"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_compose_file_ignores_directories_and_symlinks() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("compose.yaml")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", repo.path().join("compose.yml")).unwrap();
+        std::fs::write(repo.path().join("docker-compose.yaml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "docker-compose.yaml"
+        );
     }
 }

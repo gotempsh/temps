@@ -3,18 +3,27 @@
 
 import { Link, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowRight, KeyRound, Monitor, ShieldCheck } from 'lucide-react'
+import { ArrowRight } from 'lucide-react'
+import { RecordLink } from '@temps-sdk/ds'
 import type { ProviderCatalogDto } from '@/api/client'
-import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 import {
   harnessSetupHref,
   harnessSetupStatus,
+  savedConnectionLabel,
   workspaceReturnTo,
 } from './harness-onboarding'
 
@@ -31,8 +40,7 @@ export function AgentSandboxProvidersList() {
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-muted-foreground">
-          Choose a harness, save its credential, then verify your first
-          workspace reply. You only need one to start.
+          Connect one harness to start. You can add the others later.
         </p>
         <Button asChild variant="outline" size="sm">
           <Link to={returnTo}>
@@ -40,105 +48,115 @@ export function AgentSandboxProvidersList() {
           </Link>
         </Button>
       </div>
-      {isError && (
-        <div role="alert" className="rounded-lg border p-4 text-sm">
-          Could not load harness configuration.{' '}
-          <Button variant="outline" size="sm" onClick={() => void refetch()}>
-            Retry
-          </Button>
-        </div>
-      )}
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 2xl:grid-cols-3">
-        {isPending
-          ? [0, 1, 2].map((id) => (
-              <Card key={id} aria-label="Loading harness">
-                <CardContent className="space-y-3 p-4">
-                  <Skeleton className="h-8 w-40" />
-                  <Skeleton className="h-20 w-full" />
-                </CardContent>
-              </Card>
-            ))
-          : data?.providers.map((provider) => (
-              <HarnessSetupCard
-                key={provider.id}
-                provider={provider}
-                returnTo={returnTo}
-              />
-            ))}
-      </div>
-      <div className="flex items-start gap-2 rounded-lg border p-4 text-sm text-muted-foreground">
-        <ShieldCheck className="size-4 shrink-0" aria-hidden="true" />
-        <p>
-          Credentials are configured on this Temps instance, not in your
-          browser. A host CLI login is separate from a saved workspace
-          credential. A saved credential is not proof that a model can answer:
-          verify it in your workspace before starting a larger task.
-        </p>
+      <div className="rounded-lg border bg-card text-card-foreground">
+        {isError && !data ? (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-3 p-4 text-sm"
+          >
+            Could not load harness configuration.
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
+              Retry
+            </Button>
+          </div>
+        ) : data?.providers.length === 0 ? (
+          <p role="status" className="p-4 text-sm text-muted-foreground">
+            This server offers no harnesses. Update Temps to add one.
+          </p>
+        ) : (
+          <Table aria-label="Harnesses" aria-busy={isPending}>
+            <TableHeader>
+              <TableRow>
+                <TableHead scope="col">Harness</TableHead>
+                {/* Secondary on phones: the harness page shows it too. */}
+                <TableHead scope="col" className="hidden sm:table-cell">
+                  Sign-in method
+                </TableHead>
+                <TableHead scope="col">Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isPending
+                ? [0, 1, 2].map((id) => (
+                    <TableRow key={id}>
+                      <TableCell>
+                        <Skeleton className="h-5 w-40" />
+                      </TableCell>
+                      <TableCell className="hidden sm:table-cell">
+                        <Skeleton className="h-4 w-28" />
+                      </TableCell>
+                      <TableCell>
+                        <Skeleton className="h-5 w-24" />
+                      </TableCell>
+                    </TableRow>
+                  ))
+                : data?.providers.map((provider) => (
+                    <HarnessSetupRow
+                      key={provider.id}
+                      provider={provider}
+                      returnTo={returnTo}
+                    />
+                  ))}
+            </TableBody>
+          </Table>
+        )}
       </div>
     </div>
   )
 }
 
-export function HarnessSetupCard({
+export function HarnessSetupRow({
   provider,
   returnTo,
 }: {
   provider: ProviderCatalogDto
   returnTo: string
 }) {
+  const needsAttention = provider.credential_saved && !provider.workspace_ready
+  const method = provider.credential_saved
+    ? savedConnectionLabel(provider)
+    : undefined
   return (
-    <Card className="min-w-0 shadow-none">
-      <CardContent className="space-y-4 p-4">
-        <div className="flex items-center gap-3">
-          <AiHarnessLogo providerId={provider.id} size={28} />
-          <div className="min-w-0 space-y-1">
-            <h2 className="font-semibold">{provider.name}</h2>
-            <Badge variant="secondary">{harnessSetupStatus(provider)}</Badge>
-          </div>
+    <TableRow>
+      <TableCell>
+        <div className="flex min-w-0 items-center gap-3">
+          <AiHarnessLogo providerId={provider.id} size={20} />
+          <RecordLink
+            to={harnessSetupHref(provider.id, returnTo)}
+            aria-label={`${provider.credential_saved ? 'Manage' : 'Connect'} ${provider.name}`}
+          >
+            {provider.name}
+          </RecordLink>
         </div>
-        <dl className="space-y-2 text-sm">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <dt className="flex items-center gap-2 text-muted-foreground">
-              <Monitor className="size-4" />
-              Host CLI
-            </dt>
-            <dd>
-              {provider.host_version
-                ? 'Installed · ' + provider.host_version
-                : 'Not detected'}
-            </dd>
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <dt className="flex items-center gap-2 text-muted-foreground">
-              <KeyRound className="size-4" />
-              Host login
-            </dt>
-            <dd>
-              {provider.host_authenticated
-                ? 'Authenticated'
-                : 'Not authenticated'}
-            </dd>
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <dt className="text-muted-foreground">Workspace credential</dt>
-            <dd>{provider.credential_saved ? 'Saved' : 'Not saved'}</dd>
-          </div>
-        </dl>
-        <p className="text-xs text-muted-foreground">
-          {provider.workspace_ready
-            ? 'Configured for workspace use. Verify with a first reply.'
-            : provider.workspace_readiness_hint ||
-              'Connect an account to start chatting and building in a workspace.'}
-        </p>
-        <Button asChild variant="outline" size="sm">
-          <Link to={harnessSetupHref(provider.id, returnTo)}>
-            {provider.credential_saved
-              ? 'Manage connection'
-              : 'Connect harness'}{' '}
-            <ArrowRight className="size-4" />
-          </Link>
-        </Button>
-      </CardContent>
-    </Card>
+      </TableCell>
+      <TableCell className="hidden text-muted-foreground sm:table-cell">
+        {method ?? (
+          <>
+            <span aria-hidden="true">—</span>
+            <span className="sr-only">None</span>
+          </>
+        )}
+      </TableCell>
+      <TableCell>
+        <div className="space-y-1">
+          <Badge
+            variant={provider.workspace_ready ? 'secondary' : 'outline'}
+            className={
+              needsAttention
+                ? 'border-amber-500/40 text-amber-700 dark:text-amber-300'
+                : undefined
+            }
+          >
+            {harnessSetupStatus(provider)}
+          </Badge>
+          {needsAttention && (
+            <p className="text-xs text-muted-foreground">
+              {provider.workspace_readiness_hint ||
+                'Temps could not confirm a model response. Open the harness to verify it.'}
+            </p>
+          )}
+        </div>
+      </TableCell>
+    </TableRow>
   )
 }

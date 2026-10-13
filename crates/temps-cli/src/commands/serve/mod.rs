@@ -5,10 +5,12 @@ pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;
 pub mod console;
+mod node_api;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
+pub(crate) mod startup_failure;
 pub(crate) mod stateless;
 pub(crate) mod upgrade_telemetry;
 
@@ -86,6 +88,8 @@ fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::D
 enum LocalStartupMigrationError {
     #[error(transparent)]
     InstallationMode(#[from] stateless::StatelessStartupError),
+    #[error(transparent)]
+    UpgradeSafety(#[from] crate::commands::schema_upgrade::SchemaUpgradeError),
     #[error(
         "Local startup database migration failed after installation-mode validation: {source}"
     )]
@@ -97,9 +101,20 @@ enum LocalStartupMigrationError {
 
 async fn run_local_mode_migrations(
     db: &sea_orm::DatabaseConnection,
+    database_url: &str,
     data_dir: &std::path::Path,
+    backup_policy: crate::commands::schema_upgrade::BackupPolicy,
 ) -> Result<Option<upgrade_telemetry::UpgradeProbe>, LocalStartupMigrationError> {
     stateless::reject_local_mode_for_managed_database(db).await?;
+    // Schema guard + pre-migration backup: before the first migration, and
+    // after the installation-mode check so a refused start writes nothing.
+    crate::commands::schema_upgrade::prepare_schema_upgrade(
+        db,
+        database_url,
+        data_dir,
+        backup_policy,
+    )
+    .await?;
     upgrade_telemetry::run_migrations_reporting_upgrade(db, data_dir)
         .await
         .map_err(|source| LocalStartupMigrationError::Migration { source })
@@ -221,6 +236,19 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
+    /// Seconds to wait for the database at startup before giving up. While
+    /// it is unreachable (refused, no route, still starting up) the server
+    /// retries with exponential backoff (1 s, 2 s, 4 s, ... up to 30 s) and
+    /// logs each attempt with its reason. Wrong credentials or a missing
+    /// database fail at once. 0 makes a single attempt.
+    #[arg(
+        long,
+        env = "TEMPS_DB_STARTUP_WAIT",
+        value_name = "SECONDS",
+        default_value_t = temps_database::DEFAULT_DATABASE_STARTUP_WAIT.as_secs()
+    )]
+    pub database_startup_wait: u64,
+
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
@@ -242,6 +270,20 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
+    /// Address of a listener that serves only the console's public routes
+    /// (email tracking, provider webhooks, ingest) and nothing else.
+    ///
+    /// The proxy sends third-party callbacks here, so they can arrive while
+    /// the console itself stays restricted. The single-binary server picks a
+    /// loopback port for this automatically. Set it only in split topology
+    /// (`--role=console`), together with the same value on
+    /// `temps proxy --console-ingress-address`. It must be an address of its
+    /// own, also when `--console-admin-address` is set: `--console-address`
+    /// has no admin routes then, but still serves the authenticated MCP
+    /// endpoint.
+    #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
+    pub console_ingress_address: Option<String>,
+
     /// Forbid applying release updates from the console, permanently for the
     /// lifetime of this process.
     ///
@@ -253,6 +295,23 @@ pub struct ServeCommand {
     /// shows the manual command — only the "Update now" action is refused.
     #[arg(long)]
     pub disable_self_update: bool,
+
+    /// Before applying pending database migrations, dump the database to
+    /// `<data dir>/backups/pre-migration/` so you can roll back to the
+    /// previous release, and refuse to migrate if that dump fails.
+    ///
+    /// Off by default: an upgrade migrates straight away. A restart with
+    /// nothing to migrate never takes the backup, so this can stay in a
+    /// service unit permanently. Also forwarded to the `temps migrate` run
+    /// started by the console's "Update now".
+    #[arg(long, conflicts_with = "skip_pre_migration_backup")]
+    pub pre_migration_backup: bool,
+
+    /// No-op, kept so existing service units keep starting: the
+    /// pre-migration backup is now off unless `--pre-migration-backup` is
+    /// passed.
+    #[arg(long, hide = true)]
+    pub skip_pre_migration_backup: bool,
 
     /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
     /// Use "noop" on servers without Chrome installed to skip screenshot functionality
@@ -300,6 +359,26 @@ pub struct ServeCommand {
     /// exactly what the running process provides.
     #[arg(long, value_enum, default_value_t = ServeProfile::Full, env = "TEMPS_SERVE_PROFILE")]
     pub profile: ServeProfile,
+}
+
+/// Name the flag whose address the public-only listener would collide with,
+/// if any. Blank values count as unset.
+fn ingress_listener_clash(
+    ingress: Option<&str>,
+    console: Option<&str>,
+    admin: Option<&str>,
+) -> Option<&'static str> {
+    let ingress = ingress
+        .map(str::trim)
+        .filter(|address| !address.is_empty())?;
+    let same = |other: Option<&str>| other.map(str::trim) == Some(ingress);
+    if same(console) {
+        Some("--console-address")
+    } else if same(admin) {
+        Some("--console-admin-address")
+    } else {
+        None
+    }
 }
 
 impl ServeCommand {
@@ -370,6 +449,9 @@ impl ServeCommand {
         if let Some(ref admin) = self.console_admin_address {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
         }
+        if let Some(ref ingress) = self.console_ingress_address {
+            std::env::set_var("TEMPS_CONSOLE_INGRESS_ADDRESS", ingress);
+        }
 
         // Same bridge for the data directory. `ServerConfig::new` resolves it
         // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
@@ -400,6 +482,23 @@ impl ServeCommand {
             );
         }
 
+        // The public-only listener exists so that a request may reach the
+        // public routes and nothing else. Pointing it at a listener that
+        // serves more would quietly remove that guarantee (and fail to bind).
+        if let Some(clash) = ingress_listener_clash(
+            self.console_ingress_address.as_deref(),
+            self.console_address.as_deref(),
+            self.console_admin_address.as_deref(),
+        ) {
+            anyhow::bail!(
+                "--console-ingress-address must be an address of its own, but it is the same \
+                 as {clash}.\n\nThat listener serves more than the public callback routes, so \
+                 requests the admin gate denies would reach it. Give the public-only listener \
+                 a separate loopback port, e.g. `--console-ingress-address 127.0.0.1:8082`, or \
+                 omit the flag to let `temps serve` pick one."
+            );
+        }
+
         let (effective_proxy_address, effective_proxy_tls_address) = effective_proxy_listeners(
             self.role,
             &self.address,
@@ -410,12 +509,21 @@ impl ServeCommand {
 
         let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
 
-        let serve_config = Arc::new(temps_config::ServerConfig::new(
+        let serve_config = temps_config::ServerConfig::new(
             effective_proxy_address,
             self.database_url.clone(),
             effective_proxy_tls_address,
             self.console_address.clone(),
-        )?);
+        )?;
+        // ADR-051: the in-process proxy is handed the public-only listener's
+        // address directly, so it can live on a random loopback port. A split
+        // console only binds one when `--console-ingress-address` names it,
+        // because the sibling `temps proxy` could not discover a random port.
+        let serve_config = Arc::new(if self.role == ServeRole::Console {
+            serve_config
+        } else {
+            serve_config.with_default_ingress_listener()
+        });
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
             &serve_config.encryption_key,
         )?);
@@ -443,6 +551,14 @@ impl ServeCommand {
         // detached plugin tasks) shuts down before the ownership guard drops.
         let _control_plane_owner;
         let rt = tokio::runtime::Runtime::new()?;
+        // Before anything opens a connection: a database that is briefly or
+        // slowly unavailable (started alongside this server, a short outage)
+        // is waited for here, instead of exiting and letting a supervisor's
+        // restart policy turn it into a restart loop.
+        rt.block_on(temps_database::wait_for_database(
+            &self.database_url,
+            std::time::Duration::from_secs(self.database_startup_wait),
+        ))?;
         let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
         _control_plane_owner = if bootstrap_stateless {
             stateless::validate_profile(self.profile, self.role)?;
@@ -476,6 +592,14 @@ impl ServeCommand {
                     .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
             ))?;
             rt.block_on(stateless::prepare_storage())?;
+            // Stateless mode follows the same opt-in backup policy; its data
+            // dir may be temporary, so copy a dump to durable storage.
+            rt.block_on(crate::commands::schema_upgrade::prepare_schema_upgrade(
+                db.as_ref(),
+                &self.database_url,
+                &serve_config.data_dir,
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
+            ))?;
             rt.block_on(upgrade_telemetry::run_migrations_reporting_upgrade(
                 db.as_ref(),
                 &serve_config.data_dir,
@@ -487,7 +611,9 @@ impl ServeCommand {
             // start.
             rt.block_on(run_local_mode_migrations(
                 db.as_ref(),
+                &self.database_url,
                 &serve_config.data_dir,
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?
         };
         if let Some((instance_id, storage_identity)) = storage_identity {
@@ -733,6 +859,7 @@ impl ServeCommand {
             self_update_caveat,
             update_status.clone(),
             self.database_url.clone(),
+            self.pre_migration_backup,
         ));
 
         // Connect to Docker once and share the handle between:
@@ -1010,7 +1137,16 @@ impl ServeCommand {
         // review: any object that influences auth, TLS/cert issuance, IP
         // blocklists, or rate limiting MUST NOT be shared across plugin
         // contexts this way.
-        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+        //
+        // Default: stamp proxy-log rows from `observability_retention.
+        // proxy_logs_days`, refreshed in the background on this long-lived
+        // runtime, so the setting governs ClickHouse as it does TimescaleDB.
+        let settings_retention = rt.block_on(temps_config::settings_retention_resolver(Arc::new(
+            temps_config::ConfigService::new(serve_config.clone(), db.clone()),
+        )));
+        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::with_default(
+            settings_retention,
+        ));
 
         // See the field doc on `ConsoleApiParams::project_ip_gate_slot` —
         // same shared-slot mechanism and construction site as
@@ -1050,6 +1186,11 @@ impl ServeCommand {
             }
         }
 
+        // Startup outcome of the console, shared with the proxy so a failed
+        // start is explained on the console URL instead of a generic 503.
+        let console_startup_state =
+            Arc::new(temps_core::console_startup::ConsoleStartupState::new());
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -1077,6 +1218,7 @@ impl ServeCommand {
             traefik_discovery: traefik_discovery_handle,
             external_plugin_registry,
             profile: self.profile,
+            startup_state: console_startup_state.clone(),
         };
 
         if self.role == ServeRole::Console {
@@ -1114,18 +1256,27 @@ impl ServeCommand {
         // fails (e.g. Docker check, GeoIP validation, plugin init). Console API
         // requests will get connection-refused until the console finishes starting,
         // but that is far better than all proxied traffic being down.
+        let failure_state = console_startup_state.clone();
+        let console_url = serve_config.console_address.clone();
         rt.spawn(async move {
             match start_console_api(params).await {
                 Ok(()) => {
                     info!("Console API server exited normally");
                 }
                 Err(e) => {
+                    let failure = startup_failure::summarize(&e);
                     tracing::error!("❌ Console API failed to start: {}", e);
                     tracing::error!("Error details: {:?}", e);
                     tracing::error!(
+                        check = failure.check.code(),
+                        summary = %failure.summary,
+                        console_address = %console_url,
                         "The console management UI will not be available. \
-                         Proxied traffic to deployed applications is NOT affected."
+                         Proxied traffic to deployed applications is NOT affected. Requests \
+                         routed to the console get a status page with this cause (details \
+                         only for loopback and admin-allowed clients)."
                     );
+                    failure_state.record_failure(failure);
                 }
             }
         });
@@ -1188,7 +1339,52 @@ impl ServeCommand {
             overlay_dns_slot,
             docker_handle,
             self.profile.local_workloads_enabled(),
+            console_startup_state,
         )
+    }
+}
+
+#[cfg(test)]
+mod ingress_listener_tests {
+    use super::ingress_listener_clash;
+
+    #[test]
+    fn a_dedicated_ingress_address_does_not_clash() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8082"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            None
+        );
+        assert_eq!(
+            ingress_listener_clash(None, Some("127.0.0.1:8081"), None),
+            None
+        );
+        assert_eq!(ingress_listener_clash(Some("  "), Some("  "), None), None);
+    }
+
+    // Reusing the console listener is what let gate-denied requests reach
+    // authenticated MCP in dual-listener mode.
+    #[test]
+    fn reusing_the_console_or_admin_listener_is_refused() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-address")
+        );
+        assert_eq!(
+            ingress_listener_clash(
+                Some(" 127.0.0.1:9001 "),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-admin-address")
+        );
     }
 }
 
@@ -1210,6 +1406,19 @@ mod serve_profile_tests {
         TestCli::try_parse_from(argv)
             .expect("serve arguments should parse")
             .serve
+    }
+
+    #[test]
+    fn database_startup_wait_defaults_to_a_bounded_wait_and_is_configurable() {
+        assert_eq!(parse(&[]).database_startup_wait, 120);
+        assert_eq!(
+            parse(&["--database-startup-wait", "600"]).database_startup_wait,
+            600
+        );
+        assert_eq!(
+            parse(&["--database-startup-wait", "0"]).database_startup_wait,
+            0
+        );
     }
 
     #[test]
@@ -1498,9 +1707,14 @@ mod post_migration_tests {
         .await
         .expect("mark the stateless migration pending without removing its binding");
 
-        let error = run_local_mode_migrations(db, &std::env::temp_dir())
-            .await
-            .expect_err("local startup must reject a stateless-bound database");
+        let error = run_local_mode_migrations(
+            db,
+            &database.database_url,
+            &std::env::temp_dir(),
+            crate::commands::schema_upgrade::BackupPolicy::Disabled,
+        )
+        .await
+        .expect_err("local startup must reject a stateless-bound database");
         assert!(matches!(
             error,
             LocalStartupMigrationError::InstallationMode(
@@ -1529,9 +1743,14 @@ mod post_migration_tests {
         .await
         .expect("restore the pre-identity schema");
 
-        run_local_mode_migrations(db, &std::env::temp_dir())
-            .await
-            .expect("fresh local startup should apply migrations");
+        run_local_mode_migrations(
+            db,
+            &database.database_url,
+            &std::env::temp_dir(),
+            crate::commands::schema_upgrade::BackupPolicy::Disabled,
+        )
+        .await
+        .expect("fresh local startup should apply migrations");
         assert!(
             !temps_database::get_pending_migration_names(db)
                 .await

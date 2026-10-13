@@ -20,7 +20,7 @@ setup('authenticate', async ({ page }) => {
   // the login form stays put and shows an error otherwise.
   await page.waitForURL(URL_PROJECTS, { timeout: 30_000 })
   await expect(
-    page.getByRole('heading', { name: 'Projects', exact: true })
+    page.getByRole('heading', { name: /^(Projects|Deploy your first application)$/, exact: true })
   ).toBeVisible()
 
   // The first-project tour renders a modal overlay that intercepts pointer

@@ -50,7 +50,39 @@ use crate::collector::postgres::PostgresCollector;
 use crate::collector::redis::RedisCollector;
 use crate::collector::s3::S3Collector;
 use crate::collector::{Collector, CollectorConfig};
+use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+
+/// Opens a connection to the current primary of an HA (cluster-topology)
+/// PostgreSQL service.
+///
+/// A cluster has no single host/port in its stored config: the primary is
+/// whichever data member pg_auto_failover elected, possibly on another node,
+/// and it changes on failover. Resolving it needs the cluster's monitor and
+/// member records, which live in the providers layer, so the scraper takes
+/// this as an injected capability rather than depending on that crate.
+#[async_trait::async_trait]
+pub trait ClusterPrimaryConnector: Send + Sync {
+    /// Connect to `service_id`'s current primary. The returned client's
+    /// connection driver must already be running and stop when the client is
+    /// dropped.
+    async fn connect_cluster_primary(
+        &self,
+        service_id: i32,
+    ) -> Result<ClusterPrimaryConnection, MetricsError>;
+}
+
+/// A connection to an HA cluster's current primary.
+pub struct ClusterPrimaryConnection {
+    pub client: tokio_postgres::Client,
+    /// Stable identity of the member that is primary (its container name).
+    /// Cumulative counters are per server: when this changes, the previous
+    /// primary's readings are no baseline for the new one's.
+    pub member: String,
+}
+
+/// Last primary seen per cluster service, keyed by service ID.
+type ClusterPrimaries = Arc<StdMutex<HashMap<i32, String>>>;
 
 /// Minimum scrape interval enforced at runtime regardless of configuration.
 const MIN_INTERVAL_SECS: u64 = 10;
@@ -88,6 +120,12 @@ pub struct MetricsScraper {
     /// Services currently being scraped. Uses std::sync::Mutex (not tokio) so
     /// a Drop guard can release the slot even if the scrape task panics.
     in_flight: Arc<StdMutex<HashSet<i32>>>,
+    /// Reaches the primary of HA PostgreSQL clusters. Without it, cluster
+    /// services are skipped (with a warning) rather than scraped at an
+    /// address no member listens on.
+    cluster_primary: Option<Arc<dyn ClusterPrimaryConnector>>,
+    /// Which member supplied each cluster's counter baselines.
+    cluster_primaries: ClusterPrimaries,
 }
 
 impl MetricsScraper {
@@ -114,7 +152,19 @@ impl MetricsScraper {
             encryption_service,
             last_scalar_values: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            cluster_primary: None,
+            cluster_primaries: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Scrape HA PostgreSQL clusters through `connector`, which resolves and
+    /// dials each cluster's current primary.
+    pub fn with_cluster_primary_connector(
+        mut self,
+        connector: Arc<dyn ClusterPrimaryConnector>,
+    ) -> Self {
+        self.cluster_primary = Some(connector);
+        self
     }
 
     /// Run the scrape loop forever.  Spawn this on a background task.
@@ -194,6 +244,8 @@ impl MetricsScraper {
             }
 
             let encryption = Arc::clone(&self.encryption_service);
+            let cluster_primary = self.cluster_primary.clone();
+            let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
             let in_flight = Arc::clone(&self.in_flight);
             let permit = Arc::clone(&sem)
@@ -227,6 +279,28 @@ impl MetricsScraper {
                 };
 
                 let result = async {
+                    if service.topology == "cluster" {
+                        let Some((member, raw_points)) = scrape_cluster(
+                            &service,
+                            cluster_primary.as_deref(),
+                            Duration::from_secs(COLLECTOR_TIMEOUT_SECS),
+                        )
+                        .await
+                        else {
+                            return Err(());
+                        };
+                        // After a failover the new primary's counters are a
+                        // different server's: start a fresh baseline rather
+                        // than diffing them against the old primary's.
+                        if primary_changed(&cluster_primaries, service_id, &member) {
+                            reset_baselines(&last_values, service_id).await;
+                        }
+                        if raw_points.is_empty() {
+                            return Err(());
+                        }
+                        return Ok(apply_delta(&last_values, service_id, raw_points).await);
+                    }
+
                     // Build a connection string from the encrypted service config.
                     let connection_string = build_connection_string(&service, &encryption)
                         .map_err(|e| {
@@ -295,12 +369,99 @@ impl MetricsScraper {
             let mut guard = self.last_scalar_values.write().await;
             guard.retain(|(sid, _, _), _| active_ids.contains(sid));
         }
+        if let Ok(mut primaries) = self.cluster_primaries.lock() {
+            primaries.retain(|sid, _| active_ids.contains(sid));
+        }
 
         Ok(())
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Scrape an HA (cluster-topology) service at its current primary.
+///
+/// The stored `host`/`port` of a cluster describe no listening member, so the
+/// standalone connection-string path can never reach one. Only PostgreSQL
+/// clusters exist today; any other cluster engine is skipped.
+///
+/// Returns the member that answered along with its points, or `None` when no
+/// primary could be scraped.
+async fn scrape_cluster(
+    service: &external_services::Model,
+    connector: Option<&dyn ClusterPrimaryConnector>,
+    timeout: Duration,
+) -> Option<(String, Vec<MetricPoint>)> {
+    let service_id = service.id;
+    if !service.service_type.eq_ignore_ascii_case("postgres") {
+        debug!(
+            service_id,
+            service_type = service.service_type,
+            "MetricsScraper: no cluster collector for service type, skipping"
+        );
+        return None;
+    }
+    let Some(connector) = connector else {
+        warn!(
+            service_id,
+            "MetricsScraper: cannot scrape HA cluster: no cluster primary connector is registered"
+        );
+        return None;
+    };
+
+    let primary = match tokio::time::timeout(timeout, connector.connect_cluster_primary(service_id))
+        .await
+    {
+        Ok(Ok(primary)) => primary,
+        Ok(Err(e)) => {
+            warn!(service_id, error = %e, "MetricsScraper: cluster primary unavailable; skipping scrape");
+            return None;
+        }
+        Err(_elapsed) => {
+            warn!(
+                service_id,
+                timeout_secs = timeout.as_secs(),
+                "MetricsScraper: connecting to the cluster primary timed out; skipping scrape"
+            );
+            return None;
+        }
+    };
+
+    let config = CollectorConfig::new(service_id, SourceKind::Database, String::new())
+        .with_timeout(timeout)
+        .with_node_id_opt(service.node_id);
+    let points = PostgresCollector::new()
+        .collect_from_client(&primary.client, &config)
+        .await;
+    Some((primary.member, points))
+}
+
+/// Record `member` as `service_id`'s primary; `true` when it differs from the
+/// member that supplied the service's current counter baselines (including
+/// the first time a primary is seen).
+fn primary_changed(primaries: &ClusterPrimaries, service_id: i32, member: &str) -> bool {
+    let Ok(mut primaries) = primaries.lock() else {
+        // A poisoned lock: treat as a change, which only costs one skipped
+        // counter interval — never a false spike.
+        return true;
+    };
+    match primaries.get(&service_id) {
+        Some(previous) if previous == member => false,
+        _ => {
+            primaries.insert(service_id, member.to_string());
+            true
+        }
+    }
+}
+
+/// Drop every counter baseline of `service_id`, so its next scrape records
+/// fresh baselines instead of deltas.
+async fn reset_baselines(last_values: &CounterBaselines, service_id: i32) {
+    last_values
+        .write()
+        .await
+        .retain(|(sid, _, _), _| *sid != service_id);
+}
 
 /// Collect metrics from a concrete [`Collector`] implementation with a
 /// per-task timeout.  On timeout or error: log warning, return empty vec.
@@ -627,6 +788,209 @@ impl CollectorConfigExt for CollectorConfig {
 mod tests {
     use super::*;
 
+    // ── scrape_cluster ─────────────────────────────────────────────────────
+
+    fn cluster_service(id: i32, service_type: &str) -> external_services::Model {
+        external_services::Model {
+            id,
+            name: "ha-pg".to_string(),
+            service_type: service_type.to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("ha-pg".to_string()),
+            config: None,
+            node_id: None,
+            topology: "cluster".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: true,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    /// Records which services it was asked to reach, and fails or hangs.
+    struct FakeConnector {
+        calls: StdMutex<Vec<i32>>,
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterPrimaryConnector for FakeConnector {
+        async fn connect_cluster_primary(
+            &self,
+            service_id: i32,
+        ) -> Result<ClusterPrimaryConnection, MetricsError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(service_id);
+            }
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            Err(MetricsError::CollectorConnectionFailed {
+                source_id: service_id,
+                engine: "postgres".to_string(),
+                reason: "no healthy primary".to_string(),
+            })
+        }
+    }
+
+    fn connector(hang: bool) -> FakeConnector {
+        FakeConnector {
+            calls: StdMutex::new(Vec::new()),
+            hang,
+        }
+    }
+
+    fn calls(connector: &FakeConnector) -> Vec<i32> {
+        connector
+            .calls
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
+    /// Regression: HA cluster metrics were always empty because the scraper
+    /// dialled the cluster's stored host/port, where no member listens. A
+    /// cluster must be reached through the primary connector instead.
+    #[tokio::test]
+    async fn postgres_cluster_is_scraped_through_its_primary_connector() {
+        let fake = connector(false);
+        let points = scrape_cluster(
+            &cluster_service(41, "postgres"),
+            Some(&fake),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            calls(&fake),
+            vec![41],
+            "the connector must be asked for service 41"
+        );
+        assert!(
+            points.is_none(),
+            "an unavailable primary yields nothing to write, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_primary_connect_is_bounded_by_the_timeout() {
+        let fake = connector(true);
+        let started = std::time::Instant::now();
+        let points = scrape_cluster(
+            &cluster_service(42, "postgres"),
+            Some(&fake),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(points.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a hung connector must not stall the scrape cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_without_connector_or_postgres_engine_is_skipped() {
+        let points = scrape_cluster(
+            &cluster_service(43, "postgres"),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(points.is_none());
+
+        let fake = connector(false);
+        let points = scrape_cluster(
+            &cluster_service(44, "redis"),
+            Some(&fake),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(points.is_none());
+        assert!(
+            calls(&fake).is_empty(),
+            "only PostgreSQL clusters are dialled"
+        );
+    }
+
+    fn commits(value: f64) -> MetricPoint {
+        MetricPoint {
+            time: chrono::Utc::now(),
+            source_kind: SourceKind::Database,
+            source_id: 7,
+            name: "pg.commits_total".to_string(),
+            value,
+            kind: MetricKind::Counter,
+            engine: Some("postgres".to_string()),
+            environment: None,
+            node_id: None,
+            labels: HashMap::new(),
+        }
+    }
+
+    /// Regression: after a failover the new primary's independent counters
+    /// were diffed against the old primary's baseline. 100,000 commits on the
+    /// old primary then 20,000 on the new one recorded 20,000 commits in one
+    /// interval (counter-reset handling) that never happened.
+    #[tokio::test]
+    async fn failover_starts_a_fresh_counter_baseline() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let primaries: ClusterPrimaries = Arc::new(StdMutex::new(HashMap::new()));
+
+        // Two scrapes on the first primary: baseline, then a real delta.
+        assert!(primary_changed(&primaries, 7, "ha-pg-1"));
+        reset_baselines(&baselines, 7).await;
+        assert!(apply_delta(&baselines, 7, vec![commits(100_000.0)])
+            .await
+            .is_empty());
+        assert!(!primary_changed(&primaries, 7, "ha-pg-1"));
+        let delta = apply_delta(&baselines, 7, vec![commits(100_050.0)]).await;
+        assert_eq!(delta.first().map(|p| p.value), Some(50.0));
+
+        // Failover: the new primary's counters start a fresh baseline.
+        assert!(primary_changed(&primaries, 7, "ha-pg-2"));
+        reset_baselines(&baselines, 7).await;
+        let after_failover = apply_delta(&baselines, 7, vec![commits(20_000.0)]).await;
+        assert!(
+            after_failover.is_empty(),
+            "no delta may be recorded across a change of primary, got {:?}",
+            after_failover.iter().map(|p| p.value).collect::<Vec<_>>()
+        );
+        let next = apply_delta(&baselines, 7, vec![commits(20_010.0)]).await;
+        assert_eq!(next.first().map(|p| p.value), Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn resetting_one_cluster_keeps_other_services_baselines() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        apply_delta(&baselines, 7, vec![commits(1.0)]).await;
+        let mut other = commits(5.0);
+        other.source_id = 8;
+        apply_delta(&baselines, 8, vec![other]).await;
+
+        reset_baselines(&baselines, 7).await;
+
+        let keys: Vec<i32> = baselines
+            .read()
+            .await
+            .keys()
+            .map(|(sid, _, _)| *sid)
+            .collect();
+        assert_eq!(keys, vec![8]);
+    }
     // ── urlencoded ─────────────────────────────────────────────────────────
 
     #[test]

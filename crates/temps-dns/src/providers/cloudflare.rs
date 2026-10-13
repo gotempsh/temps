@@ -44,6 +44,102 @@ fn map_cf_delete_error(record_id: &str, error: ApiFailure) -> DnsError {
     map_cf_error("Failed to delete record", error)
 }
 
+/// Hard cap on pages read by any listing; reaching it is an error, never a
+/// silently truncated result.
+const MAX_PAGES: u32 = 1000;
+/// Deepest name for which candidate parent zones are probed.
+const MAX_ZONE_LABELS: usize = 16;
+
+/// The pagination totals Cloudflare reports in `result_info`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PageInfo {
+    per_page: Option<u64>,
+    total_count: Option<u64>,
+    total_pages: Option<u64>,
+}
+
+impl PageInfo {
+    fn from_result_info(result_info: Option<&serde_json::Value>) -> Self {
+        let field = |name: &str| {
+            result_info
+                .and_then(|info| info.get(name))
+                .and_then(serde_json::Value::as_u64)
+        };
+        Self {
+            per_page: field("per_page"),
+            total_count: field("total_count"),
+            total_pages: field("total_pages"),
+        }
+    }
+}
+
+/// Decide whether another page has to be fetched after `page`, and fail
+/// closed when Cloudflare's own totals show the collected set is incomplete.
+///
+/// * `page_count` is the raw number of items on this page.
+/// * `collected` is the raw number of items across all pages so far
+///   (before any client-side filtering).
+///
+/// When `total_pages`/`total_count` are reported they decide continuation,
+/// so a server that clamps `per_page` below what was requested is still read
+/// to the end. Without totals, a full page (measured against the page size
+/// the server says it used) means more may follow.
+fn more_pages(
+    context: &str,
+    page: u32,
+    requested_per_page: u32,
+    page_count: usize,
+    collected: usize,
+    info: &PageInfo,
+) -> Result<bool, DnsError> {
+    let effective_per_page = info
+        .per_page
+        .filter(|per_page| *per_page > 0)
+        .unwrap_or(u64::from(requested_per_page));
+    let more = match (info.total_pages, info.total_count) {
+        (Some(total_pages), _) => u64::from(page) < total_pages,
+        (None, Some(total_count)) => (collected as u64) < total_count,
+        (None, None) => page_count as u64 >= effective_per_page,
+    };
+    if more && page_count == 0 {
+        return Err(DnsError::ApiError(format!(
+            "{context}: Cloudflare returned empty page {page} but reported more results (total_pages={:?}, total_count={:?}); refusing a partial result",
+            info.total_pages, info.total_count
+        )));
+    }
+    if !more {
+        if let Some(total_count) = info.total_count {
+            if (collected as u64) < total_count {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: Cloudflare reported {total_count} results but only {collected} were returned across {page} page(s) (per_page={effective_per_page}); refusing a partial result"
+                )));
+            }
+        }
+    }
+    Ok(more)
+}
+
+/// Normalized `domain` followed by each parent suffix that could be a zone,
+/// longest first (`a.b.example.co.uk`, `b.example.co.uk`, `example.co.uk`,
+/// `co.uk`). A bare TLD is never probed for a multi-label name.
+fn zone_candidates(domain: &str) -> Result<Vec<String>, DnsError> {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = normalized.split('.').collect();
+    if normalized.is_empty() || labels.iter().any(|label| label.is_empty()) {
+        return Err(DnsError::Validation(format!(
+            "Cloudflare zone lookup requires a valid domain name, got '{domain}'"
+        )));
+    }
+    if labels.len() > MAX_ZONE_LABELS {
+        return Err(DnsError::Validation(format!(
+            "Cloudflare zone lookup for '{normalized}' has {} labels; at most {MAX_ZONE_LABELS} are supported",
+            labels.len()
+        )));
+    }
+    let last = labels.len().saturating_sub(1).max(1);
+    Ok((0..last).map(|start| labels[start..].join(".")).collect())
+}
+
 /// Cloudflare DNS provider
 pub struct CloudflareProvider {
     client: Client,
@@ -55,16 +151,21 @@ pub struct CloudflareProvider {
 impl CloudflareProvider {
     /// Create a new Cloudflare provider with the given credentials
     pub fn new(credentials: CloudflareCredentials) -> Result<Self, DnsError> {
+        Self::with_environment(credentials, Environment::Production)
+    }
+
+    fn with_environment(
+        credentials: CloudflareCredentials,
+        environment: Environment,
+    ) -> Result<Self, DnsError> {
         let cf_credentials = Credentials::UserAuthToken {
             token: credentials.api_token.clone(),
         };
 
-        let client = Client::new(
-            cf_credentials,
-            ClientConfig::default(),
-            Environment::Production,
-        )
-        .map_err(|e| DnsError::InvalidCredentials(format!("Failed to create client: {:?}", e)))?;
+        let client =
+            Client::new(cf_credentials, ClientConfig::default(), environment).map_err(|e| {
+                DnsError::InvalidCredentials(format!("Failed to create client: {:?}", e))
+            })?;
 
         Ok(Self {
             client,
@@ -72,44 +173,73 @@ impl CloudflareProvider {
         })
     }
 
-    /// Get zone ID for a domain
-    async fn get_zone_id(&self, domain: &str) -> Result<String, DnsError> {
-        // Extract the base domain (last two parts)
-        let base_domain = Self::extract_base_domain(domain);
+    fn public_zone(zone: zones::zone::Zone) -> DnsZone {
+        DnsZone {
+            id: zone.id,
+            name: zone.name,
+            status: Self::status_to_string(&zone.status),
+            nameservers: zone.name_servers,
+            metadata: HashMap::new(),
+        }
+    }
 
-        debug!("Fetching zone ID for base domain: {}", base_domain);
-
+    /// The zone named exactly `name`, using the API's `name` filter.
+    ///
+    /// Several exact matches (a token spanning accounts can see the same
+    /// name more than once) resolve only when exactly one of them is
+    /// active; otherwise the lookup fails closed.
+    async fn find_zone_exact(&self, name: &str) -> Result<Option<DnsZone>, DnsError> {
         let endpoint = zones::zone::ListZones {
             params: zones::zone::ListZonesParams {
-                name: Some(base_domain.to_string()),
+                name: Some(name.to_string()),
+                per_page: Some(50),
                 ..Default::default()
             },
         };
-
         let response = self
             .client
             .request(&endpoint)
             .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to list zones: {:?}", e)))?;
-
-        response
+            .map_err(|e| map_cf_error(&format!("Failed to look up zone {name}"), e))?;
+        let mut matches: Vec<zones::zone::Zone> = response
             .result
-            .first()
-            .map(|zone| zone.id.to_string())
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))
+            .into_iter()
+            .filter(|zone| zone.name.trim_end_matches('.').eq_ignore_ascii_case(name))
+            .collect();
+        if matches.len() > 1 {
+            let ids: Vec<String> = matches.iter().map(|zone| zone.id.clone()).collect();
+            let mut active: Vec<zones::zone::Zone> = matches
+                .into_iter()
+                .filter(|zone| matches!(zone.status, zones::zone::Status::Active))
+                .collect();
+            if active.len() != 1 {
+                return Err(DnsError::ApiError(format!(
+                    "Cloudflare returned {} zones named {name} (ids {ids:?}) and {} of them are active; refusing to pick one",
+                    ids.len(),
+                    active.len()
+                )));
+            }
+            matches = std::mem::take(&mut active);
+        }
+        Ok(matches.pop().map(Self::public_zone))
     }
 
-    /// Extract base domain from a full domain name
-    fn extract_base_domain(domain: &str) -> String {
-        domain
-            .split('.')
-            .rev()
-            .take(2)
-            .collect::<Vec<&str>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<&str>>()
-            .join(".")
+    /// Resolve the most specific Cloudflare zone containing `domain`, trying
+    /// the domain itself and then each parent suffix. Unlike taking the last
+    /// two labels, this finds `example.co.uk` and delegated sub-zones such
+    /// as `sub.example.com`.
+    async fn resolve_zone(&self, domain: &str) -> Result<DnsZone, DnsError> {
+        let candidates = zone_candidates(domain)?;
+        for candidate in &candidates {
+            if let Some(zone) = self.find_zone_exact(candidate).await? {
+                debug!(
+                    "Resolved {} to Cloudflare zone {} ({})",
+                    domain, zone.name, zone.id
+                );
+                return Ok(zone);
+            }
+        }
+        Err(DnsError::ZoneNotFound(domain.to_string()))
     }
 
     /// Convert Cloudflare zone status to string
@@ -307,77 +437,83 @@ impl DnsProvider for CloudflareProvider {
     }
 
     async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
-        let endpoint = zones::zone::ListZones {
-            params: Default::default(),
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| map_cf_error("Failed to list zones", e))?;
-
-        Ok(response
-            .result
-            .into_iter()
-            .map(|zone| DnsZone {
-                id: zone.id,
-                name: zone.name,
-                status: Self::status_to_string(&zone.status),
-                nameservers: zone.name_servers,
-                metadata: HashMap::new(),
-            })
-            .collect())
+        const PAGE_SIZE: u32 = 50;
+        let mut zones_found = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let endpoint = zones::zone::ListZones {
+                params: zones::zone::ListZonesParams {
+                    page: Some(page),
+                    per_page: Some(PAGE_SIZE),
+                    ..Default::default()
+                },
+            };
+            let response = self
+                .client
+                .request(&endpoint)
+                .await
+                .map_err(|e| map_cf_error("Failed to list zones", e))?;
+            let info = PageInfo::from_result_info(response.result_info.as_ref());
+            let count = response.result.len();
+            zones_found.extend(response.result.into_iter().map(Self::public_zone));
+            if !more_pages(
+                "Cloudflare zone listing",
+                page,
+                PAGE_SIZE,
+                count,
+                zones_found.len(),
+                &info,
+            )? {
+                return Ok(zones_found);
+            }
+        }
+        Err(DnsError::ApiError(format!(
+            "Cloudflare zone listing exceeded {MAX_PAGES} pages; refusing a partial result"
+        )))
     }
 
     async fn get_zone(&self, domain: &str) -> Result<Option<DnsZone>, DnsError> {
-        let base_domain = Self::extract_base_domain(domain);
-
-        let endpoint = zones::zone::ListZones {
-            params: zones::zone::ListZonesParams {
-                name: Some(base_domain.clone()),
-                ..Default::default()
-            },
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| map_cf_error("Failed to get zone", e))?;
-
-        Ok(response.result.into_iter().next().map(|zone| DnsZone {
-            id: zone.id,
-            name: zone.name,
-            status: Self::status_to_string(&zone.status),
-            nameservers: zone.name_servers,
-            metadata: HashMap::new(),
-        }))
+        match self.resolve_zone(domain).await {
+            Ok(zone) => Ok(Some(zone)),
+            Err(DnsError::ZoneNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
-            .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let zone = self.resolve_zone(domain).await?;
+        let context = format!("Cloudflare DNS record listing for zone {}", zone.name);
 
-        let endpoint = dns::dns::ListDnsRecords {
-            zone_identifier: &zone_id,
-            params: Default::default(),
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to list records: {:?}", e)))?;
-
-        Ok(response
-            .result
-            .iter()
-            .filter_map(|record| Self::convert_cf_record(record, &zone.name))
-            .collect())
+        const PAGE_SIZE: u32 = 100;
+        let mut records = Vec::new();
+        let mut collected = 0usize;
+        for page in 1..=MAX_PAGES {
+            let endpoint = dns::dns::ListDnsRecords {
+                zone_identifier: &zone.id,
+                params: dns::dns::ListDnsRecordsParams {
+                    page: Some(page),
+                    per_page: Some(PAGE_SIZE),
+                    ..Default::default()
+                },
+            };
+            let response = self.client.request(&endpoint).await.map_err(|e| {
+                map_cf_error(&format!("Failed to list records in zone {}", zone.name), e)
+            })?;
+            let info = PageInfo::from_result_info(response.result_info.as_ref());
+            let count = response.result.len();
+            collected += count;
+            records.extend(
+                response
+                    .result
+                    .iter()
+                    .filter_map(|record| Self::convert_cf_record(record, &zone.name)),
+            );
+            if !more_pages(&context, page, PAGE_SIZE, count, collected, &info)? {
+                return Ok(records);
+            }
+        }
+        Err(DnsError::ApiError(format!(
+            "{context} exceeded {MAX_PAGES} pages; refusing a partial result"
+        )))
     }
 
     async fn get_record(
@@ -386,38 +522,64 @@ impl DnsProvider for CloudflareProvider {
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<Option<DnsRecord>, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
+        Ok(self
+            .get_records(domain, name, record_type)
             .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+            .into_iter()
+            .next())
+    }
 
-        // Build FQDN for the search
+    async fn get_records(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<DnsRecord>, DnsError> {
+        let zone = self.resolve_zone(domain).await?;
         let fqdn = if name == "@" || name.is_empty() {
             zone.name.clone()
         } else {
             format!("{}.{}", name, zone.name)
         };
-
-        let endpoint = dns::dns::ListDnsRecords {
-            zone_identifier: &zone_id,
-            params: dns::dns::ListDnsRecordsParams {
-                name: Some(fqdn),
-                record_type: Some(Self::record_type_to_cf_content(record_type)),
-                ..Default::default()
-            },
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to get record: {:?}", e)))?;
-
-        Ok(response
-            .result
-            .first()
-            .and_then(|record| Self::convert_cf_record(record, &zone.name)))
+        let context = format!(
+            "Cloudflare DNS record set {record_type} {fqdn} in zone {}",
+            zone.name
+        );
+        const PAGE_SIZE: u32 = 100;
+        let mut records = Vec::new();
+        let mut collected = 0usize;
+        for page in 1..=MAX_PAGES {
+            let endpoint = dns::dns::ListDnsRecords {
+                zone_identifier: &zone.id,
+                params: dns::dns::ListDnsRecordsParams {
+                    name: Some(fqdn.clone()),
+                    record_type: Some(Self::record_type_to_cf_content(record_type)),
+                    page: Some(page),
+                    per_page: Some(PAGE_SIZE),
+                    ..Default::default()
+                },
+            };
+            let response = self
+                .client
+                .request(&endpoint)
+                .await
+                .map_err(|error| map_cf_error(&format!("Failed to get {context}"), error))?;
+            let info = PageInfo::from_result_info(response.result_info.as_ref());
+            let count = response.result.len();
+            collected += count;
+            records.extend(
+                response
+                    .result
+                    .iter()
+                    .filter_map(|record| Self::convert_cf_record(record, &zone.name)),
+            );
+            if !more_pages(&context, page, PAGE_SIZE, count, collected, &info)? {
+                return Ok(records);
+            }
+        }
+        Err(DnsError::ApiError(format!(
+            "{context} exceeded {MAX_PAGES} pages; refusing a partial result"
+        )))
     }
 
     async fn create_record(
@@ -425,11 +587,7 @@ impl DnsProvider for CloudflareProvider {
         domain: &str,
         request: DnsRecordRequest,
     ) -> Result<DnsRecord, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
-            .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let zone = self.resolve_zone(domain).await?;
 
         let cf_content = Self::to_cf_content(&request.content)?;
 
@@ -449,7 +607,7 @@ impl DnsProvider for CloudflareProvider {
         };
 
         let endpoint = dns::dns::CreateDnsRecord {
-            zone_identifier: &zone_id,
+            zone_identifier: &zone.id,
             params,
         };
 
@@ -469,11 +627,7 @@ impl DnsProvider for CloudflareProvider {
         record_id: &str,
         request: DnsRecordRequest,
     ) -> Result<DnsRecord, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
-            .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let zone = self.resolve_zone(domain).await?;
 
         let cf_content = Self::to_cf_content(&request.content)?;
 
@@ -491,7 +645,7 @@ impl DnsProvider for CloudflareProvider {
         };
 
         let endpoint = dns::dns::UpdateDnsRecord {
-            zone_identifier: &zone_id,
+            zone_identifier: &zone.id,
             identifier: record_id,
             params,
         };
@@ -507,10 +661,10 @@ impl DnsProvider for CloudflareProvider {
     }
 
     async fn delete_record(&self, domain: &str, record_id: &str) -> Result<(), DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
+        let zone = self.resolve_zone(domain).await?;
 
         let endpoint = dns::dns::DeleteDnsRecord {
-            zone_identifier: &zone_id,
+            zone_identifier: &zone.id,
             identifier: record_id,
         };
 
@@ -519,7 +673,10 @@ impl DnsProvider for CloudflareProvider {
             .await
             .map_err(|error| map_cf_delete_error(record_id, error))?;
 
-        info!("Deleted DNS record {} from zone {}", record_id, zone_id);
+        info!(
+            "Deleted DNS record {} from zone {} ({})",
+            record_id, zone.name, zone.id
+        );
         Ok(())
     }
 }
@@ -542,34 +699,298 @@ mod tests {
     // ==================== Helper function tests ====================
 
     #[test]
-    fn test_extract_base_domain() {
+    fn zone_candidates_are_longest_first() {
+        assert_eq!(zone_candidates("example.com").unwrap(), vec!["example.com"]);
         assert_eq!(
-            CloudflareProvider::extract_base_domain("example.com"),
-            "example.com"
+            zone_candidates("Deep.Sub.Example.COM.").unwrap(),
+            vec!["deep.sub.example.com", "sub.example.com", "example.com"]
         );
+        // Multi-label public suffixes are probed through to the registrable
+        // zone instead of being cut to the last two labels.
         assert_eq!(
-            CloudflareProvider::extract_base_domain("sub.example.com"),
-            "example.com"
+            zone_candidates("app.example.co.uk").unwrap(),
+            vec!["app.example.co.uk", "example.co.uk", "co.uk"]
         );
-        assert_eq!(
-            CloudflareProvider::extract_base_domain("deep.sub.example.com"),
-            "example.com"
-        );
+        assert_eq!(zone_candidates("localhost").unwrap(), vec!["localhost"]);
+        for invalid in ["", ".", "a..example.com"] {
+            assert!(matches!(
+                zone_candidates(invalid),
+                Err(DnsError::Validation(_))
+            ));
+        }
+        let deep = format!("{}example.com", "a.".repeat(MAX_ZONE_LABELS));
+        assert!(matches!(
+            zone_candidates(&deep),
+            Err(DnsError::Validation(_))
+        ));
+    }
+
+    // ==================== Pagination completeness tests ====================
+
+    fn info(per_page: u64, total_count: Option<u64>, total_pages: Option<u64>) -> PageInfo {
+        PageInfo {
+            per_page: Some(per_page),
+            total_count,
+            total_pages,
+        }
     }
 
     #[test]
-    fn test_extract_base_domain_single_part() {
-        // Edge case: single part domain
+    fn page_info_parses_result_info() {
+        let value = serde_json::json!({"page":1,"per_page":50,"count":50,"total_count":120,"total_pages":3});
         assert_eq!(
-            CloudflareProvider::extract_base_domain("localhost"),
-            "localhost"
+            PageInfo::from_result_info(Some(&value)),
+            info(50, Some(120), Some(3))
         );
+        assert_eq!(PageInfo::from_result_info(None), PageInfo::default());
     }
 
     #[test]
-    fn test_extract_base_domain_tld_only() {
-        // Edge case: only two parts
-        assert_eq!(CloudflareProvider::extract_base_domain("co.uk"), "co.uk");
+    fn more_pages_follows_reported_totals() {
+        // Server clamped per_page to 50 although 100 was requested: a short
+        // page must not end the listing while total_pages says more remain.
+        assert!(more_pages("ctx", 1, 100, 50, 50, &info(50, Some(120), Some(3))).unwrap());
+        assert!(more_pages("ctx", 2, 100, 50, 100, &info(50, Some(120), Some(3))).unwrap());
+        assert!(!more_pages("ctx", 3, 100, 20, 120, &info(50, Some(120), Some(3))).unwrap());
+        // Only total_count reported.
+        assert!(more_pages("ctx", 1, 100, 50, 50, &info(50, Some(120), None)).unwrap());
+        // No totals: fall back to the page size the server says it used.
+        assert!(more_pages("ctx", 1, 100, 50, 50, &info(50, None, None)).unwrap());
+        assert!(!more_pages("ctx", 1, 100, 49, 49, &info(50, None, None)).unwrap());
+        assert!(!more_pages("ctx", 1, 100, 99, 99, &PageInfo::default()).unwrap());
+        assert!(more_pages("ctx", 1, 100, 100, 100, &PageInfo::default()).unwrap());
+        // Records added between pages may push the count above the total.
+        assert!(!more_pages("ctx", 1, 100, 3, 3, &info(100, Some(2), Some(1))).unwrap());
+    }
+
+    #[test]
+    fn more_pages_rejects_incomplete_results() {
+        let short = more_pages(
+            "zone example.com",
+            2,
+            100,
+            10,
+            110,
+            &info(100, Some(150), Some(2)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&short, DnsError::ApiError(m)
+                if m.contains("zone example.com") && m.contains("150") && m.contains("110")),
+            "{short}"
+        );
+        let empty = more_pages(
+            "zone example.com",
+            2,
+            100,
+            0,
+            100,
+            &info(100, Some(150), None),
+        )
+        .unwrap_err();
+        assert!(matches!(empty, DnsError::ApiError(m) if m.contains("empty page 2")));
+    }
+
+    // ==================== Mocked API tests ====================
+
+    use serde_json::json;
+    use wiremock::{
+        matchers::{method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn mock_provider(server: &MockServer) -> CloudflareProvider {
+        CloudflareProvider::with_environment(
+            CloudflareCredentials {
+                api_token: "test-token".into(),
+                account_id: None,
+            },
+            Environment::Custom(format!("{}/", server.uri())),
+        )
+        .unwrap()
+    }
+
+    fn zone_json(id: &str, name: &str, status: &str) -> serde_json::Value {
+        json!({
+            "id": id, "name": name, "status": status, "type": "full",
+            "account": {"id": "account-1", "name": "Test account"},
+            "activated_on": "2024-01-01T00:00:00Z",
+            "created_on": "2024-01-01T00:00:00Z",
+            "modified_on": "2024-01-01T00:00:00Z",
+            "development_mode": 0,
+            "meta": {"custom_certificate_quota": 0, "page_rule_quota": 3, "phishing_detected": false},
+            "name_servers": ["ns1.example.net", "ns2.example.net"],
+            "owner": {"type": "user", "id": null, "email": null},
+            "paused": false,
+            "permissions": []
+        })
+    }
+
+    fn record_json(id: &str, name: &str) -> serde_json::Value {
+        json!({
+            "id": id, "name": name, "type": "A", "content": "192.0.2.1",
+            "ttl": 1, "proxied": false, "proxiable": true, "meta": {},
+            "created_on": "2024-01-01T00:00:00Z", "modified_on": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    fn envelope(
+        result: Vec<serde_json::Value>,
+        result_info: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({"success": true, "errors": [], "messages": [], "result": result, "result_info": result_info})
+    }
+
+    async fn mount_zone(server: &MockServer, name: &str, zones: Vec<serde_json::Value>) {
+        let count = zones.len();
+        Mock::given(method("GET"))
+            .and(path("/zones"))
+            .and(query_param("name", name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(
+                zones,
+                json!({"page":1,"per_page":50,"count":count,"total_count":count,"total_pages":1}),
+            )))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn resolves_longest_matching_zone_including_multi_label_suffixes() {
+        let server = MockServer::start().await;
+        mount_zone(&server, "app.example.co.uk", vec![]).await;
+        mount_zone(
+            &server,
+            "example.co.uk",
+            vec![zone_json("zone-uk", "example.co.uk", "active")],
+        )
+        .await;
+        let provider = mock_provider(&server);
+        let zone = provider
+            .get_zone("app.example.co.uk")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (zone.id.as_str(), zone.name.as_str()),
+            ("zone-uk", "example.co.uk")
+        );
+
+        // A delegated sub-zone wins over its parent.
+        mount_zone(
+            &server,
+            "sub.example.com",
+            vec![zone_json("zone-sub", "sub.example.com", "active")],
+        )
+        .await;
+        mount_zone(
+            &server,
+            "example.com",
+            vec![zone_json("zone-parent", "example.com", "active")],
+        )
+        .await;
+        let zone = provider.get_zone("sub.example.com").await.unwrap().unwrap();
+        assert_eq!(zone.id, "zone-sub");
+
+        // Nothing found anywhere.
+        mount_zone(&server, "missing.example", vec![]).await;
+        assert!(provider
+            .get_zone("missing.example")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_zone_names_fail_closed() {
+        let server = MockServer::start().await;
+        mount_zone(
+            &server,
+            "example.com",
+            vec![
+                zone_json("zone-a", "example.com", "active"),
+                zone_json("zone-b", "example.com", "active"),
+            ],
+        )
+        .await;
+        let error = mock_provider(&server)
+            .get_zone("example.com")
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, DnsError::ApiError(m) if m.contains("2 zones named example.com")));
+
+        // One active zone plus a stale pending copy resolves to the active one.
+        let server = MockServer::start().await;
+        mount_zone(
+            &server,
+            "example.com",
+            vec![
+                zone_json("zone-pending", "example.com", "pending"),
+                zone_json("zone-active", "example.com", "active"),
+            ],
+        )
+        .await;
+        let zone = mock_provider(&server)
+            .get_zone("example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(zone.id, "zone-active");
+    }
+
+    #[tokio::test]
+    async fn record_listing_follows_clamped_pages_and_rejects_short_totals() {
+        let server = MockServer::start().await;
+        mount_zone(
+            &server,
+            "example.com",
+            vec![zone_json("zone-1", "example.com", "active")],
+        )
+        .await;
+        // The server clamps per_page to 1 and reports two pages.
+        for (page, id) in [("1", "rec-1"), ("2", "rec-2")] {
+            Mock::given(method("GET"))
+                .and(path("/zones/zone-1/dns_records"))
+                .and(query_param("page", page))
+                .respond_with(ResponseTemplate::new(200).set_body_json(envelope(
+                    vec![record_json(id, &format!("{id}.example.com"))],
+                    json!({"page":page.parse::<u32>().unwrap(),"per_page":1,"count":1,"total_count":2,"total_pages":2}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let records = mock_provider(&server)
+            .list_records("example.com")
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+
+        // A final page that leaves the reported total unmet is refused.
+        let server = MockServer::start().await;
+        mount_zone(
+            &server,
+            "example.com",
+            vec![zone_json("zone-1", "example.com", "active")],
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/zones/zone-1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(
+                vec![record_json("rec-1", "www.example.com")],
+                json!({"page":1,"per_page":100,"count":1,"total_count":5,"total_pages":1}),
+            )))
+            .mount(&server)
+            .await;
+        let provider = mock_provider(&server);
+        let error = provider
+            .get_records("example.com", "www", DnsRecordType::A)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, DnsError::ApiError(m) if m.contains("www.example.com") && m.contains("reported 5")),
+            "{error}"
+        );
+        assert!(provider.list_records("example.com").await.is_err());
     }
 
     // ==================== Status conversion tests ====================

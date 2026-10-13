@@ -14,13 +14,16 @@
 //! junction table for multi-environment membership, transactional writes).
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    sea_query::LockType, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::EncryptionService;
-use temps_entities::{environments, secret_compose_services, secret_environments, secrets};
+use temps_entities::{
+    environments, secret_compose_services, secret_environments, secret_history, secrets,
+};
 use thiserror::Error;
 
 use super::types::{SecretEnvironmentRef, SecretWithEnvironments};
@@ -84,6 +87,35 @@ impl From<sea_orm::TransactionError<SecretError>> for SecretError {
             }
         }
     }
+}
+
+/// Who can read a secret matters as much as its value. Scope lives in junction
+/// tables that updates rewrite wholesale, so a trigger would see a delete and
+/// re-insert on every save; the change is detected here instead. Returns the
+/// `secret_history` details when the effective scope changed.
+fn scope_change(
+    mut previous_environments: Vec<i32>,
+    mut previous_services: Vec<String>,
+    environments: &[i32],
+    services: &[String],
+) -> Option<serde_json::Value> {
+    let mut environments = environments.to_vec();
+    let mut services = services.to_vec();
+    for list in [&mut previous_environments, &mut environments] {
+        list.sort_unstable();
+        list.dedup();
+    }
+    for list in [&mut previous_services, &mut services] {
+        list.sort_unstable();
+        list.dedup();
+    }
+    if previous_environments == environments && previous_services == services {
+        return None;
+    }
+    Some(serde_json::json!({
+        "environment_ids": environments,
+        "compose_services": services,
+    }))
 }
 
 /// Validates a secret key. Keys become file names under `/run/secrets/` and
@@ -566,15 +598,7 @@ impl SecretService {
                 let encrypted_new = encrypted_new.clone();
                 let compose_services = compose_services.clone();
                 Box::pin(async move {
-                    let row = secrets::Entity::find_by_id(secret_id)
-                        .filter(secrets::Column::ProjectId.eq(project_id))
-                        .lock_exclusive()
-                        .one(txn)
-                        .await?
-                        .ok_or(SecretError::NotFound {
-                            secret_id,
-                            project_id,
-                        })?;
+                    let row = Self::lock_for_write(txn, project_id, secret_id).await?;
                     let scoped_environments =
                         Self::environments_in_project(txn, project_id, &environment_ids).await?;
                     let environment_ids = scoped_environments
@@ -589,6 +613,21 @@ impl SecretService {
                         Some(secret_id),
                     )
                     .await?;
+
+                    let previous_environments = secret_environments::Entity::find()
+                        .filter(secret_environments::Column::SecretId.eq(secret_id))
+                        .all(txn)
+                        .await?
+                        .into_iter()
+                        .map(|junction| junction.environment_id)
+                        .collect::<Vec<_>>();
+                    let previous_services = secret_compose_services::Entity::find()
+                        .filter(secret_compose_services::Column::SecretId.eq(secret_id))
+                        .all(txn)
+                        .await?
+                        .into_iter()
+                        .map(|junction| junction.service_name)
+                        .collect::<Vec<_>>();
 
                     let mut active: secrets::ActiveModel = row.into();
                     if let Some(v) = encrypted_new {
@@ -638,6 +677,24 @@ impl SecretService {
                         .await?;
                     }
 
+                    if let Some(details) = scope_change(
+                        previous_environments,
+                        previous_services,
+                        &environment_ids,
+                        &compose_services,
+                    ) {
+                        secret_history::ActiveModel {
+                            project_id: Set(project_id),
+                            secret_id: Set(secret_id),
+                            kind: Set("scope_changed".into()),
+                            details: Set(details),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        }
+                        .insert(txn)
+                        .await?;
+                    }
+
                     Ok(SecretWithEnvironments {
                         id: row.id,
                         project_id: row.project_id,
@@ -655,32 +712,57 @@ impl SecretService {
         Ok(result)
     }
 
-    pub async fn delete(&self, project_id: i32, secret_id: i32) -> Result<(), SecretError> {
-        self.db
-            .transaction::<_, (), SecretError>(|txn| {
+    /// Locks a secret for update or delete, together with the credential checks
+    /// that read it. A check writing its result inserts secret history, which
+    /// key-share locks the secret while holding the check row. `FOR NO KEY
+    /// UPDATE` does not conflict with that key-share lock, and taking the check
+    /// rows before modifying the secret (a key rename or delete needs a full row
+    /// lock, and cascades or the history trigger touch the checks) keeps the
+    /// lock order the same as a running check's, so the two cannot deadlock.
+    async fn lock_for_write(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        secret_id: i32,
+    ) -> Result<secrets::Model, SecretError> {
+        let secret = secrets::Entity::find_by_id(secret_id)
+            .filter(secrets::Column::ProjectId.eq(project_id))
+            .lock(LockType::NoKeyUpdate)
+            .one(txn)
+            .await?
+            .ok_or(SecretError::NotFound {
+                secret_id,
+                project_id,
+            })?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM http_checks WHERE secret_id = $1 ORDER BY id FOR UPDATE",
+            [secret_id.into()],
+        ))
+        .await?;
+        Ok(secret)
+    }
+
+    /// Deletes a secret and returns its key for audit context.
+    pub async fn delete(&self, project_id: i32, secret_id: i32) -> Result<String, SecretError> {
+        let key = self
+            .db
+            .transaction::<_, String, SecretError>(|txn| {
                 Box::pin(async move {
-                    let secret = secrets::Entity::find_by_id(secret_id)
-                        .filter(secrets::Column::ProjectId.eq(project_id))
-                        .lock_exclusive()
-                        .one(txn)
-                        .await?
-                        .ok_or(SecretError::NotFound {
-                            secret_id,
-                            project_id,
-                        })?;
+                    let secret = Self::lock_for_write(txn, project_id, secret_id).await?;
 
                     secret_environments::Entity::delete_many()
                         .filter(secret_environments::Column::SecretId.eq(secret_id))
                         .exec(txn)
                         .await?;
 
+                    let key = secret.key.clone();
                     let active: secrets::ActiveModel = secret.into();
                     active.delete(txn).await?;
-                    Ok(())
+                    Ok(key)
                 })
             })
             .await?;
-        Ok(())
+        Ok(key)
     }
 
     /// Returns decrypted secrets for a project+environment, ready to be
@@ -743,6 +825,26 @@ impl SecretService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_change_ignores_order_and_duplicates_and_reports_the_new_scope() {
+        assert_eq!(
+            scope_change(vec![2, 1], vec!["web".into()], &[1, 2, 2], &["web".into()]),
+            None
+        );
+        assert_eq!(
+            scope_change(vec![1], vec![], &[3, 1], &["worker".into(), "api".into()]),
+            Some(serde_json::json!({
+                "environment_ids": [1, 3],
+                "compose_services": ["api", "worker"],
+            }))
+        );
+        assert_eq!(
+            scope_change(vec![1], vec![], &[], &[]),
+            Some(serde_json::json!({"environment_ids": [], "compose_services": []})),
+            "widening to every environment is a scope change"
+        );
+    }
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
 
     fn make_encryption_service() -> Arc<EncryptionService> {
@@ -1663,5 +1765,168 @@ mod integration_tests {
         deletion.commit().await.expect("deletion should commit");
         assert!(matches!(update.await.expect("update task should complete"),
             Err(SecretError::EnvironmentNotFound { environment_id: id, .. }) if id == target_id));
+    }
+
+    #[tokio::test]
+    async fn secret_writes_and_running_checks_never_deadlock() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "lock-order").await;
+        for operation in ["update", "delete"] {
+            let service = secret_service(&test_db);
+            let secret = create_secret(
+                &service,
+                project.id,
+                vec![],
+                &format!("LOCK_ORDER_{}", operation.to_uppercase()),
+                "first",
+            )
+            .await
+            .expect("secret fixture should insert");
+            test_db
+                .connection()
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES($1,$2,'local','Credential expiry','ciphertext')",
+                    [project.id.into(), secret.id.into()],
+                ))
+                .await
+                .expect("check fixture should insert");
+            // A running check holds its row before it records a result.
+            let check = test_db
+                .connection()
+                .begin()
+                .await
+                .expect("check transaction should begin");
+            check
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM http_checks WHERE secret_id = $1 FOR UPDATE",
+                    [secret.id.into()],
+                ))
+                .await
+                .expect("check row should lock");
+            let (project_id, secret_id) = (project.id, secret.id);
+            let write = tokio::spawn(async move {
+                if operation == "update" {
+                    service
+                        .update(
+                            project_id,
+                            secret_id,
+                            Some("rotated".into()),
+                            vec![],
+                            false,
+                            vec![],
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    service.delete(project_id, secret_id).await.map(|_| ())
+                }
+            });
+            // Let the write lock the secret and queue behind the check row.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Recording the result inserts secret history, which key-share locks the secret.
+            check
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"UPDATE http_checks SET last_checked_at=NOW(),last_result='{"status":"healthy","findings":[],"checked_at":"2026-10-03T00:00:00Z"}' WHERE secret_id = $1"#,
+                    [secret.id.into()],
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("recording a result during a secret {operation} failed: {e}"));
+            check.commit().await.expect("check should commit");
+            write
+                .await
+                .expect("write task should complete")
+                .unwrap_or_else(|e| panic!("secret {operation} after a running check failed: {e}"));
+        }
+    }
+
+    async fn secret_history_kinds(test_db: &TestDatabase, secret_id: i32) -> Vec<String> {
+        secret_history::Entity::find()
+            .filter(secret_history::Column::SecretId.eq(secret_id))
+            .order_by_asc(secret_history::Column::Id)
+            .all(test_db.connection())
+            .await
+            .expect("secret history should load")
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn updates_record_value_preview_and_scope_history_without_values() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = secret_service(&test_db);
+        let project = create_project(&test_db, "history").await;
+        let staging = create_environment(&test_db, project.id, "history-staging").await;
+        let production = create_environment(&test_db, project.id, "history-production").await;
+        let secret = create_secret(&service, project.id, vec![staging.id], "TLS_CERT", "first")
+            .await
+            .expect("secret should be created");
+
+        // Re-saving the same scope and preview flag records nothing.
+        service
+            .update(project.id, secret.id, None, vec![staging.id], false, vec![])
+            .await
+            .expect("no-op update should succeed");
+        assert_eq!(
+            secret_history_kinds(&test_db, secret.id).await,
+            vec!["created"]
+        );
+
+        service
+            .update(
+                project.id,
+                secret.id,
+                Some("rotated-plaintext".into()),
+                vec![production.id],
+                true,
+                vec![],
+            )
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            secret_history_kinds(&test_db, secret.id).await,
+            vec![
+                "created",
+                "value_changed",
+                "settings_changed",
+                "scope_changed"
+            ]
+        );
+        let scope = secret_history::Entity::find()
+            .filter(secret_history::Column::SecretId.eq(secret.id))
+            .filter(secret_history::Column::Kind.eq("scope_changed"))
+            .one(test_db.connection())
+            .await
+            .expect("scope entry should load")
+            .expect("scope entry should exist");
+        assert_eq!(scope.project_id, project.id);
+        assert_eq!(
+            scope.details,
+            serde_json::json!({"environment_ids": [production.id], "compose_services": []})
+        );
+        let all_details = secret_history::Entity::find()
+            .filter(secret_history::Column::SecretId.eq(secret.id))
+            .all(test_db.connection())
+            .await
+            .expect("history should load")
+            .into_iter()
+            .map(|entry| entry.details.to_string())
+            .collect::<String>();
+        assert!(!all_details.contains("rotated-plaintext"));
+        assert!(!all_details.contains("first"));
+
+        let key = service
+            .delete(project.id, secret.id)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(key, "TLS_CERT");
+        assert!(secret_history_kinds(&test_db, secret.id).await.is_empty());
     }
 }

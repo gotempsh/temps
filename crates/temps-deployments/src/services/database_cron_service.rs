@@ -15,10 +15,11 @@ use sea_orm::{
 };
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{cron_executions, crons, deployment_containers, deployments};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
@@ -48,6 +49,8 @@ pub enum CronServiceError {
     ExecutionFailed {
         cron_id: i32,
         url: String,
+        /// HTTP status the endpoint answered with.
+        status: u16,
         message: String,
     },
 
@@ -76,12 +79,22 @@ pub enum CronServiceError {
 /// See [`DatabaseCronConfigService::duration_until_next_minute`].
 const MIN_SCHEDULER_SLEEP: Duration = Duration::from_secs(1);
 
+/// Upper bound on raising and delivering one cron failure alarm. Delivery runs
+/// off the scheduler, so this only bounds how long a stalled notification
+/// provider can keep the task alive.
+const ALARM_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Database-backed cron configuration service
 pub struct DatabaseCronConfigService {
     db: Arc<DatabaseConnection>,
     http_client: Arc<reqwest::Client>,
     queue: Arc<dyn temps_core::JobQueue>,
     deployment_token_service: Arc<DeploymentTokenService>,
+    /// Raises an alarm (and its notifications) when an invocation fails.
+    /// Late-bound: the monitoring plugin registers after this one, so it is
+    /// set from `initialize_plugin_services`. Unset means failures are only
+    /// recorded in the execution history.
+    alarm_service: OnceLock<Arc<AlarmService>>,
 }
 
 impl DatabaseCronConfigService {
@@ -95,7 +108,13 @@ impl DatabaseCronConfigService {
             http_client: Arc::new(reqwest::Client::new()),
             queue,
             deployment_token_service,
+            alarm_service: OnceLock::new(),
         }
+    }
+
+    /// Wire in the alarm service once every plugin has registered.
+    pub fn set_alarm_service(&self, alarm_service: Arc<AlarmService>) {
+        let _ = self.alarm_service.set(alarm_service);
     }
 
     /// Normalize a cron schedule to the 6-field format required by the `cron` crate.
@@ -580,7 +599,7 @@ impl DatabaseCronConfigService {
                     )
                 }
                 Err(e) => (
-                    500,
+                    Self::recorded_status_code(e),
                     Some(e.to_string()),
                     serde_json::to_string(&std::collections::HashMap::<String, String>::new())
                         .unwrap_or_default(),
@@ -600,8 +619,57 @@ impl DatabaseCronConfigService {
 
             new_execution.insert(self.db.as_ref()).await?;
 
-            // Handle any execution errors - send notification via queue
+            // A failed invocation raises an alarm, which delivers through the
+            // configured notification routes, and is also published on the
+            // job queue for other subscribers.
             if let Err(e) = result {
+                let last_successful_run = match self.last_successful_run(cron.id).await {
+                    Ok(last) => last,
+                    Err(lookup_err) => {
+                        warn!(
+                            "Failed to look up the last successful run of cron {}: {}",
+                            cron.id, lookup_err
+                        );
+                        None
+                    }
+                };
+
+                if let Some(alarm_service) = self.alarm_service.get() {
+                    let alarm_service = Arc::clone(alarm_service);
+                    let request = Self::failure_alarm(cron, &e, &url, last_successful_run);
+                    let (cron_id, project_id) = (cron.id, cron.project_id);
+                    // Delivery waits on notification providers; the scheduler
+                    // must not, or one stalled provider would hold up every
+                    // later cron.
+                    tokio::spawn(async move {
+                        match time::timeout(
+                            ALARM_DELIVERY_TIMEOUT,
+                            alarm_service.fire_alarm(request),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(alarm_err)) => error!(
+                                "Failed to raise alarm for failed cron {} in project {}: {}",
+                                cron_id, project_id, alarm_err
+                            ),
+                            Err(_) => error!(
+                                "Raising the alarm for failed cron {} in project {} did not \
+                                 finish within {}s; notification delivery may be stalled",
+                                cron_id,
+                                project_id,
+                                ALARM_DELIVERY_TIMEOUT.as_secs()
+                            ),
+                        }
+                    });
+                } else {
+                    warn!(
+                        "Cron {} in project {} failed but no alarm service is wired; \
+                         the failure is only in the execution history",
+                        cron.id, cron.project_id
+                    );
+                }
+
                 let error_data = temps_core::CronInvocationErrorData {
                     project_id: cron.project_id,
                     environment_id: cron.environment_id,
@@ -610,7 +678,7 @@ impl DatabaseCronConfigService {
                     error_message: e.to_string(),
                     schedule: cron.schedule.clone(),
                     timestamp: Utc::now(),
-                    last_successful_run: None,
+                    last_successful_run,
                 };
 
                 if let Err(queue_err) = self
@@ -629,6 +697,76 @@ impl DatabaseCronConfigService {
 
         Ok(())
     }
+
+    /// Status code stored for a failed invocation: the endpoint's own status
+    /// when it answered, 500 when it could not be reached at all.
+    fn recorded_status_code(error: &CronServiceError) -> i32 {
+        match error {
+            CronServiceError::ExecutionFailed { status, .. } => i32::from(*status),
+            _ => 500,
+        }
+    }
+
+    /// Most recent execution of `cron_id` that answered 2xx.
+    async fn last_successful_run(
+        &self,
+        cron_id: i32,
+    ) -> Result<Option<UtcDateTime>, sea_orm::DbErr> {
+        Ok(cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron_id))
+            .filter(cron_executions::Column::StatusCode.between(200, 299))
+            .order_by_desc(cron_executions::Column::ExecutedAt)
+            .one(self.db.as_ref())
+            .await?
+            .map(|execution| execution.executed_at))
+    }
+
+    /// Alarm for one failed invocation. The alarm service debounces repeats
+    /// per project and alarm type (5-minute cooldown), so a cron failing
+    /// every minute does not page every minute.
+    fn failure_alarm(
+        cron: &crons::Model,
+        error: &CronServiceError,
+        url: &str,
+        last_successful_run: Option<UtcDateTime>,
+    ) -> FireAlarmRequest {
+        let status = match error {
+            CronServiceError::ExecutionFailed { status, .. } => Some(*status),
+            _ => None,
+        };
+        let outcome = match status {
+            Some(status) => format!("answered HTTP {status}"),
+            None => "could not be reached".to_string(),
+        };
+        let last_success = match last_successful_run {
+            Some(at) => format!("Last successful run: {}.", at.to_rfc3339()),
+            None => "It has no successful run on record.".to_string(),
+        };
+        FireAlarmRequest {
+            project_id: Some(cron.project_id),
+            environment_id: Some(cron.environment_id),
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::CronJobFailed,
+            severity: AlarmSeverity::Warning,
+            title: format!("Cron job {} failed", cron.path),
+            message: format!(
+                "Scheduled cron {} ({}, schedule '{}') {}: {}. {}",
+                cron.id, cron.path, cron.schedule, outcome, error, last_success
+            ),
+            metadata: Some(serde_json::json!({
+                "cron_id": cron.id,
+                "path": cron.path,
+                "schedule": cron.schedule,
+                "url": url,
+                "status_code": status,
+                "error": error.to_string(),
+                "last_successful_run": last_successful_run.map(|at| at.to_rfc3339()),
+            })),
+        }
+    }
+
     async fn get_deployment_url(&self, cron: &crons::Model) -> Result<String, CronServiceError> {
         // Get the first deployment for this environment
         let deployment = deployments::Entity::find()
@@ -707,13 +845,14 @@ impl DatabaseCronConfigService {
             .map_err(|e| CronServiceError::ExecutionError {
                 cron_id: cron.id,
                 url: url.clone(),
-                message: format!("Failed with status: {}", e),
+                message: format!("request failed: {}", e),
             })?;
 
         if !response.status().is_success() {
             return Err(CronServiceError::ExecutionFailed {
                 cron_id: cron.id,
                 url,
+                status: response.status().as_u16(),
                 message: format!("Failed with status: {}", response.status()),
             });
         }
@@ -1492,5 +1631,367 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn sample_cron() -> crons::Model {
+        crons::Model {
+            id: 41,
+            project_id: 5,
+            environment_id: 6,
+            path: "/api/cron/report".to_string(),
+            schedule: "*/5 * * * *".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            next_run: None,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn recorded_status_code_keeps_the_endpoint_status() {
+        let failed = CronServiceError::ExecutionFailed {
+            cron_id: 41,
+            url: "http://app:3000/api/cron/report".to_string(),
+            status: 404,
+            message: "Failed with status: 404 Not Found".to_string(),
+        };
+        assert_eq!(
+            DatabaseCronConfigService::recorded_status_code(&failed),
+            404
+        );
+
+        let unreachable = CronServiceError::ExecutionError {
+            cron_id: 41,
+            url: "http://app:3000/api/cron/report".to_string(),
+            message: "request failed: connection refused".to_string(),
+        };
+        assert_eq!(
+            DatabaseCronConfigService::recorded_status_code(&unreachable),
+            500
+        );
+    }
+
+    #[test]
+    fn failure_alarm_names_the_cron_status_and_last_success() {
+        let cron = sample_cron();
+        let error = CronServiceError::ExecutionFailed {
+            cron_id: cron.id,
+            url: "http://app:3000/api/cron/report".to_string(),
+            status: 503,
+            message: "Failed with status: 503 Service Unavailable".to_string(),
+        };
+        let last = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+        let alarm = DatabaseCronConfigService::failure_alarm(
+            &cron,
+            &error,
+            "http://app:3000/api/cron/report",
+            Some(last),
+        );
+        assert_eq!(alarm.alarm_type, AlarmType::CronJobFailed);
+        assert_eq!(alarm.project_id, Some(5));
+        assert_eq!(alarm.environment_id, Some(6));
+        assert_eq!(alarm.title, "Cron job /api/cron/report failed");
+        assert!(
+            alarm.message.contains("answered HTTP 503"),
+            "{}",
+            alarm.message
+        );
+        assert!(
+            alarm.message.contains("2026-10-01T12:00:00"),
+            "{}",
+            alarm.message
+        );
+        let metadata = alarm.metadata.expect("metadata");
+        assert_eq!(metadata["cron_id"], 41);
+        assert_eq!(metadata["status_code"], 503);
+
+        let unreachable = CronServiceError::ExecutionError {
+            cron_id: cron.id,
+            url: "http://app:3000/api/cron/report".to_string(),
+            message: "request failed: connection refused".to_string(),
+        };
+        let alarm = DatabaseCronConfigService::failure_alarm(&cron, &unreachable, "u", None);
+        assert!(
+            alarm.message.contains("could not be reached"),
+            "{}",
+            alarm.message
+        );
+        assert!(
+            alarm.message.contains("no successful run on record"),
+            "{}",
+            alarm.message
+        );
+        assert!(alarm.metadata.expect("metadata")["status_code"].is_null());
+    }
+
+    struct RecordingQueue(std::sync::Mutex<Vec<temps_core::Job>>);
+
+    #[async_trait]
+    impl temps_core::JobQueue for RecordingQueue {
+        async fn send(&self, job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            if let Ok(mut jobs) = self.0.lock() {
+                jobs.push(job);
+            }
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("Not needed for tests")
+        }
+    }
+
+    struct NoopNotificationService;
+
+    #[async_trait]
+    impl temps_core::notifications::NotificationService for NoopNotificationService {
+        async fn send_notification(
+            &self,
+            _notification: temps_core::notifications::NotificationData,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            Ok(())
+        }
+        async fn send_email(
+            &self,
+            _message: temps_core::notifications::EmailMessage,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            Ok(())
+        }
+        async fn is_configured(
+            &self,
+        ) -> Result<bool, temps_core::notifications::NotificationError> {
+            Ok(false)
+        }
+    }
+
+    /// A notification provider that accepts the request and never answers.
+    struct StalledNotificationService;
+
+    #[async_trait]
+    impl temps_core::notifications::NotificationService for StalledNotificationService {
+        async fn send_notification(
+            &self,
+            _notification: temps_core::notifications::NotificationData,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            std::future::pending().await
+        }
+        async fn send_email(
+            &self,
+            _message: temps_core::notifications::EmailMessage,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            std::future::pending().await
+        }
+        async fn is_configured(
+            &self,
+        ) -> Result<bool, temps_core::notifications::NotificationError> {
+            Ok(true)
+        }
+    }
+
+    /// Wait (bounded) for the detached alarm task to record its alarm rows.
+    async fn wait_for_cron_alarms(
+        db: &sea_orm::DatabaseConnection,
+        project_id: i32,
+    ) -> Vec<temps_entities::alarms::Model> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alarms = temps_entities::alarms::Entity::find()
+                .filter(temps_entities::alarms::Column::ProjectId.eq(project_id))
+                .filter(temps_entities::alarms::Column::AlarmType.eq("cron_job_failed"))
+                .all(db)
+                .await
+                .expect("alarm query");
+            if !alarms.is_empty() || tokio::time::Instant::now() >= deadline {
+                return alarms;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Serve `HTTP 503` to every connection, as a broken cron endpoint would.
+    async fn failing_endpoint() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        port
+    }
+
+    /// A project, environment and cron whose deployment resolves to an
+    /// endpoint that always answers `503`.
+    async fn failing_cron_fixture(
+        db: &Arc<DatabaseConnection>,
+    ) -> (
+        temps_entities::projects::Model,
+        temps_entities::environments::Model,
+        crons::Model,
+    ) {
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+        let port = failing_endpoint().await;
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("cron-alarm-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("deployment insert");
+        // Both deployment modes resolve this container to 127.0.0.1:<port>
+        // (Docker mode via the name, baremetal via localhost + host port).
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("cron-alarm-container-id".to_string()),
+            container_name: Set("127.0.0.1".to_string()),
+            container_port: Set(i32::from(port)),
+            host_port: Set(Some(i32::from(port))),
+            deployed_at: Set(Utc::now()),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("container insert");
+
+        let cron = insert_cron(
+            db.as_ref(),
+            project.id,
+            environment.id,
+            "*/5 * * * *",
+            Some(Utc::now() - chrono::Duration::minutes(1)),
+        )
+        .await;
+        (project, environment, cron)
+    }
+
+    /// #1289: a failed invocation records the endpoint's real status, raises
+    /// a cron alarm, and publishes the queue event with the last success.
+    #[tokio::test]
+    async fn failed_invocation_records_status_and_raises_an_alarm() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment, cron) = failing_cron_fixture(&db).await;
+        let last_success = Utc::now() - chrono::Duration::hours(2);
+        cron_executions::ActiveModel {
+            cron_id: Set(cron.id),
+            executed_at: Set(last_success),
+            url: Set("http://127.0.0.1/api/cron/finalize".to_string()),
+            status_code: Set(200),
+            headers: Set("{}".to_string()),
+            response_time_ms: Set(5),
+            error_message: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("previous execution insert");
+
+        let queue = Arc::new(RecordingQueue(std::sync::Mutex::new(Vec::new())));
+        let service = DatabaseCronConfigService::new(
+            db.clone(),
+            queue.clone(),
+            create_test_deployment_token_service(db.clone()),
+        );
+        service.set_alarm_service(Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            queue.clone(),
+        )));
+
+        let result = service.process_cron(&cron, Utc::now()).await;
+        assert!(
+            matches!(
+                result,
+                Err(CronServiceError::ExecutionFailed { status: 503, .. })
+            ),
+            "{result:?}"
+        );
+
+        let latest = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .order_by_desc(cron_executions::Column::ExecutedAt)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("execution recorded");
+        assert_eq!(latest.status_code, 503, "the real status, not a fixed 500");
+
+        let alarms = wait_for_cron_alarms(db.as_ref(), project.id).await;
+        assert_eq!(alarms.len(), 1, "one alarm for the failed invocation");
+        assert_eq!(alarms[0].environment_id, Some(environment.id));
+
+        let jobs = queue.0.lock().expect("queue lock");
+        let event = jobs
+            .iter()
+            .find_map(|job| match job {
+                temps_core::Job::CronInvocationError(data) => Some(data.clone()),
+                _ => None,
+            })
+            .expect("cron failure event published");
+        let recorded = event.last_successful_run.expect("last success is reported");
+        assert!(
+            (recorded - last_success).num_milliseconds().abs() < 1000,
+            "{recorded} vs {last_success}"
+        );
+    }
+
+    /// A notification provider that never answers must not hold up the
+    /// scheduler: the alarm is raised off the scheduler's awaited work.
+    #[tokio::test]
+    async fn stalled_alarm_delivery_does_not_block_the_scheduler() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, _environment, cron) = failing_cron_fixture(&db).await;
+        let queue = Arc::new(RecordingQueue(std::sync::Mutex::new(Vec::new())));
+        let service = DatabaseCronConfigService::new(
+            db.clone(),
+            queue.clone(),
+            create_test_deployment_token_service(db.clone()),
+        );
+        service.set_alarm_service(Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(StalledNotificationService),
+            queue.clone(),
+        )));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.process_cron(&cron, Utc::now()),
+        )
+        .await
+        .expect("process_cron must not wait for notification delivery");
+        assert!(
+            matches!(
+                result,
+                Err(CronServiceError::ExecutionFailed { status: 503, .. })
+            ),
+            "{result:?}"
+        );
+        // The alarm row is still recorded even though delivery never finishes.
+        assert_eq!(wait_for_cron_alarms(db.as_ref(), project.id).await.len(), 1);
     }
 }

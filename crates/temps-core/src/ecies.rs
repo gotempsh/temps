@@ -264,10 +264,8 @@ pub fn generate_x25519_static_secret() -> Result<x25519_dalek::StaticSecret, Eci
     Ok(x25519_dalek::StaticSecret::from(secret_bytes))
 }
 
-pub(crate) fn fill_secure_random_bytes(
-    operation: &str,
-    bytes: &mut [u8],
-) -> Result<(), EciesError> {
+/// Fill `bytes` from the OS CSPRNG; `operation` names the use in errors.
+pub fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), EciesError> {
     fill_random_bytes_with(&mut SysRng, operation, bytes)
 }
 

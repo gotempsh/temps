@@ -19,8 +19,9 @@
 //!    directly to S3 without a database-sized host file.
 //! 4. Otherwise run a one-shot `mongo` sidecar that executes
 //!    `mongodump --archive --gzip` against the target container over the
-//!    user-defined bridge network, capturing the archive in a host bind
-//!    mount.
+//!    user-defined bridge network, writing the archive into the sidecar's own
+//!    filesystem. Temps streams it out through the Docker archive API into an
+//!    attempt-scoped host dir (see `dump_capture`).
 //! 5. Upload the fallback `.archive` to S3 and write its metadata companion.
 //!
 //! ## Why a sidecar, not exec
@@ -39,13 +40,18 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use super::dispatch::{container_has_walg, service_container_name};
-use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
+use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
+use super::oneshot::OneShotSpec;
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "mongodb";
 const DUMP_FILE_SUFFIX: &str = "dump.archive";
+/// Database name used in user-facing dump errors.
+const MONGO_TOOL: &str = "MongoDB";
+/// Archive name inside the sidecar's attempt directory.
+const SIDECAR_ARCHIVE: &str = "dump.archive";
 const MONGO_SIDECAR_IMAGE: &str =
     "mongo:7.0.39-jammy@sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6";
 const WALG_STREAM_CREATE_COMMAND: &str = "mongodump --archive --uri=\"$MONGODB_URI\"";
@@ -186,82 +192,37 @@ impl BackupEngine for MongodbEngine {
         );
 
         // ── One-shot mongodump container ─────────────────────────────────────
-        let backup_dir = std::env::temp_dir().join("temps-mongo-backup");
-        tokio::fs::create_dir_all(&backup_dir)
-            .await
-            .map_err(|e| BackupError::Failed {
-                reason: format!("failed to create tmpdir {}: {}", backup_dir.display(), e),
-            })?;
-        let dump_filename = format!("{}.archive", backup_uuid);
-        let host_dump_path = backup_dir.join(&dump_filename);
-        let container_dump_path = format!("/backup/{}", dump_filename);
-
-        // mongodump itself writes the archive to stdout; redirect to the bind
-        // mount inside the container. `--archive=/path` is the supported form
-        // for writing directly to a file.
-        let dump_cmd = format!(
-            "mongodump --host={} --archive={} --gzip \
-             -u {} -p {} --authenticationDatabase admin",
-            v2_common::shell_escape(&target_container),
-            v2_common::shell_escape(&container_dump_path),
-            v2_common::shell_escape(&username),
-            v2_common::shell_escape(&password),
-        );
+        //
+        // The sidecar writes the archive into its own filesystem and Temps
+        // streams it out through the Docker archive API (see `dump_capture`):
+        // no host bind mount, so Docker in a VM or on another host works, and
+        // every name is scoped to this attempt so retries never collide.
+        let attempt = DumpAttempt::new(MONGO_TOOL, ENGINE_KEY, &backup_uuid)?;
+        let spec = mongodump_spec(&attempt, backup_id, &target_container, &username, &password);
+        let host_dump_path = attempt.host_path(SIDECAR_ARCHIVE);
 
         super::image_pull::ensure_image_pulled_v2(MONGO_SIDECAR_IMAGE, ENGINE_KEY).await?;
 
-        let spec = OneShotSpec {
-            image: MONGO_SIDECAR_IMAGE.to_string(),
-            name: format!("temps-mongodump-{}", backup_uuid),
-            engine: ENGINE_KEY,
-            backup_id,
-            entrypoint: vec!["sh".to_string(), "-c".to_string()],
-            cmd: vec![dump_cmd],
-            env: vec![],
-            binds: vec![format!("{}:/backup:rw", backup_dir.display())],
-            network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-            user: Some("root".to_string()),
-            stderr_watch: None,
-        };
-
-        let result = match run_one_shot(&deps.docker, spec, &ctx.cancel).await {
-            Ok(r) => r,
-            Err(OneShotError::Cancelled) => return Err(BackupError::Cancelled),
-            Err(e) => {
-                v2_common::best_effort_remove(&host_dump_path).await;
-                return Err(BackupError::Failed {
-                    reason: format!("mongodump one-shot failed: {}", e),
-                });
-            }
-        };
-        if result.exit_code != 0 {
-            v2_common::best_effort_remove(&host_dump_path).await;
-            return Err(BackupError::Failed {
-                reason: format!(
-                    "mongodump exited with code {}. stderr: {}",
-                    result.exit_code,
-                    result.stderr_tail.trim(),
-                ),
-            });
-        }
-
-        let dump_meta =
-            tokio::fs::metadata(&host_dump_path)
-                .await
-                .map_err(|e| BackupError::Failed {
-                    reason: format!("dump file missing after mongodump succeeded: {}", e),
-                })?;
-        if dump_meta.len() == 0 {
-            v2_common::best_effort_remove(&host_dump_path).await;
-            return Err(BackupError::Failed {
-                reason: "mongodump produced an empty archive".into(),
-            });
-        }
-        let file_size = dump_meta.len() as i64;
-        let host_dump_path_str = host_dump_path.to_str().unwrap_or("").to_string();
+        let file_size = capture_dump(
+            &deps.docker,
+            CaptureRequest {
+                tool: MONGO_TOOL,
+                spec,
+                container_path: attempt.container_path(SIDECAR_ARCHIVE),
+                host_path: host_dump_path.clone(),
+                failure_log: None,
+            },
+            &ctx.cancel,
+        )
+        .await?;
+        let file_size = i64::try_from(file_size).map_err(|_| BackupError::Failed {
+            reason: format!(
+                "mongodump archive for backup {backup_id} is larger than i64::MAX bytes"
+            ),
+        })?;
+        let host_dump_path_str = host_dump_path.to_string_lossy().into_owned();
 
         if ctx.cancel.is_cancelled() {
-            v2_common::best_effort_remove(&host_dump_path).await;
             return Err(BackupError::Cancelled);
         }
         let tags = v2_common::BackupTags::load_for_backup(&ctx.db, ctx.backup_id).await;
@@ -275,8 +236,13 @@ impl BackupEngine for MongodbEngine {
             Some(&tags),
             &ctx.cancel,
         )
-        .await?;
-        v2_common::best_effort_remove(&host_dump_path).await;
+        .await
+        .map_err(|error| {
+            DumpCaptureError::upload(MONGO_TOOL, &s3_source.bucket_name, &s3_key, error)
+        })?;
+        // Deletes this attempt's host dir (and the archive in it); every early
+        // return above does the same when `attempt` drops.
+        drop(attempt);
 
         let metadata_key = v2_common::derive_metadata_key(&s3_key);
         v2_common::write_metadata_companion(
@@ -308,6 +274,40 @@ impl BackupEngine for MongodbEngine {
             size_bytes: Some(file_size),
             compression: "gzip".to_string(),
         })
+    }
+}
+
+/// `mongodump --archive --gzip` into the attempt's directory inside the
+/// sidecar's own filesystem. No bind mount: the archive is read back with
+/// the Docker archive API.
+fn mongodump_spec(
+    attempt: &DumpAttempt,
+    backup_id: i32,
+    target_container: &str,
+    username: &str,
+    password: &str,
+) -> OneShotSpec {
+    let dump_cmd = format!(
+        "mkdir -p {} && mongodump --host={} --archive={} --gzip \
+         -u {} -p {} --authenticationDatabase admin",
+        v2_common::shell_escape(&attempt.container_dir()),
+        v2_common::shell_escape(target_container),
+        v2_common::shell_escape(&attempt.container_path(SIDECAR_ARCHIVE)),
+        v2_common::shell_escape(username),
+        v2_common::shell_escape(password),
+    );
+    OneShotSpec {
+        image: MONGO_SIDECAR_IMAGE.to_string(),
+        name: attempt.container_name("temps-mongodump"),
+        engine: ENGINE_KEY,
+        backup_id,
+        entrypoint: vec!["sh".to_string(), "-c".to_string()],
+        cmd: vec![dump_cmd],
+        env: vec![],
+        binds: vec![],
+        network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+        user: Some("root".to_string()),
+        stderr_watch: None,
     }
 }
 
@@ -500,6 +500,27 @@ async fn list_total_s3_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mongodump_spec_has_no_bind_mount_and_is_attempt_scoped() {
+        let parent = tempfile::tempdir().expect("parent");
+        let first =
+            DumpAttempt::new_in(parent.path(), MONGO_TOOL, ENGINE_KEY, "b-uuid").expect("first");
+        let retry =
+            DumpAttempt::new_in(parent.path(), MONGO_TOOL, ENGINE_KEY, "b-uuid").expect("retry");
+
+        let spec = mongodump_spec(&first, 7, "temps-mongodb-x", "root", "pw");
+        let retry_spec = mongodump_spec(&retry, 7, "temps-mongodb-x", "root", "pw");
+
+        assert!(
+            spec.binds.is_empty(),
+            "output must not depend on a host bind"
+        );
+        assert_ne!(spec.name, retry_spec.name);
+        assert!(spec.name.starts_with("temps-mongodump-b-uuid-"));
+        assert!(spec.cmd[0].contains(&first.container_path(SIDECAR_ARCHIVE)));
+        assert!(!spec.cmd[0].contains(&retry.container_path(SIDECAR_ARCHIVE)));
+    }
 
     #[test]
     fn mongo_sidecar_image_is_release_and_digest_pinned() {

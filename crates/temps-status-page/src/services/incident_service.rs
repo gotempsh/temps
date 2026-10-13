@@ -19,6 +19,20 @@ use super::types::{
     UpdateIncidentStatusRequest,
 };
 
+/// Longest incident update message accepted. Updates can be published on a
+/// public status page, so the bound also caps what a public page renders.
+pub const MAX_INCIDENT_UPDATE_MESSAGE_CHARS: usize = 5000;
+
+fn validate_incident_update_message(message: &str) -> Result<(), StatusPageError> {
+    let length = message.chars().count();
+    if length > MAX_INCIDENT_UPDATE_MESSAGE_CHARS {
+        return Err(StatusPageError::Validation(format!(
+            "Incident update message is {length} characters; the limit is {MAX_INCIDENT_UPDATE_MESSAGE_CHARS}"
+        )));
+    }
+    Ok(())
+}
+
 /// Service for managing status page incidents
 pub struct IncidentService {
     db: Arc<DatabaseConnection>,
@@ -192,6 +206,7 @@ impl IncidentService {
             incident_id: Set(incident_id),
             status: Set("investigating".to_string()),
             message: Set(format!("Incident created: {}", title)),
+            is_system: Set(true),
             ..Default::default()
         };
 
@@ -282,6 +297,8 @@ impl IncidentService {
             ));
         }
 
+        validate_incident_update_message(&request.message)?;
+
         let incident = status_incidents::Entity::find_by_id(incident_id)
             .one(self.db.as_ref())
             .await?
@@ -302,12 +319,45 @@ impl IncidentService {
             incident_id: Set(incident_id),
             status: Set(request.status),
             message: Set(request.message),
+            is_public: Set(request.is_public),
             ..Default::default()
         };
 
         update.insert(self.db.as_ref()).await?;
 
         Ok(result.into())
+    }
+
+    /// Make an existing incident update public or private.
+    ///
+    /// `update_id` must belong to `incident_id`; a mismatch is reported as
+    /// not-found so an update id from another incident (or project) cannot be
+    /// toggled through an incident the caller is authorized for.
+    pub async fn set_incident_update_visibility(
+        &self,
+        incident_id: i32,
+        update_id: i32,
+        is_public: bool,
+    ) -> Result<IncidentUpdateResponse, StatusPageError> {
+        let update = status_incident_updates::Entity::find_by_id(update_id)
+            .filter(status_incident_updates::Column::IncidentId.eq(incident_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(StatusPageError::IncidentUpdateNotFound {
+                incident_id,
+                update_id,
+            })?;
+
+        if is_public && update.is_system {
+            return Err(StatusPageError::SystemUpdateCannotBePublic {
+                incident_id,
+                update_id,
+            });
+        }
+        let mut update: status_incident_updates::ActiveModel = update.into();
+        update.is_public = Set(is_public);
+        let update = update.update(self.db.as_ref()).await?;
+        Ok(update.into())
     }
 
     /// Get incident updates

@@ -18,6 +18,8 @@
 //! and [`AnalyticsIngestRateLimiter::check`] themselves.
 
 pub mod audit;
+pub mod body;
+pub mod cors;
 pub mod handlers;
 pub mod rate_limiter;
 pub mod request;
@@ -31,6 +33,8 @@ pub use audit::{
     AnalyticsIngestKeyCreatedAudit, AnalyticsIngestKeyRevokedAudit, AnalyticsIngestKeyRotatedAudit,
     AnalyticsIngestKeyUpdatedAudit,
 };
+pub use body::IngestJson;
+pub use cors::{keyed_ingest_cors, wildcard_ingest_cors, KeyedIngestCors};
 pub use handlers::{
     configure_ingest_key_routes, AnalyticsIngestKeyApiDoc, AnalyticsIngestKeysAppState,
 };
@@ -38,10 +42,10 @@ pub use rate_limiter::{
     AnalyticsIngestRateLimiter, DEFAULT_RATE_LIMIT_PER_MINUTE, UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE,
 };
 pub use request::{
-    extract_analytics_key, ingest_rate_limited_problem, invalid_ingest_key_problem,
+    analytics_key, extract_analytics_key, ingest_rate_limited_problem, invalid_ingest_key_problem,
     is_origin_allowed, origin_not_allowed_problem, resolve_client_identity,
-    resolve_keyed_ingest_scope, stamp_retry_after_on_rate_limited, ANALYTICS_INGEST_KEY_HEADER,
-    ANALYTICS_INGEST_KEY_QUERY_PARAM, INGEST_RETRY_AFTER_SECONDS,
+    resolve_keyed_ingest_scope, stamp_retry_after_on_rate_limited, IngestBranch,
+    ANALYTICS_INGEST_KEY_HEADER, ANALYTICS_INGEST_KEY_QUERY_PARAM, INGEST_RETRY_AFTER_SECONDS,
 };
 pub use service::AnalyticsIngestKeyService;
 pub use types::{

@@ -31,7 +31,7 @@ use temps_entities::preset::NixpacksConfig;
 pub use temps_entities::preset::NixpacksProvider;
 use tracing::{debug, warn};
 
-fn provider_name(provider: NixpacksProvider) -> &'static str {
+pub(crate) fn provider_name(provider: NixpacksProvider) -> &'static str {
     match provider {
         NixpacksProvider::Auto => "Auto-detect",
         NixpacksProvider::Node => "Node.js",
@@ -259,7 +259,7 @@ impl NixpacksPreset {
     }
 
     /// The autopack provider that claims this project, if any.
-    fn detect_provider_id(path: &Path) -> Option<String> {
+    pub(crate) fn detect_provider_id(path: &Path) -> Option<String> {
         let app = match App::new(path) {
             Ok(app) => app,
             Err(error) => {
@@ -553,6 +553,47 @@ mod tests {
     fn a_directory_with_nothing_to_build_is_not_detected() {
         let dir = project(&[("README.md", "# nothing here")]);
         assert!(!NixpacksPreset::can_detect(dir.path()));
+    }
+
+    /// Detect on a worker thread so a scan that follows a symlink loop fails
+    /// the test instead of hanging the suite.
+    fn can_detect_with_timeout(root: std::path::PathBuf) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(NixpacksPreset::can_detect(&root));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("can_detect did not finish within 10s: the scan followed a symlink loop")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_does_not_follow_symlinks() {
+        // autopack detects .NET from `**/*.csproj` anywhere in the tree, so a
+        // project file reachable only through a link changes the result if the
+        // scan follows it. The control proves the fixture is detectable.
+        let csproj = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>"#;
+        let real = project(&[("README.md", "# docs"), ("real/App.csproj", csproj)]);
+        assert!(
+            can_detect_with_timeout(real.path().to_path_buf()),
+            "a real .csproj must be detected for this test to mean anything"
+        );
+
+        let root = project(&[("README.md", "# docs")]);
+        let outside = project(&[("App.csproj", csproj)]);
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked_dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("App.csproj"),
+            root.path().join("Linked.csproj"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("b")).unwrap();
+
+        assert!(
+            !can_detect_with_timeout(root.path().to_path_buf()),
+            "a project reachable only through symlinks must not be detected"
+        );
     }
 
     #[test]

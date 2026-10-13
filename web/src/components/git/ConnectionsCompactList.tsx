@@ -150,7 +150,12 @@ export function ConnectionsCompactList({
   const ActionsMenu = ({ c }: { c: ConnectionResponse }) => (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" className="h-7 w-7">
+        <Button
+          aria-label="Open menu"
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+        >
           <EllipsisVertical className="h-3.5 w-3.5" />
         </Button>
       </DropdownMenuTrigger>
@@ -361,7 +366,7 @@ export function ConnectionsCompactList({
                 unhealthy
                   ? 'font-medium text-destructive'
                   : healthy
-                    ? 'text-emerald-600 dark:text-emerald-400'
+                    ? 'text-emerald-700 dark:text-emerald-400'
                     : ''
               }
             >

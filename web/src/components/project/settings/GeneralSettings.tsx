@@ -286,7 +286,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       </Form>
 
       {/* Monitoring — what deployments report about themselves */}
-      <MonitoringCard project={project} refetch={refetch} />
+      {project.source_type !== 'external' && (
+        <MonitoringCard project={project} refetch={refetch} />
+      )}
 
       {/* ADR-040 — where this project's telemetry history stands with Temps
           Cloud. Always rendered: the backfill is a deliberate CLI action, so
@@ -298,7 +300,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         <div>
           <div className="flex flex-row items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5 pr-4">
-              <Label className="text-base">Cross-service trace sharing</Label>
+              <Label
+                htmlFor="cross-project-trace-sharing"
+                className="text-base"
+              >
+                Cross-service trace sharing
+              </Label>
               <p className="text-sm text-muted-foreground">
                 When on, this service&apos;s spans appear in other
                 services&apos; unified cross-service traces. Turn off to keep
@@ -306,6 +313,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               </p>
             </div>
             <Switch
+              id="cross-project-trace-sharing"
               checked={project?.cross_project_trace_sharing ?? true}
               onCheckedChange={handleToggleCrossProjectTraceSharing}
               disabled={updateProjectSettings.isPending}
@@ -319,7 +327,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         <div>
           <div className="flex flex-row items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5 pr-4">
-              <Label className="text-base">Source code in stack traces</Label>
+              <Label htmlFor="error-source-context" className="text-base">
+                Source code in stack traces
+              </Label>
               <p className="text-sm text-muted-foreground">
                 Off by default. When enabled, upload your application source per
                 release (via the CLI or API, keyed by the deployed commit/tag)
@@ -328,6 +338,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               </p>
             </div>
             <Switch
+              id="error-source-context"
               checked={project?.error_source_context_enabled ?? false}
               onCheckedChange={handleToggleErrorSourceContext}
               disabled={updateProjectSettings.isPending}

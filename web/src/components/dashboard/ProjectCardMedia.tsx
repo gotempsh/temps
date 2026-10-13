@@ -59,6 +59,7 @@ function ProjectCardMediaContent({
 
   return (
     <span
+      role="img"
       className={cn(
         'relative flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-md border bg-muted/55',
         className

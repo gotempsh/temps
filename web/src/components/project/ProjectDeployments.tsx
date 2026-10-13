@@ -46,7 +46,8 @@ import {
   getExpiredTokenMessage,
   isExpiredTokenError,
 } from '@/utils/errorHandling'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { announceOperation } from '@/components/operations/operations-tray-store'
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
@@ -65,10 +66,17 @@ import {
   Globe,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import {
+  AUTO_REFRESH_MAX_POLLS,
+  defaultDeployEnvironment,
+  projectDeploysImage,
+  shouldStopAutoRefresh,
+} from '@/lib/project-deploy-action'
 
 const ITEMS_PER_PAGE = 10
 
 export function ProjectDeployments({ project }: { project: ProjectResponse }) {
+  const queryClient = useQueryClient()
   const [isRedeployModalOpen, setIsRedeployModalOpen] = useState(false)
   const [selectedDeployment, setSelectedDeployment] = useState<number | null>(
     null
@@ -89,6 +97,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const initialDeploymentCountRef = useRef<number | null>(null)
+  const autoRefreshPollsRef = useRef(0)
   const [currentPage, setCurrentPage] = useState(1)
 
   // Handle opening new deployment modal
@@ -118,7 +127,25 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     ? Math.ceil(deploymentsData.total / ITEMS_PER_PAGE)
     : 1
 
-  // Auto-refresh when coming from deployment details
+  const stopAutoRefresh = useCallback(() => {
+    if (refreshIntervalRef.current) {
+      clearInterval(refreshIntervalRef.current)
+      refreshIntervalRef.current = null
+    }
+    initialDeploymentCountRef.current = null
+    autoRefreshPollsRef.current = 0
+    setSearchParams(
+      (previous) => {
+        const next = new URLSearchParams(previous)
+        next.delete('autoRefresh')
+        return next
+      },
+      { replace: true }
+    )
+  }, [setSearchParams])
+
+  // Auto-refresh after a deployment was started elsewhere (deployment
+  // details, the header Deploy button, a new project's first deploy).
   useEffect(() => {
     const autoRefresh = searchParams.get('autoRefresh')
 
@@ -128,28 +155,28 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         initialDeploymentCountRef.current = deploymentsData.deployments.length
       }
 
-      // Check if a new deployment appeared
-      const hasNewDeployment =
-        deploymentsData.deployments.length > initialDeploymentCountRef.current
-
-      if (hasNewDeployment) {
-        // New deployment found, stop refreshing and clear the query param
-        if (refreshIntervalRef.current) {
-          clearInterval(refreshIntervalRef.current)
-          refreshIntervalRef.current = null
-        }
-        setSearchParams({}, { replace: true })
-        initialDeploymentCountRef.current = null
-      } else {
-        // No new deployment yet, set up refresh interval
-        if (!refreshIntervalRef.current) {
-          refreshIntervalRef.current = setInterval(() => {
-            refetch()
-          }, 1000)
-        }
+      if (
+        shouldStopAutoRefresh({
+          initialCount: initialDeploymentCountRef.current,
+          currentCount: deploymentsData.deployments.length,
+          polls: autoRefreshPollsRef.current,
+        })
+      ) {
+        stopAutoRefresh()
+      } else if (!refreshIntervalRef.current) {
+        // The bound is checked here too: an unchanged list keeps the same
+        // query data, so this effect would not run again to stop it.
+        refreshIntervalRef.current = setInterval(() => {
+          autoRefreshPollsRef.current++
+          if (autoRefreshPollsRef.current >= AUTO_REFRESH_MAX_POLLS) {
+            stopAutoRefresh()
+            return
+          }
+          refetch()
+        }, 1000)
       }
     }
-  }, [deploymentsData, searchParams, setSearchParams, refetch])
+  }, [deploymentsData, searchParams, stopAutoRefresh, refetch])
 
   // Cleanup interval on unmount
   useEffect(() => {
@@ -167,7 +194,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to trigger deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment triggered successfully')
+      announceOperation(queryClient, 'Deployment triggered')
       setIsRedeployModalOpen(false)
 
       // Clear any existing interval
@@ -202,7 +229,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to redeploy image',
     },
     onSuccess: () => {
-      toast.success('Deployment triggered successfully')
+      announceOperation(queryClient, 'Deployment triggered')
       setIsRedeployModalOpen(false)
       refetch()
     },
@@ -214,7 +241,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to redeploy static files',
     },
     onSuccess: () => {
-      toast.success('Deployment triggered successfully')
+      announceOperation(queryClient, 'Deployment triggered')
       setIsRedeployModalOpen(false)
       refetch()
     },
@@ -250,7 +277,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to rollback deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment rollback initiated successfully')
       refetch()
     },
     onError: (error: any) => {
@@ -304,16 +330,18 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   useEffect(() => {
     if (searchParams.get('deploy') !== 'true') return
 
+    const requestedImage = searchParams.get('image')?.trim()
     const nextSearchParams = new URLSearchParams(searchParams)
     nextSearchParams.delete('deploy')
+    nextSearchParams.delete('image')
     setSearchParams(nextSearchParams, { replace: true })
 
     if (project.source_type === 'static_files') {
       setStaticDialogOpen(true)
       return
     }
-    if (project.source_type === 'docker_image') {
-      setImageRefInput(imageRef ?? '')
+    if (projectDeploysImage(project)) {
+      setImageRefInput(requestedImage || imageRef || '')
       setImageDialogOpen(true)
       return
     }
@@ -322,7 +350,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   }, [
     handleOpenNewDeployment,
     imageRef,
-    project.source_type,
+    project,
     searchParams,
     setSearchParams,
   ])
@@ -425,17 +453,23 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   }
 
   const handleRollbackDeployment = async (deploymentId: number) => {
-    toast.promise(
-      rollbackDeployment.mutateAsync({
+    // One toast for the whole lifecycle: loading, then replaced by the
+    // success toast (with the tray action) or dismissed in favour of the
+    // mutation's own error toast.
+    const toastId = toast.loading('Rolling back deployment...')
+    rollbackDeployment.mutate(
+      {
         path: {
           project_id: project.id,
           deployment_id: deploymentId,
         },
-      }),
+      },
       {
-        loading: 'Rolling back deployment...',
-        success: 'Deployment rollback initiated successfully',
-        error: 'Failed to rollback deployment',
+        onSuccess: () =>
+          announceOperation(queryClient, 'Deployment rollback initiated', {
+            id: toastId,
+          }),
+        onError: () => toast.dismiss(toastId),
       }
     )
   }
@@ -446,6 +480,15 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       path: { project_id: project.id },
     }),
   })
+  // Until the user picks one, the image dialog targets production so a
+  // first deploy is one click.
+  const effectiveImageEnv =
+    imageEnv ||
+    String(
+      defaultDeployEnvironment(
+        environmentsQuery.data as EnvironmentResponse[] | undefined
+      )?.id ?? ''
+    )
 
   const promoteDeploymentMut = useMutation({
     ...promoteDeploymentMutation(),
@@ -453,7 +496,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to promote deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment promoted successfully')
       setPromoteDeploymentId(null)
       setPromoteTargetEnv('')
       refetch()
@@ -471,8 +513,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   const handlePromoteDeployment = async () => {
     if (!promoteDeploymentId || !promoteTargetEnv) return
-    toast.promise(
-      promoteDeploymentMut.mutateAsync({
+    const toastId = toast.loading('Promoting deployment...')
+    promoteDeploymentMut.mutate(
+      {
         path: {
           project_id: project.id,
           deployment_id: promoteDeploymentId,
@@ -480,11 +523,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         body: {
           target_environment_id: parseInt(promoteTargetEnv),
         },
-      }),
+      },
       {
-        loading: 'Promoting deployment...',
-        success: 'Deployment promoted successfully',
-        error: 'Failed to promote deployment',
+        onSuccess: () =>
+          announceOperation(queryClient, 'Deployment promotion started', {
+            id: toastId,
+          }),
+        onError: () => toast.dismiss(toastId),
       }
     )
   }
@@ -502,16 +547,19 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   // Deploy a specific image ref (may differ from the last one) to an environment.
   const handleDeployImage = async () => {
     const ref = imageRefInput.trim()
-    if (!ref || !imageEnv) return
+    if (!ref || !effectiveImageEnv) return
     try {
       await deployImageMut.mutateAsync({
-        path: { project_id: project.id, environment_id: parseInt(imageEnv) },
+        path: {
+          project_id: project.id,
+          environment_id: parseInt(effectiveImageEnv),
+        },
         body: {
           ...serviceTemplateDeployOverrides(project),
           image_ref: ref,
         },
       })
-      toast.success('Image deployment started')
+      announceOperation(queryClient, 'Image deployment started')
       setImageDialogOpen(false)
       setImageEnv('')
       refetch()
@@ -546,7 +594,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         path: { project_id: project.id, environment_id: parseInt(staticEnv) },
         body: { static_bundle_id: bundle.id },
       })
-      toast.success('Static deployment started')
+      announceOperation(queryClient, 'Static deployment started')
       setStaticDialogOpen(false)
       setStaticFile(null)
       setStaticEnv('')
@@ -609,7 +657,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           </div>
           <div className="space-y-2">
             <Label>Environment</Label>
-            <Select value={imageEnv} onValueChange={setImageEnv}>
+            <Select value={effectiveImageEnv} onValueChange={setImageEnv}>
               <SelectTrigger>
                 <SelectValue placeholder="Select environment..." />
               </SelectTrigger>
@@ -639,7 +687,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           <Button
             onClick={handleDeployImage}
             disabled={
-              !imageRefInput.trim() || !imageEnv || deployImageMut.isPending
+              !imageRefInput.trim() ||
+              !effectiveImageEnv ||
+              deployImageMut.isPending
             }
           >
             {deployImageMut.isPending && (
@@ -823,7 +873,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                   Upload new source
                 </Link>
               </Button>
-            ) : project.source_type === 'docker_image' ? (
+            ) : projectDeploysImage(project) ? (
               <Button
                 onClick={() => {
                   setImageRefInput(imageRef ?? '')
@@ -975,7 +1025,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               disabled={currentPage <= 1 || isFetching}
             >
               <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline ml-1">Previous</span>
+              <span className="max-sm:sr-only ml-1">Previous</span>
             </Button>
             <Button
               variant="outline"
@@ -984,7 +1034,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >
-              <span className="hidden sm:inline mr-1">Next</span>
+              <span className="max-sm:sr-only mr-1">Next</span>
               <ChevronRight className="h-4 w-4" />
             </Button>
           </div>

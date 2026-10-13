@@ -80,6 +80,7 @@ export function BrowsersChart({
             <CardTitle className="flex items-center gap-2">
               {selectedBrowser && (
                 <Button
+                  aria-label="Back to all browsers"
                   variant="ghost"
                   size="icon"
                   className="h-6 w-6"

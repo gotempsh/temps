@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  externalServiceBackupPreflightOptions,
+  externalServiceBackupPreflightQueryKey,
   listS3SourcesOptions,
   runExternalServiceBackupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Dialog,
   DialogContent,
@@ -30,17 +35,35 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useMutation, useQuery } from '@tanstack/react-query'
-import { AlertCircle, HardDrive, Loader2, Star } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { announceOperation } from '@/components/operations/operations-tray-store'
+import { AlertTriangle, HardDrive, Loader2, Star } from 'lucide-react'
 import { useEffect } from 'react'
-import { useForm } from 'react-hook-form'
-import { toast } from 'sonner'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Link } from 'react-router'
+import { useForm, useWatch } from 'react-hook-form'
+import {
+  DestinationsLoadError,
+  DestinationsRefreshWarning,
+  DestinationsSkeleton,
+  NoDestinationsConfigured,
+} from './TriggerBackupDestinationStatus'
+import {
+  SELECTED_DESTINATION_MISSING_MESSAGE,
+  canSubmitBackup,
+  confirmRestartParam,
+  deriveDestinationState,
+  deriveRestartGate,
+  restartGateAllowsSubmit,
+  type RestartGate,
+  knownDestinations,
+  selectionStatus,
+  shouldRetryDestinationRead,
+} from './trigger-backup-state'
 
 type FormValues = {
   s3_source_id?: number
   backup_type?: string
+  /** Acknowledges that this backup restarts the database (#1415). */
+  confirm_restart?: boolean
 }
 
 interface TriggerBackupDialogProps {
@@ -58,23 +81,65 @@ export function TriggerBackupDialog({
   serviceName,
   onSuccess,
 }: TriggerBackupDialogProps) {
-  const { data: s3Sources, isLoading: s3SourcesLoading } = useQuery({
+  const destinationsQuery = useQuery({
     ...listS3SourcesOptions(),
     enabled: open,
+    retry: shouldRetryDestinationRead,
+  })
+
+  // Loading, failed read, failed refresh over cached data, empty, or ready.
+  // A failed read must never look like "no destinations configured".
+  const destinationState = deriveDestinationState({
+    data: destinationsQuery.data,
+    error: destinationsQuery.error,
+    isPending: destinationsQuery.isPending,
+    isError: destinationsQuery.isError,
+  })
+  // The list the form shows: fresh, or the last loaded one after a failed
+  // refresh. Undefined while availability is unknown or nothing exists.
+  const s3Sources = knownDestinations(destinationState)
+  const retryDestinations = () => {
+    void destinationsQuery.refetch()
+  }
+
+  // Whether this backup restarts the database (PostgreSQL with WAL
+  // archiving off). Fetched each time the dialog opens: archiving state
+  // changes after the first backup.
+  const preflightQuery = useQuery({
+    ...externalServiceBackupPreflightOptions({ path: { id: serviceId } }),
+    enabled: open,
+    staleTime: 0,
+    retry: false,
+  })
+  const restartGate = deriveRestartGate({
+    data: preflightQuery.data,
+    isPending: preflightQuery.isPending,
+    isError: preflightQuery.isError,
   })
 
   const form = useForm<FormValues>({
     defaultValues: {
       backup_type: 'full',
+      confirm_restart: false,
     },
   })
+  const restartConfirmed =
+    useWatch({ control: form.control, name: 'confirm_restart' }) === true
+  const selectedSourceId = useWatch({
+    control: form.control,
+    name: 's3_source_id',
+  })
+  const selection = s3Sources
+    ? selectionStatus(s3Sources, selectedSourceId)
+    : 'none'
+  const canSubmit =
+    canSubmitBackup(destinationState, selectedSourceId) &&
+    restartGateAllowsSubmit(restartGate, restartConfirmed)
 
   // The user's explicitly-flagged default S3 source, if any. Used in
   // the FormDescription render below ("Defaults to ⭐ Cloudflare …") and
   // as the first-choice preselect in the effect below.
-  const defaultSource = s3Sources?.find(
-    (s) => (s as { is_default?: boolean }).is_default === true
-  )
+  const defaultSource = s3Sources?.find((s) => s.is_default === true)
 
   // Pre-select a Storage Destination when the dialog opens:
   //   1. The default source, if any.
@@ -89,14 +154,29 @@ export function TriggerBackupDialog({
     form.setValue('s3_source_id', preferred.id)
   }, [open, s3Sources, defaultSource, form])
 
+  const queryClient = useQueryClient()
   const runBackupMutation = useMutation({
     ...runExternalServiceBackupMutation(),
     meta: {
       errorTitle: 'Failed to trigger backup',
     },
-    onSuccess: () => {
-      toast.success('Backup started successfully', {
-        description: `A backup of ${serviceName} has been triggered.`,
+    // onSettled, not onError: a local onError would replace the app-wide
+    // default that shows the error toast, leaving a failed run unexplained.
+    onSettled: (_data, error) => {
+      if (!error) return
+      // A 409 means the server found a restart the dialog did not know
+      // about; re-check so the acknowledgement appears.
+      void queryClient.invalidateQueries({
+        queryKey: externalServiceBackupPreflightQueryKey({
+          path: { id: serviceId },
+        }),
+      })
+    },
+    onSuccess: (response) => {
+      announceOperation(queryClient, 'Backup started successfully', {
+        description: response.restarts_database
+          ? `A backup of ${serviceName} has been triggered. It restarts ${serviceName} to turn on WAL archiving first.`
+          : `A backup of ${serviceName} has been triggered.`,
       })
       form.reset()
       onOpenChange(false)
@@ -105,18 +185,21 @@ export function TriggerBackupDialog({
   })
 
   const onSubmit = (values: FormValues) => {
-    const selectedSourceId =
-      values.s3_source_id ?? defaultSource?.id ?? s3Sources?.[0]?.id
-    // Backend accepts s3_source_id as Option<i32>; generated client type still requires number.
-    const body = {
-      backup_type: values.backup_type || 'full',
-      ...(selectedSourceId !== undefined
-        ? { s3_source_id: selectedSourceId }
-        : {}),
-    } as { s3_source_id: number; backup_type: string }
+    const sourceId = values.s3_source_id
+    // Never submit while destination availability is unknown, or to a
+    // destination the loaded list no longer contains. The submit button is
+    // already disabled in those states; this guards Enter-key submission.
+    if (sourceId === undefined || !canSubmitBackup(destinationState, sourceId))
+      return
+    const confirmed = values.confirm_restart === true
+    if (!restartGateAllowsSubmit(restartGate, confirmed)) return
     runBackupMutation.mutate({
       path: { id: serviceId },
-      body,
+      body: {
+        backup_type: values.backup_type || 'full',
+        s3_source_id: sourceId,
+        confirm_restart: confirmRestartParam(restartGate, confirmed),
+      },
     })
   }
 
@@ -127,7 +210,10 @@ export function TriggerBackupDialog({
     onOpenChange(newOpen)
   }
 
-  const hasS3Sources = s3Sources && s3Sources.length > 0
+  const showStatusFooter =
+    destinationState.kind === 'loading' ||
+    destinationState.kind === 'error' ||
+    destinationState.kind === 'empty'
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -143,34 +229,43 @@ export function TriggerBackupDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {s3SourcesLoading ? (
-          <div className="flex items-center justify-center py-8">
-            <Loader2 className="h-4 w-4 animate-spin mr-2" />
-            <span className="text-sm text-muted-foreground">
-              Loading storage options...
-            </span>
-          </div>
-        ) : !hasS3Sources ? (
-          <div className="space-y-4">
-            <Alert>
-              <AlertCircle className="h-4 w-4" />
-              <AlertDescription>
-                No S3 sources configured. You need to create an S3 source before
-                you can trigger backups.
-              </AlertDescription>
-            </Alert>
-            <div className="flex justify-end gap-2">
-              <Button variant="outline" onClick={() => onOpenChange(false)}>
-                Cancel
+        {destinationState.kind === 'loading' ? <DestinationsSkeleton /> : null}
+        {destinationState.kind === 'error' ? (
+          <DestinationsLoadError
+            failure={destinationState.failure}
+            onRetry={retryDestinations}
+            isRetrying={destinationsQuery.isFetching}
+          />
+        ) : null}
+        {destinationState.kind === 'empty' ? (
+          <NoDestinationsConfigured />
+        ) : null}
+        {showStatusFooter ? (
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            {destinationState.kind !== 'empty' ? (
+              <Button type="button" disabled>
+                Start Backup
               </Button>
-              <Link to="/backups">
-                <Button>Configure S3 Sources</Button>
-              </Link>
-            </div>
-          </div>
-        ) : (
+            ) : null}
+          </DialogFooter>
+        ) : null}
+        {s3Sources ? (
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+              {destinationState.kind === 'stale' ? (
+                <DestinationsRefreshWarning
+                  failure={destinationState.failure}
+                  onRetry={retryDestinations}
+                  isRetrying={destinationsQuery.isFetching}
+                />
+              ) : null}
               <FormField
                 control={form.control}
                 name="s3_source_id"
@@ -178,10 +273,7 @@ export function TriggerBackupDialog({
                   const selectedSource = s3Sources?.find(
                     (s) => s.id === field.value
                   )
-                  const selectedIsDefault =
-                    selectedSource &&
-                    (selectedSource as { is_default?: boolean }).is_default ===
-                      true
+                  const selectedIsDefault = selectedSource?.is_default === true
                   return (
                     <FormItem>
                       <FormLabel>Storage Destination</FormLabel>
@@ -208,7 +300,7 @@ export function TriggerBackupDialog({
                                   {selectedIsDefault ? (
                                     <span
                                       title="Default source"
-                                      className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                      className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
                                     >
                                       <Star className="h-3 w-3 fill-current" />
                                       Default
@@ -221,9 +313,7 @@ export function TriggerBackupDialog({
                         </FormControl>
                         <SelectContent>
                           {s3Sources?.map((source) => {
-                            const isDefault =
-                              (source as { is_default?: boolean })
-                                .is_default === true
+                            const isDefault = source.is_default === true
                             return (
                               // pl-2 overrides the shadcn SelectItem default of
                               // pl-8 (which reserves a check-mark gutter we
@@ -244,7 +334,7 @@ export function TriggerBackupDialog({
                                     {isDefault ? (
                                       <span
                                         title="Default source"
-                                        className="inline-flex items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                        className="inline-flex items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
                                       >
                                         <Star className="h-3 w-3 fill-current" />
                                         Default
@@ -262,6 +352,11 @@ export function TriggerBackupDialog({
                           })}
                         </SelectContent>
                       </Select>
+                      {selection === 'missing' ? (
+                        <p className="text-sm font-medium text-destructive">
+                          {SELECTED_DESTINATION_MISSING_MESSAGE}
+                        </p>
+                      ) : null}
                       <FormDescription>
                         {defaultSource
                           ? `Defaults to ⭐ ${defaultSource.name}. Pick a different source to override.`
@@ -304,15 +399,42 @@ export function TriggerBackupDialog({
                 )}
               />
 
+              <RestartNotice gate={restartGate} />
+              {restartGate.kind === 'needs-confirmation' ? (
+                <FormField
+                  control={form.control}
+                  name="confirm_restart"
+                  render={({ field }) => (
+                    <FormItem className="flex flex-row items-start gap-2 space-y-0">
+                      <FormControl>
+                        <Checkbox
+                          checked={field.value === true}
+                          onCheckedChange={(checked) =>
+                            field.onChange(checked === true)
+                          }
+                        />
+                      </FormControl>
+                      <FormLabel className="font-normal leading-snug">
+                        I understand {serviceName} will restart, and its
+                        connections will drop briefly
+                      </FormLabel>
+                    </FormItem>
+                  )}
+                />
+              ) : null}
+
               <DialogFooter>
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() => onOpenChange(false)}
+                  onClick={() => handleOpenChange(false)}
                 >
                   Cancel
                 </Button>
-                <Button type="submit" disabled={runBackupMutation.isPending}>
+                <Button
+                  type="submit"
+                  disabled={!canSubmit || runBackupMutation.isPending}
+                >
                   {runBackupMutation.isPending && (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                   )}
@@ -321,8 +443,33 @@ export function TriggerBackupDialog({
               </DialogFooter>
             </form>
           </Form>
-        )}
+        ) : null}
       </DialogContent>
     </Dialog>
   )
+}
+
+/** What the backup will do to the running database, before it starts. */
+function RestartNotice({ gate }: { gate: RestartGate }) {
+  switch (gate.kind) {
+    case 'checking':
+      return <Skeleton className="h-16 w-full" />
+    case 'not-needed':
+      return null
+    case 'unknown':
+      return (
+        <p className="text-sm text-muted-foreground">
+          Could not check whether this backup restarts the database. If it
+          would, you will be asked to confirm before anything changes.
+        </p>
+      )
+    case 'needs-confirmation':
+      return (
+        <Alert variant="warning">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>This backup restarts the database</AlertTitle>
+          <AlertDescription>{gate.reason}</AlertDescription>
+        </Alert>
+      )
+  }
 }

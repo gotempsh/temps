@@ -111,6 +111,48 @@ export function problemErrorCode(error: unknown): string | undefined {
   return typeof extension === 'string' ? extension : undefined
 }
 
+/** Containers a node removal could not confirm are gone. */
+export interface UnremovedNodeContainers {
+  /** How many there are. */
+  count: number
+  /**
+   * Their descriptions. The API describes at most 50 and ends with a line
+   * counting the rest, so this can be shorter than `count`.
+   */
+  lines: string[]
+}
+
+/**
+ * The containers a node removal could not confirm are gone, when the API
+ * refused it for that reason (409 "Node Still Holds Containers"). Only then
+ * is retrying with `force=true` the operator's call to make.
+ */
+export function unremovedNodeContainers(
+  error: unknown
+): UnremovedNodeContainers | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const problem = error as {
+    unremoved_containers?: unknown
+    unremoved_count?: unknown
+    extensions?: {
+      unremoved_containers?: unknown
+      unremoved_count?: unknown
+    } | null
+  }
+  const list =
+    problem.unremoved_containers ?? problem.extensions?.unremoved_containers
+  if (!Array.isArray(list) || list.length === 0) return undefined
+  const lines = list.filter((item): item is string => typeof item === 'string')
+  const count = problem.unremoved_count ?? problem.extensions?.unremoved_count
+  return {
+    count:
+      typeof count === 'number' && Number.isInteger(count) && count > 0
+        ? count
+        : lines.length,
+    lines,
+  }
+}
+
 /** True when a failed request failed because no worker node can run it. */
 export function isWorkerNodeRequiredProblem(error: unknown): boolean {
   return problemErrorCode(error) === WORKER_NODE_REQUIRED_ERROR_CODE

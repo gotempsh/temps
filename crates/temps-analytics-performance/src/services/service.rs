@@ -199,7 +199,11 @@ impl GroupBy {
 /// `ip_geolocations`; the rest live directly on `performance_metrics`.
 #[derive(Debug, Deserialize, Clone, Default, ToSchema)]
 pub struct SpeedSegmentFilters {
-    /// Page pathname (matches `performance_metrics.pathname`)
+    /// Page pathname (matches `performance_metrics.pathname` exactly).
+    /// `path` is accepted as an alias: callers that guessed the obvious name
+    /// were otherwise silently served unfiltered results, since unknown
+    /// query parameters are ignored.
+    #[serde(alias = "path")]
     pub filter_path: Option<String>,
     /// Geolocation country (matches `ip_geolocations.country`)
     pub filter_country: Option<String>,
@@ -219,6 +223,10 @@ impl SpeedSegmentFilters {
     }
 }
 
+/// Metrics the grouped breakdown reports p50/p75/p90 for. Column names on
+/// `performance_metrics`; never user input.
+const GROUPED_PERCENTILE_METRICS: [&str; 5] = ["lcp", "cls", "inp", "fcp", "ttfb"];
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GroupedPageMetric {
     pub group_key: String,
@@ -226,11 +234,64 @@ pub struct GroupedPageMetric {
     /// geographic dimensions (country/region/city) so clients can match map
     /// geometries without name-based lookups; null otherwise.
     pub country_code: Option<String>,
+    /// Mean Largest Contentful Paint (ms). A mean is pulled far off by a
+    /// handful of extreme beacons; prefer `lcp_p75` for ranking groups.
     pub lcp: Option<f32>,
+    /// Mean Cumulative Layout Shift (score).
     pub cls: Option<f32>,
+    /// Mean Interaction to Next Paint (ms).
     pub inp: Option<f32>,
+    /// Mean First Contentful Paint (ms).
     pub fcp: Option<f32>,
+    /// Mean Time to First Byte (ms).
     pub ttfb: Option<f32>,
+    /// 50th percentile Largest Contentful Paint (ms). Null when no sample in
+    /// the group reported it.
+    pub lcp_p50: Option<f32>,
+    /// 75th percentile Largest Contentful Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+    /// the group reported it.
+    pub lcp_p75: Option<f32>,
+    /// 90th percentile Largest Contentful Paint (ms). Null when no sample in
+    /// the group reported it.
+    pub lcp_p90: Option<f32>,
+    /// 50th percentile Cumulative Layout Shift (score). Null when no sample in
+    /// the group reported it.
+    pub cls_p50: Option<f32>,
+    /// 75th percentile Cumulative Layout Shift (score) — the Core Web Vitals assessment percentile. Null when no sample in
+    /// the group reported it.
+    pub cls_p75: Option<f32>,
+    /// 90th percentile Cumulative Layout Shift (score). Null when no sample in
+    /// the group reported it.
+    pub cls_p90: Option<f32>,
+    /// 50th percentile Interaction to Next Paint (ms). Null when no sample in
+    /// the group reported it.
+    pub inp_p50: Option<f32>,
+    /// 75th percentile Interaction to Next Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+    /// the group reported it.
+    pub inp_p75: Option<f32>,
+    /// 90th percentile Interaction to Next Paint (ms). Null when no sample in
+    /// the group reported it.
+    pub inp_p90: Option<f32>,
+    /// 50th percentile First Contentful Paint (ms). Null when no sample in
+    /// the group reported it.
+    pub fcp_p50: Option<f32>,
+    /// 75th percentile First Contentful Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+    /// the group reported it.
+    pub fcp_p75: Option<f32>,
+    /// 90th percentile First Contentful Paint (ms). Null when no sample in
+    /// the group reported it.
+    pub fcp_p90: Option<f32>,
+    /// 50th percentile Time to First Byte (ms). Null when no sample in
+    /// the group reported it.
+    pub ttfb_p50: Option<f32>,
+    /// 75th percentile Time to First Byte (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+    /// the group reported it.
+    pub ttfb_p75: Option<f32>,
+    /// 90th percentile Time to First Byte (ms). Null when no sample in
+    /// the group reported it.
+    pub ttfb_p90: Option<f32>,
+    /// Beacons in the group. Each beacon may carry only some metrics, so a
+    /// metric's own sample count can be lower.
     pub events: i64,
 }
 
@@ -780,27 +841,59 @@ impl PerformanceService {
         };
 
         // AVG() over real columns returns double precision in Postgres, so
-        // every aggregate is cast to ::float8 and decoded as f64.
+        // every aggregate is cast to ::float8 and decoded as f64. Percentiles
+        // use the array form of percentile_cont so each metric is sorted once
+        // for all three, and are unpacked in the outer query.
+        let percentile_columns: String = GROUPED_PERCENTILE_METRICS
+            .iter()
+            .map(|metric| {
+                format!(
+                    ", percentile_cont(ARRAY[0.5, 0.75, 0.9]::float8[]) \
+                     WITHIN GROUP (ORDER BY pm.{metric}) as {metric}_pct"
+                )
+            })
+            .collect();
+        let percentile_outputs: String = GROUPED_PERCENTILE_METRICS
+            .iter()
+            .map(|metric| {
+                format!(
+                    ", g.{metric}_pct[1] as {metric}_p50, \
+                     g.{metric}_pct[2] as {metric}_p75, \
+                     g.{metric}_pct[3] as {metric}_p90"
+                )
+            })
+            .collect();
         let query = format!(
             r#"
             SELECT
-                {} as group_key,
-                {} as country_code,
-                AVG(pm.lcp)::float8 as lcp,
-                AVG(pm.cls)::float8 as cls,
-                AVG(pm.inp)::float8 as inp,
-                AVG(pm.fcp)::float8 as fcp,
-                AVG(pm.ttfb)::float8 as ttfb,
-                COUNT(*) as events
-            FROM performance_metrics pm
-            {}
-            WHERE {}
-            GROUP BY {}
-            HAVING COUNT(*) >= 1
-            ORDER BY events DESC, group_key
-            LIMIT 100
-            "#,
-            group_field, country_code_expr, geo_join, where_clause, group_field
+                g.group_key,
+                g.country_code,
+                g.lcp,
+                g.cls,
+                g.inp,
+                g.fcp,
+                g.ttfb,
+                g.events{percentile_outputs}
+            FROM (
+                SELECT
+                    {group_field} as group_key,
+                    {country_code_expr} as country_code,
+                    AVG(pm.lcp)::float8 as lcp,
+                    AVG(pm.cls)::float8 as cls,
+                    AVG(pm.inp)::float8 as inp,
+                    AVG(pm.fcp)::float8 as fcp,
+                    AVG(pm.ttfb)::float8 as ttfb,
+                    COUNT(*) as events{percentile_columns}
+                FROM performance_metrics pm
+                {geo_join}
+                WHERE {where_clause}
+                GROUP BY {group_field}
+                HAVING COUNT(*) >= 1
+                ORDER BY events DESC, group_key
+                LIMIT 100
+            ) g
+            ORDER BY g.events DESC, g.group_key
+            "#
         );
 
         info!("Executing grouped page metrics query: {}", query);
@@ -816,6 +909,21 @@ impl PerformanceService {
             fcp: Option<f64>,
             ttfb: Option<f64>,
             events: i64,
+            lcp_p50: Option<f64>,
+            lcp_p75: Option<f64>,
+            lcp_p90: Option<f64>,
+            cls_p50: Option<f64>,
+            cls_p75: Option<f64>,
+            cls_p90: Option<f64>,
+            inp_p50: Option<f64>,
+            inp_p75: Option<f64>,
+            inp_p90: Option<f64>,
+            fcp_p50: Option<f64>,
+            fcp_p75: Option<f64>,
+            fcp_p90: Option<f64>,
+            ttfb_p50: Option<f64>,
+            ttfb_p75: Option<f64>,
+            ttfb_p90: Option<f64>,
         }
 
         let results = GroupedMetricResult::find_by_statement(Statement::from_sql_and_values(
@@ -843,6 +951,21 @@ impl PerformanceService {
                     inp: r.inp.map(|v| v as f32),
                     fcp: r.fcp.map(|v| v as f32),
                     ttfb: r.ttfb.map(|v| v as f32),
+                    lcp_p50: r.lcp_p50.map(|v| v as f32),
+                    lcp_p75: r.lcp_p75.map(|v| v as f32),
+                    lcp_p90: r.lcp_p90.map(|v| v as f32),
+                    cls_p50: r.cls_p50.map(|v| v as f32),
+                    cls_p75: r.cls_p75.map(|v| v as f32),
+                    cls_p90: r.cls_p90.map(|v| v as f32),
+                    inp_p50: r.inp_p50.map(|v| v as f32),
+                    inp_p75: r.inp_p75.map(|v| v as f32),
+                    inp_p90: r.inp_p90.map(|v| v as f32),
+                    fcp_p50: r.fcp_p50.map(|v| v as f32),
+                    fcp_p75: r.fcp_p75.map(|v| v as f32),
+                    fcp_p90: r.fcp_p90.map(|v| v as f32),
+                    ttfb_p50: r.ttfb_p50.map(|v| v as f32),
+                    ttfb_p75: r.ttfb_p75.map(|v| v as f32),
+                    ttfb_p90: r.ttfb_p90.map(|v| v as f32),
                     events: r.events,
                 })
             })
@@ -1380,6 +1503,138 @@ mod tests {
         assert!(needs_geo, "geo filters must request the geo join");
         assert!(clause.contains("ig.country = $4"));
         assert_eq!(params.len(), 4);
+    }
+
+    fn grouped_row(
+        group_key: &str,
+        events: i64,
+    ) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        let mut row: std::collections::BTreeMap<String, sea_orm::Value> = [
+            (
+                "group_key",
+                sea_orm::Value::String(Some(Box::new(group_key.to_string()))),
+            ),
+            ("country_code", sea_orm::Value::String(None)),
+            ("lcp", sea_orm::Value::Double(Some(5000.0))),
+            ("cls", sea_orm::Value::Double(Some(0.05))),
+            ("inp", sea_orm::Value::Double(None)),
+            ("fcp", sea_orm::Value::Double(Some(700.0))),
+            ("ttfb", sea_orm::Value::Double(Some(19000.0))),
+            ("events", sea_orm::Value::BigInt(Some(events))),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+        for metric in GROUPED_PERCENTILE_METRICS {
+            for (suffix, value) in [("p50", 100.0), ("p75", 200.0), ("p90", 400.0)] {
+                // INP had no samples in this group: every percentile is NULL.
+                let value = (metric != "inp").then_some(value);
+                row.insert(format!("{metric}_{suffix}"), sea_orm::Value::Double(value));
+            }
+        }
+        row
+    }
+
+    #[tokio::test]
+    async fn grouped_page_metrics_returns_percentiles_next_to_means() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[grouped_row("/compare/vs-other", 45)]])
+                .into_connection(),
+        );
+        let service = PerformanceService::new(db.clone());
+        let filters = SpeedSegmentFilters {
+            filter_path: Some("/compare/vs-other".to_string()),
+            ..Default::default()
+        };
+
+        let response = service
+            .get_grouped_page_metrics(
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                7,
+                None,
+                None,
+                None,
+                &filters,
+                true,
+                GroupBy::Path,
+            )
+            .await
+            .expect("grouped metrics");
+
+        assert_eq!(response.grouped_by, "path");
+        assert_eq!(response.total_events, 45);
+        let group = &response.groups[0];
+        assert_eq!(group.group_key, "/compare/vs-other");
+        // The mean stays where existing clients read it...
+        assert_eq!(group.ttfb, Some(19000.0));
+        // ...and the robust percentiles sit beside it.
+        assert_eq!(group.ttfb_p50, Some(100.0));
+        assert_eq!(group.ttfb_p75, Some(200.0));
+        assert_eq!(group.ttfb_p90, Some(400.0));
+        assert_eq!(group.lcp_p75, Some(200.0));
+        assert_eq!(group.cls_p75, Some(200.0));
+        assert_eq!(group.fcp_p90, Some(400.0));
+        assert_eq!(group.inp, None);
+        assert_eq!(group.inp_p75, None);
+
+        let log = transaction_log(service, db);
+        let sql = format!("{:?}", log[0]);
+        for metric in GROUPED_PERCENTILE_METRICS {
+            assert!(
+                sql.contains(&format!(
+                    "WITHIN GROUP (ORDER BY pm.{metric}) as {metric}_pct"
+                )),
+                "missing percentile aggregate for {metric}: {sql}"
+            );
+            assert!(sql.contains(&format!("g.{metric}_pct[2] as {metric}_p75")));
+        }
+        assert!(
+            sql.contains("pm.pathname = $4"),
+            "path filter not applied: {sql}"
+        );
+        assert!(
+            sql.contains("/compare/vs-other"),
+            "path filter value not bound: {sql}"
+        );
+    }
+
+    #[test]
+    fn grouped_metric_serializes_existing_fields_unchanged() {
+        let metric = GroupedPageMetric {
+            group_key: "/".to_string(),
+            country_code: None,
+            lcp: Some(1.0),
+            cls: None,
+            inp: None,
+            fcp: None,
+            ttfb: Some(2.0),
+            lcp_p50: None,
+            lcp_p75: Some(3.0),
+            lcp_p90: None,
+            cls_p50: None,
+            cls_p75: None,
+            cls_p90: None,
+            inp_p50: None,
+            inp_p75: None,
+            inp_p90: None,
+            fcp_p50: None,
+            fcp_p75: None,
+            fcp_p90: None,
+            ttfb_p50: None,
+            ttfb_p75: Some(4.0),
+            ttfb_p90: None,
+            events: 9,
+        };
+        let json = serde_json::to_value(&metric).unwrap();
+        assert_eq!(json["group_key"], "/");
+        assert_eq!(json["lcp"], 1.0);
+        assert_eq!(json["ttfb"], 2.0);
+        assert_eq!(json["events"], 9);
+        assert_eq!(json["lcp_p75"], 3.0);
+        assert_eq!(json["ttfb_p75"], 4.0);
+        assert!(json["inp_p75"].is_null());
     }
 
     #[test]

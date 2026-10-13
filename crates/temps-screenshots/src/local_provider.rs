@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use temps_core::log_transitions::{FailureLatch, FailureLog, DEFAULT_REMINDER_INTERVAL};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::provider::ScreenshotProvider;
@@ -29,6 +30,110 @@ use crate::provider::ScreenshotProvider;
 /// running -- see `check_availability`'s use of `lock_owned()`.
 static CHROME_LAUNCH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
+
+/// Run blocking `work` while holding `lock` for exactly as long as it runs.
+///
+/// The guard is moved into the blocking task rather than kept on the caller's
+/// stack, because dropping the returned future (a timeout, a cancelled
+/// request) does not stop work already running on a blocking thread.
+async fn run_blocking_holding_lock<T, F>(
+    lock: Arc<AsyncMutex<()>>,
+    work: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = lock.lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        work()
+    })
+    .await
+}
+
+/// Whether headless Chrome is currently failing to launch on this host.
+///
+/// Chrome is an optional dependency: hosts without it simply don't get local
+/// deployment screenshots (or switch to a remote provider in Settings). It is
+/// reported once at WARN when first observed, with the fix, plus an hourly
+/// reminder — not as an ERROR on every availability probe and every
+/// deployment's screenshot attempt.
+static CHROME_UNAVAILABLE: ChromeStatus = ChromeStatus::new();
+
+/// Whether Chrome is currently failing to launch, and the last reason why.
+///
+/// The reason is kept so a probe that cannot run its own launch -- because
+/// an earlier one is still holding the launch lock -- can still answer with
+/// what is known instead of waiting for that launch.
+struct ChromeStatus {
+    latch: FailureLatch,
+    reason: std::sync::Mutex<Option<String>>,
+}
+
+impl ChromeStatus {
+    const fn new() -> Self {
+        Self {
+            latch: FailureLatch::new(DEFAULT_REMINDER_INTERVAL),
+            reason: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn is_failing(&self) -> bool {
+        self.latch.is_failing()
+    }
+
+    /// The reason recorded with the latest failure, while Chrome is failing.
+    fn failure_reason(&self) -> Option<String> {
+        if !self.is_failing() {
+            return None;
+        }
+        self.reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_reason(&self, reason: Option<String>) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reason;
+    }
+}
+
+/// Report that Chrome could not be launched. `reason` should name the fix.
+fn report_chrome_unavailable(status: &ChromeStatus, reason: &str) -> FailureLog {
+    status.set_reason(Some(reason.to_string()));
+    let outcome = status.latch.record_failure();
+    match outcome {
+        FailureLog::Started => warn!(
+            "Local screenshots are unavailable: headless Chrome could not be launched: {}",
+            reason
+        ),
+        FailureLog::Reminder { consecutive } => warn!(
+            consecutive_failures = consecutive,
+            "Local screenshots are still unavailable: headless Chrome could not be launched: {}",
+            reason
+        ),
+        FailureLog::Suppressed { consecutive } => debug!(
+            consecutive_failures = consecutive,
+            "Headless Chrome is still unavailable: {}", reason
+        ),
+    }
+    outcome
+}
+
+/// Report that Chrome launched, logging the recovery if it had been failing.
+fn report_chrome_available(status: &ChromeStatus) {
+    status.set_reason(None);
+    if let Some(failures) = status.latch.record_success() {
+        info!(
+            previous_failures = failures,
+            "Headless Chrome is available again; local screenshots are enabled"
+        );
+    }
+}
 
 /// Local screenshot provider using headless Chrome
 pub struct LocalScreenshotProvider {
@@ -79,13 +184,13 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             return Err(ScreenshotError::InvalidUrl(format!("Invalid URL: {}", url)));
         }
 
-        // Hold this for the whole capture (not just the launch): the closure
-        // below is fully synchronous, so there's no cheaper point to release it
-        // at without splitting Browser::new() out of spawn_blocking.
-        let _launch_guard = CHROME_LAUNCH_LOCK.lock().await;
-
-        // Launch browser in a blocking context since headless_chrome is sync
-        let browser = tokio::task::spawn_blocking({
+        // Hold the launch lock for the whole capture (not just the launch),
+        // and inside the blocking task: a caller's timeout drops this future
+        // but cannot stop the blocking Chrome work, so a lock held here would
+        // be released while that Chrome still runs and let a retry start a
+        // second browser beside it. The browser is owned by the closure, so it
+        // is shut down exactly when the lock is released.
+        let browser = run_blocking_holding_lock(CHROME_LAUNCH_LOCK.clone(), {
             let timeout = self.timeout_seconds;
             let width = self.viewport_width;
             let height = self.viewport_height;
@@ -100,20 +205,29 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                     .window_size(Some((width, height))) // Set window size
                     .build()
                     .map_err(|e| {
-                        error!("Failed to build launch options: {}", e);
+                        report_chrome_unavailable(
+                            &CHROME_UNAVAILABLE,
+                            &format!("failed to build launch options: {}", e),
+                        );
                         ScreenshotError::ChromeError(format!("Failed to build options: {}", e))
                     })?;
 
-                // Launch browser
+                // Launch browser. Failing here means Chrome (an optional
+                // dependency) is missing or broken on this host — reported
+                // once by the latch, and returned to the caller.
                 let browser = Browser::new(options).map_err(|e| {
-                    error!("Failed to launch Chrome browser: {}", e);
+                    report_chrome_unavailable(
+                        &CHROME_UNAVAILABLE,
+                        &format!("failed to launch browser: {}", e),
+                    );
                     ScreenshotError::ChromeError(format!("Failed to launch browser: {}", e))
                 })?;
 
+                report_chrome_available(&CHROME_UNAVAILABLE);
                 debug!("Browser launched successfully");
 
                 let tab = browser.new_tab().map_err(|e| {
-                    error!("Failed to create new tab: {}", e);
+                    warn!("Failed to create new Chrome tab for screenshot of {}: {}", url, e);
                     ScreenshotError::ChromeError(format!("Failed to create tab: {}", e))
                 })?;
 
@@ -129,8 +243,10 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                 // Inject into every new document via Page.addScriptToEvaluateOnNewDocument
                 tab.evaluate(disable_animations_css, false).ok();
 
+                // The target is the user's deployed app; it being unreachable
+                // is the app's state, not a Temps fault.
                 tab.navigate_to(&url).map_err(|e| {
-                    error!("Failed to navigate to {}: {}", url, e);
+                    warn!("Failed to navigate to {} for screenshot: {}", url, e);
                     ScreenshotError::ChromeError(format!("Failed to navigate: {}", e))
                 })?;
 
@@ -177,7 +293,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                         true, // Capture beyond viewport (full page)
                     )
                     .map_err(|e| {
-                        error!("Failed to capture screenshot: {}", e);
+                        warn!("Failed to capture screenshot of {}: {}", url, e);
                         ScreenshotError::ChromeError(format!("Screenshot capture failed: {}", e))
                     })?;
 
@@ -203,81 +319,322 @@ impl ScreenshotProvider for LocalScreenshotProvider {
     }
 
     async fn check_availability(&self) -> ScreenshotResult<()> {
-        // See CHROME_LAUNCH_LOCK: serialize this probe launch against any
-        // concurrent real capture (or another probe) on this provider.
-        //
-        // An owned guard, not a plain `.lock().await`: `spawn_blocking`
-        // tasks are NOT cancelled when the `JoinHandle` future stops being
-        // polled/is dropped (e.g. by the 10s `timeout` below elapsing) --
-        // the launch keeps running on its blocking thread regardless. If the
-        // guard lived on this function's stack, it would be dropped the
-        // moment we give up waiting, letting a second caller start a second
-        // launch while the first is still executing -- the exact race this
-        // lock exists to prevent. Instead, hand the owned guard to a
-        // detached supervisor that releases it only once the real launch
-        // attempt truly finishes; `timeout` below races the supervisor's
-        // *report* of that outcome, not the launch itself.
-        let launch_guard = CHROME_LAUNCH_LOCK.clone().lock_owned().await;
-        let handle = tokio::task::spawn_blocking(|| {
-            let options = LaunchOptions::default_builder()
-                .headless(true)
-                .sandbox(false)
-                .idle_browser_timeout(Duration::from_secs(5))
-                .build();
+        probe_chrome_launch(
+            CHROME_LAUNCH_LOCK.clone(),
+            &CHROME_UNAVAILABLE,
+            CHROME_PROBE_TIMEOUT,
+            || {
+                let options = LaunchOptions::default_builder()
+                    .headless(true)
+                    .sandbox(false)
+                    .idle_browser_timeout(Duration::from_secs(5))
+                    .build();
 
-            match options {
-                Ok(opts) => match Browser::new(opts) {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
-                },
-                Err(e) => Err(format!("Failed to build launch options: {}", e)),
-            }
-        });
-
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let outcome = handle.await;
-            drop(launch_guard);
-            let _ = done_tx.send(outcome);
-        });
-
-        // Use a 10-second timeout to prevent hanging on VPS/servers without Chrome
-        let check_result = tokio::time::timeout(Duration::from_secs(10), done_rx).await;
-
-        let reason = match check_result {
-            Ok(Ok(Ok(Ok(())))) => {
-                debug!("Chrome browser is available");
-                return Ok(());
-            }
-            Ok(Ok(Ok(Err(e)))) => e,
-            Ok(Ok(Err(e))) => format!("Chrome availability check task failed: {}", e),
-            Ok(Err(_)) => "Chrome availability check task failed: supervisor task dropped before \
-                 reporting an outcome"
-                .to_string(),
-            Err(_) => {
-                "Chrome availability check timed out after 10 seconds; Chrome is most likely \
-                 installed but missing shared libraries (check `ldd <chrome-binary> | grep \
-                 'not found'`)"
-                    .to_string()
-            }
-        };
-
-        let message = format!(
-            "{}. To fix: install Chrome's runtime dependencies (on Debian/Ubuntu: \
-             `apt-get install -y chromium` or `apt-get install -y libnss3 libnspr4 libatk1.0-0 \
-             libatk-bridge2.0-0 libcups2 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
-             libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libasound2t64`), or switch \
-             to a remote screenshot provider in Settings.",
-            reason
-        );
-        error!("Chrome browser is NOT available: {}", message);
-        Err(ScreenshotError::ChromeError(message))
+                match options {
+                    Ok(opts) => match Browser::new(opts) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
+                    },
+                    Err(e) => Err(format!("Failed to build launch options: {}", e)),
+                }
+            },
+        )
+        .await
     }
+}
+
+/// How long an availability probe waits for its own Chrome launch to report,
+/// and, separately, for a launch or capture already holding the launch lock.
+const CHROME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Check that `launch` can start Chrome, holding `lock` while it runs.
+///
+/// Every wait is bounded, so a caller (an HTTP request, a deployment job)
+/// always gets an answer within about twice `timeout`:
+///
+/// - The launch lock is held by a launch or capture already in progress.
+///   When Chrome is already known to be failing, its recorded reason is
+///   returned at once: that holder is most likely a launch that will never
+///   finish (an installed Chrome missing shared libraries can block before
+///   printing its DevTools address), and queueing behind it is what kept a
+///   screenshot request open indefinitely. Otherwise the probe waits up to
+///   `timeout` for the lock; a holder that keeps it longer is a capture still
+///   running, which means Chrome launches, so the probe does not start a
+///   second browser beside it.
+/// - The probe's own launch runs on a blocking thread that cannot be
+///   cancelled. The owned guard is handed to a detached supervisor that
+///   releases it only once that launch truly finishes, and the probe waits
+///   `timeout` for the supervisor's report, not for the launch itself.
+async fn probe_chrome_launch<F>(
+    lock: Arc<AsyncMutex<()>>,
+    status: &ChromeStatus,
+    timeout: Duration,
+    launch: F,
+) -> ScreenshotResult<()>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let launch_guard = match lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if let Some(reason) = status.failure_reason() {
+                return Err(ScreenshotError::ChromeError(still_running_message(&reason)));
+            }
+            match tokio::time::timeout(timeout, lock.lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    if let Some(reason) = status.failure_reason() {
+                        return Err(ScreenshotError::ChromeError(still_running_message(&reason)));
+                    }
+                    debug!(
+                        "Chrome is in use by a capture that has run for over {}s; \
+                         treating it as available",
+                        timeout.as_secs()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let handle = tokio::task::spawn_blocking(launch);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let outcome = handle.await;
+        drop(launch_guard);
+        let _ = done_tx.send(outcome);
+    });
+
+    // Bounded so a host where Chrome cannot start still gets an answer.
+    let check_result = tokio::time::timeout(timeout, done_rx).await;
+
+    let reason = match check_result {
+        Ok(Ok(Ok(Ok(())))) => {
+            debug!("Chrome browser is available");
+            report_chrome_available(status);
+            return Ok(());
+        }
+        Ok(Ok(Ok(Err(e)))) => e,
+        Ok(Ok(Err(e))) => format!("Chrome availability check task failed: {}", e),
+        Ok(Err(_)) => "Chrome availability check task failed: supervisor task dropped before \
+             reporting an outcome"
+            .to_string(),
+        Err(_) => format!(
+            "Chrome availability check timed out after {} seconds; Chrome is most likely \
+             installed but missing shared libraries (check `ldd <chrome-binary> | grep \
+             'not found'`)",
+            timeout.as_secs()
+        ),
+    };
+
+    let message = format!(
+        "{}. To fix: install Chrome's runtime dependencies (on Debian/Ubuntu: \
+         `apt-get install -y chromium` or `apt-get install -y libnss3 libnspr4 libatk1.0-0 \
+         libatk-bridge2.0-0 libcups2 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
+         libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libasound2t64`), or switch \
+         to a remote screenshot provider in Settings.",
+        reason
+    );
+    report_chrome_unavailable(status, &message);
+    Err(ScreenshotError::ChromeError(message))
+}
+
+/// The answer given while an earlier launch that already failed its check
+/// still holds the launch lock.
+fn still_running_message(reason: &str) -> String {
+    format!(
+        "{} (an earlier Chrome launch on this server is still running and has not finished; \
+         no new launch was attempted)",
+        reason
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lock_outlives_a_timed_out_caller_until_the_blocking_work_ends() {
+        let lock = Arc::new(AsyncMutex::new(()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        // The caller gives up long before the blocking work finishes.
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_blocking_holding_lock(lock.clone(), move || {
+                let _ = release_rx.recv();
+            }),
+        )
+        .await;
+        assert!(gave_up.is_err(), "the caller should have timed out");
+
+        // The work is still running, so a retry must not get the lock.
+        assert!(
+            lock.try_lock().is_err(),
+            "the lock was released while the blocking work still ran"
+        );
+
+        release_tx.send(()).expect("release the blocking work");
+        let reacquired = tokio::time::timeout(Duration::from_secs(5), lock.lock()).await;
+        assert!(
+            reacquired.is_ok(),
+            "the lock must be released once the blocking work ends"
+        );
+    }
+
+    /// #1383: a Chrome launch that never returns (an installed Chrome
+    /// missing shared libraries can block before printing its DevTools URL)
+    /// keeps the launch lock. A later probe must report the failure already
+    /// observed instead of queueing behind it, or the request that asked
+    /// for a screenshot never gets a response.
+    #[tokio::test]
+    async fn a_probe_behind_a_stuck_launch_reports_the_known_failure_promptly() {
+        let stuck_launch = CHROME_LAUNCH_LOCK.clone().lock_owned().await;
+        report_chrome_unavailable(
+            &CHROME_UNAVAILABLE,
+            "Chrome availability check timed out after 10 seconds",
+        );
+
+        let probe = tokio::time::timeout(
+            Duration::from_secs(3),
+            LocalScreenshotProvider::new().check_availability(),
+        )
+        .await;
+        drop(stuck_launch);
+
+        let error = probe
+            .expect("the probe must not wait for a launch that is not finishing")
+            .expect_err("Chrome is known to be failing");
+        let message = error.to_string();
+        assert!(message.contains("timed out after 10 seconds"), "{message}");
+        assert!(message.contains("still running"), "{message}");
+    }
+
+    /// A launch that never returns, released only when the test says so.
+    fn stuck_launch() -> (
+        impl FnOnce() -> Result<(), String> + Send + 'static,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let launch = move || {
+            let _ = release_rx.recv();
+            Err("released by the test".to_string())
+        };
+        (launch, release_tx)
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_never_returns_is_reported_and_blocks_no_later_probe() {
+        let lock = Arc::new(AsyncMutex::new(()));
+        let status = ChromeStatus::new();
+        let timeout = Duration::from_millis(200);
+        let (launch, release) = stuck_launch();
+
+        let first = probe_chrome_launch(lock.clone(), &status, timeout, launch)
+            .await
+            .expect_err("a launch that does not report in time is a failure");
+        assert!(
+            first.to_string().contains("timed out after 0 seconds"),
+            "{first}"
+        );
+        assert!(status.is_failing());
+
+        // The stuck launch still holds the lock: the next probe answers at
+        // once, with the recorded reason, and launches nothing.
+        let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let second = probe_chrome_launch(lock.clone(), &status, Duration::from_secs(30), {
+            let launched = launched.clone();
+            move || {
+                launched.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("Chrome is known to be failing");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(second.to_string().contains("still running"), "{second}");
+        assert!(second.to_string().contains("timed out"), "{second}");
+        assert!(!launched.load(std::sync::atomic::Ordering::SeqCst));
+
+        release.send(()).expect("release the stuck launch");
+    }
+
+    #[tokio::test]
+    async fn a_busy_browser_that_is_not_failing_is_waited_for_then_probed() {
+        let lock = Arc::new(AsyncMutex::new(()));
+        let status = ChromeStatus::new();
+        let capture = lock.clone().lock_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(capture);
+        });
+
+        let result = probe_chrome_launch(lock, &status, Duration::from_secs(5), || Ok(())).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!status.is_failing());
+    }
+
+    #[tokio::test]
+    async fn a_long_capture_is_not_mistaken_for_a_broken_browser() {
+        let lock = Arc::new(AsyncMutex::new(()));
+        let status = ChromeStatus::new();
+        let _capture = lock.clone().lock_owned().await;
+        let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = probe_chrome_launch(lock, &status, Duration::from_millis(100), {
+            let launched = launched.clone();
+            move || {
+                launched.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("must not run".to_string())
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!launched.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_names_the_reason_and_a_later_success_clears_it() {
+        let lock = Arc::new(AsyncMutex::new(()));
+        let status = ChromeStatus::new();
+        let error = probe_chrome_launch(lock.clone(), &status, Duration::from_secs(5), || {
+            Err("Failed to launch Chrome browser: libnss3.so missing".to_string())
+        })
+        .await
+        .expect_err("launch failed");
+        assert!(error.to_string().contains("libnss3.so missing"), "{error}");
+        assert!(status
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("libnss3.so missing")));
+
+        probe_chrome_launch(lock, &status, Duration::from_secs(5), || Ok(()))
+            .await
+            .expect("Chrome launches again");
+        assert_eq!(status.failure_reason(), None);
+    }
+
+    #[test]
+    fn missing_chrome_is_reported_once_until_it_becomes_available() {
+        let latch = ChromeStatus::new();
+
+        assert_eq!(
+            report_chrome_unavailable(&latch, "no chrome binary"),
+            FailureLog::Started
+        );
+        // Every later probe or deployment screenshot stays quiet.
+        for _ in 0..10 {
+            assert!(!report_chrome_unavailable(&latch, "no chrome binary").should_log());
+        }
+        report_chrome_available(&latch);
+        assert!(!latch.is_failing());
+        assert_eq!(latch.failure_reason(), None);
+        // Breaking again (e.g. a package removed) is a new transition.
+        assert_eq!(
+            report_chrome_unavailable(&latch, "no chrome binary"),
+            FailureLog::Started
+        );
+    }
 
     // Concurrent real-Chrome-launch tests used to race on headless_chrome's
     // shared cached `fetch` binary and need their own lock. That's now

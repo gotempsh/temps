@@ -101,6 +101,7 @@ mod tests {
             telemetry: true,
             backups: false,
             notifications: false,
+            console_access: false,
         })
         .expect("apply feature switches");
     }

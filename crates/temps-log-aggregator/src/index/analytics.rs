@@ -803,6 +803,7 @@ pub(crate) fn test_cloud_link(dir: &std::path::Path) -> Arc<temps_cloud_client::
         telemetry: true,
         backups: false,
         notifications: false,
+        console_access: false,
     })
     .expect("apply feature switches");
     link

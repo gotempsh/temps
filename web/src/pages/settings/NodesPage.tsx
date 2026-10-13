@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Badge } from '@/components/ui/badge'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -11,8 +10,25 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
+import { Skeleton } from '@/components/ui/skeleton'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
+import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
+import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
+import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
+import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useAuth } from '@/contexts/AuthContext-shared'
+import { problemDetail } from '@/lib/api-problem'
+import {
+  MeshConnectionBadge,
+  useWireguardMesh,
+  WorkerJoinGuide,
+} from '@/components/nodes/WorkerJoinGuide'
+import { strandedPublicNodes } from '@/lib/wireguard-mesh'
 import {
   useInvalidateNodeCapability,
   useNodeCapability,
@@ -20,6 +36,8 @@ import {
 import {
   canAddWorkerNode,
   shouldPromptForFirstWorkerNode,
+  unremovedNodeContainers,
+  type UnremovedNodeContainers,
   WORKER_NODES_URL,
 } from '@/lib/worker-nodes'
 import {
@@ -35,8 +53,10 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
+  adminDrainStatusOptions,
   adminGetNodeOptions,
   adminListNodeContainersOptions,
+  listNodeSandboxesOptions,
   getJoinTokenStatusOptions,
   getSettingsOptions,
   generateJoinTokenMutation,
@@ -45,6 +65,9 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
+  NodePlacementReference,
+  RemoveNodeResponse,
+  WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -52,10 +75,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Box,
-  ChevronDown,
-  ChevronRight,
   Cpu,
-  ExternalLink,
   Globe,
   HardDrive,
   Key,
@@ -67,10 +87,11 @@ import {
   Server,
   Shield,
   Tag,
+  Terminal,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -86,25 +107,27 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
+import { describeUpdatedPlacements } from '@/lib/node-placements'
 
 // ── Helpers ──
 
+/** Status tones, from the theme's contrast-checked status tokens. */
+const nodeStatusVariant: Record<
+  string,
+  'success-subtle' | 'destructive-subtle' | 'warning-subtle' | 'neutral-subtle'
+> = {
+  active: 'success-subtle',
+  offline: 'destructive-subtle',
+  draining: 'warning-subtle',
+  drained: 'neutral-subtle',
+  pending: 'warning-subtle',
+}
+
 function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    active:
-      'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-    offline: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-    draining:
-      'bg-orange-500/15 text-orange-700 dark:text-orange-400 border-orange-500/20',
-    drained:
-      'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
-    pending:
-      'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  }
   return (
     <Badge
-      variant="default"
-      className={`${styles[status] ?? ''} text-xs capitalize`}
+      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      className="text-xs capitalize"
     >
       {status}
     </Badge>
@@ -287,7 +310,13 @@ function NodeLabels({ labels }: { labels: unknown }) {
 
 function JoinTokenSection() {
   const queryClient = useQueryClient()
-  const { data: tokenStatus, isLoading: statusLoading } = useQuery({
+  const {
+    data: tokenStatus,
+    isLoading: statusLoading,
+    error: statusError,
+    refetch: refetchStatus,
+    isFetching: statusFetching,
+  } = useQuery({
     ...getJoinTokenStatusOptions(),
   })
   const generateToken = useMutation({
@@ -311,8 +340,6 @@ function JoinTokenSection() {
   })
   const [generatedToken, setGeneratedToken] = useState<string | null>(null)
 
-  const externalUrl = window.location.origin
-
   const handleGenerate = async () => {
     try {
       const result = await generateToken.mutateAsync({})
@@ -335,9 +362,25 @@ function JoinTokenSection() {
 
   if (statusLoading) {
     return (
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Loading token status...
+      <div className="space-y-4">
+        <Skeleton className="h-6 w-80" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    )
+  }
+
+  // The guide renders in every branch: pairing and adding a server over SSH
+  // do not need a join token, and the mesh onboarding lives in it too.
+  if (statusError) {
+    return (
+      <div className="space-y-4">
+        <QueryErrorAlert
+          title="Could not read the join token status"
+          error={statusError}
+          onRetry={() => void refetchStatus()}
+          retrying={statusFetching}
+        />
+        <WorkerJoinGuide token={null} />
       </div>
     )
   }
@@ -345,7 +388,6 @@ function JoinTokenSection() {
   const hasToken = tokenStatus?.has_token ?? false
 
   if (generatedToken) {
-    const joinCommand = `temps join ${externalUrl} ${generatedToken} --private-address <worker-ip>`
     return (
       <div className="space-y-4">
         <Alert className="border-amber-500/30 bg-amber-500/5">
@@ -353,13 +395,13 @@ function JoinTokenSection() {
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             Save this token now
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             This is the only time the join token will be displayed. Copy the
             command below and store the token securely.
           </AlertDescription>
         </Alert>
 
-        <JoinInstructions joinCommand={joinCommand} />
+        <WorkerJoinGuide token={generatedToken} />
 
         <div className="flex items-center gap-2">
           <Button
@@ -381,14 +423,10 @@ function JoinTokenSection() {
   }
 
   if (hasToken) {
-    const joinCommand = `temps join ${externalUrl} <join-token> --private-address <worker-ip>`
     return (
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-sm">
-          <Badge
-            variant="default"
-            className="bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20"
-          >
+          <Badge variant="success-subtle">
             <Shield className="h-3 w-3 mr-1" />
             Token configured
           </Badge>
@@ -397,7 +435,7 @@ function JoinTokenSection() {
           </span>
         </div>
 
-        <JoinInstructions joinCommand={joinCommand} />
+        <WorkerJoinGuide token={null} />
 
         <div className="flex items-center gap-2">
           <Button
@@ -438,7 +476,7 @@ function JoinTokenSection() {
         <AlertTitle className="text-amber-700 dark:text-amber-400">
           No join token configured
         </AlertTitle>
-        <AlertDescription className="text-amber-600 dark:text-amber-300">
+        <AlertDescription className="text-amber-700 dark:text-amber-300">
           Without a join token, any machine that knows the endpoint can register
           as a worker node. Generate a token to secure node registration.
         </AlertDescription>
@@ -452,94 +490,41 @@ function JoinTokenSection() {
         )}
         Generate Join Token
       </Button>
+
+      <WorkerJoinGuide
+        token={null}
+        missingToken={{
+          onGenerate: () => void handleGenerate(),
+          generating: generateToken.isPending,
+        }}
+      />
     </div>
   )
 }
 
-function JoinInstructions({ joinCommand }: { joinCommand: string }) {
-  const [expanded, setExpanded] = useState(true)
-
+/** One line under the node detail header saying what its role changes. */
+function NodeRoleDescription({ labels }: { labels: unknown }) {
+  const role = nodeSchedulingRole(labels)
+  if (!role) return null
   return (
-    <div className="rounded-lg border bg-muted/30 p-4">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 text-sm font-medium w-full text-left"
-      >
-        {expanded ? (
-          <ChevronDown className="h-4 w-4" />
-        ) : (
-          <ChevronRight className="h-4 w-4" />
-        )}
-        How to add a worker node
-      </button>
-      {expanded && (
-        <div className="mt-3 space-y-3 text-sm text-muted-foreground">
-          <div>
-            <p className="font-medium text-foreground">
-              1. Install Temps CLI on the worker machine
-            </p>
-            <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-              <span className="flex-1 overflow-x-auto">
-                curl -fsSL https://temps.sh/install.sh | bash
-              </span>
-              <CopyButton
-                minimal
-                className="h-6 w-6 shrink-0"
-                value="curl -fsSL https://temps.sh/install.sh | bash"
-              />
-            </div>
-          </div>
-          <div>
-            <p className="font-medium text-foreground">2. Join the cluster</p>
-            <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-              <span className="flex-1 overflow-x-auto">{joinCommand}</span>
-              <CopyButton
-                minimal
-                className="h-6 w-6 shrink-0"
-                value={joinCommand}
-              />
-            </div>
-            <p className="mt-1 text-xs">
-              Replace <code>&lt;worker-ip&gt;</code> with the worker machine’s
-              private IP address.
-            </p>
-          </div>
-          <div>
-            <p className="font-medium text-foreground">3. Start the agent</p>
-            <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-              <span className="flex-1 overflow-x-auto">temps agent</span>
-              <CopyButton
-                minimal
-                className="h-6 w-6 shrink-0"
-                value="temps agent"
-              />
-            </div>
-            <p className="mt-1 text-xs">
-              Reads config saved by <code>temps join</code> and starts the
-              worker with heartbeats.
-            </p>
-          </div>
-          <div>
-            <a
-              href="https://temps.sh/docs/multi-node"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-            >
-              Full documentation
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          </div>
-        </div>
-      )}
-    </div>
+    <p className="text-xs text-muted-foreground mt-1">
+      {NODE_ROLE_BADGE[role].description}
+    </p>
   )
 }
 
 // ── Node Table ──
 
-function NodeTable({ nodes }: { nodes: NodeInfoResponse[] }) {
+function NodeTable({
+  nodes,
+  mesh,
+}: {
+  nodes: NodeInfoResponse[]
+  mesh: WireguardMeshStatusResponse | undefined
+}) {
   const navigate = useNavigate()
+  const showMesh = mesh !== undefined && mesh.state !== 'disabled'
+  const meshNodes = new Map(mesh?.nodes.map((node) => [node.node_id, node]))
   return (
     <div className="overflow-x-auto">
       <Table>
@@ -551,56 +536,95 @@ function NodeTable({ nodes }: { nodes: NodeInfoResponse[] }) {
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
+            {showMesh && <TableHead>Mesh</TableHead>}
             <TableHead>Last Heartbeat</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {nodes.map((node) => (
-            <TableRow
-              key={node.id}
-              className="cursor-pointer hover:bg-accent/50"
-              onClick={() => navigate(`/settings/nodes/${node.id}`)}
-            >
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  <Server className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div className="min-w-0">
-                    <span className="font-medium truncate max-w-[200px] block">
-                      {node.name}
-                    </span>
-                    <Badge
-                      variant="outline"
-                      className="text-[10px] capitalize mt-0.5"
-                    >
-                      {node.role}
-                    </Badge>
+          {nodes.map((node) => {
+            const meshNode = meshNodes.get(node.id)
+            return (
+              <TableRow
+                key={node.id}
+                className="cursor-pointer hover:bg-accent/50"
+                onClick={() => navigate(`/settings/nodes/${node.id}`)}
+              >
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <Server className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <div className="min-w-0">
+                      <span className="font-medium truncate max-w-[200px] block">
+                        {node.name}
+                      </span>
+                      <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] capitalize"
+                        >
+                          {node.role}
+                        </Badge>
+                        <NodeRoleBadge labels={node.labels} />
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </TableCell>
-              <TableCell>
-                <StatusBadge status={node.status} />
-              </TableCell>
-              <TableCell className="hidden sm:table-cell">
-                <NodeArchitecture architecture={node.architecture} />
-              </TableCell>
-              <TableCell className="hidden md:table-cell">
-                <NodeLabels labels={node.labels} />
-              </TableCell>
-              <TableCell className="hidden lg:table-cell">
-                <NodeCapacityMini capacity={node.capacity} />
-              </TableCell>
-              <TableCell className="hidden md:table-cell">
-                <span className="font-mono text-xs text-muted-foreground truncate max-w-[200px] block">
-                  {node.private_address}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="text-sm text-muted-foreground">
-                  {formatRelativeTime(node.last_heartbeat)}
-                </span>
-              </TableCell>
-            </TableRow>
-          ))}
+                </TableCell>
+                <TableCell>
+                  <StatusBadge status={node.status} />
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <NodeArchitecture architecture={node.architecture} />
+                </TableCell>
+                <TableCell className="hidden md:table-cell">
+                  <NodeLabels labels={node.labels} />
+                </TableCell>
+                <TableCell className="hidden lg:table-cell">
+                  <NodeCapacityMini capacity={node.capacity} />
+                </TableCell>
+                <TableCell className="hidden md:table-cell">
+                  <span className="font-mono text-xs text-muted-foreground truncate max-w-[200px] block">
+                    {node.private_address}
+                  </span>
+                </TableCell>
+                {showMesh && (
+                  <TableCell>
+                    {meshNode ? (
+                      <MeshConnectionBadge
+                        connection={meshNode.connection}
+                        address={meshNode.mesh_address}
+                        checks={meshNode.checks}
+                      />
+                    ) : node.role === 'control-plane' && mesh?.control_plane ? (
+                      <div>
+                        <Badge
+                          variant="outline"
+                          className="text-xs"
+                          title={
+                            mesh.control_plane.endpoint
+                              ? `Nodes dial it at ${mesh.control_plane.endpoint}`
+                              : 'No public endpoint: it dials the nodes that have one'
+                          }
+                        >
+                          {mesh.control_plane.endpoint
+                            ? 'Reachable'
+                            : 'Dials out'}
+                        </Badge>
+                        <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
+                          {mesh.control_plane.address}
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    )}
+                  </TableCell>
+                )}
+                <TableCell>
+                  <span className="text-sm text-muted-foreground">
+                    {formatRelativeTime(node.last_heartbeat)}
+                  </span>
+                </TableCell>
+              </TableRow>
+            )
+          })}
         </TableBody>
       </Table>
     </div>
@@ -821,9 +845,9 @@ function MiniStat({
 }) {
   const accentClass =
     accent === 'green'
-      ? 'text-green-600 dark:text-green-400'
+      ? 'text-success-strong'
       : accent === 'yellow'
-        ? 'text-yellow-600 dark:text-yellow-400'
+        ? 'text-yellow-700 dark:text-yellow-400'
         : accent === 'blue'
           ? 'text-blue-600 dark:text-blue-400'
           : ''
@@ -894,6 +918,14 @@ function NodeDetail({
   const [showUndrainDialog, setShowUndrainDialog] = useState(false)
   const [drainPending, setDrainPending] = useState(false)
   const [removePending, setRemovePending] = useState(false)
+  // Containers a removal could not confirm are gone. While set, the remove
+  // dialog lists them and offers to remove the node anyway.
+  const [unremovedContainers, setUnremovedContainers] =
+    useState<UnremovedNodeContainers | null>(null)
+  // Environments pinned only to this node, from a refused removal.
+  const [pinnedPlacements, setPinnedPlacements] = useState<
+    NodePlacementReference[] | null
+  >(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -908,24 +940,35 @@ function NodeDetail({
     refetchInterval: 15_000,
   })
 
-  // Poll drain status when node is draining (every 5s for live progress)
-  interface DrainStatus {
-    remaining_containers: number
-    drain_complete: boolean
-    can_remove: boolean
-    message: string
-  }
-  const { data: drainStatus } = useQuery<DrainStatus>({
-    queryKey: ['node-drain-status', nodeId],
-    queryFn: async () => {
-      const resp = await client.get({
-        url: '/internal/nodes/{node_id}/drain' as never,
-        path: { node_id: nodeId },
-      })
-      return resp.data as DrainStatus
-    },
-    enabled: node?.status === 'draining',
-    refetchInterval: node?.status === 'draining' ? 5_000 : false,
+  // Sandboxes are tracked apart from deployment containers (ADR-048). Only
+  // admins may list other users' sandboxes, so others see an explanation.
+  const { user } = useAuth()
+  const canSeeSandboxes = canManageSandboxPlacement(user?.role)
+  const [sandboxPage, setSandboxPage] = useState(1)
+  const sandboxesQuery = useQuery({
+    ...listNodeSandboxesOptions({
+      path: { node: String(nodeId) },
+      query: { page: sandboxPage, page_size: 20 },
+    }),
+    enabled: canSeeSandboxes,
+    refetchInterval: 15_000,
+  })
+  const liveSandboxes = sandboxesQuery.data?.total ?? 0
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tab =
+    searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
+
+  // Drain status decides whether the node can be removed; the server folds
+  // in live sandboxes, which draining does not move. Poll every 5s while
+  // draining for live progress.
+  const removalRelevant =
+    node?.status === 'draining' ||
+    node?.status === 'drained' ||
+    node?.status === 'offline'
+  const { data: drainStatus } = useQuery({
+    ...adminDrainStatusOptions({ path: { node_id: nodeId } }),
+    enabled: removalRelevant,
+    refetchInterval: node?.status === 'draining' ? 5_000 : 15_000,
   })
 
   const containers = containersData?.containers ?? []
@@ -942,7 +985,12 @@ function NodeDetail({
         if (handleSensitiveActionError(resp.error, () => handleDrain())) {
           return
         }
-        toast.error('Failed to drain node')
+        toast.error('Could not drain node', {
+          description: problemDetail(
+            resp.error,
+            'Check your permissions and try again.'
+          ),
+        })
         return
       }
       toast.success(`Node is now draining`)
@@ -961,18 +1009,81 @@ function NodeDetail({
     }
   }
 
-  const handleRemove = async () => {
+  const handleRemove = async (force = false) => {
     setRemovePending(true)
+    let keepDialogOpen = false
     try {
       const resp = await client.delete({
         url: '/internal/nodes/{node_id}',
         path: { node_id: nodeId },
+        query: force ? { force: true } : undefined,
       })
       if (resp.error) {
-        toast.error('Failed to remove node')
+        if (handleSensitiveActionError(resp.error, () => handleRemove(force))) {
+          return
+        }
+        // Containers Temps placed on the node may still exist: keep the
+        // dialog open with the list so the operator decides whether the
+        // host is gone for good.
+        const pinned = (resp.error as { placements?: unknown }).placements
+        if (Array.isArray(pinned) && pinned.length > 0) {
+          setPinnedPlacements(pinned as NodePlacementReference[])
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
+        const unremoved = unremovedNodeContainers(resp.error)
+        if (unremoved && !force) {
+          setUnremovedContainers(unremoved)
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
+        // Live sandboxes block removal and draining doesn't move them:
+        // point straight at the tab that can destroy them.
+        const hostsSandboxes =
+          (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
+        toast.error('Could not remove node', {
+          description: problemDetail(
+            resp.error,
+            'Check your permissions and try again.'
+          ),
+          action: hostsSandboxes
+            ? {
+                label: 'Show sandboxes',
+                onClick: () =>
+                  setSearchParams(
+                    (prev) => {
+                      const next = new URLSearchParams(prev)
+                      next.set('tab', 'sandboxes')
+                      return next
+                    },
+                    { replace: true }
+                  ),
+              }
+            : undefined,
+        })
         return
       }
-      toast.success('Node removed')
+      const removal = resp.data as RemoveNodeResponse | undefined
+      const orphaned = removal?.orphaned_containers ?? []
+      // Environments whose target nodes listed this node no longer do; say
+      // which, since a rejoined machine gets a new ID and is not targeted.
+      const placements = describeUpdatedPlacements(removal?.placements_updated)
+      if (orphaned.length > 0) {
+        toast.warning('Node removed', {
+          description: [
+            'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
+            placements,
+          ]
+            .filter(Boolean)
+            .join(' '),
+        })
+      } else if (placements) {
+        toast.warning('Node removed', { description: placements })
+      } else {
+        toast.success('Node removed')
+      }
       queryClient.invalidateQueries({
         queryKey: adminListNodesOptions().queryKey,
       })
@@ -982,7 +1093,11 @@ function NodeDetail({
       toast.error('Failed to remove node')
     } finally {
       setRemovePending(false)
-      setShowRemoveDialog(false)
+      if (!keepDialogOpen) {
+        setShowRemoveDialog(false)
+        setUnremovedContainers(null)
+        setPinnedPlacements(null)
+      }
     }
   }
 
@@ -1033,10 +1148,14 @@ function NodeDetail({
 
   const canDrain = node.status === 'active'
   const canUndrain = node.status === 'draining' || node.status === 'drained'
-  const canRemove =
+  // Draining does not move sandboxes; they have to be destroyed first.
+  const remainingSandboxes = drainStatus?.remaining_sandboxes ?? liveSandboxes
+  const removableState =
     (node.status === 'drained' &&
-      (drainStatus?.can_remove ?? containers.length === 0)) ||
+      (drainStatus?.remaining_containers ?? containers.length) === 0) ||
     node.status === 'offline'
+  const canRemove = removableState && remainingSandboxes === 0
+  const blockedBySandboxes = removableState && remainingSandboxes > 0
 
   return (
     <div className="space-y-6">
@@ -1044,6 +1163,7 @@ function NodeDetail({
       {/* Header */}
       <div className="flex items-center gap-3">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={onBack}
@@ -1057,11 +1177,13 @@ function NodeDetail({
             <h3 className="text-lg font-semibold truncate">{node.name}</h3>
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
+            <NodeRoleBadge labels={node.labels} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
             {formatRelativeTime(node.last_heartbeat)}
           </p>
+          <NodeRoleDescription labels={node.labels} />
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {canDrain && (
@@ -1076,7 +1198,7 @@ function NodeDetail({
               ) : (
                 <Pause className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Drain</span>
+              <span className="max-sm:sr-only">Drain</span>
             </Button>
           )}
           {canUndrain && (
@@ -1091,7 +1213,7 @@ function NodeDetail({
               ) : (
                 <Play className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Undrain</span>
+              <span className="max-sm:sr-only">Undrain</span>
             </Button>
           )}
           {canRemove && (
@@ -1106,7 +1228,7 @@ function NodeDetail({
               ) : (
                 <Trash2 className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Remove</span>
+              <span className="max-sm:sr-only">Remove</span>
             </Button>
           )}
         </div>
@@ -1139,29 +1261,66 @@ function NodeDetail({
       </AlertDialog>
 
       {/* Remove confirmation dialog */}
-      <AlertDialog open={showRemoveDialog} onOpenChange={setShowRemoveDialog}>
+      <AlertDialog
+        open={showRemoveDialog}
+        onOpenChange={(open) => {
+          setShowRemoveDialog(open)
+          if (!open) {
+            setUnremovedContainers(null)
+            setPinnedPlacements(null)
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently remove the node from the cluster. This
-              action cannot be undone. The node must be drained first (no active
-              containers).
+              {pinnedPlacements
+                ? 'The node was not removed: it is the only target node of the environments below. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.'
+                : unremovedContainers
+                  ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
+                  : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {pinnedPlacements && (
+            <ul
+              tabIndex={0}
+              className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm"
+            >
+              {pinnedPlacements.map((placement) => (
+                <li
+                  key={`${placement.project_id}-${placement.environment_id ?? 'default'}`}
+                >
+                  {placement.environment_name
+                    ? `${placement.project_name} / ${placement.environment_name}`
+                    : `${placement.project_name} (project default)`}
+                </li>
+              ))}
+            </ul>
+          )}
+          {unremovedContainers && (
+            <ul
+              tabIndex={0}
+              className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all"
+            >
+              {unremovedContainers.lines.map((container) => (
+                <li key={container}>{container}</li>
+              ))}
+            </ul>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={removePending}>
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              onClick={handleRemove}
+              onClick={() => handleRemove(unremovedContainers !== null)}
               disabled={removePending}
               className="bg-destructive text-white hover:bg-destructive/90"
             >
               {removePending && (
                 <Loader2 className="h-4 w-4 animate-spin mr-1" />
               )}
-              Remove Node
+              {unremovedContainers ? 'Remove Anyway' : 'Remove Node'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1212,8 +1371,8 @@ function NodeDetail({
           <AlertTitle
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-700 dark:text-green-400'
-                : 'text-orange-700 dark:text-orange-400'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1225,8 +1384,8 @@ function NodeDetail({
           <AlertDescription
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-600 dark:text-green-300'
-                : 'text-orange-600 dark:text-orange-300'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1236,6 +1395,23 @@ function NodeDetail({
                 : containers.length > 0
                   ? `${containers.length} container(s) still running. Workloads are being migrated to other nodes.`
                   : 'All containers have been migrated. This node can now be safely removed.'}
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {blockedBySandboxes && (
+        <Alert>
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>
+            This node still hosts {remainingSandboxes} sandbox(es)
+          </AlertTitle>
+          <AlertDescription>
+            Draining does not move sandboxes, so the node can&rsquo;t be removed
+            yet. Destroy them on the{' '}
+            <Link to="?tab=sandboxes" className="underline underline-offset-2">
+              Sandboxes tab
+            </Link>
+            , then remove the node.
           </AlertDescription>
         </Alert>
       )}
@@ -1286,92 +1462,119 @@ function NodeDetail({
       {/* Edge Analytics (only for edge nodes) */}
       {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
 
-      {/* Containers */}
-      <Card>
-        <CardHeader className="py-3 px-4">
-          <CardTitle className="text-sm flex items-center gap-2">
+      {/* Workload on this node: deployment containers and sandboxes */}
+      <Tabs
+        value={tab}
+        onValueChange={(value) =>
+          setSearchParams(
+            (prev) => {
+              const next = new URLSearchParams(prev)
+              if (value === 'containers') next.delete('tab')
+              else next.set('tab', value)
+              return next
+            },
+            { replace: true }
+          )
+        }
+      >
+        <TabsList>
+          <TabsTrigger
+            value="containers"
+            count={containersLoading ? undefined : containers.length}
+          >
             <Box className="h-4 w-4" />
             Containers
-            {!containersLoading && (
-              <Badge variant="secondary" className="text-xs ml-1">
-                {containers.length}
-              </Badge>
-            )}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="px-0 pb-0">
-          {containersLoading ? (
-            <div className="flex items-center justify-center py-8">
-              <Loader2 className="h-5 w-5 animate-spin" />
-            </div>
-          ) : containers.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-8 text-center px-4">
-              <Box className="h-8 w-8 text-muted-foreground mb-2" />
-              <p className="text-sm text-muted-foreground">
-                No containers running on this node.
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Container</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Service
-                    </TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Environment
-                    </TableHead>
-                    <TableHead className="hidden lg:table-cell">
-                      Image
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {containers.map((c: NodeContainerResponse) => (
-                    <TableRow key={c.container_id}>
-                      <TableCell>
-                        <span className="font-mono text-xs truncate max-w-[200px] block">
-                          {c.container_name}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={
-                            c.status === 'running' ? 'default' : 'secondary'
-                          }
-                          className={`text-xs ${
-                            c.status === 'running'
-                              ? 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20'
-                              : ''
-                          }`}
-                        >
-                          {c.status}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">
-                        <span className="text-sm">{c.project_name}</span>
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">
-                        <Badge variant="outline" className="text-xs">
-                          {c.environment_name}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="hidden lg:table-cell">
-                        <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
-                          {c.image_name}
-                        </span>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+          </TabsTrigger>
+          <TabsTrigger value="sandboxes" count={sandboxesQuery.data?.total}>
+            <Terminal className="h-4 w-4" />
+            Sandboxes
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="containers">
+          <Card>
+            <CardContent className="px-0 pb-0 pt-0">
+              {containersLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                </div>
+              ) : containers.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-8 text-center px-4">
+                  <Box className="h-8 w-8 text-muted-foreground mb-2" />
+                  <p className="text-sm text-muted-foreground">
+                    No containers running on this node.
+                  </p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Container</TableHead>
+                        <TableHead>Status</TableHead>
+                        <TableHead className="hidden md:table-cell">
+                          Service
+                        </TableHead>
+                        <TableHead className="hidden md:table-cell">
+                          Environment
+                        </TableHead>
+                        <TableHead className="hidden lg:table-cell">
+                          Image
+                        </TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {containers.map((c: NodeContainerResponse) => (
+                        <TableRow key={c.container_id}>
+                          <TableCell>
+                            <span className="font-mono text-xs truncate max-w-[200px] block">
+                              {c.container_name}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <Badge
+                              variant={
+                                c.status === 'running'
+                                  ? 'success-subtle'
+                                  : 'secondary'
+                              }
+                              className="text-xs"
+                            >
+                              {c.status}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="hidden md:table-cell">
+                            <span className="text-sm">{c.project_name}</span>
+                          </TableCell>
+                          <TableCell className="hidden md:table-cell">
+                            <Badge variant="outline" className="text-xs">
+                              {c.environment_name}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="hidden lg:table-cell">
+                            <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
+                              {c.image_name}
+                            </span>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="sandboxes">
+          <NodeSandboxesPanel
+            nodeId={nodeId}
+            nodeName={node.name}
+            canSee={canSeeSandboxes}
+            query={sandboxesQuery}
+            page={sandboxPage}
+            onPageChange={setSandboxPage}
+          />
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }
@@ -1558,6 +1761,14 @@ export function NodesPage() {
     refetchInterval: 30_000,
   })
   const { data: capability } = useNodeCapability()
+  const {
+    data: mesh,
+    isLoading: meshLoading,
+    error: meshError,
+    refetch: refetchMesh,
+    isFetching: meshFetching,
+  } = useWireguardMesh()
+  const stranded = strandedPublicNodes(mesh)
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
   const nodeCount = nodes.length
@@ -1613,6 +1824,21 @@ export function NodesPage() {
         <CardContent className="space-y-6">
           <JoinTokenSection />
 
+          {stranded.length > 0 && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                {stranded.map((node) => node.name).join(', ')} joined with a
+                public address
+              </AlertTitle>
+              <AlertDescription className="text-amber-700 dark:text-amber-300">
+                {mesh?.state === 'starting'
+                  ? 'They move onto the WireGuard mesh as soon as it is up.'
+                  : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}
+              </AlertDescription>
+            </Alert>
+          )}
+
           {needsFirstNode ? (
             <div className="border-t pt-6">
               <WorkerNodeRequiredAlert
@@ -1631,11 +1857,18 @@ export function NodesPage() {
               </p>
             </div>
           ) : (
-            <NodeTable nodes={nodes} />
+            <NodeTable nodes={nodes} mesh={mesh} />
           )}
         </CardContent>
       </Card>
 
+      <MeshHubCard
+        mesh={mesh}
+        isLoading={meshLoading}
+        error={meshError}
+        onRetry={() => void refetchMesh()}
+        retrying={meshFetching}
+      />
       <ClusterDnsCard />
       <ClusterTrustCard />
     </div>

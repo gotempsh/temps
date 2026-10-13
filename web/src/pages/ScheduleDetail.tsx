@@ -599,7 +599,7 @@ export function ScheduleDetail() {
               }
             >
               <Play className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline">Run now</span>
+              <span className="max-sm:sr-only">Run now</span>
             </Button>
 
             <Button
@@ -614,7 +614,7 @@ export function ScheduleDetail() {
                 aria-label="Edit schedule"
               >
                 <Pencil className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Edit</span>
+                <span className="max-sm:sr-only">Edit</span>
               </Link>
             </Button>
 
@@ -807,7 +807,7 @@ export function ScheduleDetail() {
                     className="shrink-0"
                   >
                     <Plus className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">Attach service</span>
+                    <span className="max-sm:sr-only">Attach service</span>
                   </Button>
                 </CardHeader>
                 <CardContent className="p-5">
@@ -961,7 +961,7 @@ export function ScheduleDetail() {
                   <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                     Backups to delete
                   </p>
-                  <ul className="max-h-48 divide-y overflow-y-auto rounded-md border bg-background font-mono text-xs">
+                  <ul tabIndex={0} className="max-h-48 divide-y overflow-y-auto rounded-md border bg-background font-mono text-xs">
                     {cleanupReport.candidate_backup_ids.map((backupId) => (
                       <li key={backupId} className="break-all px-3 py-2">
                         {backupId}

@@ -20,7 +20,10 @@ export type DeploymentRedeployPlan =
   | { kind: 'git' }
   | { kind: 'docker_image' }
   | { kind: 'static_files'; staticBundleId?: number }
-  | { kind: 'unsupported'; sourceType: 'uploaded_source' | 'manual' }
+  | {
+      kind: 'unsupported'
+      sourceType: 'uploaded_source' | 'manual' | 'external'
+    }
 
 export function resolveDeploymentSourceType(
   deployment: DeploymentResponse,
@@ -64,6 +67,7 @@ export function deploymentRedeployPlan(
         kind: 'static_files',
         staticBundleId: deployment.metadata?.staticBundleId ?? undefined,
       }
+    case 'external':
     case 'uploaded_source':
     case 'manual':
       return { kind: 'unsupported', sourceType }

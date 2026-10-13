@@ -42,9 +42,10 @@ use crate::handlers::types::{
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
-    LatestDeploymentMediaResponseItem, ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest,
-    ResourceLimitsResponse, SendFailureReportRequest,
+    EnvVarResponse, FailureReportPreviewResponse, LastDeploymentResponse,
+    LatestDeploymentMediaResponse, LatestDeploymentMediaResponseItem,
+    ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest, ResourceLimitsResponse,
+    SendFailureReportRequest,
 };
 use crate::services::{
     managed_environment_variables, ManagedEnvironmentVariable, ManagedEnvironmentVariableSource,
@@ -230,6 +231,11 @@ async fn deployment_response_with_service_urls(
     components(schemas(
         DeploymentListResponse,
         DeploymentResponse,
+        crate::services::DeploymentFailureInfo,
+        crate::services::DeploymentFailureStage,
+        crate::services::DeploymentFailureCode,
+        crate::services::FailureSettingsSection,
+        LastDeploymentResponse,
         LatestDeploymentMediaResponse,
         LatestDeploymentMediaResponseItem,
         DeploymentStateResponse,
@@ -587,6 +593,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
 }
 
 /// Get the last deployment for a specific project
+///
+/// A project that exists but has never been deployed answers 200 with
+/// `deployment: null`; only an unknown project is a 404.
 #[utoipa::path(
     tag = "Deployments",
     get,
@@ -594,8 +603,8 @@ impl From<crate::services::services::DeploymentError> for Problem {
         ("id" = i32, Path, description = "Project ID")
     ),
     responses(
-        (status = 200, description = "Last deployment details", body = DeploymentResponse),
-        (status = 404, description = "Project not found or no deployments"),
+        (status = 200, description = "Last deployment, or `deployment: null` when the project has no deployments yet", body = LastDeploymentResponse),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     path = "/projects/{id}/last-deployment"
@@ -610,9 +619,13 @@ pub async fn get_last_deployment(
     project_access_guard!(auth, id, state.project_access_checker);
 
     debug!("Getting last deployment for project with id: {}", id);
-    let deployment = state.deployment_service.get_last_deployment(id).await?;
-    let response = deployment_response_with_service_urls(&state, id, deployment).await?;
-    Ok(Json(response).into_response())
+    let deployment = match state.deployment_service.get_last_deployment(id).await? {
+        Some(deployment) => {
+            Some(deployment_response_with_service_urls(&state, id, deployment).await?)
+        }
+        None => None,
+    };
+    Ok(Json(LastDeploymentResponse { deployment }).into_response())
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
@@ -1728,6 +1741,18 @@ pub async fn get_deployment_jobs(
     }))
 }
 
+/// Largest `tail` a job-log read may request.
+const MAX_JOB_LOG_TAIL_LINES: usize = 100_000;
+
+/// Query parameters for reading a deployment job's log.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+pub struct JobLogsQuery {
+    /// Return the most recent complete lines (1-100000), reading at most
+    /// 8 MiB from local or archived storage. Omit to read the whole log.
+    #[param(minimum = 1, maximum = 100000)]
+    pub tail: Option<usize>,
+}
+
 /// Get logs for a specific deployment job
 #[utoipa::path(
     get,
@@ -1736,10 +1761,12 @@ pub async fn get_deployment_jobs(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("deployment_id" = i32, Path, description = "Deployment ID"),
-        ("job_id" = String, Path, description = "Job ID")
+        ("job_id" = String, Path, description = "Job ID"),
+        JobLogsQuery
     ),
     responses(
         (status = 200, description = "Job logs retrieved successfully", body = String),
+        (status = 400, description = "Invalid tail parameter"),
         (status = 404, description = "Job or logs not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1751,10 +1778,12 @@ pub async fn get_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    Query(query): Query<JobLogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let tail = validate_job_log_tail(query.tail, &job_id, deployment_id)?;
 
     // Get the job to verify it exists and get its log_id
     let jobs = state
@@ -1768,16 +1797,70 @@ pub async fn get_deployment_job_logs(
         .ok_or_else(|| problemdetails::new(StatusCode::NOT_FOUND).with_detail("Job not found"))?;
 
     // Get logs using the log_id
-    let log_content = state
-        .log_service
-        .get_log_content(&job.log_id)
-        .await
-        .map_err(|e| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_detail(format!("Failed to read logs: {}", e))
-        })?;
+    let read = match tail {
+        Some(max_lines) => state.log_service.get_log_tail(&job.log_id, max_lines).await,
+        None => state.log_service.get_log_content(&job.log_id).await,
+    };
+    let log_content = match read {
+        Ok(content) => content,
+        Err(error) => job_logs_read_failure(&job_id, deployment_id, &job.status, &error)?,
+    };
 
     Ok((StatusCode::OK, log_content))
+}
+
+/// Validate the optional `tail` of a job-log read.
+fn validate_job_log_tail(
+    tail: Option<usize>,
+    job_id: &str,
+    deployment_id: i32,
+) -> Result<Option<usize>, Problem> {
+    match tail {
+        None => Ok(None),
+        Some(lines) if (1..=MAX_JOB_LOG_TAIL_LINES).contains(&lines) => Ok(Some(lines)),
+        Some(lines) => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail(format!(
+                "tail={lines} for job '{job_id}' of deployment {deployment_id} must be between 1 and {MAX_JOB_LOG_TAIL_LINES}"
+            ))),
+    }
+}
+
+/// Map a failed job-log read to a response.
+///
+/// A job that has not written anything yet (queued, waiting on a dependency,
+/// skipped, or cancelled before it ran) has no log file, and that is not an
+/// error: the console polls these jobs and gets an empty log. A job that ran
+/// to completion and has no log any more is a 404. Anything else is a real
+/// read failure and stays a 500.
+fn job_logs_read_failure(
+    job_id: &str,
+    deployment_id: i32,
+    status: &temps_entities::types::JobStatus,
+    error: &std::io::Error,
+) -> Result<String, Problem> {
+    use temps_entities::types::JobStatus;
+
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to Read Job Logs")
+            .with_detail(format!(
+                "Failed to read logs for job '{job_id}' of deployment {deployment_id}: {error}"
+            )));
+    }
+
+    match status {
+        JobStatus::Pending
+        | JobStatus::Waiting
+        | JobStatus::Running
+        | JobStatus::Skipped
+        | JobStatus::Cancelled => Ok(String::new()),
+        JobStatus::Success | JobStatus::Failure => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Job Logs Not Found")
+            .with_detail(format!(
+                "Logs for job '{job_id}' of deployment {deployment_id} are no longer available"
+            ))),
+    }
 }
 
 /// List the captured (historical) container-log dumps for a deployment.
@@ -2841,6 +2924,84 @@ pub async fn purge_environment_asset_cache(
 
 #[cfg(test)]
 mod tests {
+
+    mod job_log_tail_tests {
+        use super::super::{validate_job_log_tail, MAX_JOB_LOG_TAIL_LINES};
+        use axum::http::StatusCode;
+
+        #[test]
+        fn omitted_tail_reads_the_whole_log() {
+            assert_eq!(
+                validate_job_log_tail(None, "build_image", 7).ok(),
+                Some(None)
+            );
+        }
+
+        #[test]
+        fn tail_within_range_is_accepted() {
+            for lines in [1, 10_000, MAX_JOB_LOG_TAIL_LINES] {
+                assert_eq!(
+                    validate_job_log_tail(Some(lines), "build_image", 7).ok(),
+                    Some(Some(lines))
+                );
+            }
+        }
+
+        #[test]
+        fn tail_out_of_range_is_a_400_with_context() {
+            for lines in [0, MAX_JOB_LOG_TAIL_LINES + 1] {
+                let problem = validate_job_log_tail(Some(lines), "build_image", 7).unwrap_err();
+                assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+                let body = serde_json::to_string(&problem.body).unwrap();
+                assert!(body.contains("build_image"), "{body}");
+                assert!(body.contains("deployment 7"), "{body}");
+            }
+        }
+    }
+
+    mod job_logs_read_failure_tests {
+        use super::super::job_logs_read_failure;
+        use axum::http::StatusCode;
+        use temps_entities::types::JobStatus;
+
+        fn not_found() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file")
+        }
+
+        #[test]
+        fn jobs_without_output_yet_return_an_empty_log() {
+            for status in [
+                JobStatus::Pending,
+                JobStatus::Waiting,
+                JobStatus::Running,
+                JobStatus::Skipped,
+                JobStatus::Cancelled,
+            ] {
+                let result = job_logs_read_failure("deploy_container", 2, &status, &not_found());
+                assert_eq!(result.ok().as_deref(), Some(""), "status {status}");
+            }
+        }
+
+        #[test]
+        fn finished_jobs_with_missing_logs_return_404_with_context() {
+            for status in [JobStatus::Success, JobStatus::Failure] {
+                let problem = job_logs_read_failure("build_image", 7, &status, &not_found())
+                    .expect_err("finished job without logs must be an error");
+                assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+                let body = serde_json::to_string(&problem.body).unwrap_or_default();
+                assert!(body.contains("build_image"), "{body}");
+                assert!(body.contains('7'), "{body}");
+            }
+        }
+
+        #[test]
+        fn other_read_failures_stay_500() {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            let problem = job_logs_read_failure("build_image", 7, &JobStatus::Pending, &error)
+                .expect_err("permission errors are real failures");
+            assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     use super::*;
     use async_trait::async_trait;
     use axum::Router;
@@ -4706,6 +4867,7 @@ mod tests {
                 .expect("Failed to create screenshot service"),
         );
 
+        let capture_guard = Arc::new(crate::jobs::DeploymentCaptureGuard::default());
         let workflow_executor = Arc::new(crate::services::WorkflowExecutionService::new(
             db.clone(),
             queue_service.clone(),
@@ -4735,7 +4897,8 @@ mod tests {
                 ),
                 db.clone(),
             )),
-            screenshot_service,
+            screenshot_service.clone(),
+            capture_guard.clone(),
             Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults().expect("docker"),
             ))),
@@ -4752,11 +4915,46 @@ mod tests {
             .expect("Failed to build test FailureReportService"),
         );
 
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let config_service = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:0".to_string(),
+                    "postgresql://test:test@localhost:5432/test".to_string(),
+                    None,
+                    None,
+                )
+                .expect("config"),
+            ),
+            db.clone(),
+        ));
+        let enrollment_token_service =
+            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
+        let node_pairing_admin = Arc::new(
+            crate::services::node_pairing_admin::NodePairingAdminService::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+                enrollment_token_service.clone(),
+            ),
+        );
+
+        let external_deployment_manager =
+            Arc::new(crate::services::ExternalDeploymentManager::new());
         Arc::new(AppState {
             deployment_service,
             log_service,
             cron_service,
-            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+            external_deployment_manager: external_deployment_manager.clone(),
+            screenshot_operations: Arc::new(crate::services::ScreenshotOperationService::new(
+                db.clone(),
+                screenshot_service,
+                config_service.clone(),
+                external_deployment_manager,
+                capture_guard,
+            )),
             remote_deployment_service,
             db: db.clone(),
             workflow_planner,
@@ -4770,21 +4968,8 @@ mod tests {
             node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
                 crate::services::NodeService::new(db.clone()),
             ))),
-            encryption_service: Arc::new(
-                temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
-            ),
-            config_service: Arc::new(ConfigService::new(
-                Arc::new(
-                    temps_config::ServerConfig::new(
-                        "127.0.0.1:0".to_string(),
-                        "postgresql://test:test@localhost:5432/test".to_string(),
-                        None,
-                        None,
-                    )
-                    .expect("config"),
-                ),
-                db.clone(),
-            )),
+            encryption_service,
+            config_service,
             docker: Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
@@ -4796,6 +4981,8 @@ mod tests {
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
+            enrollment_token_service,
+            node_pairing_admin,
             sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }
@@ -4904,10 +5091,106 @@ mod tests {
             "Response body: {}",
             serde_json::to_string_pretty(&body).unwrap()
         );
-        assert_eq!(body["id"], deployment.id);
-        assert_eq!(body["status"], "deployed");
+        assert_eq!(body["deployment"]["id"], deployment.id);
+        assert_eq!(body["deployment"]["status"], "deployed");
 
         println!("✅ GET /projects/{{id}}/last-deployment test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_endpoint_empty_state_and_missing_project() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::projects;
+
+        if !database_test_prerequisites_available().await {
+            println!("Docker/test database not available, skipping");
+            return;
+        }
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_last_deployment_empty_http_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temporary data directory");
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        // A project that exists but has never been deployed.
+        let project = projects::ActiveModel {
+            name: Set("Empty Project".to_string()),
+            slug: Set("empty-project".to_string()),
+            repo_name: Set("empty-repo".to_string()),
+            repo_owner: Set("example-owner".to_string()),
+            directory: Set("/tmp/empty-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(create_test_auth_context());
+                next.run(req).await
+            },
+        );
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+
+        // Exists but empty -> 200 with an explicit null.
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, project.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(body, serde_json::json!({ "deployment": null }));
+
+        // Unknown project -> 404 that names the project.
+        let missing_id = project.id + 10_000;
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, missing_id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(response.status(), 404);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(
+            body["detail"],
+            format!("project {missing_id} not found").as_str()
+        );
+
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 

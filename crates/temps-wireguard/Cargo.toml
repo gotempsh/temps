@@ -17,6 +17,9 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+hkdf = { workspace = true }
+hmac = "0.13"
+sha2 = { workspace = true }
 temps-core = { path = "../temps-core" }
 
 # Embedded WireGuard (no external wireguard-tools dependency)

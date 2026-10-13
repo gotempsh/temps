@@ -18,7 +18,10 @@ use temps_core::{
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{AuditContext, SourceFileUploadedAudit, SourceFilesDeletedAudit};
+use crate::handlers::audit::{
+    AuditContext, SourceFileUploadedAudit, SourceFilesDeletedAudit, SourceMapDeletedAudit,
+    SourceMapUploadedAudit, SourceMapsDeletedAudit,
+};
 
 use crate::services::source_map_service::{
     SourceFileInfo, SourceMapError, SourceMapInfo, SourceMapService, MAX_SOURCE_MAP_BYTES,
@@ -197,6 +200,7 @@ async fn upload_source_map(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SourceMapAppState>>,
     Path((project_id, release)): Path<(i32, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
@@ -286,6 +290,28 @@ async fn upload_source_map(
         .upload(project_id, &release, &file_path, source_map_data, dist)
         .await?;
 
+    let audit = SourceMapUploadedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        source_map_id: info.id,
+        release: release.clone(),
+        file_path: info.file_path.clone(),
+        dist: info.dist.clone(),
+        size_bytes: info.size_bytes,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            source_map_id = info.id,
+            "Failed to create source-map upload audit log: {}",
+            e
+        );
+    }
+
     Ok((StatusCode::CREATED, Json(SourceMapResponse::from(info))))
 }
 
@@ -372,6 +398,7 @@ async fn delete_release_source_maps(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SourceMapAppState>>,
     Path((project_id, release)): Path<(i32, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -380,6 +407,25 @@ async fn delete_release_source_maps(
         .source_map_service
         .delete_release(project_id, &release)
         .await?;
+
+    let audit = SourceMapsDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        release: release.clone(),
+        deleted_count: deleted,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            "Failed to create source-map release deletion audit log for release '{}': {}",
+            release,
+            e
+        );
+    }
 
     Ok(Json(DeleteResponse { deleted }))
 }
@@ -405,6 +451,7 @@ async fn delete_source_map(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SourceMapAppState>>,
     Path((project_id, source_map_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -413,6 +460,22 @@ async fn delete_source_map(
         .source_map_service
         .delete_by_id(project_id, source_map_id)
         .await?;
+
+    let audit = SourceMapDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        source_map_id,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            source_map_id, "Failed to create source-map deletion audit log: {}", e
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

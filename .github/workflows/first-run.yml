@@ -1,0 +1,353 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: First Run and Quiet Logs
+
+# Nightly checks that a brand-new install works and stays quiet:
+#
+#   first-run   fresh database + `temps serve` with the bootstrap admin, then
+#               deploy a public image, a git Dockerfile app, a Node preset
+#               app, a compose stack, a static site and managed Postgres +
+#               Redis linked to an app (apps/temps-e2e first-run-scenario),
+#               plus the console's Flexible Docker-image flow in Playwright.
+#               Every step reports its time to first response.
+#   quiet-logs  the same fresh install with one app, one managed service, one
+#               alert rule and one uptime monitor, left idle; fails on any
+#               ERROR line or a module over its WARN-per-hour budget.
+#
+# How to run either locally (including on macOS with Colima) and the 24 h
+# soak: scripts/first-run/README.md.
+on:
+  schedule:
+    # After the 03:00 UTC nightly release cut, so a regression it shipped
+    # shows up the same morning.
+    - cron: "15 4 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: Quiet-logs idle period in minutes (1440 = 24 h; jobs are capped at 6 h on hosted runners)
+        required: false
+        default: "20"
+      warn_per_hour:
+        description: Max WARN lines per hour for any one module during the idle window
+        required: false
+        default: "12"
+  # Only when the suite itself changes; the nightly run covers everything else.
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/first-run.yml
+      - scripts/first-run/**
+      - examples/first-run/**
+      - apps/temps-e2e/src/commands/first-run-scenario.ts
+      - apps/temps-e2e/src/commands/quiet-logs-fixture.ts
+      - apps/temps-e2e/src/lib/first-run.ts
+      - web/e2e/authenticated/first-run-flexible-image.spec.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DATABASE_URL: postgresql://temps:temps@localhost:5432/temps
+  FIRST_RUN_DIR: /tmp/temps-first-run
+  FIRST_RUN_ADDRESS: 127.0.0.1:8760
+  FIRST_RUN_CONSOLE: 127.0.0.1:8761
+  FIRST_RUN_TLS: 127.0.0.1:8763
+  TEMPS_URL: http://127.0.0.1:8760
+  TEMPS_BIN: ${{ github.workspace }}/ci-prebuilt/temps
+  TEMPS_TELEMETRY: "0"
+  ADMIN_EMAIL: admin@localho.st
+
+jobs:
+  checks:
+    name: Suite self-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Test the quiet-logs analyzer
+        run: python3 scripts/first-run/test_check_quiet_logs.py
+
+      - name: Lint suite scripts
+        run: |
+          bash -n scripts/first-run/*.sh
+          shellcheck scripts/first-run/*.sh
+
+  # Same musl build as rust-tests.yml's build-binary, kept here because a
+  # scheduled run has no rust-tests run to borrow an artifact from. It only
+  # restores main's cache (never saves), so it adds no cache entries.
+  build-binary:
+    name: Build temps Binary (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build toolchain image (GHA layer cache, read-only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: toolchain
+          platforms: linux/amd64
+          load: true
+          tags: temps-toolchain:ci
+          cache-from: |
+            type=gha,scope=temps-toolchain
+
+      - name: Restore cargo target dir (musl, fast profile)
+        uses: actions/cache/restore@v6
+        with:
+          path: ci-build-cache
+          key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          restore-keys: |
+            temps-musl-fast-
+
+      - name: Rebuild CAPTCHA WASM in toolchain container
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --volume "$PWD":/build --workdir /build/crates/temps-captcha-wasm \
+            --env CARGO_TARGET_DIR=/tmp/captcha-target \
+            temps-toolchain:ci \
+            sh -ec 'git config --global --add safe.directory /build; bun run build'
+
+      - name: Build temps binary in toolchain container
+        run: |
+          mkdir -p ci-build-cache/target ci-build-cache/cargo-registry ci-prebuilt
+          docker run --rm \
+            --volume "$PWD":/build --workdir /build \
+            --volume "$PWD/ci-build-cache/target":/build/target \
+            --volume "$PWD/ci-build-cache/cargo-registry":/usr/local/cargo/registry \
+            temps-toolchain:ci \
+            sh -ec '
+              git config --global --add safe.directory /build
+              cd /build/web && bun install && \
+                RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist bun run build
+              cd /build
+              cargo build --profile fast --bin temps --package temps-cli
+              cp target/fast/temps ci-prebuilt/temps
+              chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
+                ci-prebuilt crates/temps-cli/dist
+            '
+          chmod +x ci-prebuilt/temps
+          file ci-prebuilt/temps
+
+      - name: Upload temps binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: first-run-temps-binary
+          path: ci-prebuilt/temps
+          retention-days: 1
+          compression-level: 0
+
+  first-run:
+    name: First-run suite
+    needs: build-binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    services:
+      timescaledb:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_DB: temps
+          POSTGRES_USER: temps
+          POSTGRES_PASSWORD: temps
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U temps -d temps"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: first-run-temps-binary
+          path: ci-prebuilt
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install scenario and console test dependencies
+        run: |
+          chmod +x "$TEMPS_BIN"
+          (cd packages/api && bun install --frozen-lockfile && bun run build && bun link)
+          (cd sdks/node/packages/node-sdk && bun install && bun run build && bun link)
+          (cd apps/temps-e2e && bun install --frozen-lockfile && bun run typecheck)
+          (cd web && bun install --frozen-lockfile && bunx playwright install --with-deps chromium)
+
+      - name: Start a fresh Temps (bootstrap admin from env)
+        run: scripts/first-run/temps-instance.sh start
+
+      - name: Log in as the bootstrap admin and mint an API key
+        run: |
+          if ! key="$(scripts/first-run/temps-instance.sh mint-key)"; then
+            echo "Could not mint an API key as the bootstrap admin"
+            exit 1
+          fi
+          echo "::add-mask::$key"
+          printf 'TEMPS_API_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+          password="$(cat "$FIRST_RUN_DIR/admin-password")"
+          echo "::add-mask::$password"
+          printf 'E2E_PASSWORD=%s\n' "$password" >> "$GITHUB_ENV"
+
+      - name: Run the first-run suite
+        env:
+          E2E_EMAIL: ${{ env.ADMIN_EMAIL }}
+          E2E_BASE_URL: http://127.0.0.1:8761
+          # The git step clones the Dockerfile sample app from this very
+          # commit's branch (the fork's, for a fork PR).
+          FIRST_RUN_GIT_URL: https://github.com/${{ github.event.pull_request.head.repo.full_name || github.repository }}.git
+          FIRST_RUN_GIT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: scripts/first-run/run-first-run.sh
+
+      - name: Publish timings
+        if: always()
+        run: |
+          if [ -f "$FIRST_RUN_DIR/first-run-report.md" ]; then
+            cat "$FIRST_RUN_DIR/first-run-report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No first-run report was written." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload reports and server log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: first-run-reports
+          path: |
+            /tmp/temps-first-run/first-run-report.*
+            /tmp/temps-first-run/temps.log
+            web/playwright-report/
+            web/test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Docker diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a --format '{{.Names}} {{.Image}} {{.Status}}'
+          # Operational fields only: a full inspect includes container env,
+          # which carries managed-service credentials.
+          docker ps -aq | while IFS= read -r container; do
+            docker inspect --format '{{json .Name}} {{json .State}}' "$container" || true
+            docker logs --tail 80 "$container" 2>&1 || true
+          done
+
+      - name: Stop Temps
+        if: always()
+        run: scripts/first-run/temps-instance.sh stop
+
+  quiet-logs:
+    name: Quiet-logs soak
+    needs: build-binary
+    runs-on: ubuntu-latest
+    # Nightly: 20 min soak + ~15 min setup. A manual run may ask for a longer
+    # soak, so it gets the hosted-runner maximum of 6 h.
+    timeout-minutes: ${{ inputs.soak_minutes && 360 || 60 }}
+    services:
+      timescaledb:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_DB: temps
+          POSTGRES_USER: temps
+          POSTGRES_PASSWORD: temps
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U temps -d temps"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      SOAK_MINUTES: ${{ inputs.soak_minutes || '20' }}
+      WARN_PER_HOUR: ${{ inputs.warn_per_hour || '12' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: first-run-temps-binary
+          path: ci-prebuilt
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install scenario dependencies
+        run: |
+          chmod +x "$TEMPS_BIN"
+          (cd packages/api && bun install --frozen-lockfile && bun run build && bun link)
+          (cd sdks/node/packages/node-sdk && bun install && bun run build && bun link)
+          (cd apps/temps-e2e && bun install --frozen-lockfile)
+
+      - name: Start a fresh Temps (bootstrap admin from env)
+        run: scripts/first-run/temps-instance.sh start
+
+      - name: Log in as the bootstrap admin and mint an API key
+        run: |
+          if ! key="$(scripts/first-run/temps-instance.sh mint-key)"; then
+            echo "Could not mint an API key as the bootstrap admin"
+            exit 1
+          fi
+          echo "::add-mask::$key"
+          printf 'TEMPS_API_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+
+      - name: Build the workload, idle, and check the log
+        run: scripts/first-run/quiet-logs-soak.sh
+
+      - name: Publish log summary
+        if: always()
+        run: |
+          if [ -f "$FIRST_RUN_DIR/quiet-logs-report.md" ]; then
+            cat "$FIRST_RUN_DIR/quiet-logs-report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The soak did not reach the log check." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload reports and server log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quiet-logs-reports
+          path: |
+            /tmp/temps-first-run/quiet-logs-*
+            /tmp/temps-first-run/temps.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Stop Temps
+        if: always()
+        run: scripts/first-run/temps-instance.sh stop

@@ -82,9 +82,25 @@
  *      in this 2-node cluster the container has nowhere to go but the
  *      control plane, so this also implicitly re-tests the `Local`
  *      fallback scheduling path.
- *  13. remove the worker node (`DELETE /internal/nodes/{id}`) and confirm
+ *  13. sandboxes on the worker (ADR-048 §13, see multinode-sandbox-phases.ts):
+ *      reactivate the drained worker, then placement API, create on the
+ *      named worker (container on the worker, not the control plane), exec,
+ *      file write/read, stop/start, control-plane restart recovery, refused
+ *      snapshot, disallowed node, default placement with the control plane
+ *      excluded, offline node (`docker pause` the worker -> 503), node removal
+ *      refused while a sandbox lives there, destroy (container + work dir
+ *      gone), eviction, and a re-drain whose status allows removal. Runs
+ *      here because the worker hosts no deployment containers any more, so
+ *      only sandboxes can block its removal.
+ *  14. dedicated nodes (see multinode-dedicated-phases.ts): relabel the
+ *      drained worker `temps.sh/role=dedicated` through its agent.json and
+ *      restart it, then prove an unpinned 2-replica deployment stays on the
+ *      control plane, a selector-only deployment fails naming the dedicated
+ *      node, a pinned one lands on the worker, and automatic sandbox
+ *      placement refuses it; re-drain for removal.
+ *  15. remove the worker node (`DELETE /internal/nodes/{id}`) and confirm
  *      it's gone from `GET /internal/nodes`.
- *  14. teardown (in a `finally`, matching every other scenario's
+ *  16. teardown (in a `finally`, matching every other scenario's
  *      discipline): `docker compose down` (no `-v`, so the cache volumes —
  *      cargo registry/git + workspace target/ — survive for a fast
  *      re-run), then explicitly `docker volume rm` the identity/state
@@ -109,6 +125,8 @@ import {
   linkServiceToProject,
 } from '@temps-sdk/api'
 import { makeClient, unwrap } from '../lib/client.ts'
+import { runMultinodeSandboxPhases } from './multinode-sandbox-phases.ts'
+import { runMultinodeDedicatedPhases } from './multinode-dedicated-phases.ts'
 import {
   createE2eProject,
   createE2eService,
@@ -124,24 +142,105 @@ import type { Client } from '@temps-sdk/api/client'
 
 // apps/temps-e2e/src/commands/ -> repo root is 4 levels up.
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..')
-const DEFAULT_COMPOSE_FILE = path.join(REPO_ROOT, 'tools/e2e-multinode-cluster/docker-compose.yml')
-const COMPOSE_PROJECT = 'temps-e2e-mn'
-const CONTROL_PLANE_CONTAINER = 'temps-e2e-mn-control-plane'
-const WORKER_CONTAINER = 'temps-e2e-mn-worker-1'
 const WORKER_NAME = 'worker-1'
-const CONTROL_PLANE_URL = 'http://localhost:18180'
-const POSTGRES_DIRECT_URL = 'postgres://temps:temps@10.52.0.5:5432/temps'
-const IDENTITY_VOLUMES = [
-  'temps-e2e-mn-postgres-data',
-  'temps-e2e-mn-cp-docker',
-  'temps-e2e-mn-cp-data',
-  'temps-e2e-mn-worker1-docker',
-  'temps-e2e-mn-worker1-data',
-  'temps-e2e-mn-worker1-home',
-  'temps-e2e-mn-bootstrap-state',
-]
+
+/**
+ * A 2-node cluster the scenario can run against. Every name, address and
+ * volume differs, so both can run at once.
+ *
+ * - `bridge`: both nodes on one Docker bridge (tools/e2e-multinode-cluster).
+ * - `wireguard`: the nodes share no network at all; the worker sits behind a
+ *   NAT router in an isolated network and reaches the control plane only
+ *   through a kernel WireGuard tunnel, joining with its tunnel address as
+ *   --private-address (tools/e2e-wireguard-cluster).
+ */
+interface ClusterTopology {
+  composeFile: string
+  composeProject: string
+  postgresContainer: string
+  controlPlaneContainer: string
+  workerContainer: string
+  controlPlaneUrl: string
+  postgresDirectUrl: string
+  controlPlanePrivateAddress: string
+  /** Passed as --underlay-dev when the underlay is not the default route. */
+  controlPlaneUnderlayDev?: string
+  workerPrivateAddress: string
+  /** Started together once the control plane's overlay is set up. */
+  workerServices: string[]
+  identityVolumes: string[]
+  wireguard?: {
+    /** A service on the control plane's LAN the worker must never reach. */
+    controlPlaneLanProbe: string
+    /** The same service through the tunnel, which must work. */
+    controlPlaneTunnelProbe: string
+    /** The worker's agent on its LAN address, which the control plane must never reach. */
+    workerLanProbe: string
+    /** The worker's agent through the tunnel, which must work. */
+    workerTunnelProbe: string
+    /** Largest overlay MTU the tunnel can carry (wg0 MTU minus VXLAN overhead). */
+    overlayMtu: number
+  }
+}
+
+export type MultinodeTopologyName = 'bridge' | 'wireguard'
+
+const TOPOLOGIES: Record<MultinodeTopologyName, ClusterTopology> = {
+  bridge: {
+    composeFile: path.join(REPO_ROOT, 'tools/e2e-multinode-cluster/docker-compose.yml'),
+    composeProject: 'temps-e2e-mn',
+    postgresContainer: 'temps-e2e-mn-postgres',
+    controlPlaneContainer: 'temps-e2e-mn-control-plane',
+    workerContainer: 'temps-e2e-mn-worker-1',
+    controlPlaneUrl: 'http://localhost:18180',
+    postgresDirectUrl: 'postgres://temps:temps@10.52.0.5:5432/temps',
+    controlPlanePrivateAddress: '10.52.0.10',
+    workerPrivateAddress: '10.52.0.21',
+    workerServices: ['worker-1'],
+    identityVolumes: [
+      'temps-e2e-mn-postgres-data',
+      'temps-e2e-mn-cp-docker',
+      'temps-e2e-mn-cp-data',
+      'temps-e2e-mn-worker1-docker',
+      'temps-e2e-mn-worker1-data',
+      'temps-e2e-mn-worker1-home',
+      'temps-e2e-mn-bootstrap-state',
+    ],
+  },
+  wireguard: {
+    composeFile: path.join(REPO_ROOT, 'tools/e2e-wireguard-cluster/docker-compose.yml'),
+    composeProject: 'temps-e2e-wg',
+    postgresContainer: 'temps-e2e-wg-postgres',
+    controlPlaneContainer: 'temps-e2e-wg-control-plane',
+    workerContainer: 'temps-e2e-wg-worker-1',
+    controlPlaneUrl: 'http://localhost:18280',
+    postgresDirectUrl: 'postgres://temps:temps@10.56.1.5:5432/temps',
+    controlPlanePrivateAddress: '10.57.0.1',
+    controlPlaneUnderlayDev: 'wg0',
+    workerPrivateAddress: '10.57.0.11',
+    workerServices: ['router-w1', 'worker-1'],
+    identityVolumes: [
+      'temps-e2e-wg-postgres-data',
+      'temps-e2e-wg-cp-docker',
+      'temps-e2e-wg-cp-data',
+      'temps-e2e-wg-worker1-docker',
+      'temps-e2e-wg-worker1-data',
+      'temps-e2e-wg-worker1-home',
+      'temps-e2e-wg-bootstrap-state',
+    ],
+    wireguard: {
+      controlPlaneLanProbe: '10.56.1.10:443',
+      controlPlaneTunnelProbe: '10.57.0.1:443',
+      workerLanProbe: '10.56.2.10:3100',
+      workerTunnelProbe: '10.57.0.11:3100',
+      // wg0 is 1420; VXLAN adds 50 bytes.
+      overlayMtu: 1370,
+    },
+  },
+}
 
 export interface MultinodeJoinScenarioOptions {
+  topology?: string
   composeFile?: string
   buildTimeout?: string
   keep?: boolean
@@ -151,6 +250,8 @@ export interface MultinodeJoinScenarioOptions {
 interface StepLog {
   step: string
   ok: boolean
+  /** Not run (the reason is in `detail`); does not fail the scenario. */
+  skipped?: boolean
   detail?: string
   ms?: number
 }
@@ -274,7 +375,21 @@ async function waitForWhoami(
 }
 
 export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOptions): Promise<void> {
-  const composeFile = opts.composeFile ?? DEFAULT_COMPOSE_FILE
+  const topologyName = (opts.topology ?? 'bridge') as MultinodeTopologyName
+  const topology = TOPOLOGIES[topologyName]
+  if (!topology) {
+    throw new Error(`--topology must be one of ${Object.keys(TOPOLOGIES).join(', ')}, got "${opts.topology}"`)
+  }
+  const {
+    composeProject: COMPOSE_PROJECT,
+    controlPlaneContainer: CONTROL_PLANE_CONTAINER,
+    workerContainer: WORKER_CONTAINER,
+    controlPlaneUrl: CONTROL_PLANE_URL,
+    postgresDirectUrl: POSTGRES_DIRECT_URL,
+    postgresContainer: POSTGRES_CONTAINER,
+    identityVolumes: IDENTITY_VOLUMES,
+  } = topology
+  const composeFile = opts.composeFile ?? topology.composeFile
   const buildTimeoutMs = Number(opts.buildTimeout ?? '1800000')
   if (!Number.isFinite(buildTimeoutMs) || buildTimeoutMs <= 0) {
     throw new Error(`--build-timeout must be a positive number of milliseconds, got "${opts.buildTimeout}"`)
@@ -283,7 +398,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
   const log = (msg: string) => {
     if (!json) process.stderr.write(msg + '\n')
   }
-  if (!json) log(`Temps multinode-join scenario  ->  dedicated 2-node cluster (${composeFile})`)
+  if (!json) log(`Temps multinode-join scenario  ->  dedicated 2-node ${topologyName} cluster (${composeFile})`)
 
   const composeArgs = ['docker', 'compose', '-f', composeFile, '-p', COMPOSE_PROJECT]
 
@@ -305,6 +420,10 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       throw e
     }
   }
+  const skip = (name: string, reason: string) => {
+    steps.push({ step: name, ok: true, skipped: true, detail: reason })
+    log(`\n▶ ${name}\n  - SKIPPED: ${reason}`)
+  }
 
   let client: Client | undefined
   let cfg: { url: string; apiKey: string } | undefined
@@ -319,7 +438,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     const revoke = await runCaptured([
       'docker',
       'exec',
-      'temps-e2e-mn-postgres',
+      POSTGRES_CONTAINER,
       'psql',
       '-U',
       'temps',
@@ -413,6 +532,28 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     client = makeClient(cfg)
     log(`  cfg: ${cfg.url}`)
 
+    // The container reports healthy once the proxy completes a TLS handshake,
+    // which can be seconds before the API behind it is listening; until then
+    // the proxy answers 503. Wait for the API itself before the first write.
+    await step('wait for the control-plane API to answer through the proxy', () =>
+      pollUntil(
+        async () => {
+          try {
+            return (await adminListNodes({ client: client! })).response?.status ?? 0
+          } catch {
+            return 0
+          }
+        },
+        (status) => status === 200,
+        {
+          timeoutMs: 120_000,
+          intervalMs: 1000,
+          onPoll: (status) => log(`    ...control-plane API status=${status || '(no response)'}`),
+          label: 'control-plane API to answer an authenticated request',
+        },
+      ),
+    )
+
     managedPostgres = await step('create managed Postgres before enabling the control-plane overlay', () =>
       createE2eService(client!, {
         name: `${runId}-postgres`,
@@ -446,7 +587,8 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         'network',
         'setup-multi-node',
         '--private-address',
-        '10.52.0.10',
+        topology.controlPlanePrivateAddress,
+        ...(topology.controlPlaneUnderlayDev ? ['--underlay-dev', topology.controlPlaneUnderlayDev] : []),
       ])
       if (setup.code !== 0) {
         throw new Error(
@@ -463,9 +605,9 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
 
     await step('start a worker only after live control-plane setup', async () => {
       await runStreamed(
-        [...composeArgs, 'up', '-d', '--no-deps', 'worker-1'],
+        [...composeArgs, 'up', '-d', '--no-deps', ...topology.workerServices],
         (line) => log(`    [worker] ${line}`),
-        'docker compose up -d --no-deps worker-1',
+        `docker compose up -d --no-deps ${topology.workerServices.join(' ')}`,
         buildTimeoutMs,
       )
     })
@@ -519,7 +661,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       const posture = await runCaptured([
         'docker',
         'exec',
-        'temps-e2e-mn-postgres',
+        POSTGRES_CONTAINER,
         'psql',
         '-At',
         '-U',
@@ -533,6 +675,111 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         throw new Error(`unexpected enrollment posture: ${posture.stdout.trim() || posture.stderr.trim() || '(no output)'}`)
       }
     })
+
+    // Bytes the worker's tunnel has carried, sampled after the join so the
+    // app-traffic steps below can be shown to have used it.
+    /** Bytes the worker has sent through its WireGuard tunnel, all peers. */
+    const wireguardSentBytes = async (): Promise<number> => {
+      const res = await runCaptured(['docker', 'exec', WORKER_CONTAINER, 'wg', 'show', 'wg0', 'transfer'])
+      if (res.code !== 0) throw new Error(`wg show wg0 transfer failed on the worker: ${res.stderr.trim()}`)
+      return res.stdout
+        .trim()
+        .split('\n')
+        .reduce((sum, line) => {
+          const [, , tx = '0'] = line.trim().split(/\s+/)
+          return sum + Number(tx)
+        }, 0)
+    }
+    if (topology.wireguard) {
+      const { controlPlaneLanProbe, controlPlaneTunnelProbe, workerLanProbe, workerTunnelProbe, overlayMtu } =
+        topology.wireguard
+      const tcpProbe = (target: string, from = WORKER_CONTAINER) => {
+        const separator = target.lastIndexOf(':')
+        return runCaptured([
+          'docker',
+          'exec',
+          from,
+          'timeout',
+          '3',
+          'bash',
+          '-c',
+          `exec 3<>/dev/tcp/${target.slice(0, separator)}/${target.slice(separator + 1)}`,
+        ])
+      }
+      await step('prove the worker reaches the control plane only through WireGuard', async () => {
+        const nodes = unwrap(await adminListNodes({ client: client! }), 'adminListNodes')
+        const worker = nodes.nodes.find((node) => node.id === workerNodeId)
+        if (!worker?.address.includes(`//${topology.workerPrivateAddress}:`)) {
+          throw new Error(
+            `worker registered ${worker?.address ?? '(missing)'}, expected its tunnel address ${topology.workerPrivateAddress}`,
+          )
+        }
+        if ((await tcpProbe(controlPlaneLanProbe)).code === 0) {
+          throw new Error(`worker reached ${controlPlaneLanProbe} on the control plane's LAN without the tunnel`)
+        }
+        if ((await tcpProbe(controlPlaneTunnelProbe)).code !== 0) {
+          throw new Error(`worker could not reach ${controlPlaneTunnelProbe} through the tunnel`)
+        }
+        // The other direction carries the agent API and every proxied request.
+        if ((await tcpProbe(workerLanProbe, CONTROL_PLANE_CONTAINER)).code === 0) {
+          throw new Error(`control plane reached the worker's agent at ${workerLanProbe} without the tunnel`)
+        }
+        if ((await tcpProbe(workerTunnelProbe, CONTROL_PLANE_CONTAINER)).code !== 0) {
+          throw new Error(`control plane could not reach the worker's agent at ${workerTunnelProbe} through the tunnel`)
+        }
+        const handshakes = await runCaptured(['docker', 'exec', WORKER_CONTAINER, 'wg', 'show', 'wg0', 'latest-handshakes'])
+        const latest = Number(handshakes.stdout.trim().split(/\s+/)[1] ?? '0')
+        if (handshakes.code !== 0 || !(latest > 0)) {
+          throw new Error(`worker has no WireGuard handshake with the control plane: ${handshakes.stdout.trim() || handshakes.stderr.trim()}`)
+        }
+        log(
+          `  worker: ${controlPlaneLanProbe} unreachable, ${controlPlaneTunnelProbe} reachable; control plane: ${workerLanProbe} unreachable, ${workerTunnelProbe} reachable; handshake ${Math.round(Date.now() / 1000 - latest)}s ago`,
+        )
+      })
+      await step(`check both overlays fit inside the tunnel and carry full-size packets (MTU <= ${overlayMtu})`, async () => {
+        // A VXLAN sized for the wrong link silently drops full-size packets
+        // that the tunnel cannot carry, which stalls large TCP transfers
+        // between containers on different nodes.
+        const overlayMtus = new Map<string, number>()
+        for (const container of [CONTROL_PLANE_CONTAINER, WORKER_CONTAINER]) {
+          const res = await runCaptured(['docker', 'exec', container, 'cat', '/sys/class/net/vxlan-temps0/mtu'])
+          const mtu = Number(res.stdout.trim())
+          if (res.code !== 0 || !(mtu > 0)) {
+            throw new Error(`${container} has no vxlan-temps0 overlay: ${res.stderr.trim() || res.stdout.trim()}`)
+          }
+          if (mtu > overlayMtu) {
+            throw new Error(
+              `${container} sized its overlay for MTU ${mtu}, but the WireGuard tunnel only carries ${overlayMtu}; full-size cross-node packets would be dropped`,
+            )
+          }
+          overlayMtus.set(container, mtu)
+        }
+        // The configured MTU is only a claim: send the largest packet each
+        // node's overlay allows, unfragmentable, to the other node's overlay
+        // bridge. An overlay sized larger than the tunnel fails here.
+        const pairs: Array<[string, string]> = [
+          [WORKER_CONTAINER, CONTROL_PLANE_CONTAINER],
+          [CONTROL_PLANE_CONTAINER, WORKER_CONTAINER],
+        ]
+        for (const [from, to] of pairs) {
+          const addr = await runCaptured(['docker', 'exec', to, 'ip', '-4', '-o', 'addr', 'show', 'br-temps0'])
+          const bridgeIp = addr.stdout.match(/inet (\d+\.\d+\.\d+\.\d+)\//)?.[1]
+          if (addr.code !== 0 || !bridgeIp) {
+            throw new Error(`${to} has no br-temps0 address: ${addr.stderr.trim() || addr.stdout.trim()}`)
+          }
+          const payload = (overlayMtus.get(from) ?? overlayMtu) - 28
+          const ping = await runCaptured([
+            'docker', 'exec', from, 'ping', '-M', 'do', '-c', '3', '-W', '2', '-s', String(payload), bridgeIp,
+          ])
+          if (ping.code !== 0) {
+            throw new Error(
+              `a full-size overlay packet (${payload + 28} bytes, DF set) from ${from} to ${to}'s overlay bridge ${bridgeIp} was not delivered: ${ping.stdout.trim().split('\n').slice(-2).join(' ') || ping.stderr.trim()}`,
+            )
+          }
+          log(`  ${from} -> ${to} (${bridgeIp}): ${payload + 28}-byte unfragmentable packet delivered`)
+        }
+      })
+    }
 
     const project = await step('create a throwaway project', () =>
       createE2eProject(client!, { name: `${runId}-mn`, exposedPort: 80 }),
@@ -613,6 +860,30 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
 
     const target = resolveLoadTarget(cfg.url, env.mainUrl)
     await step('real HTTP proof of life through the control-plane proxy', () => waitForWhoami(target))
+
+    if (topology.wireguard) {
+      await step('prove a proxied response from the worker crossed the WireGuard tunnel', async () => {
+        // The app runs only on the worker, and the control plane reaches it at
+        // the worker's tunnel address. Ask it for a 1 MiB body through the
+        // control-plane proxy: the worker's tunnel send counter must grow by at
+        // least that much. Heartbeats and keepalives in the same few seconds
+        // are a few KB, so they cannot account for it.
+        const size = 1024 * 1024
+        const before = await wireguardSentBytes()
+        const res = await fetch(new URL(`/data?size=${size}`, target.url), { headers: target.headers })
+        const body = await res.arrayBuffer()
+        const sent = (await wireguardSentBytes()) - before
+        if (res.status !== 200 || body.byteLength < size) {
+          throw new Error(`proxied /data?size=${size} returned HTTP ${res.status} with ${body.byteLength} bytes`)
+        }
+        if (sent < size) {
+          throw new Error(
+            `the worker sent only ${sent} bytes through the tunnel while serving a ${size}-byte proxied response; the response took another path`,
+          )
+        }
+        log(`  ${body.byteLength}-byte response; the worker sent ${sent} bytes through wg0 meanwhile`)
+      })
+    }
 
     const dnsClientProject = await step('create a second application for app-to-app DNS', () =>
       createE2eProject(client!, { name: `${runId}-dns-client`, exposedPort: 8080 }),
@@ -824,7 +1095,36 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       await waitForWhoami(target)
     })
 
-    await step('remove the worker node', async () => {
+    await runMultinodeSandboxPhases({
+      client: client!,
+      cfg,
+      runId,
+      workerNodeId: workerNodeId!,
+      workerName: WORKER_NAME,
+      workerContainer: WORKER_CONTAINER,
+      controlPlaneContainer: CONTROL_PLANE_CONTAINER,
+      step,
+      skip,
+      log,
+      runCaptured,
+      containerHealthStatus,
+    })
+
+    await runMultinodeDedicatedPhases({
+      client: client!,
+      cfg,
+      runId,
+      workerNodeId: workerNodeId!,
+      workerName: WORKER_NAME,
+      workerContainer: WORKER_CONTAINER,
+      controlPlaneContainer: CONTROL_PLANE_CONTAINER,
+      step,
+      log,
+      runCaptured,
+      dockerPsNames,
+    })
+
+    await step('remove the worker node (no deployment containers, and after eviction no sandboxes, block it)', async () => {
       unwrap(
         await adminRemoveNode({ client: client!, path: { node_id: workerNodeId! } }),
         'adminRemoveNode',
@@ -838,7 +1138,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         WORKER_CONTAINER,
         'bash',
         '-c',
-        'read -r token < /run/temps-bootstrap/join_token.txt; TEMPS_JOIN_TOKEN="$token" /usr/local/bin/temps join https://control-plane.temps.test "$token" --name worker-1 --private-address 10.52.0.21 --agent-address 0.0.0.0:3100',
+        `read -r token < /run/temps-bootstrap/join_token.txt; TEMPS_JOIN_TOKEN="$token" /usr/local/bin/temps join https://control-plane.temps.test "$token" --name worker-1 --private-address ${topology.workerPrivateAddress} --agent-address 0.0.0.0:3100`,
       ])
       if (replay.code === 0) {
         throw new Error('consumed single-use enrollment token unexpectedly registered the removed node again')

@@ -295,6 +295,7 @@ mod tests {
             6100,
             6100,
             ServiceResourceLimits::default(),
+            &crate::externalsvc::postgres_cluster::ClusterAuthSecrets::generate(),
         );
 
         assert!(
@@ -334,6 +335,7 @@ mod tests {
             6100,
             6101,
             ServiceResourceLimits::default(),
+            &crate::externalsvc::postgres_cluster::ClusterAuthSecrets::generate(),
         );
 
         assert!(params.environment.contains_key("MONITOR_URI"));

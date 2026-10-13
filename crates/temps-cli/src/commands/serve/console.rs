@@ -87,6 +87,7 @@ use temps_deployments::handlers::nodes::NodeAppState;
 use temps_deployments::jobs::node_health_check::{
     check_control_plane_resources, check_drain_completion, check_node_health, check_node_resources,
     failover_due_nodes, notify_nodes_offline, refresh_control_plane_metrics,
+    restore_recovered_replicas, HeartbeatWatch,
 };
 use temps_deployments::services::node_service::NodeService;
 use utoipa_swagger_ui::SwaggerUi;
@@ -241,8 +242,6 @@ fn spawn_heartbeat_task(
     reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
     db: std::sync::Arc<sea_orm::DatabaseConnection>,
 ) {
-    use temps_core::telemetry::TelemetryEventKind;
-
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         // The first tick completes immediately; skip it so the first heartbeat
@@ -251,12 +250,28 @@ fn spawn_heartbeat_task(
         interval.tick().await;
         loop {
             interval.tick().await;
-            let event =
-                build_instance_event(TelemetryEventKind::InstanceHeartbeat, db.as_ref()).await;
-            reporter.report(event);
-            tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+            emit_heartbeat(reporter.as_ref(), db.as_ref()).await;
         }
     });
+}
+
+/// One heartbeat tick. Checks the *current* telemetry state first: an admin
+/// can turn telemetry off (or on) at runtime from Settings > Telemetry, so the
+/// loop always runs and each tick decides. When disabled nothing is built or
+/// sent -- not even the count queries run. Returns whether an event was sent.
+async fn emit_heartbeat(
+    reporter: &dyn temps_core::telemetry::TelemetryReporter,
+    db: &sea_orm::DatabaseConnection,
+) -> bool {
+    use temps_core::telemetry::TelemetryEventKind;
+
+    if !reporter.is_enabled() {
+        return false;
+    }
+    let event = build_instance_event(TelemetryEventKind::InstanceHeartbeat, db).await;
+    reporter.report(event);
+    tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+    true
 }
 
 /// Interval between anonymous `error_summary` flushes. Shorter than the daily
@@ -279,9 +294,14 @@ fn spawn_error_summary_task(
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Always drain, so counts accumulated while telemetry was off are
+            // discarded rather than reported after an admin turns it back on.
             let Some(summary) = temps_core::error_metrics::global().drain() else {
                 continue;
             };
+            if !reporter.is_enabled() {
+                continue;
+            }
             reporter.report(build_error_summary_event(&summary));
             tracing::debug!("emitted anonymous error_summary telemetry event");
         }
@@ -727,7 +747,7 @@ enum InitialAdminBootstrapError {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum InitialAdminConfigError {
+pub(crate) enum InitialAdminConfigError {
     #[error("TEMPS_ADMIN_EMAIL must be a valid email address")]
     InvalidEmail,
     #[error("TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE must be configured together")]
@@ -1067,7 +1087,7 @@ fn bootstrap_cloud_enrollment_from_env(
         let already_linked_service = cloud_service.clone();
         let apply_backend_url_service = cloud_service.clone();
         let enroll_service = cloud_service.clone();
-        let provision_service = cloud_service;
+        let provision_service = cloud_service.clone();
         let backend_url_audit = audit_logger.clone();
         let link_audit = audit_logger.clone();
         let backup_audit = audit_logger;
@@ -1112,6 +1132,8 @@ fn bootstrap_cloud_enrollment_from_env(
                          registered; the CLOUD_LINK_CONNECTED audit record was not written"
                     ),
                 }
+                // Enrollment preserves console consent. Enable remote console
+                // access explicitly from Settings > Temps Cloud or the CLI.
             },
             move || async move {
                 provision_service
@@ -1494,18 +1516,39 @@ async fn serve_original_console(req: Request) -> Response {
     serve_static_from(&WEBSITE, req)
 }
 
+/// Detail text for a request path that must never fall through to the SPA,
+/// or `None` when the console may serve it.
+///
+/// The returned text is a fixed literal (no request data), so it is safe to
+/// embed in the JSON body verbatim.
+fn unmatched_api_detail(path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/") {
+        Some("No API route matched")
+    } else if path == "/ai/v1" || path.starts_with("/ai/v1/") {
+        Some(
+            "No API route matched. The AI gateway is served under /api/ai/v1, \
+             for example /api/ai/v1/chat/completions",
+        )
+    } else {
+        None
+    }
+}
+
 fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     let raw_path = req.uri().path();
 
     // Never serve the SPA for /api/ paths — those should 404 if unmatched
-    // by any API router (including external plugin proxies).
-    if raw_path.starts_with("/api/") {
+    // by any API router (including external plugin proxies). The same goes for
+    // `/ai/v1/*`: the AI gateway lives under `/api/ai/v1`, and answering a
+    // client that dropped the `/api` prefix with the console HTML (200) makes
+    // every OpenAI SDK fail with an unparseable body instead of a pointer to
+    // the right URL.
+    if let Some(detail) = unmatched_api_detail(raw_path) {
+        let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"status":404,"title":"Not Found","detail":"No API route matched"}"#,
-            ))
+            .body(Body::from(body))
             .unwrap();
     }
 
@@ -1675,8 +1718,12 @@ async fn validate_geolite2_database(
     );
     match download_geolite2_database_on_startup(default_db_path, license_key).await {
         Ok(()) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!(
-            "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
+        Err(e) => Err(anyhow::Error::new(
+            super::startup_failure::ConsoleStartupError::GeoDatabase {
+                checked: search_paths.clone(),
+                reason: e.to_string(),
+                message: format!(
+                    "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
             The MaxMind GeoLite2 database is required for geolocation features.\n\n\
             📍 Checked locations (in order):\n\
             1. {}\n\
@@ -1701,10 +1748,12 @@ async fn validate_geolite2_database(
             interval configured there (default every 24 hours).\n\n\
             🐳 For Docker users:\n\
             See Dockerfile in the repository for embedding the database",
-            search_paths[0].display(),
-            search_paths[1].display(),
-            e,
-            search_paths[1].display()
+                    search_paths[0].display(),
+                    search_paths[1].display(),
+                    e,
+                    search_paths[1].display()
+                ),
+            },
         )),
     }
 }
@@ -1819,6 +1868,10 @@ pub struct ConsoleApiParams {
     /// constructed at all — see `register_local_workload_plugins` — and is
     /// published to clients through `GET /api/platform/features`.
     pub profile: super::ServeProfile,
+    /// Shared with the in-process proxy. Marked running here when the
+    /// listeners start; the caller records the failure if this function
+    /// returns an error, so the proxy can explain it on the console URL.
+    pub startup_state: Arc<temps_core::console_startup::ConsoleStartupState>,
 }
 
 /// How long the `control-plane` profile waits for a Docker ping before
@@ -1826,28 +1879,29 @@ pub struct ConsoleApiParams {
 /// startup path, and "no daemon" is an expected, supported answer here.
 const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The operator-facing message for "this profile needs Docker and it isn't
+/// The operator-facing error for "this profile needs Docker and it isn't
 /// there". Shared by both failure points so the remediation steps can't drift
-/// apart.
+/// apart; names the endpoint that was tried and where it came from.
 fn docker_unavailable_error(reason: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "❌ Docker dependency check FAILED\n\n\
-        The system requires Docker to be running and accessible.\n\n\
-        Error details: {}\n\n\
-        Solutions:\n\
-        1. Ensure Docker daemon is running\n\
-           - macOS: Check Docker Desktop application\n\
-           - Linux: Run 'sudo systemctl start docker'\n\n\
-        2. Verify Docker socket permissions\n\
-           - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
-        3. Check Docker environment variables\n\
-           - DOCKER_HOST may need to be set\n\n\
-        4. Run this control plane without local workloads\n\
-           - `temps serve --profile control-plane` needs no Docker daemon; \
-             applications then run on worker nodes joined with `temps join`\n\n\
-        Deployment features will not be available until Docker is accessible.",
-        reason
+    anyhow::Error::new(
+        super::startup_failure::ConsoleStartupError::DockerUnavailable {
+            endpoint: crate::docker_context::docker_endpoint().describe(),
+            reason: reason.to_string(),
+        },
     )
+}
+
+/// Bind a console listener, naming the address in the error so the startup
+/// status page can tell the operator which address is taken.
+async fn bind_console_listener(
+    address: &str,
+) -> Result<TcpListener, super::startup_failure::ConsoleStartupError> {
+    TcpListener::bind(address).await.map_err(|source| {
+        super::startup_failure::ConsoleStartupError::ListenerBind {
+            address: address.to_string(),
+            source,
+        }
+    })
 }
 
 /// Storage backend selection for the log aggregator.
@@ -2033,6 +2087,81 @@ fn health_router(ready: Arc<std::sync::atomic::AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
         .route("/readyz", get(readyz))
+}
+
+/// The console's public surface and nothing else (ADR-051 D4).
+///
+/// Serves the health probes and the public router under `/api`. It has no
+/// admin routes, no MCP endpoint and no dashboard fallback, so a request that
+/// reaches it cannot execute an admin handler or receive the SPA whatever its
+/// path, `Host`, forwarding headers or cookies: the boundary is what is
+/// mounted here, not a path match. The proxy sends it the public ingress
+/// hostname and every request the admin gate denies.
+///
+/// Handlers on `public_router` authenticate the request (a provider
+/// signature, a capability token in the path, a scoped API key), never the
+/// session — they have to work for callers that hold no cookie at all.
+fn public_only_app(health: Router, public_router: Router) -> Router {
+    Router::new()
+        .merge(health)
+        .nest("/api", public_router)
+        .fallback(public_only_not_found)
+        .layer(axum::middleware::from_fn(track_server_errors))
+}
+
+/// Serve the public-only app until shutdown. Resolves immediately when this
+/// process has no such listener (a split console started without
+/// `--console-ingress-address`), so callers can join it unconditionally.
+async fn serve_public_only(
+    ingress: Option<(TcpListener, Router)>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    match ingress {
+        Some((listener, app)) => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown)
+            .await
+        }
+        None => Ok(()),
+    }
+}
+
+/// 404 for everything that is not a public route. A browser gets the same
+/// branded page the proxy renders for an unknown host, so a non-allowlisted
+/// visitor sees exactly what they saw before this listener existed; an API
+/// client gets an empty body.
+async fn public_only_not_found(req: Request) -> Response {
+    use axum::response::IntoResponse;
+
+    let headers = req.headers();
+    let wants_html = !req.uri().path().starts_with("/api/")
+        && headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|accept| accept.contains("text/html"));
+    if !wants_html {
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        ],
+        temps_proxy::branded_404::render(host, request_id),
+    )
+        .into_response()
 }
 
 /// ALLOWLIST for the AI `call_api` read tool — opt-in / secure by default.
@@ -2851,6 +2980,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         traefik_discovery,
         external_plugin_registry,
         profile,
+        startup_state,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -2957,23 +3087,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Checking logs directory...");
     let logs_dir = config.data_dir.join("logs");
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-        return Err(anyhow::anyhow!(
-            "❌ Logs directory creation FAILED\n\n\
-            Cannot create or access the logs directory.\n\n\
-            Path: {}\n\
-            Error: {}\n\n\
-            Solutions:\n\
-            1. Check directory permissions\n\
-               - Ensure write permissions to parent directory: {}\n\n\
-            2. Verify disk space\n\
-               - Run: df -h\n\n\
-            3. Check file ownership\n\
-               - Run: ls -la {}\n\n\
-            Logs are required for system diagnostics and operation tracking.",
-            logs_dir.display(),
-            e,
-            config.data_dir.display(),
-            config.data_dir.display()
+        return Err(anyhow::Error::new(
+            super::startup_failure::ConsoleStartupError::LogsDirectory {
+                path: logs_dir.clone(),
+                data_dir: config.data_dir.clone(),
+                reason: e.to_string(),
+            },
         ));
     }
     debug!("✓ Logs directory is accessible");
@@ -3143,7 +3262,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let stateless_instance_id = temps_config::stateless_instance_id(db.as_ref()).await?;
     let shared_log_storage_config =
         log_aggregator_storage_config(&config.data_dir, stateless_instance_id.as_deref())
-            .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
+            .map_err(|source| super::startup_failure::ConsoleStartupError::LogStorage { source })?;
     let logs_plugin = Box::new(LogsPlugin::new(logs_dir, shared_log_storage_config.clone()));
     plugin_manager.register_plugin(logs_plugin);
 
@@ -3536,10 +3655,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         tracing::error!("  • Service initialization error");
         tracing::error!("");
         tracing::error!("Check the error message above for details.");
-        return Err(anyhow::anyhow!(
-            "Plugin initialization failed: {}",
-            error_msg
-        ));
+        return Err(
+            super::startup_failure::ConsoleStartupError::PluginInitialization { reason: error_msg }
+                .into(),
+        );
     }
     debug!("All plugins initialized successfully");
 
@@ -3582,16 +3701,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
-            // Keep "active instances" honest: a daily heartbeat so a live-but-idle
-            // instance still checks in even when it isn't deploying. No-op when
-            // telemetry is disabled (guarded above + report() no-ops anyway).
-            spawn_heartbeat_task(reporter.clone(), db.clone());
-            // Periodic aggregated error_summary flush (ERROR logs / console
-            // 5xx / panics — counts only, never messages). Only spawned when
-            // telemetry is enabled; the counters themselves are just bounded
-            // in-process memory either way.
-            spawn_error_summary_task(reporter.clone());
         }
+        // Telemetry can be switched on or off at runtime from Settings >
+        // Telemetry, so the periodic tasks always run and every tick checks the
+        // current state: nothing is built or sent while it is off.
+        //
+        // Keep "active instances" honest: a daily heartbeat so a live-but-idle
+        // instance still checks in even when it isn't deploying.
+        spawn_heartbeat_task(reporter.clone(), db.clone());
+        // Periodic aggregated error_summary flush (ERROR logs / console
+        // 5xx / panics — counts only, never messages). The counters are
+        // bounded in-process memory and are drained every tick either way.
+        spawn_error_summary_task(reporter.clone());
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
         // Always ensure the system user (id=0) exists — needed for webhook-created
@@ -3625,11 +3746,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             } else if let Some(admin_email) = prompt_for_admin_email()? {
                 create_initial_admin_user(db.as_ref(), &admin_email, None).await?;
             } else {
-                return Err(anyhow::anyhow!("Valid admin email is required to continue"));
+                return Err(super::startup_failure::ConsoleStartupError::AdminEmailRequired.into());
             }
         }
     } else {
         debug!("UserService not available, skipping user initialization");
+    }
+
+    if let Some(manager) = service_context.get_service::<temps_git::GitProviderManager>() {
+        let db = service_context.require_service::<temps_database::DbConnection>();
+        let encryption = service_context.require_service::<temps_core::EncryptionService>();
+        if let Err(error) =
+            temps_git::services::host_import::import_host_credentials(db, encryption, manager).await
+        {
+            tracing::warn!(event = "host_git_bootstrap_failed", error = %error);
+        }
     }
 
     // Cloud console-access SSO bootstrap from `<TEMPS_DATA_DIR>/cloud-oidc.json`
@@ -4054,12 +4185,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // can retrieve it for HTTP query endpoints.
                     service_context.register_service(metrics_store.clone());
 
-                    let scraper = Arc::new(MetricsScraper::new(
-                        db.clone(),
-                        metrics_store.clone(),
-                        cfg_svc,
-                        enc_svc,
-                    ));
+                    let mut scraper =
+                        MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
+                    // HA clusters are scraped at their elected primary, which
+                    // only the providers layer can resolve.
+                    match service_context.get_service::<temps_providers::ExternalServiceManager>() {
+                        Some(manager) => {
+                            scraper = scraper.with_cluster_primary_connector(manager);
+                        }
+                        None => warn!(
+                            "ExternalServiceManager not available - HA cluster database metrics \
+                             will not be collected"
+                        ),
+                    }
+                    let scraper = Arc::new(scraper);
 
                     tokio::spawn(async move {
                         scraper.start().await;
@@ -4257,8 +4396,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let health_config_service = service_context.get_service::<temps_config::ConfigService>();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Node silence only counts from when this process started watching
+            // heartbeats: while it was down it recorded none.
+            let mut heartbeat_watch = HeartbeatWatch::start(chrono::Utc::now());
             loop {
                 interval.tick().await;
+                let watching_since = heartbeat_watch.tick(chrono::Utc::now());
                 // Sample the control plane's own host metrics so the synthetic
                 // control-plane node shows live CPU/mem/disk (it has no agent
                 // heartbeat). Always runs, independent of alert config.
@@ -4279,7 +4422,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     },
                     None => temps_core::MultiNodeSettings::default().node_failover_after_secs,
                 };
-                let offline_ids = check_node_health(&health_node_service, health_db.as_ref()).await;
+                let offline_ids =
+                    check_node_health(&health_node_service, health_db.as_ref(), watching_since)
+                        .await;
                 if !offline_ids.is_empty() {
                     tracing::info!(
                         "Node health check: marked {} node(s) as offline",
@@ -4306,6 +4451,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 {
                     let failed_over = failover_due_nodes(
                         after_secs,
+                        watching_since,
                         &health_node_service,
                         deployment_service,
                         health_alarm_service.as_ref(),
@@ -4315,6 +4461,19 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         tracing::info!(
                             "Node health check: failed over workloads from {} node(s)",
                             failed_over.len()
+                        );
+                    }
+                }
+
+                // Restore the replicas a failover took out of routing on nodes
+                // that are sending heartbeats again.
+                if let Some(ref deployment_service) = deployment_service_for_failover {
+                    let restored =
+                        restore_recovered_replicas(&health_node_service, deployment_service).await;
+                    if restored > 0 {
+                        tracing::info!(
+                            "Node health check: queued {} recovery redeploy(s) for recovered node(s)",
+                            restored
                         );
                     }
                 }
@@ -4548,6 +4707,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // ADR-045 §3: a second clone of `admin_router`, shaped exactly like
+    // `admin_app` below (`nest("/api", ..)` + the static-file fallback) but
+    // taken *before* that router is wrapped in the admin IP-allowlist gate —
+    // for the same reason `plugin_api_router` above omits it: authorization
+    // for a console-proxied request comes from Cloud's own auth plus the
+    // browser's session cookie, not from network topology. Installed into
+    // the shared `ConsoleDispatchSlot` near the `RouterHostApi` wiring below,
+    // for `temps-cloud-client::console_proxy::ConsoleProxyWorker` (started
+    // elsewhere, once the `cloud.console_access_enabled` setting exists) to
+    // drive in-process.
+    let console_router = Router::new()
+        .nest("/api", admin_router.clone())
+        .fallback(serve_static_file);
+    // Nodes paired from the control plane reach it over the WireGuard mesh
+    // (ADR 048 D3); that listener serves only the routes nodes call.
+    super::node_api::spawn(
+        db.clone(),
+        service_context.require_service::<temps_config::ConfigService>(),
+        service_context.require_service::<temps_core::EncryptionService>(),
+        Router::new().nest("/api", public_router.clone().merge(admin_router.clone())),
+    );
+
     // Build root-level MCP routes (ADR-039). These live outside /api so the
     // CLI wizard's unauthenticated probe (GET /mcp/tools) works without a key.
     // The authenticated sub-router gets the full plugin middleware stack (auth,
@@ -4566,6 +4747,14 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             Router::new()
         }
     };
+
+    // ADR-051 D4: the same public routes a second time, with nothing else
+    // around them. Bound in both listener modes: in dual-listener mode
+    // `console_address` has no admin routes, but `public_app` below still
+    // mounts the authenticated MCP endpoint, so it cannot stand in for it.
+    let ingress_app = config
+        .public_surface_address()
+        .map(|_| public_only_app(health_router(ready_flag.clone()), public_router.clone()));
 
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
@@ -4609,7 +4798,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 admin_gate_handle.clone(),
                 super::admin_gate::admin_gate,
             ));
-        let listener = TcpListener::bind(addr).await?;
+        let listener = bind_console_listener(addr).await?;
         info!("Platform console (original temps UI) listening on {addr}");
         tokio::spawn(async move {
             if let Err(e) = axum::serve(
@@ -4624,6 +4813,33 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     info!("Plugin system initialized successfully with static file serving");
+
+    // ADR-045 §3: install the just-assembled `console_router` into a shared
+    // slot for the console-proxy dispatcher — the same "shared slot, filled
+    // post-construction" shape `RouterHostApi`'s bridge uses just below, and
+    // for the same reason: the router does not exist until this point in
+    // startup. The Cloud plugin registers the slot (and starts
+    // `ConsoleProxyWorker` reading from it) during service registration;
+    // this fills it. The fallback only exists for builds without that
+    // plugin, so the console still starts — nothing reads the slot then.
+    let console_dispatch_slot = match plugin_manager
+        .service_context()
+        .get_service::<temps_cloud_client::ConsoleDispatchSlot>()
+    {
+        Some(slot) => slot.as_ref().clone(),
+        None => {
+            let slot = temps_cloud_client::ConsoleDispatchSlot::new();
+            plugin_manager
+                .service_context()
+                .register_service(Arc::new(slot.clone()));
+            slot
+        }
+    };
+    console_dispatch_slot
+        .set(Arc::new(temps_cloud_client::ConsoleRouterHandle::new(
+            console_router,
+        )))
+        .await;
 
     let external_plugins_service = plugin_manager
         .service_context()
@@ -4701,15 +4917,30 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .shared()
     };
 
+    // Bound before `/readyz` flips, so a proxy that is told the console is
+    // ready can already reach the public-only surface.
+    let ingress = match (config.public_surface_address(), ingress_app) {
+        (Some(address), Some(app)) => {
+            let listener = bind_console_listener(address).await?;
+            info!(
+                "Console PUBLIC-ONLY API server listening on {} (third-party callbacks, ADR-051)",
+                address
+            );
+            Some((listener, app))
+        }
+        _ => None,
+    };
+    let ingress_fut = serve_public_only(ingress, shutdown_signal.clone());
+
     match config.console_admin_address.as_deref() {
         Some(admin_addr) if !admin_addr.is_empty() => {
             // Two-listener mode: public + admin on separate addresses.
-            let public_listener = TcpListener::bind(&config.console_address).await?;
+            let public_listener = bind_console_listener(&config.console_address).await?;
             info!(
                 "Console PUBLIC API server listening on {}",
                 config.console_address
             );
-            let admin_listener = TcpListener::bind(admin_addr).await?;
+            let admin_listener = bind_console_listener(admin_addr).await?;
             info!("Console ADMIN API server listening on {}", admin_addr);
 
             // Routers, middleware, and both listeners are ready; flip
@@ -4717,6 +4948,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // after plugin init -- see that call site for why the two are
             // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            startup_state.mark_running();
             super::upgrade_telemetry::complete_startup(
                 upgrade_probe.as_ref(),
                 startup_reporter.as_ref(),
@@ -4735,7 +4967,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             )
             .with_graceful_shutdown(shutdown_signal);
 
-            tokio::try_join!(public_fut, admin_fut)?;
+            tokio::try_join!(public_fut, admin_fut, ingress_fut)?;
         }
         _ => {
             // Single-listener mode (backwards compatible): merge public + admin
@@ -4744,7 +4976,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // want network-layer isolation should set TEMPS_CONSOLE_ADMIN_ADDRESS.
             let merged = Router::new().merge(public_app).merge(admin_app);
 
-            let listener = TcpListener::bind(&config.console_address).await?;
+            let listener = bind_console_listener(&config.console_address).await?;
             info!("Console API server listening on {}", config.console_address);
 
             // Routers, middleware, and the listener are ready; flip `/readyz`
@@ -4752,23 +4984,196 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // plugin init -- see that call site for why the two are
             // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            startup_state.mark_running();
             super::upgrade_telemetry::complete_startup(
                 upgrade_probe.as_ref(),
                 startup_reporter.as_ref(),
                 &config.data_dir,
             );
 
-            axum::serve(
+            let console_fut = axum::serve(
                 listener,
                 merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal)
-            .await?;
+            .with_graceful_shutdown(shutdown_signal);
+
+            tokio::try_join!(console_fut, ingress_fut)?;
         }
     }
 
     info!("Console API server exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod public_only_app_tests {
+    //! ADR-051 invariant 1: a request that reaches the public-only listener
+    //! cannot execute an admin handler or receive the dashboard, whatever its
+    //! path or headers. The boundary is what `public_only_app` mounts.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, post};
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// A public router shaped like the real one: receivers only.
+    fn public_router() -> Router {
+        Router::new()
+            .route("/emails/{email_id}/track/open", get(|| async { "pixel" }))
+            .route("/webhook/git/gitlab/events", post(|| async { "ok" }))
+            .route("/_temps/event", post(|| async { "ok" }))
+    }
+
+    /// Routes that exist on the admin router and on the merged console
+    /// listener, and must not exist here.
+    fn admin_router() -> Router {
+        Router::new()
+            .route("/settings", get(|| async { "settings" }))
+            .route("/projects", get(|| async { "projects" }))
+            .route("/_temps/internal", get(|| async { "internal" }))
+    }
+
+    fn app() -> Router {
+        public_only_app(
+            health_router(Arc::new(AtomicBool::new(true))),
+            public_router(),
+        )
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.expect("router responds")
+    }
+
+    fn request(method: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "hooks.example.com")
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    #[tokio::test]
+    async fn serves_public_receivers_and_health_probes() {
+        for (method, path) in [
+            ("GET", "/healthz"),
+            ("GET", "/readyz"),
+            (
+                "GET",
+                "/api/emails/0b5a51a2-2b0a-4c0b-9f0e-6a1f0d1c2e3f/track/open",
+            ),
+            ("POST", "/api/webhook/git/gitlab/events"),
+            ("POST", "/api/_temps/event"),
+        ] {
+            assert_eq!(
+                send(app(), request(method, path)).await.status(),
+                StatusCode::OK,
+                "{method} {path} must be served on the public-only listener"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_and_the_dashboard_are_not_mounted() {
+        // Sanity check: these paths do answer on a console that mounts them,
+        // so a 404 below is the boundary and not a typo in the path.
+        let merged = Router::new()
+            .nest("/api", public_router().merge(admin_router()))
+            .fallback(|| async { "dashboard" });
+        for path in [
+            "/",
+            "/api/settings",
+            "/api/projects",
+            "/api/_temps/internal",
+        ] {
+            assert_eq!(
+                send(merged.clone(), request("GET", path)).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        for path in [
+            "/",
+            "/dashboard",
+            "/index.html",
+            "/settings",
+            "/api/settings",
+            "/api/projects",
+            // An authenticated sibling of a public ingest route.
+            "/api/_temps/internal",
+            "/mcp",
+            "/mcp/tools",
+            "/api/swagger-ui",
+        ] {
+            let response = send(app(), request("GET", path)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable on the public-only listener"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headers_cannot_steer_a_request_onto_an_admin_route() {
+        let request = Request::builder()
+            .uri("/api/settings")
+            .header(header::HOST, "console.example.com")
+            .header("x-forwarded-host", "console.example.com")
+            .header("x-forwarded-for", "127.0.0.1")
+            .header(header::COOKIE, "session=valid-admin-session")
+            .header(header::AUTHORIZATION, "Bearer tk_admin")
+            .body(Body::empty())
+            .expect("request builds");
+        assert_eq!(send(app(), request).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_browser_gets_the_branded_404_and_an_api_client_an_empty_one() {
+        let browser = Request::builder()
+            .uri("/dashboard")
+            .header(header::HOST, "hooks.example.com")
+            .header(header::ACCEPT, "text/html,application/xhtml+xml")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = send(app(), browser).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("<!doctype html>"),
+            "expected the branded page"
+        );
+        assert!(html.contains("hooks.example.com"));
+        assert!(
+            !html.contains("id=\"root\""),
+            "the dashboard bundle must never be served here"
+        );
+
+        // `/api/*` never gets HTML, even from a browser.
+        let api = Request::builder()
+            .uri("/api/settings")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = send(app(), api).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -6077,6 +6482,61 @@ mod ai_tool_allowlist_tests {
 }
 
 #[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
+
+    /// Reporter whose enabled state a test can flip, recording what it was
+    /// asked to send.
+    #[derive(Default)]
+    struct SwitchableReporter {
+        enabled: AtomicBool,
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl TelemetryReporter for SwitchableReporter {
+        fn report(&self, event: TelemetryEvent) {
+            self.sent.lock().unwrap().push(event.event_type);
+        }
+
+        fn is_enabled(&self) -> bool {
+            self.enabled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_not_built_or_sent_while_telemetry_is_disabled() {
+        let reporter = SwitchableReporter::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        assert!(!emit_heartbeat(&reporter, &db).await);
+        assert!(reporter.sent.lock().unwrap().is_empty());
+        // Nothing was queried either: the instance counts are only gathered
+        // for an event that will actually be sent.
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_follows_a_runtime_change_without_restart() {
+        let reporter = SwitchableReporter::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        reporter.enabled.store(true, Ordering::SeqCst);
+        assert!(emit_heartbeat(&reporter, &db).await);
+        reporter.enabled.store(false, Ordering::SeqCst);
+        assert!(!emit_heartbeat(&reporter, &db).await);
+
+        assert_eq!(
+            *reporter.sent.lock().unwrap(),
+            vec!["instance_heartbeat".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
 mod error_telemetry_tests {
     use super::*;
     use axum::response::IntoResponse;
@@ -6360,5 +6820,58 @@ mod log_storage_config_tests {
             }
             other => panic!("expected the S3 backend, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spa_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn api_paths_never_fall_through_to_the_spa() {
+        assert_eq!(
+            unmatched_api_detail("/api/does-not-exist"),
+            Some("No API route matched")
+        );
+    }
+
+    #[test]
+    fn ai_gateway_path_without_api_prefix_points_to_the_real_base_url() {
+        for path in ["/ai/v1", "/ai/v1/models", "/ai/v1/chat/completions"] {
+            let detail = unmatched_api_detail(path)
+                .unwrap_or_else(|| panic!("{path} must not be answered with the console HTML"));
+            assert!(
+                detail.contains("/api/ai/v1"),
+                "detail for {path} must name the correct base URL, got: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_routes_are_still_served_by_the_spa() {
+        for path in ["/", "/ai", "/ai-first", "/ai/v1x", "/projects/1/ai/v1"] {
+            assert_eq!(
+                unmatched_api_detail(path),
+                None,
+                "{path} is a console route and must keep the SPA fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_answers_ai_gateway_prefix_with_a_json_404() {
+        let request = axum::http::Request::builder()
+            .uri("/ai/v1/models")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = serve_static_from(&WEBSITE, request);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(b"application/json".as_slice())
+        );
     }
 }

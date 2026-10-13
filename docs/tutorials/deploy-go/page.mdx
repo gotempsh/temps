@@ -1,152 +1,146 @@
 export const metadata = {
-  title: 'Deploy a Go App',
-  description: 'Deploy a Go application on Temps with a tiny container image, PostgreSQL, and automatic HTTPS.',
+  title: "Deploy Go Services With Automatic HTTPS",
+  description:
+    "Deploy Go apps (Gin, Echo, Chi, Fiber) on your own VPS with automatic HTTPS and zero-downtime deployments. Compiled to a static binary on a Debian slim image.",
   alternates: {
-    canonical: '/docs/deploy-go',
+    canonical: "/docs/deploy-go",
   },
-}
+  openGraph: {
+    title: "Deploy Go Services With Automatic HTTPS",
+    description: "Deploy Go apps (Gin, Echo, Chi, Fiber) on your own VPS with automatic HTTPS and zero-downtime deployments. Compiled to a static binary on a Debian slim image.",
+    images: [{ url: "/og/docs/deploy-go.png", width: 1200, height: 630, alt: "Deploy Go" }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Deploy Go Services With Automatic HTTPS",
+    description: "Deploy Go apps (Gin, Echo, Chi, Fiber) on your own VPS with automatic HTTPS and zero-downtime deployments. Compiled to a static binary on a Debian slim image.",
+    images: ["/og/docs/deploy-go.png"],
+  }
+};
 
-# Deploy a Go App
+export const sections = [
+  { title: 'Quickstart', id: 'quickstart' },
+  { title: 'What Temps handles automatically', id: 'what-temps-handles-automatically' },
+  { title: 'Dockerfile (optional)', id: 'dockerfile-optional' },
+  { title: 'Reading PORT from environment', id: 'reading-port-from-environment' },
+  { title: 'Managed PostgreSQL', id: 'managed-postgresql' },
+  { title: 'Platform behavior', id: 'platform-behavior' },
+];
 
-This tutorial walks you through deploying a Go application on Temps. Go produces a single static binary, making it ideal for lightweight container deployments. {{ className: 'lead' }}
+# Deploy Go on Your Own Server
+
+Deploy Go web applications as small container images. Go compiles to a single static binary, so startup is near-instant. {{ className: 'lead' }}
 
 ---
 
-## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+## Quickstart {{ anchor: true, id: 'quickstart' }}
 
-- A Go app deployed from a Git repository
-- A minimal container image (under 20 MB)
-- PostgreSQL database (optional)
-- Automatic HTTPS and deployment on every push
+From your project root, deploy with your preferred package manager:
 
-**Time required:** 10 minutes.
+<CliCommands commands={[
+  { args: "up" },
+]} />
 
-**Prerequisites:**
-- A running Temps instance ([install guide](/docs/your-first-deployment))
-- A Go app in a Git repository
-- (Optional) A custom domain
+Temps detects your `go.mod`, compiles a static binary with `go build`, and runs it on a Debian slim image. The Go version comes from the `go` line in `go.mod`, and defaults to 1.23. Zero cold starts.
 
----
+Temps builds the `main` package in the repository root, or the single `cmd/<name>/main.go` if there is no root `main.go`. If your repository has several commands under `cmd/`, pick one in a `.temps.yaml` file:
 
-## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
-
-### Add a health check endpoint
-
-```go {{ title: 'main.go' }}
-package main
-
-import (
-	"encoding/json"
-	"log"
-	"net/http"
-	"os"
-)
-
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	// ... your existing routes
-
-	log.Printf("Listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
+```yaml
+build:
+  build_command: go build -o /app/bin/app ./cmd/api
 ```
 
-### Create a Dockerfile
+---
 
-Go compiles to a static binary, so the final image can use `scratch` or `alpine`:
+## What Temps handles automatically {{ anchor: true, id: 'what-temps-handles-automatically' }}
 
-```dockerfile {{ title: 'Dockerfile' }}
-FROM golang:1.23-alpine AS builder
+| Feature | How Temps handles it |
+| ------- | -------------------- |
+| Build | `go build -ldflags='-s -w'` with `CGO_ENABLED=0` (a static binary) |
+| Image | Multi-stage build: the binary is copied into a Debian slim runtime image |
+| HTTPS | Let's Encrypt, auto-renewed |
+| Port | `PORT` env var injected, defaults to 8080 |
+| Health checks | HTTP check on `/` at deploy time, or the path set in `.temps.yaml` |
+| Startup | Near-instant — static binary, no runtime |
 
+---
+
+## Dockerfile (optional) {{ anchor: true, id: 'dockerfile-optional' }}
+
+Temps auto-generates a Dockerfile for Go projects. If you want full control, add your own:
+
+```dockerfile
+# Build stage
+FROM golang:1.22-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /server .
+RUN go build -o app .
 
-FROM alpine:3.20
+# Run stage
+FROM alpine:latest
 RUN apk add --no-cache ca-certificates
-
-COPY --from=builder /server /server
-
+WORKDIR /app
+COPY --from=builder /app/app .
 EXPOSE 8080
-CMD ["/server"]
-```
-
-<Note>
-  Using `CGO_ENABLED=0` produces a statically linked binary. If your app needs cgo (for example, SQLite), remove this flag and use `alpine` as the base image.
-</Note>
-
----
-
-## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
-
-1. Open the Temps dashboard
-2. Click **New Project**
-3. Connect your repository
-
-```bash
-bunx @temps-sdk/cli projects create -n "my-go-app" -d "Go application"
-bunx @temps-sdk/cli projects git -p my-go-app --owner yourorg --repo my-go-app --branch main -y
+CMD ["./app"]
 ```
 
 ---
 
-## Step 3: Provision a database (optional) {{ anchor: true, id: 'database' }}
+## Reading PORT from environment {{ anchor: true, id: 'reading-port-from-environment' }}
 
-If your app needs PostgreSQL:
-
-```bash
-bunx @temps-sdk/cli services create -p my-go-app -t postgres -n "go-db"
-```
-
-The `DATABASE_URL` environment variable is automatically injected. Parse it in your app:
+Make sure your server reads the `PORT` environment variable:
 
 ```go
-import "os"
-
-dbURL := os.Getenv("DATABASE_URL")
+port := os.Getenv("PORT")
+if port == "" {
+    port = "8080"
+}
+log.Fatal(http.ListenAndServe(":"+port, nil))
 ```
 
 ---
 
-## Step 4: Set environment variables {{ anchor: true, id: 'env-vars' }}
+## Managed PostgreSQL {{ anchor: true, id: 'managed-postgresql' }}
 
-Set any variables your app needs in the Temps dashboard:
+Create a PostgreSQL database under **Databases → Create database**, then link it from your project's **Databases** page. Temps injects the connection string as `POSTGRES_URL`:
 
-| Variable | Value | Notes |
-| -------- | ----- | ----- |
-| `PORT` | Auto-set by Temps | Do not override |
-| `ENVIRONMENT` | `production` | Your app can read this |
-
----
-
-## Step 5: Deploy {{ anchor: true, id: 'deploy' }}
-
-```bash
-bunx @temps-sdk/cli deploy my-go-app -b main -e production -y
+```go
+db, err := sql.Open("pgx", os.Getenv("POSTGRES_URL"))
 ```
 
-Temps will:
-1. Build your Go binary in the Docker build stage
-2. Create a minimal container image
-3. Start the binary and run health checks
-4. Route traffic and issue an SSL certificate
+See [Deploy with a Database](/docs/deploy-with-database) for all the injected variables.
 
 ---
 
-## What to do next {{ anchor: true, id: 'next-steps' }}
+## Platform behavior {{ anchor: true, id: 'platform-behavior' }}
 
-- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
-- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
-- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+These rules apply to every app deployed on Temps, regardless of framework.
+
+<PortBinding />
+
+### Health checks
+
+<HealthChecks />
+
+### Auto-injected environment variables
+
+<InjectedEnvVars />
+
+---
+
+## Next Steps
+
+<div className="not-prose">
+  <Button href="/docs/docker-containers" variant="text" arrow="right">
+    Custom Dockerfiles
+  </Button>
+  <Button href="/docs/deploy-with-database" variant="text" arrow="right">
+    Deploy with a database
+  </Button>
+  <Button href="/docs/environment-variables" variant="text" arrow="right">
+    Environment variables
+  </Button>
+</div>

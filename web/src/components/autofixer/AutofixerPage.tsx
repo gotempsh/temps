@@ -78,13 +78,6 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Wand2 className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">Autofixer</h1>
-        </div>
-      </div>
-
       <p className="text-sm text-muted-foreground">
         Select an error to analyze and fix with AI. Claude will read your
         codebase, identify the root cause, and generate a fix.

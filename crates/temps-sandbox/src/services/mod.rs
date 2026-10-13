@@ -9,10 +9,12 @@ pub mod exec;
 pub mod expiration_sweeper;
 pub mod fs;
 pub mod job_tracker;
+pub mod placement;
 pub mod preview_password;
 pub mod preview_urls;
 pub mod public_id;
 pub mod registry;
+pub mod row_status;
 pub mod sandbox_service;
 pub mod snapshot_service;
 

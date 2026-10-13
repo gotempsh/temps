@@ -42,6 +42,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Tooltip,
@@ -64,6 +65,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 
 /**
  * ADR-045 §4: tooltip shown on the disabled delete control for the provider
@@ -178,7 +180,7 @@ export function OidcProviderDetailPage() {
     )
   }
 
-  if (providersQuery.isLoading) {
+  if (providersQuery.isPending) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-8 w-64" />
@@ -188,15 +190,26 @@ export function OidcProviderDetailPage() {
   }
 
   if (!provider) {
+    // "Not found" is only provable from a list read that succeeded and lacks
+    // this id. A failed or refused list read says nothing about the provider.
     return (
       <div className="space-y-4">
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>Provider not found</AlertTitle>
-          <AlertDescription>
-            The OIDC provider you requested does not exist or was deleted.
-          </AlertDescription>
-        </Alert>
+        {providersQuery.isError ? (
+          <ReadFailure
+            resource="SSO provider"
+            error={providersQuery.error}
+            onRetry={() => providersQuery.refetch()}
+            retrying={providersQuery.isFetching}
+          />
+        ) : (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Provider not found</AlertTitle>
+            <AlertDescription>
+              The OIDC provider you requested does not exist or was deleted.
+            </AlertDescription>
+          </Alert>
+        )}
         <Button variant="outline" onClick={() => navigate('/settings/auth')}>
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back to authentication
@@ -239,6 +252,19 @@ export function OidcProviderDetailPage() {
         </div>
       </div>
 
+      {/* A failed refresh keeps the last-known settings on screen, but they
+          may have changed: say so and offer Retry rather than present them
+          as current. */}
+      {providersQuery.isError && (
+        <ReadFailure
+          resource="SSO provider"
+          error={providersQuery.error}
+          cached
+          onRetry={() => providersQuery.refetch()}
+          retrying={providersQuery.isFetching}
+        />
+      )}
+
       <ProviderEditor
         provider={provider}
         redirectUri={redirectUri}
@@ -257,6 +283,7 @@ export function OidcProviderDetailPage() {
       />
 
       <OidcRoleMappingsCard
+        readOnly={provider.managed_by_cloud}
         providerId={provider.id}
         defaultRole={provider.default_role}
       />
@@ -482,7 +509,7 @@ function UsersForProviderCard({
             </p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          <ScrollRegion regionLabel="Users who signed in through this provider, scrollable">
             <table className="w-full min-w-[640px] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase text-muted-foreground">
@@ -531,7 +558,7 @@ function UsersForProviderCard({
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollRegion>
         )}
       </CardContent>
     </Card>

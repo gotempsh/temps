@@ -53,7 +53,11 @@
 //! (`TraceSortField` / `SortOrder`) with no user-controlled input path.
 
 pub mod migrations;
+pub mod read_limits;
 
+use migrations::WriteTable;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -158,6 +162,14 @@ impl ClickHouseOtelClient {
             .with_database(config.database)
             .with_user(config.user)
             .with_password(config.password)
+            // NOTE: these limits belong to THIS client only, and it is built for
+            // the backfill CLI. `ClickHouseOtelStorage::new` builds its own
+            // client with no settings at all, so storage reads run under
+            // whatever the server profile says (a profile's `max_memory_usage`
+            // is what actually bounded them, not the 8 GiB below). Reads that
+            // must be bounded set their own per-query limits — see
+            // `storage::global_traces::local_clickhouse`.
+            //
             // Per-query blast radius. Without these, one authenticated read of
             // a very large project (an unbounded `count_traces`, a wide window,
             // a pathological offset) can hold many GB and many minutes on a
@@ -634,14 +646,23 @@ pub struct ChMetricRow {
     // ── Dedup key ───────────────────────────────────────────────────────────
     /// _version  UInt64  DEFAULT toUnixTimestamp64Milli(now64())
     pub _version: u64,
+
+    // ── Retention ───────────────────────────────────────────────────────────
+    /// retention_days  UInt16  DEFAULT 90
+    ///
+    /// Added by migration 0009_metrics_retention_days.sql, which also points
+    /// the table TTL at it. `From<&MetricPoint>` fills in the table default;
+    /// `store_metrics` overwrites it from the storage's `RetentionResolver`.
+    pub retention_days: u16,
 }
 
-/// The number of named columns in the `metrics` DDL (`0003_metrics.sql`),
-/// excluding the `_version` dedup sentinel. The [`ChMetricRow`] struct must have
-/// exactly this many domain fields, in the same order. Bump together with the
-/// DDL when the schema changes. Used by the field-order guard test.
+/// The number of named columns in the `metrics` DDL (`0003_metrics.sql` plus
+/// columns added by later migrations), excluding the `_version` dedup
+/// sentinel. The [`ChMetricRow`] struct must have exactly this many domain
+/// fields, in the same order. Bump together with the DDL when the schema
+/// changes. Used by the field-order guard test.
 #[allow(dead_code)]
-pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 31;
+pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 32;
 
 impl From<&MetricPoint> for ChMetricRow {
     fn from(p: &MetricPoint) -> Self {
@@ -713,6 +734,7 @@ impl From<&MetricPoint> for ChMetricRow {
             exemplars,
             attributes,
             _version: version,
+            retention_days: temps_core::RetentionTable::Metrics.default_days(),
         }
     }
 }
@@ -1265,11 +1287,31 @@ pub(crate) fn ch_ingest_err(operation: &str, err: ::clickhouse::error::Error) ->
 }
 
 /// Wrap a ClickHouse query error into an [`OtelError::Storage`] with context.
+///
+/// A read that hit one of the limits of [`read_limits`] says so -- which limit,
+/// and what to do about it -- instead of surfacing the server's raw text alone.
 pub(crate) fn ch_query_err(operation: &str, err: ::clickhouse::error::Error) -> OtelError {
-    let kind = ch_err_kind(&err);
-    OtelError::Storage {
-        message: format!("ClickHouse query {operation} failed: {err}"),
-        kind,
+    use read_limits::{classify, Failure};
+    match classify(&err) {
+        Failure::MemoryLimit => OtelError::Storage {
+            message: format!(
+                "ClickHouse query {operation} exceeded its {} MiB memory budget; \
+                 narrow the time window or filters: {err}",
+                read_limits::READ_MAX_MEMORY_BYTES >> 20
+            ),
+            kind: StorageErrorKind::ClickHouseOther,
+        },
+        Failure::Timeout => OtelError::Storage {
+            message: format!(
+                "ClickHouse query {operation} exceeded its {:?} time budget: {err}",
+                read_limits::READ_MAX_EXECUTION_TIME
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        },
+        Failure::Other => OtelError::Storage {
+            message: format!("ClickHouse query {operation} failed: {err}"),
+            kind: ch_err_kind(&err),
+        },
     }
 }
 
@@ -1313,8 +1355,13 @@ pub fn trace_ref_version(first_seen_ms: i64) -> u64 {
 /// methods delegate to the inner `TimescaleDbStorage` until Phase 1–4
 /// implementations land (see module-level doc).
 pub struct ClickHouseOtelStorage {
-    /// ClickHouse client — cheap to clone (Arc-backed internally).
+    /// ClickHouse client — cheap to clone (Arc-backed internally). Used for
+    /// writes, migrations and health checks; carries no read limits.
     ch: ::clickhouse::Client,
+    /// The same connection with the read bounds of [`read_limits`] applied.
+    /// Every SELECT goes through this one, so no read depends on the server
+    /// profile alone for its memory or time ceiling.
+    read: ::clickhouse::Client,
     /// Postgres/TimescaleDB inner storage for delegation.
     ///
     /// All non-span methods and (for now) all span read methods are
@@ -1332,6 +1379,59 @@ pub struct ClickHouseOtelStorage {
     /// When `None`, all facet slot columns are written as NULL and queries
     /// fall back to `JSONExtractString` predicates for all attributes.
     facet_cache: Option<crate::services::FacetCache>,
+    /// Per [`WriteTable`]: set while the migrations that table's rows depend
+    /// on have not applied; its writes are refused with
+    /// [`OtelError::StorageMigrating`] meanwhile. See
+    /// [`Self::hold_writes_until_migrated`].
+    writes_held: Arc<[AtomicBool; 3]>,
+}
+
+/// Refuses [`ClickHouseOtelStorage`] writes, table by table, until the
+/// migrations each table's rows depend on have applied.
+///
+/// The migration task owns it and reports each applied migration through
+/// [`Self::migration_applied`]; a table's writes resume as soon as its last
+/// required migration lands, so a migration that keeps failing only holds
+/// the writes it would actually break (a failed `0009` holds metrics, not
+/// spans). A failed run keeps the rest held while the task retries, since
+/// those writes would fail against the old schema anyway. Dropping the hold
+/// releases every table, so a panicking runner cannot wedge ingest for good.
+#[derive(Debug)]
+pub struct MigrationWriteHold {
+    writes_held: Arc<[AtomicBool; 3]>,
+    applied: std::sync::Mutex<std::collections::HashSet<&'static str>>,
+}
+
+impl MigrationWriteHold {
+    /// Record that `name` has applied (now or by an earlier run), and resume
+    /// writes to every table whose required migrations are now all in.
+    pub fn migration_applied(&self, name: &'static str) {
+        // Only the migration task touches this, never the write path. A
+        // poisoned lock still holds a valid set: keep using it.
+        let mut applied = match self.applied.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        applied.insert(name);
+        for table in WriteTable::ALL {
+            let held = &self.writes_held[table.index()];
+            if held.load(Ordering::Acquire) && migrations::writes_ready(table, &applied) {
+                held.store(false, Ordering::Release);
+                tracing::info!(
+                    table = table.table_name(),
+                    "ClickHouse OTel migrations for this table applied; accepting writes"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for MigrationWriteHold {
+    fn drop(&mut self) {
+        for held in self.writes_held.iter() {
+            held.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl ClickHouseOtelStorage {
@@ -1358,17 +1458,51 @@ impl ClickHouseOtelStorage {
             .with_database(&config.database)
             .with_user(&config.user)
             .with_password(&config.password);
+        let read = read_limits::bounded_read_client(&ch);
         Self {
             ch,
+            read,
             inner,
             resolver,
             facet_cache,
+            writes_held: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
         }
     }
 
     /// Expose the raw ClickHouse client for migration runners / health checks.
     pub fn ch_client(&self) -> &::clickhouse::Client {
         &self.ch
+    }
+
+    /// Refuse writes until the returned hold reports their migrations
+    /// applied (see [`MigrationWriteHold`]).
+    ///
+    /// Call before spawning the migrations. A batch written against a table
+    /// a pending migration is about to
+    /// change (`metrics` before 0009 adds `retention_days`) fails with a
+    /// schema error that is not retryable, so it would be lost. Refusing it
+    /// with [`OtelError::StorageMigrating`] instead answers the exporter with
+    /// a 503, and the exporter keeps the batch and retries: nothing is
+    /// buffered here however long the migrations take.
+    pub fn hold_writes_until_migrated(&self) -> MigrationWriteHold {
+        for held in self.writes_held.iter() {
+            held.store(true, Ordering::Release);
+        }
+        MigrationWriteHold {
+            writes_held: self.writes_held.clone(),
+            applied: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Fail fast while `table`'s migrations are pending. One atomic load
+    /// once they have applied.
+    fn ensure_migrated(&self, table: WriteTable, operation: &str) -> StorageResult<()> {
+        if self.writes_held[table.index()].load(Ordering::Acquire) {
+            return Err(OtelError::StorageMigrating {
+                operation: operation.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1378,7 +1512,14 @@ impl OtelStorage for ClickHouseOtelStorage {
         &self,
         query: crate::storage::global_traces::GlobalTraceQuery,
     ) -> StorageResult<crate::storage::global_traces::GlobalTraceStream> {
-        super::global_traces::clickhouse(&self.ch, &query, None).await
+        // Same lock-free snapshot the project trace list filters with, so a
+        // faceted attribute uses its indexed slot column here too.
+        let facets = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_default();
+        super::global_traces::clickhouse_local(&self.read, &query, &facets).await
     }
     // ── Span write (ClickHouse — system of record) ──────────────────────────
 
@@ -1400,6 +1541,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = spans.len() as u64;
+        self.ensure_migrated(WriteTable::Spans, "store_spans")?;
 
         // Load the facet cache once per batch (lock-free ArcSwap read).
         // All spans in the batch share the same snapshot — a create/delete
@@ -1654,7 +1796,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         };
 
         // Apply binds sequentially to the query builder.
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in all_binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -1979,7 +2121,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         all_binds.push(Bv::I64(offset as i64));
         let binds = all_binds;
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2155,7 +2297,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             )
         };
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2193,7 +2335,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
 
         let rows = self
-            .ch
+            .read
             .query("SELECT 1 AS one FROM spans WHERE project_id = ? LIMIT 1")
             .bind(project_id)
             .fetch_all::<ChExistsRow>()
@@ -2238,7 +2380,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2379,7 +2521,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             LIMIT ? OFFSET ?"#
         );
 
-        let mut q = bind_all(self.ch.query(&sql), binds);
+        let mut q = bind_all(self.read.query(&sql), binds);
         q = q
             .bind(query.min_count as i64)
             .bind(limit as i64)
@@ -2409,7 +2551,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             )"#
         );
 
-        let q = bind_all(self.ch.query(&sql), binds).bind(query.min_count as i64);
+        let q = bind_all(self.read.query(&sql), binds).bind(query.min_count as i64);
 
         let row = q
             .fetch_one::<ChCountRow>()
@@ -2556,7 +2698,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         binds.push(Bv::I64(limit as i64));
         binds.push(Bv::I64(offset as i64));
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2648,7 +2790,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2743,7 +2885,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         let where_sql = where_parts.join(" AND ");
         let sql = format!("SELECT uniqExact(trace_id) AS cnt FROM spans FINAL WHERE {where_sql}");
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2779,7 +2921,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2887,6 +3029,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = safe.len() as u64;
+        self.ensure_migrated(WriteTable::Metrics, "store_metrics")?;
 
         for chunk in safe.chunks(MAX_METRIC_INSERT_BATCH) {
             let mut inserter = self
@@ -2896,7 +3039,10 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_metrics (inserter setup)", e))?;
 
             for point in chunk {
-                let row = ChMetricRow::from(*point);
+                let mut row = ChMetricRow::from(*point);
+                row.retention_days = self
+                    .resolver
+                    .resolve(point.project_id, temps_core::RetentionTable::Metrics);
                 inserter
                     .write(&row)
                     .await
@@ -3072,7 +3218,7 @@ impl OtelStorage for ClickHouseOtelStorage {
 
         // Bind order: SELECT group keys first (the `attributes[?]` in the
         // projection), then WHERE params in clause order, then LIMIT.
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for key in &query.group_by {
             q = q.bind(key.clone());
         }
@@ -3137,7 +3283,7 @@ impl OtelStorage for ClickHouseOtelStorage {
              ORDER BY bucket_ms ASC \
              LIMIT ?"
         );
-        let mut hq = self.ch.query(&hist_sql);
+        let mut hq = self.read.query(&hist_sql);
         for key in &query.group_by {
             hq = hq.bind(key.clone());
         }
@@ -3232,7 +3378,7 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// List distinct metric names for a project from the CH `metrics` table.
     async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT metric_name FROM metrics \
                  WHERE project_id = ? ORDER BY metric_name",
@@ -3255,7 +3401,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // Sample recent rows first (subquery LIMIT), then ARRAY JOIN the sampled
         // attribute-key arrays — keeps the unnest bounded on high-volume metrics.
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT label_key FROM ( \
                    SELECT mapKeys(attributes) AS ks FROM metrics \
@@ -3288,7 +3434,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // `attributes[?]` reads the value for the chosen key; `mapContains` keeps
         // only rows that actually carry it. Sampled and capped like the keys query.
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT label_key FROM ( \
                    SELECT attributes[?] AS label_key FROM metrics \
@@ -3360,6 +3506,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         if trace_ids.is_empty() {
             return Ok(0);
         }
+        self.ensure_migrated(WriteTable::TraceRefs, "record_trace_refs")?;
 
         let first_seen_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3415,7 +3562,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // min(first_seen) at query time keeps the earliest observation even
         // before ReplacingMergeTree merges collapse duplicate pairs.
         let ch_rows = self
-            .ch
+            .read
             .query(
                 "SELECT project_id, \
                         toInt64(toUnixTimestamp64Milli(min(first_seen))) AS first_seen_ms \
@@ -3571,7 +3718,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         "#;
 
         let ch_bytes = self
-            .ch
+            .read
             .query(CH_QUOTA_BYTES_SQL)
             .bind(project_id)
             .bind(project_id)
@@ -3667,7 +3814,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         );
 
         let mut q = self
-            .ch
+            .read
             .query(&sql)
             .bind(project_id)
             .bind(service_name)
@@ -3732,7 +3879,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         );
 
         let mut q = self
-            .ch
+            .read
             .query(&sql)
             .bind(project_id)
             .bind(service_name)
@@ -4145,9 +4292,133 @@ mod tests {
     }
 
     #[test]
+    fn ch_query_err_names_the_budget_a_read_exceeded() {
+        let memory = ::clickhouse::error::Error::BadResponse(
+            "Code: 241. DB::Exception: Query memory limit exceeded (MEMORY_LIMIT_EXCEEDED)".into(),
+        );
+        let message = ch_query_err("query_span_stats", memory).to_string();
+        assert!(message.contains("query_span_stats"), "{message}");
+        assert!(message.contains("1024 MiB memory budget"), "{message}");
+
+        let timeout = ::clickhouse::error::Error::BadResponse(
+            "Code: 159. DB::Exception: Timeout exceeded (TIMEOUT_EXCEEDED)".into(),
+        );
+        match ch_query_err("query_metrics", timeout) {
+            OtelError::Storage { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::ClickHouseTimeout);
+                assert!(message.contains("60s time budget"), "{message}");
+            }
+            other => panic!("expected a storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn empty_metric_series_array_has_explicit_clickhouse_type() {
         assert_eq!(EMPTY_STRING_ARRAY_SQL, "CAST([], 'Array(String)')");
         assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
+    }
+
+    // ── Migration write hold ────────────────────────────────────────────────
+
+    /// A store pointed at a port nothing listens on: a write that gets past
+    /// the hold fails on the network, which is how the test tells "refused"
+    /// from "attempted" without a ClickHouse server.
+    fn unreachable_store() -> ClickHouseOtelStorage {
+        ClickHouseOtelStorage::new(
+            ClickHouseOtelConfig {
+                url: "http://127.0.0.1:1".into(),
+                database: "otel".into(),
+                user: "default".into(),
+                password: String::new(),
+            },
+            Arc::new(TimescaleDbStorage::new(
+                Arc::new(sea_orm::DatabaseConnection::Disconnected),
+                None,
+            )),
+            Arc::new(temps_core::FixedRetentionResolver),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn writes_are_refused_while_migrations_run_and_attempted_after() {
+        let storage = unreachable_store();
+        let hold = storage.hold_writes_until_migrated();
+
+        let refused = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(refused, Err(OtelError::StorageMigrating { ref operation }) if operation == "store_metrics"),
+            "got {refused:?}"
+        );
+        assert!(matches!(
+            storage.store_spans(vec![make_span()]).await,
+            Err(OtelError::StorageMigrating { .. })
+        ));
+        assert!(matches!(
+            storage.record_trace_refs(&["t".to_string()], 1).await,
+            Err(OtelError::StorageMigrating { .. })
+        ));
+
+        // Migration 0009 keeps failing: everything before it reported in.
+        for name in [
+            "0001_spans",
+            "0002_spans_codecs",
+            "0003_metrics",
+            "0004_retention_days",
+            "0005_retention_ttl",
+            "0006_trace_refs",
+            "0007_spans_recent_projection",
+            "0008_facet_slots",
+        ] {
+            hold.migration_applied(name);
+        }
+        assert!(
+            matches!(
+                storage.store_spans(vec![make_span()]).await,
+                Err(OtelError::Storage { .. })
+            ),
+            "span writes do not depend on 0009 and must be attempted"
+        );
+        assert!(matches!(
+            storage.record_trace_refs(&["t".to_string()], 1).await,
+            Err(OtelError::Storage { .. })
+        ));
+        assert!(
+            matches!(
+                storage.store_metrics(vec![make_gauge()]).await,
+                Err(OtelError::StorageMigrating { .. })
+            ),
+            "metric rows carry the column 0009 adds and must stay held"
+        );
+
+        hold.migration_applied("0009_metrics_retention_days");
+        let attempted = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_hold_releases_every_table() {
+        let storage = unreachable_store();
+        let hold = storage.hold_writes_until_migrated();
+        // A panicking migration task drops the hold without reporting.
+        drop(hold);
+        let attempted = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_nobody_migrates_never_refuses_writes() {
+        let attempted = unreachable_store().store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
     }
 
     // ── Metric row tests ────────────────────────────────────────────────────
@@ -4242,10 +4513,11 @@ mod tests {
             exemplars: _,
             attributes: _,
             _version: _,
+            retention_days: _,
         } = row;
-        // 31 domain columns + _version sentinel = 32 serialised fields; the DDL
-        // declares 31 named columns plus _version, matching this destructure.
-        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 31);
+        // 32 domain columns + _version sentinel = 33 serialised fields; the DDL
+        // declares 32 named columns plus _version, matching this destructure.
+        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 32);
     }
 
     #[test]
@@ -4590,6 +4862,21 @@ mod tests {
             ddl_columns.push(token.to_string());
         }
 
+        // Columns added by later migrations are appended after the original
+        // ones (ALTER TABLE ... ADD COLUMN without FIRST/AFTER).
+        for later in [include_str!(
+            "../../../migrations/clickhouse/0009_metrics_retention_days.sql"
+        )] {
+            for statement in later.lines().map(str::trim) {
+                if let Some(rest) =
+                    statement.strip_prefix("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS ")
+                {
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    ddl_columns.push(name.to_string());
+                }
+            }
+        }
+
         // The ChMetricRow field order, declared once here and kept in lockstep
         // with the struct definition above. Any change to the struct field list
         // (or the DDL) must update this and will be caught by the two asserts.
@@ -4626,9 +4913,10 @@ mod tests {
             "exemplars",
             "attributes",
             "_version",
+            "retention_days",
         ];
 
-        // 31 domain columns + _version sentinel.
+        // 32 domain columns + _version sentinel.
         assert_eq!(
             row_fields.len(),
             CH_METRIC_ROW_FIELD_COUNT + 1,

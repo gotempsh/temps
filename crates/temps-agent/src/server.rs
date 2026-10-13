@@ -15,6 +15,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
+use crate::sandbox_handlers::{self, SandboxHost, SandboxHostState, SANDBOX_UPLOAD_BODY_LIMIT};
 use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::docker_socket_grant::DockerSocketGrant;
@@ -42,32 +43,55 @@ fn store_platform(platform: &SharedPlatform, value: String) {
     }
 }
 
+/// Network state the sync loop keeps current and request handlers read.
+#[derive(Clone)]
+pub struct SharedNetwork {
+    pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    pub overlay_peers: crate::network_sync::SharedPeers,
+    pub host_bind_address: crate::network_sync::SharedBindAddress,
+}
+
 /// Build the agent Axum router with authentication middleware.
 pub fn build_router(
     container_deployer: Arc<dyn ContainerDeployer>,
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: &AgentConfig,
-    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
-    overlay_peers: crate::network_sync::SharedPeers,
+    network: SharedNetwork,
     platform: SharedPlatform,
 ) -> Router {
-    // Same address app-container deploys bind to (never "0.0.0.0" — see
-    // AgentConfig::private_address). Falls back to loopback only for the
-    // legacy-config test-fixture case; `temps agent`'s CLI entrypoint
-    // already hard-errors before reaching here if this is genuinely unset.
-    let host_bind_address = config
-        .private_address
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    // ADR-048: the worker hosts sandboxes with the same Docker provider the
+    // control plane uses for local ones.
+    let sandbox_host = docker.clone().map(|docker| {
+        let docker = Arc::new(docker);
+        let provider = Arc::new(temps_agents::sandbox::docker::DockerSandboxProvider::new(
+            docker.clone(),
+            temps_agents::sandbox::docker::DockerSandboxConfig {
+                control_plane_url: config.control_plane_url.clone(),
+                // Bound exec output while Docker streams it, not after: the
+                // exec response is cut to this size anyway.
+                exec_output_limit: Some(temps_agents::sandbox::remote::WORKER_EXEC_OUTPUT_LIMIT),
+                ..Default::default()
+            },
+        ));
+        spawn_sandbox_quarantine(provider.clone(), config.node_name.clone());
+        SandboxHost {
+            provider,
+            containers: docker,
+        }
+    });
+    let sandbox_state = Arc::new(SandboxHostState::new(
+        sandbox_host,
+        config.sandbox_work_root(),
+    ));
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
         docker,
-        overlay_bridge_address,
-        overlay_peers,
+        overlay_bridge_address: network.overlay_bridge_address,
+        overlay_peers: network.overlay_peers,
         platform,
-        host_bind_address,
+        host_bind_address: network.host_bind_address,
     });
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
@@ -126,6 +150,10 @@ pub fn build_router(
             "/agent/images/export",
             get(crate::build_handler::export_image),
         )
+        .route(
+            "/agent/images/extract",
+            get(crate::build_handler::extract_image_path),
+        )
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
@@ -165,15 +193,125 @@ pub fn build_router(
             post(service_handlers::restore_service),
         )
         .layer(middleware::from_fn(require_agent_auth))
-        .layer(Extension(auth))
+        .layer(Extension(auth.clone()))
         .layer(Extension(resource_limits))
         .with_state(state);
+
+    let sandbox_routes = sandbox_router(sandbox_state, auth);
 
     // Swagger UI — no auth required so it's accessible for documentation
     let swagger_ui =
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", AgentApiDoc::openapi());
 
-    api_routes.merge(swagger_ui)
+    api_routes.merge(sandbox_routes).merge(swagger_ui)
+}
+
+/// ADR-048 sandbox host API — same auth as every other agent route. File
+/// and directory uploads travel base64-encoded in JSON, so only those two
+/// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
+/// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
+/// other route keeps axum's 2 MiB default.
+fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
+    let upload_slot =
+        || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
+    Router::new()
+        .route("/agent/sandboxes", post(sandbox_handlers::create_sandbox))
+        .route(
+            "/agent/sandboxes/exec",
+            post(sandbox_handlers::exec_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/exec-stream",
+            post(sandbox_handlers::exec_sandbox_stream),
+        )
+        .route(
+            "/agent/sandboxes/alive",
+            post(sandbox_handlers::sandbox_alive),
+        )
+        .route(
+            "/agent/sandboxes/read-file",
+            post(sandbox_handlers::read_sandbox_file),
+        )
+        .route(
+            "/agent/sandboxes/write-file",
+            post(sandbox_handlers::write_sandbox_file)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    SANDBOX_UPLOAD_BODY_LIMIT,
+                ))
+                .layer(upload_slot()),
+        )
+        .route(
+            "/agent/sandboxes/write-directory",
+            post(sandbox_handlers::write_sandbox_directory)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    SANDBOX_UPLOAD_BODY_LIMIT,
+                ))
+                .layer(upload_slot()),
+        )
+        .route(
+            "/agent/sandboxes/kill-processes",
+            post(sandbox_handlers::kill_sandbox_processes),
+        )
+        .route(
+            "/agent/sandboxes/destroy",
+            post(sandbox_handlers::destroy_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/stop",
+            post(sandbox_handlers::stop_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/start",
+            post(sandbox_handlers::start_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/recover",
+            post(sandbox_handlers::recover_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/status",
+            post(sandbox_handlers::sandbox_status),
+        )
+        .layer(middleware::from_fn_with_state(
+            sandbox_state.clone(),
+            sandbox_handlers::redact_host_paths,
+        ))
+        .layer(middleware::from_fn(require_agent_auth))
+        .layer(Extension(auth))
+        .with_state(sandbox_state)
+}
+
+/// Stop sandboxes on this node whose network isolation predates the current
+/// policy, as the control plane does for its own sandboxes at startup. They
+/// are recreated (keeping their volumes) the next time they are used.
+/// Off the critical path: the agent serves while this runs, and a failure
+/// is logged, not fatal — the node still refuses to recover a stale sandbox
+/// when it is next accessed.
+fn spawn_sandbox_quarantine(
+    provider: Arc<temps_agents::sandbox::docker::DockerSandboxProvider>,
+    node_name: String,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            node = %node_name,
+            "No async runtime while building the agent router; skipping stale sandbox quarantine"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        match provider.quarantine_stale_sandboxes().await {
+            Ok(()) => tracing::info!(
+                node = %node_name,
+                "Validated the isolation policy of existing sandboxes on this node"
+            ),
+            Err(error) => tracing::warn!(
+                node = %node_name,
+                error = %error,
+                "Could not validate the isolation policy of existing sandboxes on this node; \
+                 stale sandboxes are still refused when they are next recovered"
+            ),
+        }
+    });
 }
 
 /// Maximum number of consecutive heartbeat failures before escalating to error-level logging.
@@ -209,6 +347,7 @@ fn spawn_heartbeat_loop(
     docker_socket_grant: DockerSocketGrant,
 ) {
     let control_plane_url = config.control_plane_url.clone();
+    let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
     let token = config.token.clone();
     let labels = config.labels.clone();
@@ -224,10 +363,7 @@ fn spawn_heartbeat_loop(
         // node's auth token. A MitM with a self-signed cert here would
         // capture the token and impersonate this worker. There is no
         // opt-in: `AppSettings.insecure_tls` is server-side only.
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
+        let client = match heartbeat_client.timeout(Duration::from_secs(10)).build() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to build heartbeat HTTP client: {}", e);
@@ -576,8 +712,7 @@ pub async fn start_agent_server(
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: AgentConfig,
-    overlay_peers: crate::network_sync::SharedPeers,
-    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
@@ -601,13 +736,17 @@ pub async fn start_agent_server(
         ),
     }
 
+    // `network.host_bind_address` is the same slot `container_deployer`
+    // publishes app-container ports on (never "0.0.0.0" — see
+    // AgentConfig::private_address); the network-sync loop moves it to the
+    // mesh address for a node that joined with a public one, and both app
+    // deploys and agent-API services follow it.
     let router = build_router(
         container_deployer.clone(),
         image_builder,
         docker.clone(),
         &config,
-        overlay_bridge_address.clone(),
-        overlay_peers.clone(),
+        network.clone(),
         platform.clone(),
     );
 
@@ -620,7 +759,7 @@ pub async fn start_agent_server(
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(
         &config,
-        container_deployer,
+        container_deployer.clone(),
         platform,
         docker,
         dns_health.clone(),
@@ -634,9 +773,11 @@ pub async fn start_agent_server(
     // peers reconciled. `temps join` semantics are unchanged either way.
     crate::network_sync::spawn(
         &config,
-        overlay_bridge_address.clone(),
-        overlay_peers,
+        network.overlay_bridge_address,
+        network.overlay_peers,
         dns_health,
+        network.host_bind_address,
+        container_deployer,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
@@ -828,6 +969,10 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
+            wg_endpoint: None,
+            control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
+            control_plane_legacy_cert_path: None,
         }
     }
 
@@ -978,5 +1123,117 @@ mod tests {
             body["architecture"] = serde_json::json!(platform);
         }
         assert_eq!(body["architecture"], serde_json::json!("linux/arm64"));
+    }
+
+    /// Every sandbox host route, as the control plane's client calls it.
+    const SANDBOX_ROUTES: [&str; 13] = [
+        "/agent/sandboxes",
+        "/agent/sandboxes/exec",
+        "/agent/sandboxes/exec-stream",
+        "/agent/sandboxes/alive",
+        "/agent/sandboxes/read-file",
+        "/agent/sandboxes/write-file",
+        "/agent/sandboxes/write-directory",
+        "/agent/sandboxes/kill-processes",
+        "/agent/sandboxes/destroy",
+        "/agent/sandboxes/stop",
+        "/agent/sandboxes/start",
+        "/agent/sandboxes/recover",
+        "/agent/sandboxes/status",
+    ];
+    const UPLOAD_ROUTES: [&str; 2] = [
+        "/agent/sandboxes/write-file",
+        "/agent/sandboxes/write-directory",
+    ];
+
+    fn sandbox_app() -> (Router, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
+        (
+            sandbox_router(state, Arc::new(AgentAuth::new("secret"))),
+            root,
+        )
+    }
+
+    fn post_json(
+        route: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::post(route)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_sandbox_route_is_registered_behind_agent_auth() {
+        use tower::ServiceExt;
+        let (app, _root) = sandbox_app();
+        for route in SANDBOX_ROUTES {
+            for token in [None, Some("wrong")] {
+                let response = app
+                    .clone()
+                    .oneshot(post_json(route, token, b"{}".to_vec()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "{route} with token {token:?}"
+                );
+            }
+            let response = app
+                .clone()
+                .oneshot(post_json(route, Some("secret"), b"{}".to_vec()))
+                .await
+                .unwrap();
+            assert!(
+                !matches!(
+                    response.status(),
+                    axum::http::StatusCode::NOT_FOUND
+                        | axum::http::StatusCode::METHOD_NOT_ALLOWED
+                        | axum::http::StatusCode::UNAUTHORIZED
+                ),
+                "{route} answered {}",
+                response.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_upload_routes_accept_bodies_over_two_mib() {
+        use tower::ServiceExt;
+        let (app, _root) = sandbox_app();
+        // Valid JSON just over axum's 2 MiB default.
+        let mut big = b"{\"padding\":\"".to_vec();
+        big.extend(std::iter::repeat_n(b'a', 3 * 1024 * 1024));
+        big.extend_from_slice(b"\"}");
+        for route in SANDBOX_ROUTES {
+            // `status` reads no body at all.
+            if route == "/agent/sandboxes/status" {
+                continue;
+            }
+            let response = app
+                .clone()
+                .oneshot(post_json(route, Some("secret"), big.clone()))
+                .await
+                .unwrap();
+            if UPLOAD_ROUTES.contains(&route) {
+                assert_ne!(
+                    response.status(),
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "{route} must accept large uploads"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "{route} must keep the 2 MiB default"
+                );
+            }
+        }
     }
 }

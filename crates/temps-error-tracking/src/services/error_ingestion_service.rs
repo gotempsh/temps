@@ -49,6 +49,39 @@ fn extract_trace_id_from_data(data: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// The exception type and message a group is created from, from the first
+/// exception or else the legacy top-level fields. When the message is
+/// missing (most `captureMessage` payloads and Sentry SDKs that send only an
+/// event-level message), probe the raw event for a usable one so the title
+/// doesn't render as the useless literal "Error: Unknown error".
+///
+/// The similarity lookup embeds the same text (message, else type), so an
+/// incoming event is compared against what each group was embedded from.
+fn group_type_and_message(error_data: &CreateErrorEventData) -> (String, Option<String>) {
+    let raw_message = || extract_message_from_raw(error_data.raw_sentry_event.as_ref());
+    match error_data.exceptions.first() {
+        Some(first_exception) => (
+            first_exception.exception_type.clone(),
+            first_exception
+                .exception_value
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(raw_message),
+        ),
+        None => (
+            error_data
+                .exception_type
+                .clone()
+                .unwrap_or_else(|| "Error".to_string()),
+            error_data
+                .exception_value
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(raw_message),
+        ),
+    }
+}
+
 /// Probe a raw Sentry payload for a usable human-readable message.
 ///
 /// SDKs that send `captureMessage()` (no exception) put the text in
@@ -126,26 +159,18 @@ impl ErrorIngestionService {
             return Ok(group_id);
         }
 
-        // 3. Try vector similarity search (fallback)
-        // Use first exception for embedding text
-        let embedding_text = if let Some(first_exception) = error_data.exceptions.first() {
-            first_exception
-                .exception_value
-                .as_ref()
-                .unwrap_or(&first_exception.exception_type)
-                .clone()
-        } else {
-            error_data
-                .exception_type
-                .as_ref()
-                .or(error_data.exception_value.as_ref())
-                .unwrap_or(&"Unknown error".to_string())
-                .clone()
-        };
+        // 3. Try vector similarity search (fallback). The lookup must embed
+        // the same text a group is created from (see `group_type_and_message`),
+        // otherwise the vectors never match. The embedding only covers the
+        // message, so the lookup is also restricted to the same exception
+        // type: `TypeError: x is not a function` and `RangeError: x is not a
+        // function` embed identically but are different errors.
+        let (exception_type, exception_value) = group_type_and_message(&error_data);
+        let embedding_text = exception_value.unwrap_or_else(|| exception_type.clone());
 
         if let Some(embedding) = self.create_embedding(&embedding_text) {
             if let Some(similar_group_id) = self
-                .find_similar_group_by_embedding(&embedding, error_data.project_id)
+                .find_similar_group_by_embedding(&embedding, error_data.project_id, &exception_type)
                 .await?
             {
                 self.create_error_event(&error_data, similar_group_id, &fingerprint)
@@ -321,19 +346,24 @@ impl ErrorIngestionService {
     /// Hardcoded similarity threshold: 0.15 (lower = more similar, 0 = identical)
     ///
     /// Only searches unresolved and assigned groups (excludes resolved and ignored)
+    /// of the same `error_type`: the embedding is built from the message alone.
     async fn find_similar_group_by_embedding(
         &self,
         embedding: &error_groups::PgVector,
         project_id: i32,
+        error_type: &str,
     ) -> Result<Option<i32>, ErrorTrackingError> {
         #[derive(Debug, FromQueryResult)]
         struct SimilarGroup {
             id: i32,
-            #[allow(dead_code)]
-            distance: f32,
+            // pgvector's `<=>` returns `double precision`: decoding it as
+            // `f32` failed every lookup that matched a row, which rejected
+            // the event instead of grouping it.
+            distance: f64,
         }
 
-        const SIMILARITY_THRESHOLD: f32 = 0.15; // Cosine distance threshold
+        // Cosine distance threshold, bound as FLOAT8 like the `<=>` result.
+        const SIMILARITY_THRESHOLD: f64 = 0.15;
 
         // Convert embedding to array string for SQL
         let embedding_array = format!(
@@ -351,6 +381,7 @@ impl ErrorIngestionService {
             SELECT id, embedding <=> $1::vector AS distance
             FROM error_groups
             WHERE project_id = $2
+              AND error_type = $4
               AND embedding IS NOT NULL
               AND status IN ('unresolved', 'assigned')
               AND embedding <=> $1::vector < $3
@@ -367,11 +398,19 @@ impl ErrorIngestionService {
                     embedding_array.into(),
                     project_id.into(),
                     SIMILARITY_THRESHOLD.into(),
+                    error_type.into(),
                 ],
             ))
             .one(self.db.as_ref())
             .await?;
 
+        if let Some(group) = &result {
+            tracing::debug!(
+                group_id = group.id,
+                distance = group.distance,
+                "error grouped by embedding similarity"
+            );
+        }
         Ok(result.map(|r| r.id))
     }
 
@@ -381,33 +420,7 @@ impl ErrorIngestionService {
         error_data: &CreateErrorEventData,
         _fingerprint: &str,
     ) -> Result<i32, ErrorTrackingError> {
-        // Use first exception for title, or fall back to legacy fields.
-        // When `exception_value` is missing (most `captureMessage` payloads
-        // and Sentry SDKs that send only an event-level message), probe
-        // the raw event for a usable message so the title doesn't render
-        // as the useless literal "Error: Unknown error".
-        let (exception_type, exception_value) =
-            if let Some(first_exception) = error_data.exceptions.first() {
-                let value = first_exception
-                    .exception_value
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| extract_message_from_raw(error_data.raw_sentry_event.as_ref()));
-                (first_exception.exception_type.clone(), value)
-            } else {
-                let value = error_data
-                    .exception_value
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| extract_message_from_raw(error_data.raw_sentry_event.as_ref()));
-                (
-                    error_data
-                        .exception_type
-                        .clone()
-                        .unwrap_or_else(|| "Error".to_string()),
-                    value,
-                )
-            };
+        let (exception_type, exception_value) = group_type_and_message(error_data);
 
         let title = match exception_value.as_deref() {
             Some(v) if !v.trim().is_empty() => format!(
@@ -623,7 +636,578 @@ impl ErrorIngestionService {
 
 #[cfg(test)]
 mod tests {
-    include!("error_ingestion_tests.rs");
+    use super::*;
+    use sea_orm::PaginatorTrait;
+    use std::sync::Arc;
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{error_events, error_groups, projects};
+
+    async fn setup_test_db() -> TestDatabase {
+        TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database")
+    }
+
+    async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
+        use temps_entities::preset::Preset;
+        use uuid::Uuid;
+
+        let unique_slug = format!("test-project-{}", Uuid::new_v4());
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(unique_slug),
+            preset: Set(Preset::NextJs),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        };
+
+        project
+            .insert(db.as_ref())
+            .await
+            .expect("Failed to create project")
+            .id
+    }
+
+    fn create_test_error_data(project_id: i32) -> CreateErrorEventData {
+        CreateErrorEventData {
+            source: Some("test".to_string()),
+            exception_type: Some("TypeError".to_string()),
+            exception_value: Some("Cannot read property 'foo' of undefined".to_string()),
+            stack_trace: Some(serde_json::json!([
+                {
+                    "filename": "/app/index.js",
+                    "function": "doSomething",
+                    "lineno": 42
+                }
+            ])),
+            project_id,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_process_error_event_creates_new_group() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+
+        let project_id = create_test_project(&db).await;
+        let error_data = create_test_error_data(project_id);
+
+        let group_id = service
+            .process_error_event(error_data)
+            .await
+            .expect("Failed to process error event");
+
+        // Verify group was created
+        let group = error_groups::Entity::find_by_id(group_id)
+            .one(db.as_ref())
+            .await
+            .expect("Failed to fetch group")
+            .expect("Group not found");
+
+        assert_eq!(group.project_id, project_id);
+        assert_eq!(group.total_count, 1);
+        assert_eq!(group.status, "unresolved");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_process_error_event_groups_similar_errors() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+
+        let project_id = create_test_project(&db).await;
+
+        // Process first error
+        let error_data1 = create_test_error_data(project_id);
+        let group_id1 = service
+            .process_error_event(error_data1.clone())
+            .await
+            .expect("Failed to process first error");
+
+        // Process second identical error
+        let error_data2 = error_data1.clone();
+        let group_id2 = service
+            .process_error_event(error_data2)
+            .await
+            .expect("Failed to process second error");
+
+        // Should be grouped together
+        assert_eq!(group_id1, group_id2);
+
+        // Verify count was incremented
+        let group = error_groups::Entity::find_by_id(group_id1)
+            .one(db.as_ref())
+            .await
+            .expect("Failed to fetch group")
+            .expect("Group not found");
+
+        assert_eq!(group.total_count, 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_generate_fingerprint_is_consistent() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let error_data = CreateErrorEventData {
+            exception_type: Some("TypeError".to_string()),
+            exception_value: Some("Test error".to_string()),
+            stack_trace: Some(serde_json::json!([{"filename": "test.js", "function": "test"}])),
+            project_id: 1,
+            ..Default::default()
+        };
+
+        let fingerprint1 = service.generate_fingerprint(&error_data);
+        let fingerprint2 = service.generate_fingerprint(&error_data);
+
+        assert_eq!(fingerprint1, fingerprint2);
+        assert!(!fingerprint1.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_generate_fingerprint_differs_for_different_errors() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let error_data1 = CreateErrorEventData {
+            exception_type: Some("TypeError".to_string()),
+            exception_value: Some("Error 1".to_string()),
+            stack_trace: None,
+            project_id: 1,
+            ..Default::default()
+        };
+
+        let error_data2 = CreateErrorEventData {
+            exception_type: Some("ReferenceError".to_string()),
+            exception_value: Some("Error 2".to_string()),
+            stack_trace: None,
+            project_id: 1,
+            ..Default::default()
+        };
+
+        let fingerprint1 = service.generate_fingerprint(&error_data1);
+        let fingerprint2 = service.generate_fingerprint(&error_data2);
+
+        assert_ne!(fingerprint1, fingerprint2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message1 = "Error: Connection failed at line 123";
+        let message2 = "ERROR: CONNECTION FAILED AT LINE 123";
+
+        let normalized1 = service.normalize_error_message(message1);
+        let normalized2 = service.normalize_error_message(message2);
+
+        assert_eq!(normalized1, normalized2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_process_error_event_creates_event() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+
+        let project_id = create_test_project(&db).await;
+        let error_data = create_test_error_data(project_id);
+
+        let group_id = service
+            .process_error_event(error_data)
+            .await
+            .expect("Failed to process error event");
+
+        // Verify event was created
+        let events = error_events::Entity::find()
+            .filter(error_events::Column::ErrorGroupId.eq(group_id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to fetch events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].exception_type, "TypeError");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_extract_stack_signature() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let stack_trace = Some(serde_json::json!([
+            {"filename": "/app/src/index.js", "function": "main"},
+            {"filename": "/app/src/utils.js", "function": "helper"},
+            {"filename": "/app/src/lib.js", "function": "doWork"},
+        ]));
+
+        let signature = service.extract_stack_signature(&stack_trace, 3);
+
+        assert!(signature.contains("index.js"));
+        assert!(signature.contains("main"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_uuids() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: Resource 550e8400-e29b-41d4-a716-446655440000 not found";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("<uuid>"));
+        assert!(!normalized.contains("550e8400"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_hex_ids() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: Transaction 0xdeadbeef1234 failed";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("<hex_id>"));
+        assert!(!normalized.contains("deadbeef"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_numbers() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: User 123456 failed to authenticate";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("<num>"));
+        assert!(!normalized.contains("123456"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_paths() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message1 = "Error: Cannot read /home/user/app/config.json";
+        let normalized1 = service.normalize_error_message(message1);
+        assert!(normalized1.contains("<path>"));
+
+        let message2 = "Error: File C:\\Users\\Admin\\file.txt not found";
+        let normalized2 = service.normalize_error_message(message2);
+        assert!(normalized2.contains("<path>"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_urls() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: Failed to fetch https://api.example.com/users/123";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("<url>"));
+        assert!(!normalized.contains("example.com"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_emails() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: Email user@example.com already exists";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("<email>"));
+        assert!(!normalized.contains("user@example"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_ips() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: Connection to 192.168.1.100 timeout";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("<ip>"));
+        assert!(!normalized.contains("192.168"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_replaces_table_refs() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        let message = "Error: Foreign key constraint failed on table users_123";
+        let normalized = service.normalize_error_message(message);
+
+        assert!(normalized.contains("users_<id>"));
+        assert!(!normalized.contains("users_123"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_normalize_error_message_groups_similar_errors() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db);
+
+        // These errors should normalize to the same message
+        let message1 = "Error: User 12345 not found at 192.168.1.100";
+        let message2 = "Error: User 67890 not found at 10.0.0.5";
+        let message3 = "Error: User 99999 not found at 172.16.0.1";
+
+        let normalized1 = service.normalize_error_message(message1);
+        let normalized2 = service.normalize_error_message(message2);
+        let normalized3 = service.normalize_error_message(message3);
+
+        // All should normalize to the same pattern
+        assert_eq!(normalized1, normalized2);
+        assert_eq!(normalized2, normalized3);
+        assert!(normalized1.contains("<num>"));
+        assert!(normalized1.contains("<ip>"));
+    }
+
+    /// Same message, different stack: the fingerprints differ, so grouping has to
+    /// go through the pgvector similarity lookup.
+    fn error_data_with_frame(
+        project_id: i32,
+        filename: &str,
+        function: &str,
+    ) -> CreateErrorEventData {
+        CreateErrorEventData {
+            stack_trace: Some(serde_json::json!([
+                {
+                    "filename": filename,
+                    "function": function,
+                    "lineno": 7
+                }
+            ])),
+            ..create_test_error_data(project_id)
+        }
+    }
+
+    /// Regression: `embedding <=> $1::vector` is FLOAT8, and decoding it into an
+    /// `f32` failed the whole ingest with a ColumnDecode error as soon as the
+    /// similarity query matched a row, so the event was dropped.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_process_error_event_groups_by_embedding_when_fingerprint_differs() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+
+        let first = error_data_with_frame(project_id, "/app/a.js", "handlerA");
+        let second = error_data_with_frame(project_id, "/app/b.js", "handlerB");
+        assert_ne!(
+            service.generate_fingerprint(&first),
+            service.generate_fingerprint(&second),
+            "precondition: the two events must not share a fingerprint"
+        );
+
+        let group_a = service
+            .process_error_event(first)
+            .await
+            .expect("first event must be stored");
+        let group_b = service
+            .process_error_event(second)
+            .await
+            .expect("an event matched by embedding similarity must be stored, not rejected");
+
+        assert_eq!(
+            group_a, group_b,
+            "similar event must join the existing group"
+        );
+
+        let group = error_groups::Entity::find_by_id(group_a)
+            .one(db.as_ref())
+            .await
+            .expect("Failed to fetch group")
+            .expect("Group not found");
+        assert_eq!(group.total_count, 2);
+
+        let events = error_events::Entity::find()
+            .filter(error_events::Column::ErrorGroupId.eq(group_a))
+            .count(db.as_ref())
+            .await
+            .expect("Failed to count events");
+        assert_eq!(events, 2, "both events must be persisted");
+    }
+
+    /// Resolved groups are excluded from the similarity lookup: a similar event
+    /// opens a new group instead of reviving the resolved one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_similarity_lookup_skips_resolved_groups() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+
+        let group_a = service
+            .process_error_event(error_data_with_frame(project_id, "/app/a.js", "handlerA"))
+            .await
+            .expect("first event must be stored");
+
+        let mut resolved: error_groups::ActiveModel = error_groups::Entity::find_by_id(group_a)
+            .one(db.as_ref())
+            .await
+            .expect("Failed to fetch group")
+            .expect("Group not found")
+            .into();
+        resolved.status = Set("resolved".to_string());
+        resolved
+            .update(db.as_ref())
+            .await
+            .expect("Failed to resolve group");
+
+        let group_b = service
+            .process_error_event(error_data_with_frame(project_id, "/app/b.js", "handlerB"))
+            .await
+            .expect("second event must be stored");
+
+        assert_ne!(
+            group_a, group_b,
+            "a resolved group must not absorb new events"
+        );
+    }
+
+    /// The similarity lookup is scoped to the event's project.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_similarity_lookup_is_scoped_to_project() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+        let project_a = create_test_project(&db).await;
+        let project_b = create_test_project(&db).await;
+
+        let group_a = service
+            .process_error_event(error_data_with_frame(project_a, "/app/a.js", "handlerA"))
+            .await
+            .expect("first event must be stored");
+        let group_b = service
+            .process_error_event(error_data_with_frame(project_b, "/app/b.js", "handlerB"))
+            .await
+            .expect("second event must be stored");
+
+        assert_ne!(
+            group_a, group_b,
+            "groups must never be shared across projects"
+        );
+    }
+
+    /// The embedding covers the message only, so two exception types with the
+    /// same message embed identically; the lookup must keep them apart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_similarity_lookup_requires_same_error_type() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+
+        let type_error = error_data_with_frame(project_id, "/app/a.js", "handlerA");
+        let range_error = CreateErrorEventData {
+            exception_type: Some("RangeError".to_string()),
+            ..error_data_with_frame(project_id, "/app/b.js", "handlerB")
+        };
+
+        let group_a = service
+            .process_error_event(type_error)
+            .await
+            .expect("first event must be stored");
+        let group_b = service
+            .process_error_event(range_error)
+            .await
+            .expect("second event must be stored");
+
+        assert_ne!(
+            group_a, group_b,
+            "a RangeError must not join a TypeError group with the same message"
+        );
+    }
+
+    /// Sentry-style payloads carry an `exceptions` array. Same message, different
+    /// frames: the second event must join the first group through the similarity
+    /// lookup, which exercises the pgvector distance decode on that path too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_similarity_grouping_for_exception_array_payloads() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+
+        let event = |filename: &str| CreateErrorEventData {
+            exceptions: vec![super::super::types::ExceptionData {
+                exception_type: "RangeError".to_string(),
+                exception_value: Some("Maximum call stack size exceeded".to_string()),
+                stack_trace: Some(serde_json::json!([
+                    { "filename": filename, "function": "recurse", "lineno": 3 }
+                ])),
+                mechanism: None,
+                module: None,
+                thread_id: None,
+            }],
+            source: Some("test".to_string()),
+            project_id,
+            ..Default::default()
+        };
+
+        let first = event("/app/a.js");
+        let second = event("/app/b.js");
+        assert_ne!(
+            service.generate_fingerprint(&first),
+            service.generate_fingerprint(&second),
+            "precondition: the two events must not share a fingerprint"
+        );
+
+        let group_a = service
+            .process_error_event(first)
+            .await
+            .expect("first event must be stored");
+        let group_b = service
+            .process_error_event(second)
+            .await
+            .expect("an event matched by embedding similarity must be stored, not rejected");
+        assert_eq!(group_a, group_b);
+    }
 }
 
 #[cfg(test)]

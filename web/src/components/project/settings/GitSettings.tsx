@@ -15,7 +15,6 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
-  getComposeSecurityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -25,6 +24,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
 import { FollowedRepositoryNotice } from '@/components/project-groups/FollowedRepositoryNotice'
+import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
@@ -66,7 +66,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ScrollableTabsList, Tabs, TabsTrigger } from '@/components/ui/tabs'
 import {
   Tooltip,
   TooltipContent,
@@ -96,7 +96,11 @@ import {
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
-import { isRepositoryRootDirectory } from '@/lib/project-directory'
+import { problemDetail } from '@/lib/api-problem'
+import {
+  isRepositoryRootDirectory,
+  rootDirectoryHelp,
+} from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -138,6 +142,7 @@ import {
   repositoryConnectionPath,
   repositorySelectionPath,
 } from '@/lib/repository-connection-route'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface GitSettingsProps {
   project: ProjectResponse
@@ -455,6 +460,10 @@ function GitSettingsInline({
 
   // Directory editor
   const [directoryDraft, setDirectoryDraft] = useState('')
+  // The server refuses a root directory the repository does not have on the
+  // configured branch, naming what is there instead; keep that next to the
+  // field rather than only in a toast that disappears.
+  const [directoryError, setDirectoryError] = useState<string | null>(null)
   useEffect(() => {
     // The draft intentionally resets after a successful server refetch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -516,8 +525,9 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
-  const composeSecurityQuery = useQuery(
-    getComposeSecurityOptions({ path: { id: project.id } })
+  const composeSecurityQuery = useComposeSecurityPolicy(
+    project.id,
+    isComposePreset
   )
   const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
     null
@@ -716,7 +726,11 @@ function GitSettingsInline({
                 type="button"
                 size="sm"
                 variant="outline"
-                onClick={() => navigate(`/projects/${project.slug}/git`)}
+                onClick={() =>
+                  navigate(
+                    settingsSectionHref(project.slug, 'delivery', 'repository')
+                  )
+                }
               >
                 View Git settings
               </Button>
@@ -1035,16 +1049,31 @@ function GitSettingsInline({
                     editing={editing === 'directory'}
                     onStartEdit={() => {
                       setDirectoryDraft(project.directory || './')
+                      setDirectoryError(null)
                       setEditing('directory')
                     }}
-                    onCancel={close}
+                    onCancel={() => {
+                      setDirectoryError(null)
+                      close()
+                    }}
                     onSave={async () => {
                       const next = directoryDraft || './'
                       if (next === project.directory) {
                         close()
                         return
                       }
-                      await saveGitField({ directory: next })
+                      try {
+                        await saveGitField({ directory: next })
+                      } catch (error) {
+                        setDirectoryError(
+                          problemDetail(
+                            error,
+                            'The root directory could not be saved.'
+                          )
+                        )
+                        return
+                      }
+                      setDirectoryError(null)
                       toast.success('Root directory updated')
                       close()
                     }}
@@ -1058,13 +1087,36 @@ function GitSettingsInline({
                       </div>
                     }
                     editor={
-                      <Input
-                        value={directoryDraft}
-                        onChange={(e) => setDirectoryDraft(e.target.value)}
-                        placeholder="./"
-                        className="flex-1 font-mono text-sm"
-                        autoFocus
-                      />
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <Input
+                          value={directoryDraft}
+                          onChange={(e) => {
+                            setDirectoryDraft(e.target.value)
+                            setDirectoryError(null)
+                          }}
+                          placeholder="./"
+                          className="font-mono text-sm"
+                          aria-invalid={directoryError ? true : undefined}
+                          aria-describedby="root-directory-help"
+                          autoFocus
+                        />
+                        <p
+                          id="root-directory-help"
+                          role={directoryError ? 'alert' : undefined}
+                          className={cn(
+                            'text-xs',
+                            directoryError
+                              ? 'text-destructive'
+                              : 'text-muted-foreground'
+                          )}
+                        >
+                          {rootDirectoryHelp(
+                            directoryError,
+                            isLocalSource,
+                            project.main_branch
+                          )}
+                        </p>
+                      </div>
                     }
                   />
                   <li
@@ -1371,7 +1423,7 @@ function GitSettingsInline({
                         </div>
                         <div className="flex items-center gap-1.5">
                           {composeOverrideDirty && (
-                            <div className="text-sm text-amber-600 dark:text-amber-400">
+                            <div className="text-sm text-amber-700 dark:text-amber-400">
                               Unsaved
                             </div>
                           )}
@@ -1461,7 +1513,7 @@ function GitSettingsInline({
                       {composeSecurityQuery.isError ? (
                         <div className="flex h-[360px] flex-col items-center justify-center gap-3 p-6 text-center">
                           <p className="text-sm text-destructive">
-                            Could not load this service's Compose security
+                            Could not load this service&apos;s Compose security
                             policy.
                           </p>
                           <Button
@@ -1613,6 +1665,7 @@ function GitSettingsInline({
           <CardContent className="p-0 divide-y">
             <div className="flex items-center gap-4 p-6">
               <Switch
+                aria-label="Automatic deployments"
                 checked={autoDeployOn}
                 onCheckedChange={handleAutoDeployToggle}
               />
@@ -1651,7 +1704,7 @@ function GitSettingsInline({
                   {hasWebhook ? (
                     <Check className="size-4 text-green-600 dark:text-green-400" />
                   ) : (
-                    <RefreshCw className="size-4 text-amber-600 dark:text-amber-400" />
+                    <RefreshCw className="size-4 text-amber-700 dark:text-amber-400" />
                   )}
                 </div>
                 <div className="flex-1 min-w-0">
@@ -2430,7 +2483,7 @@ function ExcludedServicesInline({
                   {service.looksLikeDatabase && (
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+                        <span className="flex items-center gap-1 text-xs text-amber-700 dark:text-amber-500">
                           <Database className="h-3 w-3" />
                           <Info className="h-3 w-3" />
                         </span>
@@ -2774,7 +2827,8 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     }
   }, [detectedPresetData, directory])
 
-  const back = () => navigate(`/projects/${project.slug}/git`)
+  const back = () =>
+    navigate(settingsSectionHref(project.slug, 'delivery', 'repository'))
   const connectionBasePath = repositoryConnectionBasePath(project.slug)
 
   const repoToConnect =
@@ -2891,10 +2945,8 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 
       {mode === 'connection' ? (
         <div className="space-y-3 rounded-lg border p-3">
-          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
-            <p className="shrink-0 text-base font-medium sm:text-sm">
-              Git connection
-            </p>
+          <div className="min-w-0 space-y-1">
+            <p className="text-base font-medium sm:text-sm">Git connection</p>
             <Tabs
               value={selectedConnectionId?.toString()}
               onValueChange={(value) => {
@@ -2905,19 +2957,14 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                   navigate(repositoryConnectionPath(project.slug, connectionId))
                 }
               }}
-              className="min-w-0"
             >
-              <TabsList
-                className="h-9 max-w-full justify-start overflow-x-auto p-1"
-                aria-label="Git provider connections"
-              >
+              <ScrollableTabsList aria-label="Git provider connections">
                 {connections.map((c) => {
                   const provider = providers.find((p) => p.id === c.provider_id)
                   return (
                     <TabsTrigger
                       key={c.id}
                       value={c.id.toString()}
-                      className="h-7 gap-2 px-2.5 py-1"
                       title={`${provider?.name || 'Git'}: ${c.account_name}`}
                     >
                       <ProviderLogo
@@ -2928,12 +2975,12 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                     </TabsTrigger>
                   )
                 })}
-              </TabsList>
+              </ScrollableTabsList>
             </Tabs>
           </div>
 
           {selectedConnectionId && (
-            <div className="space-y-3 border-t pt-3">
+            <div className="space-y-3">
               <div className="inline-flex rounded-lg border p-0.5">
                 <Button
                   type="button"
@@ -3184,10 +3231,13 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   )
 }
 
-export function GitSettings(props: GitSettingsProps) {
+export function GitSettings(props: GitSettingsProps & { embedded?: boolean }) {
   return (
     <div className="space-y-4">
-      <FollowedRepositoryNotice project={props.project} onChanged={props.refetch} />
+      <FollowedRepositoryNotice
+        project={props.project}
+        onChanged={props.refetch}
+      />
       <GitSettingsInline {...props} view="git" />
     </div>
   )

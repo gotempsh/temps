@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, afterEach, vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
 import "@testing-library/react";
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // Undo vi.spyOn overrides even when a test fails before its own
+  // mockRestore(), so one failure cannot cascade into unrelated tests.
+  vi.restoreAllMocks();
+  localStorage.clear();
 });
 
 // Mock fetch and sendBeacon globally
@@ -29,15 +33,5 @@ Object.defineProperty(window, "location", {
 
 Object.defineProperty(document, "visibilityState", {
   value: "visible",
-  writable: true,
-});
-
-Object.defineProperty(window, "localStorage", {
-  value: {
-    getItem: vi.fn(),
-    setItem: vi.fn(),
-    removeItem: vi.fn(),
-    clear: vi.fn(),
-  },
   writable: true,
 });

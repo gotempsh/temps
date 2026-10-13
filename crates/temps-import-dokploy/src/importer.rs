@@ -1201,6 +1201,8 @@ async fn execute_plan(
         .unwrap_or_else(|| context.main_branch.clone());
 
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
         name: context.project_name.clone(),
         expected_slug: None,
         repo_name,

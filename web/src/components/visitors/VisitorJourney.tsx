@@ -283,7 +283,10 @@ function CustomEventNode({ event }: { event: JourneyEvent }) {
           )}
         </div>
         {expanded && hasData && (
-          <pre className="mt-1.5 rounded bg-muted p-2 text-xs font-mono overflow-x-auto max-h-48">
+          <pre
+            tabIndex={0}
+            className="mt-1.5 rounded bg-muted p-2 text-xs font-mono overflow-x-auto max-h-48"
+          >
             <HighlightedCode
               code={JSON.stringify(event.event_data, null, 2)}
               language="json"

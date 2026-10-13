@@ -28,6 +28,8 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -36,7 +38,7 @@ import {
   ShieldAlert,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const TRIGGER_TYPES = [
@@ -108,7 +110,9 @@ export function AlertRulesManagement({
   const selectedProject = projectList?.find(
     (project) => project.id === projectId
   )
-  const showProjectSelector = !fixedProjectId && (projectList?.length ?? 0) > 1
+  // Rules are per project, so outside a project the picker is always shown,
+  // even with a single project, to make that scope explicit.
+  const showProjectSelector = !fixedProjectId && (projectList?.length ?? 0) > 0
 
   const navigateToRule = (suffix: 'new' | `${number}/edit`) => {
     if (fixedProjectId) {
@@ -152,16 +156,23 @@ export function AlertRulesManagement({
     },
   })
 
-  const handleDelete = async (rule: AlertRuleResponse) => {
-    if (!projectId) return
-    await deleteMutation.mutateAsync({
-      path: { project_id: projectId, rule_id: rule.id },
+  const [ruleToDelete, setRuleToDelete] = useState<AlertRuleResponse | null>(
+    null
+  )
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!projectId || !ruleToDelete) return
+    deleteMutation.mutate({
+      path: { project_id: projectId, rule_id: ruleToDelete.id },
     })
+    setRuleToDelete(null)
   }
 
-  const handleToggleEnabled = async (rule: AlertRuleResponse) => {
+  const handleToggleEnabled = (rule: AlertRuleResponse) => {
     if (!projectId) return
-    await updateMutation.mutateAsync({
+    updateMutation.mutate({
       path: { project_id: projectId, rule_id: rule.id },
       body: { enabled: !rule.enabled },
     })
@@ -170,11 +181,7 @@ export function AlertRulesManagement({
   const hasRules = useMemo(() => rules && rules.length > 0, [rules])
 
   if (!fixedProjectId && projectsLoading) {
-    return (
-      <div className="flex items-center justify-center py-6">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
-      </div>
-    )
+    return <RulesSkeleton />
   }
 
   if (!fixedProjectId && !projectList?.length) {
@@ -182,7 +189,15 @@ export function AlertRulesManagement({
       <EmptyState
         icon={ShieldAlert}
         title="No services found"
-        description="Create a service first to configure error alert rules."
+        description="Error alert rules belong to a service. Create one to configure them."
+        action={
+          <Button asChild>
+            <Link to="/projects/new">
+              <Plus className="h-4 w-4 mr-2" />
+              Create service
+            </Link>
+          </Button>
+        }
       />
     )
   }
@@ -194,16 +209,28 @@ export function AlertRulesManagement({
           <h3 className="text-lg font-medium">Error Alert Rules</h3>
           <p className="text-sm text-muted-foreground">
             Configure rules that trigger notifications when errors match certain
-            conditions.
+            conditions. Rules apply to one project
+            {selectedProject && !fixedProjectId ? (
+              <>
+                ; showing{' '}
+                <span className="font-medium text-foreground">
+                  {selectedProject.name}
+                </span>
+              </>
+            ) : null}
+            .
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           {showProjectSelector && (
             <Select
               value={String(projectId)}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-[200px]" aria-label="Service">
+              <SelectTrigger
+                className="w-full sm:w-[200px]"
+                aria-label="Service"
+              >
                 <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
@@ -224,9 +251,7 @@ export function AlertRulesManagement({
       </div>
 
       {rulesLoading ? (
-        <div className="flex items-center justify-center py-6">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
-        </div>
+        <RulesGridSkeleton />
       ) : !hasRules ? (
         <EmptyState
           icon={AlertTriangle}
@@ -286,7 +311,7 @@ export function AlertRulesManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(rule)}
+                        onClick={() => setRuleToDelete(rule)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -315,6 +340,38 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
+      <ConfirmDialog
+        open={ruleToDelete !== null}
+        onOpenChange={(open) => !open && setRuleToDelete(null)}
+        title={`Delete ${ruleToDelete?.name ?? 'alert rule'}?`}
+        description="This permanently deletes the alert rule. It will stop sending notifications immediately. This cannot be undone."
+        onConfirm={handleConfirmDelete}
+      />
+    </div>
+  )
+}
+
+function RulesGridSkeleton() {
+  return (
+    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      {[0, 1, 2].map((i) => (
+        <Skeleton key={i} className="h-32 w-full" />
+      ))}
+    </div>
+  )
+}
+
+function RulesSkeleton() {
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="space-y-2">
+          <Skeleton className="h-6 w-40" />
+          <Skeleton className="h-4 w-72" />
+        </div>
+        <Skeleton className="h-9 w-[200px]" />
+      </div>
+      <RulesGridSkeleton />
     </div>
   )
 }

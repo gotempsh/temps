@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { missingLogLines } from './job-log-state'
+
 import {
   DeploymentJobResponse,
   DeploymentResponse,
@@ -10,6 +12,7 @@ import { getDeploymentJobsOptions } from '@/api/client/@tanstack/react-query.gen
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CodeBlock } from '@/components/ui/code-block'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
   DialogContent,
@@ -23,11 +26,9 @@ import { useQuery } from '@tanstack/react-query'
 import AnsiToHtml from 'ansi-to-html'
 import {
   AlertTriangle,
-  Check,
   CheckCircle2,
   ChevronDownIcon,
   ChevronUpIcon,
-  Copy,
   Info,
   Loader2,
   Settings,
@@ -37,6 +38,12 @@ import {
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useAiAssistant } from '../ai/AiAssistantContext'
 import { ElapsedTime } from '../global/ElapsedTime'
+import {
+  JobLogNoticeBar,
+  JobLogPlaceholder,
+  JobLogTruncationNote,
+} from './JobLogStatus'
+import { useDeploymentJobLogs } from './useDeploymentJobLogs'
 
 interface DeploymentStagesProps {
   project: ProjectResponse
@@ -49,143 +56,21 @@ interface LogViewerProps {
   job: DeploymentJobResponse
 }
 
-interface LogEntry {
-  level: string
-  message: string
-  timestamp: string
-  line: number
-}
-
-function useLogWebSocket(
-  project: ProjectResponse,
-  deployment: DeploymentResponse,
-  job: DeploymentJobResponse
-) {
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [connectionStatus, setConnectionStatus] = useState<
-    'connecting' | 'connected' | 'error'
-  >('connecting')
-  const wsRef = useRef<WebSocket | null>(null)
-
-  useEffect(() => {
-    if (!project.slug || !deployment.id || !job.job_id) {
-      console.error('Missing required parameters for WebSocket connection')
-      return
-    }
-
-    let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
-    let isCleaningUp = false
-    let reconnectAttempts = 0
-
-    const connectWS = () => {
-      // Don't reconnect if component is unmounting
-      if (isCleaningUp) return
-
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/deployments/${deployment.id}/jobs/${job.job_id}/logs/tail`
-
-      wsRef.current = new WebSocket(wsUrl)
-      setConnectionStatus('connecting')
-
-      wsRef.current.onopen = () => {
-        setConnectionStatus('connected')
-        reconnectAttempts = 0
-      }
-
-      wsRef.current.onmessage = (event) => {
-        setLogs((prevLogs) => {
-          // Dedupe by absolute file line number — after reconnect the
-          // backend re-streams the last 1000 lines, which will overlap
-          // with what's already in state.
-          const lastSeenLine =
-            prevLogs.length > 0 ? prevLogs[prevLogs.length - 1].line : 0
-          try {
-            const data = JSON.parse(event.data) as LogEntry
-            // Validate that it's a proper log entry
-            if (data.level && data.message && data.line !== undefined) {
-              if (data.line <= lastSeenLine) {
-                return prevLogs
-              }
-              // Trim leading and trailing newlines/carriage returns from the message
-              const cleanedMessage = data.message.replace(
-                /^[\r\n]+|[\r\n]+$/g,
-                ''
-              )
-              return [
-                ...prevLogs,
-                {
-                  ...data,
-                  message: cleanedMessage,
-                },
-              ]
-            }
-            // Fallback for old format
-            return [
-              ...prevLogs,
-              {
-                level: 'info',
-                message: data.message?.replace(/^[\r\n]+|[\r\n]+$/g, '') || '',
-                timestamp: new Date().toISOString(),
-                line: lastSeenLine + 1,
-              },
-            ]
-          } catch {
-            // Fallback for non-JSON messages
-            const message =
-              typeof event.data === 'string' ? event.data : String(event.data)
-            return [
-              ...prevLogs,
-              {
-                level: 'info',
-                message: message.replace(/^[\r\n]+|[\r\n]+$/g, ''),
-                timestamp: new Date().toISOString(),
-                line: lastSeenLine + 1,
-              },
-            ]
-          }
-        })
-      }
-
-      wsRef.current.onerror = () => {
-        setConnectionStatus('error')
-      }
-
-      wsRef.current.onclose = () => {
-        // Always reconnect unless the component is being cleaned up.
-        // The backend log tail is an infinite stream, so any closure
-        // (including a normal 1000 from a redeploy churning the log source)
-        // is unexpected from the user's perspective. Use exponential backoff
-        // capped at 10s so we recover quickly from transient drops.
-        if (isCleaningUp) return
-        setConnectionStatus('error')
-        const delay = Math.min(1000 * 2 ** reconnectAttempts, 10000)
-        reconnectAttempts += 1
-        reconnectTimeoutId = setTimeout(connectWS, delay)
-      }
-    }
-
-    connectWS()
-
-    return () => {
-      isCleaningUp = true
-      if (reconnectTimeoutId) {
-        clearTimeout(reconnectTimeoutId)
-      }
-      if (wsRef.current) {
-        wsRef.current.close(1000, 'Component unmounting')
-      }
-    }
-  }, [project.id, deployment.id, job.job_id, project.slug])
-
-  return { logs, connectionStatus }
-}
-
 function LogViewer({ project, deployment, job }: LogViewerProps) {
   const scrollAreaRef = useRef<HTMLDivElement>(null)
-  const { logs, connectionStatus } = useLogWebSocket(project, deployment, job)
+  const {
+    entries: logs,
+    view,
+    problemDetail,
+    retry,
+  } = useDeploymentJobLogs({
+    projectId: project.id,
+    deploymentId: deployment.id,
+    jobId: job.job_id,
+    jobStatus: job.status,
+  })
   const [searchQuery, setSearchQuery] = useState('')
   const [activeFilters, setActiveFilters] = useState<Set<string>>(new Set())
-  const [copied, setCopied] = useState(false)
 
   useEffect(() => {
     if (logs.length > 0 && scrollAreaRef.current) {
@@ -228,14 +113,14 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
   const getLevelIconColor = (level: string) => {
     switch (level.toLowerCase()) {
       case 'error':
-        return 'text-red-500'
+        return 'text-red-700 dark:text-red-500'
       case 'warning':
       case 'warn':
-        return 'text-yellow-500'
+        return 'text-yellow-700 dark:text-yellow-500'
       case 'success':
-        return 'text-green-500'
+        return 'text-green-700 dark:text-green-500'
       case 'info':
-        return 'text-blue-500'
+        return 'text-blue-600 dark:text-blue-500'
       default:
         return 'text-muted-foreground'
     }
@@ -395,43 +280,22 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
         </div>
       </div>
 
-      {connectionStatus === 'error' && (
-        <div
-          role="status"
-          className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200"
-        >
-          <AlertTriangle className="h-4 w-4 shrink-0" />
-          Log stream disconnected. Existing lines are preserved while Temps
-          reconnects.
-        </div>
-      )}
+      <JobLogNoticeBar notice={view.notice} onRetry={retry} />
+      <JobLogTruncationNote
+        firstLine={logs[0]?.line}
+        missingLines={missingLogLines(logs)}
+      />
 
       {/* Log Viewer */}
       <div className="relative group">
-        {/* Copy Button - CodeBlock Style */}
-        <Button
-          size="sm"
-          variant="ghost"
-          className="absolute top-2 right-2 z-10 h-7 px-2 bg-background/80 dark:bg-zinc-800/50 hover:bg-background dark:hover:bg-zinc-800 text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-all duration-200 backdrop-blur-sm"
-          onClick={async () => {
-            await navigator.clipboard.writeText(plainTextLogs)
-            setCopied(true)
-            setTimeout(() => setCopied(false), 2000)
-          }}
-          disabled={logs.length === 0 || connectionStatus === 'connecting'}
+        <CopyButton
+          value={plainTextLogs}
+          label="Copy logs"
+          disabled={logs.length === 0}
+          className="absolute top-2 right-2 z-10 h-7 gap-1 rounded-md px-2 bg-background/80 text-muted-foreground opacity-0 backdrop-blur-sm group-hover:opacity-100 focus-visible:opacity-100 dark:bg-zinc-800/50 [&_svg]:h-3 [&_svg]:w-3"
         >
-          {copied ? (
-            <>
-              <Check className="h-3 w-3 mr-1" />
-              <span className="text-xs">Copied</span>
-            </>
-          ) : (
-            <>
-              <Copy className="h-3 w-3 mr-1" />
-              <span className="text-xs">Copy</span>
-            </>
-          )}
-        </Button>
+          <span className="text-xs">Copy</span>
+        </CopyButton>
 
         {/* Native scroll container (not Radix ScrollArea) — Radix only wires
             up a vertical scrollbar and its display:table viewport blocks
@@ -439,20 +303,20 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             clipped with no way to reach them. A plain overflow-auto div gives
             reliable two-axis touch scrolling. */}
         <div
+          tabIndex={0}
           ref={scrollAreaRef}
-          className={`h-96 overflow-auto border rounded-md bg-background overscroll-contain ${connectionStatus === 'connecting' ? 'opacity-50' : 'opacity-100'}`}
+          className="h-96 overflow-auto border rounded-md bg-background overscroll-contain"
         >
           {/* w-max + min-w-full lets rows grow to the longest line so it can be
               scrolled to horizontally, while never shrinking below the viewport. */}
           <div className="text-xs font-mono p-4 w-max min-w-full">
-            {logs.length === 0 ? (
-              <div className="text-muted-foreground">
-                {connectionStatus === 'error'
-                  ? 'Could not connect to the log stream. Retrying…'
-                  : connectionStatus === 'connected'
-                    ? 'Connected. Waiting for log output…'
-                    : 'Connecting to log stream…'}
-              </div>
+            {view.body !== 'lines' ? (
+              <JobLogPlaceholder
+                body={view.body}
+                jobStatus={job.status}
+                detail={problemDetail}
+                onRetry={retry}
+              />
             ) : filteredLogs.length === 0 ? (
               <div className="text-muted-foreground">
                 No logs match the current filters
@@ -463,7 +327,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
                   key={log.line}
                   className="flex gap-2 items-start hover:bg-muted/50 leading-relaxed"
                 >
-                  <span className="text-muted-foreground/50 select-none min-w-[3ch] text-right shrink-0">
+                  <span className="text-muted-foreground select-none min-w-[3ch] text-right shrink-0">
                     {log.line}
                   </span>
                   <span
@@ -477,7 +341,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
                       __html: ansiConverter.toHtml(log.message),
                     }}
                   />
-                  <span className="text-muted-foreground/40 text-[10px] whitespace-nowrap shrink-0">
+                  <span className="text-muted-foreground text-[10px] whitespace-nowrap shrink-0">
                     {formatTimestamp(log.timestamp)}
                   </span>
                 </div>
@@ -688,7 +552,7 @@ export function DeploymentStages({
         return (
           <Badge
             variant="secondary"
-            className="capitalize bg-orange-500/10 text-orange-600 border-orange-500/20"
+            className="capitalize bg-orange-500/10 text-orange-700 dark:text-orange-600 border-orange-500/20"
           >
             In Progress
           </Badge>
@@ -751,7 +615,7 @@ export function DeploymentStages({
                     title="Debug this failure with AI"
                   >
                     <Sparkles className="h-4 w-4" />
-                    <span className="hidden sm:inline">Debug with AI</span>
+                    <span className="max-sm:sr-only">Debug with AI</span>
                   </Button>
                 )}
                 <ElapsedTime
@@ -771,13 +635,22 @@ export function DeploymentStages({
                   <Settings className="h-4 w-4" />
                 </Button>
                 <button
+                  type="button"
                   onClick={() => toggleStage(stage.id)}
-                  className="cursor-pointer"
+                  aria-expanded={expandedStageIds.has(stage.id)}
+                  aria-label={`${expandedStageIds.has(stage.id) ? 'Hide' : 'Show'} logs for ${stage.name}`}
+                  className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 >
                   {expandedStageIds.has(stage.id) ? (
-                    <ChevronUpIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronUpIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <ChevronDownIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronDownIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   )}
                 </button>
               </div>

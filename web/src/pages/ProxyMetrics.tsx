@@ -940,6 +940,7 @@ function FilterBar({
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
       <ProjectSelect
+        ariaLabel="Filter by service"
         value={filter.projectId}
         onValueChange={(projectId) =>
           onChange({ projectId, environmentId: null })
@@ -1019,9 +1020,12 @@ const TRAFFIC_COLUMNS: {
 ]
 
 const STATUS_STYLES: Record<string, { dot: string; text: string }> = {
-  healthy: { dot: 'bg-emerald-500', text: 'text-emerald-600' },
-  degraded: { dot: 'bg-amber-500', text: 'text-amber-600' },
-  down: { dot: 'bg-red-500', text: 'text-red-600' },
+  healthy: {
+    dot: 'bg-emerald-500',
+    text: 'text-emerald-700 dark:text-emerald-600',
+  },
+  degraded: { dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-600' },
+  down: { dot: 'bg-red-500', text: 'text-red-700 dark:text-red-600' },
   unknown: { dot: 'bg-muted-foreground/40', text: 'text-muted-foreground' },
 }
 
@@ -1175,7 +1179,7 @@ function TrafficByProject({
             <Skeleton className="h-8 w-full" />
           </div>
         ) : hasError ? (
-          <div className="py-8 text-center text-sm text-rose-500">
+          <div className="py-8 text-center text-sm text-rose-700 dark:text-rose-500">
             Failed to load service traffic
           </div>
         ) : sorted.length === 0 ? (

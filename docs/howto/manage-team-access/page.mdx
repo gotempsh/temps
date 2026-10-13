@@ -24,7 +24,7 @@ Temps has a role-based permission system that controls who can view, deploy, and
 
 ## Understand roles {{ anchor: true, id: 'understand-roles' }}
 
-Temps includes several built-in roles:
+Temps includes several built-in roles. User accounts are either **Admin** or **User**; the other roles are for API keys. To limit which projects a **User** account can change, use [Teams](/docs/teams).
 
 | Role | Description |
 |------|-------------|
@@ -37,9 +37,8 @@ Additional specialized roles:
 
 | Role | Description |
 |------|-------------|
-| **ApiReader** | Read-only API access. For monitoring and reporting integrations. |
-| **Mcp** | For MCP (Model Context Protocol) server integrations. |
-| **Demo** | Limited access for demonstration purposes. |
+| **Platform Admin** | Administers users, settings and the platform, with read-only access to projects, deployments, domains and environments. |
+| **ApiReader** | Read-only API access to projects, deployments and analytics. For monitoring and reporting integrations. |
 
 ---
 
@@ -110,7 +109,7 @@ curl -H "Authorization: Bearer tk_your_api_key" \
 
 ## Scope API key permissions {{ anchor: true, id: 'scope-api-key-permissions' }}
 
-API keys use the **Custom** role by default, meaning they have no permissions until you explicitly grant them. This follows the principle of least privilege.
+When you create an API key, pick one of the roles above or switch to custom permissions. A key with custom permissions has no access until you grant it permissions, which follows the principle of least privilege. A key can never receive a permission that its creator does not have.
 
 Common permission scopes:
 
@@ -118,7 +117,8 @@ Common permission scopes:
 
 Grant only what is needed to trigger deployments:
 
-- `deployments:create` — trigger new deployments
+- `deployments:create` — deploy pre-built images or static bundles
+- `projects:write` — trigger a Git build with `POST /projects/{project_id}/trigger-pipeline`
 - `deployments:read` — check deployment status
 - `projects:read` — list projects
 - `environments:read` — list environments
@@ -154,7 +154,7 @@ Deployment tokens allow your running application to call back into the Temps API
 These tokens are:
 - Auto-generated and managed by Temps
 - Scoped to the specific project and environment
-- Rotated on each deployment
+- Reused across redeploys and never expire (rotate one manually if it leaks)
 - Not visible in the API key management UI (they are managed per-environment)
 
 You do not need to create or manage deployment tokens manually. They are available in your application as `process.env.TEMPS_API_TOKEN`.

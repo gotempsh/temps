@@ -74,6 +74,14 @@ impl From<OtelError> for Problem {
                     .with_title("OTel Ingest Saturated")
                     .with_detail(error.to_string())
             }
+            OtelError::StorageMigrating { .. } => {
+                // OTLP exporters retry a 503 with backoff and keep the batch
+                // meanwhile, which is the point: nothing is buffered here.
+                warn!(error = %error, "OTel ingest refused while ClickHouse migrations run");
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("OTel Storage Migrating")
+                    .with_detail(error.to_string())
+            }
             OtelError::QuotaExceeded { .. } => {
                 warn!(error = %error, "OTel ingest quota exceeded");
                 problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
@@ -104,6 +112,15 @@ impl From<OtelError> for Problem {
                     .with_title("Dashboard Not Found")
                     .with_detail(error.to_string())
             }
+            OtelError::MetricAlertLimitReached {
+                project_id, limit, ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/alert-rule-limit-reached")
+                .title("Alert Rule Limit Reached")
+                .detail(error.to_string())
+                .value("project_id", project_id)
+                .value("limit", limit)
+                .build(),
             OtelError::MetricAlertNotFound { .. } => {
                 warn!(error = %error, "OTel metric alert rule not found");
                 problemdetails::new(StatusCode::NOT_FOUND)
@@ -1340,6 +1357,15 @@ mod tests {
     }
 
     #[test]
+    fn test_error_storage_migrating_maps_to_503() {
+        let problem: Problem = OtelError::StorageMigrating {
+            operation: "store_metrics".into(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn test_error_quota_exceeded_maps_to_413() {
         let err = OtelError::QuotaExceeded {
             project_id: 1,
@@ -1402,6 +1428,27 @@ mod tests {
             .get("detail")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn metric_alert_limit_maps_to_conflict_with_actionable_detail() {
+        let err = OtelError::MetricAlertLimitReached {
+            project_id: 7,
+            existing: 200,
+            limit: 200,
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem_detail(&problem);
+        assert!(
+            detail.contains("Project 7"),
+            "detail names the project: {detail}"
+        );
+        assert!(
+            detail.contains("200 metric alert rules"),
+            "detail: {detail}"
+        );
+        assert!(detail.contains("limit is 200"), "detail: {detail}");
     }
 
     /// Internal-error variants must never echo their underlying message (DB

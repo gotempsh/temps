@@ -83,6 +83,34 @@ pub struct SetupMultiNodeCommand {
     /// Temps data directory containing the existing encryption_key.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Carry the container overlay over a managed, encrypted WireGuard mesh.
+    /// Every node gets a private mesh address as its overlay underlay, so
+    /// containers on nodes that only share public IPs (different providers,
+    /// no private network) reach each other, encrypted. Each node must
+    /// accept UDP on the mesh port from the other nodes' addresses; nodes
+    /// behind NAT are not supported yet. A node that joined with a public
+    /// address is reached (agent API, published container ports) on its mesh
+    /// address; one on the control plane's private network keeps using that
+    /// network. Once on, it stays on; running the command again without the
+    /// flag keeps the mesh. The Worker Nodes page can also turn it on.
+    #[arg(long)]
+    pub wireguard: bool,
+
+    /// Mesh address pool (private IPv4, clear of the compute pool). Only
+    /// changeable before any node has joined the mesh.
+    #[arg(long, requires = "wireguard")]
+    pub wireguard_cidr: Option<String>,
+
+    /// UDP port every node's WireGuard interface listens on (not the VXLAN
+    /// port). Only changeable before any node has joined the mesh.
+    #[arg(long, requires = "wireguard")]
+    pub wireguard_port: Option<u16>,
+
+    /// TCP port nodes reach the control plane's API on over the mesh
+    /// (defaults to the WireGuard port number).
+    #[arg(long, requires = "wireguard")]
+    pub node_api_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -237,6 +265,7 @@ impl NetworkCommand {
 }
 
 async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<()> {
+    let cmd_wireguard = cmd.wireguard;
     let database_url = cmd
         .database_url
         .or_else(|| std::env::var("TEMPS_DATABASE_URL").ok())
@@ -287,24 +316,48 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         }
     };
 
-    let docker = Arc::new(
-        bollard::Docker::connect_with_defaults()
-            .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
-    );
-    let overlay = temps_network::control_plane::setup(
-        db.clone(),
-        docker.as_ref(),
-        private_address.trim(),
-        cmd.underlay_dev.as_deref(),
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
+    if cmd.wireguard {
+        let mesh = temps_network::mesh::enable(
+            db.as_ref(),
+            cmd.wireguard_cidr.as_deref(),
+            cmd.wireguard_port,
+            cmd.node_api_port,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("could not enable the WireGuard mesh: {error}"))?;
+        println!(
+            "  {} WireGuard mesh {} on UDP {} (control plane {})",
+            "MESH".bright_green(),
+            mesh.cidr,
+            mesh.port,
+            mesh.control_plane_address()
+        );
+        println!(
+            "       Every node must accept UDP {} from the other nodes.",
+            mesh.port
+        );
+    }
 
     let data_dir = cmd
         .data_dir
         .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
         .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
         .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
+
+    let docker = Arc::new(
+        bollard::Docker::connect_with_defaults()
+            .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
+    );
+    let mesh_key_dir = temps_network::mesh::key_dir(&data_dir);
+    let overlay = temps_network::control_plane::setup(
+        db.clone(),
+        docker.as_ref(),
+        Some(private_address.trim()),
+        cmd.underlay_dev.as_deref(),
+        Some(&mesh_key_dir),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
     let encryption_key = temps_config::resolve_installation_secrets(&data_dir)
         .map_err(|error| anyhow::anyhow!("could not resolve installation secrets: {error}"))?
         .encryption_key;
@@ -356,6 +409,12 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         overlay.alloc.underlay_address, overlay.config.underlay_dev
     );
     println!("  Managed-service DNS: {published} published, {skipped} skipped");
+    if cmd_wireguard {
+        println!(
+            "  A running `temps serve` and every agent move onto the mesh on their own within \
+             a minute; cross-node traffic pauses while nodes switch."
+        );
+    }
     println!("  No `temps serve` restart is required.");
     Ok(())
 }

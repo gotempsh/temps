@@ -113,6 +113,16 @@ async fn link_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `ip -d -o link show dev <name>`: the device's full detail on one line.
+async fn link_detail(name: &str) -> String {
+    let output = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", name])
+        .output()
+        .await
+        .expect("ip link show");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 async fn link_mtu(name: &str) -> Option<u32> {
     let out = Command::new("ip")
         .args(["-d", "link", "show", name])
@@ -269,11 +279,26 @@ async fn cleanup_all() {
         .args(["link", "del", "vxlan-temps0"])
         .output()
         .await;
+    // Devices a test set up beside Temps' own: a foreign VXLAN and the
+    // dummy parent standing in for a previous underlay.
+    for device in ["temps-it-vx0", "temps-it-d0"] {
+        let _ = Command::new("ip")
+            .args(["link", "del", device])
+            .output()
+            .await;
+    }
     let _ = Command::new("ip")
         .args(["link", "del", "br-temps0"])
         .output()
         .await;
+    let _ = Command::new("ip")
+        .args(["link", "del", OLD_UNDERLAY])
+        .output()
+        .await;
 }
+
+/// Dummy parent device for the underlay-migration test.
+const OLD_UNDERLAY: &str = "temps-old-ul0";
 
 struct Cleanup;
 impl Drop for Cleanup {
@@ -427,7 +452,11 @@ async fn bootstrap_is_idempotent() {
 }
 
 #[tokio::test]
-async fn bootstrap_rejects_existing_vxlan_with_incompatible_topology() {
+async fn bootstrap_recreates_existing_vxlan_with_a_changed_topology() {
+    // A VXLAN device under Temps' name built for another parent, VNI or port
+    // (the underlay moved onto the WireGuard mesh) is never adopted as is:
+    // its parent cannot change in place, so bootstrap replaces it with the
+    // requested topology.
     let (env, mgr, _cleanup) = fixture().await;
     let output = Command::new("ip")
         .args([
@@ -453,14 +482,388 @@ async fn bootstrap_rejects_existing_vxlan_with_incompatible_topology() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let peer = env.peer();
+    mgr.bootstrap(env.alloc(), vec![peer])
+        .await
+        .expect("bootstrap replaces a VXLAN device with another topology");
+
+    let detail = link_detail("vxlan-temps0").await;
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    let has_pair = |key: &str, value: &str| {
+        tokens
+            .windows(2)
+            .any(|pair| pair[0] == key && pair[1] == value)
+    };
+    assert!(has_pair("id", "42"), "VNI not replaced: {detail}");
+    assert!(!has_pair("id", "99"), "old VNI kept: {detail}");
+    assert!(has_pair("dev", &env.underlay_dev), "parent: {detail}");
+    assert!(has_pair("master", "br-temps0"), "not re-enslaved: {detail}");
+    assert!(
+        fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await,
+        "the replacement's FDB was not repopulated"
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_that_cannot_be_built_keeps_the_working_vxlan() {
+    // The topology changed to an underlay device that does not exist (yet):
+    // the replacement cannot be built, so the device carrying the overlay
+    // today must survive, still on the bridge, with its FDB.
+    let (env, mgr, _cleanup) = fixture().await;
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("first bootstrap");
+
+    let mut moved = env.config();
+    moved.underlay_dev = "temps-it-gone0".into();
+    let moved = NetworkManager::new(moved).expect("manager for the moved underlay");
+    let error = moved
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect_err("no replacement on a missing underlay");
+    assert!(
+        error.to_string().contains("the existing device is kept"),
+        "{error}"
+    );
+
+    let detail = link_detail("vxlan-temps0").await;
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    let has_pair = |key: &str, value: &str| {
+        tokens
+            .windows(2)
+            .any(|pair| pair[0] == key && pair[1] == value)
+    };
+    assert!(has_pair("id", "42"), "{detail}");
+    assert!(has_pair("dev", &env.underlay_dev), "{detail}");
+    assert!(has_pair("master", "br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
+/// Run `ip` with `args`, failing the test with its stderr if it fails.
+async fn ip(args: &[&str]) {
+    let output = Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .expect("run ip");
+    assert!(
+        output.status.success(),
+        "ip {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The interface index of `name`: unchanged as long as the device was never
+/// deleted and recreated.
+async fn link_index(name: &str) -> String {
+    let detail = link_detail(name).await;
+    detail
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_replacement_another_vxlan_would_collide_with_is_never_started() {
+    // Another VXLAN device already holds the requested VNI and port, so the
+    // kernel would refuse the replacement: the working device is not even
+    // deleted.
+    let (env, _mgr, _cleanup) = fixture().await;
+    let mut previous = env.config();
+    previous.transport = Transport::Vxlan {
+        vni: 99,
+        port: 4789,
+    };
+    let previous = NetworkManager::new(previous).expect("manager for the previous VNI");
+    let alloc = env.alloc();
+    let peer = env.peer();
+    previous
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("first bootstrap");
+    let index = link_index("vxlan-temps0").await;
+
+    ip(&["link", "add", "temps-it-d0", "type", "dummy"]).await;
+    ip(&[
+        "link",
+        "add",
+        "temps-it-vx0",
+        "type",
+        "vxlan",
+        "id",
+        "42",
+        "dev",
+        "temps-it-d0",
+        "dstport",
+        "4789",
+        "nolearning",
+    ])
+    .await;
+
+    let requested = NetworkManager::new(env.config()).expect("manager for the requested VNI");
+    let error = requested
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect_err("VNI 42 is held by another device");
+    assert!(
+        error.to_string().contains("already holds vni=42"),
+        "{error}"
+    );
+
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "the device was deleted"
+    );
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(detail.contains("id 99"), "{detail}");
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+    assert!(link_detail("temps-it-vx0").await.contains("id 42"));
+}
+
+#[tokio::test]
+async fn a_refused_replacement_is_restored_then_migrates_once_the_parent_is_repaired() {
+    // The new parent cannot carry the overlay's MTU, which the kernel only
+    // reports once the old device is gone. The half-built replacement is
+    // removed, the previous device comes back as it was — parent, MTU,
+    // bridge, FDB — and the next bootstrap keeps it rather than tearing it
+    // down to hit the same refusal — a carrier flap on the parent repairs
+    // nothing and does not change that. Once the parent is repaired, the
+    // move happens without waiting out the backoff.
+    let (env, mgr, _cleanup) = fixture().await;
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("first bootstrap");
+    let mtu_before = link_mtu("vxlan-temps0").await;
+
+    ip(&["link", "add", "temps-it-d0", "mtu", "1000", "type", "dummy"]).await;
+    ip(&["link", "set", "temps-it-d0", "up"]).await;
+    let mut moved = env.config();
+    moved.underlay_dev = "temps-it-d0".into();
+    let moved = NetworkManager::new(moved).expect("manager for the moved underlay");
+
+    let error = moved
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect_err("the new parent cannot carry the overlay MTU");
+    assert!(
+        error
+            .to_string()
+            .contains("the previous device was restored"),
+        "{error}"
+    );
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains(&format!("dev {} ", env.underlay_dev)),
+        "previous parent not restored: {detail}"
+    );
+    assert!(detail.contains("id 42"), "{detail}");
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert_eq!(link_mtu("vxlan-temps0").await, mtu_before);
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+
+    let index = link_index("vxlan-temps0").await;
+    let error = moved
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect_err("the refused replacement is not retried yet");
+    assert!(error.to_string().contains("retried in"), "{error}");
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "a retry tore the restored device down again"
+    );
+
+    ip(&["link", "set", "dev", "temps-it-d0", "carrier", "off"]).await;
+    ip(&["link", "set", "dev", "temps-it-d0", "carrier", "on"]).await;
+    let error = moved
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect_err("a carrier flap is not a repair");
+    assert!(error.to_string().contains("retried in"), "{error}");
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "a carrier flap tore the restored device down"
+    );
+
+    ip(&["link", "set", "temps-it-d0", "mtu", "1500"]).await;
+    // Even a repaired parent waits out the floor between two attempts.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    moved
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect("the repaired parent is used at once");
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains("dev temps-it-d0 "),
+        "not migrated: {detail}"
+    );
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_a_non_vxlan_device_under_the_vxlan_name() {
+    // Something else holding the name is not Temps' to delete.
+    let (env, mgr, _cleanup) = fixture().await;
+    let output = Command::new("ip")
+        .args(["link", "add", "vxlan-temps0", "type", "dummy"])
+        .output()
+        .await
+        .expect("create dummy device");
+    assert!(
+        output.status.success(),
+        "create dummy device: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let error = mgr
         .bootstrap(env.alloc(), vec![])
         .await
-        .expect_err("bootstrap must not adopt an incompatible VXLAN device");
-    let message = error.to_string();
-    assert!(message.contains("existing VXLAN topology does not match"));
-    assert!(message.contains("vni=42"));
-    assert!(message.contains("id 99"));
+        .expect_err("bootstrap must not take over a device that is not VXLAN");
+    assert!(
+        error.to_string().contains("existing device is not VXLAN"),
+        "{error}"
+    );
+    assert!(link_exists("vxlan-temps0").await, "the device was deleted");
+}
+
+#[tokio::test]
+async fn bootstrap_moves_existing_vxlan_to_the_requested_underlay() {
+    // An agent upgraded from "default-route device" to "private-address
+    // device" finds its overlay on the old parent. It must be recreated on
+    // the requested one, at that device's MTU, with peers re-added.
+    let (env, mgr, _cleanup) = fixture().await;
+    for args in [
+        vec!["link", "add", OLD_UNDERLAY, "type", "dummy"],
+        vec!["link", "set", OLD_UNDERLAY, "mtu", "9000", "up"],
+        vec![
+            "link",
+            "add",
+            "vxlan-temps0",
+            "type",
+            "vxlan",
+            "id",
+            "42",
+            "dev",
+            OLD_UNDERLAY,
+            "dstport",
+            "4789",
+            "nolearning",
+        ],
+        vec!["link", "set", "vxlan-temps0", "mtu", "8950"],
+    ] {
+        let output = Command::new("ip")
+            .args(&args)
+            .output()
+            .await
+            .expect("spawn ip");
+        assert!(
+            output.status.success(),
+            "ip {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("bootstrap must move the overlay to the requested underlay");
+
+    let detail = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", "vxlan-temps0"])
+        .output()
+        .await
+        .expect("inspect vxlan");
+    let detail = String::from_utf8_lossy(&detail.stdout);
+    assert!(
+        detail.contains(&format!("dev {} ", env.underlay_dev)),
+        "vxlan must be on {}: {detail}",
+        env.underlay_dev
+    );
+    assert!(
+        detail.contains("master br-temps0"),
+        "vxlan must be enslaved: {detail}"
+    );
+    assert_eq!(link_mtu("vxlan-temps0").await, Some(1450));
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+
+    // And the moved device is now simply compatible.
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("second bootstrap is a no-op");
+    assert_eq!(link_mtu("vxlan-temps0").await, Some(1450));
+}
+
+#[tokio::test]
+async fn bootstrap_keeps_existing_vxlan_when_the_requested_underlay_is_missing() {
+    // Moving the overlay must not delete the working device before its new
+    // parent is known to exist: a typo in the underlay device would
+    // otherwise cut every container off the overlay.
+    let (env, _mgr, _cleanup) = fixture().await;
+    for args in [
+        vec!["link", "add", OLD_UNDERLAY, "type", "dummy"],
+        vec!["link", "set", OLD_UNDERLAY, "up"],
+        vec![
+            "link",
+            "add",
+            "vxlan-temps0",
+            "type",
+            "vxlan",
+            "id",
+            "42",
+            "dev",
+            OLD_UNDERLAY,
+            "dstport",
+            "4789",
+            "nolearning",
+        ],
+    ] {
+        let output = Command::new("ip")
+            .args(&args)
+            .output()
+            .await
+            .expect("spawn ip");
+        assert!(
+            output.status.success(),
+            "ip {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut config = env.config();
+    config.underlay_dev = "temps-none0".into();
+    let mgr = NetworkManager::new(config).expect("manager new");
+    let error = mgr
+        .bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect_err("bootstrap must fail when the requested underlay does not exist");
+    assert!(
+        error.to_string().contains("'temps-none0' not found"),
+        "unexpected error: {error}"
+    );
+
+    let detail = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", "vxlan-temps0"])
+        .output()
+        .await
+        .expect("inspect vxlan");
+    assert!(detail.status.success(), "the existing vxlan must survive");
+    let detail = String::from_utf8_lossy(&detail.stdout);
+    assert!(
+        detail.contains(&format!("dev {OLD_UNDERLAY} ")),
+        "the existing vxlan must stay on {OLD_UNDERLAY}: {detail}"
+    );
 }
 
 #[tokio::test]

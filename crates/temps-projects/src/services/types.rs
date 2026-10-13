@@ -16,6 +16,7 @@ pub struct EnvVarEnvironment {
 #[derive(Debug, Serialize)]
 pub struct ProjectStatistics {
     pub total_count: i64,
+    pub has_completed_deployment: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -377,6 +378,8 @@ impl CreateProjectEnvVar {
 
 #[derive(Deserialize)]
 pub struct CreateProjectRequest {
+    pub cloudflare_enabled: Option<bool>,
+    pub delivery_provider: Option<String>,
     pub name: String,
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
@@ -419,6 +422,17 @@ pub struct CreateProjectRequest {
     pub hosting: temps_entities::types::Hosting,
 }
 
+/// `app.example.com (binding 3), www.example.com (binding 4)` -- names both
+/// the hostname a user recognises and the binding id an administrator acts on.
+pub(crate) fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i32]) -> String {
+    hostnames
+        .iter()
+        .zip(binding_ids)
+        .map(|(hostname, binding_id)| format!("{hostname} (binding {binding_id})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Error, Debug)]
 pub enum ProjectError {
     #[error("Database connection error: {0}")]
@@ -438,6 +452,14 @@ pub enum ProjectError {
 
     #[error("A project with slug '{slug}' was created concurrently. Please retry.")]
     SlugConflict { slug: String },
+
+    /// Another active project already uses this display name. Names are what
+    /// the console, CLI and notifications show, so two projects called the
+    /// same thing are indistinguishable everywhere except their URL slug.
+    #[error(
+        "A project named '{name}' already exists. Choose a different name, or rename or delete the existing project first."
+    )]
+    NameAlreadyExists { name: String },
 
     #[error("Failed to create default environment for project {project_id}: {reason}")]
     EnvironmentCreationFailed { project_id: i32, reason: String },
@@ -494,6 +516,18 @@ pub enum ProjectError {
         rolled_back_scope: String,
     },
 
+    #[error(
+        "Project {project_id} still delivers {} through a CDN ({binding_count} delivery binding(s)); remove CDN/DNS delivery for these domains before deleting the project, so Temps can clean up their DNS records and CDN hostnames. Delivery is removed from the project's Domains settings and requires DNS management permissions (DNS providers and DNS automation write); ask an administrator with those permissions if you do not have them",
+        describe_delivery_bindings(hostnames, binding_ids)
+    )]
+    DeliveryBindingsExist {
+        project_id: i32,
+        binding_count: usize,
+        /// Hostnames still delivered, in the same order as `binding_ids`.
+        hostnames: Vec<String>,
+        binding_ids: Vec<i32>,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 
@@ -502,6 +536,20 @@ pub enum ProjectError {
 
     #[error("Invalid git URL '{url}': {reason}")]
     InvalidGitUrl { url: String, reason: String },
+
+    /// The configured root directory is not in the repository at the
+    /// configured branch (issue #1350). Only raised on proof of absence: the
+    /// provider listed the parent directory and it has no such entry.
+    #[error(
+        "Root directory '{directory}' does not exist in {repository} on branch '{branch}': \
+         {explanation}. Choose a directory that exists on that branch, or push it first."
+    )]
+    DirectoryNotInRepository {
+        repository: String,
+        branch: String,
+        directory: String,
+        explanation: String,
+    },
 
     /// The caller tried to move a slug this host grants `/var/run/docker.sock`
     /// to (ADR 045) without being an instance admin — either taking it
@@ -683,6 +731,7 @@ mod tests {
         )
         .expect("request should deserialize");
 
+        assert_eq!(request.cloudflare_enabled, None);
         let env_vars = request.environment_variables.expect("env vars present");
         assert_eq!(env_vars.len(), 2);
         assert!(env_vars[0].is_secret);

@@ -227,6 +227,18 @@ const WORKSPACE_MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const WORKSPACE_MODEL_REFRESH_COOLDOWN: Duration = Duration::from_secs(15);
 const WORKSPACE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const WORKSPACE_MODEL_REFRESH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// `GET /models` on a user-supplied OpenAI-compatible endpoint.
+const COMPATIBLE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_COMPATIBLE_MODEL_LIST_BYTES: usize = 4 * 1024 * 1024;
+/// Error purpose the console maps to an endpoint-specific refresh message.
+const COMPATIBLE_MODEL_DISCOVERY_PURPOSE: &str = "provider.capabilities.compatible";
+
+/// OpenCode's saved OpenAI-compatible connection, resolved for one refresh.
+struct SavedCompatibleEndpoint {
+    base_url: String,
+    api_key: String,
+    verified_model: Option<String>,
+}
 
 #[derive(Clone)]
 struct WorkspaceModelSnapshot {
@@ -1745,6 +1757,7 @@ impl AgentCliAiService {
             }
             None => provider
                 .create(SandboxCreateConfig {
+                    node_id: None,
                     // Container identity comes exclusively from the opaque
                     // label. The numeric id is retained for provider error
                     // context and intentionally carries no user input.
@@ -1774,6 +1787,171 @@ impl AgentCliAiService {
         }?;
         self.cache_sandbox_handle(workspace.sandbox_label.clone(), handle.clone());
         Ok(handle)
+    }
+
+    /// The saved OpenCode endpoint, when OpenCode is connected to an
+    /// OpenAI-compatible API rather than native auth. `None` for every other
+    /// harness, credential kind, or an unreadable credential, so callers fall
+    /// back to their existing behaviour.
+    async fn saved_compatible_endpoint(&self) -> Option<SavedCompatibleEndpoint> {
+        if self.provider.name() != "opencode" {
+            return None;
+        }
+        let resolver = self.sandbox_credentials.as_ref()?;
+        match resolver(self.provider.name()).await {
+            Ok(credentials) => match credentials.provider_credential {
+                crate::model_relay::SandboxProviderCredential::OpenAiCompatible {
+                    base_url,
+                    api_key,
+                    verified_model,
+                } => Some(SavedCompatibleEndpoint {
+                    base_url,
+                    api_key,
+                    verified_model,
+                }),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// List the endpoint's models with `GET /models`. The request is made from
+    /// this server with the saved key, through the external-only client, so
+    /// neither the key nor the endpoint is exposed to a sandbox or browser.
+    ///
+    /// Same discipline as [`Self::discover_workspace_capabilities`]: the read
+    /// barrier keeps a credential replacement from publishing the old
+    /// endpoint's list, the principal slot makes concurrent refreshes
+    /// single-flight, and the cooldown also covers failed attempts so repeated
+    /// retries cannot turn into a stream of requests to the endpoint.
+    async fn discover_compatible_endpoint_models(
+        &self,
+        principal_id: i32,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let requested_at = Instant::now();
+        let _credential_guard = self.workspace_model_refresh_barrier.read().await;
+        let refresh_slot = {
+            let mut refreshes = self.workspace_model_refreshes.lock().await;
+            refreshes
+                .entry(principal_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _refresh_guard = refresh_slot.lock().await;
+        {
+            let states = self.workspace_models.lock().await;
+            if let Some(state) = states.get(&principal_id) {
+                if should_reuse_completed_refresh(
+                    state.last_completed_at,
+                    requested_at,
+                    Instant::now(),
+                ) {
+                    if let Some(snapshot) = state.snapshot.as_ref() {
+                        return Ok(Self::workspace_cached_snapshot(snapshot));
+                    }
+                    return Err(AiError::Provider {
+                        purpose: COMPATIBLE_MODEL_DISCOVERY_PURPOSE.to_string(),
+                        reason: "the last attempt was a few seconds ago; wait before retrying"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        // Resolved under the barrier: a credential saved before this point is
+        // the one used, and one saved after it waits for this refresh and then
+        // clears whatever it published.
+        let Some(endpoint) = self.saved_compatible_endpoint().await else {
+            return Err(AiError::Provider {
+                purpose: COMPATIBLE_MODEL_DISCOVERY_PURPOSE.to_string(),
+                reason: format!(
+                    "{} is no longer connected to an OpenAI-compatible endpoint",
+                    self.provider.name()
+                ),
+            });
+        };
+        let result = self.fetch_compatible_endpoint_models(&endpoint).await;
+        let mut states = self.workspace_models.lock().await;
+        let state = states.entry(principal_id).or_default();
+        state.last_completed_at = Some(Instant::now());
+        let capabilities = result?;
+        let refreshed_at = chrono::Utc::now();
+        state.snapshot = Some(WorkspaceModelSnapshot {
+            capabilities: capabilities.clone(),
+            refreshed_at,
+            expires_at: Instant::now() + WORKSPACE_MODEL_CACHE_TTL,
+        });
+        Ok(temps_ai::ProviderCapabilitiesSnapshot {
+            capabilities,
+            model_source: temps_ai::ModelCatalogSource::Live,
+            models_refreshed_at: Some(refreshed_at.to_rfc3339()),
+        })
+    }
+
+    async fn fetch_compatible_endpoint_models(
+        &self,
+        endpoint: &SavedCompatibleEndpoint,
+    ) -> Result<temps_ai::ProviderCapabilities, AiError> {
+        let provider_error = |reason: String| AiError::Provider {
+            purpose: COMPATIBLE_MODEL_DISCOVERY_PURPOSE.to_string(),
+            reason,
+        };
+        let base_url = endpoint.base_url.as_str();
+        let models_url = format!("{base_url}/models");
+        let client = temps_agents::ai_cli::openai_compatible::external_only_http_client(Some(
+            COMPATIBLE_MODEL_DISCOVERY_TIMEOUT,
+        ))
+        .map_err(|error| {
+            provider_error(format!(
+                "could not create the HTTP client for {models_url}: {error}"
+            ))
+        })?;
+        let mut response = client
+            .get(&models_url)
+            .bearer_auth(&endpoint.api_key)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|error| provider_error(format!("could not reach {models_url}: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(provider_error(format!(
+                "{models_url} answered HTTP {status}"
+            )));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            provider_error(format!(
+                "could not read the model list from {models_url}: {error}"
+            ))
+        })? {
+            if body.len() + chunk.len() > MAX_COMPATIBLE_MODEL_LIST_BYTES {
+                return Err(provider_error(format!(
+                    "the model list from {models_url} is larger than 4 MiB"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let model_ids = temps_agents::ai_cli::openai_compatible::parse_model_list(
+            base_url,
+            &body,
+            endpoint.verified_model.as_deref(),
+        )
+        .map_err(|error| provider_error(error.to_string()))?;
+        let models = model_ids
+            .into_iter()
+            .map(|id| temps_agents::ai_cli::AiCliModelCapability {
+                id: temps_agents::ai_cli::openai_compatible::opencode_selection(&id),
+                name: id,
+                reasoning_options: Vec::new(),
+                default_reasoning_option: None,
+            })
+            .collect::<Vec<_>>();
+        if models.is_empty() {
+            return Err(provider_error(format!(
+                "{models_url} listed no usable models"
+            )));
+        }
+        self.workspace_capabilities_from_models(models)
     }
 
     fn workspace_capabilities_from_models(
@@ -3134,7 +3312,7 @@ fn retained_event_deltas(
     match event {
         TurnEvent::SessionStarted { session_id, title } => vec![ChatStreamDelta::SessionMetadata {
             session_id: Some(redact(session_id)),
-            title: title.map(&redact),
+            title: title.map(redact),
         }],
         TurnEvent::TextDelta { text } | TurnEvent::ReasoningDelta { text } => {
             let text = stream_redactor
@@ -3656,6 +3834,43 @@ fn configure_sandbox_model_relay(
                 purpose: "chat.application.model_relay".to_string(),
                 reason: "the OpenCode relay is missing its validated provider".to_string(),
             })?;
+            if provider_id
+                == temps_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID
+            {
+                // A custom provider: OpenCode only selects models declared
+                // here, and appends `/chat/completions` to the relay URL. The
+                // sandbox holds the turn-scoped relay bearer, never the key.
+                let model = relay
+                    .compatible_model
+                    .as_deref()
+                    .ok_or_else(|| AiError::Provider {
+                        purpose: "chat.application.model_relay".to_string(),
+                        reason: "the OpenAI-compatible relay has no selected model".to_string(),
+                    })?;
+                environment.insert(
+                    "OPENCODE_AUTH_CONTENT".to_string(),
+                    serde_json::json!({ provider_id: { "type": "api", "key": relay.bearer } })
+                        .to_string(),
+                );
+                merge_opencode_config(
+                    environment,
+                    serde_json::json!({
+                        "enabled_providers": [provider_id],
+                        "provider": {
+                            provider_id: {
+                                "npm": "@ai-sdk/openai-compatible",
+                                "name": "OpenAI-compatible",
+                                "options": {
+                                    "baseURL": relay.base_url,
+                                    "apiKey": relay.bearer,
+                                },
+                                "models": { model: { "name": model } }
+                            }
+                        }
+                    }),
+                )?;
+                return Ok(());
+            }
             let base_url = if provider_id == "anthropic" {
                 format!("{}/v1", relay.base_url)
             } else {
@@ -4503,6 +4718,7 @@ fn candidate_probe_create_config(
             }
         })?;
     Ok(SandboxCreateConfig {
+        node_id: None,
         run_id: 0,
         container_name_override: Some(label),
         host_work_dir,
@@ -5254,10 +5470,27 @@ impl AgentCliAiService {
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
-            let opencode_model = if self.provider.name() == "opencode" {
-                selected_opencode_probe_model(&opencode_models, verification_model)?
-            } else {
+            let compatible_endpoint = matches!(
+                &credentials.provider_credential,
+                crate::model_relay::SandboxProviderCredential::OpenAiCompatible { .. }
+            );
+            let opencode_model = if self.provider.name() != "opencode" {
                 None
+            } else if compatible_endpoint {
+                // There is no safe default for a user-supplied endpoint: the
+                // caller must name a model the endpoint actually serves.
+                let model = verification_model.ok_or_else(|| AiError::Provider {
+                    purpose: "provider.credentials.verify.invalid".into(),
+                    reason: "an OpenAI-compatible endpoint needs a model to verify".into(),
+                })?;
+                temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
+                    .map_err(|error| AiError::Provider {
+                        purpose: "provider.credentials.verify.invalid".into(),
+                        reason: error.to_string(),
+                    })?;
+                Some(model)
+            } else {
+                selected_opencode_probe_model(&opencode_models, verification_model)?
             };
             let selected_model = match self.provider.name() {
                 "claude_cli" => Some(verification_model.unwrap_or("haiku")),
@@ -5362,6 +5595,16 @@ impl AgentCliAiService {
                 relay_guard.inference_succeeded(),
                 &output,
             )?;
+            // Native OpenCode auth talks to its provider directly, so an answer
+            // is the only evidence available. A relay-backed endpoint must also
+            // have answered through the relay, or the reply proves nothing
+            // about the saved key.
+            if compatible_endpoint && !relay_guard.inference_succeeded() {
+                return Err(AiError::Provider {
+                    purpose: "provider.credentials.verify.model".into(),
+                    reason: "OpenCode replied without a successful request to the OpenAI-compatible endpoint".into(),
+                });
+            }
             for model in opencode_models
                 .iter()
                 .skip(1)
@@ -5643,6 +5886,16 @@ impl AiService for AgentCliAiService {
         principal_id: i32,
         refresh: temps_ai::RefreshPolicy,
     ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        // The host's own OpenCode CLI knows nothing about a user-supplied
+        // endpoint, so its inventory must not decide which models are valid.
+        // A cold cache stays non-authoritative (bootstrap) rather than
+        // inventing models; an explicit refresh asks the endpoint itself.
+        if self.saved_compatible_endpoint().await.is_some() {
+            if refresh == temps_ai::RefreshPolicy::Cached {
+                return self.cached_workspace_capabilities(principal_id).await;
+            }
+            return self.discover_compatible_endpoint_models(principal_id).await;
+        }
         if matches!(self.provider.name(), "claude_cli" | "codex_cli") {
             if refresh == temps_ai::RefreshPolicy::Cached {
                 return self.cached_workspace_capabilities(principal_id).await;
@@ -6589,6 +6842,7 @@ mod tests {
                         )),
                     },
                     handle: temps_agents::sandbox::SandboxHandle {
+                        node_id: None,
                         sandbox_id: format!("sandbox-{principal_id}"),
                         sandbox_name: format!("workspace-{principal_id}"),
                         work_dir: PathBuf::from("/home/temps/workspace"),
@@ -6613,6 +6867,7 @@ mod tests {
 
     fn test_sandbox_handle() -> temps_agents::sandbox::SandboxHandle {
         temps_agents::sandbox::SandboxHandle {
+            node_id: None,
             sandbox_id: "sandbox-model-discovery".to_string(),
             sandbox_name: "workspace-model-discovery".to_string(),
             work_dir: PathBuf::from("/tmp/workspace-model-discovery"),
@@ -7403,6 +7658,7 @@ mod tests {
             2,
         );
         let handle = temps_agents::sandbox::SandboxHandle {
+            node_id: None,
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "temps-sandbox-app-one".to_string(),
             work_dir: PathBuf::from("/home/temps/workspace"),
@@ -8861,6 +9117,183 @@ mod tests {
         );
     }
 
+    struct OpencodeTestProvider;
+
+    #[async_trait]
+    impl AiCliProvider for OpencodeTestProvider {
+        fn name(&self) -> &str {
+            "opencode"
+        }
+
+        async fn check_installed(&self) -> bool {
+            true
+        }
+
+        async fn get_status(&self) -> AiCliStatus {
+            available_status()
+        }
+
+        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+            Ok(fixed_result("", None))
+        }
+
+        async fn continue_conversation(
+            &self,
+            config: AiRunConfig,
+        ) -> Result<AiRunResult, AgentError> {
+            self.run(config).await
+        }
+    }
+
+    /// OpenCode connected to an endpoint that is never actually contacted:
+    /// every test below must be decided before a request would be sent. The
+    /// resolver reports a compatible endpoint for the first `compatible_calls`
+    /// lookups and native auth afterwards.
+    fn compatible_endpoint_service(
+        scratch: &std::path::Path,
+        compatible_calls: usize,
+    ) -> AgentCliAiService {
+        let mut service = AgentCliAiService::new(
+            Arc::new(OpencodeTestProvider),
+            scratch.to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let lookups = Arc::new(AtomicUsize::new(0));
+        service.sandbox_credentials = Some(Arc::new(move |_provider: &str| {
+            let lookup = lookups.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(if lookup < compatible_calls {
+                    SandboxHarnessCredentials::openai_compatible(
+                        "https://models.invalid/v1",
+                        "sk-never-sent",
+                        "http://temps.invalid",
+                    )
+                } else {
+                    SandboxHarnessCredentials::opencode_auth_json(
+                        b"{}".to_vec(),
+                        vec!["openai".to_string()],
+                        "http://temps.invalid",
+                    )
+                })
+            })
+        }));
+        service
+    }
+
+    #[tokio::test]
+    async fn compatible_refresh_reuses_a_recent_list_without_contacting_the_endpoint() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = compatible_endpoint_service(scratch.path(), usize::MAX);
+        let capabilities = provider_capabilities_from_models(
+            "opencode",
+            vec![temps_agents::ai_cli::AiCliModelCapability {
+                id: "openai-compatible/served-model".to_string(),
+                name: "served-model".to_string(),
+                reasoning_options: Vec::new(),
+                default_reasoning_option: None,
+            }],
+        )
+        .expect("OpenCode capability contract");
+        {
+            let mut states = service.workspace_models.lock().await;
+            let state = states.entry(7).or_default();
+            state.snapshot = Some(WorkspaceModelSnapshot {
+                capabilities,
+                refreshed_at: chrono::Utc::now(),
+                expires_at: Instant::now() + WORKSPACE_MODEL_CACHE_TTL,
+            });
+            state.last_completed_at = Some(Instant::now());
+        }
+
+        let snapshot = service
+            .capabilities_snapshot_for_principal(None, 7, temps_ai::RefreshPolicy::Refresh)
+            .await
+            .expect("a refresh inside the cooldown reuses the last list");
+
+        assert_eq!(snapshot.model_source, temps_ai::ModelCatalogSource::Cache);
+        assert_eq!(
+            snapshot
+                .capabilities
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["openai-compatible/served-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_refresh_cools_down_after_a_failed_attempt() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = compatible_endpoint_service(scratch.path(), usize::MAX);
+        service
+            .workspace_models
+            .lock()
+            .await
+            .entry(7)
+            .or_default()
+            .last_completed_at = Some(Instant::now());
+
+        let error = service
+            .capabilities_snapshot_for_principal(None, 7, temps_ai::RefreshPolicy::Refresh)
+            .await
+            .expect_err("a failed attempt must not be retried immediately");
+
+        assert!(matches!(
+            error,
+            AiError::Provider { purpose, reason }
+                if purpose == COMPATIBLE_MODEL_DISCOVERY_PURPOSE
+                    && reason.contains("wait before retrying")
+        ));
+    }
+
+    #[tokio::test]
+    async fn compatible_refresh_uses_the_credential_saved_under_the_barrier() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        // Routing still sees the endpoint; by the time the refresh holds the
+        // barrier the credential has been replaced with native auth.
+        let service = compatible_endpoint_service(scratch.path(), 1);
+
+        let error = service
+            .capabilities_snapshot_for_principal(None, 7, temps_ai::RefreshPolicy::Refresh)
+            .await
+            .expect_err("a replaced credential must not be used to list models");
+
+        assert!(matches!(
+            error,
+            AiError::Provider { purpose, reason }
+                if purpose == COMPATIBLE_MODEL_DISCOVERY_PURPOSE
+                    && reason.contains("no longer connected to an OpenAI-compatible endpoint")
+        ));
+        assert!(
+            service
+                .workspace_models
+                .lock()
+                .await
+                .get(&7)
+                .is_none_or(|state| state.snapshot.is_none()),
+            "nothing may be published for a replaced credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_endpoint_cold_cache_is_not_authoritative() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = compatible_endpoint_service(scratch.path(), usize::MAX);
+
+        let snapshot = service
+            .capabilities_snapshot_for_principal(None, 7, temps_ai::RefreshPolicy::Cached)
+            .await
+            .expect("a cold cache answers without contacting the endpoint");
+
+        assert_eq!(
+            snapshot.model_source,
+            temps_ai::ModelCatalogSource::Bootstrap
+        );
+        assert!(!snapshot.model_source.is_authoritative());
+    }
+
     #[tokio::test]
     async fn credential_invalidation_clears_an_in_flight_refresh_result() {
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -9993,12 +10426,85 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_opencode_reaches_a_compatible_endpoint_only_through_the_relay() {
+        let relay = SandboxModelRelay {
+            base_url: "http://temps-sandbox-egress-proxy:3128/.temps/model-relay/id".to_string(),
+            bearer: "tmodel_short_lived".to_string(),
+            provider_id: Some("openai-compatible"),
+            native_opencode_auth: None,
+            compatible_model: Some("meta-llama/llama-3.3-70b".to_string()),
+        };
+        let mut environment = HashMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            r#"{"provider":{"evil":{"options":{"baseURL":"https://attacker.test"}}}}"#.to_string(),
+        )]);
+        let mut command = Vec::new();
+        let mut secret_files = Vec::new();
+
+        configure_sandbox_model_relay(
+            "opencode",
+            &mut command,
+            &mut environment,
+            &mut secret_files,
+            &relay,
+        )
+        .expect("OpenAI-compatible relay should be configured");
+
+        let config: serde_json::Value = serde_json::from_str(
+            environment
+                .get("OPENCODE_CONFIG_CONTENT")
+                .expect("generated OpenCode config"),
+        )
+        .unwrap();
+        assert_eq!(
+            config["enabled_providers"],
+            serde_json::json!(["openai-compatible"])
+        );
+        let provider = &config["provider"]["openai-compatible"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["options"]["baseURL"], relay.base_url.as_str());
+        assert_eq!(provider["options"]["apiKey"], "tmodel_short_lived");
+        assert!(provider["models"]["meta-llama/llama-3.3-70b"].is_object());
+        // Request-supplied configuration never survives.
+        assert!(config["provider"].get("evil").is_none());
+        let auth: serde_json::Value = serde_json::from_str(
+            environment
+                .get("OPENCODE_AUTH_CONTENT")
+                .expect("relay auth"),
+        )
+        .unwrap();
+        assert_eq!(auth["openai-compatible"]["key"], "tmodel_short_lived");
+        assert!(command.is_empty());
+        assert!(secret_files.is_empty());
+    }
+
+    #[test]
+    fn sandbox_opencode_compatible_relay_requires_a_model() {
+        let relay = SandboxModelRelay {
+            base_url: "http://temps-sandbox-egress-proxy:3128/.temps/model-relay/id".to_string(),
+            bearer: "tmodel_short_lived".to_string(),
+            provider_id: Some("openai-compatible"),
+            native_opencode_auth: None,
+            compatible_model: None,
+        };
+        assert!(configure_sandbox_model_relay(
+            "opencode",
+            &mut Vec::new(),
+            &mut HashMap::new(),
+            &mut Vec::new(),
+            &relay,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn sandbox_claude_receives_only_the_model_relay_capability() {
         let relay = SandboxModelRelay {
             base_url: "https://temps.example.test/api/ai/sandbox-models/id".to_string(),
             bearer: "tmodel_short_lived".to_string(),
             provider_id: None,
             native_opencode_auth: None,
+            compatible_model: None,
         };
         let mut environment = HashMap::new();
         let mut command = Vec::new();
@@ -10034,6 +10540,7 @@ mod tests {
             bearer: "tmodel_short_lived".to_string(),
             provider_id: None,
             native_opencode_auth: None,
+            compatible_model: None,
         };
         let mut command = vec!["codex".to_string(), "exec".to_string()];
         let mut environment = HashMap::new();
@@ -10073,6 +10580,7 @@ mod tests {
             bearer: "tmodel_short_lived".into(),
             provider_id: Some("anthropic"),
             native_opencode_auth: None,
+            compatible_model: None,
         };
         let mut environment = HashMap::new();
         environment.insert(
@@ -10122,6 +10630,7 @@ mod tests {
                 br#"{"anthropic":{"type":"oauth","access":"secret","refresh":"refresh","expires":999}}"#.to_vec(),
                 vec!["anthropic".into()],
             )),
+            compatible_model: None,
         };
         let mut environment = HashMap::new();
         environment.insert("OPENCODE_AUTH_CONTENT".into(), "ambient-secret".into());

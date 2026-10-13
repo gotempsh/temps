@@ -29,6 +29,7 @@ import {
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
 import { cn } from '@/lib/utils'
+import { gitInstallationPollingOptions } from '@/lib/git-installation-polling'
 import { formatDistanceToNow } from 'date-fns'
 
 interface GitConnectionStepProps {
@@ -140,10 +141,11 @@ export function GitConnectionStep({
   )
   const [showAddNew, setShowAddNew] = useState(false)
 
-  const { data: connectionsData, isLoading: connectionsLoading } = useQuery(
-    listConnectionsOptions({})
-  )
   const { data: providersData } = useQuery(listGitProvidersOptions({}))
+  const { data: connectionsData, isLoading: connectionsLoading } = useQuery({
+    ...listConnectionsOptions({}),
+    ...gitInstallationPollingOptions(providersData),
+  })
 
   const connections = connectionsData?.connections || []
   const providers = providersData || []

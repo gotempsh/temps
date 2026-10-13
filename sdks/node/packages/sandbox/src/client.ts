@@ -39,6 +39,8 @@ interface WireSandboxInner {
   disk_size_mb?: number | null;
   preview_url_template: string;
   preview_password_hint?: string;
+  /** Hosting node name (ADR-048); absent on older servers. */
+  node_name?: string;
 }
 
 /** Create/get responses wrap the sandbox with its preview routes. */
@@ -87,6 +89,7 @@ function toSummary(w: WireSandboxInner): SandboxSummary {
     expiresAt: new Date(w.createdAt + w.timeout).toISOString(),
     previewUrlTemplate: w.preview_url_template,
     previewPasswordHint: w.preview_password_hint,
+    nodeName: w.node_name,
   };
 }
 
@@ -102,6 +105,7 @@ function toCreateBody(opts: CreateSandboxOptions): Record<string, unknown> {
     source: opts.source ? toSourceBody(opts.source) : undefined,
     preview_password: opts.previewPassword,
     backend: opts.backend,
+    node: opts.node,
   };
 }
 

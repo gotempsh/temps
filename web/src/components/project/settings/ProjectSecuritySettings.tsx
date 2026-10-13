@@ -690,6 +690,7 @@ export function ProjectSecuritySettings({
                             placeholder="192.168.1.1 or 10.0.0.0/24"
                           />
                           <Button
+                            aria-label="Remove from allowlist"
                             type="button"
                             variant="outline"
                             size="icon"
@@ -728,6 +729,7 @@ export function ProjectSecuritySettings({
                             placeholder="192.168.1.1 or 10.0.0.0/24"
                           />
                           <Button
+                            aria-label="Remove from blocklist"
                             type="button"
                             variant="outline"
                             size="icon"

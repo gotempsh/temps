@@ -11,6 +11,7 @@ import { projectSourceAction } from './source.js'
 import { projectHostingAction } from './hosting.js'
 import { projectGroupAction } from './group.js'
 import { registerProjectSecretsCommands } from './secrets.js'
+import { cloudflareCapabilityAction } from './cloudflare-capability.js'
 
 export function registerProjectsCommands(program: Command): void {
   const projects = program
@@ -52,8 +53,19 @@ export function registerProjectsCommands(program: Command): void {
     .option('--image <image>', 'Docker image for the first deployment (manual mode)')
     .option('--port <port>', 'Application/container port (manual mode, default: 3000)')
     .option('--external', 'The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes)')
+    .option(
+      '--delivery-provider <provider>',
+      'Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`)'
+    )
     .option('-y, --yes', 'Skip optional prompts (services, env vars, set-default)')
     .action(create)
+
+  projects
+    .command('cloudflare-capability')
+    .alias('delivery-capability')
+    .description('Show whether Cloudflare/Bunny delivery is ready and which one new services get by default')
+    .option('--json', 'Output in JSON format')
+    .action(cloudflareCapabilityAction)
 
   projects
     .command('show')

@@ -43,10 +43,10 @@ use crate::service::proxy_log_batch_writer::{
 };
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
-    bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
-    object_etag, open_static_file, opened_cas_size_matches, read_static_chunk,
-    resolve_static_object_request, static_not_found_contract, static_object_key,
-    unavailable_outcome, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
+    bounded_cas_etag, bounded_log_value, canonical_redirect_location, cap_static_chunk,
+    if_none_match_matches, metadata_etag, object_etag, open_static_file, opened_cas_size_matches,
+    read_static_chunk, resolve_static_object_request, static_not_found_contract, static_object_key,
+    unavailable_outcome, StaticFileMatch, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -564,6 +564,40 @@ fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<Respo
     Ok(response)
 }
 
+/// Build the `Location` for a custom domain's "Redirect to" setting.
+///
+/// The stored target is an absolute URL (the domain service normalizes a bare
+/// host to `https://host`). When it names only an origin — no path beyond `/`,
+/// no query, no fragment — the request's path and query are carried over, so
+/// `www.example.com/pricing?x=1` lands on `example.com/pricing?x=1` instead of
+/// the target's homepage. A target that spells out its own path or query is a
+/// deliberate "send everything here" redirect and is returned verbatim, which
+/// is what every redirect did before path preservation existed.
+///
+/// `path` is the raw request path from the URI (still percent-encoded), so no
+/// re-encoding happens here.
+fn domain_redirect_location(target: &str, path: &str, query: Option<&str>) -> String {
+    let Some(scheme_end) = target.find("://") else {
+        // Not an absolute URL (legacy row written before normalization):
+        // keep the old behaviour rather than guess how to join it.
+        return target.to_string();
+    };
+    let after_scheme = &target[scheme_end + 3..];
+    let rest = after_scheme
+        .find(['/', '?', '#'])
+        .map_or("", |idx| &after_scheme[idx..]);
+    if !rest.is_empty() && rest != "/" {
+        return target.to_string();
+    }
+
+    let origin = &target[..scheme_end + 3 + after_scheme.len() - rest.len()];
+    let path = if path.is_empty() { "/" } else { path };
+    match query.filter(|q| !q.is_empty()) {
+        Some(query) => format!("{origin}{path}?{query}"),
+        None => format!("{origin}{path}"),
+    }
+}
+
 fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
     // Applications must not be able to impersonate the pre-upstream redirect
     // used by managed monitors to decide whether a local TLS follow-up is safe.
@@ -634,6 +668,117 @@ fn should_apply_production_https_default(
         && !path.starts_with(INTERNAL_CLUSTER_PREFIX)
         && force_https.is_none()
         && has_environment
+}
+
+#[cfg(test)]
+mod domain_redirect_location_tests {
+    use super::domain_redirect_location;
+
+    #[test]
+    fn origin_target_keeps_request_path() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/pricing", None),
+            "https://example.com/pricing"
+        );
+    }
+
+    #[test]
+    fn origin_target_keeps_request_query() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/pricing", Some("x=1&y=two")),
+            "https://example.com/pricing?x=1&y=two"
+        );
+    }
+
+    #[test]
+    fn empty_query_is_dropped() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/pricing", Some("")),
+            "https://example.com/pricing"
+        );
+    }
+
+    #[test]
+    fn root_request_lands_on_target_root() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/", None),
+            "https://example.com/"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com", "", None),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_are_preserved_without_doubling() {
+        assert_eq!(
+            domain_redirect_location("https://example.com/", "/docs/", None),
+            "https://example.com/docs/"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com/", "/", Some("a=1")),
+            "https://example.com/?a=1"
+        );
+    }
+
+    #[test]
+    fn target_port_and_scheme_are_kept() {
+        assert_eq!(
+            domain_redirect_location("http://example.com:8080", "/a/b", Some("c=d")),
+            "http://example.com:8080/a/b?c=d"
+        );
+    }
+
+    #[test]
+    fn target_with_its_own_path_is_used_verbatim() {
+        assert_eq!(
+            domain_redirect_location("https://example.com/welcome", "/pricing", Some("x=1")),
+            "https://example.com/welcome"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com/blog/", "/post", None),
+            "https://example.com/blog/"
+        );
+    }
+
+    #[test]
+    fn target_with_its_own_query_or_fragment_is_used_verbatim() {
+        assert_eq!(
+            domain_redirect_location("https://example.com?ref=old", "/pricing", None),
+            "https://example.com?ref=old"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com/#top", "/pricing", None),
+            "https://example.com/#top"
+        );
+    }
+
+    #[test]
+    fn encoded_request_path_is_not_reencoded() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/caf%C3%A9/a%20b", Some("q=%2F")),
+            "https://example.com/caf%C3%A9/a%20b?q=%2F"
+        );
+    }
+
+    #[test]
+    fn protocol_relative_looking_path_stays_on_target_host() {
+        // `//evil.example` as a request path must not become a host: the
+        // target origin always precedes it.
+        assert_eq!(
+            domain_redirect_location("https://example.com", "//evil.example/x", None),
+            "https://example.com//evil.example/x"
+        );
+    }
+
+    #[test]
+    fn non_absolute_legacy_target_is_returned_unchanged() {
+        assert_eq!(
+            domain_redirect_location("example.com", "/pricing", None),
+            "example.com"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -929,6 +1074,16 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
+    /// The admin gate denied this request, so `upstream_peer` must send it to
+    /// the listener that serves only the console's public routes (ADR-051)
+    /// instead of resolving a peer. A non-allowlisted client can therefore
+    /// reach a tracking pixel or a provider webhook, and structurally nothing
+    /// else, because nothing else is mounted there.
+    pub public_surface_only: bool,
+    /// The request is for a status page's custom hostname (#1412) and was
+    /// rewritten to that page's route; `upstream_peer` sends it to the
+    /// public-only listener and nowhere else.
+    pub status_page_host: bool,
     /// The upstream confirmed a long-lived stream (SSE `text/event-stream`, or
     /// a `101` WebSocket upgrade). Such a session's total duration is a
     /// connection lifetime, not a latency, so `logging` keeps it out of the
@@ -1008,6 +1163,10 @@ pub struct LoadBalancer {
     /// Per-project/environment concurrent-connection cap enforcement. See
     /// issue #646 and `crate::connection_limiter`.
     connection_limiter: Arc<crate::connection_limiter::ConnectionLimiter>,
+    /// Per-client-IP rate limits and rate-limit blacklists from the instance
+    /// and project security settings. See issue #1288 and
+    /// `crate::rate_limiter`.
+    rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     /// In-memory moka cache for sandbox preview lookups. Keyed by sandbox
     /// hex suffix; values are `PreviewSandboxLookup` (both `Protected` and
     /// `NotFound` are cached). TTL 30 s. See `preview_auth.rs` and WS6 in
@@ -1027,6 +1186,70 @@ pub struct LoadBalancer {
     /// histogram). Updated on every completed/failed request; drained by the
     /// background `ProxyMetricsSampler`, never read on the request path.
     proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
+    upstream_failures: temps_core::log_transitions::KeyedFailureLatch<(i32, i32, Option<String>)>,
+    /// Startup state of the in-process console (`temps serve`). When set and
+    /// the console failed to start, console-bound requests get a status page
+    /// naming the cause instead of the generic 503 — see
+    /// `crate::console_unavailable`. `None` in split topology (`temps proxy`),
+    /// where the console is another process this one cannot observe.
+    console_unavailable: Option<Arc<crate::console_unavailable::ConsoleUnavailableResponder>>,
+}
+
+/// Status recorded in proxy logs when the client disconnected before a
+/// response could be sent (the nginx convention).
+const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// Project outages share a key; unscoped routes use their actual upstream.
+fn upstream_failure_key(
+    project_id: Option<i32>,
+    environment_id: Option<i32>,
+    upstream: Option<&str>,
+    host: &str,
+) -> (i32, i32, Option<String>) {
+    (
+        project_id.unwrap_or(0),
+        environment_id.unwrap_or(0),
+        project_id
+            .is_none()
+            .then(|| upstream.unwrap_or(host).to_owned()),
+    )
+}
+
+/// Who caused a proxy failure, which decides how loudly it is logged.
+///
+/// Only a failure inside Temps is an ERROR. A client that disconnected
+/// mid-request is routine (a browser cancelling a fetch), and an upstream
+/// that refuses or drops the connection is the deployed application being
+/// down, which is the operator's to see at WARN, not a Temps fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyFailureKind {
+    ClientGone,
+    Upstream,
+    Internal,
+}
+
+impl ProxyFailureKind {
+    fn of(error: &Error) -> Self {
+        use pingora::{ErrorSource, ErrorType};
+        match error.esource() {
+            ErrorSource::Downstream => match error.etype() {
+                ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::WriteError => {
+                    Self::ClientGone
+                }
+                _ => Self::Internal,
+            },
+            ErrorSource::Upstream => Self::Upstream,
+            ErrorSource::Internal | ErrorSource::Unset => Self::Internal,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientGone => "client disconnected",
+            Self::Upstream => "upstream unavailable",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 impl LoadBalancer {
@@ -1072,9 +1295,28 @@ impl LoadBalancer {
             static_object_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
+            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
+            upstream_failures: Default::default(),
+            console_unavailable: None,
         }
+    }
+
+    /// Wire the in-process console's startup state so console-bound requests
+    /// explain a failed (or still running) console startup. `console_address`
+    /// must be the address the upstream resolver forwards console traffic to.
+    pub fn with_console_startup_state(
+        mut self,
+        state: Arc<temps_core::console_startup::ConsoleStartupState>,
+        console_address: &str,
+        console_ingress_address: Option<&str>,
+    ) -> Self {
+        self.console_unavailable = Some(Arc::new(
+            crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address)
+                .with_ingress_address(console_ingress_address),
+        ));
+        self
     }
 
     pub fn with_request_policy_gate(
@@ -1085,16 +1327,25 @@ impl LoadBalancer {
         self
     }
 
+    /// Record into a counter set shared with other components (the proxy-log
+    /// batch writer reports its retries and drops there) instead of this
+    /// instance's private one.
+    pub fn with_proxy_metrics(mut self, metrics: Arc<crate::metrics::ProxyMetrics>) -> Self {
+        self.proxy_metrics = metrics;
+        self
+    }
+
     /// Handle to the hot-path metrics counters, for the background sampler.
     /// The returned `Arc` shares the counters this instance records into.
     pub fn proxy_metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {
         Arc::clone(&self.proxy_metrics)
     }
 
-    /// Wire the shared admin-gate handle. When set, `request_filter`
-    /// short-circuits unknown-host requests with 404 unless the request
-    /// matches the gate (`/api/_temps/*` is always exempt because public
-    /// ingest must reach the console from any host).
+    /// Wire the shared admin-gate handle. When set, `request_filter` keeps
+    /// requests the gate denies away from the console: they are sent to the
+    /// public-only listener when one exists (ADR-051), and answered with a
+    /// 404 otherwise. `/api/_temps/*` is never gated because public ingest
+    /// must work from any host.
     pub fn with_admin_gate(mut self, handle: temps_core::admin_gate::AdminGateHandle) -> Self {
         self.admin_gate = Some(handle);
         self
@@ -1185,12 +1436,144 @@ impl LoadBalancer {
         Some(trace_id.to_ascii_lowercase())
     }
 
+    /// Answer a failed console-bound request with the console's startup
+    /// status instead of the generic 503, when the console in this process
+    /// failed to start or is still starting. Returns `None` to fall through
+    /// to the generic failure handling (application upstreams, a running
+    /// console that errored, split topology, a client that already left).
+    async fn serve_console_status_page(
+        &self,
+        session: &mut PingoraSession,
+        e: &Error,
+        ctx: &mut ProxyContext,
+    ) -> Option<FailToProxy> {
+        use temps_core::console_startup::ConsolePhase;
+
+        let responder = self.console_unavailable.as_ref()?;
+        if !ctx
+            .upstream_host
+            .as_deref()
+            .is_some_and(|host| responder.is_console_address(host))
+        {
+            return None;
+        }
+        if ProxyFailureKind::of(e) == ProxyFailureKind::ClientGone {
+            return None;
+        }
+
+        let req = session.req_header();
+        let format = crate::console_unavailable::ResponseFormat::for_request(
+            req.uri.path(),
+            req.headers.get("accept").and_then(|v| v.to_str().ok()),
+        );
+        let (body, routing_status, retry_after) = match responder.phase() {
+            ConsolePhase::Failed => {
+                let client_ip = ctx
+                    .ip_address
+                    .as_deref()
+                    .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+                let gate = self.admin_gate.as_ref().map(|gate| gate.current());
+                let detailed = crate::console_unavailable::client_may_see_details(
+                    client_ip,
+                    &ctx.host,
+                    gate.as_deref(),
+                );
+                (
+                    responder.failure_body(detailed, format)?,
+                    "console_startup_failed",
+                    None,
+                )
+            }
+            ConsolePhase::Starting if is_connect_failure(e) => (
+                crate::console_unavailable::ConsoleUnavailableResponder::starting_body(format),
+                "console_starting",
+                Some(crate::console_unavailable::CONSOLE_STARTING_RETRY_AFTER_SECS),
+            ),
+            ConsolePhase::Starting | ConsolePhase::Running => return None,
+        };
+
+        // The cause was logged once, at ERROR, when startup failed; one line
+        // per request here would only repeat it.
+        debug!(
+            request_id = %ctx.request_id,
+            host = %ctx.host,
+            path = %ctx.path,
+            routing_status,
+            "serving console status page"
+        );
+        ctx.error_message = Some(e.to_string());
+        ctx.routing_status = routing_status.to_string();
+
+        let error_code = 503;
+        let written = async {
+            let mut header = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+            header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            header.insert_header(header::CACHE_CONTROL, "no-store")?;
+            header.insert_header(header::CONTENT_TYPE, format.content_type())?;
+            header.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
+            header.insert_header("X-Content-Type-Options", "nosniff")?;
+            header.insert_header("X-Request-ID", &ctx.request_id)?;
+            if let Some(seconds) = retry_after {
+                header.insert_header(header::RETRY_AFTER, seconds.to_string())?;
+            }
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(body.clone()), true)
+                .await?;
+            Ok::<(), Box<Error>>(())
+        }
+        .await;
+        if let Err(write_error) = written {
+            debug!(
+                request_id = %ctx.request_id,
+                "Failed to write console status page: {:?}",
+                write_error
+            );
+        }
+        self.log_failed_request(ctx, error_code, Some(body.len() as i64));
+
+        Some(FailToProxy {
+            error_code,
+            can_reuse_downstream: false,
+        })
+    }
+
+    /// Whether this request is for the dedicated public ingress hostname
+    /// and a public-only listener exists to pin it to. Lock-free and
+    /// allocation-free: one `Option` check and one snapshot comparison.
+    fn is_public_ingress_request(&self, host: &str) -> bool {
+        self.upstream_resolver.console_ingress_address().is_some()
+            && self.upstream_resolver.is_public_ingress_host(host)
+    }
+
+    /// Decide where a request that is about to fall through to the console
+    /// may go, given the admin gate. Pure, so the three-way decision of
+    /// ADR-051 D4 is testable without a live session.
+    fn console_fall_through(
+        config: &temps_core::admin_gate::AdminGateConfig,
+        client_ip: std::net::IpAddr,
+        host: &str,
+        has_public_only_listener: bool,
+    ) -> ConsoleFallThrough {
+        if config.would_allow(client_ip, Some(host)) {
+            ConsoleFallThrough::Console
+        } else if has_public_only_listener {
+            ConsoleFallThrough::PublicSurfaceOnly
+        } else {
+            ConsoleFallThrough::NotFound
+        }
+    }
+
     /// Decide whether the admin gate should be consulted for this request.
     ///
     /// The gate is only meaningful when it's non-noop, the request isn't a
     /// workspace/sandbox preview (those carry their own auth), and the path
-    /// isn't a public temps ingest endpoint (`/api/_temps/*` must reach the
-    /// console from any host). Even when this returns `true`, the caller
+    /// isn't a public temps ingest endpoint (`/api/_temps/*` must work from
+    /// any host; the resolver sends it to the public-only listener when one
+    /// exists, so skipping the gate exposes nothing else). Even when this
+    /// returns `true`, the caller
     /// must still consult `has_route_for_host` first so legitimate project
     /// traffic is never gated — only console fall-throughs are.
     fn should_consult_admin_gate(
@@ -1199,6 +1582,79 @@ impl LoadBalancer {
         is_preview: bool,
     ) -> bool {
         !config.is_noop() && !is_preview && !path.starts_with(ROUTE_PREFIX_TEMPS)
+    }
+
+    /// Record a request that failed before an upstream response was sent
+    /// (skipping static assets, like successful requests).
+    fn log_failed_request(
+        &self,
+        ctx: &ProxyContext,
+        status_code: u16,
+        response_size_bytes: Option<i64>,
+    ) {
+        if Self::should_log_request(&ctx.path) {
+            // Prefer bytes actually received from the client (see log_request);
+            // fall back to Content-Length if the body never reached the filter.
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
+
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
+            let proxy_log_request = CreateProxyLogRequest {
+                method: ctx.method.clone(),
+                path: ctx.path.clone(),
+                query_string: None,
+                host: ctx.host.clone(),
+                status_code: status_code as i16,
+                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                request_source: request_source.to_string(),
+                is_system_request,
+                routing_status: ctx.routing_status.clone(),
+                project_id: ctx.project.as_ref().map(|p| p.id),
+                environment_id: ctx.environment.as_ref().map(|e| e.id),
+                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
+                container_id: None,
+                upstream_host: None,
+                error_message: ctx.error_message.clone(),
+                client_ip: ctx.ip_address.clone(),
+                user_agent: Some(ctx.user_agent.clone()),
+                referrer: ctx.referrer.clone(),
+                request_id: ctx.request_id.clone(),
+                ip_geolocation_id: None,
+                browser: None,
+                browser_version: None,
+                operating_system: None,
+                device_type: None,
+                is_bot: None,
+                bot_name: None,
+                request_size_bytes: request_size,
+                response_size_bytes,
+                cache_status: None,
+                request_headers: ctx
+                    .request_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                response_headers: ctx
+                    .response_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
+                error_group_id: None,
+            };
+
+            // Non-blocking enqueue; shed with rate-limited accounting when full.
+            self.proxy_log_handle.send_or_drop(proxy_log_request);
+        }
     }
 
     /// Check if a request should be logged to proxy_logs based on path
@@ -1539,9 +1995,18 @@ impl LoadBalancer {
     ) -> Result<()> {
         upstream_response.insert_header("X-Request-ID", &ctx.request_id)?;
 
-        // Apply security headers from project settings or global config
-        self.apply_security_headers(upstream_response, ctx.project.as_deref())
-            .await?;
+        // Public status pages (#1412) carry their own strict headers (no-store,
+        // CSP `default-src 'none'`, DENY framing); a global preset must not
+        // loosen them. On a custom status hostname nothing else is added
+        // either: no tracking cookies.
+        if ctx.status_page_host {
+            return Ok(());
+        }
+        if !ctx.path.starts_with("/api/status/") {
+            // Apply security headers from project settings or global config
+            self.apply_security_headers(upstream_response, ctx.project.as_deref())
+                .await?;
+        }
 
         // Set visitor and session cookies
         self.set_tracking_cookies(session, upstream_response, ctx)
@@ -1820,6 +2285,186 @@ impl LoadBalancer {
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
             .is_some()
+    }
+
+    /// Serve a request for a status page's custom hostname (#1412).
+    ///
+    /// Allowed, in order:
+    /// 1. ACME HTTP-01 challenges for the hostname, so ownership can be proven
+    ///    and the certificate renewed.
+    /// 2. `GET`/`HEAD` of `/` and `/summary.json` while the page is published
+    ///    and the hostname verified: an HTTPS upgrade on plain HTTP, otherwise
+    ///    a rewrite to the page's slug route, pinned to the public-only
+    ///    listener by `upstream_peer`.
+    ///
+    /// Everything else gets the status-page 404, byte-identical to the
+    /// console's, whatever the reason.
+    async fn handle_status_page_host(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        route: temps_routes::StatusPageHostRoute,
+    ) -> Result<bool> {
+        use temps_core::public_status_page::{StatusHostPath, STATUS_HOST_HEADER};
+
+        let host = temps_routes::normalize_route_hostname(&ctx.host).into_owned();
+        ctx.routing_status = "status_page_host".to_string();
+
+        if ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            if let Some(key_authorization) =
+                self.handle_acme_http_challenge(&host, &ctx.path).await?
+            {
+                let body = Bytes::from(key_authorization);
+                let mut resp = ResponseHeader::build(200, None)?;
+                resp.insert_header("Content-Type", "text/plain")?;
+                resp.insert_header("Cache-Control", "no-cache")?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "status_page_host_acme".to_string();
+                return Ok(true);
+            }
+            return self.write_status_page_not_found(session, ctx, false).await;
+        }
+
+        let view = StatusHostPath::parse(&ctx.path);
+        let method_allowed = matches!(ctx.method.as_str(), "GET" | "HEAD");
+        let (Some(view), true, Some(slug)) = (view, method_allowed, route.slug) else {
+            return self
+                .write_status_page_not_found(session, ctx, ctx.path == "/summary.json")
+                .await;
+        };
+
+        // Over TLS the certificate the client negotiated and the Host it sent
+        // must name the same hostname: a connection made for one status page
+        // cannot be steered to another with a forged Host header. The console
+        // re-checks the hostname-to-page binding (`STATUS_HOST_HEADER`) too.
+        let is_tls = self.is_tls_connection(session);
+        if is_tls {
+            let sni = Self::tls_sni(session);
+            if sni
+                .as_deref()
+                .map(temps_routes::normalize_route_hostname)
+                .as_deref()
+                != Some(host.as_str())
+            {
+                // 421 rather than 404: a browser reusing a connection opened
+                // for another name on the same certificate (HTTP/2 connection
+                // coalescing) retries on a fresh connection with the right SNI.
+                debug!(
+                    host = %host,
+                    sni = ?sni,
+                    "status-page request whose TLS SNI does not match its Host; answering 421"
+                );
+                return self.write_misdirected(session, ctx).await;
+            }
+        } else if !self.disable_https_redirect {
+            // A verified hostname always has its certificate: upgrade.
+            let location = format!("https://{host}{}", ctx.path);
+            let resp = https_redirect_response(&location, &ctx.request_id)?;
+            ctx.routing_status = "status_page_host_https_redirect".to_string();
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
+        }
+
+        if self.upstream_resolver.console_ingress_address().is_none() {
+            // Split topology without `--console-ingress-address`: the only
+            // other listener is the full console, which this host must never
+            // reach. Fail closed.
+            warn!(
+                host = %host,
+                "status-page custom hostname requested but no public ingress listener is configured; answering 404"
+            );
+            return self
+                .write_status_page_not_found(session, ctx, view == StatusHostPath::Summary)
+                .await;
+        }
+
+        let target = view.console_path(&slug);
+        let header = session.req_header_mut();
+        header.set_raw_path(target.as_bytes())?;
+        // Credentials and caller-chosen forwarding headers never reach the
+        // public listener from a custom hostname.
+        header.remove_header("cookie");
+        header.remove_header("authorization");
+        header.remove_header("x-forwarded-host");
+        strip_untrusted_client_ip_headers(header);
+        if let Some(ip) = ctx.ip_address.as_deref() {
+            header.insert_header("X-Forwarded-For", ip)?;
+        } else {
+            header.remove_header("x-forwarded-for");
+        }
+        header.insert_header("X-Forwarded-Proto", if is_tls { "https" } else { "http" })?;
+        header.insert_header("Host", host.as_str())?;
+        header.insert_header(STATUS_HOST_HEADER, host.as_str())?;
+
+        ctx.path = target;
+        ctx.query_string = None;
+        ctx.status_page_host = true;
+        Ok(false)
+    }
+
+    /// SNI captured during the TLS handshake (`TlsExtensionData`), if any.
+    fn tls_sni(session: &PingoraSession) -> Option<String> {
+        session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .and_then(|d| d.extension.get::<crate::server::TlsExtensionData>())
+            .map(|data| data.sni_hostname.clone())
+    }
+
+    /// `421 Misdirected Request`: the connection was negotiated for another
+    /// hostname. A browser retries on a fresh connection with the right SNI
+    /// (e.g. after HTTP/2 connection coalescing across a shared certificate).
+    async fn write_misdirected(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<bool> {
+        debug!(host = %ctx.host, "request on a status-page TLS connection names another host; answering 421");
+        let mut response = ResponseHeader::build(421, None)?;
+        response.insert_header("Content-Length", "0")?;
+        response.insert_header("Cache-Control", "no-store")?;
+        response.insert_header("X-Request-ID", &ctx.request_id)?;
+        session
+            .write_response_header(Box::new(response), true)
+            .await?;
+        ctx.routing_status = "status_page_host_misdirected".to_string();
+        Ok(true)
+    }
+
+    async fn write_status_page_not_found(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        json: bool,
+    ) -> Result<bool> {
+        use temps_core::public_status_page::{NOT_FOUND_HTML, NOT_FOUND_JSON, SECURITY_HEADERS};
+        let (body, content_type) = if json {
+            (NOT_FOUND_JSON, "application/problem+json")
+        } else {
+            (NOT_FOUND_HTML, "text/html; charset=utf-8")
+        };
+        let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+        response.insert_header("Content-Type", content_type)?;
+        for (name, value) in SECURITY_HEADERS {
+            response.insert_header(name, value)?;
+        }
+        response.insert_header("X-Request-ID", &ctx.request_id)?;
+        response.insert_header("Content-Length", body.len().to_string())?;
+        let head_only = ctx.method == "HEAD";
+        session
+            .write_response_header(Box::new(response), head_only)
+            .await?;
+        if !head_only {
+            session
+                .write_response_body(Some(Bytes::from_static(body.as_bytes())), true)
+                .await?;
+        }
+        ctx.routing_status = "status_page_host_not_found".to_string();
+        Ok(true)
     }
 
     async fn handle_acme_http_challenge(&self, host: &str, path: &str) -> Result<Option<String>> {
@@ -2370,19 +3015,27 @@ impl LoadBalancer {
             .to_str()
             .map(Self::infer_content_type)
             .unwrap_or("application/octet-stream");
+        if opened.matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
         // Metadata + immutable deployment identity produce the validator before
         // body IO. Conditional requests therefore never read the file body.
         let etag = metadata_etag(&opened.canonical_path, &opened.metadata);
+        let is_not_found_page = opened.matched == StaticFileMatch::NotFoundPage;
 
-        // Check If-None-Match header for 304 Not Modified response
+        // Check If-None-Match header for 304 Not Modified response. A 404 has
+        // no validator, so the deployment's 404 page is always sent in full.
         if let Some(if_none_match) = session
             .req_header()
             .headers
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| !is_not_found_page)
         {
             if if_none_match_matches(if_none_match, &etag) {
                 debug!("ETag match - returning 304 Not Modified for: {}", ctx.path);
@@ -2390,18 +3043,10 @@ impl LoadBalancer {
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
-                // Add cache headers
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, opened.matched),
+                )?;
 
                 // CRITICAL: Set tracking cookies even for 304 responses to keep sessions alive
                 // Without this, visitors won't get cookies on cached root URLs (/) and events will fail
@@ -2414,27 +3059,21 @@ impl LoadBalancer {
         }
 
         // Build response
-        let mut resp = ResponseHeader::build(200, None)?;
+        let mut resp = ResponseHeader::build(opened.matched.status(), None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        resp.insert_header("ETag", &etag)?;
-
-        // Add cache headers for static assets
-        if Self::is_cacheable_static_asset(&ctx.path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        Self::insert_static_validators(&mut resp, &ctx.path, &etag, opened.matched)?;
 
         // Set visitor and session tracking cookies for static file responses
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         // HEAD has the same metadata as GET and intentionally never reads a body.
+        let outcome = Self::static_served_outcome(opened.matched);
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
-            return Ok(StaticFileServeOutcome::Served);
+            return Ok(outcome);
         }
 
         let mut remaining = opened.metadata.len();
@@ -2469,7 +3108,93 @@ impl LoadBalancer {
         }
         session.write_response_body(None, true).await?;
 
-        Ok(StaticFileServeOutcome::Served)
+        Ok(outcome)
+    }
+
+    /// `Cache-Control` for a static-site response. The deployment's 404 page
+    /// gets no cache lifetime: it answers a path that may exist in the next
+    /// deployment, and a hashed-asset path (`/assets/app-1a2b.js`) must never
+    /// pin a 404 page as `immutable`.
+    fn static_cache_control(request_path: &str, matched: StaticFileMatch) -> &'static str {
+        match matched {
+            StaticFileMatch::NotFoundPage => "no-store",
+            // The next deployment may add `<path>/index.html`, which must win.
+            StaticFileMatch::CanonicalRedirect => "public, max-age=0, must-revalidate",
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                if Self::is_cacheable_static_asset(request_path) {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "public, max-age=0, must-revalidate"
+                }
+            }
+        }
+    }
+
+    /// `ETag` and `Cache-Control` for a full static response. The 404 page has
+    /// no validator, so a conditional request can never turn it into a 304.
+    fn insert_static_validators(
+        resp: &mut ResponseHeader,
+        request_path: &str,
+        etag: &str,
+        matched: StaticFileMatch,
+    ) -> Result<()> {
+        if matched != StaticFileMatch::NotFoundPage {
+            resp.insert_header("ETag", etag)?;
+        }
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(request_path, matched),
+        )?;
+        Ok(())
+    }
+
+    fn static_served_outcome(matched: StaticFileMatch) -> StaticFileServeOutcome {
+        match matched {
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                StaticFileServeOutcome::Served
+            }
+            StaticFileMatch::NotFoundPage => StaticFileServeOutcome::ServedNotFoundPage,
+            StaticFileMatch::CanonicalRedirect => StaticFileServeOutcome::Redirected,
+        }
+    }
+
+    /// Answer a trailing-slash request whose page is `<path>.html` with a 308
+    /// to the slashless URL, keeping the query string.
+    ///
+    /// `page_content_type` is the MIME of the page being redirected to. The
+    /// redirect is attributed like that page: it is often a visitor's first
+    /// request, and the one that still carries the original `Referer` and UTM
+    /// query, so the visitor and session are created here and their cookies
+    /// set on the 308. The followed request then reuses them instead of
+    /// starting a second, referrer-less visit.
+    async fn write_static_canonical_redirect(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        page_content_type: &str,
+    ) -> Result<StaticFileServeOutcome> {
+        let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
+        else {
+            warn!(
+                request_path = %bounded_log_value(&ctx.path),
+                "Static canonical redirect rejected an unsafe location"
+            );
+            return Ok(StaticFileServeOutcome::NotFound);
+        };
+        let matched = StaticFileMatch::CanonicalRedirect;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
+        resp.insert_header(header::LOCATION, &location)?;
+        resp.insert_header(header::CONTENT_LENGTH, "0")?;
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(&ctx.path, matched),
+        )?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        self.ensure_static_visitor_session(session, ctx, page_content_type)
+            .await;
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(Self::static_served_outcome(matched))
     }
 
     /// Serve a static file from an object-store-backed deployment
@@ -2515,10 +3240,12 @@ impl LoadBalancer {
         // for an already-cached key and a metadata-only backend call
         // (e.g. S3 `HeadObject`) otherwise.
         let is_head = ctx.method == "HEAD";
-        let mut resolved: Option<(String, temps_file_store::OpenedBlob)> = None;
+        let mut resolved: Option<(String, StaticFileMatch, temps_file_store::OpenedBlob)> = None;
         for candidate in &request.candidates {
-            let key = static_object_key(&request.relative_static_dir, candidate);
-            let lookup = if is_head {
+            let key = static_object_key(&request.relative_static_dir, &candidate.path);
+            // A redirect never sends the page body, so it only needs to know
+            // the key exists.
+            let lookup = if is_head || candidate.matched == StaticFileMatch::CanonicalRedirect {
                 store
                     .stat_raw(&key)
                     .await
@@ -2531,7 +3258,7 @@ impl LoadBalancer {
             };
             match lookup {
                 Ok(opened) => {
-                    resolved = Some((key, opened));
+                    resolved = Some((key, candidate.matched, opened));
                     break;
                 }
                 Err(temps_file_store::FileStoreError::NotFound { .. }) => continue,
@@ -2551,7 +3278,7 @@ impl LoadBalancer {
                 }
             }
         }
-        let Some((resolved_key, mut opened)) = resolved else {
+        let Some((resolved_key, matched, mut opened)) = resolved else {
             debug!(
                 request_path = %bounded_log_value(&ctx.path),
                 stored_static_dir = %bounded_log_value(static_dir),
@@ -2564,6 +3291,11 @@ impl LoadBalancer {
         // from the resolved key (e.g. an SPA fallback's `index.html`) rather
         // than the original request path — identical to the disk-backed path.
         let content_type = Self::infer_content_type(&resolved_key);
+        if matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
@@ -2574,22 +3306,16 @@ impl LoadBalancer {
             .headers
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| matched != StaticFileMatch::NotFoundPage)
         {
             if if_none_match_matches(if_none_match, &etag) {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, matched),
+                )?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -2597,22 +3323,18 @@ impl LoadBalancer {
             }
         }
 
-        let mut resp = ResponseHeader::build(200, None)?;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        resp.insert_header("ETag", &etag)?;
-        if Self::is_cacheable_static_asset(&ctx.path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        Self::insert_static_validators(&mut resp, &ctx.path, &etag, matched)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
+        let outcome = Self::static_served_outcome(matched);
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
-            return Ok(StaticFileServeOutcome::Served);
+            return Ok(outcome);
         }
 
         let mut remaining = opened.size_bytes;
@@ -2649,7 +3371,7 @@ impl LoadBalancer {
         }
         session.write_response_body(None, true).await?;
 
-        Ok(StaticFileServeOutcome::Served)
+        Ok(outcome)
     }
 
     /// Serve embedded WASM files for CAPTCHA solver
@@ -3496,6 +4218,66 @@ fn is_browser_document_request(
     }
 }
 
+/// Whether `error` means the upstream could not be connected to at all
+/// (nothing listening yet), as opposed to failing mid-request.
+fn is_connect_failure(error: &Error) -> bool {
+    use pingora::ErrorType;
+    matches!(
+        error.etype(),
+        ErrorType::ConnectRefused
+            | ErrorType::ConnectTimedout
+            | ErrorType::ConnectError
+            | ErrorType::ConnectNoRoute
+            | ErrorType::SocketError
+    )
+}
+
+/// The workspace preview a request is for, if any.
+///
+/// A host that is the reserved public ingress hostname is never a preview,
+/// even when it has the `ws-<id>-<port>` shape: it must reach the callback
+/// routes, not preview authentication or the preview gateway.
+///
+/// `is_public_ingress_host` is only consulted for a host that parses as a
+/// preview, so ordinary requests pay nothing for the check.
+fn preview_host_for_request(
+    host: &str,
+    preview_domain: &str,
+    is_public_ingress_host: impl FnOnce() -> bool,
+) -> Option<PreviewHost> {
+    parse_preview_host(host, preview_domain).filter(|_| !is_public_ingress_host())
+}
+
+/// Where a request with no project route may go once the admin gate has
+/// been consulted (ADR-051 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleFallThrough {
+    /// The gate allows the client: the full console (dashboard + admin API).
+    Console,
+    /// The gate denies the client: only the console's public routes, on the
+    /// listener that mounts nothing else.
+    PublicSurfaceOnly,
+    /// The gate denies the client and there is no public-only listener to
+    /// hand it to: the proxy answers 404 itself.
+    NotFound,
+}
+
+/// The control-plane listener `peer_addr` belongs to, for timeout purposes.
+///
+/// The public-only listener (ADR-051) is the same console process as
+/// `console_addr`, so a request routed there gets the console's fixed
+/// timeout rather than whatever customer traffic is configured to use.
+fn control_plane_address<'a>(
+    peer_addr: &str,
+    console_addr: &'a str,
+    ingress_addr: Option<&'a str>,
+) -> &'a str {
+    match ingress_addr {
+        Some(ingress) if !ingress.is_empty() && peer_addr == ingress => ingress,
+        _ => console_addr,
+    }
+}
+
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
 /// what customer app traffic is configured to use — a `None` (no timeout)
 /// resolved for customer traffic must never leak into the console path.
@@ -4117,6 +4899,8 @@ impl ProxyHttp for LoadBalancer {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            public_surface_only: false,
+            status_page_host: false,
             streaming_session: false,
             connection_permit: None,
         }
@@ -4350,6 +5134,30 @@ impl ProxyHttp for LoadBalancer {
         // honored by downstream auth middleware.
         let _ = session.req_header_mut().remove_header("X-Temps-Demo-Mode");
 
+        // SECURITY: only the status-host branch below may tag a request with
+        // the custom hostname it was served for (#1412).
+        let _ = session
+            .req_header_mut()
+            .remove_header(temps_core::public_status_page::STATUS_HOST_HEADER);
+
+        // A status page's custom hostname (#1412) is answered here and only
+        // here: before previews, wake-on-request, project routing, the admin
+        // gate and the console fall-through, so no path or header can steer it
+        // anywhere but the page it is attached to.
+        if let Some(status_route) = self.upstream_resolver.status_page_host(&ctx.host) {
+            return self
+                .handle_status_page_host(session, ctx, status_route)
+                .await;
+        }
+        // A TLS connection negotiated for a status hostname may only ever
+        // carry requests for that hostname: a different Host must not use it
+        // to reach the console or an application.
+        if let Some(sni) = Self::tls_sni(session) {
+            if self.upstream_resolver.status_page_host(&sni).is_some() {
+                return self.write_misdirected(session, ctx).await;
+            }
+        }
+
         // Workspace preview gateway: requests to `ws-<sid>-<port>.<preview_domain>`
         // are authenticated here against the per-session argon2 password hash
         // via a form-based login + encrypted cookie. On success we mark the
@@ -4359,8 +5167,18 @@ impl ProxyHttp for LoadBalancer {
         //
         // HTTP Basic auth is NOT supported — see `preview_auth.rs` for
         // rationale.
+        //
+        // The public ingress hostname (ADR-051) is never a preview, whatever
+        // it looks like: it is reserved for the platform's callback routes,
+        // and treating a `ws-` shaped one as a sandbox would answer provider
+        // callbacks with a login redirect or a 404. The settings API refuses
+        // such a hostname; this keeps the guarantee if one is stored anyway.
         if let Ok(settings) = self.config_service.get_settings().await {
-            if let Some(preview_host) = parse_preview_host(&ctx.host, &settings.preview_domain) {
+            if let Some(preview_host) =
+                preview_host_for_request(&ctx.host, &settings.preview_domain, || {
+                    self.upstream_resolver.is_public_ingress_host(&ctx.host)
+                })
+            {
                 let client_ip = ctx
                     .ip_address
                     .as_deref()
@@ -4946,18 +5764,21 @@ impl ProxyHttp for LoadBalancer {
                         // attack-mode checks, and activity recording.
                         let resolve_deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        // A context for a host without a live upstream (its
+                        // containers not running yet) is not routable: keep
+                        // polling rather than failing the first request.
                         let mut routable = self
                             .project_context_resolver
                             .resolve_context(&ctx.host)
                             .await
-                            .is_some();
+                            .is_some_and(|context| !context.upstream_unavailable);
                         while !routable && std::time::Instant::now() < resolve_deadline {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             routable = self
                                 .project_context_resolver
                                 .resolve_context(&ctx.host)
                                 .await
-                                .is_some();
+                                .is_some_and(|context| !context.upstream_unavailable);
                         }
 
                         if routable {
@@ -5238,6 +6059,8 @@ impl ProxyHttp for LoadBalancer {
                     project: target.project.clone()?,
                     environment: target.environment.clone()?,
                     deployment: target.deployment.clone()?,
+                    // A target is only attached once it has a live backend.
+                    upstream_unavailable: false,
                 })
             });
         let project_context = match path_target_context {
@@ -5255,9 +6078,14 @@ impl ProxyHttp for LoadBalancer {
             ctx.deployment = Some(project_ctx.deployment.clone());
             ctx.routing_status = "routed".to_string();
 
-            // Record activity for on-demand idle tracking
+            // Record activity for on-demand idle tracking. A request that
+            // will be answered 503 (no live upstream) is not activity: it must
+            // not keep an environment with dead containers from idling to
+            // sleep, after which the next request wakes it cleanly.
             if let Some(ref on_demand) = self.on_demand_manager {
-                on_demand.record_activity(project_ctx.environment.id);
+                if !project_ctx.upstream_unavailable {
+                    on_demand.record_activity(project_ctx.environment.id);
+                }
             }
 
             // Per-project/environment concurrent-connection cap (issue #646): a slow
@@ -5266,11 +6094,13 @@ impl ProxyHttp for LoadBalancer {
             // on environment id (the actual upstream-instance granularity); global
             // default and the project/environment DeploymentConfig override are
             // resolved the same way as the timeout settings above.
-            let connection_limits = self
+            // One TTL-cached settings read serves both the connection cap and
+            // the rate limits below (an in-memory read, not a DB round-trip).
+            let (connection_limits, instance_rate_limiting) = self
                 .config_service
                 .get_settings()
                 .await
-                .map(|settings| settings.connection_limits)
+                .map(|settings| (settings.connection_limits, settings.rate_limiting))
                 .unwrap_or_default();
             let project_config = project_ctx
                 .project
@@ -5417,6 +6247,80 @@ impl ProxyHttp for LoadBalancer {
                     }
                     .to_string();
                 return Ok(true);
+            }
+
+            // Per-client-IP rate limits and rate-limit blacklists (issue
+            // #1288). Runs after the IP restriction gate so a denied caller
+            // never consumes budget. An unresolvable client IP is not
+            // limited: there is nothing to attribute the request to, and the
+            // IP gate above already fails closed where a policy requires it.
+            if let Some(client_ip) = parsed_ip {
+                if let Some(resolved) = crate::rate_limiter::resolve_policy(
+                    &instance_rate_limiting,
+                    effective_config.security.as_ref(),
+                    project_ctx.environment.id,
+                ) {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    match resolved.check(&self.rate_limiter, client_ip, now_secs) {
+                        crate::rate_limiter::RateLimitDecision::Allow => {}
+                        crate::rate_limiter::RateLimitDecision::Blacklisted => {
+                            self.proxy_metrics.record_rate_limited();
+                            warn!(
+                                project_id = project_ctx.project.id,
+                                environment_id = project_ctx.environment.id,
+                                ip = %client_ip,
+                                "Request denied by rate-limit blacklist"
+                            );
+                            // Same generic 403 as the IP restriction above.
+                            let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                                .await?;
+                            ctx.routing_status = "rate_limit_blacklisted".to_string();
+                            return Ok(true);
+                        }
+                        crate::rate_limiter::RateLimitDecision::Limited {
+                            window,
+                            retry_after_secs,
+                        } => {
+                            self.proxy_metrics.record_rate_limited();
+                            debug!(
+                                project_id = project_ctx.project.id,
+                                environment_id = project_ctx.environment.id,
+                                ip = %client_ip,
+                                window = window.as_str(),
+                                scope = ?resolved.scope,
+                                "Request rejected by rate limit"
+                            );
+                            let mut response =
+                                ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                            response.insert_header("Retry-After", retry_after_secs.to_string())?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session
+                                .write_response_body(
+                                    Some(Bytes::from_static(b"Too Many Requests\n")),
+                                    true,
+                                )
+                                .await?;
+                            ctx.routing_status = "rate_limited".to_string();
+                            return Ok(true);
+                        }
+                    }
+                }
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
@@ -5970,11 +6874,13 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Check if this host should redirect
-        if let Some((redirect_url, status_code)) = self
+        if let Some((redirect_target, status_code)) = self
             .project_context_resolver
             .get_redirect_info(&ctx.host)
             .await
         {
+            let redirect_url =
+                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
             debug!(
                 request_id = %ctx.request_id,
                 host = %ctx.host,
@@ -6125,13 +7031,15 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Check for redirects or static file serving
-        if let Some(redirect_info) = self
+        if let Some((redirect_target, status_code)) = self
             .project_context_resolver
             .get_redirect_info(&ctx.host)
             .await
         {
-            let mut resp = ResponseHeader::build(redirect_info.1, None)?;
-            resp.insert_header(header::LOCATION, &redirect_info.0)?;
+            let location =
+                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
+            let mut resp = ResponseHeader::build(status_code, None)?;
+            resp.insert_header(header::LOCATION, &location)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }
@@ -6179,6 +7087,39 @@ impl ProxyHttp for LoadBalancer {
                         debug!("Served static file: {}", ctx.path);
                         ctx.routing_status = "static_file".to_string();
                         self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
+                        return Ok(true);
+                    }
+                    Ok(StaticFileServeOutcome::ServedNotFoundPage) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            stored_static_dir = %bounded_log_value(&static_dir),
+                            "Static file request answered with the deployment's 404 page"
+                        );
+                        ctx.routing_status = "static_file_not_found_page".to_string();
+                        self.log_static_request(
+                            ctx,
+                            404,
+                            "static_file_not_found_page",
+                            &static_dir,
+                            Some("Static file not found".to_string()),
+                            None,
+                        );
+                        return Ok(true);
+                    }
+                    Ok(StaticFileServeOutcome::Redirected) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            "Static file request redirected to its slashless page"
+                        );
+                        ctx.routing_status = "static_file_redirect".to_string();
+                        self.log_static_request(
+                            ctx,
+                            308,
+                            "static_file_redirect",
+                            &static_dir,
+                            None,
+                            None,
+                        );
                         return Ok(true);
                     }
                     Ok(StaticFileServeOutcome::NotFound) => {
@@ -6317,10 +7258,17 @@ impl ProxyHttp for LoadBalancer {
         // Admin gate: when a non-noop gate is wired and the request is
         // about to fall back to the console (no deployed app for this host,
         // not a public ingest path under /api/_temps/*, not a preview),
-        // require the (IP, Host) tuple to pass the gate. If it doesn't,
-        // return a 404 from the proxy itself so the management surface is
-        // invisible from non-admin hosts.
-        if let Some(gate) = self.admin_gate.as_ref() {
+        // require the (IP, Host) tuple to pass the gate. If it doesn't, the
+        // management surface must stay invisible from non-admin hosts.
+        //
+        // The public ingress hostname (ADR-051) is not gated at all: the
+        // resolver pins it to the public-only listener for every client, so
+        // there is no management surface behind it to protect.
+        if let Some(gate) = self
+            .admin_gate
+            .as_ref()
+            .filter(|_| !self.is_public_ingress_request(&ctx.host))
+        {
             let config = gate.current();
             if Self::should_consult_admin_gate(&config, &ctx.path, ctx.preview_route.is_some()) {
                 let host_has_route = self.upstream_resolver.has_route_for_host(&ctx.host).await;
@@ -6330,26 +7278,50 @@ impl ProxyHttp for LoadBalancer {
                         .as_deref()
                         .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-                    if !config.would_allow(client_ip, Some(&ctx.host)) {
-                        warn!(
-                            host = %ctx.host,
-                            client_ip = %client_ip,
-                            path = %ctx.path,
-                            "admin gate denied request to non-admin host"
-                        );
-                        let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        let body =
-                            Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
-                        response.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(body), true).await?;
-                        ctx.routing_status = "admin_gate_denied".to_string();
-                        return Ok(true);
+                    match Self::console_fall_through(
+                        &config,
+                        client_ip,
+                        &ctx.host,
+                        self.upstream_resolver.console_ingress_address().is_some(),
+                    ) {
+                        ConsoleFallThrough::Console => {}
+                        // A denied client is still a legitimate caller of the
+                        // public routes: a mail client fetching a tracking
+                        // pixel, a git provider delivering a push. Hand it to
+                        // the listener that mounts those and nothing else.
+                        // That listener answers everything that is not a
+                        // public route with a 404, so the console stays as
+                        // invisible as when the proxy answered itself.
+                        ConsoleFallThrough::PublicSurfaceOnly => {
+                            debug!(
+                                host = %ctx.host,
+                                client_ip = %client_ip,
+                                path = %ctx.path,
+                                "admin gate denied request; serving the public-only surface"
+                            );
+                            ctx.public_surface_only = true;
+                        }
+                        ConsoleFallThrough::NotFound => {
+                            warn!(
+                                host = %ctx.host,
+                                client_ip = %client_ip,
+                                path = %ctx.path,
+                                "admin gate denied request to non-admin host"
+                            );
+                            let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                            let body =
+                                Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
+                            response.insert_header("Content-Length", body.len().to_string())?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session.write_response_body(Some(body), true).await?;
+                            ctx.routing_status = "admin_gate_denied".to_string();
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -6367,6 +7339,25 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        {
+            let key = upstream_failure_key(
+                ctx.project.as_ref().map(|p| p.id),
+                ctx.environment.as_ref().map(|e| e.id),
+                ctx.upstream_host.as_deref(),
+                &ctx.host,
+            );
+            // Only an actual upstream response proves recovery. Selecting a
+            // route or starting a retry must not re-arm the failure warning.
+            if let Some(failures) = self.upstream_failures.record_success(&key) {
+                info!(
+                    project_id = key.0,
+                    environment_id = key.1,
+                    failures,
+                    "Upstream connection recovered"
+                );
+            }
+        }
+
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
         strip_proxy_owned_response_headers(upstream_response);
@@ -6698,6 +7689,23 @@ impl ProxyHttp for LoadBalancer {
         // and can hand a connection opened for one sandbox back out to
         // serve another token-bearing request (see `preview_request_group_key`
         // doc comment for the full mechanism).
+        // A status page's custom hostname (#1412): the public-only listener
+        // and nothing else. `request_filter` already refused the request if no
+        // such listener exists; this keeps the guarantee if it ever did not.
+        if ctx.status_page_host {
+            let Some(ingress_address) = self.upstream_resolver.console_ingress_address() else {
+                return Err(Error::explain(
+                    pingora_core::ErrorType::ConnectNoRoute,
+                    "status-page custom hostname has no public ingress listener to reach",
+                ));
+            };
+            let mut peer = Box::new(HttpPeer::new(ingress_address, false, String::new()));
+            peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
+            peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
+            ctx.upstream_host = Some(ingress_address.to_string());
+            return Ok(peer);
+        }
+
         if let Some(host) = &ctx.preview_route {
             let preview_io_timeout = if is_websocket {
                 std::time::Duration::from_secs(3600)
@@ -6727,13 +7735,30 @@ impl ProxyHttp for LoadBalancer {
             domain, path
         );
 
+        // The admin gate denied this request: it may reach the console's
+        // public routes and nothing else (ADR-051). Skip resolution entirely
+        // so no path or `Host` can steer it to another peer. This takes
+        // precedence over a path route's target for the same reason.
+        let public_surface_address = ctx
+            .public_surface_only
+            .then(|| self.upstream_resolver.console_ingress_address())
+            .flatten();
         // A path route's target was resolved in `request_filter`; the
         // request goes to its current deployment, not the host's service.
-        let path_target = ctx
-            .path_route
-            .as_ref()
-            .and_then(|route| route.target.as_ref());
-        let selection = if let Some(target) = path_target {
+        let path_target = if public_surface_address.is_some() {
+            None
+        } else {
+            ctx.path_route
+                .as_ref()
+                .and_then(|route| route.target.as_ref())
+        };
+        let selection = if let Some(ingress_address) = public_surface_address {
+            PeerSelection {
+                peer: Box::new(HttpPeer::new(ingress_address, false, String::new())),
+                container_id: None,
+                container_name: None,
+            }
+        } else if let Some(target) = path_target {
             // Static targets are answered in `request_filter`; reaching here
             // with one would otherwise fall back to the console address.
             if target.is_static() {
@@ -6766,6 +7791,21 @@ impl ProxyHttp for LoadBalancer {
         };
 
         let mut peer = selection.peer;
+
+        // The console failed to start: nothing is listening on its address
+        // (or something unrelated is). Don't connect; `fail_to_proxy` serves
+        // the startup-failure page. One atomic load on the healthy path.
+        if let Some(responder) = self.console_unavailable.as_ref() {
+            if responder.phase() == temps_core::console_startup::ConsolePhase::Failed
+                && responder.is_console_peer(&peer)
+            {
+                ctx.upstream_host = Some(peer.address().to_string());
+                return Err(Error::explain(
+                    pingora::ErrorType::ConnectRefused,
+                    "console failed to start; serving its startup status page",
+                ));
+            }
+        }
 
         // Resolve the effective per-request/idle timeout for customer app
         // traffic: project config as the base layer, environment config
@@ -6811,9 +7851,14 @@ impl ProxyHttp for LoadBalancer {
         // RST'd out from under a handler that goes on to finish successfully
         // server-side — the import completes, but the browser sees a 503
         // and the user has no way to know it worked.
+        let peer_address = peer.address().to_string();
         let io_timeout = upstream_io_timeout(
-            &peer.address().to_string(),
-            self.upstream_resolver.console_address(),
+            &peer_address,
+            control_plane_address(
+                &peer_address,
+                self.upstream_resolver.console_address(),
+                self.upstream_resolver.console_ingress_address(),
+            ),
             is_websocket,
             customer_io_timeout,
         );
@@ -6858,14 +7903,29 @@ impl ProxyHttp for LoadBalancer {
         // Retry once on connection failure — handles stale pooled connections
         // where the upstream closed the keep-alive connection before we sent
         // the request (TCP RST / "Connection reset by peer").
+        //
+        // Neither branch logs above debug: a final failure reaches
+        // `fail_to_proxy`, which logs it once with the request context.
         if ctx.upstream_connect_tries == 0 {
             ctx.upstream_connect_tries += 1;
-            warn!("Upstream connection failed (try 1), retrying: {:?}", e);
+            debug!("Upstream connection failed (try 1), retrying: {:?}", e);
             e.set_retry(true);
         } else {
-            error!("Upstream connection failed after retry: {:?}", e);
+            debug!("Upstream connection failed after retry: {:?}", e);
         }
         e
+    }
+
+    /// `fail_to_proxy` already logs every failure once, with the request
+    /// context and a level that matches the cause. Pingora's own
+    /// "Fail to proxy" ERROR line would log each of them a second time.
+    fn suppress_error_log(
+        &self,
+        _session: &PingoraSession,
+        _ctx: &Self::CTX,
+        _error: &Error,
+    ) -> bool {
+        true
     }
 
     async fn fail_to_proxy(
@@ -6877,15 +7937,46 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        error!(
-            "Failed to proxy: {:?} | request_id={} client_ip={} host={} method={} path={}",
-            e,
-            ctx.request_id,
-            ctx.ip_address.as_deref().unwrap_or("unknown"),
-            ctx.host,
-            ctx.method,
-            ctx.path
-        );
+        if let Some(result) = self.serve_console_status_page(session, e, ctx).await {
+            return result;
+        }
+
+        let failure = ProxyFailureKind::of(e);
+        macro_rules! log_failure {
+            ($level:ident) => {
+                $level!(
+                    "Failed to proxy ({}): {:?} | request_id={} client_ip={} host={} method={} path={}",
+                    failure.as_str(),
+                    e,
+                    ctx.request_id,
+                    ctx.ip_address.as_deref().unwrap_or("unknown"),
+                    ctx.host,
+                    ctx.method,
+                    ctx.path
+                )
+            };
+        }
+        match failure {
+            ProxyFailureKind::ClientGone => log_failure!(debug),
+            ProxyFailureKind::Upstream => {
+                let key = upstream_failure_key(
+                    ctx.project.as_ref().map(|p| p.id),
+                    ctx.environment.as_ref().map(|e| e.id),
+                    ctx.upstream_host.as_deref(),
+                    &ctx.host,
+                );
+                if self
+                    .upstream_failures
+                    .record_failure_bounded(key, 4096)
+                    .should_log()
+                {
+                    log_failure!(warn);
+                } else {
+                    log_failure!(debug);
+                }
+            }
+            ProxyFailureKind::Internal => log_failure!(error),
+        }
 
         let mut error_code = 500;
         let can_reuse_downstream = false;
@@ -6893,6 +7984,17 @@ impl ProxyHttp for LoadBalancer {
         // Update context with error
         ctx.error_message = Some(e.to_string());
         ctx.routing_status = "error".to_string();
+
+        // The client already went away: there is nobody to send a 503 page
+        // to, and trying only produces a second write error. Record it as
+        // 499 (client closed request) and report that no response was sent.
+        if failure == ProxyFailureKind::ClientGone {
+            self.log_failed_request(ctx, CLIENT_CLOSED_REQUEST, None);
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream,
+            };
+        }
 
         let mut header = match ResponseHeader::build(503, None) {
             Ok(header) => header,
@@ -6946,74 +8048,7 @@ impl ProxyHttp for LoadBalancer {
         }
 
         error_code = 503;
-
-        // Asynchronously log failed proxy request (skip static assets)
-        if Self::should_log_request(&ctx.path) {
-            // Prefer bytes actually received from the client (see log_request);
-            // fall back to Content-Length if the body never reached the filter.
-            let request_size = if ctx.client_body_bytes_received > 0 {
-                Some(ctx.client_body_bytes_received as i64)
-            } else {
-                ctx.request_headers
-                    .as_ref()
-                    .and_then(|h| h.get("content-length"))
-                    .and_then(|v| v.parse::<i64>().ok())
-            };
-
-            // For failed requests, response size is the error message size
-            let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
-
-            let (request_source, is_system_request) =
-                Self::traffic_classification(&ctx.path, &ctx.user_agent);
-            let proxy_log_request = CreateProxyLogRequest {
-                method: ctx.method.clone(),
-                path: ctx.path.clone(),
-                query_string: None,
-                host: ctx.host.clone(),
-                status_code: error_code as i16,
-                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: request_source.to_string(),
-                is_system_request,
-                routing_status: ctx.routing_status.clone(),
-                project_id: ctx.project.as_ref().map(|p| p.id),
-                environment_id: ctx.environment.as_ref().map(|e| e.id),
-                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: None,
-                visitor_id: None,
-                visitor_uuid: ctx.visitor_id.clone(),
-                session_uuid: ctx.session_id.clone(),
-                container_id: None,
-                upstream_host: None,
-                error_message: ctx.error_message.clone(),
-                client_ip: ctx.ip_address.clone(),
-                user_agent: Some(ctx.user_agent.clone()),
-                referrer: ctx.referrer.clone(),
-                request_id: ctx.request_id.clone(),
-                ip_geolocation_id: None,
-                browser: None,
-                browser_version: None,
-                operating_system: None,
-                device_type: None,
-                is_bot: None,
-                bot_name: None,
-                request_size_bytes: request_size,
-                response_size_bytes: response_size,
-                cache_status: None,
-                request_headers: ctx
-                    .request_headers
-                    .as_ref()
-                    .and_then(|h| serde_json::to_value(h).ok()),
-                response_headers: ctx
-                    .response_headers
-                    .as_ref()
-                    .and_then(|h| serde_json::to_value(h).ok()),
-                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
-                error_group_id: None,
-            };
-
-            // Non-blocking enqueue; shed with rate-limited accounting when full.
-            self.proxy_log_handle.send_or_drop(proxy_log_request);
-        }
+        self.log_failed_request(ctx, error_code, Some(SERVICE_UNAVAILABLE_BODY.len() as i64));
 
         FailToProxy {
             error_code,
@@ -7121,6 +8156,122 @@ mod admin_gate_tests {
     fn normal_request_consults_gate_when_configured() {
         let config = gated(&["app.temps.kfs.es"]);
         assert!(LoadBalancer::should_consult_admin_gate(&config, "/", false,));
+    }
+
+    // ADR-051 D4: the three-way console fall-through.
+
+    #[test]
+    fn allowlisted_client_reaches_the_full_console() {
+        let config = AdminGateConfig::from_parts(
+            &["203.0.113.0/24".to_string()],
+            &[],
+            false,
+            AdminGateSource::Db,
+        )
+        .expect("valid gate");
+        let admin: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        for has_listener in [true, false] {
+            assert_eq!(
+                LoadBalancer::console_fall_through(
+                    &config,
+                    admin,
+                    "console.example.com",
+                    has_listener
+                ),
+                ConsoleFallThrough::Console
+            );
+        }
+    }
+
+    #[test]
+    fn denied_client_gets_only_the_public_surface() {
+        let config = AdminGateConfig::from_parts(
+            &["203.0.113.0/24".to_string()],
+            &[],
+            false,
+            AdminGateSource::Db,
+        )
+        .expect("valid gate");
+        let stranger: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, stranger, "console.example.com", true),
+            ConsoleFallThrough::PublicSurfaceOnly,
+            "a mail client or webhook sender must reach the public routes"
+        );
+    }
+
+    #[test]
+    fn denied_client_keeps_the_404_without_a_public_only_listener() {
+        let config = gated(&["console.example.com"]);
+        let stranger: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, stranger, "other.example.com", false),
+            ConsoleFallThrough::NotFound,
+            "a split proxy with no ingress address must behave as before"
+        );
+    }
+
+    #[test]
+    fn host_allowlist_denial_also_falls_through_to_the_public_surface() {
+        let config = gated(&["console.example.com"]);
+        let client: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, client, "console.example.com", true),
+            ConsoleFallThrough::Console
+        );
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, client, "203.0.113.5", true),
+            ConsoleFallThrough::PublicSurfaceOnly
+        );
+    }
+
+    #[test]
+    fn the_public_ingress_host_is_never_treated_as_a_workspace_preview() {
+        let preview_shaped = "ws-0123456789abcdef-3000.apps.example.com";
+
+        // Ordinarily that host is a sandbox preview…
+        let preview = preview_host_for_request(preview_shaped, "apps.example.com", || false)
+            .expect("a ws- host under the preview domain is a preview");
+        assert_eq!(preview.port, 3000);
+        // …but not when it is the reserved callback hostname.
+        assert!(preview_host_for_request(preview_shaped, "apps.example.com", || true).is_none());
+        // An ordinary host is not a preview, and the ingress check is not
+        // even consulted for it.
+        assert!(
+            preview_host_for_request("hooks.example.com", "apps.example.com", || {
+                unreachable!("only preview-shaped hosts are checked")
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn public_only_listener_gets_the_console_timeout() {
+        let console = "127.0.0.1:8081";
+        let ingress = "127.0.0.1:8082";
+        assert_eq!(
+            control_plane_address(ingress, console, Some(ingress)),
+            ingress
+        );
+        assert_eq!(
+            control_plane_address(console, console, Some(ingress)),
+            console
+        );
+        assert_eq!(
+            control_plane_address("10.0.0.9:3000", console, None),
+            console
+        );
+        // A request routed to the public-only listener is control-plane
+        // traffic: it must not inherit a customer timeout (or lack of one).
+        assert_eq!(
+            upstream_io_timeout(
+                ingress,
+                control_plane_address(ingress, console, Some(ingress)),
+                false,
+                None
+            ),
+            Some(std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS))
+        );
     }
 
     // Regression: setting an admin host (e.g. `app.temps.kfs.es`) used to
@@ -7419,6 +8570,8 @@ mod markdown_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            public_surface_only: false,
+            status_page_host: false,
             streaming_session: false,
             connection_permit: None,
         }
@@ -7954,6 +9107,8 @@ mod markdown_pipeline_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            public_surface_only: false,
+            status_page_host: false,
             streaming_session: false,
             connection_permit: None,
         }
@@ -9448,5 +10603,799 @@ mod cdn_client_ip_tests {
             t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
             real_client
         );
+    }
+}
+
+#[cfg(test)]
+mod static_response_policy_tests {
+    use super::*;
+
+    fn header_value<'a>(resp: &'a ResponseHeader, name: &str) -> Option<&'a str> {
+        resp.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn not_found_page_has_no_etag_and_is_never_cached() {
+        for path in ["/does-not-exist", "/assets/app-1a2b.js"] {
+            let mut resp = ResponseHeader::build(StaticFileMatch::NotFoundPage.status(), None)
+                .expect("build response");
+
+            LoadBalancer::insert_static_validators(
+                &mut resp,
+                path,
+                "W/\"etag\"",
+                StaticFileMatch::NotFoundPage,
+            )
+            .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 404, "{path}");
+            assert_eq!(header_value(&resp, "etag"), None, "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_files_keep_their_etag_and_path_based_caching() {
+        for (path, matched, cache_control) in [
+            (
+                "/assets/app.js",
+                StaticFileMatch::Requested,
+                "public, max-age=31536000, immutable",
+            ),
+            (
+                "/about",
+                StaticFileMatch::Requested,
+                "public, max-age=0, must-revalidate",
+            ),
+            (
+                "/dashboard",
+                StaticFileMatch::SpaShell,
+                "public, max-age=0, must-revalidate",
+            ),
+        ] {
+            let mut resp = ResponseHeader::build(matched.status(), None).expect("build response");
+
+            LoadBalancer::insert_static_validators(&mut resp, path, "W/\"etag\"", matched)
+                .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 200, "{path}");
+            assert_eq!(header_value(&resp, "etag"), Some("W/\"etag\""), "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some(cache_control),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_not_found_page_reports_a_not_found_outcome() {
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::Requested),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::SpaShell),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::NotFoundPage),
+            StaticFileServeOutcome::ServedNotFoundPage
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::CanonicalRedirect),
+            StaticFileServeOutcome::Redirected
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_is_tracked_like_the_page_it_redirects_to() {
+        // The 308 for `/about/` is attributed with the MIME of `about.html`,
+        // so a browser's first navigation creates the visit on the redirect.
+        let page_content_type = LoadBalancer::infer_content_type("about.html");
+        let browser_navigation = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("text/html,application/xhtml+xml"),
+            Some("document"),
+            Some("1"),
+        );
+        assert!(browser_navigation);
+
+        let plain_http_client = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("*/*"),
+            None,
+            None,
+        );
+        assert!(!plain_http_client);
+    }
+
+    #[test]
+    fn canonical_redirect_is_revalidated_even_on_an_asset_like_path() {
+        assert_eq!(
+            LoadBalancer::static_cache_control(
+                "/assets/guide/",
+                StaticFileMatch::CanonicalRedirect
+            ),
+            "public, max-age=0, must-revalidate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_failure_kind_tests {
+    use super::upstream_failure_key;
+    use super::ProxyFailureKind;
+    use pingora::{Error, ErrorSource, ErrorType};
+
+    fn error(etype: ErrorType, source: ErrorSource) -> Box<Error> {
+        let mut e = Error::new(etype);
+        e.esource = source;
+        e
+    }
+
+    #[test]
+    fn client_disconnects_are_not_errors() {
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::WriteError,
+        ] {
+            assert_eq!(
+                ProxyFailureKind::of(&error(etype, ErrorSource::Downstream)),
+                ProxyFailureKind::ClientGone
+            );
+        }
+    }
+
+    #[test]
+    fn independent_unscoped_upstreams_keep_independent_outages() {
+        let latch = temps_core::log_transitions::KeyedFailureLatch::default();
+        let a = upstream_failure_key(None, None, Some("service-a:80"), "a.example.com");
+        let b = upstream_failure_key(None, None, Some("service-b:80"), "b.example.com");
+        assert!(latch.record_failure(a.clone()).should_log());
+        assert!(latch.record_failure(b.clone()).should_log());
+        assert!(!latch.record_failure(a.clone()).should_log());
+        latch.record_success(&a);
+        assert!(latch.is_failing(&b));
+        assert!(latch.record_failure(a).should_log());
+        assert_eq!(
+            upstream_failure_key(Some(1), Some(2), Some("host"), "route"),
+            (1, 2, None)
+        );
+    }
+
+    #[test]
+    fn upstream_failures_are_classified_as_upstream() {
+        for etype in [
+            ErrorType::ConnectRefused,
+            ErrorType::ConnectTimedout,
+            ErrorType::ConnectionClosed,
+        ] {
+            assert_eq!(
+                ProxyFailureKind::of(&error(etype, ErrorSource::Upstream)),
+                ProxyFailureKind::Upstream
+            );
+        }
+    }
+
+    #[test]
+    fn everything_else_is_internal() {
+        assert_eq!(
+            ProxyFailureKind::of(&error(
+                ErrorType::InvalidHTTPHeader,
+                ErrorSource::Downstream
+            )),
+            ProxyFailureKind::Internal
+        );
+        assert_eq!(
+            ProxyFailureKind::of(&error(ErrorType::InternalError, ErrorSource::Internal)),
+            ProxyFailureKind::Internal
+        );
+        assert_eq!(
+            ProxyFailureKind::of(&error(ErrorType::InternalError, ErrorSource::Unset)),
+            ProxyFailureKind::Internal
+        );
+    }
+}
+
+#[cfg(test)]
+mod stopped_app_tests {
+    use super::LoadBalancer;
+    use crate::config::ProxyConfig;
+    use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
+    use crate::test_utils::*;
+    use crate::traits::{ProjectContextResolver, UpstreamResolver};
+    use anyhow::Result;
+    use pingora::upstreams::peer::Peer;
+    use std::sync::Arc;
+    use temps_database::test_utils::TestDatabase;
+    use temps_routes::CachedPeerTable;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
+        let encryption_key = "default-32-byte-key-for-testing!";
+        Arc::new(
+            temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"),
+        )
+    }
+
+    fn create_test_config_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_config::ConfigService> {
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test@localhost/test".to_string(),
+            None,
+            None,
+        )
+        .expect("Failed to create test ServerConfig");
+
+        Arc::new(temps_config::ConfigService::new(Arc::new(config), db))
+    }
+
+    fn create_mock_ip_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_geo::IpAddressService> {
+        // Force mock mode for tests by setting environment variable
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+
+        let geoip_service =
+            Arc::new(temps_geo::GeoIpService::new().expect("Failed to create GeoIpService"));
+        Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
+    }
+
+    /// Stand-in for the console: answers every request with the console's
+    /// SPA shell and HTTP 200, as the real console does for any path.
+    async fn start_console_stand_in() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let body = "<!DOCTYPE html><html><head><title>Temps</title></head>\
+                                <body><div id=\"root\"></div></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// Issue #1334: a request to an app whose containers are all down must
+    /// get the proxy's 503 page, never the console. Before the fix the host
+    /// vanished from the route table, the request fell through to the console
+    /// and was answered with the console SPA and HTTP 200, so uptime monitors
+    /// reported the stopped app as operational.
+    ///
+    /// Drives the real `ProxyHttp` hooks over an in-memory HTTP/1.1 session,
+    /// in the order Pingora calls them.
+    #[tokio::test]
+    async fn test_stopped_app_gets_503_instead_of_the_console() -> Result<()> {
+        use pingora_proxy::{ProxyHttp, Session};
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let test_db_mock = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping stopped-app proxy test: Docker runtime unavailable");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let db = test_db_mock.connection_arc().clone();
+        let test_db = TestDBMockOperations::new(db.clone()).await.unwrap();
+
+        let host = "stopped-app.example.com";
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain(host)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // The request below is plain HTTP. A resolved production environment
+        // is redirected to HTTPS by default, exactly as a running app would
+        // be; opt out so the request reaches upstream selection.
+        temps_entities::environments::ActiveModel {
+            id: Set(environment.id),
+            force_https: Set(Some(false)),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await?;
+        temps_entities::deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("stopped-app-container".to_string()),
+            container_name: Set("stopped-app-container".to_string()),
+            container_port: Set(3000),
+            host_port: Set(None),
+            status: Set(Some("exited".to_string())),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        route_table.load_routes().await?;
+
+        // The console is a live server: if the request reached it, the test
+        // would see its 200 instead of the 503.
+        let console_addr = start_console_stand_in().await;
+        let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: console_addr,
+                ..ProxyConfig::default()
+            }),
+            Arc::new(crate::service::lb_service::LbService::new(db.clone())),
+            route_table.clone(),
+        )) as Arc<dyn UpstreamResolver>;
+        let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table))
+            as Arc<dyn ProjectContextResolver>;
+
+        let ip_service = create_mock_ip_service(db.clone());
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
+        );
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
+            crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            );
+        let lb = LoadBalancer::new(
+            upstream_resolver,
+            proxy_log_handle,
+            tracking_handle,
+            project_context_resolver,
+            create_crypto_cookie_crypto(),
+            db.clone(),
+            create_test_config_service(db.clone()),
+            Arc::new(
+                crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+            ),
+            Arc::new(temps_core::OpenIpGate),
+            Arc::new(crate::service::challenge_service::ChallengeService::new(
+                db.clone(),
+            )),
+            Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+                db.clone(),
+            )),
+            false,
+        );
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Temps-Status-Monitor/1.0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await?, "request must parse");
+
+        let mut ctx = lb.new_ctx();
+        lb.early_request_filter(&mut session, &mut ctx).await?;
+        assert!(
+            !lb.request_filter(&mut session, &mut ctx).await?,
+            "nothing in request_filter may answer for the stopped app (answered as {})",
+            ctx.routing_status
+        );
+        assert_eq!(
+            ctx.project.as_ref().map(|project| project.id),
+            Some(project.id),
+            "the failed request is attributed to the app's project"
+        );
+
+        let error = match lb.upstream_peer(&mut session, &mut ctx).await {
+            Ok(peer) => panic!("stopped app was proxied to {}", peer.address()),
+            Err(error) => error,
+        };
+        let outcome = lb.fail_to_proxy(&mut session, &error, &mut ctx).await;
+        assert_eq!(outcome.error_code, 503);
+        drop(session);
+
+        let mut raw = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut raw),
+        )
+        .await??;
+        let response = String::from_utf8_lossy(&raw).to_string();
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("malformed response: {response:?}"));
+        assert!(
+            head.starts_with("HTTP/1.1 503"),
+            "a stopped app must answer 503: {head}"
+        );
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case("cache-control: private, no-store")),
+            "the outage page must not be cached: {head}"
+        );
+        assert!(
+            body.contains("<title>Service Unavailable</title>"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("<title>Temps</title>"),
+            "the console must never answer for an application host: {body}"
+        );
+
+        Ok(())
+    }
+}
+
+/// Status pages on custom hostnames (#1412): the proxy is the only thing that
+/// may answer such a host, and it allows exactly two paths.
+#[cfg(test)]
+mod status_page_host_tests {
+    use super::LoadBalancer;
+    use crate::config::ProxyConfig;
+    use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
+    use crate::traits::{ProjectContextResolver, UpstreamResolver};
+    use anyhow::Result;
+    use pingora::upstreams::peer::Peer;
+    use pingora_proxy::{ProxyHttp, Session};
+    use std::sync::Arc;
+    use temps_core::public_status_page::{NOT_FOUND_HTML, NOT_FOUND_JSON, STATUS_HOST_HEADER};
+    use temps_database::test_utils::TestDatabase;
+    use temps_routes::CachedPeerTable;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
+        Arc::new(
+            temps_core::CookieCrypto::new("default-32-byte-key-for-testing!")
+                .expect("Failed to create cookie crypto"),
+        )
+    }
+
+    fn create_test_config_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_config::ConfigService> {
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test@localhost/test".to_string(),
+            None,
+            None,
+        )
+        .expect("Failed to create test ServerConfig");
+        Arc::new(temps_config::ConfigService::new(Arc::new(config), db))
+    }
+
+    fn create_mock_ip_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_geo::IpAddressService> {
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let geoip_service =
+            Arc::new(temps_geo::GeoIpService::new().expect("Failed to create GeoIpService"));
+        Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
+    }
+
+    const SLUG: &str = "0123456789abcdef0123456789abcdef";
+    const HOST: &str = "status.example.com";
+    const INGRESS: &str = "127.0.0.1:1";
+
+    struct Harness {
+        _db: TestDatabase,
+        lb: LoadBalancer,
+        route_table: Arc<CachedPeerTable>,
+    }
+
+    async fn harness(
+        ingress: Option<&str>,
+        disable_https_redirect: bool,
+    ) -> Result<Option<Harness>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping status-page host proxy test: Docker runtime unavailable");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let db = test_db.connection_arc().clone();
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: "127.0.0.1:2".to_string(),
+                console_ingress_address: ingress.map(str::to_string),
+                ..ProxyConfig::default()
+            }),
+            Arc::new(crate::service::lb_service::LbService::new(db.clone())),
+            route_table.clone(),
+        )) as Arc<dyn UpstreamResolver>;
+        let project_context_resolver =
+            Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
+                as Arc<dyn ProjectContextResolver>;
+        let ip_service = create_mock_ip_service(db.clone());
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
+        );
+        let (proxy_log_handle, tracking_handle, _writer) =
+            crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            );
+        let lb = LoadBalancer::new(
+            upstream_resolver,
+            proxy_log_handle,
+            tracking_handle,
+            project_context_resolver,
+            create_crypto_cookie_crypto(),
+            db.clone(),
+            create_test_config_service(db.clone()),
+            Arc::new(
+                crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+            ),
+            Arc::new(temps_core::OpenIpGate),
+            Arc::new(crate::service::challenge_service::ChallengeService::new(
+                db.clone(),
+            )),
+            Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+                db.clone(),
+            )),
+            disable_https_redirect,
+        );
+        Ok(Some(Harness {
+            _db: test_db,
+            lb,
+            route_table,
+        }))
+    }
+
+    enum Outcome {
+        /// `request_filter` let the request through to `upstream_peer`.
+        Forwarded {
+            path: String,
+            status_host: Option<String>,
+            cookie: bool,
+            peer: Option<String>,
+        },
+        /// The proxy answered itself.
+        Answered { head: String, body: String },
+    }
+
+    async fn send(h: &Harness, raw_request: &str) -> Result<Outcome> {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(raw_request.as_bytes()).await?;
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await?, "request must parse");
+        let mut ctx = h.lb.new_ctx();
+        h.lb.early_request_filter(&mut session, &mut ctx).await?;
+        let answered = h.lb.request_filter(&mut session, &mut ctx).await?;
+        if !answered {
+            let header = session.req_header();
+            let path = header
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_default();
+            let status_host = header
+                .headers
+                .get(STATUS_HOST_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let cookie = header.headers.get("cookie").is_some();
+            let peer = if ctx.status_page_host {
+                Some(
+                    h.lb.upstream_peer(&mut session, &mut ctx)
+                        .await?
+                        .address()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            return Ok(Outcome::Forwarded {
+                path,
+                status_host,
+                cookie,
+                peer,
+            });
+        }
+        drop(session);
+        let mut raw = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut raw),
+        )
+        .await??;
+        let response = String::from_utf8_lossy(&raw).to_string();
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .map(|(h, b)| (h.to_string(), b.to_string()))
+            .unwrap_or((response.clone(), String::new()));
+        Ok(Outcome::Answered { head, body })
+    }
+
+    fn get(path: &str, host: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: session=secret\r\n\r\n")
+    }
+
+    fn assert_not_found(outcome: Outcome, json: bool) {
+        match outcome {
+            Outcome::Answered { head, body } => {
+                assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+                assert!(
+                    head.to_ascii_lowercase()
+                        .contains("cache-control: no-store"),
+                    "{head}"
+                );
+                assert_eq!(body, if json { NOT_FOUND_JSON } else { NOT_FOUND_HTML });
+                assert!(!body.contains("<title>Temps</title>"));
+            }
+            Outcome::Forwarded { path, .. } => panic!("must answer 404, forwarded {path}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_host_serves_only_the_page_and_summary_on_the_ingress_listener() -> Result<()>
+    {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+
+        for (path, expected) in [
+            ("/", format!("/api/status/{SLUG}")),
+            ("/summary.json", format!("/api/status/{SLUG}/summary.json")),
+        ] {
+            match send(&h, &get(path, HOST)).await? {
+                Outcome::Forwarded {
+                    path: forwarded,
+                    status_host,
+                    cookie,
+                    peer,
+                } => {
+                    assert_eq!(forwarded, expected);
+                    assert_eq!(status_host.as_deref(), Some(HOST));
+                    assert!(!cookie, "credentials never reach the public listener");
+                    assert_eq!(peer.as_deref(), Some(INGRESS));
+                }
+                Outcome::Answered { head, .. } => panic!("{path} must be forwarded: {head}"),
+            }
+        }
+
+        // A query string never travels: `/` is the page, whatever follows.
+        match send(&h, &get("/?x=1/../../api/projects", HOST)).await? {
+            Outcome::Forwarded { path, .. } => assert_eq!(path, format!("/api/status/{SLUG}")),
+            Outcome::Answered { head, .. } => panic!("{head}"),
+        }
+
+        // Host header spelling does not matter; the binding does.
+        assert!(matches!(
+            send(&h, &get("/", "Status.Example.COM.:8080")).await?,
+            Outcome::Forwarded { .. }
+        ));
+
+        for path in [
+            "/index.html",
+            "/api/projects",
+            &format!("/api/status/{SLUG}"),
+            "/api/_temps/captcha/verify",
+            "/api/otel/v1/traces",
+            "/summary.json/",
+            "//",
+            "/%2e%2e/api/projects",
+            "/.well-known/acme-challenge/unknown-token",
+        ] {
+            assert_not_found(send(&h, &get(path, HOST)).await?, false);
+        }
+        assert_not_found(
+            send(
+                &h,
+                &format!("POST / HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: 0\r\n\r\n"),
+            )
+            .await?,
+            false,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unverified_or_unpublished_host_answers_404_and_never_the_console() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test("pending.example.com", None);
+        assert_not_found(send(&h, &get("/", "pending.example.com")).await?, false);
+        assert_not_found(
+            send(&h, &get("/summary.json", "pending.example.com")).await?,
+            true,
+        );
+        assert_not_found(
+            send(&h, &get("/api/projects", "pending.example.com")).await?,
+            false,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_an_ingress_listener_the_host_fails_closed() -> Result<()> {
+        let Some(h) = harness(None, true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        assert_not_found(send(&h, &get("/", HOST)).await?, false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plain_http_is_upgraded_to_https_on_a_verified_host() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), false).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        match send(&h, &get("/summary.json", HOST)).await? {
+            Outcome::Answered { head, .. } => {
+                assert!(head.starts_with("HTTP/1.1 301"), "{head}");
+                assert!(
+                    head.contains(&format!("https://{HOST}/summary.json")),
+                    "{head}"
+                );
+            }
+            Outcome::Forwarded { .. } => panic!("plain HTTP must be upgraded"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_tag_a_request_with_a_status_host() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        // A request for another host carrying a forged tag reaches normal
+        // routing without it.
+        let raw = format!(
+            "GET /api/status/{SLUG} HTTP/1.1\r\nHost: console.example.net\r\n{STATUS_HOST_HEADER}: {HOST}\r\n\r\n"
+        );
+        match send(&h, &raw).await? {
+            Outcome::Forwarded { status_host, .. } => assert_eq!(status_host, None),
+            Outcome::Answered { .. } => {}
+        }
+        // On the status host itself, a forged tag is replaced by the real one.
+        let raw = format!(
+            "GET / HTTP/1.1\r\nHost: {HOST}\r\n{STATUS_HOST_HEADER}: other.example.com\r\n\r\n"
+        );
+        match send(&h, &raw).await? {
+            Outcome::Forwarded { status_host, .. } => {
+                assert_eq!(status_host.as_deref(), Some(HOST))
+            }
+            Outcome::Answered { head, .. } => panic!("{head}"),
+        }
+        Ok(())
     }
 }

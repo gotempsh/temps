@@ -129,23 +129,8 @@ impl EnrollmentTokenService {
         &self,
         plaintext: &str,
     ) -> Result<node_enrollment_tokens::Model, EnrollmentError> {
+        let row = self.validate(plaintext).await?;
         let token_hash = Self::hash(plaintext);
-
-        let row = node_enrollment_tokens::Entity::find()
-            .filter(node_enrollment_tokens::Column::TokenHash.eq(&token_hash))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(EnrollmentError::InvalidToken)?;
-
-        if row.revoked_at.is_some() {
-            return Err(EnrollmentError::Revoked);
-        }
-        if row.expires_at < chrono::Utc::now() {
-            return Err(EnrollmentError::Expired);
-        }
-        if row.used_count >= row.max_uses {
-            return Err(EnrollmentError::Exhausted);
-        }
 
         // Atomic conditional consume — guards against concurrent over-use.
         let stmt = Statement::from_sql_and_values(
@@ -170,6 +155,47 @@ impl EnrollmentTokenService {
             .await?
             .unwrap_or(row);
         Ok(updated)
+    }
+
+    /// Validate without consuming a use so registration can check its pins and source first.
+    pub async fn validate(
+        &self,
+        plaintext: &str,
+    ) -> Result<node_enrollment_tokens::Model, EnrollmentError> {
+        let token_hash = Self::hash(plaintext);
+
+        let row = node_enrollment_tokens::Entity::find()
+            .filter(node_enrollment_tokens::Column::TokenHash.eq(&token_hash))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(EnrollmentError::InvalidToken)?;
+
+        if row.revoked_at.is_some() {
+            return Err(EnrollmentError::Revoked);
+        }
+        if row.expires_at < chrono::Utc::now() {
+            return Err(EnrollmentError::Expired);
+        }
+        if row.used_count >= row.max_uses {
+            return Err(EnrollmentError::Exhausted);
+        }
+
+        Ok(row)
+    }
+
+    /// Give back one use consumed by [`Self::validate_and_consume`] when the
+    /// registration it authorized was rolled back, so the node can retry with
+    /// the same token instead of needing a new one.
+    pub async fn release_use(&self, id: i32) -> Result<(), EnrollmentError> {
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE node_enrollment_tokens \
+             SET used_count = used_count - 1, updated_at = now() \
+             WHERE id = $1 AND used_count > 0",
+            [id.into()],
+        );
+        self.db.execute(stmt).await?;
+        Ok(())
     }
 
     /// List currently-valid (non-revoked, non-expired) tokens, newest first.

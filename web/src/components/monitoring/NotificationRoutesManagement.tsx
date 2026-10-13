@@ -12,18 +12,28 @@ import type { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { BellRing, Pencil, Plus, Trash2 } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
+import { withReturnTo } from '@/lib/safe-return-to'
 import { toast } from 'sonner'
 import {
   configuredSlackChannel,
   severityRangeLabel,
 } from './notificationRouteUtils'
+import { RouteTestButton } from './RouteTestButton'
 
-export function NotificationRoutesManagement() {
+interface NotificationRoutesManagementProps {
+  /** Forwarded to route and provider setup so they return to the task. */
+  returnTo?: string | null
+}
+
+export function NotificationRoutesManagement({
+  returnTo = null,
+}: NotificationRoutesManagementProps = {}) {
   const navigate = useNavigate()
   const {
     data: routePage,
@@ -56,17 +66,34 @@ export function NotificationRoutesManagement() {
     },
   })
 
+  const [routeToDelete, setRouteToDelete] = useState<{
+    id: number
+    name: string
+  } | null>(null)
+  const handleConfirmDelete = () => {
+    if (!routeToDelete) return
+    deleteMutation.mutate({ path: { id: routeToDelete.id } })
+    setRouteToDelete(null)
+  }
+
   const routes = routePage?.items || []
   const isLoading = routesLoading || providersLoading
-  const startCreate = () => navigate('/settings/notifications/routes/new')
+  const startCreate = () =>
+    navigate(withReturnTo('/settings/notifications/routes/new', returnTo))
   const startEdit = (routeId: number) =>
-    navigate(`/settings/notifications/routes/${routeId}`)
+    navigate(
+      withReturnTo(`/settings/notifications/routes/${routeId}`, returnTo)
+    )
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4">
         <div>
           <h2 className="text-base font-semibold">Routes</h2>
+          <p className="text-sm text-muted-foreground">
+            Routes apply to all projects: every alert whose severity is in a
+            route&apos;s range goes to that route&apos;s providers.
+          </p>
         </div>
         {providers && providers.length > 0 && routes.length > 0 && (
           <Button onClick={startCreate}>
@@ -82,7 +109,11 @@ export function NotificationRoutesManagement() {
           title="Add a destination first"
           description="Routes send alerts to providers. Add an email, Slack, webhook, or Cloudflare destination before creating a route."
           action={
-            <Button onClick={() => navigate('/settings/notifications/new')}>
+            <Button
+              onClick={() =>
+                navigate(withReturnTo('/settings/notifications/new', returnTo))
+              }
+            >
               Add Provider
             </Button>
           }
@@ -108,12 +139,18 @@ export function NotificationRoutesManagement() {
                         route.max_severity
                       )}
                     </Badge>
+                    <Badge variant="outline">All projects</Badge>
                     {!route.enabled && (
                       <Badge variant="outline">Disabled</Badge>
                     )}
                   </div>
                 </div>
                 <div className="flex gap-1">
+                  <RouteTestButton
+                    routeId={route.id}
+                    routeName={route.name}
+                    iconOnly
+                  />
                   <Button
                     variant="ghost"
                     size="icon"
@@ -128,7 +165,7 @@ export function NotificationRoutesManagement() {
                     aria-label={`Delete ${route.name}`}
                     disabled={deleteMutation.isPending}
                     onClick={() =>
-                      deleteMutation.mutate({ path: { id: route.id } })
+                      setRouteToDelete({ id: route.id, name: route.name })
                     }
                   >
                     <Trash2 className="h-4 w-4" />
@@ -162,6 +199,13 @@ export function NotificationRoutesManagement() {
           ))}
         </div>
       )}
+      <ConfirmDialog
+        open={routeToDelete !== null}
+        onOpenChange={(open) => !open && setRouteToDelete(null)}
+        title={`Delete ${routeToDelete?.name ?? 'notification route'}?`}
+        description="This permanently deletes the notification route. Alerts matching it will no longer be delivered through it. This cannot be undone."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

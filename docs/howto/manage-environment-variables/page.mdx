@@ -31,7 +31,9 @@ Environment variables let you pass configuration to your application without har
 5. Select which environments this variable applies to (e.g. production, staging, or all)
 6. Click **Save**
 
-The variable takes effect on the next deployment. Existing running containers are not updated — you need to redeploy for changes to take effect.
+The variable takes effect on the next deployment. Existing running containers are not updated — you need to redeploy for changes to take effect. When an environment the variable applies to is running a deployment, the confirmation after you add, edit, delete or import variables says **Applies on next deploy** and offers a **Redeploy** button that redeploys those environments from their current commit, image or bundle. Creating or deleting a secret shows the same prompt.
+
+**Environment Variables** in the project sidebar is the one place to edit variables. **Settings → Variables** links to it and holds the project's secrets and deployment tokens.
 
 <Note>
 **Sensitive values:** Environment variables are stored in the database. For secrets like API keys and database passwords, use Temps' managed services where possible — they handle credential generation and injection automatically. For other secrets, consider that anyone with dashboard access to your project can view these values.

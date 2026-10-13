@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Json, Redirect},
     routing::{get, post},
@@ -26,6 +26,8 @@ use crate::services::github::GithubAppServiceError;
 use octocrab::models::webhook_events::payload::InstallationRepositoriesWebhookEventAction;
 use octocrab::models::webhook_events::{EventInstallation, WebhookEvent, WebhookEventPayload};
 
+/// Browser-driven GitHub App callbacks. GitHub redirects the operator's own
+/// browser to these, so they stay on the session-bearing console surface.
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         // GITHUB-SPECIFIC endpoints under /git-providers/{provider_id}/github/*
@@ -35,13 +37,24 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/webhook/git/github/callback",
             get(github_app_installation_callback),
         ) // Installation callback
-        .route("/webhook/git/github/events", post(github_webhook_events))
         .route("/webhook/git/github/install", get(github_install_webhook))
-        .route("/webhook/source/github/events", post(github_webhook_events))
         .route(
             "/webhook/source/github/install",
             get(github_install_webhook),
         )
+}
+
+/// The server-to-server event receiver GitHub delivers webhooks to, on the
+/// current path and the legacy `/webhook/source` one. Authenticated by
+/// `X-Hub-Signature-256` against the App's webhook secret before any event is
+/// processed, so it needs no session and is mounted on the public router.
+pub fn configure_public_routes() -> Router<Arc<AppState>> {
+    let events = || {
+        post(github_webhook_events).layer(DefaultBodyLimit::max(super::PROVIDER_EVENT_BODY_LIMIT))
+    };
+    Router::new()
+        .route("/webhook/git/github/events", events())
+        .route("/webhook/source/github/events", events())
 }
 
 // ===== Webhook Handlers =====

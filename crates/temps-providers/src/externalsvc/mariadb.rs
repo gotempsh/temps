@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
-use bollard::{body_full, Docker};
+use bollard::Docker;
 use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,6 @@ fn extra_restore_image_repositories() -> &'static [String] {
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const MARIADB_BINLOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_BINLOG_REPLAY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_RESTORE_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_BINLOG_POSITION: u64 = u32::MAX as u64;
@@ -625,7 +624,7 @@ impl MariaDbService {
     }
 
     fn get_container_name(&self) -> String {
-        format!("mariadb-{}", self.name)
+        mariadb_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -928,14 +927,19 @@ impl MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
             .await?;
 
         if let Some(existing) = containers.first() {
-            let existing_image = existing.image.as_deref().unwrap_or("");
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| existing.image.clone())
+                .unwrap_or_default();
             if existing_image == config.docker_image {
                 info!(
                     "Container {} already exists with same image",
@@ -948,24 +952,46 @@ impl MariaDbService {
                 "Container {} already exists with different image (current: {}, requested: {}), recreating it",
                 container_name, existing_image, config.docker_image
             );
-            let _ = docker
-                .stop_container(&container_name, None::<StopContainerOptions>)
-                .await;
-            docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        v: false,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to remove existing MariaDB container: {}", e)
-                })?;
+            super::recreate_guard::recreate_preserving_data(
+                super::recreate_guard::RecreateRequest {
+                    docker,
+                    engine: super::recreate_guard::ManagedEngine::MariaDb,
+                    service_name: &self.name,
+                    container_name: &container_name,
+                    replacement: self.replacement_storage(),
+                    operation: "changing its image",
+                },
+                || self.create_fresh_container(docker, config, resource_limits),
+            )
+            .await?;
+            return Ok(());
         }
 
+        self.create_fresh_container(docker, config, resource_limits)
+            .await
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/var/lib/mysql".to_string(),
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: format!("mariadb_data_{}", self.name),
+                target: "/var/lib/mysql".to_string(),
+            }],
+        }
+    }
+
+    /// Create, start and wait for a new container. The caller has made sure
+    /// no container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &MariaDbConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
         self.warn_if_host_capacity_tight(docker, config, resource_limits)
             .await;
 
@@ -2319,24 +2345,17 @@ impl MariaDbService {
         let container_name = self.get_live_container_name(config);
         let restore_filename = "temps_mariadb_restore.sql";
 
-        let tar_data = {
-            let mut archive = tar::Builder::new(Vec::new());
-            archive.append_path_with_name(sql_path, restore_filename)?;
-            archive.finish()?;
-            archive.into_inner()?
-        };
-
-        self.docker
-            .upload_to_container(
-                &container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/tmp".to_string(),
-                    ..Default::default()
-                }),
-                body_full(bytes::Bytes::from(tar_data)),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
+        // Streamed, so memory does not grow with the dump's size.
+        super::container_upload::upload_file_to_container(
+            &self.docker,
+            &container_name,
+            sql_path,
+            "/tmp",
+            restore_filename,
+            0o644,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
 
         let restore_path = format!("/tmp/{}", restore_filename);
         let restore_cmd = format!(
@@ -2735,6 +2754,9 @@ impl MariaDbService {
                     image: Some(image),
                     cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
                     env: Some(env),
+                    labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                        &container_name,
+                    )),
                     host_config: Some(HostConfig {
                         volumes_from: Some(vec![container_name.clone()]),
                         ..Default::default()
@@ -2988,6 +3010,9 @@ impl MariaDbService {
                 volumes_from: Some(vec![container_name.to_string()]),
                 ..Default::default()
             }),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                container_name,
+            )),
             ..Default::default()
         };
 
@@ -3013,7 +3038,6 @@ impl MariaDbService {
                 mbstream_host_path,
                 "/var/tmp",
                 "restore.mbstream",
-                MARIADB_BACKUP_EXEC_TIMEOUT,
             )
             .await;
         if let Err(e) = upload_result {
@@ -3102,44 +3126,18 @@ impl MariaDbService {
         host_path: &std::path::Path,
         dest_dir: &str,
         dest_name: &str,
-        timeout: Duration,
     ) -> Result<()> {
-        let tar_data = {
-            let mut archive = tar::Builder::new(Vec::new());
-            archive
-                .append_path_with_name(host_path, dest_name)
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to tar {} for upload: {}", host_path.display(), e)
-                })?;
-            archive.finish()?;
-            archive
-                .into_inner()
-                .map_err(|e| anyhow::anyhow!("Failed to finalize upload tar: {}", e))?
-        };
-
-        tokio::time::timeout(timeout, async {
-            self.docker
-                .upload_to_container(
-                    container_id,
-                    Some(bollard::query_parameters::UploadToContainerOptions {
-                        path: dest_dir.to_string(),
-                        ..Default::default()
-                    }),
-                    body_full(bytes::Bytes::from(tar_data)),
-                )
-                .await
-        })
+        // Streamed from disk, so memory does not grow with the backup's size.
+        super::container_upload::upload_file_to_container(
+            &self.docker,
+            container_id,
+            host_path,
+            dest_dir,
+            dest_name,
+            0o644,
+        )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Timed out uploading {} to container {} after {}s",
-                dest_name,
-                container_id,
-                timeout.as_secs()
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e))?;
-        Ok(())
+        .map_err(|e| anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e))
     }
 
     /// Best-effort collection of a container's combined stdout/stderr logs,
@@ -3381,14 +3379,8 @@ impl MariaDbService {
                 file = %file,
                 "Uploading MariaDB PITR binlog segment to restored container"
             );
-            self.upload_file_to_container(
-                &container_name,
-                host_path,
-                container_dir,
-                file,
-                MARIADB_BINLOG_UPLOAD_TIMEOUT,
-            )
-            .await?;
+            self.upload_file_to_container(&container_name, host_path, container_dir, file)
+                .await?;
             container_files.push(format!("{}/{}", container_dir, file));
         }
         info!(
@@ -3766,8 +3758,43 @@ impl MariaDbService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn mariadb_container_name(name: &str) -> String {
+    format!("mariadb-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn mariadb_volume_names(name: &str) -> [String; 1] {
+    [format!("mariadb_data_{}", name)]
+}
+
 #[async_trait]
 impl ExternalService for MariaDbService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::MariaDb,
+            self.replacement_storage(),
+        ))
+    }
+
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![mariadb_container_name(&self.name)],
+            volumes: mariadb_volume_names(&self.name).to_vec(),
+        })
+    }
+
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!(
             "Initializing MariaDB service (name={}, type={:?}, version={:?})",
@@ -3908,7 +3935,7 @@ impl ExternalService for MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3963,7 +3990,7 @@ impl ExternalService for MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3983,7 +4010,7 @@ impl ExternalService for MariaDbService {
         self.cleanup().await?;
 
         let container_name = self.get_container_name();
-        let volume_name = format!("mariadb_data_{}", self.name);
+        let [volume_name] = mariadb_volume_names(&self.name);
 
         let containers = self
             .docker
@@ -3991,7 +4018,7 @@ impl ExternalService for MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -4743,6 +4770,9 @@ impl ExternalService for MariaDbService {
         })
     }
 }
+
+/// Importing data from an external MariaDB/MySQL server (see `crate::data_import`).
+mod data_import;
 
 #[cfg(test)]
 mod tests {

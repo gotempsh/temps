@@ -60,6 +60,19 @@ pub enum ChatError {
     Ai(String),
     #[error("retained AI harness diagnostic for '{purpose}': {reason}")]
     RetainedHarnessDiagnostic { purpose: String, reason: String },
+    /// The provider's reply stream ended before the provider finished it.
+    /// `partial_bytes` is how much text had already been received and kept.
+    #[error(
+        "AI turn '{turn_id}' of conversation {conversation_id} was interrupted: the provider \
+         stream ended before the reply was complete ({partial_bytes} bytes of partial text \
+         kept): {cause}"
+    )]
+    StreamInterrupted {
+        conversation_id: i64,
+        turn_id: String,
+        partial_bytes: usize,
+        cause: String,
+    },
     #[error(transparent)]
     AuthorizationRefresh(#[from] ToolAuthorizationRefreshError),
     #[error("the assistant claimed a proposal was staged without a write-tool receipt")]
@@ -148,6 +161,18 @@ impl ChatError {
                 }
                 failure
             }
+            // The raw cause may carry a provider URL or transport detail, so
+            // it stays in the server log; the browser gets the category.
+            Self::StreamInterrupted { partial_bytes, .. } => PublicChatFailure {
+                code: "provider_stream_interrupted",
+                title: "AI response was interrupted",
+                detail: if *partial_bytes == 0 {
+                    "The AI provider stopped sending the reply before it finished (the connection closed or timed out) and nothing was received. Retry the message.".to_string()
+                } else {
+                    "The AI provider stopped sending the reply before it finished (the connection closed or timed out). The text received so far is kept and marked incomplete. Retry the message to get a full answer.".to_string()
+                },
+                retryable: true,
+            },
             Self::AiUnavailable => PublicChatFailure {
                 code: "ai_not_configured",
                 title: "AI harness unavailable",

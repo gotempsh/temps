@@ -432,7 +432,7 @@ async fn dispatch_request(
         PlatformCallRequest::GenerateAi(_) => Some(PluginHostPermission::AiGenerate),
         PlatformCallRequest::GetHostCapabilities(_) => None,
     };
-    let allowed = required_permission.is_none_or(&effective);
+    let allowed = required_permission.is_none_or(effective);
     let Some(auditor) = audit_service.read().await.clone() else {
         return ChannelResponse::err(
             req.id,
@@ -674,7 +674,7 @@ async fn handle_api_call(
         return Err(ChannelError::new(
             ChannelErrorCode::PermissionDenied,
             format!(
-                "Plugin '{plugin_name}' called {} {} but does not declare the '{}' capability;                  add it to the plugin manifest",
+                "Plugin '{plugin_name}' called {} {} but does not declare the '{}' capability; add it to the plugin manifest",
                 call.method.as_str(),
                 call.path,
                 required.as_str()

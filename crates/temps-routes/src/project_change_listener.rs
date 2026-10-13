@@ -13,7 +13,8 @@
 use crate::route_table::CachedPeerTable;
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use temps_core::log_transitions::{FailureLatch, FailureLog};
+use tracing::{debug, error, info, warn};
 
 /// How long to wait for a route-change notification before reconciling the
 /// route table anyway.
@@ -26,6 +27,84 @@ use tracing::{debug, error, info};
 /// control plane, which is well below what an active install already does —
 /// every deployment triggers a reload through this same path.
 const IDLE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Failure state of the listener task's recurring operations.
+///
+/// The task reconciles the route table every [`IDLE_RECONCILE_INTERVAL`], and
+/// retries the `LISTEN` connection every few seconds while PostgreSQL is
+/// unreachable. Logging each failed attempt at ERROR turned one outage into a
+/// stream of identical lines; these latches log when a failure starts (plus
+/// an hourly reminder) and when it recovers.
+#[derive(Default)]
+struct ListenerHealth {
+    /// The `LISTEN` connection (receive + reconnect).
+    connection: FailureLatch,
+    /// Reloading the route table from the database.
+    reload: FailureLatch,
+    /// Publishing `RouteTableUpdated` on the job queue.
+    publish: FailureLatch,
+}
+
+/// Reload the route table and announce it on the queue, logging failures on
+/// state transitions only. Returns whether the reload succeeded.
+async fn reload_and_publish(
+    peer_table: &CachedPeerTable,
+    queue: &Arc<dyn temps_core::JobQueue>,
+    health: &ListenerHealth,
+    environment_id: Option<i32>,
+    deployment_id: Option<i32>,
+) -> bool {
+    if let Err(e) = peer_table.load_routes().await {
+        match health.reload.record_failure() {
+            FailureLog::Started => error!("Failed to reload project routes: {}", e),
+            FailureLog::Reminder { consecutive } => error!(
+                consecutive_failures = consecutive,
+                "Still failing to reload project routes: {}", e
+            ),
+            FailureLog::Suppressed { consecutive } => debug!(
+                consecutive_failures = consecutive,
+                "Failed to reload project routes: {}", e
+            ),
+        }
+        return false;
+    }
+    if let Some(failures) = health.reload.record_success() {
+        info!(
+            previous_failures = failures,
+            "Project route reload recovered"
+        );
+    }
+
+    let route_count = peer_table.len();
+    debug!("Project route table synchronized ({} entries)", route_count);
+    let event = temps_core::Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
+        environment_id,
+        deployment_id,
+        route_count,
+    });
+    match queue.send(event).await {
+        Ok(()) => {
+            if let Some(failures) = health.publish.record_success() {
+                info!(
+                    previous_failures = failures,
+                    "Publishing RouteTableUpdated events recovered"
+                );
+            }
+        }
+        Err(e) => match health.publish.record_failure() {
+            FailureLog::Started => error!("Failed to send RouteTableUpdated event: {}", e),
+            FailureLog::Reminder { consecutive } => error!(
+                consecutive_failures = consecutive,
+                "Still failing to send RouteTableUpdated events: {}", e
+            ),
+            FailureLog::Suppressed { consecutive } => debug!(
+                consecutive_failures = consecutive,
+                "Failed to send RouteTableUpdated event: {}", e
+            ),
+        },
+    }
+    true
+}
 
 /// Listens for project route changes and updates the route cache
 pub struct ProjectChangeListener {
@@ -66,6 +145,7 @@ impl ProjectChangeListener {
         let queue = self.queue.clone();
 
         let handle = tokio::spawn(async move {
+            let health = ListenerHealth::default();
             // Event-driven loop with a bounded wait. Reacting to PG NOTIFY
             // alone is not sufficient: a `LISTEN` connection dropped by a NAT,
             // firewall, or load balancer idle-timeout leaves `recv()` parked on
@@ -83,7 +163,13 @@ impl ProjectChangeListener {
                     Ok(Ok(n)) => {
                         // handle_project_change_static parses the payload,
                         // calls load_routes, and broadcasts the event.
-                        Self::handle_project_change_static(&peer_table, &queue, n.payload()).await;
+                        Self::handle_project_change_static(
+                            &peer_table,
+                            &queue,
+                            &health,
+                            n.payload(),
+                        )
+                        .await;
                         continue;
                     }
                     Err(_elapsed) => {
@@ -100,22 +186,60 @@ impl ProjectChangeListener {
                         );
                     }
                     Ok(Err(e)) => {
-                        error!("Error receiving project change notification: {}", e);
+                        // A dropped LISTEN connection (PostgreSQL restart,
+                        // idle-connection reaper, network blip) is recovered
+                        // right below, so the first drop is a WARN. Failing to
+                        // reconnect means the database itself is unreachable:
+                        // that is reported at ERROR, once per outage plus an
+                        // hourly reminder, not once per 5-second retry.
+                        let outcome = health.connection.record_failure();
+                        match outcome {
+                            FailureLog::Started => warn!(
+                                "Lost project_route_change listener connection: {}; reconnecting",
+                                e
+                            ),
+                            FailureLog::Reminder { consecutive } => error!(
+                                consecutive_failures = consecutive,
+                                "project_route_change listener is still disconnected: {}", e
+                            ),
+                            FailureLog::Suppressed { consecutive } => debug!(
+                                consecutive_failures = consecutive,
+                                "Error receiving project change notification: {}", e
+                            ),
+                        }
 
                         // Attempt to reconnect after error
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-                        match PgListener::connect_with(&pool).await {
+                        let reconnect = match PgListener::connect_with(&pool).await {
                             Ok(mut new_listener) => {
-                                if let Err(e) = new_listener.listen("project_route_change").await {
-                                    error!("Failed to re-subscribe to project_route_change: {}", e);
-                                } else {
-                                    pg_listener = new_listener;
-                                    info!("Reconnected to project_route_change listener");
+                                match new_listener.listen("project_route_change").await {
+                                    Ok(()) => {
+                                        pg_listener = new_listener;
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(format!(
+                                        "failed to re-subscribe to project_route_change: {e}"
+                                    )),
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to reconnect project_route_change listener: {}", e);
+                            Err(e) => Err(format!(
+                                "failed to reconnect project_route_change listener: {e}"
+                            )),
+                        };
+                        match reconnect {
+                            Ok(()) => {
+                                let failures = health.connection.record_success().unwrap_or(0);
+                                info!(
+                                    failed_attempts = failures,
+                                    "Reconnected to project_route_change listener"
+                                );
+                            }
+                            Err(reason) if matches!(outcome, FailureLog::Suppressed { .. }) => {
+                                debug!("{}", reason);
+                            }
+                            Err(reason) => {
+                                error!("{}; will keep retrying", reason);
                             }
                         }
                         // Fall through to reload once after reconnect.
@@ -124,22 +248,7 @@ impl ProjectChangeListener {
 
                 // Safety reload: reached after a listener error/reconnect, or
                 // after an idle window elapsed without a notification.
-                if let Err(e) = peer_table.load_routes().await {
-                    error!("Failed to reload routes during listener reconcile: {}", e);
-                } else {
-                    let route_count = peer_table.len();
-                    debug!("Project route table synchronized ({} entries)", route_count);
-
-                    let event =
-                        temps_core::Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
-                            environment_id: None,
-                            deployment_id: None,
-                            route_count,
-                        });
-                    if let Err(e) = queue.send(event).await {
-                        error!("Failed to send RouteTableUpdated event: {}", e);
-                    }
-                }
+                reload_and_publish(&peer_table, &queue, &health, None, None).await;
             }
         });
 
@@ -164,6 +273,7 @@ impl ProjectChangeListener {
     async fn handle_project_change_static(
         peer_table: &CachedPeerTable,
         queue: &Arc<dyn temps_core::JobQueue>,
+        health: &ListenerHealth,
         payload: &str,
     ) {
         // Try to parse as RouteChangePayload which handles both project and environment changes
@@ -200,21 +310,7 @@ impl ProjectChangeListener {
                 // With concurrent deployments, the deployment_id may not match what
                 // the route table actually resolved to. Consumers (e.g. mark_complete)
                 // should verify the actual DB state rather than trusting this field.
-                if let Err(e) = peer_table.load_routes().await {
-                    error!("Failed to reload routes after change: {}", e);
-                } else {
-                    let route_count = peer_table.len();
-
-                    let event =
-                        temps_core::Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
-                            environment_id,
-                            deployment_id,
-                            route_count,
-                        });
-                    if let Err(e) = queue.send(event).await {
-                        error!("Failed to send RouteTableUpdated event: {}", e);
-                    }
-                }
+                reload_and_publish(peer_table, queue, health, environment_id, deployment_id).await;
             }
             Err(e) => {
                 error!(
@@ -404,6 +500,67 @@ mod tests {
              reload the route table constantly, got {:?}",
             IDLE_RECONCILE_INTERVAL
         );
+    }
+
+    /// A queue whose sends always fail, counting attempts.
+    struct FailingQueue(std::sync::atomic::AtomicUsize);
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::JobQueue for FailingQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(temps_core::QueueError::SendError("no receivers".into()))
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("not needed in tests")
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_failures_are_tracked_as_one_ongoing_outage() {
+        // Model failed database queries rather than a connection with no
+        // backend, whose query builder panics before returning a DB error.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors(
+                    (0..5).map(|_| sea_orm::DbErr::Custom("database unavailable".into())),
+                )
+                .into_connection(),
+        );
+        let peer_table = CachedPeerTable::new(db);
+        let health = ListenerHealth::default();
+        let queue = test_queue();
+
+        for _ in 0..5 {
+            assert!(!reload_and_publish(&peer_table, &queue, &health, None, None).await);
+        }
+        assert!(health.reload.is_failing());
+        assert_eq!(
+            health.reload.record_failure(),
+            FailureLog::Suppressed { consecutive: 6 },
+            "every reload after the first stays below the logged level"
+        );
+        // Nothing is published while routes cannot be loaded.
+        assert!(!health.publish.is_failing());
+    }
+
+    #[tokio::test]
+    async fn handle_change_with_unparsable_payload_does_not_reload() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = CachedPeerTable::new(db);
+        let health = ListenerHealth::default();
+        let queue: Arc<dyn temps_core::JobQueue> =
+            Arc::new(FailingQueue(std::sync::atomic::AtomicUsize::new(0)));
+
+        ProjectChangeListener::handle_project_change_static(
+            &peer_table,
+            &queue,
+            &health,
+            "not json",
+        )
+        .await;
+        assert!(!health.reload.is_failing());
+        assert!(!health.publish.is_failing());
     }
 
     #[test]

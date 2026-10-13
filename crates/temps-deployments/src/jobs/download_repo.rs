@@ -5,11 +5,13 @@
 //!
 //! Downloads repository source code using git provider manager
 
+use crate::services::deployment_commit::{is_unresolved_commit, record_checked_out_commit};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_database::DbConnection;
 use temps_git::GitProviderManagerTrait;
 use temps_logs::{LogLevel, LogService};
 
@@ -168,6 +170,8 @@ pub struct DownloadRepoJob {
     git_provider_manager: Arc<dyn GitProviderManagerTrait>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    /// Records the checked-out commit on a deployment queued without one.
+    db: Option<Arc<DbConnection>>,
 }
 
 // Manual Debug implementation since trait objects don't auto-derive Debug
@@ -216,6 +220,7 @@ impl DownloadRepoJob {
             git_provider_manager,
             log_id: None,
             log_service: None,
+            db: None,
         }
     }
 
@@ -242,6 +247,7 @@ impl DownloadRepoJob {
             git_provider_manager,
             log_id: None,
             log_service: None,
+            db: None,
         }
     }
 
@@ -292,6 +298,82 @@ impl DownloadRepoJob {
         self
     }
 
+    pub fn with_db(mut self, db: Arc<DbConnection>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Read the commit the checkout landed on, publish it as the
+    /// `commit_sha` output, and record it on the deployment when the
+    /// deployment was queued without a concrete commit.
+    ///
+    /// Archive downloads carry no `.git`, so there is nothing to read; that
+    /// and every other failure here is reported but never fails the
+    /// deployment, which already has its source.
+    async fn resolve_checked_out_commit(
+        &self,
+        context: &mut WorkflowContext,
+        repo_dir: &std::path::Path,
+    ) -> Result<(), WorkflowError> {
+        let dir = repo_dir.to_path_buf();
+        let head = tokio::task::spawn_blocking(move || {
+            temps_git::services::git_ops::read_head_commit(&dir)
+        })
+        .await
+        .map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Task reading the checked-out commit in {} panicked: {}",
+                repo_dir.display(),
+                e
+            ))
+        })?;
+
+        let commit = match head {
+            Ok(Some(commit)) => commit,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    "Could not read the checked-out commit: {}",
+                    e
+                );
+                self.log(
+                    context,
+                    format!("⚠️ Could not determine the checked-out commit: {}", e),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        self.log(context, format!("Checked out commit {}", commit.sha))
+            .await?;
+        context.set_output(&self.job_id, "commit_sha", &commit.sha)?;
+
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+        match record_checked_out_commit(db, context.deployment_id, &commit).await {
+            Ok(true) => {
+                tracing::info!(
+                    deployment_id = context.deployment_id,
+                    commit_sha = %commit.sha,
+                    "Recorded checked-out commit on deployment queued without one"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    commit_sha = %commit.sha,
+                    "Failed to record checked-out commit on deployment: {}",
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Write log message to both job-specific log file and context log writer
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         // Detect log level from message content/emojis
@@ -339,7 +421,11 @@ impl DownloadRepoJob {
         }
 
         if let Some(ref tag) = self.tag_ref {
-            return tag.clone();
+            return if tag.starts_with("refs/tags/") {
+                tag.clone()
+            } else {
+                format!("refs/tags/{tag}")
+            };
         }
 
         if let Some(ref branch) = self.branch_ref {
@@ -652,6 +738,40 @@ impl DownloadRepoJob {
             return Ok(repo_dir);
         }
 
+        // A provider archive has no .git metadata. When a deployment was
+        // queued without a concrete commit, clone the requested ref instead so
+        // we can record the exact revision that supplied the build sources.
+        if is_unresolved_commit(self.commit_sha.as_deref()) {
+            self.log(
+                context,
+                "Cloning to resolve the deployment commit".to_string(),
+            )
+            .await?;
+            std::fs::remove_dir_all(&repo_dir).map_err(WorkflowError::IoError)?;
+            self.git_provider_manager
+                .clone_repository(
+                    connection_id,
+                    &self.repo_owner,
+                    &self.repo_name,
+                    &repo_dir,
+                    Some(&checkout_ref),
+                )
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to clone repository at {}: {}",
+                        checkout_ref, e
+                    ))
+                })?;
+            if !repo_dir.exists() || std::fs::read_dir(&repo_dir)?.next().is_none() {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Repository directory is empty after resolving its commit".to_string(),
+                ));
+            }
+            temp_dir_guard.disarm();
+            return Ok(repo_dir);
+        }
+
         // Try download archive first (faster). Wire a progress channel so the
         // download — which can take minutes on a slow link for a large repo —
         // shows steady movement in the deployment log instead of appearing stuck.
@@ -834,6 +954,28 @@ impl WorkflowTask for DownloadRepoJob {
             }
         };
 
+        // A configured root directory the checkout does not contain would
+        // otherwise surface only in the build, as a bare "No such file or
+        // directory". Say here what is missing and what the checkout holds.
+        if let Some(directory) = self.project_directory.as_deref() {
+            if let Err(reason) = verify_project_directory(&repo_dir, directory) {
+                // No later job receives this checkout; remove it now.
+                let _checkout = repo_dir.parent().map(|temp_dir| {
+                    TempDirGuard::new(temp_dir.to_path_buf(), keep_deployment_temp_files())
+                });
+                let message = format!(
+                    "Invalid configuration: the project's root directory {reason}. Checked {}/{} \
+                     at {}. Change the root directory in the project's Git settings, or deploy a \
+                     ref that contains it.",
+                    self.repo_owner,
+                    self.repo_name,
+                    self.get_checkout_ref(&context)
+                );
+                self.log(&context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobValidationFailed(message));
+            }
+        }
+
         // Set job outputs
         context.set_output(
             &self.job_id,
@@ -847,6 +989,8 @@ impl WorkflowTask for DownloadRepoJob {
         )?;
         context.set_output(&self.job_id, "repo_owner", &self.repo_owner)?;
         context.set_output(&self.job_id, "repo_name", &self.repo_name)?;
+        self.resolve_checked_out_commit(&mut context, &repo_dir)
+            .await?;
 
         // Set artifacts
         context.set_artifact(&self.job_id, "source_code", repo_dir.clone());
@@ -925,6 +1069,240 @@ impl WorkflowTask for DownloadRepoJob {
     }
 }
 
+/// Upper bound on the directory names listed when a configured root
+/// directory is not in the checkout, and on the `.gitmodules` read for it.
+const MAX_LISTED_DIRECTORIES: usize = 20;
+const MAX_GITMODULES_BYTES: u64 = 1024 * 1024;
+
+/// Confirm the project's configured root directory is a directory inside the
+/// checkout. `Err` completes the sentence "the project's root directory ..."
+/// with what is wrong and, for a missing path, what the checkout contains.
+fn verify_project_directory(repo_dir: &std::path::Path, directory: &str) -> Result<(), String> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .trim_start_matches("./")
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(());
+    }
+    let relative = std::path::Path::new(&normalized);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "'{directory}' is not a relative path inside the repository"
+        ));
+    }
+    let path = repo_dir.join(relative);
+
+    // A submodule is a separate repository: a clone leaves its directory
+    // empty and a provider archive leaves none at all.
+    if let Some(submodule) = enclosing_submodule(repo_dir, &normalized) {
+        let empty = std::fs::read_dir(&path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true);
+        if empty {
+            return Err(format!(
+                "'{normalized}' is inside Git submodule '{submodule}', a separate repository \
+                 whose files are not fetched with this one. Deploy the submodule's own \
+                 repository instead, or commit its files into this one"
+            ));
+        }
+    }
+
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let escapes = match (repo_dir.canonicalize(), path.canonicalize()) {
+                (Ok(root), Ok(target)) => !target.starts_with(root),
+                _ => true,
+            };
+            if escapes {
+                Err(format!(
+                    "'{normalized}' is a symbolic link that leads outside the repository"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(_) => Err(format!("'{normalized}' is a file, not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(missing_directory_reason(repo_dir, &normalized))
+        }
+        Err(error) => Err(format!("'{normalized}' cannot be read: {error}")),
+    }
+}
+
+/// The deepest existing part of `normalized`, the component missing below
+/// it, a case-insensitive near miss, and the directories that do exist there.
+fn missing_directory_reason(repo_dir: &std::path::Path, normalized: &str) -> String {
+    let mut current = repo_dir.to_path_buf();
+    let mut found: Vec<&str> = Vec::new();
+    // Directory names are listed into the deployment log, so never follow a
+    // link out of the checkout: a repository could otherwise point one at
+    // the host's filesystem and read its layout back.
+    let root = repo_dir.canonicalize().ok();
+    for component in normalized.split('/').filter(|part| !part.is_empty()) {
+        let candidate = current.join(component);
+        let leaves_checkout = std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            && match (&root, candidate.canonicalize()) {
+                (Some(root), Ok(target)) => !target.starts_with(root),
+                // A dangling link is reported below without being followed.
+                (_, Err(_)) => false,
+                (None, Ok(_)) => true,
+            };
+        if leaves_checkout {
+            found.push(component);
+            return format!(
+                "'{normalized}' is not in the checked-out source: '{}' is a symbolic link that \
+                 leads outside the repository",
+                found.join("/")
+            );
+        }
+        let is_directory = std::fs::metadata(&candidate)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        if is_directory {
+            found.push(component);
+            current = candidate;
+            continue;
+        }
+        if std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            found.push(component);
+            return format!(
+                "'{normalized}' is not a directory in the checked-out source: '{}' is a \
+                 symbolic link to a missing target",
+                found.join("/")
+            );
+        }
+        let listing = list_directories(&current, component);
+        let parent = if found.is_empty() {
+            "the repository root".to_string()
+        } else {
+            format!("'{}'", found.join("/"))
+        };
+        let mut reason = format!(
+            "'{normalized}' is not in the checked-out source: {parent} has no '{component}'"
+        );
+        if let Some(near) = &listing.near_miss {
+            let mut suggestion = found.clone();
+            suggestion.push(near.as_str());
+            reason.push_str(&format!(" (did you mean '{}'?)", suggestion.join("/")));
+        }
+        if listing.first.is_empty() {
+            reason.push_str(" and contains no directories");
+        } else {
+            let names: Vec<&str> = listing.first.iter().map(String::as_str).collect();
+            reason.push_str(&format!("; it contains {}", names.join(", ")));
+            if listing.truncated {
+                reason.push_str(&format!(
+                    " and {}{} more",
+                    if listing.scan_stopped {
+                        "at least "
+                    } else {
+                        ""
+                    },
+                    listing.total - listing.first.len()
+                ));
+            }
+        }
+        return reason;
+    }
+    // Every component exists, so the final one is not a directory (for
+    // example a dangling symbolic link).
+    format!("'{normalized}' is not a directory in the checked-out source")
+}
+
+/// Entries examined at most when listing one directory of a checkout.
+const MAX_SCANNED_ENTRIES: usize = 10_000;
+
+/// The directories in one checkout directory, for an explanation.
+struct DirectoryListing {
+    /// The alphabetically first [`MAX_LISTED_DIRECTORIES`] names.
+    first: std::collections::BTreeSet<String>,
+    /// Directories seen in total (a lower bound when `scan_stopped`).
+    total: usize,
+    truncated: bool,
+    /// More than [`MAX_SCANNED_ENTRIES`] entries: the rest were not read.
+    scan_stopped: bool,
+    /// A directory whose name differs from `wanted` only in case.
+    near_miss: Option<String>,
+}
+
+/// List `directory` in constant memory and bounded time: a checkout may hold
+/// any number of entries, and only a few names are ever shown.
+fn list_directories(directory: &std::path::Path, wanted: &str) -> DirectoryListing {
+    let mut listing = DirectoryListing {
+        first: std::collections::BTreeSet::new(),
+        total: 0,
+        truncated: false,
+        scan_stopped: false,
+        near_miss: None,
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return listing;
+    };
+    for (scanned, entry) in entries.filter_map(Result::ok).enumerate() {
+        if scanned >= MAX_SCANNED_ENTRIES {
+            listing.scan_stopped = true;
+            listing.truncated = true;
+            break;
+        }
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name == ".git" {
+            continue;
+        }
+        listing.total += 1;
+        if listing.near_miss.is_none() && name.eq_ignore_ascii_case(wanted) {
+            listing.near_miss = Some(name.clone());
+        }
+        listing.first.insert(name);
+        if listing.first.len() > MAX_LISTED_DIRECTORIES {
+            listing.first.pop_last();
+            listing.truncated = true;
+        }
+    }
+    listing
+}
+
+/// The `.gitmodules` path containing (or equal to) `normalized`, if any.
+fn enclosing_submodule(repo_dir: &std::path::Path, normalized: &str) -> Option<String> {
+    use std::io::Read;
+    let path = repo_dir.join(".gitmodules");
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_GITMODULES_BYTES {
+        return None;
+    }
+    let mut contents = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(MAX_GITMODULES_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "path" {
+            return None;
+        }
+        let submodule = value.trim().trim_matches('"').trim_matches('/');
+        let inside = normalized == submodule
+            || normalized
+                .strip_prefix(submodule)
+                .is_some_and(|rest| rest.starts_with('/'));
+        (!submodule.is_empty() && inside).then(|| submodule.to_string())
+    })
+}
+
 /// Builder for DownloadRepoJob
 pub struct DownloadRepoBuilder {
     job_id: Option<String>,
@@ -940,6 +1318,7 @@ pub struct DownloadRepoBuilder {
     pull_only_root_directory: bool,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    db: Option<Arc<DbConnection>>,
 }
 
 impl DownloadRepoBuilder {
@@ -958,6 +1337,7 @@ impl DownloadRepoBuilder {
             pull_only_root_directory: false,
             log_id: None,
             log_service: None,
+            db: None,
         }
     }
 
@@ -1026,6 +1406,11 @@ impl DownloadRepoBuilder {
         self
     }
 
+    pub fn db(mut self, db: Arc<DbConnection>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
     pub fn build(
         self,
         git_provider_manager: Arc<dyn GitProviderManagerTrait>,
@@ -1089,6 +1474,9 @@ impl DownloadRepoBuilder {
         }
         if let Some(log_service) = self.log_service {
             job = job.with_log_service(log_service);
+        }
+        if let Some(db) = self.db {
+            job = job.with_db(db);
         }
 
         Ok(job)
@@ -1556,5 +1944,512 @@ mod tests {
         for entry in kept {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+
+    use temps_entities::deployments;
+    use temps_git::services::git_ops::HeadCommit;
+
+    fn deployment_model(
+        id: i32,
+        commit_sha: Option<&str>,
+        commit_message: Option<&str>,
+    ) -> deployments::Model {
+        let now = chrono::Utc::now();
+        deployments::Model {
+            id,
+            project_id: 1,
+            environment_id: 1,
+            slug: format!("app-{id}"),
+            state: "running".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: Some("main".to_string()),
+            tag_ref: None,
+            commit_sha: commit_sha.map(str::to_string),
+            commit_message: commit_message.map(str::to_string),
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    const CHECKED_OUT_SHA: &str = "7f05d217867b2af52b0a28c6d1c91df97e1b5b39";
+
+    fn checked_out_commit() -> HeadCommit {
+        HeadCommit {
+            sha: CHECKED_OUT_SHA.to_string(),
+            message: Some("Add health endpoint".to_string()),
+            author: Some("Example Author".to_string()),
+        }
+    }
+
+    fn statements(db: sea_orm::DatabaseConnection) -> Vec<String> {
+        db.into_transaction_log()
+            .into_iter()
+            .map(|transaction| format!("{transaction:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn only_missing_or_symbolic_commits_are_unresolved() {
+        assert!(is_unresolved_commit(None));
+        assert!(is_unresolved_commit(Some("")));
+        assert!(is_unresolved_commit(Some("HEAD")));
+        assert!(is_unresolved_commit(Some(" head ")));
+        assert!(!is_unresolved_commit(Some(CHECKED_OUT_SHA)));
+        assert!(!is_unresolved_commit(Some("7f05d21")));
+    }
+
+    #[tokio::test]
+    async fn records_the_checked_out_commit_on_a_deployment_without_one() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let mut updated = deployment_model(42, Some(CHECKED_OUT_SHA), Some("Add health endpoint"));
+        updated.commit_author = Some("Example Author".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![deployment_model(42, None, None)]])
+            .append_query_results([vec![updated]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 42, &checked_out_commit())
+            .await
+            .expect("record commit");
+
+        assert!(recorded);
+        let log = statements(db).join("\n");
+        assert!(log.contains("UPDATE"), "{log:?}");
+        assert!(log.contains("DEPLOYMENT_COMMIT_RESOLVED"), "{log:?}");
+        let audit_insert = log
+            .lines()
+            .find(|line| line.contains("INSERT") && line.contains("audit_logs"))
+            .unwrap();
+        assert!(audit_insert.contains("created_at"), "{audit_insert}");
+        assert!(log.contains("temps-deployment-workflow"), "{log:?}");
+        assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
+        assert!(log.contains("Add health endpoint"), "{log:?}");
+        assert!(log.contains("Example Author"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn replaces_a_symbolic_head_but_keeps_provider_details() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![deployment_model(
+                7,
+                Some("HEAD"),
+                Some("Message from the provider API"),
+            )]])
+            .append_query_results([vec![deployment_model(
+                7,
+                Some(CHECKED_OUT_SHA),
+                Some("Message from the provider API"),
+            )]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 7, &checked_out_commit())
+            .await
+            .expect("record commit");
+
+        assert!(recorded);
+        let log = statements(db).join("\n");
+        assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
+        assert!(!log.contains("Add health endpoint"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn leaves_a_concrete_commit_untouched() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![deployment_model(
+                9,
+                Some("0123456789abcdef0123456789abcdef01234567"),
+                None,
+            )]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 9, &checked_out_commit())
+            .await
+            .expect("lookup succeeds");
+
+        assert!(!recorded);
+        let log = statements(db).join("\n");
+        assert!(
+            !log.contains("sql: \"UPDATE "),
+            "no UPDATE for a concrete commit: {log}"
+        );
+        assert!(!log.contains("DEPLOYMENT_COMMIT_RESOLVED"));
+    }
+
+    #[tokio::test]
+    async fn missing_deployment_is_not_an_error() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<deployments::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 404, &checked_out_commit())
+            .await
+            .expect("lookup succeeds");
+
+        assert!(!recorded);
+    }
+
+    /// "Clones" by copying a local repository, so the download job's clone
+    /// path runs end to end without a network or provider.
+    struct LocalCloneGitProviderManager {
+        source: PathBuf,
+    }
+
+    #[async_trait]
+    impl GitProviderManagerTrait for LocalCloneGitProviderManager {
+        async fn get_connection_access_token(
+            &self,
+            _connection_id: i32,
+        ) -> Result<(String, String), GitProviderManagerError> {
+            Ok(("unused".to_string(), "generic".to_string()))
+        }
+
+        async fn clone_repository(
+            &self,
+            _connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+            target_dir: &Path,
+            _branch_or_ref: Option<&str>,
+        ) -> Result<(), GitProviderManagerError> {
+            let source = self.source.to_string_lossy().to_string();
+            temps_git::services::git_ops::clone_repo(&source, target_dir, None)
+                .map(|_| ())
+                .map_err(|e| GitProviderManagerError::Other(e.to_string()))
+        }
+
+        async fn get_repository_info(
+            &self,
+            _connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+        ) -> Result<temps_git::RepositoryInfo, GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("unused".into()))
+        }
+
+        async fn download_archive(
+            &self,
+            _connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+            _branch_or_ref: &str,
+            _archive_path: &Path,
+            _progress: Option<&temps_git::ArchiveProgressSender>,
+        ) -> Result<(), GitProviderManagerError> {
+            panic!("unknown commit must use git clone, never an archive")
+        }
+
+        async fn push_files_and_create_pr(
+            &self,
+            _connection_id: i32,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+            _base_branch: &str,
+            _files: Vec<(String, Vec<u8>)>,
+            _commit_message: &str,
+            _pr_title: &str,
+            _pr_body: &str,
+        ) -> Result<temps_git::PullRequest, temps_git::GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("unused".into()))
+        }
+
+        async fn mint_scoped_repo_token(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, temps_git::GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("unused".into()))
+        }
+    }
+
+    /// A one-commit repository built with the git CLI, returning its SHA.
+    fn local_repository_with_commit(dir: &Path) -> Option<String> {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Example Author",
+                    "-c",
+                    "user.email=author@example.com",
+                ])
+                .args([
+                    "-c",
+                    "init.defaultBranch=main",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(dir.join("main.go"), "package main\n").ok()?;
+        git(&["add", "main.go"])?;
+        git(&["commit", "-q", "-m", "Add health endpoint"])?;
+        let head = git(&["rev-parse", "HEAD"])?;
+        Some(String::from_utf8_lossy(&head.stdout).trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn clone_keeps_git_metadata_and_records_the_checked_out_commit() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let source = tempfile::tempdir().unwrap();
+        let Some(sha) = local_repository_with_commit(source.path()) else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+
+        let deployment_id = 900_000 + (std::process::id() as i32 % 50_000);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![deployment_model(deployment_id, None, None)]])
+                .append_query_results([vec![deployment_model(
+                    deployment_id,
+                    Some(&sha),
+                    Some("Add health endpoint"),
+                )]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let job = DownloadRepoBuilder::new()
+            .repo_owner("example".to_string())
+            .repo_name("service".to_string())
+            .git_provider_connection_id(1)
+            .branch_ref("main".to_string())
+            .db(db.clone())
+            .build(Arc::new(LocalCloneGitProviderManager {
+                source: source.path().to_path_buf(),
+            }))
+            .unwrap();
+        let context = crate::test_utils::create_test_context(
+            "wf-commit-resolution".to_string(),
+            deployment_id,
+            1,
+            1,
+        );
+
+        let result = job.execute(context).await.expect("download succeeds");
+        let context = result.context;
+        let repo_dir: String = context
+            .get_output("download_repo", "repo_dir")
+            .unwrap()
+            .unwrap();
+        let commit: Option<String> = context.get_output("download_repo", "commit_sha").unwrap();
+        let has_git = Path::new(&repo_dir).join(".git").is_dir();
+        job.cleanup(&context).await.unwrap();
+        if let Some(work_dir) = &context.work_dir {
+            let _ = std::fs::remove_dir_all(work_dir);
+        }
+
+        // The checkout keeps `.git`, so builds that read VCS metadata work.
+        assert!(has_git, "cloned checkout must keep .git");
+        assert_eq!(commit.as_deref(), Some(sha.as_str()));
+        drop(job);
+        let db = Arc::try_unwrap(db).expect("job released the connection");
+        let log = statements(db).join("\n");
+        assert!(log.contains(&sha), "{log:?}");
+    }
+
+    fn nested_checkout() -> tempfile::TempDir {
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join("examples/starters/go/gin")).unwrap();
+        std::fs::create_dir_all(checkout.path().join("examples/starters/node")).unwrap();
+        std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
+        std::fs::write(
+            checkout.path().join("examples/starters/go/gin/go.mod"),
+            "module app\n",
+        )
+        .unwrap();
+        checkout
+    }
+
+    #[test]
+    fn verify_project_directory_accepts_the_root_and_nested_directories() {
+        let checkout = nested_checkout();
+        for directory in [
+            "",
+            ".",
+            "./",
+            "examples/starters/go/gin",
+            "/examples/starters/go/gin/",
+            "./examples/starters/go/gin",
+        ] {
+            assert_eq!(
+                verify_project_directory(checkout.path(), directory),
+                Ok(()),
+                "{directory:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_project_directory_explains_a_missing_directory() {
+        let checkout = nested_checkout();
+        let reason = verify_project_directory(checkout.path(), "examples/starters/python/flask")
+            .unwrap_err();
+        assert!(
+            reason.contains("'examples/starters' has no 'python'"),
+            "{reason}"
+        );
+        assert!(reason.contains("it contains go, node"), "{reason}");
+
+        // A case near miss only fails on a case-sensitive filesystem.
+        if !checkout.path().join("EXAMPLES").exists() {
+            let reason =
+                verify_project_directory(checkout.path(), "Examples/starters").unwrap_err();
+            assert!(
+                reason.contains("the repository root has no 'Examples'"),
+                "{reason}"
+            );
+            assert!(reason.contains("did you mean 'examples'?"), "{reason}");
+            assert!(!reason.contains(".git"), "{reason}");
+        }
+
+        let reason = verify_project_directory(checkout.path(), "examples/starters/go/gin/go.mod")
+            .unwrap_err();
+        assert!(reason.contains("is a file, not a directory"), "{reason}");
+
+        let reason = verify_project_directory(checkout.path(), "../outside").unwrap_err();
+        assert!(reason.contains("not a relative path"), "{reason}");
+    }
+
+    /// A directory with many entries lists only the alphabetically first
+    /// names and counts the rest, without holding them all.
+    #[test]
+    fn a_large_directory_lists_the_first_names_and_counts_the_rest() {
+        let checkout = tempfile::tempdir().unwrap();
+        for index in 0..45 {
+            std::fs::create_dir(checkout.path().join(format!("svc-{index:02}"))).unwrap();
+        }
+        std::fs::write(checkout.path().join("README.md"), "files are not listed").unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "svc-99").unwrap_err();
+
+        assert!(reason.contains("it contains svc-00, svc-01"), "{reason}");
+        assert!(reason.contains("svc-19 and 25 more"), "{reason}");
+        assert!(!reason.contains("svc-20"), "{reason}");
+        assert!(!reason.contains("README"), "{reason}");
+    }
+
+    #[test]
+    fn verify_project_directory_names_an_unfetched_submodule() {
+        let checkout = nested_checkout();
+        std::fs::write(
+            checkout.path().join(".gitmodules"),
+            "[submodule \"services\"]\n\tpath = services/api\n\turl = https://example.test/api.git\n",
+        )
+        .unwrap();
+        // Provider archives leave no directory; clones leave an empty one.
+        for create in [false, true] {
+            if create {
+                std::fs::create_dir_all(checkout.path().join("services/api")).unwrap();
+            }
+            let reason = verify_project_directory(checkout.path(), "services/api").unwrap_err();
+            assert!(
+                reason.contains("inside Git submodule 'services/api'"),
+                "{reason}"
+            );
+        }
+        // A sibling whose name merely starts with the submodule path is not in it.
+        assert!(enclosing_submodule(checkout.path(), "services/api-v2").is_none());
+        assert_eq!(
+            enclosing_submodule(checkout.path(), "services/api/cmd").as_deref(),
+            Some("services/api")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_project_directory_refuses_a_link_out_of_the_checkout() {
+        let checkout = nested_checkout();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), checkout.path().join("linked")).unwrap();
+        let reason = verify_project_directory(checkout.path(), "linked").unwrap_err();
+        assert!(reason.contains("leads outside the repository"), "{reason}");
+
+        std::os::unix::fs::symlink(
+            checkout.path().join("missing-target"),
+            checkout.path().join("dangling"),
+        )
+        .unwrap();
+        let reason = verify_project_directory(checkout.path(), "dangling").unwrap_err();
+        assert!(reason.contains("is not a directory"), "{reason}");
+    }
+
+    /// The missing-directory explanation lists directory names into the
+    /// deployment log; a link out of the checkout must not let a repository
+    /// read the host's layout through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_directory_behind_a_link_out_never_lists_the_link_target() {
+        let checkout = nested_checkout();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("host-private-directory")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), checkout.path().join("apps")).unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "apps/api").unwrap_err();
+
+        assert!(reason.contains("'apps' is a symbolic link"), "{reason}");
+        assert!(reason.contains("leads outside the repository"), "{reason}");
+        assert!(!reason.contains("host-private-directory"), "{reason}");
+    }
+
+    /// A link that stays inside the checkout is still followed, so the
+    /// explanation keeps naming what the linked directory holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_directory_behind_a_link_inside_is_still_explained() {
+        let checkout = nested_checkout();
+        std::os::unix::fs::symlink(
+            checkout.path().join("examples/starters"),
+            checkout.path().join("starters"),
+        )
+        .unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "starters/python").unwrap_err();
+
+        assert!(reason.contains("'starters' has no 'python'"), "{reason}");
+        assert!(reason.contains("go, node"), "{reason}");
     }
 }

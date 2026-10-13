@@ -71,8 +71,11 @@ pub enum AgentError {
         reason: String,
     },
 
-    #[error("Sandbox not found for run {run_id}")]
-    SandboxNotFound { run_id: i32 },
+    /// `sandbox` names what was looked up (a container name, a sandbox id,
+    /// or the run), so the error says which sandbox is missing even where
+    /// there is no run id (`run_id` is 0 for sandboxes outside agent runs).
+    #[error("Sandbox not found: {sandbox}")]
+    SandboxNotFound { run_id: i32, sandbox: String },
 
     #[error("Sandbox exec failed for run {run_id} in sandbox {sandbox_id}: {reason}")]
     SandboxExecFailed {
@@ -92,6 +95,40 @@ pub enum AgentError {
 
     #[error("Sandbox provider '{provider}' unavailable: {reason}")]
     SandboxProviderUnavailable { provider: String, reason: String },
+
+    #[error("Sandbox node '{node_name}' (id {node_id}) is unavailable: {reason}")]
+    SandboxNodeUnavailable {
+        node_id: i32,
+        node_name: String,
+        reason: String,
+    },
+
+    /// A sandbox on a worker node was asked for a feature that only works
+    /// for sandboxes on the control plane yet (ADR-048 phase 1): the request
+    /// is valid, it just cannot be served where this sandbox lives.
+    #[error(
+        "{feature} is not available yet for sandboxes on worker nodes ({}). \
+         Create the sandbox on the control plane to use it.",
+        unsupported_scope(sandbox_id, node_name)
+    )]
+    SandboxUnsupportedOnNode {
+        sandbox_id: String,
+        node_name: String,
+        feature: String,
+    },
+
+    /// A worker node refused to create a sandbox because it would replace a
+    /// live one (a running sandbox or a create in flight under the same
+    /// label). Nothing must be torn down in response: the conflicting
+    /// sandbox is not this request's.
+    #[error(
+        "Sandbox '{sandbox}' conflicts with existing state on worker node '{node_name}': {reason}"
+    )]
+    SandboxConflictOnNode {
+        sandbox: String,
+        node_name: String,
+        reason: String,
+    },
 
     #[error("Secret '{name}' not found")]
     SecretNotFound { name: String },
@@ -129,6 +166,14 @@ pub enum AgentError {
          (ADR 045) and this action is admin-only"
     )]
     DockerSocketWriteRequiresAdmin { slug: String },
+}
+
+fn unsupported_scope(sandbox_id: &str, node_name: &str) -> String {
+    if sandbox_id.is_empty() {
+        format!("node '{}'", node_name)
+    } else {
+        format!("sandbox {} runs on node '{}'", sandbox_id, node_name)
+    }
 }
 
 fn scope_label(project_id: Option<i32>) -> String {
@@ -171,6 +216,33 @@ impl From<sea_orm::DbErr> for AgentError {
     }
 }
 
+/// Prefix of the [`AgentError::SandboxCreationFailed`] reason when the
+/// container runtime could not pull the sandbox image. The reason is a string
+/// because the error also crosses the worker-node HTTP boundary, so the pull
+/// failure is encoded and decoded in one place: [`image_pull_failure_reason`]
+/// builds it and [`AgentError::image_pull_failure`] reads it back.
+const IMAGE_PULL_REASON_PREFIX: &str = "Failed to pull image ";
+
+/// Build the `SandboxCreationFailed` reason for an image that could not be
+/// pulled. `cause` is the container runtime's own message.
+pub fn image_pull_failure_reason(image: &str, cause: &str) -> String {
+    format!("{IMAGE_PULL_REASON_PREFIX}{image}: {cause}")
+}
+
+impl AgentError {
+    /// When this error is a sandbox creation that failed because the image
+    /// could not be pulled, return `(image, cause)`.
+    pub fn image_pull_failure(&self) -> Option<(&str, &str)> {
+        match self {
+            AgentError::SandboxCreationFailed { reason, .. } => reason
+                .strip_prefix(IMAGE_PULL_REASON_PREFIX)
+                .and_then(|rest| rest.split_once(": "))
+                .filter(|(image, _)| !image.is_empty() && !image.contains(char::is_whitespace)),
+            _ => None,
+        }
+    }
+}
+
 /// Try to pull the slug out of a Postgres unique-violation message.
 /// Postgres includes `DETAIL: Key (slug)=(foo) already exists.` in its
 /// error body. Missing DETAIL just means we fall back to `None`.
@@ -180,4 +252,49 @@ fn extract_dup_slug(msg: &str) -> Option<String> {
     let val_start = rest.find(")=(")? + 3;
     let val_end = rest[val_start..].find(')')?;
     Some(rest[val_start..val_start + val_end].to_string())
+}
+
+#[cfg(test)]
+mod image_pull_tests {
+    use super::*;
+
+    fn creation_failed(reason: String) -> AgentError {
+        AgentError::SandboxCreationFailed {
+            run_id: 7,
+            provider: "docker".into(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn pull_failure_round_trips_image_and_cause() {
+        let error = creation_failed(image_pull_failure_reason(
+            "registry.example.test/team/img:1.2.3",
+            "Docker responded with status code 404: manifest unknown",
+        ));
+        assert_eq!(
+            error.image_pull_failure(),
+            Some((
+                "registry.example.test/team/img:1.2.3",
+                "Docker responded with status code 404: manifest unknown"
+            ))
+        );
+    }
+
+    #[test]
+    fn other_creation_failures_are_not_pull_failures() {
+        let error = creation_failed("inspect runtime image x:1: no such image".into());
+        assert_eq!(error.image_pull_failure(), None);
+        let error = creation_failed("Failed to pull image : empty".into());
+        assert_eq!(error.image_pull_failure(), None);
+    }
+
+    #[test]
+    fn non_creation_errors_are_not_pull_failures() {
+        let error = AgentError::SandboxProviderUnavailable {
+            provider: "docker".into(),
+            reason: "Failed to pull image a:1: boom".into(),
+        };
+        assert_eq!(error.image_pull_failure(), None);
+    }
 }

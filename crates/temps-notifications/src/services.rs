@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
-use crate::NotificationRoutingService;
+use crate::{
+    NotificationRouteError, NotificationRouteTestResult, NotificationRoutingService,
+    RouteTestDelivery, RouteTestDeliveryStatus,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -30,7 +33,7 @@ use temps_entities::{
     notification_preferences, notification_providers, notification_routes, notifications, roles,
     user_roles, users,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 #[derive(Debug, thiserror::Error)]
@@ -198,6 +201,15 @@ fn provider_config_field<'a>(
     }
 }
 
+/// Result of [`NotificationService::test_provider`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderTestOutcome {
+    /// Whether every destination accepted the test notification.
+    pub success: bool,
+    /// What was confirmed, or why delivery failed and what to check.
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
@@ -222,6 +234,75 @@ fn default_starttls_required() -> bool {
 
 fn default_accept_invalid_certs() -> bool {
     false // Default to secure behavior
+}
+
+impl std::fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsMode::None => f.write_str("none"),
+            TlsMode::Starttls => f.write_str("STARTTLS"),
+            TlsMode::Tls => f.write_str("TLS"),
+        }
+    }
+}
+
+/// Why an SMTP notification was not (fully) accepted. Messages carry the SMTP
+/// endpoint and TLS mode an operator needs to fix it, never credentials.
+#[derive(Debug, thiserror::Error)]
+pub enum EmailDeliveryError {
+    #[error(
+        "Email provider for SMTP server {smtp_host}:{smtp_port} has no valid recipients: \
+         add at least one recipient address or an admin user with an email address"
+    )]
+    NoRecipients { smtp_host: String, smtp_port: u16 },
+
+    #[error(
+        "SMTP server {smtp_host}:{smtp_port} (TLS mode: {tls_mode}) did not accept the message \
+         for any of {attempted} recipient(s): {failures}. Check that {smtp_host}:{smtp_port} is \
+         reachable from the Temps server and that the TLS mode matches what the server expects, \
+         then retry"
+    )]
+    AllRecipientsFailed {
+        smtp_host: String,
+        smtp_port: u16,
+        tls_mode: String,
+        attempted: usize,
+        failures: String,
+    },
+
+    #[error(
+        "SMTP server {smtp_host}:{smtp_port} accepted the message for only {accepted} of \
+         {attempted} recipient(s); not accepted: {failures}"
+    )]
+    PartialDelivery {
+        smtp_host: String,
+        smtp_port: u16,
+        accepted: usize,
+        attempted: usize,
+        failures: String,
+    },
+}
+
+/// Per-recipient outcome of one SMTP send.
+#[derive(Debug, Default)]
+struct EmailDeliveryReport {
+    accepted: Vec<String>,
+    /// `(recipient, reason)` for every address the SMTP server did not accept.
+    failed: Vec<(String, String)>,
+}
+
+impl EmailDeliveryReport {
+    fn attempted(&self) -> usize {
+        self.accepted.len() + self.failed.len()
+    }
+
+    fn describe_failures(&self) -> String {
+        self.failed
+            .iter()
+            .map(|(addr, reason)| format!("{addr} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 // Provider-specific structs
@@ -581,6 +662,33 @@ fn is_human_visible_metadata_key(
     true
 }
 
+/// Decide whether a metadata key becomes a Slack attachment field. Slack is
+/// read by people scanning a channel, where a raw database ID carries no
+/// meaning, so every `<prefix>_id` key is dropped — including ones without a
+/// readable twin. Producers that want an entity identified in Slack must send
+/// its `<prefix>_name` or `<prefix>_slug` (e.g. `project_slug`). The IDs still
+/// reach webhook payloads and persisted metadata for correlation.
+fn is_slack_visible_metadata_key(
+    key: &str,
+    metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    is_human_visible_metadata_key(key, metadata) && !key.ends_with("_id")
+}
+
+/// Turn a metadata key into a readable label: `project_slug` -> `Project Slug`.
+fn metadata_label(key: &str) -> String {
+    key.split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// HTML-encode the five characters that can break element structure or inject
 /// new tags when user-controlled text is interpolated into an HTML template.
 fn html_escape(s: &str) -> String {
@@ -626,6 +734,15 @@ pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
     async fn send(&self, notification: &Notification) -> Result<()>;
     async fn health_check(&self) -> Result<bool>;
+
+    /// Sends an operator-triggered test notification and describes what was
+    /// confirmed. Unlike [`NotificationProvider::send`], a test must fail on
+    /// *any* undelivered destination, so the operator never reads success
+    /// while part of the configuration is broken.
+    async fn send_test(&self, notification: &Notification) -> Result<String> {
+        self.send(notification).await?;
+        Ok("Test notification sent successfully".to_string())
+    }
 }
 
 const CLOUD_TITLE_MAX_CHARS: usize = 200;
@@ -908,9 +1025,8 @@ impl EmailProvider {
     }
 }
 
-#[async_trait]
-impl NotificationProvider for EmailProvider {
-    async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
+impl EmailProvider {
+    fn initialize_mailer(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
         let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.smtp_host)
             .port(self.smtp_port);
 
@@ -1003,7 +1119,9 @@ impl NotificationProvider for EmailProvider {
         Ok(())
     }
 
-    async fn send(&self, notification: &Notification) -> Result<()> {
+    /// Sends one message per recipient and records which ones the SMTP
+    /// server accepted. Per-recipient failures are collected, not returned.
+    async fn deliver(&self, notification: &Notification) -> Result<EmailDeliveryReport> {
         let mailer = self
             .mailer
             .as_ref()
@@ -1047,6 +1165,7 @@ impl NotificationProvider for EmailProvider {
         all_recipients.dedup();
 
         // Send individual emails to each recipient
+        let mut report = EmailDeliveryReport::default();
         for addr in &all_recipients {
             match addr.parse::<Mailbox>() {
                 Ok(to_mailbox) => {
@@ -1057,17 +1176,96 @@ impl NotificationProvider for EmailProvider {
                         .header(ContentType::TEXT_HTML)
                         .body(email_body.clone())?;
 
-                    if let Err(e) = mailer.send(email_msg).await {
-                        error!("Failed to send email to {}: {}", addr, e);
+                    match mailer.send(email_msg).await {
+                        Ok(_) => report.accepted.push(addr.clone()),
+                        Err(e) => {
+                            error!(
+                                "Failed to send email to {} via SMTP server {}:{}: {}",
+                                addr, self.smtp_host, self.smtp_port, e
+                            );
+                            report.failed.push((addr.clone(), e.to_string()));
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Invalid email address {}: {}", addr, e);
+                    report
+                        .failed
+                        .push((addr.clone(), format!("invalid address: {e}")));
                 }
             }
         }
 
+        Ok(report)
+    }
+
+    /// Maps a delivery report onto the provider contract. With
+    /// `require_all`, any recipient the SMTP server refused is an error
+    /// (provider tests); otherwise only a send that reached nobody is.
+    fn delivery_result(
+        &self,
+        report: &EmailDeliveryReport,
+        require_all: bool,
+    ) -> std::result::Result<(), EmailDeliveryError> {
+        if report.attempted() == 0 {
+            return Err(EmailDeliveryError::NoRecipients {
+                smtp_host: self.smtp_host.clone(),
+                smtp_port: self.smtp_port,
+            });
+        }
+        if report.accepted.is_empty() {
+            return Err(EmailDeliveryError::AllRecipientsFailed {
+                smtp_host: self.smtp_host.clone(),
+                smtp_port: self.smtp_port,
+                tls_mode: self.tls_mode.to_string(),
+                attempted: report.attempted(),
+                failures: report.describe_failures(),
+            });
+        }
+        if !report.failed.is_empty() {
+            let partial = EmailDeliveryError::PartialDelivery {
+                smtp_host: self.smtp_host.clone(),
+                smtp_port: self.smtp_port,
+                accepted: report.accepted.len(),
+                attempted: report.attempted(),
+                failures: report.describe_failures(),
+            };
+            if require_all {
+                return Err(partial);
+            }
+            // A real alert reached some recipients; resending would duplicate
+            // it for them, so it counts as delivered but is logged loudly.
+            warn!("{}", partial);
+        }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl NotificationProvider for EmailProvider {
+    async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
+        self.initialize_mailer(db)
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let report = self.deliver(notification).await?;
+        self.delivery_result(&report, false)?;
+        Ok(())
+    }
+
+    async fn send_test(&self, notification: &Notification) -> Result<String> {
+        let report = self.deliver(notification).await?;
+        self.delivery_result(&report, true)?;
+        // SMTP acceptance is all Temps can observe; the receiving mail server
+        // may still bounce or spam-filter the message afterwards.
+        Ok(format!(
+            "SMTP server {}:{} accepted the test message for {} recipient(s): {}. \
+             Check the inbox (and spam folder) to confirm final delivery.",
+            self.smtp_host,
+            self.smtp_port,
+            report.accepted.len(),
+            report.accepted.join(", ")
+        ))
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -1194,20 +1392,7 @@ impl EmailProvider {
             let rows: String = visible_metadata
                 .iter()
                 .map(|(k, v)| {
-                    // Format key: replace underscores with spaces and title-case
-                    let label = k
-                        .split('_')
-                        .map(|w| {
-                            let mut c = w.chars();
-                            match c.next() {
-                                None => String::new(),
-                                Some(f) => {
-                                    f.to_uppercase().collect::<String>() + c.as_str()
-                                }
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let label = metadata_label(k);
                     format!(
                         r#"<tr>
                             <td style="padding: 8px 12px; color: #6b7280; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; white-space: nowrap; vertical-align: top;">{}</td>
@@ -1540,10 +1725,10 @@ impl NotificationProvider for SlackProvider {
         let metadata_fields = notification
             .metadata
             .iter()
-            .filter(|(k, _)| is_human_visible_metadata_key(k, &notification.metadata))
+            .filter(|(k, _)| is_slack_visible_metadata_key(k, &notification.metadata))
             .map(|(k, v)| {
                 serde_json::json!({
-                    "title": slack_escape(k),
+                    "title": slack_escape(&metadata_label(k)),
                     "value": slack_escape(v),
                     "short": true
                 })
@@ -2380,7 +2565,10 @@ impl NotificationService {
         }
     }
 
-    pub async fn test_provider(&self, provider_id: i32) -> Result<bool> {
+    /// Sends a real test notification through one provider. A delivery
+    /// failure is a test *result* (`success: false` with the reason), not an
+    /// error; only a missing provider or an unloadable config is an error.
+    pub async fn test_provider(&self, provider_id: i32) -> Result<ProviderTestOutcome> {
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
             .await?;
@@ -2394,14 +2582,128 @@ impl NotificationService {
             // A provider test must exercise delivery, not only configuration.
             // Otherwise the UI can report success while credentials, routing,
             // or the remote destination are unable to accept a message.
-            notification_provider.send(&notification).await?;
-            Ok(true)
+            match notification_provider.send_test(&notification).await {
+                Ok(message) => Ok(ProviderTestOutcome {
+                    success: true,
+                    message,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        provider_id,
+                        provider_type = %provider.provider_type,
+                        error = %error,
+                        "Provider test notification was not delivered"
+                    );
+                    Ok(ProviderTestOutcome {
+                        success: false,
+                        message: format!("Test notification was not delivered: {error}"),
+                    })
+                }
+            }
         } else {
             Err(anyhow::anyhow!(
                 "Notification provider with ID {} not found",
                 provider_id
             ))
         }
+    }
+
+    /// Destinations a notification at `severity` would reach with the current
+    /// configuration: enabled providers on enabled routes covering that
+    /// severity, plus Temps Cloud when it delivers.
+    pub async fn destination_count(
+        &self,
+        severity: NotificationSeverity,
+    ) -> std::result::Result<usize, NotificationRouteError> {
+        let routed = self
+            .routing_service
+            .resolve_provider_models(severity)
+            .await?
+            .len();
+        Ok(routed + usize::from(self.cloud_notifications_enabled()))
+    }
+
+    /// Whether Temps Cloud delivers notifications in addition to the routed
+    /// providers. When it does, every notification reaches someone even with
+    /// no provider configured locally.
+    pub fn cloud_notifications_enabled(&self) -> bool {
+        self.cloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.notifications_enabled())
+    }
+
+    /// Sends a sample notification through one route: once to each provider
+    /// assigned to it, at the lowest severity the route matches. Per-provider
+    /// failures are reported in the result rather than failing the call, so
+    /// the operator can see which destination is broken.
+    pub async fn test_route(
+        &self,
+        route_id: i32,
+    ) -> std::result::Result<NotificationRouteTestResult, NotificationRouteError> {
+        let (route, providers) = self.routing_service.route_with_providers(route_id).await?;
+        let severity = NotificationRoutingService::parse_severity(&route.min_severity)?;
+        let notification = Notification::new(
+            format!("Temps test notification: route \"{}\"", route.name),
+            "This is a test alert sent through a notification route from your Temps notification settings. No action is required.",
+        )
+        .with_severity(severity);
+
+        let mut deliveries = Vec::with_capacity(providers.len());
+        for provider in providers {
+            let (status, message) = if !provider.enabled {
+                (
+                    RouteTestDeliveryStatus::SkippedDisabled,
+                    Some("Provider is disabled, so real notifications skip it too".to_string()),
+                )
+            } else {
+                match self.load_provider(&provider).await {
+                    Ok(loaded) => match loaded.send_test(&notification).await {
+                        Ok(_) => (RouteTestDeliveryStatus::Sent, None),
+                        Err(error) => {
+                            tracing::warn!(
+                                route_id,
+                                provider_id = provider.id,
+                                error = %error,
+                                "Route test notification failed to deliver"
+                            );
+                            (
+                                RouteTestDeliveryStatus::Failed,
+                                Some(format!("Delivery failed: {error}")),
+                            )
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            route_id,
+                            provider_id = provider.id,
+                            error = %error,
+                            "Route test could not load provider configuration"
+                        );
+                        (
+                            RouteTestDeliveryStatus::Failed,
+                            Some(format!(
+                                "Provider configuration could not be loaded: {error}"
+                            )),
+                        )
+                    }
+                }
+            };
+            deliveries.push(RouteTestDelivery {
+                provider_id: provider.id,
+                provider_name: provider.name,
+                provider_type: provider.provider_type,
+                status,
+                message,
+            });
+        }
+
+        Ok(NotificationRouteTestResult {
+            route_id: route.id,
+            route_name: route.name,
+            route_enabled: route.enabled,
+            severity: severity.as_str().to_string(),
+            deliveries,
+        })
     }
 
     // Add a method to clean up old notifications
@@ -2556,6 +2858,18 @@ impl CoreNotificationService for NotificationService {
             Ok(configured) => Ok(configured),
             Err(e) => Err(CoreNotificationError::ConfigurationError(e.to_string())),
         }
+    }
+
+    async fn destination_count(
+        &self,
+        severity: &str,
+    ) -> Result<Option<usize>, CoreNotificationError> {
+        let severity = NotificationRoutingService::parse_severity(severity)
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))?;
+        self.destination_count(severity)
+            .await
+            .map(Some)
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))
     }
 }
 
@@ -3061,6 +3375,156 @@ mod tests {
         );
         assert!(!error.contains("http"));
         assert!(!error.contains("token"));
+    }
+
+    /// Minimal plaintext SMTP server: accepts every recipient except those
+    /// starting with `reject`, which get a permanent 550.
+    async fn start_fake_smtp_server() -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let _ = write.write_all(b"220 fake ESMTP\r\n").await;
+                    let mut in_data = false;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let reply: &[u8] = if in_data {
+                            if line == "." {
+                                in_data = false;
+                                b"250 queued\r\n"
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            let upper = line.to_ascii_uppercase();
+                            if upper.starts_with("RCPT TO:<REJECT") {
+                                b"550 no such user\r\n"
+                            } else if upper.starts_with("DATA") {
+                                in_data = true;
+                                b"354 go ahead\r\n"
+                            } else if upper.starts_with("QUIT") {
+                                let _ = write.write_all(b"221 bye\r\n").await;
+                                break;
+                            } else {
+                                b"250 ok\r\n"
+                            }
+                        };
+                        if write.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    async fn smtp_test_provider(port: u16, recipients: &[&str]) -> EmailProvider {
+        let mut provider = EmailProvider {
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: port,
+            username: None,
+            password: None,
+            from_address: "temps@example.com".to_string(),
+            from_name: None,
+            to_addresses: recipients.iter().map(|r| r.to_string()).collect(),
+            tls_mode: TlsMode::None,
+            starttls_required: false,
+            accept_invalid_certs: false,
+            mailer: None,
+            db: Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection()),
+        };
+        let db = provider.db.clone();
+        provider.initialize(db).await.unwrap();
+        provider
+    }
+
+    /// A port nothing listens on, so connections are refused.
+    async fn refused_smtp_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn test_email_send_succeeds_when_smtp_accepts_every_recipient() {
+        let port = start_fake_smtp_server().await;
+        let provider = smtp_test_provider(port, &["ops@example.com"]).await;
+        let notification = Notification::new("Alert", "Something broke");
+
+        provider.send(&notification).await.unwrap();
+        let message = provider.send_test(&notification).await.unwrap();
+        assert!(
+            message.contains(&format!("127.0.0.1:{port}"))
+                && message.contains("1 recipient(s)")
+                && message.contains("inbox"),
+            "test message should state SMTP acceptance, not inbox delivery: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_email_send_errors_when_smtp_connection_is_refused() {
+        let port = refused_smtp_port().await;
+        let provider = smtp_test_provider(port, &["ops@example.com"]).await;
+        let notification = Notification::new("Alert", "Something broke");
+
+        let error = provider.send(&notification).await.unwrap_err();
+        let delivery = error
+            .downcast_ref::<EmailDeliveryError>()
+            .expect("typed delivery error");
+        assert!(matches!(
+            delivery,
+            EmailDeliveryError::AllRecipientsFailed { attempted: 1, .. }
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("127.0.0.1:{port}"))
+                && message.contains("TLS mode: none")
+                && message.contains("ops@example.com"),
+            "error should name endpoint, TLS mode and recipient: {message}"
+        );
+        assert!(provider.send_test(&notification).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_email_partial_delivery_fails_test_but_not_alert() {
+        let port = start_fake_smtp_server().await;
+        let provider = smtp_test_provider(port, &["ops@example.com", "reject@example.com"]).await;
+        let notification = Notification::new("Alert", "Something broke");
+
+        // A real alert that reached some recipients is delivered (no resend).
+        provider.send(&notification).await.unwrap();
+
+        // A provider test must surface the refused recipient.
+        let error = provider.send_test(&notification).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EmailDeliveryError>(),
+            Some(EmailDeliveryError::PartialDelivery {
+                accepted: 1,
+                attempted: 2,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("reject@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_email_send_errors_without_recipients() {
+        let port = start_fake_smtp_server().await;
+        let provider = smtp_test_provider(port, &[]).await;
+        let error = provider
+            .send(&Notification::new("Alert", "Something broke"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EmailDeliveryError>(),
+            Some(EmailDeliveryError::NoRecipients { .. })
+        ));
     }
 
     #[test]
@@ -4719,6 +5183,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destination_count_only_counts_enabled_providers_routed_for_the_severity() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-destination-count-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let slack = |hook: &str| {
+            serde_json::json!({
+                "webhook_url": format!("https://hooks.slack.com/services/TEST/TEST/{hook}"),
+                "channel": "#alerts"
+            })
+        };
+        let enabled = service
+            .add_provider("Enabled".to_string(), "slack".to_string(), slack("A"), true)
+            .await
+            .unwrap();
+        service
+            .add_provider(
+                "Disabled".to_string(),
+                "slack".to_string(),
+                slack("B"),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            1,
+            "a disabled provider is not a destination"
+        );
+
+        // Narrow the enabled provider's only route below critical.
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+        let route = routing
+            .list(1, 20)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|route| route.provider_ids == vec![enabled.id])
+            .unwrap();
+        routing
+            .update(
+                route.id,
+                crate::UpdateNotificationRoute {
+                    name: None,
+                    enabled: None,
+                    min_severity: Some("debug".to_string()),
+                    max_severity: Some("warning".to_string()),
+                    provider_ids: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            0,
+            "a provider whose routes stop below critical does not receive critical alarms"
+        );
+        assert!(
+            service.is_configured().await.unwrap(),
+            "the severity-blind check still reports a destination, which is why the \
+             health card must not rely on it for a critical alarm"
+        );
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Warning)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn add_provider_atomically_creates_a_catch_all_route() {
         let test_db = test_database_or_skip!();
         let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
@@ -5084,7 +5636,86 @@ FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
     }
 
     #[test]
-    fn slack_send_omits_ids_with_readable_twins_but_keeps_others() {
+    fn metadata_label_title_cases_words() {
+        assert_eq!(metadata_label("project_slug"), "Project Slug");
+        assert_eq!(metadata_label("branch"), "Branch");
+    }
+
+    #[test]
+    fn slack_visible_metadata_drops_every_id_key() {
+        let notification = Notification {
+            id: "test-outage".to_string(),
+            title: "Monitor is down".to_string(),
+            message: "Monitor 'prod' is down".to_string(),
+            notification_type: NotificationType::Error,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: vec![
+                ("monitor_id".to_string(), "22".to_string()),
+                ("monitor_name".to_string(), "production Monitor".to_string()),
+                ("project_id".to_string(), "19".to_string()),
+                ("project_slug".to_string(), "my-app".to_string()),
+                ("incident_id".to_string(), "5".to_string()),
+                ("_chart_svg".to_string(), "<svg/>".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            bypass_throttling: false,
+        };
+
+        let visible_keys: std::collections::HashSet<&str> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| is_slack_visible_metadata_key(k, &notification.metadata))
+            .map(|(k, _)| k.as_str())
+            .collect();
+
+        assert_eq!(
+            visible_keys,
+            ["monitor_name", "project_slug"].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_send_shows_project_slug_instead_of_ids() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+
+        // Same metadata shape an HTTP/expiry check alert sends.
+        let notification = Notification::new(
+            "Expiry check 'Example endpoint' failed",
+            "Certificate 'svc.example.test' expired.",
+        )
+        .with_metadata("project_id", "2")
+        .with_metadata("project_slug", "checkout-api")
+        .with_metadata("http_check_id", "72");
+
+        provider.send(&notification).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let fields = body["attachments"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1, "only the project slug is shown: {body}");
+        assert_eq!(fields[0]["title"], "Project Slug");
+        assert_eq!(fields[0]["value"], "checkout-api");
+    }
+
+    #[test]
+    fn human_visible_metadata_omits_ids_with_readable_twins_but_keeps_others() {
         let notification = Notification {
             id: "test-outage".to_string(),
             title: "Monitor is down".to_string(),

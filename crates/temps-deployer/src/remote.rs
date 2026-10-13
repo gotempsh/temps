@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::build_protocol::{
+    dockerfile_build_arg_names, dockerfile_reads_build_arg, is_worker_build_arg_name,
     validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore,
-    BUILD_PROTOCOL_VERSION, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
-    MAX_BUILD_EVENT_BYTES,
+    CACHE_MOUNT_NAMESPACE_ARG, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
+    MAX_BUILD_EVENT_BYTES, MAX_BUILD_SPEC_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
 use crate::{
@@ -85,21 +86,31 @@ async fn agent_error_detail(response: reqwest::Response) -> String {
 }
 
 /// What to archive from a build context, decided before anything is read.
-struct ContextFilter {
+pub(crate) struct ContextFilter {
     ignore: DockerIgnore,
+    root_ignore: Option<DockerIgnore>,
     /// Paths the Docker CLI always sends even when ignored: the Dockerfile
     /// and the ignore file itself.
     always_include: Vec<PathBuf>,
 }
 
 impl ContextFilter {
-    fn includes(&self, path: &Path) -> bool {
-        self.always_include.iter().any(|kept| kept == path) || !self.ignore.is_excluded(path)
+    pub(crate) fn includes(&self, path: &Path) -> bool {
+        self.always_include.iter().any(|kept| kept == path)
+            || (!self.ignore.is_excluded(path)
+                && !self
+                    .root_ignore
+                    .as_ref()
+                    .is_some_and(|ignore| ignore.is_excluded(path)))
     }
 
     /// Whether an excluded directory may still contain something to send.
-    fn must_descend(&self, directory: &Path) -> bool {
+    pub(crate) fn must_descend(&self, directory: &Path) -> bool {
         self.ignore.has_exceptions()
+            || self
+                .root_ignore
+                .as_ref()
+                .is_some_and(DockerIgnore::has_exceptions)
             || self
                 .always_include
                 .iter()
@@ -180,8 +191,13 @@ fn append_build_context(
 
 /// Load the ignore rules Docker would apply for `dockerfile`: a
 /// `<Dockerfile>.dockerignore` beside it takes precedence over the context
-/// root's `.dockerignore`, as with BuildKit.
-fn load_context_filter(root: &Path, dockerfile: &Path) -> Result<ContextFilter, BuilderError> {
+/// root's `.dockerignore`, as with BuildKit. Generated widened-workspace
+/// contexts opt in via WORKSPACE_ROOT_IGNORE_MARKER: root exclusions are then
+/// enforced independently, so app negations cannot expose private siblings.
+pub(crate) fn load_context_filter(
+    root: &Path,
+    dockerfile: &Path,
+) -> Result<ContextFilter, BuilderError> {
     let mut specific = dockerfile.as_os_str().to_owned();
     specific.push(".dockerignore");
     let candidates = [PathBuf::from(specific), PathBuf::from(".dockerignore")];
@@ -193,32 +209,96 @@ fn load_context_filter(root: &Path, dockerfile: &Path) -> Result<ContextFilter, 
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(BuilderError::IoError(error)),
         };
-        if !metadata.is_file() {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(BuilderError::InvalidContext(format!(
                 "'{}' must be a regular file",
                 candidate.display()
             )));
         }
-        let contents = std::fs::read_to_string(&full).map_err(|error| {
-            BuilderError::InvalidContext(format!("Cannot read '{}': {error}", candidate.display()))
-        })?;
+        let contents = read_ignore_file(root, &candidate)?;
         let ignore = DockerIgnore::parse(&contents, &candidate.to_string_lossy())
             .map_err(BuilderError::InvalidContext)?;
+        let root_ignore = if candidate != Path::new(".dockerignore")
+            && contents
+                .lines()
+                .any(|line| line == WORKSPACE_ROOT_IGNORE_MARKER)
+        {
+            let root_file = Path::new(".dockerignore");
+            let root_contents = match std::fs::symlink_metadata(root.join(root_file)) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    Some(read_ignore_file(root, root_file)?)
+                }
+                Ok(_) => {
+                    return Err(BuilderError::InvalidContext(
+                        "Workspace root .dockerignore must be a regular non-symlink file".into(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(BuilderError::IoError(error)),
+            };
+            if let Some(contents) = root_contents {
+                always_include.push(root_file.to_path_buf());
+                Some(
+                    DockerIgnore::parse(&contents, ".dockerignore")
+                        .map_err(BuilderError::InvalidContext)?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         always_include.push(candidate);
         return Ok(ContextFilter {
             ignore,
+            root_ignore,
             always_include,
         });
     }
     Ok(ContextFilter {
         ignore: DockerIgnore::empty(),
+        root_ignore: None,
         always_include,
     })
+}
+
+fn read_ignore_file(root: &Path, relative: &Path) -> Result<String, BuilderError> {
+    use std::io::Read;
+    let full = root.join(relative);
+    let canonical_root = root.canonicalize().map_err(BuilderError::IoError)?;
+    let canonical_file = full.canonicalize().map_err(BuilderError::IoError)?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err(BuilderError::InvalidContext(format!(
+            "Ignore file '{}' escapes the build context",
+            relative.display()
+        )));
+    }
+    const MAX_IGNORE_BYTES: u64 = 1024 * 1024;
+    let mut contents = String::new();
+    std::fs::File::open(&full)
+        .map_err(BuilderError::IoError)?
+        .take(MAX_IGNORE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| {
+            BuilderError::InvalidContext(format!("Cannot read '{}': {error}", relative.display()))
+        })?;
+    if contents.len() as u64 > MAX_IGNORE_BYTES {
+        return Err(BuilderError::InvalidContext(format!(
+            "Ignore file '{}' exceeds the {MAX_IGNORE_BYTES} byte limit",
+            relative.display()
+        )));
+    }
+    Ok(contents)
 }
 
 fn prepare_build_context(
     request: &BuildRequest,
 ) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
+    if !request.cache_from.is_empty() {
+        return Err(BuilderError::InvalidContext(
+            "Worker builds do not support cache_from image imports; use a local builder or remove cache_from".to_string(),
+        ));
+    }
     // These inputs materialise as a generated .npmrc before archiving. Never
     // rely on application-owned ignore rules to enforce the credential boundary.
     if request
@@ -265,25 +345,59 @@ fn prepare_build_context(
             "Worker build Dockerfile must be a regular file".into(),
         ));
     }
-    // The planner includes every resolved environment value in build_args,
-    // including credentials, even when a Dockerfile does not use them. Do not
-    // transfer any of those values to a worker. A Dockerfile declaring ARG
-    // needs an explicit credential-handling design before remote builds can
-    // preserve the local builder's semantics safely.
-    if !request.build_args.is_empty() || !request.build_args_buildkit.is_empty() {
+    // Build-argument values travel to the worker inside the spec, over the
+    // node's authenticated build channel. Which values may leave the control
+    // plane at all is the caller's decision -- `BuildImageJob` never passes a
+    // value marked secret or a platform credential to a worker builder. Here
+    // a worker additionally receives only what its Dockerfile can read, so no
+    // value crosses that the build has no use for.
+    let mut supplied = request.build_args.clone();
+    supplied.extend(
+        request
+            .build_args_buildkit
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    // The cache namespace is derived by the control plane per project,
+    // environment and ref, and keeps builds of different projects on the
+    // same worker from reading or poisoning each other's cache mounts. It is
+    // BuildKit's own argument, so it has its own field.
+    let cache_namespace = supplied.remove(CACHE_MOUNT_NAMESPACE_ARG);
+    let build_args = if supplied.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
         let contents =
             std::fs::read_to_string(root.join(&dockerfile)).map_err(BuilderError::IoError)?;
-        if dockerfile_declares_build_arg(&contents) {
-            return Err(BuilderError::InvalidContext(
-                "Worker builds cannot use Dockerfile ARG instructions until build-argument credential handling is reviewed".into(),
-            ));
+        match dockerfile_build_arg_names(&contents) {
+            Some(declared) => supplied
+                .into_iter()
+                .filter(|(name, _)| dockerfile_reads_build_arg(&declared, name))
+                .collect(),
+            // An ARG names a variable reference, so which values it reads
+            // cannot be told here; the caller has already limited them to
+            // values that may leave the control plane.
+            None => supplied.into_iter().collect(),
         }
+    };
+    if let Some(name) = build_args
+        .keys()
+        .find(|name| !is_worker_build_arg_name(name))
+    {
+        // Names only: the values are exactly what must not be quoted.
+        return Err(BuilderError::InvalidContext(format!(
+            "Worker builds cannot pass build argument '{}': it is not a valid ARG name, or is \
+             a BUILDKIT_* argument a worker sets itself. Rename the variable, or build on the \
+             control plane",
+            name.escape_debug()
+        )));
     }
     let spec = BuildSpec {
-        version: BUILD_PROTOCOL_VERSION,
+        version: BuildSpec::version_for(&build_args),
         image_name: request.image_name.clone(),
         dockerfile: dockerfile.to_string_lossy().into_owned(),
         platform: request.platform.clone(),
+        cache_namespace,
+        build_args,
     };
     spec.validate().map_err(BuilderError::InvalidContext)?;
     let archive_file = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
@@ -313,14 +427,6 @@ fn prepare_build_context(
         )));
     }
     Ok((archive_file, spec))
-}
-
-/// Conservative scan: false positives only refuse a build, while a missed
-/// ARG could change its result after we intentionally discard all arguments.
-fn dockerfile_declares_build_arg(contents: &str) -> bool {
-    contents
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .any(|word| word.eq_ignore_ascii_case("ARG"))
 }
 
 async fn dispatch_build_event(
@@ -1062,6 +1168,15 @@ impl ImageBuilder for RemoteNodeDeployer {
         let spec_json = serde_json::to_string(&spec).map_err(|error| {
             BuilderError::Other(format!("Cannot encode worker build spec: {error}"))
         })?;
+        if spec_json.len() > MAX_BUILD_SPEC_BYTES {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "Worker build spec for node '{}' is {} bytes, more than the {} bytes a worker \
+                 accepts; reduce the size of the build-argument values",
+                self.node_name,
+                spec_json.len(),
+                MAX_BUILD_SPEC_BYTES
+            )));
+        }
         let form = reqwest::multipart::Form::new()
             .text("spec", spec_json)
             .part("context", context);
@@ -1085,8 +1200,15 @@ impl ImageBuilder for RemoteNodeDeployer {
         if !response.status().is_success() {
             let status = response.status();
             let detail = agent_error_detail(response).await;
+            // An agent that predates build arguments refuses version 2.
+            let upgrade = if detail.contains("Unsupported worker build protocol version") {
+                ". This worker runs an older Temps agent that cannot receive build arguments; \
+                 upgrade Temps on the worker"
+            } else {
+                ""
+            };
             return Err(BuilderError::Other(format!(
-                "Worker '{}' refused image build (HTTP {status}): {detail}",
+                "Worker '{}' refused image build (HTTP {status}): {detail}{upgrade}",
                 self.node_name
             )));
         }
@@ -1266,15 +1388,68 @@ impl ImageBuilder for RemoteNodeDeployer {
         ))
     }
 
+    async fn export_path_stream(
+        &self,
+        image_name: &str,
+        source_path: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        let url = format!("{}/agent/images/extract", self.agent_url);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_EXPORT_REQUEST_TIMEOUT)
+            .query(&[("image", image_name), ("path", source_path)])
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot export path '{source_path}' of image '{image_name}' from node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = agent_error_detail(response).await;
+            let message = format!(
+                "Node '{}' refused to export path '{source_path}' of image '{image_name}' (HTTP {status}): {detail}",
+                self.node_name
+            );
+            return Err(match status {
+                reqwest::StatusCode::NOT_FOUND => BuilderError::ImageNotFound(message),
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
+                    BuilderError::ResourceLimitExceeded(message)
+                }
+                _ => BuilderError::Other(message),
+            });
+        }
+        let node_name = self.node_name.clone();
+        Ok(Box::pin(response.bytes_stream().map_err(move |error| {
+            std::io::Error::other(format!(
+                "Path export stream from node '{node_name}' failed: {error}"
+            ))
+        })))
+    }
+
+    /// Extract from an image that lives on this worker.
+    ///
+    /// The worker only streams the raw archive; it is unpacked here under the
+    /// same byte, entry, depth and file-type limits as a local extraction, so
+    /// what lands on the control plane is validated by the control plane.
     async fn extract_from_image(
         &self,
-        _image_name: &str,
-        _source_path: &str,
-        _destination_path: &Path,
+        image_name: &str,
+        source_path: &str,
+        destination_path: &Path,
     ) -> Result<(), BuilderError> {
-        Err(BuilderError::Other(
-            "Extract from image not supported on remote nodes".into(),
-        ))
+        let stream = ImageBuilder::export_path_stream(self, image_name, source_path).await?;
+        crate::docker::unpack_static_archive_stream(
+            stream,
+            image_name,
+            source_path,
+            destination_path,
+        )
+        .await
     }
 
     async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
@@ -1417,6 +1592,7 @@ mod tests {
         )
         .expect("git config");
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: source.path().to_path_buf(),
             dockerfile_path: None,
@@ -1465,28 +1641,121 @@ mod tests {
         }
     }
 
+    /// Issue #1344: a Dockerfile's `ARG` receives its value on a worker,
+    /// exactly as `docker build --build-arg` would give it locally. Only the
+    /// values the Dockerfile reads are sent, in the spec and nowhere else.
     #[test]
-    fn worker_build_refuses_dockerfile_arg_with_sensitive_arguments() {
+    fn worker_build_transfers_values_the_dockerfile_declares() {
         let source = tempfile::tempdir().expect("source");
         std::fs::write(
             source.path().join("Dockerfile"),
-            "FROM scratch\nARG TOKEN\n",
+            "# syntax=docker/dockerfile:1\nARG NODE_VERSION=22\nFROM node:${NODE_VERSION}\n\
+             ARG API_URL \\\n    BUILD_LABEL=local\nONBUILD ARG LATER\n\
+             RUN echo \"$API_URL\" > /api-url\n",
+        )
+        .expect("Dockerfile");
+        std::fs::write(source.path().join("app"), "hello").expect("app");
+        let mut request = context_request(source.path(), None);
+        for (name, value) in [
+            ("API_URL", "https://api.example.test/v1"),
+            ("BUILD_LABEL", "synthetic-label"),
+            ("UNREAD_RUNTIME_VALUE", "must-not-transfer"),
+            (CACHE_MOUNT_NAMESPACE_ARG, "ns-app-main"),
+        ] {
+            request.build_args.insert(name.into(), value.into());
+        }
+        request
+            .build_args_buildkit
+            .insert("LATER".into(), "from-buildkit-map".into());
+
+        let (archive, spec) = prepare_build_context(&request).expect("accepted");
+        assert_eq!(
+            spec.version,
+            crate::build_protocol::BUILD_PROTOCOL_VERSION_BUILD_ARGS
+        );
+        assert_eq!(spec.cache_namespace.as_deref(), Some("ns-app-main"));
+        assert_eq!(
+            spec.build_args,
+            std::collections::BTreeMap::from([
+                (
+                    "API_URL".to_string(),
+                    "https://api.example.test/v1".to_string()
+                ),
+                ("BUILD_LABEL".to_string(), "synthetic-label".to_string()),
+                ("LATER".to_string(), "from-buildkit-map".to_string()),
+            ])
+        );
+        spec.validate().expect("a worker accepts the spec");
+        let spec_json = serde_json::to_string(&spec).expect("serialize spec");
+        assert!(!spec_json.contains("must-not-transfer"), "{spec_json}");
+        // Values travel in the spec only, never in the uploaded context.
+        let mut tar = tar::Archive::new(archive.reopen().expect("reopen archive"));
+        for entry in tar.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let mut body = String::new();
+            use std::io::Read;
+            entry.read_to_string(&mut body).expect("entry body");
+            for value in ["api.example.test", "synthetic-label", "must-not-transfer"] {
+                assert!(!body.contains(value), "context carries '{value}'");
+            }
+        }
+    }
+
+    /// A value whose Dockerfile does not read it stays on the control plane,
+    /// and a build with no value to send still speaks protocol v1, so a worker
+    /// that has not been upgraded keeps building it.
+    #[test]
+    fn worker_build_sends_no_value_the_dockerfile_does_not_read() {
+        let source = tempfile::tempdir().expect("source");
+        // ARG names are case-sensitive: `temps_api_token` does not read
+        // `TEMPS_API_TOKEN`. A continued RUN line is not an ARG.
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG temps_api_token\nRUN echo build \\\n  ARG UNRELATED\n",
+        )
+        .expect("Dockerfile");
+        for buildkit in [false, true] {
+            let mut request = context_request(source.path(), None);
+            let args = if buildkit {
+                &mut request.build_args_buildkit
+            } else {
+                &mut request.build_args
+            };
+            args.insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
+            args.insert("UNRELATED".into(), "must-not-transfer".into());
+            let (_archive, spec) = prepare_build_context(&request).expect("accepted");
+            assert!(spec.build_args.is_empty());
+            assert_eq!(spec.version, crate::build_protocol::BUILD_PROTOCOL_VERSION);
+            let spec_json = serde_json::to_string(&spec).expect("serialize spec");
+            assert!(!spec_json.contains("must-not-transfer"), "{spec_json}");
+            assert!(!spec_json.contains("build_args"), "{spec_json}");
+        }
+    }
+
+    /// BuildKit's own arguments change how a worker builds (its frontend
+    /// image, cache export), so they are refused by name before anything is
+    /// uploaded, and the refusal never quotes the value.
+    #[test]
+    fn worker_build_refuses_buildkit_and_invalid_argument_names() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG BUILDKIT_SYNTAX\n",
         )
         .expect("Dockerfile");
         let mut request = context_request(source.path(), None);
-        request
-            .build_args
-            .insert("TOKEN".into(), "must-not-transfer".into());
+        request.build_args.insert(
+            "BUILDKIT_SYNTAX".into(),
+            "registry.example.test/frontend".into(),
+        );
         match prepare_build_context(&request) {
             Err(BuilderError::InvalidContext(message)) => {
-                assert!(message.contains("ARG instructions"));
-                assert!(!message.contains("must-not-transfer"));
+                assert!(message.starts_with("Worker builds cannot"), "{message}");
+                assert!(message.contains("BUILDKIT_SYNTAX"), "{message}");
+                assert!(!message.contains("registry.example.test"), "{message}");
             }
             other => panic!("expected InvalidContext, got {:?}", other.map(|_| ())),
         }
-        assert!(dockerfile_declares_build_arg(
-            "FROM base\nONBUILD ARG TOKEN\n"
-        ));
     }
 
     #[cfg(unix)]
@@ -1496,6 +1765,7 @@ mod tests {
         std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
         std::os::unix::fs::symlink("/etc/passwd", source.path().join("linked")).expect("symlink");
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: source.path().to_path_buf(),
             dockerfile_path: None,
@@ -1529,6 +1799,7 @@ mod tests {
 
     fn context_request(root: &Path, dockerfile: Option<PathBuf>) -> BuildRequest {
         BuildRequest {
+            cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: root.to_path_buf(),
             dockerfile_path: dockerfile,
@@ -1539,8 +1810,58 @@ mod tests {
         }
     }
 
+    /// The control plane's cache namespace always reaches the worker, in its
+    /// own field; a value the Dockerfile does not read stays here.
+    #[test]
+    fn worker_build_spec_carries_only_the_cache_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM scratch\nRUN --mount=type=cache,target=/cache true\n",
+        )
+        .unwrap();
+        let namespace = "0123456789abcdef".repeat(4);
+        let mut request = context_request(dir.path(), None);
+        request
+            .build_args
+            .insert(CACHE_MOUNT_NAMESPACE_ARG.into(), namespace.clone());
+        request
+            .build_args
+            .insert("DATABASE_URL".into(), "must-not-transfer".into());
+        let (_archive, spec) = prepare_build_context(&request).expect("accepted");
+        assert_eq!(spec.cache_namespace.as_deref(), Some(namespace.as_str()));
+        let wire = serde_json::to_string(&spec).expect("serialize spec");
+        assert!(wire.contains(&namespace), "{wire}");
+        assert!(!wire.contains("must-not-transfer"), "{wire}");
+
+        // No namespace planned (an older control-plane path): none is sent.
+        let (_archive, spec) =
+            prepare_build_context(&context_request(dir.path(), None)).expect("accepted");
+        assert!(spec.cache_namespace.is_none());
+
+        // A namespace a worker would refuse is refused here first.
+        let mut request = context_request(dir.path(), None);
+        request
+            .build_args
+            .insert(CACHE_MOUNT_NAMESPACE_ARG.into(), "ns with space".into());
+        assert!(matches!(
+            prepare_build_context(&request),
+            Err(BuilderError::InvalidContext(_))
+        ));
+    }
+
     /// Files the project keeps out of its image must not leave the control
     /// plane at all — `.env` files are the canonical case.
+    #[test]
+    fn worker_context_refuses_unsupported_image_cache_import() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch").unwrap();
+        let mut request = context_request(dir.path(), None);
+        request.cache_from.push("app:previous".into());
+        let error = prepare_build_context(&request).err().unwrap();
+        assert!(error.to_string().contains("cache_from"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn worker_context_archive_applies_dockerignore() {
@@ -1581,6 +1902,73 @@ mod tests {
                 "{dropped} transferred: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn worker_workspace_archive_intersects_root_and_specific_rules() {
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path();
+        for directory in ["apps/web", "private-data", "app-private", "src", "docs"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for file in [
+            "apps/web/Dockerfile",
+            "private-data/secret",
+            "app-private/secret",
+            "src/keep.ts",
+            "src/drop.ts",
+            "docs/readme",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(
+            root.join(".dockerignore"),
+            "private-data\nsrc\n!src/keep.ts\n!app-private\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/Dockerfile.dockerignore"),
+            format!("{WORKSPACE_ROOT_IGNORE_MARKER}\napp-private\n!private-data\n!src\n"),
+        )
+        .unwrap();
+        let paths = archive_paths(&context_request(
+            root,
+            Some(PathBuf::from("apps/web/Dockerfile")),
+        ));
+        for kept in [
+            "apps/web/Dockerfile",
+            "apps/web/Dockerfile.dockerignore",
+            ".dockerignore",
+            "src/keep.ts",
+            "docs/readme",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == kept),
+                "missing {kept}: {paths:?}"
+            );
+        }
+        for excluded in ["private-data/secret", "app-private/secret", "src/drop.ts"] {
+            assert!(
+                !paths.iter().any(|path| path == excluded),
+                "exposed {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_archive_rejects_invalid_root_rules_even_with_specific_ignore() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch").unwrap();
+        std::fs::write(
+            source.path().join("Dockerfile.dockerignore"),
+            WORKSPACE_ROOT_IGNORE_MARKER,
+        )
+        .unwrap();
+        std::fs::write(source.path().join(".dockerignore"), "[broken").unwrap();
+        assert!(matches!(
+            prepare_build_context(&context_request(source.path(), None)),
+            Err(BuilderError::InvalidContext(_))
+        ));
     }
 
     /// BuildKit's `<Dockerfile>.dockerignore` wins over the root file.
@@ -1693,6 +2081,145 @@ mod tests {
         assert!(request
             .to_lowercase()
             .contains("authorization: bearer token"));
+    }
+
+    /// A container-archive tar rooted at `dist/`, as Docker returns for a
+    /// download of `/app/dist`. Leaked so the one-shot agent can serve it.
+    fn container_archive(entries: &[(&str, tar::EntryType, &[u8])]) -> &'static [u8] {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, entry_type, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*entry_type);
+            header.set_path(path).expect("tar path");
+            header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
+            header.set_size(if entry_type.is_file() {
+                content.len() as u64
+            } else {
+                0
+            });
+            if entry_type.is_symlink() {
+                header.set_link_name("/etc/passwd").expect("link name");
+            }
+            header.set_cksum();
+            builder.append(&header, *content).expect("append tar entry");
+        }
+        Box::leak(builder.into_inner().expect("finish tar").into_boxed_slice())
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_unpacks_the_worker_archive_into_destination() {
+        let archive = container_archive(&[
+            ("dist/", tar::EntryType::Directory, b""),
+            (
+                "dist/index.html",
+                tar::EntryType::Regular,
+                b"<html>ok</html>",
+            ),
+            ("dist/assets/", tar::EntryType::Directory, b""),
+            (
+                "dist/assets/app.js",
+                tar::EntryType::Regular,
+                b"console.log(1)",
+            ),
+        ]);
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/x-tar", archive).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let destination = workspace.path().join("static");
+
+        remote
+            .extract_from_image("temps-site:abc", "/app/dist", &destination)
+            .await
+            .expect("worker archive unpacks");
+
+        assert_eq!(
+            std::fs::read(destination.join("index.html")).unwrap(),
+            b"<html>ok</html>"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("assets/app.js")).unwrap(),
+            b"console.log(1)"
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(
+                "GET /agent/images/extract?image=temps-site%3Aabc&path=%2Fapp%2Fdist "
+            ),
+            "{request}"
+        );
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer node-token"));
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_rejects_unsafe_worker_archive_entries() {
+        // The worker is not trusted to have filtered its own archive: a
+        // symlink must be refused by the control plane's unpacker.
+        let archive = container_archive(&[
+            ("dist/", tar::EntryType::Directory, b""),
+            ("dist/index.html", tar::EntryType::Symlink, b""),
+        ]);
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/x-tar", archive).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let destination = workspace.path().join("static");
+
+        let error = remote
+            .extract_from_image("temps-site:abc", "/app/dist", &destination)
+            .await
+            .expect_err("symlinks from a worker must be rejected");
+
+        assert!(matches!(error, BuilderError::InvalidContext(_)), "{error}");
+        assert!(error.to_string().contains("temps-site:abc"), "{error}");
+        assert!(
+            !destination.exists(),
+            "nothing may be published on rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_maps_missing_image_to_image_not_found() {
+        let (url, _server) = spawn_one_shot_agent(
+            "404 Not Found",
+            "application/problem+json",
+            br#"{"title":"Image not found","status":404,"detail":"Worker image not found: Image 'temps-site:abc' is not present on this node"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let error = remote
+            .extract_from_image("temps-site:abc", "/app/dist", &workspace.path().join("out"))
+            .await
+            .expect_err("missing image must fail");
+
+        assert!(matches!(error, BuilderError::ImageNotFound(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("builder-1"), "{message}");
+        assert!(message.contains("/app/dist"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_maps_oversized_export_to_resource_limit() {
+        let (url, _server) = spawn_one_shot_agent(
+            "413 Payload Too Large",
+            "application/problem+json",
+            br#"{"title":"Image resource limit","status":413,"detail":"too large"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let error = remote
+            .extract_from_image("temps-site:abc", "/app/dist", &workspace.path().join("out"))
+            .await
+            .expect_err("oversized export must fail");
+
+        assert!(
+            matches!(error, BuilderError::ResourceLimitExceeded(_)),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -2055,8 +2582,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A refused build argument is refused before the deployer contacts the
+    /// worker at all (the agent address here is unroutable).
     #[tokio::test]
-    async fn test_worker_build_rejects_unreviewed_build_arguments() {
+    async fn test_worker_build_refuses_invalid_build_argument_before_upload() {
         let deployer = RemoteNodeDeployer::new(
             "https://10.100.0.2:3100".to_string(),
             "token".to_string(),
@@ -2066,15 +2595,19 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         std::fs::write(
             source.path().join("Dockerfile"),
-            "FROM scratch\nARG TOKEN\n",
+            "FROM scratch\nARG BUILDKIT_INLINE_CACHE\n",
         )
         .unwrap();
         let result = deployer
             .build_image(BuildRequest {
+                cache_from: Vec::new(),
                 image_name: "test:latest".to_string(),
                 context_path: source.path().to_path_buf(),
                 dockerfile_path: None,
-                build_args: std::collections::HashMap::from([("TOKEN".into(), "secret".into())]),
+                build_args: std::collections::HashMap::from([(
+                    "BUILDKIT_INLINE_CACHE".into(),
+                    "1".into(),
+                )]),
                 build_args_buildkit: std::collections::HashMap::new(),
                 platform: None,
                 log_path: source.path().join("build.log"),

@@ -20,6 +20,7 @@ import { DeploymentContainerLogs } from '@/components/deployments/DeploymentCont
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
 import { RetainedFailedContainers } from '@/components/deployments/RetainedFailedContainers'
+import { RollbackToLastSuccessful } from '@/components/deployments/RollbackToLastSuccessful'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -48,7 +49,17 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import {
+  failedDeploymentImageRef,
+  failureSettingsLink,
+  failureStageLabel,
+  failureTimeoutSummary,
+} from '@/lib/deployment-failure-guidance'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import {
+  canRollbackTo,
+  deploymentMenuHasActions,
+} from '@/lib/deployment-rollback'
 import {
   deploymentRedeployPlan,
   resolveDeploymentSourceType,
@@ -91,6 +102,7 @@ import {
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { announceOperation } from '@/components/operations/operations-tray-store'
 
 type BadgeVariant =
   'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
@@ -403,14 +415,12 @@ function SecondaryActions({
   deployment: DeploymentResponse
   actions: OverviewActions
 }) {
-  const showMenu = ['completed', 'paused', 'running', 'pending'].includes(
-    deployment.status
-  )
+  const showMenu = deploymentMenuHasActions(deployment)
   return (
     <>
       <Button variant="outline" onClick={actions.onRedeploy} title="Redeploy">
         <RotateCw className="h-4 w-4" />
-        <span className="hidden sm:inline">Redeploy</span>
+        <span className="max-sm:sr-only">Redeploy</span>
       </Button>
       {showMenu && (
         <DropdownMenu>
@@ -439,7 +449,7 @@ function SecondaryActions({
                 Pause Deployment
               </DropdownMenuItem>
             )}
-            {deployment.status === 'completed' && (
+            {canRollbackTo(deployment) && (
               <DropdownMenuItem
                 onClick={actions.onRollback}
                 disabled={actions.rollbackPending}
@@ -465,34 +475,142 @@ function SecondaryActions({
 }
 
 // Top-level failure/cancellation banner shown directly under the header for
-// deployments that didn't succeed.
-function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
+// deployments that didn't succeed. Failed deployments also carry a server-side
+// classification (stage, code, concrete fix and the settings page that fixes
+// it), which leads the banner; the raw error stays one click away.
+function CancelledReason({
+  deployment,
+  projectSlug,
+  onEditImage,
+}: {
+  deployment: DeploymentResponse
+  projectSlug: string
+  /** Opens the redeploy dialog, where a registry image can be edited. */
+  onEditImage?: () => void
+}) {
   const [isExpanded, setIsExpanded] = useState(false)
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
   const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
+  const failure = isCancelled ? null : deployment.failure
+  const settingsLink = failure
+    ? failureSettingsLink(failure.settings_section, projectSlug)
+    : null
+  const timeoutSummary = failure ? failureTimeoutSummary(failure) : null
+  const failedImageRef = failedDeploymentImageRef(
+    failure,
+    deployment.metadata?.externalImageRef
+  )
   return (
-    <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+    <div
+      className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
+      data-testid="deployment-failure-banner"
+    >
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
-      <div className="min-w-0">
-        <p className="text-sm font-medium text-destructive">
-          {isCancelled ? 'Deployment cancelled' : 'Deployment failed'}
-        </p>
-        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-destructive/80">
-          {isExpanded ? failureReason.fullReason : failureReason.summary}
-        </p>
-        {failureReason.hasMore && (
-          <Button
-            type="button"
-            variant="link"
-            size="sm"
-            className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
-            aria-expanded={isExpanded}
-            onClick={() => setIsExpanded((expanded) => !expanded)}
-          >
-            {isExpanded ? 'Collapse error' : 'Show full error'}
-          </Button>
+      <div className="min-w-0 flex-1 space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm font-medium text-destructive">
+            {isCancelled
+              ? 'Deployment cancelled'
+              : failure
+                ? `Deployment failed: ${failure.title}`
+                : 'Deployment failed'}
+          </p>
+          {failure && (
+            <Badge
+              variant="outline"
+              className="border-destructive/30 text-destructive"
+              data-testid="deployment-failure-stage"
+            >
+              {failureStageLabel(failure.stage)}
+            </Badge>
+          )}
+          {failure && failure.code !== 'unknown' && (
+            // Opaque surface, not another destructive/10 tint: the banner it sits
+            // in is already tinted, and stacked tints measured 4.35:1.
+            <code className="rounded border border-destructive/30 bg-background px-1.5 py-0.5 text-xs text-destructive">
+              {failure.code}
+            </code>
+          )}
+        </div>
+        {failure && (
+          <div className="space-y-1.5" data-testid="deployment-failure-fix">
+            <p className="text-sm text-foreground">
+              <span className="font-medium">How to fix: </span>
+              {failure.remediation}
+            </p>
+            {(timeoutSummary || failure.failed_job) && (
+              <p className="text-xs text-muted-foreground">
+                {[
+                  failure.failed_job
+                    ? `Failed step: ${failure.failed_job}`
+                    : null,
+                  timeoutSummary,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </p>
+            )}
+            {failedImageRef && (
+              <p
+                className="text-xs text-muted-foreground"
+                data-testid="deployment-failure-image"
+              >
+                Image:{' '}
+                <code className="break-all rounded bg-muted px-1 py-0.5 font-mono text-foreground">
+                  {failedImageRef}
+                </code>
+              </p>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {failedImageRef && onEditImage && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7"
+                  onClick={onEditImage}
+                >
+                  Edit image and redeploy
+                </Button>
+              )}
+              {settingsLink && (
+                <Button asChild variant="outline" size="sm" className="h-7">
+                  <Link to={settingsLink.href}>
+                    Open {settingsLink.label}
+                    <ExternalLink className="ml-1.5 h-3 w-3" />
+                  </Link>
+                </Button>
+              )}
+            </div>
+          </div>
         )}
+        {deployment.status === 'failed' && (
+          <RollbackToLastSuccessful
+            deployment={deployment}
+            projectSlug={projectSlug}
+          />
+        )}
+        <div>
+          {failure && (
+            <p className="text-xs font-medium text-muted-foreground">Error</p>
+          )}
+          <p className="whitespace-pre-wrap break-words text-sm text-destructive">
+            {isExpanded ? failureReason.fullReason : failureReason.summary}
+          </p>
+          {failureReason.hasMore && (
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
+              aria-expanded={isExpanded}
+              onClick={() => setIsExpanded((expanded) => !expanded)}
+            >
+              {isExpanded ? 'Collapse error' : 'Show full error'}
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -615,6 +733,7 @@ function DeployFailureReport({
                 <Skeleton className="h-64 w-full" />
               ) : (
                 <Textarea
+                  aria-label="Failure report"
                   value={reportText}
                   onChange={(e) => setEditedText(e.target.value)}
                   className="h-64 font-mono text-xs"
@@ -916,7 +1035,7 @@ function DeploymentHeader({
             <Clock className="h-3.5 w-3.5" />
             {buildStats.map((stat, i) => (
               <span key={stat.label} className="inline-flex items-center gap-1">
-                {i > 0 && <span className="text-muted-foreground/40">·</span>}
+                {i > 0 && <span className="text-muted-foreground">·</span>}
                 <span>{stat.label}</span>
                 <span className="font-medium tabular-nums text-foreground">
                   {stat.value}
@@ -1011,6 +1130,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
     onSuccess: () => {
       setIsRedeployModalOpen(false)
+      announceOperation(queryClient, 'Redeploy started')
     },
   })
 
@@ -1023,6 +1143,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
     onSuccess: () => {
       setIsRedeployModalOpen(false)
+      announceOperation(queryClient, 'Redeploy started')
     },
   })
 
@@ -1033,6 +1154,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
     onSuccess: () => {
       setIsRedeployModalOpen(false)
+      announceOperation(queryClient, 'Redeploy started')
     },
   })
 
@@ -1082,7 +1204,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to rollback deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment rollback initiated successfully')
+      announceOperation(queryClient, 'Deployment rollback initiated')
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
     },
   })
@@ -1219,6 +1341,9 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           : '',
         deployment.cancelled_reason
           ? `Failure reason: ${deployment.cancelled_reason}.`
+          : '',
+        deployment.failure
+          ? `Classified as ${deployment.failure.code} in the ${deployment.failure.stage} stage. Suggested fix: ${deployment.failure.remediation}`
           : '',
         'Fetch details via the temps CLI: `deployments get_deployment`, `get_deployment_jobs`, `get_deployment_job_logs`.',
       ]
@@ -1411,7 +1536,15 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         />
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
-        <CancelledReason deployment={deployment} />
+        <CancelledReason
+          deployment={deployment}
+          projectSlug={project.slug}
+          onEditImage={
+            redeployPlan?.kind === 'docker_image'
+              ? () => setIsRedeployModalOpen(true)
+              : undefined
+          }
+        />
 
         {/* Failed Compose candidates are the primary debugging surface, so
             keep their live logs beside the concise failure summary instead

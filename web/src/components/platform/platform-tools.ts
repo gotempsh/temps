@@ -5,6 +5,7 @@ import {
   Activity,
   BarChart3,
   Bug,
+  CircleDollarSign,
   Bot,
   Box,
   Cloud,
@@ -74,11 +75,11 @@ export const platformToolGroups: PlatformToolGroup[] = [
         keywords: ['context', 'workspace', 'projects', 'services'],
       },
       {
-        title: 'Git providers',
+        title: 'Git connections',
         description: 'Connect repositories and source providers.',
         url: '/git-providers',
         icon: GitBranch,
-        keywords: ['github', 'gitlab', 'source'],
+        keywords: ['github', 'gitlab', 'providers', 'source'],
       },
     ],
   },
@@ -127,7 +128,15 @@ export const platformToolGroups: PlatformToolGroup[] = [
         description: 'Connect DNS automation providers.',
         url: '/dns-providers',
         icon: Cloud,
-        keywords: ['cloudflare', 'dns'],
+        keywords: ['cloudflare', 'bunny', 'dns'],
+      },
+      {
+        title: 'Delivery profiles',
+        description:
+          'Choose Direct, Cloudflare, or Bunny CDN delivery for project domains.',
+        url: '/delivery-profiles',
+        icon: Cloud,
+        keywords: ['delivery', 'cdn', 'cloudflare', 'bunny', 'domains'],
       },
     ],
   },
@@ -137,7 +146,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
     icon: Radar,
     items: [
       {
-        title: 'Server',
+        title: 'Server metrics',
         description:
           'CPU, memory, disk, Docker disk usage and I/O of the control-plane host.',
         url: '/monitoring/server',
@@ -150,6 +159,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
           'network',
           'host',
           'resources',
+          'server',
         ],
       },
       {
@@ -157,6 +167,22 @@ export const platformToolGroups: PlatformToolGroup[] = [
         description: 'Compare traffic across services.',
         url: '/analytics',
         icon: BarChart3,
+      },
+      {
+        title: 'Revenue',
+        description: 'Track MRR and revenue events across projects.',
+        url: '/revenue',
+        icon: CircleDollarSign,
+        keywords: [
+          'mrr',
+          'arr',
+          'stripe',
+          'payments',
+          'subscriptions',
+          'billing',
+          'churn',
+        ],
+        featureKey: 'revenue-tracking',
       },
       {
         title: 'Traces',

@@ -47,6 +47,10 @@ pub struct AppState {
     /// in the handler, so the challenge cannot drift away from the guard it
     /// protects. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Optional hook run right after the deletion fence commits, so features
+    /// that serve project data publicly stop doing so before cleanup starts.
+    /// `None` when no plugin registers one.
+    pub project_deletion_hook: Option<Arc<dyn temps_core::ProjectDeletionHook>>,
 }
 
 // Domain-related types
@@ -177,8 +181,24 @@ pub struct ProjectEnvVarInput {
     pub is_secret: bool,
 }
 
+/// Cloudflare availability and the default used by future project creation.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CloudflareProjectCapability {
+    pub configured: bool,
+    pub default_enabled: bool,
+    pub reason: Option<String>,
+    pub setup_path: Option<String>,
+    pub bunny_configured: bool,
+    pub bunny_default_enabled: bool,
+    pub bunny_reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
+    /// Override the instance default for this new project.
+    pub cloudflare_enabled: Option<bool>,
+    /// Choose a delivery provider for this project. `none` disables the global default.
+    pub delivery_provider: Option<String>,
     pub name: String,
     /// Optimistically reserved slug used by template creation to ensure the
     /// persisted project receives the URL shown during configuration.
@@ -186,8 +206,11 @@ pub struct CreateProjectRequest {
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
+    #[serde(default)]
     pub directory: String,
+    #[serde(default)]
     pub main_branch: String,
+    #[serde(default)]
     pub preset: String,
     /// Preset-specific configuration
     ///
@@ -222,6 +245,7 @@ pub struct CreateProjectRequest {
     pub is_web_app: Option<bool>,
     #[serde(default = "default_performance_metrics")]
     pub performance_metrics_enabled: bool,
+    #[serde(default)]
     pub storage_service_ids: Vec<i32>,
     pub use_default_wildcard: Option<bool>,
     pub custom_domain: Option<String>,
@@ -610,6 +634,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.max_concurrent_connections),
+                health_check_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.health_check_timeout_seconds),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
@@ -619,6 +647,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.cross_architecture_builds),
+                build_location: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.build_location),
             },
         }
     }
@@ -705,6 +737,27 @@ impl From<CustomDomainWithInfo> for CustomDomainResponse {
     }
 }
 
+/// Result of looking a hostname up among the custom domains the caller can see.
+///
+/// "Not assigned to any project" is a normal state for a certificate that has
+/// not been attached yet, so it is expressed as `custom_domain: null` with a
+/// 200 rather than a 404. A hostname that belongs to a project the caller
+/// cannot see is deliberately reported the same way.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct CustomDomainLookupResponse {
+    /// The matching assignment, or `null` when the hostname is not assigned to
+    /// a project environment visible to the caller.
+    pub custom_domain: Option<CustomDomainResponse>,
+}
+
+impl From<Option<CustomDomainWithInfo>> for CustomDomainLookupResponse {
+    fn from(value: Option<CustomDomainWithInfo>) -> Self {
+        Self {
+            custom_domain: value.map(CustomDomainResponse::from),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CheckDomainConfigurationRequest {
     pub domain: String,
@@ -747,6 +800,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// are emulated on the control plane and substantially slower, so they are
     /// opted into rather than triggered by cluster topology.
     pub cross_architecture_builds: Option<bool>,
+    /// Where source images are built: `control_plane` (the default) or
+    /// `node` to move builds onto a worker node, falling back to the control
+    /// plane when no worker can take the build. Environments inherit this
+    /// and may override it. Absent leaves the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_location: Option<temps_entities::deployment_config::BuildLocation>,
     /// Project-level default timeout for regular (non-streaming) HTTP
     /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
     /// override this; always clamped to the operator's global hard ceiling
@@ -772,6 +831,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// issue #646.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_connections: Option<i32>,
+    /// How long, in seconds (30-3600), a new deployment's containers may take
+    /// to start and pass their readiness check before the deployment fails.
+    /// Absent leaves the current value unchanged; the platform default is
+    /// 300 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_timeout_seconds: Option<i32>,
 }
 
 /// Complete replacement for the editable runtime of a single-container
@@ -1092,6 +1157,8 @@ pub struct ProjectStats {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ProjectStatisticsResponse {
     pub total_count: i64,
+    /// Whether an accessible project's deployment has reached the ready state.
+    pub has_completed_deployment: bool,
 }
 
 // Add this struct with the other response types
@@ -1188,6 +1255,12 @@ impl From<ProjectError> for Problem {
                 .with_title("Slug Already Exists")
                 .with_detail(format!("A project with slug '{}' already exists", slug)),
 
+            err @ ProjectError::NameAlreadyExists { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Name Already Exists")
+                    .with_detail(err.to_string())
+            }
+
             ProjectError::SlugConflict { slug } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Slug Conflict")
                 .with_detail(format!(
@@ -1241,6 +1314,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::DeliveryBindingsExist { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Has Active Domain Delivery")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -1248,6 +1327,12 @@ impl From<ProjectError> for Problem {
             ProjectError::InvalidGitUrl { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Git URL")
                 .with_detail(error.to_string()),
+
+            ProjectError::DirectoryNotInRepository { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Root Directory Not In Repository")
+                    .with_detail(error.to_string())
+            }
 
             // 403, not 409: the slug is not taken, the caller is not allowed
             // to take it. An admin sending the same request succeeds.
@@ -1313,6 +1398,16 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Circular Redirect")
                     .with_detail(msg)
+            }
+            CustomDomainError::DeliveryBindingExists { domain_id, binding_id } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(format!("Custom domain {domain_id} has CDN/DNS delivery binding {binding_id}; remove the domain's delivery before deleting the domain. Removing delivery requires DNS management permissions, so ask an administrator if you do not have them"))
+            }
+            CustomDomainError::DeliveryBindingBlocksChange { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(error.to_string())
             }
             CustomDomainError::InvalidRedirectUrl(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
@@ -1456,6 +1551,53 @@ mod tests {
     use axum::response::IntoResponse;
 
     #[test]
+    fn custom_domain_lookup_without_assignment_serializes_explicit_null() {
+        let response = CustomDomainLookupResponse::from(None);
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value, serde_json::json!({ "custom_domain": null }));
+    }
+
+    #[test]
+    fn custom_domain_lookup_with_assignment_wraps_the_domain() {
+        let now = chrono::Utc::now();
+        let model = temps_entities::project_custom_domains::Model {
+            id: 7,
+            project_id: 3,
+            environment_id: 5,
+            domain: "app.example.com".to_string(),
+            redirect_to: None,
+            status_code: None,
+            branch: None,
+            status: "active".to_string(),
+            message: None,
+            created_at: now,
+            updated_at: now,
+            certificate_id: None,
+            service_name: None,
+        };
+        let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
+            custom_domain: model,
+            domain_info: None,
+            environment: None,
+        }));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["custom_domain"]["id"], 7);
+        assert_eq!(value["custom_domain"]["domain"], "app.example.com");
+    }
+
+    #[test]
+    fn external_project_request_only_needs_name() {
+        let request: CreateProjectRequest = serde_json::from_value(serde_json::json!({
+            "name": "External app", "source_type": "external"
+        }))
+        .unwrap();
+        assert_eq!(request.source_type, SourceType::External);
+        assert!(request.preset.is_empty());
+        assert!(request.repo_name.is_none());
+        assert!(request.storage_service_ids.is_empty());
+    }
+
+    #[test]
     fn public_repo_rate_limit_returns_actionable_429() {
         let problem: Problem = ProjectError::PublicRepoRateLimited {
             project_id: 42,
@@ -1474,6 +1616,37 @@ mod tests {
         assert!(problem.body["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("Connect this project")));
+    }
+
+    /// Issue #1350: a root directory missing from the repository is the
+    /// caller's input to fix, so it is a 400 naming repository, branch and path.
+    #[test]
+    fn root_directory_not_in_repository_is_a_contextual_400() {
+        let problem: Problem = ProjectError::DirectoryNotInRepository {
+            repository: "example/monorepo".to_string(),
+            branch: "main".to_string(),
+            directory: "apps/apii".to_string(),
+            explanation: "'apps' has no 'apii'; it contains: api, web".to_string(),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Root Directory Not In Repository"))
+        );
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        for expected in [
+            "'apps/apii'",
+            "example/monorepo",
+            "branch 'main'",
+            "'apps' has no 'apii'; it contains: api, web",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "{expected} missing from: {detail}"
+            );
+        }
     }
 
     #[test]

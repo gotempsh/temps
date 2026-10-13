@@ -116,7 +116,23 @@ pub const METRIC_SELF_P99: &str = "proxy.self_duration_p99_ms";
 /// The two cases covered here are the ones that produce hour-long sessions by
 /// design; the rest are bounded by the upstream read timeout.
 pub const METRIC_STREAMING_SESSIONS: &str = "proxy.streaming_sessions";
+/// Requests rejected by an instance or project rate limit, or by a
+/// rate-limit blacklist entry (issue #1288).
+pub const METRIC_RATE_LIMITED: &str = "proxy.rate_limited";
 pub const METRIC_STREAMING_DURATION_AVG: &str = "proxy.streaming_duration_avg_ms";
+/// Request-log batch writes that hit a transient database conflict (deadlock
+/// or serialization failure) and were retried. Each retry of one batch counts
+/// once, so a batch that needed two retries adds 2. A non-zero value with
+/// `proxy.log_batches_dropped` at zero means the retry path is absorbing the
+/// contention and no request log was lost (issue #1425).
+pub const METRIC_LOG_WRITE_RETRIES: &str = "proxy.log_write_retries";
+/// Request-log batches abandoned after the bounded retry budget (or on a
+/// non-retryable error such as an unreachable database). Their entries are
+/// gone; see `proxy.log_entries_dropped` for how many.
+pub const METRIC_LOG_BATCHES_DROPPED: &str = "proxy.log_batches_dropped";
+/// Request-log entries lost: with the dropped batches above, plus entries shed
+/// because the writer's bounded channel was full.
+pub const METRIC_LOG_ENTRIES_DROPPED: &str = "proxy.log_entries_dropped";
 
 /// Where a request was routed. The three variants are mutually exclusive and
 /// exhaustive, so their per-interval counters always sum to `proxy.requests`.
@@ -188,6 +204,14 @@ pub struct ProxyMetrics {
     /// wall-clock lifetime. Reported separately from request latency.
     streaming_sessions: AtomicU64,
     streaming_sum_ms: AtomicU64,
+    /// Requests rejected by rate limiting (429) or a rate-limit blacklist (403).
+    rate_limited: AtomicU64,
+    /// Request-log batch writes retried after a transient DB conflict.
+    log_write_retries: AtomicU64,
+    /// Request-log batches abandoned after retries were exhausted.
+    log_batches_dropped: AtomicU64,
+    /// Request-log entries lost with the abandoned batches.
+    log_entries_dropped: AtomicU64,
 }
 
 /// Find the histogram bucket for a duration.
@@ -291,6 +315,32 @@ impl ProxyMetrics {
         }
     }
 
+    /// Count one request rejected by rate limiting. One relaxed atomic add.
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one retry of a request-log batch write. Called from the
+    /// background batch writer, never the request path.
+    pub fn record_log_write_retry(&self) {
+        self.log_write_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a request-log batch abandoned with `entries` rows. Called from the
+    /// background batch writer, never the request path.
+    pub fn record_log_batch_dropped(&self, entries: u64) {
+        self.log_batches_dropped.fetch_add(1, Ordering::Relaxed);
+        self.log_entries_dropped
+            .fetch_add(entries, Ordering::Relaxed);
+    }
+
+    /// Count request-log entries shed because the batch writer's bounded
+    /// channel was full. Called from the request path: one relaxed atomic add.
+    pub fn record_log_entries_shed(&self, entries: u64) {
+        self.log_entries_dropped
+            .fetch_add(entries, Ordering::Relaxed);
+    }
+
     /// Read a consistent-enough view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -311,6 +361,10 @@ impl ProxyMetrics {
             self_count: self.self_count.load(Ordering::Relaxed),
             streaming_sessions: self.streaming_sessions.load(Ordering::Relaxed),
             streaming_sum_ms: self.streaming_sum_ms.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            log_write_retries: self.log_write_retries.load(Ordering::Relaxed),
+            log_batches_dropped: self.log_batches_dropped.load(Ordering::Relaxed),
+            log_entries_dropped: self.log_entries_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -331,6 +385,10 @@ pub struct MetricsSnapshot {
     self_count: u64,
     streaming_sessions: u64,
     streaming_sum_ms: u64,
+    rate_limited: u64,
+    log_write_retries: u64,
+    log_batches_dropped: u64,
+    log_entries_dropped: u64,
 }
 
 impl MetricsSnapshot {
@@ -366,6 +424,16 @@ impl MetricsSnapshot {
                 .streaming_sessions
                 .saturating_sub(prev.streaming_sessions),
             streaming_sum_ms: self.streaming_sum_ms.saturating_sub(prev.streaming_sum_ms),
+            rate_limited: self.rate_limited.saturating_sub(prev.rate_limited),
+            log_write_retries: self
+                .log_write_retries
+                .saturating_sub(prev.log_write_retries),
+            log_batches_dropped: self
+                .log_batches_dropped
+                .saturating_sub(prev.log_batches_dropped),
+            log_entries_dropped: self
+                .log_entries_dropped
+                .saturating_sub(prev.log_entries_dropped),
         }
     }
 }
@@ -395,6 +463,10 @@ pub struct MetricsDelta {
     self_count: u64,
     streaming_sessions: u64,
     streaming_sum_ms: u64,
+    rate_limited: u64,
+    log_write_retries: u64,
+    log_batches_dropped: u64,
+    log_entries_dropped: u64,
 }
 
 impl MetricsDelta {
@@ -464,6 +536,26 @@ impl MetricsDelta {
             ProxySample {
                 name: METRIC_STREAMING_SESSIONS,
                 value: self.streaming_sessions as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_RATE_LIMITED,
+                value: self.rate_limited as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_LOG_WRITE_RETRIES,
+                value: self.log_write_retries as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_LOG_BATCHES_DROPPED,
+                value: self.log_batches_dropped as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_LOG_ENTRIES_DROPPED,
+                value: self.log_entries_dropped as f64,
                 is_counter: true,
             },
         ];
@@ -694,8 +786,55 @@ mod tests {
     fn test_samples_idle_interval_emits_only_counters() {
         let delta = MetricsDelta::default();
         let samples = delta.samples();
-        assert_eq!(samples.len(), 10);
+        assert_eq!(samples.len(), 14);
         assert!(samples.iter().all(|s| s.is_counter && s.value == 0.0));
+    }
+
+    #[test]
+    fn test_rate_limited_requests_are_counted_per_interval() {
+        let m = ProxyMetrics::default();
+        let first = m.snapshot();
+        m.record_rate_limited();
+        m.record_rate_limited();
+        let delta = m.snapshot().delta_since(&first);
+        let rate_limited = delta
+            .samples()
+            .into_iter()
+            .find(|s| s.name == METRIC_RATE_LIMITED)
+            .map(|s| (s.value, s.is_counter));
+        assert_eq!(rate_limited, Some((2.0, true)));
+    }
+
+    #[test]
+    fn test_log_write_retries_and_drops_are_counted_per_interval() {
+        let m = ProxyMetrics::default();
+        let first = m.snapshot();
+        m.record_log_write_retry();
+        m.record_log_write_retry();
+        m.record_log_batch_dropped(7);
+        m.record_log_batch_dropped(3);
+        let delta = m.snapshot().delta_since(&first);
+        let value_of = |name: &str| {
+            delta
+                .samples()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.value, s.is_counter))
+        };
+        assert_eq!(value_of(METRIC_LOG_WRITE_RETRIES), Some((2.0, true)));
+        assert_eq!(value_of(METRIC_LOG_BATCHES_DROPPED), Some((2.0, true)));
+        assert_eq!(value_of(METRIC_LOG_ENTRIES_DROPPED), Some((10.0, true)));
+
+        // The next interval starts from the new baseline.
+        let second = m.snapshot();
+        m.record_log_write_retry();
+        let next = m.snapshot().delta_since(&second);
+        let retries = next
+            .samples()
+            .into_iter()
+            .find(|s| s.name == METRIC_LOG_WRITE_RETRIES)
+            .map(|s| s.value);
+        assert_eq!(retries, Some(1.0));
     }
 
     /// Regression: a long-lived WebSocket/SSE session must not be booked as

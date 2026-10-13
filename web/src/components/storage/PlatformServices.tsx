@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { useAuth } from '@/contexts/AuthContext'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   kvStatusOptions,
   kvEnableMutation,
@@ -11,6 +13,10 @@ import {
   blobEnableMutation,
   blobDisableMutation,
   blobUpdateMutation,
+  kvGetSettingsOptions,
+  kvUpdateSettingsMutation,
+  blobGetSettingsOptions,
+  blobUpdateSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -47,8 +53,18 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from 'sonner'
 import { DEFAULT_RUSTFS_IMAGE } from '@/lib/service-images'
+import { problemDetail } from '@/lib/api-problem'
+import { ContainerNameField } from './ContainerNameField'
 
 type ServiceType = 'kv' | 'blob'
+
+/** The server's explanation when it refused (a 409 names the setting to change), else `fallback`. */
+function failureMessage(error: unknown, fallback: string): string {
+  return problemDetail(
+    error,
+    error instanceof Error && error.message ? error.message : fallback
+  )
+}
 
 interface EditDockerImageDialogProps {
   open: boolean
@@ -58,6 +74,7 @@ interface EditDockerImageDialogProps {
   onDockerImageChange: (image: string) => void
   onSave: (newImage: string) => void
   isPending: boolean
+  available: boolean
 }
 
 function EditDockerImageDialog({
@@ -68,9 +85,10 @@ function EditDockerImageDialog({
   onDockerImageChange,
   onSave,
   isPending,
+  available,
 }: EditDockerImageDialogProps) {
   const handleSave = () => {
-    if (dockerImage.trim()) {
+    if (available && dockerImage.trim()) {
       onSave(dockerImage.trim())
     }
   }
@@ -105,6 +123,12 @@ function EditDockerImageDialog({
             </p>
           </div>
         </div>
+        {!available && (
+          <p role="status" className="text-sm text-muted-foreground">
+            Configuration changes require administrator access and a successful
+            status check. Close this dialog and retry the status read.
+          </p>
+        )}
         <DialogFooter>
           <Button
             variant="outline"
@@ -115,7 +139,7 @@ function EditDockerImageDialog({
           </Button>
           <Button
             onClick={handleSave}
-            disabled={isPending || !dockerImage.trim()}
+            disabled={isPending || !available || !dockerImage.trim()}
           >
             {isPending ? (
               <>
@@ -134,20 +158,58 @@ function EditDockerImageDialog({
 
 export function PlatformServices() {
   const queryClient = useQueryClient()
+  const { user } = useAuth()
+  const canManage = user?.role === 'admin' || user?.role === 'platform_admin'
   const [editDialogOpen, setEditDialogOpen] = useState(false)
   const [editingService, setEditingService] = useState<ServiceType | null>(null)
   const [editDockerImage, setEditDockerImage] = useState('')
 
   // Fetch KV status
-  const { data: kvStatus, isLoading: kvLoading } = useQuery({
+  const kvQuery = useQuery({
     ...kvStatusOptions(),
     refetchInterval: 10000,
+    retry: false,
   })
 
   // Fetch Blob status
-  const { data: blobStatus, isLoading: blobLoading } = useQuery({
+  const blobQuery = useQuery({
     ...blobStatusOptions(),
     refetchInterval: 10000,
+    retry: false,
+  })
+
+  // Container names (per-instance, so several Temps instances can share a
+  // Docker host)
+  const kvSettingsQuery = useQuery({ ...kvGetSettingsOptions(), retry: false })
+  const blobSettingsQuery = useQuery({
+    ...blobGetSettingsOptions(),
+    retry: false,
+  })
+
+  const kvSettingsMut = useMutation({
+    ...kvUpdateSettingsMutation(),
+    onSuccess: () => {
+      toast.success('KV Store container name saved')
+      queryClient.invalidateQueries({
+        queryKey: kvGetSettingsOptions().queryKey,
+      })
+    },
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to save the container name'))
+    },
+  })
+
+  const blobSettingsMut = useMutation({
+    ...blobUpdateSettingsMutation(),
+    onSuccess: () => {
+      toast.success('Blob Storage container name saved')
+      queryClient.invalidateQueries({
+        queryKey: blobGetSettingsOptions().queryKey,
+      })
+    },
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to save the container name'))
+    },
   })
 
   // KV mutations
@@ -156,9 +218,12 @@ export function PlatformServices() {
     onSuccess: () => {
       toast.success('KV Store enabled successfully')
       queryClient.invalidateQueries({ queryKey: kvStatusOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: kvGetSettingsOptions().queryKey,
+      })
     },
-    onError: (error: Error) => {
-      toast.error(error.message || 'Failed to enable KV Store')
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to enable KV Store'))
     },
   })
 
@@ -192,9 +257,12 @@ export function PlatformServices() {
     onSuccess: () => {
       toast.success('Blob Storage enabled successfully')
       queryClient.invalidateQueries({ queryKey: blobStatusOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: blobGetSettingsOptions().queryKey,
+      })
     },
-    onError: (error: Error) => {
-      toast.error(error.message || 'Failed to enable Blob Storage')
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to enable Blob Storage'))
     },
   })
 
@@ -222,7 +290,8 @@ export function PlatformServices() {
     },
   })
 
-  const isLoading = kvLoading || blobLoading
+  const kvStatus = kvQuery.data
+  const blobStatus = blobQuery.data
 
   const handleEditKv = () => {
     setEditDockerImage(kvStatus?.docker_image || 'redis:8-alpine')
@@ -237,22 +306,12 @@ export function PlatformServices() {
   }
 
   const handleSaveDockerImage = (newImage: string) => {
-    if (editingService === 'kv') {
+    if (!canManage) return
+    if (editingService === 'kv' && kvQuery.isSuccess) {
       kvUpdateMut.mutate({ body: { docker_image: newImage } })
-    } else if (editingService === 'blob') {
+    } else if (editingService === 'blob' && blobQuery.isSuccess) {
       blobUpdateMut.mutate({ body: { docker_image: newImage } })
     }
-  }
-
-  if (isLoading) {
-    return (
-      <div className="space-y-6">
-        <div className="grid gap-6 md:grid-cols-2">
-          <ServiceCardSkeleton />
-          <ServiceCardSkeleton />
-        </div>
-      </div>
-    )
   }
 
   const currentServiceName =
@@ -276,7 +335,13 @@ export function PlatformServices() {
           name="KV Store"
           description="Redis-backed key-value storage for caching, sessions, and real-time data"
           icon={Database}
-          enabled={kvStatus?.enabled ?? false}
+          loading={kvQuery.isPending}
+          error={kvQuery.isError ? kvQuery.error : undefined}
+          lastChecked={kvQuery.dataUpdatedAt}
+          onRetry={() => kvQuery.refetch()}
+          retrying={kvQuery.isFetching}
+          canManage={canManage && kvQuery.isSuccess}
+          enabled={kvStatus?.enabled}
           healthy={kvStatus?.healthy ?? false}
           version={kvStatus?.version}
           dockerImage={kvStatus?.docker_image}
@@ -286,6 +351,23 @@ export function PlatformServices() {
             'Atomic operations (INCR, DECR)',
             'Pattern-based key matching',
           ]}
+          containerName={
+            <ContainerNameField
+              serviceName="KV Store"
+              settings={kvSettingsQuery.data}
+              isLoading={kvSettingsQuery.isPending}
+              error={kvSettingsQuery.isError ? kvSettingsQuery.error : undefined}
+              canManage={canManage}
+              isSaving={kvSettingsMut.isPending}
+              onSave={(container_name, onSaved) =>
+                kvSettingsMut.mutate(
+                  { body: { container_name } },
+                  { onSuccess: onSaved }
+                )
+              }
+              onRetry={() => kvSettingsQuery.refetch()}
+            />
+          }
           onEnable={() => kvEnableMut.mutate({ body: {} })}
           onDisable={() => kvDisableMut.mutate({})}
           onEdit={handleEditKv}
@@ -298,7 +380,13 @@ export function PlatformServices() {
           name="Blob Storage"
           description="S3-compatible object storage for files, images, and large data"
           icon={HardDrive}
-          enabled={blobStatus?.enabled ?? false}
+          loading={blobQuery.isPending}
+          error={blobQuery.isError ? blobQuery.error : undefined}
+          lastChecked={blobQuery.dataUpdatedAt}
+          onRetry={() => blobQuery.refetch()}
+          retrying={blobQuery.isFetching}
+          canManage={canManage && blobQuery.isSuccess}
+          enabled={blobStatus?.enabled}
           healthy={blobStatus?.healthy ?? false}
           version={blobStatus?.version}
           dockerImage={blobStatus?.docker_image}
@@ -308,6 +396,25 @@ export function PlatformServices() {
             'Streaming uploads/downloads',
             'Prefix-based listing',
           ]}
+          containerName={
+            <ContainerNameField
+              serviceName="Blob Storage"
+              settings={blobSettingsQuery.data}
+              isLoading={blobSettingsQuery.isPending}
+              error={
+                blobSettingsQuery.isError ? blobSettingsQuery.error : undefined
+              }
+              canManage={canManage}
+              isSaving={blobSettingsMut.isPending}
+              onSave={(container_name, onSaved) =>
+                blobSettingsMut.mutate(
+                  { body: { container_name } },
+                  { onSuccess: onSaved }
+                )
+              }
+              onRetry={() => blobSettingsQuery.refetch()}
+            />
+          }
           onEnable={() => blobEnableMut.mutate({ body: {} })}
           onDisable={() => blobDisableMut.mutate({})}
           onEdit={handleEditBlob}
@@ -328,6 +435,10 @@ export function PlatformServices() {
         onDockerImageChange={setEditDockerImage}
         onSave={handleSaveDockerImage}
         isPending={kvUpdateMut.isPending || blobUpdateMut.isPending}
+        available={
+          canManage &&
+          (editingService === 'kv' ? kvQuery.isSuccess : blobQuery.isSuccess)
+        }
       />
     </div>
   )
@@ -337,11 +448,19 @@ interface ServiceCardProps {
   name: string
   description: string
   icon: React.ComponentType<{ className?: string }>
-  enabled: boolean
+  loading: boolean
+  error?: unknown
+  lastChecked: number
+  onRetry: () => void
+  retrying: boolean
+  canManage: boolean
+  enabled?: boolean
   healthy: boolean
   version?: string | null
   dockerImage?: string | null
   features: string[]
+  /** The container-name setting; shown whether or not the service is enabled. */
+  containerName: React.ReactNode
   onEnable: () => void
   onDisable: () => void
   onEdit: () => void
@@ -353,21 +472,30 @@ function ServiceCard({
   name,
   description,
   icon: Icon,
+  loading,
+  error,
+  lastChecked,
+  onRetry,
+  retrying,
+  canManage,
   enabled,
   healthy,
   version,
   dockerImage,
   features,
+  containerName,
   onEnable,
   onDisable,
   onEdit,
   isEnabling,
   isDisabling,
 }: ServiceCardProps) {
-  const isPending = isEnabling || isDisabling
+  const isPending = isEnabling || isDisabling || !canManage
+  const unknown = !!error || enabled === undefined
+  if (loading) return <ServiceCardSkeleton />
 
   return (
-    <Card className="flex flex-col">
+    <Card className="flex flex-col shadow-none">
       <CardHeader>
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
@@ -378,11 +506,23 @@ function ServiceCard({
               <CardTitle className="text-lg">{name}</CardTitle>
               <Badge
                 variant={
-                  enabled ? (healthy ? 'default' : 'destructive') : 'secondary'
+                  unknown
+                    ? 'secondary'
+                    : enabled
+                      ? healthy
+                        ? 'default'
+                        : 'destructive'
+                      : 'secondary'
                 }
                 className="mt-1"
               >
-                {enabled ? (
+                {unknown ? (
+                  lastChecked ? (
+                    'Status unavailable · stale'
+                  ) : (
+                    'Status unknown'
+                  )
+                ) : enabled ? (
                   healthy ? (
                     <>
                       <CheckCircle2 className="h-3 w-3 mr-1" />
@@ -408,6 +548,7 @@ function ServiceCard({
               variant="ghost"
               size="icon"
               onClick={onEdit}
+              disabled={isPending}
               title="Edit configuration"
             >
               <Settings className="h-4 w-4" />
@@ -418,6 +559,33 @@ function ServiceCard({
       </CardHeader>
 
       <CardContent className="flex-1 space-y-4">
+        {error != null && (
+          <ReadFailure
+            embedded
+            resource={`${name} status`}
+            error={error}
+            cached={lastChecked > 0}
+            onRetry={onRetry}
+            retrying={retrying}
+          />
+        )}
+        <p className="text-xs text-muted-foreground">
+          Last checked:{' '}
+          {lastChecked
+            ? new Date(lastChecked).toLocaleString()
+            : 'Never successfully checked'}
+        </p>
+        {unknown && lastChecked > 0 && (
+          <p className="text-sm text-muted-foreground">
+            Last known state:{' '}
+            {enabled ? (healthy ? 'Healthy' : 'Unhealthy') : 'Disabled'}
+          </p>
+        )}
+        {!canManage && !unknown && (
+          <p className="text-sm text-muted-foreground">
+            Administrator permission is required to change platform services.
+          </p>
+        )}
         {enabled && (
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="p-3 rounded-lg border bg-muted/30">
@@ -435,6 +603,8 @@ function ServiceCard({
           </div>
         )}
 
+        {containerName}
+
         <div>
           <h4 className="text-sm font-medium mb-2">Features</h4>
           <ul className="text-sm text-muted-foreground space-y-1">
@@ -449,7 +619,7 @@ function ServiceCard({
       </CardContent>
 
       <div className="p-6 pt-0">
-        {enabled ? (
+        {enabled === undefined ? null : enabled ? (
           <Button
             variant="destructive"
             className="w-full gap-2"

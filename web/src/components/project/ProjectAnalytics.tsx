@@ -49,6 +49,8 @@ import { ApiTrafficTab } from '@/components/analytics/ApiTraffic'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
+import { AnalyticsOnboardingGate } from '@/components/analytics/AnalyticsOnboardingGate'
+import { requestLogsRedirectPath } from '@/components/analytics/analytics-legacy-routes'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Button } from '@/components/ui/button'
 import {
@@ -109,7 +111,6 @@ import { cn } from '@/lib/utils'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
 import { EditFunnel } from '@/pages/EditFunnel'
-import RequestLogs from '@/pages/RequestLogs'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { toast } from 'sonner'
@@ -138,6 +139,7 @@ import {
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import {
+  Navigate,
   Route,
   Routes,
   useLocation,
@@ -256,7 +258,7 @@ export function AnalyticsFilters({
             onEnvironmentChange(value ? parseInt(value) : undefined)
           }
         >
-          <SelectTrigger className="w-[200px]">
+          <SelectTrigger aria-label="Environment" className="w-[200px]">
             <SelectValue placeholder="All environments" />
           </SelectTrigger>
           <SelectContent>
@@ -1170,6 +1172,18 @@ interface ProjectAnalyticsProps {
   project: ProjectResponse
 }
 
+/**
+ * Request logs used to be mounted a second time under analytics; keep old
+ * links working by sending them to the canonical Request logs page.
+ */
+function RequestLogsRedirect({ projectSlug }: { projectSlug: string }) {
+  const { '*': rest = '' } = useParams()
+  const { search } = useLocation()
+  return (
+    <Navigate to={requestLogsRedirectPath(projectSlug, rest, search)} replace />
+  )
+}
+
 export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
   return (
     <Routes>
@@ -1178,11 +1192,18 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         path="activity"
         element={<ActivityReportPage project={project} />}
       />
-      <Route path="requests/*" element={<RequestLogs project={project} />} />
+      <Route
+        path="requests/*"
+        element={<RequestLogsRedirect projectSlug={project.slug} />}
+      />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
       <Route
         path="live-visitors"
-        element={<LiveVisitors project={project} />}
+        element={
+          <AnalyticsOnboardingGate project={project} feature="live-visitors">
+            <LiveVisitors project={project} />
+          </AnalyticsOnboardingGate>
+        }
       />
       <Route
         path="visitors/*"
@@ -1209,9 +1230,23 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="replays" element={<SessionReplaysTab project={project} />} />
       <Route path="api-traffic" element={<ApiTrafficTab project={project} />} />
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
-      <Route path="live" element={<LiveGlobePage project={project} />} />
+      <Route
+        path="live"
+        element={
+          <AnalyticsOnboardingGate project={project} feature="live-globe">
+            <LiveGlobePage project={project} />
+          </AnalyticsOnboardingGate>
+        }
+      />
       <Route path="globe" element={<VisitorGlobePage project={project} />} />
-      <Route path="journey" element={<JourneyTab project={project} />} />
+      <Route
+        path="journey"
+        element={
+          <AnalyticsOnboardingGate project={project} feature="journey">
+            <JourneyTab project={project} />
+          </AnalyticsOnboardingGate>
+        }
+      />
     </Routes>
   )
 }
@@ -1373,7 +1408,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                 <Button
                   variant="link"
                   size="sm"
-                  className="text-yellow-600 dark:text-yellow-400"
+                  className="text-yellow-700 dark:text-yellow-400"
                   onClick={() =>
                     navigate(`/projects/${project.slug}/analytics/setup`)
                   }
@@ -1903,6 +1938,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             <div className="space-y-1.5">
               <div className="flex gap-2">
                 <Input
+                  aria-label="Public key"
                   value={primaryKey.public_key}
                   readOnly
                   className="font-mono text-sm"

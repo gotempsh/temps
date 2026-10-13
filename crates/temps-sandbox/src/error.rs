@@ -43,6 +43,14 @@ pub enum SandboxSnapshotError {
     #[error("Snapshot is not supported by backend '{backend}'")]
     NotSupported { backend: String },
 
+    /// Snapshots are not available yet for sandboxes on worker nodes
+    /// (ADR-048 phase 2). Refused before anything touches the sandbox.
+    #[error(
+        "Snapshots are not available yet for sandboxes on worker nodes (this sandbox runs on node '{node}'). \
+         Create the sandbox on the control plane (`--node control-plane`) to snapshot it."
+    )]
+    NotOnWorkerNode { node: String },
+
     /// A snapshot for this user is already in progress (`creating` status).
     ///
     /// Only one snapshot per user may be in flight at a time to prevent the
@@ -160,6 +168,17 @@ pub enum SandboxError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    /// The container runtime could not pull the sandbox image: the tag is
+    /// not published, the registry is unreachable or access was denied.
+    /// Mapped to HTTP 503: the request is valid and retrying can succeed once
+    /// the image is available, but nothing about the request itself can fix it.
+    #[error("Sandbox image '{image}' could not be pulled for sandbox {sandbox_id}: {reason}")]
+    ImageUnavailable {
+        sandbox_id: String,
+        image: String,
+        reason: String,
+    },
+
     /// The sandbox exists but is not in a state that allows the requested
     /// operation (e.g. exec on a stopped sandbox). Mapped to HTTP 409.
     #[error("Sandbox {sandbox_id} is in state '{state}' — cannot {operation}")]
@@ -208,6 +227,61 @@ pub enum SandboxError {
     #[error("Sandbox subsystem unavailable: {reason}")]
     Unavailable { reason: String },
 
+    /// A sandbox's worker node could not destroy it: unreachable, or it did
+    /// not answer in time. The sandbox is kept (ADR-048 §7), so its
+    /// container is not left running with nothing tracking it. Mapped to 503.
+    #[error("Sandbox {sandbox_id} was not destroyed: its node '{node}' is unreachable ({reason}). It is kept so its container is not left running untracked. Try again once the node is back. If the node is gone for good, an administrator can destroy every sandbox on it from the node's Sandboxes tab or with `bunx @temps-sdk/cli sandbox nodes evict {node}`.")]
+    NodeUnreachable {
+        sandbox_id: String,
+        node: String,
+        reason: String,
+    },
+
+    /// The sandbox runs on a worker node, which cannot serve this feature
+    /// yet (ADR-048 phase 1). The request is well-formed; it just cannot be
+    /// served where the sandbox lives. Mapped to HTTP 422.
+    #[error(
+        "{feature} is not available yet for sandboxes on worker nodes (sandbox {sandbox_id} runs on node '{node_name}'). Create the sandbox on the control plane (`--node control-plane`) to use it."
+    )]
+    UnsupportedOnWorkerNode {
+        sandbox_id: String,
+        node_name: String,
+        feature: String,
+    },
+
+    /// The sandbox's worker node refused the operation because it would
+    /// replace a live sandbox there (ADR-048). Mapped to HTTP 409.
+    #[error("Sandbox {sandbox_id} conflicts with existing state on its worker node: {reason}")]
+    NodeConflict { sandbox_id: String, reason: String },
+
+    /// The requested node does not exist (ADR-048).
+    #[error("Node '{node}' does not exist. List the nodes that can run sandboxes with `bunx @temps-sdk/cli sandbox nodes`.")]
+    NodeNotFound { node: String },
+
+    /// The requested node exists but the operator excluded it from sandbox
+    /// placement (ADR-048).
+    #[error("Node '{node}' is not allowed to run sandboxes. An administrator can allow it under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    NodeNotAllowed { node: String },
+
+    /// The requested node is allowed but not accepting new sandboxes
+    /// (offline, draining, pending enrollment).
+    #[error("Node '{node}' is {status} and cannot take new sandboxes right now. Pick another node or wait until it is active.")]
+    NodeNotReady { node: String, status: String },
+
+    /// No node is eligible for automatic placement (ADR-048).
+    #[error("No node can run sandboxes: every allowed node is offline or the allow-list is empty. Allow a node under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    NoPlacementNode,
+
+    /// Automatic placement found only dedicated nodes
+    /// (`temps.sh/role=dedicated`), which take a sandbox only when it asks
+    /// for them by id or name.
+    #[error("No node can take this sandbox automatically: {nodes}. Request a dedicated node explicitly by passing its id or name as `node`, or allow a node without the temps.sh/role=dedicated label under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    DedicatedNodesOnly {
+        /// The dedicated nodes passed over, formatted as
+        /// `node <id> (<name>) is dedicated …`.
+        nodes: String,
+    },
+
     /// The sandbox is attached to a project but that project has no active
     /// environment from which scoped service credentials can be issued.
     #[error("Project {project_id} attached to sandbox {sandbox_id} has no active environment")]
@@ -252,6 +326,26 @@ pub enum SandboxError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Automatic placement found allowed, active nodes, but none of them
+    /// could run a sandbox when asked (ADR-048). `reasons` names each node
+    /// tried and why it failed. Mapped to 422.
+    #[error("No node can run sandboxes right now: {reasons}. Fix the node (or allow another one under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`), then try again.")]
+    NoReadyPlacementNode { reasons: String },
+
+    /// Another eviction of the same node is still running (ADR-048).
+    /// Mapped to 409.
+    #[error("Sandboxes on node '{node}' are already being evicted. Wait for that eviction to finish, then check the node's Sandboxes tab and run the eviction again if any are left.")]
+    NodeEvictionInProgress { node: String },
+
+    /// The platform settings holding the sandbox placement allow-list could
+    /// not be read or written. Mapped to 500.
+    #[error("Could not {operation} the sandbox placement settings: {source}")]
+    PlacementSettings {
+        operation: &'static str,
+        #[source]
+        source: temps_config::ConfigServiceError,
+    },
 }
 
 /// Translate a lower-level `AgentError` from the shared `SandboxProvider`
@@ -260,6 +354,13 @@ pub enum SandboxError {
 /// caller is responsible for passing the public `sandbox_id` so users see
 /// the opaque ID, not the internal integer.
 pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
+    if let Some((image, reason)) = err.image_pull_failure() {
+        return SandboxError::ImageUnavailable {
+            sandbox_id: sandbox_id.to_string(),
+            image: image.to_string(),
+            reason: reason.to_string(),
+        };
+    }
     match err {
         AgentError::SandboxNotFound { .. } => SandboxError::NotFound {
             sandbox_id: sandbox_id.to_string(),
@@ -271,7 +372,31 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         limit_error @ AgentError::SnapshotSizeLimitExceeded { .. } => SandboxError::Validation {
             message: limit_error.to_string(),
         },
+        // A request the provider (or a worker node, ADR-048) rejected as
+        // invalid is the caller's error, not a failed exec.
+        AgentError::Validation { message } => SandboxError::Validation { message },
         AgentError::Io(e) => SandboxError::Io(e),
+        // ADR-048: a feature sandboxes on worker nodes cannot serve yet — a
+        // 422 naming the feature and node, not a failed exec.
+        AgentError::SandboxUnsupportedOnNode {
+            node_name, feature, ..
+        } => SandboxError::UnsupportedOnWorkerNode {
+            sandbox_id: sandbox_id.to_string(),
+            node_name,
+            feature,
+        },
+        // ADR-048: the worker refused to replace a live sandbox — a 409, and
+        // nothing is torn down for it.
+        conflict @ AgentError::SandboxConflictOnNode { .. } => SandboxError::NodeConflict {
+            sandbox_id: sandbox_id.to_string(),
+            reason: conflict.to_string(),
+        },
+        // ADR-048: the worker hosting the sandbox is offline or unreachable —
+        // a 503 with the node named, not a generic exec failure.
+        node_error @ (AgentError::SandboxNodeUnavailable { .. }
+        | AgentError::SandboxProviderUnavailable { .. }) => SandboxError::Unavailable {
+            reason: node_error.to_string(),
+        },
         other => SandboxError::ExecFailed {
             sandbox_id: sandbox_id.to_string(),
             reason: other.to_string(),
@@ -282,6 +407,80 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_conflicts_are_409s_not_failures() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxConflictOnNode {
+                sandbox: "temps-sandbox-abc".into(),
+                node_name: "worker-1".into(),
+                reason: "already exists and is running".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::NodeConflict { sandbox_id, reason }
+                if sandbox_id == "sbx_abc" && reason.contains("worker-1")),
+            "{err:?}"
+        );
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn image_pull_failures_become_image_unavailable_with_image_and_cause() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 3,
+                provider: "docker".into(),
+                reason: temps_agents::error::image_pull_failure_reason(
+                    "registry.example.test/team/img:9.9.9",
+                    "manifest unknown",
+                ),
+            },
+        );
+        match &err {
+            SandboxError::ImageUnavailable {
+                sandbox_id,
+                image,
+                reason,
+            } => {
+                assert_eq!(sandbox_id, "sbx_abc");
+                assert_eq!(image, "registry.example.test/team/img:9.9.9");
+                assert_eq!(reason, "manifest unknown");
+            }
+            other => panic!("expected ImageUnavailable, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("registry.example.test/team/img:9.9.9"));
+        assert!(message.contains("sbx_abc"));
+        assert!(message.contains("manifest unknown"));
+    }
+
+    #[test]
+    fn other_creation_failures_stay_generic_exec_failures() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 3,
+                provider: "docker".into(),
+                reason: "no space left on device".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::ExecFailed { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn provider_validation_errors_stay_validation_errors() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::Validation {
+                message: "bad path".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Validation { ref message } if message == "bad path"));
+    }
 
     #[test]
     fn not_found_message_includes_id() {
@@ -343,7 +542,10 @@ mod tests {
 
     #[test]
     fn from_agent_error_preserves_not_found() {
-        let agent = AgentError::SandboxNotFound { run_id: 42 };
+        let agent = AgentError::SandboxNotFound {
+            run_id: 42,
+            sandbox: "sbx_test".into(),
+        };
         let err = from_agent_error("sbx_public", agent);
         assert!(matches!(err, SandboxError::NotFound { .. }));
         // The public ID propagates, not the internal run_id
@@ -367,6 +569,58 @@ mod tests {
             }
             other => panic!("expected ExecFailed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn unsupported_on_node_keeps_the_public_id_node_and_feature() {
+        let err = from_agent_error(
+            "sbx_pub",
+            AgentError::SandboxUnsupportedOnNode {
+                sandbox_id: "temps-sandbox-abc".into(),
+                node_name: "worker-2".into(),
+                feature: "The interactive terminal".into(),
+            },
+        );
+        match &err {
+            SandboxError::UnsupportedOnWorkerNode {
+                sandbox_id,
+                node_name,
+                feature,
+            } => {
+                assert_eq!(sandbox_id, "sbx_pub");
+                assert_eq!(node_name, "worker-2");
+                assert_eq!(feature, "The interactive terminal");
+            }
+            other => panic!("expected UnsupportedOnWorkerNode, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_pub"), "{msg}");
+        assert!(msg.contains("worker-2"), "{msg}");
+        assert!(!msg.contains("temps-sandbox-abc"), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_on_worker_node_is_a_422_problem_with_its_own_type() {
+        let problem =
+            temps_core::problemdetails::Problem::from(SandboxError::UnsupportedOnWorkerNode {
+                sandbox_id: "sbx_pub".into(),
+                node_name: "worker-2".into(),
+                feature: "Disk resize".into(),
+            });
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            problem.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("Disk resize") && detail.contains("worker-2"));
     }
 
     #[test]

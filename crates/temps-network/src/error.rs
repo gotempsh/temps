@@ -121,6 +121,18 @@ pub enum NetworkError {
         device: String,
     },
 
+    #[error(
+        "WireGuard mesh pool {pool} overlaps host route {existing_cidr} on device '{device}'; \
+         the mesh would shadow that network. Pick another pool with \
+         `temps network setup-multi-node --wireguard --wireguard-cidr <cidr>` before nodes join, \
+         or free that range on this host"
+    )]
+    MeshRouteCollision {
+        pool: Ipv4Net,
+        existing_cidr: Ipv4Net,
+        device: String,
+    },
+
     // ----- config / validation -----
     /// The provided config was internally inconsistent (e.g. peer CIDR
     /// overlaps the node's own CIDR).

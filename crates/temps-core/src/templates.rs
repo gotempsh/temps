@@ -679,13 +679,13 @@ fn default_version() -> String {
 
 impl TemplatesConfig {
     /// Parse configuration from YAML string
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, yaml_serde::Error> {
+        yaml_serde::from_str(yaml)
     }
 
     /// Serialize configuration to YAML string
-    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
-        serde_yaml::to_string(self)
+    pub fn to_yaml(&self) -> Result<String, yaml_serde::Error> {
+        yaml_serde::to_string(self)
     }
 
     /// Load configuration from a file path
@@ -744,7 +744,11 @@ pub fn managed_service_types_compatible(required: &str, selected: &str) -> bool 
     canonical_managed_service_type(required) == canonical_managed_service_type(selected)
 }
 
-fn is_pinned_image_reference(image: &str) -> bool {
+/// Whether `image` is an immutable reference: `name@sha256:<64 hex>`
+/// (optionally `name:tag@sha256:…`). Template deployments of every kind only
+/// accept these, so a mutable tag can never silently change what a template
+/// runs.
+pub fn is_pinned_image_reference(image: &str) -> bool {
     image.rsplit_once('@').is_some_and(|(name, digest)| {
         !name.trim().is_empty()
             && digest.strip_prefix("sha256:").is_some_and(|hash| {
@@ -950,7 +954,7 @@ fn parse_bundled_templates(
     let mut templates = Vec::with_capacity(files.len());
     let mut slug_sources = BTreeMap::new();
     for (path, yaml) in files {
-        let template: ProjectTemplate = serde_yaml::from_str(yaml).map_err(|error| {
+        let template: ProjectTemplate = yaml_serde::from_str(yaml).map_err(|error| {
             TemplateConfigError::ParseError(format!(
                 "Failed to parse bundled template '{path}': {error}"
             ))
@@ -2138,6 +2142,61 @@ templates:
         );
     }
 
+    /// Template deployments reject mutable image tags, so a curated template
+    /// with one could never be deployed (it failed the first-run demo with
+    /// "use an immutable image reference ending in @sha256:…").
+    #[test]
+    fn bundled_template_images_are_pinned_by_digest() {
+        let config = bundled_templates_config().expect("bundled templates must parse");
+        let unpinned: Vec<String> = config
+            .templates
+            .iter()
+            .filter_map(|template| {
+                let image = template.primary().image.as_deref()?.trim();
+                (!image.is_empty() && !is_pinned_image_reference(image))
+                    .then(|| format!("{}: {}", template.slug, image))
+            })
+            .collect();
+        assert!(
+            unpinned.is_empty(),
+            "bundled templates must pin images as name@sha256:<64 hex>; unpinned: {:?}",
+            unpinned
+        );
+
+        let starter = config
+            .get_by_slug("observability-starter")
+            .expect("observability-starter template must exist");
+        assert!(
+            starter
+                .primary()
+                .image
+                .as_deref()
+                .is_some_and(is_pinned_image_reference),
+            "the first-run demo must deploy from a pinned image"
+        );
+    }
+
+    #[test]
+    fn pinned_image_reference_rules() {
+        let digest = "a".repeat(64);
+        assert!(is_pinned_image_reference(&format!(
+            "ghcr.io/example/app@sha256:{digest}"
+        )));
+        assert!(is_pinned_image_reference(&format!(
+            "ghcr.io/example/app:1.2.3@sha256:{digest}"
+        )));
+        assert!(!is_pinned_image_reference("ghcr.io/example/app:latest"));
+        assert!(!is_pinned_image_reference(&format!("@sha256:{digest}")));
+        assert!(!is_pinned_image_reference("ghcr.io/example/app@sha256:abc"));
+        assert!(!is_pinned_image_reference(&format!(
+            "ghcr.io/example/app@sha512:{digest}"
+        )));
+        assert!(!is_pinned_image_reference(&format!(
+            "ghcr.io/example/app@sha256:{}",
+            "g".repeat(64)
+        )));
+    }
+
     #[test]
     fn bundled_template_files_are_sorted_deterministically() {
         let alpha = r#"
@@ -2518,7 +2577,7 @@ routes:
     #[test]
     fn a_template_can_list_several_services() {
         let template: ProjectTemplate =
-            serde_yaml::from_str(MULTI_SERVICE).expect("multi-service template parses");
+            yaml_serde::from_str(MULTI_SERVICE).expect("multi-service template parses");
 
         assert_eq!(template.kind, TemplateKind::App);
         assert!(template.is_multi_service());
@@ -2667,7 +2726,7 @@ routes:
     #[test]
     fn explicit_service_names_are_still_validated() {
         let template: ProjectTemplate =
-            serde_yaml::from_str(MULTI_SERVICE).expect("multi-service template parses");
+            yaml_serde::from_str(MULTI_SERVICE).expect("multi-service template parses");
         let mut template = template;
         template.services[0].name = "Not_A_Label".to_string();
         let errors = TemplateService::validate_template(&template);
@@ -2682,7 +2741,7 @@ routes:
     #[test]
     fn a_snapshot_names_the_service_it_belongs_to() {
         let template: ProjectTemplate =
-            serde_yaml::from_str(MULTI_SERVICE).expect("multi-service template parses");
+            yaml_serde::from_str(MULTI_SERVICE).expect("multi-service template parses");
         let instance = ServiceTemplateInstance::new(SERVICE_TEMPLATE_SCHEMA_VERSION, template)
             .for_service("frontend");
         assert_eq!(
@@ -2709,7 +2768,7 @@ services:
   - name: web
     preset: nextjs
 "#;
-        let error = serde_yaml::from_str::<ProjectTemplate>(yaml)
+        let error = yaml_serde::from_str::<ProjectTemplate>(yaml)
             .expect_err("a template cannot use both shapes");
         assert!(error
             .to_string()
@@ -2719,7 +2778,7 @@ services:
     #[test]
     fn references_between_services_are_checked() {
         let mut template: ProjectTemplate =
-            serde_yaml::from_str(MULTI_SERVICE).expect("multi-service template parses");
+            yaml_serde::from_str(MULTI_SERVICE).expect("multi-service template parses");
         template.routes.push(TemplateRoute {
             source: "frontend".to_string(),
             prefix: "/admin".to_string(),
@@ -2755,7 +2814,7 @@ services:
     #[test]
     fn services_of_an_app_may_build_from_a_pinned_source() {
         let mut template: ProjectTemplate =
-            serde_yaml::from_str(MULTI_SERVICE).expect("multi-service template parses");
+            yaml_serde::from_str(MULTI_SERVICE).expect("multi-service template parses");
         assert!(template.services.iter().all(|service| !service.is_image()));
         assert!(TemplateService::validate_template(&template).is_empty());
 

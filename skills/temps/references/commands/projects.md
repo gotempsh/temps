@@ -13,6 +13,7 @@ Manage projects
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
@@ -121,7 +122,18 @@ Create a new project (git-based or manual deployment)
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
 | `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it | - | No |
+| `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+
+### `projects cloudflare-capability` (alias: `delivery-capability`)
+
+Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `projects show` (alias: `get`)
 

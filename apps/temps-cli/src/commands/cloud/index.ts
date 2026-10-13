@@ -19,6 +19,7 @@ import { promptConfirm } from '../../ui/prompts.js'
 import { getCloudUrl, cloudFetch, isCloudAuthenticated } from '../../lib/cloud-client.js'
 import { registerCloudVpsCommands } from './vps.js'
 import { registerCloudBillingCommands } from './billing.js'
+import { registerCloudConsoleAccessCommands } from './console-access.js'
 import {
   registerCloudTelemetryCommands,
   type CloudTelemetryWriteStatus,
@@ -452,5 +453,6 @@ export function registerCloudCommands(program: Command): void {
 
   registerCloudVpsCommands(cloud)
   registerCloudBillingCommands(cloud)
+  registerCloudConsoleAccessCommands(cloud)
   registerCloudTelemetryCommands(cloud)
 }

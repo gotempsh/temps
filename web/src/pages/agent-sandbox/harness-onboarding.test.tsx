@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ProviderCatalogDto } from '@/api/client'
-import { HarnessSetupCard } from './AgentSandboxProvidersList'
+import { HarnessSetupRow } from './AgentSandboxProvidersList'
 import { ProviderEditor } from './AgentSandboxProviderDetail'
 import { WorkspaceHarnessSetup } from '@/components/ai-first/WorkspaceHarnessSetup'
 import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
@@ -15,6 +15,11 @@ import {
   harnessSectionHref,
   harnessCheckError,
   harnessSetupStatus,
+  harnessConnectionMethods,
+  initialConnectionMethodId,
+  openAiCompatibleCredential,
+  openAiCompatibleModelSelection,
+  openAiCompatibleUpstreamModel,
   workspaceReturnTo,
   credentialVerificationMessage,
 } from './harness-onboarding'
@@ -104,43 +109,147 @@ describe('harness onboarding', () => {
       ).toBe('/ai-first')
     }
   })
-  test('Codex offers three connection cards without exposing every form', () => {
+  test('Codex shows one method at a time and prefers a detected host login', () => {
+    const codex: ProviderCatalogDto = {
+      ...provider,
+      id: 'codex_cli',
+      name: 'Codex',
+      auth_flavors: [
+        {
+          id: 'subscription',
+          label: 'ChatGPT subscription',
+          description: 'Run `codex login`, then paste `~/.codex/auth.json`.',
+          format: 'config_file',
+          env_var: null,
+        },
+        {
+          id: 'api_key',
+          label: 'API key',
+          description: 'Paste an OpenAI API key.',
+          format: 'api_key',
+          env_var: null,
+        },
+      ],
+      local_credential: {
+        auth_type: 'subscription',
+        source: 'host_auth_store',
+        label: 'Authenticated host CLI',
+      },
+    }
     const html = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
-          <ProviderEditor
-            provider={{
-              ...provider,
-              id: 'codex_cli',
-              name: 'Codex',
-              auth_flavors: [
-                {
-                  id: 'subscription',
-                  label: 'Subscription',
-                  description: 'auth.json',
-                  format: 'config_file',
-                  env_var: null,
-                },
-                {
-                  id: 'api_key',
-                  label: 'API key',
-                  description: 'OpenAI key',
-                  format: 'api_key',
-                  env_var: null,
-                },
-              ],
-            }}
-            isActive={false}
-          />
+          <ProviderEditor provider={codex} isActive={false} />
         </MemoryRouter>
       </QueryClientProvider>
     )
-    expect(html).toContain('Use local login')
-    expect(html).toContain('Subscription')
-    expect(html).toContain('OpenAI API key')
+    expect(html).toContain('aria-label="Connection method"')
+    expect(html).toContain('Login on this server')
+    expect(html).toContain('ChatGPT subscription')
+    expect(html).toContain('API key')
+    // Only the selected method's form is mounted.
+    expect(html).toContain('Import login')
     expect(html).not.toContain('id="cred-codex_cli"')
     expect(html).not.toContain('Login instructions')
   })
+
+  test('connection methods only offer a host login once one is detected', () => {
+    const flavors = [
+      {
+        id: 'subscription',
+        label: 'ChatGPT subscription',
+        description: 'auth.json',
+        format: 'config_file',
+      },
+      {
+        id: 'api_key',
+        label: 'API key',
+        description: 'key',
+        format: 'api_key',
+      },
+    ]
+    const detected = {
+      auth_type: 'subscription',
+      source: 'host_auth_store',
+      label: 'Authenticated host CLI',
+    }
+    expect(
+      harnessConnectionMethods({
+        id: 'codex_cli',
+        auth_flavors: flavors,
+        local_credential: null,
+      }).map((method) => method.id)
+    ).toEqual(['subscription', 'api_key'])
+    expect(
+      harnessConnectionMethods({
+        id: 'codex_cli',
+        auth_flavors: flavors,
+        local_credential: detected,
+      }).map((method) => method.id)
+    ).toEqual(['local', 'subscription', 'api_key'])
+    // Claude Code never accepts a host login, even with stale discovery data.
+    expect(
+      harnessConnectionMethods({
+        id: 'claude_cli',
+        auth_flavors: flavors,
+        local_credential: detected,
+      }).map((method) => method.id)
+    ).toEqual(['subscription', 'api_key'])
+  })
+
+  test('OpenAI-compatible helpers build the stored document and model selection', () => {
+    expect(
+      JSON.parse(
+        openAiCompatibleCredential(' https://api.example.com/v1 ', ' sk-1 ')
+      )
+    ).toEqual({ base_url: 'https://api.example.com/v1', api_key: 'sk-1' })
+    expect(openAiCompatibleModelSelection(' llama-3 ')).toBe(
+      'openai-compatible/llama-3'
+    )
+    expect(
+      openAiCompatibleUpstreamModel('openai-compatible/meta-llama/llama-3:free')
+    ).toBe('meta-llama/llama-3:free')
+    expect(openAiCompatibleUpstreamModel('anthropic/claude-sonnet-4-6')).toBe(
+      ''
+    )
+    expect(openAiCompatibleUpstreamModel(null)).toBe('')
+  })
+
+  test('replacing a saved credential preselects the method it was saved with', () => {
+    const methods = harnessConnectionMethods({
+      id: 'codex_cli',
+      auth_flavors: [
+        {
+          id: 'subscription',
+          label: 'S',
+          description: '',
+          format: 'config_file',
+        },
+        { id: 'api_key', label: 'K', description: '', format: 'api_key' },
+      ],
+      local_credential: null,
+    })
+    expect(
+      initialConnectionMethodId(
+        { credential_saved: true, current_auth_type: 'api_key' },
+        methods
+      )
+    ).toBe('api_key')
+    expect(
+      initialConnectionMethodId(
+        { credential_saved: false, current_auth_type: 'api_key' },
+        methods
+      )
+    ).toBe('subscription')
+    expect(
+      initialConnectionMethodId(
+        { credential_saved: true, current_auth_type: 'retired' },
+        methods
+      )
+    ).toBe('subscription')
+    expect(initialConnectionMethodId({ credential_saved: false }, [])).toBe('')
+  })
+
   test('shared wizard marks completed steps and supports full-width workspace setup', () => {
     const html = renderToStaticMarkup(
       <SetupWizardShell
@@ -198,20 +307,58 @@ describe('harness onboarding', () => {
       </QueryClientProvider>
     )
     expect(html).toContain('Connect once. Reuse this account')
-    expect(html).toContain('Connection methods')
-    expect(html).toContain('Subscription')
-    expect(html).toContain('Anthropic API key')
-    expect(html).not.toContain('role="tablist"')
-    expect(html).not.toContain('Use local login')
-    expect(html).not.toContain('id="cred-claude_cli"')
-    expect(html).not.toContain('aria-pressed=')
-    expect(html).toContain('border-0 shadow-none rounded-none')
-    expect(html).not.toContain('How do I get a credential?')
-    expect(html).not.toContain('<details open=')
-    expect(html).not.toContain('Check environment')
-    expect(html).not.toContain('2. Choose a model')
+    expect(html).toContain('aria-label="Connection method"')
+    expect(html).toContain('Subscription (OAuth)')
+    expect(html).toContain('API Key')
+    expect(html).toContain('Use a subscription token.')
+    expect(html).toContain('id="cred-claude_cli"')
+    expect(html).not.toContain('Login on this server')
+    // Tuning and diagnostics stay on the harness page, out of the wizard.
+    expect(html).not.toContain('Advanced')
+    expect(html).not.toContain('Check setup')
+    expect(html).not.toContain('Default model')
     expect(html).not.toContain('workspace-prompt')
     expect(html).not.toContain('Back to workspace')
+  })
+
+  test('a saved connection is a one-line summary in the wizard, not a form', () => {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <WorkspaceHarnessSetup
+            provider={{
+              ...provider,
+              auth_flavors: [
+                {
+                  id: 'subscription',
+                  label: 'Claude subscription',
+                  description: 'Paste a token.',
+                  format: 'oauth_token',
+                  env_var: null,
+                },
+              ],
+              credential_saved: true,
+              credential_verification_status: 'verified',
+              current_auth_type: 'subscription',
+              workspace_ready: true,
+            }}
+            mode="connection"
+            selection={{
+              providerId: provider.id,
+              modelId: null,
+              thinkingOptionId: null,
+              permissionModeId: null,
+            }}
+            onChange={() => {}}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('Connected')
+    expect(html).toContain('Claude subscription')
+    expect(html).toContain('Replace')
+    expect(html).not.toContain('id="cred-claude_cli"')
+    expect(html).not.toContain('Use saved Claude Code connection')
   })
 
   test('model step does not ask for credentials again', () => {
@@ -291,27 +438,58 @@ describe('harness onboarding', () => {
     )
   })
 
-  test('host authentication does not hide missing workspace credentials', () => {
-    const html = renderToStaticMarkup(
+  const renderRow = (row: ProviderCatalogDto) =>
+    renderToStaticMarkup(
       <MemoryRouter>
-        <HarnessSetupCard
-          provider={{
-            ...provider,
-            host_authenticated: true,
-            host_version: '1.2.3',
-          }}
-          returnTo="/ai-first"
-        />
+        <table>
+          <tbody>
+            <HarnessSetupRow provider={row} returnTo="/ai-first" />
+          </tbody>
+        </table>
       </MemoryRouter>
     )
+
+  test('host authentication does not hide missing workspace credentials', () => {
+    const html = renderRow({
+      ...provider,
+      host_authenticated: true,
+      host_version: '1.2.3',
+    })
     expect(html).toContain('Not connected')
-    expect(html).toContain('Authenticated')
-    expect(html).toContain('Not saved')
-    expect(html).toContain('Connect harness')
+    expect(html).toContain('aria-label="Connect Claude Code"')
+    expect(html).not.toContain('Credential saved')
+    expect(html).not.toContain('Manage')
     expect(html).not.toContain('Workspace ready')
   })
 
-  test('setup stays renderable without auth methods and explains verification scope', () => {
+  test('a harness row links its name to setup and shows how it is connected', () => {
+    const html = renderRow({
+      ...provider,
+      auth_flavors: [
+        {
+          id: 'oauth_token',
+          label: 'Claude subscription',
+          description: 'Paste a token.',
+          format: 'oauth_token',
+        },
+      ],
+      credential_saved: true,
+      current_auth_type: 'oauth_token',
+      credential_verification_status: 'verified',
+      workspace_ready: true,
+    })
+    expect(html).toContain('<tr')
+    expect(html).toContain('aria-label="Manage Claude Code"')
+    expect(html).toContain(
+      `href="${harnessSetupHref('claude_cli', '/ai-first')}"`
+    )
+    expect(html).toContain('Claude subscription')
+    expect(html).toContain('Credential saved')
+    // The name is the only link: no separate Connect/Manage button.
+    expect(html.match(/<a /g)).toHaveLength(1)
+  })
+
+  test('setup stays renderable without auth methods and keeps tuning collapsed', () => {
     const html = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
@@ -319,15 +497,17 @@ describe('harness onboarding', () => {
         </MemoryRouter>
       </QueryClientProvider>
     )
-    expect(html).toContain('1. Connect your account')
-    expect(html).toContain('2. Choose a model')
-    expect(html).toContain('3. Verify your first workspace reply')
-    expect(html).toContain('claude setup-token')
-    expect(html).toContain('not in the workspace terminal')
+    expect(html).toContain('Sign in')
+    expect(html).toContain('has no connection methods on this server')
+    // Everything beyond signing in is collapsed by default.
+    expect(html).toContain('Advanced')
+    expect(html).not.toContain('<details open')
+    expect(html).toContain('Default model')
     expect(html).toContain(
       'This does not verify a reply in your persistent workspace'
     )
-    expect(html).toContain('Advanced: instance default and autofix limits')
+    expect(html).not.toContain('1. Connect your account')
+    expect(html).not.toContain('3. Verify your first workspace reply')
   })
 
   test('OpenCode setup retains the trusted workspace credential disclosure', () => {
@@ -335,7 +515,20 @@ describe('harness onboarding', () => {
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
           <ProviderEditor
-            provider={{ ...provider, id: 'opencode', name: 'OpenCode' }}
+            provider={{
+              ...provider,
+              id: 'opencode',
+              name: 'OpenCode',
+              auth_flavors: [
+                {
+                  id: 'config_file',
+                  label: 'auth.json',
+                  description: 'Paste auth.json.',
+                  format: 'config_file',
+                  env_var: null,
+                },
+              ],
+            }}
             isActive={false}
           />
         </MemoryRouter>
@@ -344,6 +537,7 @@ describe('harness onboarding', () => {
     expect(html).toContain(
       'Code running as the harness user can access this credential'
     )
+    expect(html).toContain('Model to verify')
     expect(html).not.toContain('reusable credential is never injected')
   })
 })

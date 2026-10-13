@@ -91,6 +91,7 @@ export function OperatingSystemChart({
             <CardTitle className="flex items-center gap-2">
               {selectedOs && (
                 <Button
+                  aria-label="Back to all operating systems"
                   variant="ghost"
                   size="icon"
                   className="h-6 w-6"

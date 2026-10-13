@@ -109,7 +109,9 @@ async function exec(_command: string | undefined, options: ExecOptions): Promise
 
 export function registerExecCommands(program: Command): void {
   program
-    .command('exec [command]')
+    // Not implemented yet: registered (so `temps exec` explains itself) but
+    // hidden from help, so the CLI does not advertise a missing command.
+    .command('exec [command]', { hidden: true })
     .alias('ssh')
     .description('Execute a command in a running container (coming soon)')
     .option('-p, --project <project>', 'Project slug')

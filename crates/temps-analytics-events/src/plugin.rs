@@ -129,7 +129,13 @@ impl TempsPlugin for EventsPlugin {
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         });
 
-        let routes = crate::handlers::configure_public_routes().with_state(state);
+        // The CORS layer resolves keys through the very same service and
+        // limiter the handler uses, so the two can never disagree about a key.
+        let cors = temps_analytics::ingest_keys::KeyedIngestCors::new(
+            state.ingest_key_service.clone(),
+            state.ingest_rate_limiter.clone(),
+        );
+        let routes = crate::handlers::configure_public_routes(cors).with_state(state);
         Some(PluginRoutes::new(routes))
     }
 

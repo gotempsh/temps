@@ -6,6 +6,7 @@ import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { DropButton } from '@/components/dashboard/DropButton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
+import { OperationsTray } from '@/components/operations/OperationsTray'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { featureKeyForPath } from '@/lib/feature-maturity'
@@ -63,7 +64,7 @@ function ProjectSwitcher({
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label="Switch service"
+          aria-label={`${label}: switch service`}
           className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-sm font-normal text-foreground transition-colors hover:bg-accent"
         >
           <span className="max-w-[120px] truncate sm:max-w-[200px] lg:max-w-[280px]">
@@ -191,10 +192,11 @@ export function Header() {
           {/* The "+" quick-actions menu and the theme toggle used to live here.
               Every entry it held is now in the command palette (⌘K), and
               appearance moved into the account menu — so the header keeps only
-              what you reach for mid-task: dropping files, the assistant, and
-              alerts. */}
+              what you reach for mid-task: dropping files, the assistant,
+              in-flight operations, and alerts. */}
           <DropButton />
           <AiAssistantButton />
+          <OperationsTray />
           <BackupAlertsButton />
         </div>
       </div>

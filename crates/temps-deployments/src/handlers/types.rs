@@ -18,6 +18,9 @@ pub struct AppState {
     pub log_service: Arc<temps_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
+    /// Starts on-demand screenshot captures (`take_screenshot` operation)
+    /// and records their pending/completed/failed outcome.
+    pub screenshot_operations: Arc<crate::services::ScreenshotOperationService>,
     pub remote_deployment_service: Arc<RemoteDeploymentService>,
     // Services for remote deployments
     pub db: Arc<DatabaseConnection>,
@@ -79,6 +82,11 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
+    /// Single-use enrollment tokens that `temps join` redeems (ADR-020 WS-1.1).
+    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
+    /// Starts and cancels node pairings (ADR 048 D2b); shared with the admin
+    /// pairing routes so SSH enrollment pairs nodes the same way.
+    pub node_pairing_admin: Arc<crate::services::node_pairing_admin::NodePairingAdminService>,
     /// Central policy evaluator for sensitive mutations (e.g. draining a
     /// node) -- challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
@@ -254,6 +262,17 @@ pub struct LatestDeploymentMediaResponse {
     pub projects: std::collections::HashMap<String, LatestDeploymentMediaResponseItem>,
 }
 
+/// Most recent deployment of a project.
+///
+/// A project that has never been deployed is a normal state, so it is
+/// reported as `deployment: null` with a 200 instead of a 404.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct LastDeploymentResponse {
+    /// The most recent deployment, or `null` when the project exists but has
+    /// no deployments yet.
+    pub deployment: Option<DeploymentResponse>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeploymentResponse {
     pub id: i32,
@@ -274,6 +293,13 @@ pub struct DeploymentResponse {
     pub commit_date: Option<i64>,
     pub is_current: bool,
     pub cancelled_reason: Option<String>,
+    /// Classified cause of a failed deployment: the stage it failed in, a
+    /// stable failure code, and a concrete fix. Present only when `status` is
+    /// `failed` and a failure reason was recorded. Derived from
+    /// `cancelled_reason` at read time, so older deployments are classified
+    /// by the current classifier too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::services::DeploymentFailureInfo>,
     /// Deployment configuration snapshot (CPU, memory, replicas, environment variables, etc.)
     pub deployment_config: Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
     /// Deployment metadata (build info, git event, etc.)
@@ -295,6 +321,11 @@ pub struct DeploymentEnvironmentResponse {
 
 impl DeploymentResponse {
     pub fn from_service_deployment(deployment: Deployment) -> Self {
+        let failure = if deployment.status == "failed" {
+            crate::services::describe_failure(deployment.cancelled_reason.as_deref())
+        } else {
+            None
+        };
         Self {
             id: deployment.id,
             project_id: deployment.project_id,
@@ -320,6 +351,7 @@ impl DeploymentResponse {
             commit_date: deployment.commit_date.map(|d| d.timestamp_millis()),
             is_current: deployment.is_current,
             cancelled_reason: deployment.cancelled_reason,
+            failure,
             deployment_config: deployment.deployment_config,
             metadata: deployment.metadata,
         }

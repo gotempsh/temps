@@ -197,7 +197,10 @@ export function usePostgresPreset(): PresetState {
 }
 
 // -----------------------------------------------------------------------------
-// Redis preset — managed walg image (S3-archived RDB snapshots) + custom.
+// Redis preset — managed image (RDB snapshots streamed to S3 by its bundled
+// WAL-G) + custom (snapshot staged on local disk, then uploaded).
+// Postgres-style "WAL-G / PITR" wording is deliberately avoided here: Redis
+// has no WAL, and users read "WAL-G" as a PostgreSQL feature.
 // PITR is not implemented for Redis; restore is always LATEST.
 // -----------------------------------------------------------------------------
 
@@ -207,14 +210,14 @@ export const REDIS_OPTIONS: PresetOption[] = [
   {
     id: 'managed',
     title: 'Redis 8',
-    subtitle: 'Managed + WAL-G',
+    subtitle: 'Managed image',
     value: REDIS_MANAGED_IMAGE,
-    hint: 'S3 backups',
+    hint: 'RDB snapshots streamed to S3',
   },
   {
     id: 'custom',
     title: 'Custom image',
-    subtitle: 'Local snapshots only',
+    subtitle: 'Snapshots staged on disk',
     custom: true,
   },
 ]
@@ -234,7 +237,7 @@ export function useRedisPreset(): PresetState {
     ui: (
       <PresetGroup
         label="Redis version"
-        description="The managed image bundles WAL-G to push RDB snapshots to S3. Custom images only support local snapshots."
+        description="Backups are RDB snapshots uploaded to your S3 backup destination. The managed image streams each snapshot straight to S3; custom images first write a full snapshot copy to local disk, then upload it."
         options={REDIS_OPTIONS}
         selected={selected}
         customValue={custom}
@@ -247,7 +250,8 @@ export function useRedisPreset(): PresetState {
 }
 
 // -----------------------------------------------------------------------------
-// MongoDB preset — managed walg image (S3-archived mongodump) + custom.
+// MongoDB preset — managed image (mongodump streamed to S3 by its bundled
+// WAL-G) + custom (dump staged on local disk, then uploaded).
 // PITR is not implemented for MongoDB; restore is always LATEST.
 // -----------------------------------------------------------------------------
 
@@ -257,14 +261,14 @@ export const MONGO_OPTIONS: PresetOption[] = [
   {
     id: 'managed',
     title: 'MongoDB 8',
-    subtitle: 'Managed + WAL-G',
+    subtitle: 'Managed image',
     value: MONGO_MANAGED_IMAGE,
-    hint: 'S3 backups',
+    hint: 'Dumps streamed to S3',
   },
   {
     id: 'custom',
     title: 'Custom image',
-    subtitle: 'Local dumps only',
+    subtitle: 'Dumps staged on disk',
     custom: true,
   },
 ]
@@ -284,7 +288,7 @@ export function useMongodbPreset(): PresetState {
     ui: (
       <PresetGroup
         label="MongoDB version"
-        description="The managed image bundles WAL-G to push mongodump snapshots to S3. Custom images only support local dumps."
+        description="Backups are mongodump archives uploaded to your S3 backup destination. The managed image streams each dump straight to S3; custom images first write the full dump to local disk, then upload it."
         options={MONGO_OPTIONS}
         selected={selected}
         customValue={custom}

@@ -200,14 +200,21 @@ impl FilesystemSource {
             let mut entries = tokio::fs::read_dir(dir).await?;
 
             while let Some(entry) = entries.next_entry().await? {
+                // Never follow symlinks: a link out of the tree lists host
+                // paths, and a link back into it makes the walk unbounded.
+                // `DirEntry::file_type` does not traverse the link.
+                let file_type = entry.file_type().await?;
+                if file_type.is_symlink() {
+                    continue;
+                }
                 let path = entry.path();
 
                 if let Ok(relative) = path.strip_prefix(base) {
                     let relative_str = relative.to_string_lossy().to_string();
 
-                    if path.is_file() {
+                    if file_type.is_file() {
                         files.push(relative_str);
-                    } else if path.is_dir() {
+                    } else if file_type.is_dir() {
                         Self::walk_dir(&path, base, files).await?;
                     }
                 }
@@ -324,5 +331,32 @@ mod tests {
         assert_eq!(glob_to_regex("**/*.ts"), r"^(?:.*/)?[^/]*\.ts$");
         assert_eq!(glob_to_regex("src/**/*.tsx"), r"^src/(?:.*/)?[^/]*\.tsx$");
         assert_eq!(glob_to_regex("test?.js"), r"^test[^/]\.js$");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_filesystem_source_does_not_follow_symlinks() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked_dir")).unwrap();
+        // A file link is a separate case: a walker could skip directory links
+        // and still list linked files.
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("pnpm-workspace.yaml"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("b")).unwrap();
+
+        let source = FilesystemSource::new(root.path().to_path_buf());
+        let files = tokio::time::timeout(std::time::Duration::from_secs(10), source.list_files())
+            .await
+            .expect("list_files did not finish within 10s: the walk followed a symlink loop")
+            .unwrap();
+
+        assert_eq!(files, vec!["package.json".to_string()]);
     }
 }

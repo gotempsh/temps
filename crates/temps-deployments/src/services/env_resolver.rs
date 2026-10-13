@@ -652,8 +652,10 @@ impl DeploymentEnvResolver {
             project.id, environment.id
         );
 
-        // Get base URL from config service for DSN generation
-        match self.config_service.get_external_url_or_default().await {
+        // The DSN is reported to by the application and by browser SDKs it
+        // ships, so it is built from the public ingress URL (ADR-051), which
+        // defaults to the external URL.
+        match self.config_service.get_public_ingress_url().await {
             Ok(base_url) => {
                 match self
                     .dsn_service
@@ -1132,7 +1134,7 @@ mod tests {
 
     #[test]
     fn each_service_of_an_app_gets_its_own_bindings() {
-        let template: temps_core::templates::ProjectTemplate = serde_yaml::from_str(
+        let template: temps_core::templates::ProjectTemplate = yaml_serde::from_str(
             r#"
 slug: secrets-manager
 name: Secrets manager

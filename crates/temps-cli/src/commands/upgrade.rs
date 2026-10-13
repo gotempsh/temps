@@ -402,18 +402,12 @@ impl UpgradeCommand {
         )
         .await?;
 
-        // Also download the checksum
-        let checksum_name = format!("{}.sha256", tarball_name);
-        let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name);
-
-        if let Some(checksum_asset) = checksum_asset {
-            debug!("Verifying checksum...");
-            let checksum_text = download_asset_text(&checksum_asset.browser_download_url).await?;
-            verify_computed_checksum(&computed, &checksum_text)?;
-            println!("  Checksum verified.");
-        } else {
-            debug!("No checksum asset found, skipping verification");
-        }
+        // Fail closed, like install.sh: nothing is unpacked, let alone
+        // installed, unless the release publishes a checksum that matches.
+        debug!("Verifying checksum...");
+        let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
+        verify_computed_checksum(&computed, &checksum_text)?;
+        println!("  Checksum verified.");
 
         // Extract the binary from the tarball, straight into the staging file
         // that the atomic rename below consumes.
@@ -847,20 +841,47 @@ fn version_sort_key(tag: &str) -> Option<VersionSortKey> {
 /// treats any tag difference as upgradeable (including downgrades the
 /// operator explicitly pins with `--version`).
 pub(crate) fn is_newer_version(candidate: &str, current: &str) -> bool {
-    match (version_sort_key(candidate), version_sort_key(current)) {
-        (Some(candidate_key), Some(current_key)) => candidate_key > current_key,
-        _ => false,
+    update_verdict(current, candidate) == UpdateVerdict::Available
+}
+
+/// How the newest release on a channel relates to the running build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateVerdict {
+    /// The channel's newest release is the running version.
+    UpToDate,
+    /// The channel's newest release is strictly newer: suggest it.
+    Available,
+    /// The running build is newer than anything on the channel (e.g. a
+    /// nightly host whose channel is set to stable). Never a suggestion:
+    /// installing the channel's release would be a downgrade.
+    AheadOfChannel,
+    /// One of the tags is not version-shaped (a dev build or a fork tag).
+    Incomparable,
+}
+
+/// Compare the newest release on a channel against the running version. The
+/// single rule every "is there an update?" surface (`temps doctor`, the
+/// background notifier, the console's check) must agree on: only a strictly
+/// newer semver tag is an update, never merely a different one.
+pub(crate) fn update_verdict(current: &str, latest: &str) -> UpdateVerdict {
+    if current.trim() == latest.trim() {
+        return UpdateVerdict::UpToDate;
+    }
+    match (version_sort_key(latest), version_sort_key(current)) {
+        (Some(latest_key), Some(current_key)) => match latest_key.cmp(&current_key) {
+            std::cmp::Ordering::Greater => UpdateVerdict::Available,
+            std::cmp::Ordering::Less => UpdateVerdict::AheadOfChannel,
+            std::cmp::Ordering::Equal => UpdateVerdict::UpToDate,
+        },
+        _ => UpdateVerdict::Incomparable,
     }
 }
 
 /// Is `candidate` strictly older than `current`? Unparsable development or
 /// fork tags are not classified as downgrades so existing explicit workflows
 /// keep working; official release tags are always semver-shaped.
-fn is_older_version(candidate: &str, current: &str) -> bool {
-    match (version_sort_key(candidate), version_sort_key(current)) {
-        (Some(candidate_key), Some(current_key)) => candidate_key < current_key,
-        _ => false,
-    }
+pub(crate) fn is_older_version(candidate: &str, current: &str) -> bool {
+    update_verdict(current, candidate) == UpdateVerdict::AheadOfChannel
 }
 
 fn ensure_implicit_upgrade_is_not_downgrade(
@@ -1366,11 +1387,20 @@ async fn stream_response_to_file(
 ///
 /// Format: `"<hash>  <filename>"` or `"<hash> <filename>"`.
 fn parse_expected_checksum(checksum_text: &str) -> anyhow::Result<String> {
-    Ok(checksum_text
+    let hash = checksum_text
         .split_whitespace()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid checksum file format"))?
-        .to_lowercase())
+        .ok_or_else(|| anyhow::anyhow!("Invalid checksum file format: the file is empty"))?
+        .to_lowercase();
+    // A truncated download or an HTML error page must read as "unverifiable",
+    // not as a mismatch against garbage.
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "Invalid checksum file format: '{}' is not a SHA-256 digest",
+            hash.chars().take(80).collect::<String>()
+        ));
+    }
+    Ok(hash)
 }
 
 /// Compare an already-computed SHA256 against a `.sha256` file body.
@@ -1391,6 +1421,91 @@ pub(crate) fn verify_computed_checksum(computed: &str, checksum_text: &str) -> a
     }
 
     Ok(())
+}
+
+/// Name of the combined checksum manifest every release publishes next to
+/// the per-tarball `.sha256` files (`sha256sum` output for all tarballs).
+const COMBINED_CHECKSUMS_ASSET: &str = "checksums.txt";
+
+/// The published asset that carries the expected SHA-256 for a tarball.
+#[derive(Debug)]
+pub(crate) enum ChecksumSource<'a> {
+    /// `<tarball>.sha256`, the tarball's own checksum file.
+    Sibling(&'a GitHubAsset),
+    /// `checksums.txt`, used only when the sibling file is missing.
+    Combined(&'a GitHubAsset),
+}
+
+/// Find where a release publishes the checksum for `tarball_name`.
+///
+/// Fails closed: a release that publishes neither `<tarball>.sha256` nor a
+/// `checksums.txt` cannot be verified, and neither `temps upgrade` nor the
+/// console's self-update will install it. Same contract as `install.sh`.
+pub(crate) fn find_checksum_source<'a>(
+    release: &'a GitHubRelease,
+    tarball_name: &str,
+) -> anyhow::Result<ChecksumSource<'a>> {
+    let sibling_name = format!("{tarball_name}.sha256");
+    if let Some(asset) = release.assets.iter().find(|a| a.name == sibling_name) {
+        return Ok(ChecksumSource::Sibling(asset));
+    }
+    if let Some(asset) = release
+        .assets
+        .iter()
+        .find(|a| a.name == COMBINED_CHECKSUMS_ASSET)
+    {
+        return Ok(ChecksumSource::Combined(asset));
+    }
+    Err(anyhow::anyhow!(
+        "Release {} publishes no SHA-256 checksum for {} (looked for '{}' and '{}'), so the \
+         download cannot be verified. Refusing to install an unverified binary. Pick a release \
+         that publishes checksums with `temps upgrade --version <tag>`, or report the broken \
+         release at {}",
+        release.tag_name,
+        tarball_name,
+        sibling_name,
+        COMBINED_CHECKSUMS_ASSET,
+        release.html_url
+    ))
+}
+
+/// Extract the expected hash for `file_name` from a `sha256sum`-style
+/// manifest (`<hash>  <name>` per line, `*<name>` in binary mode).
+pub(crate) fn checksum_for_file(manifest: &str, file_name: &str) -> anyhow::Result<String> {
+    manifest
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let hash = fields.next()?;
+            let name = fields.next()?.trim_start_matches('*');
+            // `sha256sum dir/file` records the path; match on the file name.
+            let name = name.rsplit('/').next().unwrap_or(name);
+            (name == file_name).then(|| hash.to_string())
+        })
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no entry for {}, so the download cannot be verified",
+                COMBINED_CHECKSUMS_ASSET,
+                file_name
+            )
+        })
+}
+
+/// Download the expected SHA-256 line for `tarball_name` from `release`.
+/// Errors if the release publishes no checksum for it (see
+/// [`find_checksum_source`]); the result feeds [`verify_computed_checksum`].
+pub(crate) async fn fetch_expected_checksum(
+    release: &GitHubRelease,
+    tarball_name: &str,
+) -> anyhow::Result<String> {
+    match find_checksum_source(release, tarball_name)? {
+        ChecksumSource::Sibling(asset) => download_asset_text(&asset.browser_download_url).await,
+        ChecksumSource::Combined(asset) => {
+            let manifest = download_asset_text(&asset.browser_download_url).await?;
+            checksum_for_file(&manifest, tarball_name)
+        }
+    }
 }
 
 /// Verify SHA256 checksum of downloaded data.
@@ -2263,19 +2378,160 @@ mod tests {
 
     #[test]
     fn test_verify_computed_checksum_matches_case_insensitively() {
-        let computed = "AABBCC";
-        let checksum_text = "aabbcc  temps-linux-amd64.tar.gz";
-        assert!(verify_computed_checksum(computed, checksum_text).is_ok());
+        let computed = "AABBCC".repeat(10) + "AABB";
+        let checksum_text = format!("{}  temps-linux-amd64.tar.gz", computed.to_lowercase());
+        assert!(verify_computed_checksum(&computed, &checksum_text).is_ok());
     }
 
     #[test]
     fn test_verify_computed_checksum_reports_both_hashes_on_mismatch() {
-        let err = verify_computed_checksum("aaaa", "bbbb  temps.tar.gz")
+        let computed = "a".repeat(64);
+        let expected = "b".repeat(64);
+        let err = verify_computed_checksum(&computed, &format!("{expected}  temps.tar.gz"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("Checksum mismatch"));
-        assert!(err.contains("aaaa"));
-        assert!(err.contains("bbbb"));
+        assert!(err.contains(&computed));
+        assert!(err.contains(&expected));
+    }
+
+    #[test]
+    fn test_verify_computed_checksum_rejects_a_body_that_is_not_a_digest() {
+        // An HTML error page or a truncated file is "unverifiable", not a
+        // mismatch against whatever its first word happens to be.
+        for body in ["<!DOCTYPE html><html>", "abc123  temps.tar.gz", "Not Found"] {
+            let err = verify_computed_checksum(&"a".repeat(64), body)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("is not a SHA-256 digest"),
+                "unexpected error for {body:?}: {err}"
+            );
+        }
+    }
+
+    // ── Checksum source selection (fail closed) ──────────────────────────
+
+    fn release_with_assets(tag: &str, names: &[&str]) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.to_string(),
+            prerelease: true,
+            draft: false,
+            assets: names
+                .iter()
+                .map(|name| GitHubAsset {
+                    name: name.to_string(),
+                    browser_download_url: format!("https://example.test/{name}"),
+                    size: 1,
+                })
+                .collect(),
+            html_url: format!("https://example.test/releases/{tag}"),
+        }
+    }
+
+    #[test]
+    fn test_checksum_source_prefers_the_tarball_sibling() {
+        let release = release_with_assets(
+            "v1.2.3",
+            &[
+                "temps-linux-amd64.tar.gz",
+                "temps-linux-amd64.tar.gz.sha256",
+                "checksums.txt",
+            ],
+        );
+        match find_checksum_source(&release, "temps-linux-amd64.tar.gz").unwrap() {
+            ChecksumSource::Sibling(asset) => {
+                assert_eq!(asset.name, "temps-linux-amd64.tar.gz.sha256")
+            }
+            other => panic!("expected the sibling .sha256, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_checksum_source_falls_back_to_combined_manifest() {
+        let release = release_with_assets("v1.2.3", &["temps-linux-amd64.tar.gz", "checksums.txt"]);
+        match find_checksum_source(&release, "temps-linux-amd64.tar.gz").unwrap() {
+            ChecksumSource::Combined(asset) => assert_eq!(asset.name, "checksums.txt"),
+            other => panic!("expected checksums.txt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_checksum_source_missing_refuses_with_actionable_error() {
+        // A checksum for a different platform does not verify this one.
+        let release = release_with_assets(
+            "v1.2.3-beta.4",
+            &[
+                "temps-linux-amd64.tar.gz",
+                "temps-darwin-arm64.tar.gz.sha256",
+            ],
+        );
+        let err = find_checksum_source(&release, "temps-linux-amd64.tar.gz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("v1.2.3-beta.4"), "{err}");
+        assert!(err.contains("temps-linux-amd64.tar.gz.sha256"), "{err}");
+        assert!(err.contains("checksums.txt"), "{err}");
+        assert!(err.contains("Refusing to install"), "{err}");
+        assert!(err.contains("--version"), "{err}");
+        assert!(
+            err.contains("https://example.test/releases/v1.2.3-beta.4"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_checksum_for_file_picks_the_matching_line() {
+        let amd = "a".repeat(64);
+        let arm = "b".repeat(64);
+        let manifest = format!(
+            "{arm}  temps-linux-arm64.tar.gz\n{amd}  temps-linux-amd64.tar.gz\n{}  runtime-images.json\n",
+            "c".repeat(64)
+        );
+        assert_eq!(
+            checksum_for_file(&manifest, "temps-linux-amd64.tar.gz").unwrap(),
+            amd
+        );
+        assert_eq!(
+            checksum_for_file(&manifest, "temps-linux-arm64.tar.gz").unwrap(),
+            arm
+        );
+    }
+
+    #[test]
+    fn test_checksum_for_file_accepts_binary_mode_and_paths() {
+        let hash = "d".repeat(64);
+        assert_eq!(
+            checksum_for_file(
+                &format!("{hash} *temps-linux-amd64.tar.gz"),
+                "temps-linux-amd64.tar.gz"
+            )
+            .unwrap(),
+            hash
+        );
+        assert_eq!(
+            checksum_for_file(
+                &format!("{hash}  release/temps-linux-amd64.tar.gz"),
+                "temps-linux-amd64.tar.gz"
+            )
+            .unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn test_checksum_for_file_without_entry_is_an_error() {
+        let manifest = format!("{}  temps-linux-arm64.tar.gz\n", "a".repeat(64));
+        let err = checksum_for_file(&manifest, "temps-linux-amd64.tar.gz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("temps-linux-amd64.tar.gz"), "{err}");
+        // A prefix of the wanted name must not match.
+        assert!(checksum_for_file(
+            &format!("{}  temps-linux-amd64.tar.gz.sig\n", "a".repeat(64)),
+            "temps-linux-amd64.tar.gz"
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -2735,6 +2991,79 @@ mod tests {
         assert!(is_newer_version("v1.0.0-beta.10", "v1.0.0-beta.2"));
         // …and a prerelease of the NEXT version beats the current release.
         assert!(is_newer_version("v1.1.0-beta.1", "v1.0.0"));
+    }
+
+    #[test]
+    fn test_update_verdict_nightly_never_offered_an_older_beta() {
+        // The reported bug: a nightly host was told the newest beta was
+        // "available", which would have been a cross-channel downgrade.
+        assert_eq!(
+            update_verdict("v0.1.0-nightly.20261004.32a8e9c1", "v0.1.0-beta.56"),
+            UpdateVerdict::AheadOfChannel
+        );
+        assert!(!is_newer_version(
+            "v0.1.0-beta.56",
+            "v0.1.0-nightly.20261004.32a8e9c1"
+        ));
+    }
+
+    #[test]
+    fn test_update_verdict_nightlies_compare_by_date() {
+        assert_eq!(
+            update_verdict(
+                "v0.1.0-nightly.20261003.6f74680e",
+                "v0.1.0-nightly.20261004.32a8e9c1"
+            ),
+            UpdateVerdict::Available
+        );
+        assert_eq!(
+            update_verdict(
+                "v0.1.0-nightly.20261004.32a8e9c1",
+                "v0.1.0-nightly.20261003.6f74680e"
+            ),
+            UpdateVerdict::AheadOfChannel
+        );
+        assert_eq!(
+            update_verdict(
+                "v0.1.0-nightly.20261004.32a8e9c1",
+                "v0.1.0-nightly.20261004.32a8e9c1"
+            ),
+            UpdateVerdict::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_update_verdict_betas_and_stable() {
+        assert_eq!(
+            update_verdict("v0.1.0-beta.9", "v0.1.0-beta.10"),
+            UpdateVerdict::Available
+        );
+        assert_eq!(
+            update_verdict("v0.1.0-beta.56", "v0.1.0"),
+            UpdateVerdict::Available
+        );
+        assert_eq!(
+            update_verdict("v0.1.0", "v0.1.0-beta.56"),
+            UpdateVerdict::AheadOfChannel
+        );
+        // A newer core version wins regardless of the prerelease label.
+        assert_eq!(
+            update_verdict("v0.1.0-nightly.20261004.32a8e9c1", "v0.2.0-beta.1"),
+            UpdateVerdict::Available
+        );
+    }
+
+    #[test]
+    fn test_update_verdict_dev_builds_are_incomparable() {
+        assert_eq!(
+            update_verdict("local-dev", "v0.1.0"),
+            UpdateVerdict::Incomparable
+        );
+        assert_eq!(
+            update_verdict("v0.1.0", "nightly"),
+            UpdateVerdict::Incomparable
+        );
+        assert!(!is_older_version("nightly", "v0.1.0"));
     }
 
     #[test]

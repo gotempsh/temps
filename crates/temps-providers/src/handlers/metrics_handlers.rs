@@ -60,6 +60,9 @@ use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use super::types::AppState;
+use crate::alert_rule_service::{
+    insert_alert_rule_within_limit, AlertRuleCreateError, MAX_ALERT_RULES_PER_SERVICE,
+};
 
 // `is_monotonic_counter` / `range_to_step` live in `temps_metrics` (shared
 // with the deployment container metrics handlers) — imported below.
@@ -676,6 +679,7 @@ async fn list_service_alert_rules(
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "The service already has the maximum number of alert rules"),
         (status = 500, description = "Internal server error"),
     ),
     security(("bearer_auth" = []))
@@ -719,14 +723,50 @@ async fn create_service_alert_rule(
         ..Default::default()
     };
 
-    let rule = active_model.insert(state.db.as_ref()).await.map_err(|e| {
-        error!(service_id = id, error = %e, "Failed to create alert rule");
-        internal_server_error()
-            .detail(format!("Failed to create alert rule: {}", e))
-            .build()
+    let rule = insert_alert_rule_within_limit(
+        state.db.as_ref(),
+        id,
+        active_model,
+        MAX_ALERT_RULES_PER_SERVICE,
+    )
+    .await
+    .map_err(|e| {
+        match &e {
+            AlertRuleCreateError::LimitReached { .. } => {
+                info!(service_id = id, "Rejected alert rule creation: {}", e)
+            }
+            AlertRuleCreateError::ServiceNotFound { .. }
+            | AlertRuleCreateError::Database { .. } => {
+                error!(service_id = id, error = %e, "Failed to create alert rule")
+            }
+        }
+        Problem::from(e)
     })?;
 
     Ok((StatusCode::CREATED, Json(AlertRuleResponse::from(rule))))
+}
+
+impl From<AlertRuleCreateError> for Problem {
+    fn from(error: AlertRuleCreateError) -> Self {
+        match &error {
+            AlertRuleCreateError::LimitReached {
+                service_id, limit, ..
+            } => ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/alert-rule-limit-reached")
+                .title("Alert Rule Limit Reached")
+                .detail(error.to_string())
+                .value("service_id", service_id)
+                .value("limit", limit)
+                .build(),
+            AlertRuleCreateError::ServiceNotFound { .. } => not_found()
+                .title("External Service Not Found")
+                .detail(error.to_string())
+                .build(),
+            AlertRuleCreateError::Database { .. } => {
+                internal_server_error().detail(error.to_string()).build()
+            }
+        }
+    }
 }
 
 /// Update an existing monitoring alert rule for an external service.
@@ -931,13 +971,15 @@ async fn toggle_service_metrics(
         if let Err(e) =
             temps_monitoring::seed_default_rules(state.db.as_ref(), id, &service.service_type).await
         {
-            // Non-fatal — the user can create rules manually. Log but continue.
-            error!(
-                service_id = id,
-                engine = %service.service_type,
-                error = %e,
-                "Failed to seed default alert rules; continuing"
-            );
+            // Do not enable metrics while silently omitting built-in alerts.
+            return Err(match e {
+                temps_monitoring::DefaultRuleSeedError::Capacity { .. } => {
+                    bad_request().detail(e.to_string()).build()
+                }
+                temps_monitoring::DefaultRuleSeedError::Database(_) => internal_server_error()
+                    .detail("Failed to install built-in alert rules")
+                    .build(),
+            });
         }
 
         // For OTLP-push services (RustFS): provision an si_ ingest key and
@@ -2068,6 +2110,190 @@ mod tests {
     fn test_validate_severity_invalid() {
         assert!(validate_severity("info").is_err());
         assert!(validate_severity("").is_err());
+    }
+
+    // ── alert rule limit (resource exhaustion) ─────────────────────────────
+
+    fn rule_for(service_id: i32, metric: &str) -> monitoring_alert_rules::ActiveModel {
+        monitoring_alert_rules::ActiveModel {
+            service_id: Set(Some(service_id)),
+            deployment_id: Set(None),
+            name: Set(format!("rule {metric}")),
+            metric_name: Set(metric.to_string()),
+            threshold: Set(1.0),
+            comparator: Set(">".to_string()),
+            severity: Set("warning".to_string()),
+            for_duration_secs: Set(0),
+            enabled: Set(true),
+            silenced_until: Set(None),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn alert_rule_limit_maps_to_conflict_with_actionable_detail() {
+        let problem = Problem::from(AlertRuleCreateError::LimitReached {
+            service_id: 12,
+            existing: 100,
+            limit: 100,
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).expect("problem body serializes");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("12") && detail.contains("100"), "{detail}");
+        assert_eq!(MAX_ALERT_RULES_PER_SERVICE, 100);
+    }
+
+    #[tokio::test]
+    async fn alert_rule_creation_stops_at_the_per_service_limit() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping alert rule limit test: {error}");
+                return;
+            }
+            Err(error) => panic!("alert rule limit test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let now = Utc::now();
+        let mut service_ids = Vec::new();
+        for name in ["limit-a", "limit-b"] {
+            let svc = external_services::ActiveModel {
+                name: Set(name.to_string()),
+                service_type: Set("postgres".to_string()),
+                status: Set("running".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                topology: Set("standalone".to_string()),
+                consecutive_health_failures: Set(0),
+                metrics_enabled: Set(true),
+                default_backup_provisioned: Set(false),
+                ai_data_access: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert external service");
+            service_ids.push(svc.id);
+        }
+        let (a, b) = (service_ids[0], service_ids[1]);
+
+        for metric in ["m.one", "m.two"] {
+            insert_alert_rule_within_limit(db.as_ref(), a, rule_for(a, metric), 2)
+                .await
+                .expect("under the limit");
+        }
+        let err = insert_alert_rule_within_limit(db.as_ref(), a, rule_for(a, "m.three"), 2)
+            .await
+            .expect_err("third rule exceeds a limit of 2");
+        assert!(
+            matches!(
+                err,
+                AlertRuleCreateError::LimitReached {
+                    service_id,
+                    existing: 2,
+                    limit: 2
+                } if service_id == a
+            ),
+            "unexpected error: {err}"
+        );
+
+        // Default seeding and custom rules share the same row lock and budget.
+        for index in 2..99 {
+            insert_alert_rule_within_limit(
+                db.as_ref(),
+                a,
+                rule_for(a, &format!("custom.{index}")),
+                MAX_ALERT_RULES_PER_SERVICE,
+            )
+            .await
+            .expect("fill to one slot below the cap");
+        }
+        let (seeded, custom) = tokio::join!(
+            temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres"),
+            insert_alert_rule_within_limit(
+                db.as_ref(),
+                a,
+                rule_for(a, "custom.raced"),
+                MAX_ALERT_RULES_PER_SERVICE
+            ),
+        );
+        assert!(matches!(
+            seeded,
+            Err(temps_monitoring::DefaultRuleSeedError::Capacity { .. })
+        ));
+        assert!(custom.is_ok() || matches!(custom, Err(AlertRuleCreateError::LimitReached { .. })));
+        let error = temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+            .await
+            .expect_err("full custom-rule budget must report missing defaults");
+        assert!(matches!(
+            error,
+            temps_monitoring::DefaultRuleSeedError::Capacity { existing: 100, .. }
+        ));
+        use sea_orm::PaginatorTrait;
+        assert_eq!(
+            monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            MAX_ALERT_RULES_PER_SERVICE
+        );
+
+        // A failed seed inserts no partial default set. Free capacity and retry:
+        // all built-ins are installed, and the retry remains idempotent.
+        assert_eq!(
+            monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .filter(monitoring_alert_rules::Column::MetricName.like("pg.%"))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+        for index in 2..12 {
+            monitoring_alert_rules::Entity::delete_many()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .filter(monitoring_alert_rules::Column::MetricName.eq(format!("custom.{index}")))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+        }
+        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+            .await
+            .expect("complete defaults fit after freeing capacity");
+        let after_seed = monitoring_alert_rules::Entity::find()
+            .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert!(after_seed > 90 && after_seed <= 100);
+        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+            .await
+            .expect("idempotent retry");
+        assert_eq!(
+            monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            after_seed
+        );
+
+        // The limit is per service: another service is unaffected.
+        insert_alert_rule_within_limit(db.as_ref(), b, rule_for(b, "m.one"), 2)
+            .await
+            .expect("other service has its own budget");
+
+        let missing = insert_alert_rule_within_limit(db.as_ref(), -1, rule_for(-1, "m.x"), 2)
+            .await
+            .expect_err("unknown service");
+        assert!(matches!(
+            missing,
+            AlertRuleCreateError::ServiceNotFound { service_id: -1 }
+        ));
     }
 
     // ── deployment ownership policy (SECURITY metrics-security-6 / IDOR) ───────

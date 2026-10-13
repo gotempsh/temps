@@ -15,6 +15,12 @@ pub struct Model {
     pub incident_id: i32,
     pub status: String, // investigating, identified, monitoring, resolved
     pub message: String,
+    /// Whether this update appears on the project's published status pages.
+    /// Private by default; only an explicit opt-in makes it public.
+    pub is_public: bool,
+    /// Written by Temps itself (e.g. "Incident created: <title>"). Such
+    /// updates embed internal text and can never be made public.
+    pub is_system: bool,
     pub created_at: DBDateTime,
 }
 

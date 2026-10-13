@@ -6,16 +6,7 @@ import {
   deleteWebhookMutation,
   listWebhooksOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -99,8 +90,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold">Webhooks</h2>
-          <p className="text-sm text-muted-foreground mt-1">
+          <p className="text-sm text-muted-foreground">
             Configure webhooks to receive real-time notifications about events
             in your service
           </p>
@@ -180,7 +170,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                         {webhook.enabled ? (
                           <Badge
                             variant="outline"
-                            className="border-green-500/50 text-green-600 bg-green-50 dark:bg-green-950 dark:text-green-400"
+                            className="border-green-500/50 text-green-700 bg-green-50 dark:bg-green-950 dark:text-green-400"
                           >
                             <CheckCircle2 className="h-3 w-3 mr-1" />
                             Enabled
@@ -217,6 +207,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button
+                        aria-label="Open menu"
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8"
@@ -225,7 +216,14 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                         <EllipsisVertical className="h-4 w-4" />
                       </Button>
                     </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
+                    {/* The menu is portalled, but React events still bubble
+                        through the React tree to the card, whose click opens
+                        the webhook. Without this, choosing Delete also
+                        navigated away and unmounted the confirmation. */}
+                    <DropdownMenuContent
+                      align="end"
+                      onClick={(event) => event.stopPropagation()}
+                    >
                       <DropdownMenuItem
                         onClick={() =>
                           navigate(
@@ -290,33 +288,15 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
         </Card>
       ) : null}
 
-      <AlertDialog
+      <ConfirmDialog
         open={deleteDialogOpen}
-        onOpenChange={() => setWebhookToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete webhook?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              webhook and stop all event notifications to this endpoint.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (webhookToDelete) {
-                  handleDelete(webhookToDelete)
-                }
-              }}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => !open && setWebhookToDelete(null)}
+        title="Delete webhook?"
+        description="This action cannot be undone. This will permanently delete the webhook and stop all event notifications to this endpoint."
+        onConfirm={() => {
+          if (webhookToDelete !== null) handleDelete(webhookToDelete)
+        }}
+      />
     </div>
   )
 }

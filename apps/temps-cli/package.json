@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/cli",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "description": "CLI for Temps deployment platform",
   "type": "module",
   "bin": {
@@ -13,7 +13,7 @@
     "dev": "bun run src/index.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "bun run clean && bun run build",
-    "build": "bun build src/index.ts --outdir dist --target node && sed -i '' '1s|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/index.js && chmod +x dist/index.js",
+    "build": "bun build src/index.ts --outdir dist --target node && sed -i '' '1s|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/index.js && chmod +x dist/index.js && rm -rf dist/skills && mkdir -p dist/skills && cp -R ../../skills/temps dist/skills/temps",
     "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
     "spec:update": "bun run scripts/update-openapi.ts",
     "spec:check": "bun run scripts/check-openapi.ts",

@@ -14,7 +14,11 @@ git:
   ref: main
   subfolder: examples/observability-starter
 preset: nextjs
-image: ghcr.io/gotempsh/observability-starter:latest
+# Templates only deploy immutable images (name@sha256:<digest>). This is the
+# multi-arch (linux/amd64, linux/arm64) index published for commit tag
+# 16dfe9198b5145ee55ac430e055992502be877c5. To update, resolve the new tag's
+# index digest and replace it here.
+image: ghcr.io/gotempsh/observability-starter@sha256:ef17b523cadeadc59b1d9e3a735c379456a9c4ffcfad91f8be2ef46ff49f0fbe
 exposed_port: 3000
 health_check_path: /
 tags:

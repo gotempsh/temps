@@ -3,7 +3,7 @@
 
 use crate::disk_status::DiskSpaceCheckResult;
 use crate::service::preserve_provider_credential_proof;
-use crate::{ConfigService, EffectiveTelemetryPolicies};
+use crate::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
 use axum::{
     extract::{Extension, State},
     http::{header, StatusCode},
@@ -26,7 +26,7 @@ use temps_core::{
     RequestMetadata, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
@@ -168,6 +168,39 @@ impl AuditOperation for CloudTelemetryBulkGuardUpdatedAudit {
     }
 }
 
+/// `PUBLIC_INGRESS_URL_UPDATED` — a change to the base URL handed to third
+/// parties that call back into Temps (ADR-051).
+///
+/// A separate event from `SETTINGS_UPDATED` because it redirects where every
+/// provider webhook, tracking link and DSN points: an audit trail has to be
+/// able to answer "when did callbacks start going to this host, and who moved
+/// them" without diffing two settings documents.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PublicIngressUrlUpdatedAudit {
+    context: AuditContext,
+    previous_url: Option<String>,
+    new_url: Option<String>,
+}
+
+impl AuditOperation for PublicIngressUrlUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "PUBLIC_INGRESS_URL_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 /// `FORWARDED_IP_TRUST_UPDATED` — a change to whether Temps trusts
 /// `X-Forwarded-For`/`X-Real-IP` from a loopback reverse proxy.
 ///
@@ -185,6 +218,39 @@ struct ForwardedIpTrustUpdatedAudit {
 impl AuditOperation for ForwardedIpTrustUpdatedAudit {
     fn operation_type(&self) -> String {
         "FORWARDED_IP_TRUST_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// `TRUSTED_PRIVATE_NETWORKS_UPDATED` — the private networks user-configured
+/// outbound requests may reach changed.
+///
+/// A separate event from `SETTINGS_UPDATED` because this list widens the SSRF
+/// guard: every project member who can create a webhook, uptime check, or AI
+/// provider can reach addresses inside it. Both sides are recorded so the
+/// audit trail answers "who opened this network, and when".
+#[derive(Debug, Clone, serde::Serialize)]
+struct TrustedPrivateNetworksUpdatedAudit {
+    context: AuditContext,
+    previous_networks: Vec<String>,
+    new_networks: Vec<String>,
+}
+
+impl AuditOperation for TrustedPrivateNetworksUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "TRUSTED_PRIVATE_NETWORKS_UPDATED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -301,9 +367,16 @@ pub struct AppSettingsResponse {
     // Core settings
     pub external_url: Option<String>,
     pub internal_url: Option<String>,
+    /// Base URL handed to third parties that call back into Temps (ADR-051).
+    /// `None` means callbacks use `external_url`; see
+    /// `GET /settings/public-ingress` for the effective value.
+    pub public_ingress_url: Option<String>,
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Applies Cloudflare delivery only to future projects.
+    pub cloudflare_new_projects: bool,
+    pub bunny_new_projects: bool,
     /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
     /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
     /// explicit operator override. No sensitive content.
@@ -395,6 +468,10 @@ pub struct AppSettingsResponse {
     // Outbound TLS verification toggle
     pub insecure_tls: bool,
 
+    /// Private networks (normalized CIDRs) that user-configured outbound
+    /// requests may reach despite the SSRF guard. Empty means none.
+    pub trusted_private_networks: Vec<String>,
+
     /// Whether `temps setup` has been run at least once. The web onboarding
     /// wizard checks this field on load and skips itself when true.
     pub setup_complete: bool,
@@ -442,6 +519,70 @@ pub struct AppSettingsResponse {
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
     pub mcp_server: temps_core::McpServerSettings,
+}
+
+fn conflicting_delivery_defaults(settings: &AppSettings) -> bool {
+    settings.cloudflare_new_projects && settings.bunny_new_projects
+}
+
+/// Delivery providers this save switches on as the default for new projects.
+///
+/// Only a transition from off to on is checked for availability: a default
+/// that was valid when saved and whose provider was disconnected later must
+/// not make every unrelated settings save fail. Project creation degrades such
+/// a stale default to "no delivery" instead.
+fn newly_enabled_delivery_defaults(
+    stored: &AppSettings,
+    submitted: &AppSettings,
+) -> Vec<&'static str> {
+    let mut enabled = Vec::new();
+    if submitted.cloudflare_new_projects && !stored.cloudflare_new_projects {
+        enabled.push("cloudflare");
+    }
+    if submitted.bunny_new_projects && !stored.bunny_new_projects {
+        enabled.push("bunny");
+    }
+    enabled
+}
+
+/// Refuse a delivery default that project creation could not honour: both
+/// providers at once, or a provider with no usable DNS provider/profile.
+async fn validate_delivery_defaults(
+    config_service: &ConfigService,
+    stored: &AppSettings,
+    submitted: &AppSettings,
+) -> Result<(), Problem> {
+    if conflicting_delivery_defaults(submitted) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Conflicting Delivery Defaults")
+            .detail("Choose Cloudflare or Bunny for new projects; both cannot be enabled globally at once.")
+            .build());
+    }
+    for provider in newly_enabled_delivery_defaults(stored, submitted) {
+        let reason = config_service
+            .delivery_default_unavailable_reason(provider)
+            .await
+            .map_err(|error| {
+                error!(
+                    "Could not check whether delivery provider {} is usable before enabling it as the new-project default: {}",
+                    provider, error
+                );
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Settings Save Aborted")
+                    .detail(format!(
+                        "Could not check whether {provider} delivery is configured before enabling it for new projects; nothing was saved: {error}"
+                    ))
+                    .build()
+            })?;
+        if let Some(reason) = reason {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Delivery Provider Not Configured")
+                .detail(format!("{reason}. Nothing was saved."))
+                .value("provider", provider)
+                .build());
+        }
+    }
+    Ok(())
 }
 
 /// Geolocation settings with the MaxMind license key masked.
@@ -633,8 +774,11 @@ impl From<AppSettings> for AppSettingsResponse {
             plugin_installation_reporting_enabled: settings.plugin_installation_reporting_enabled,
             external_url: settings.external_url,
             internal_url: settings.internal_url,
+            public_ingress_url: settings.public_ingress_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            cloudflare_new_projects: settings.cloudflare_new_projects,
+            bunny_new_projects: settings.bunny_new_projects,
             console_force_https: settings.console_force_https,
             // Overridden by the handler via `with_proxy_port` — this struct
             // has no access to `ConfigService` here, only the DB-backed
@@ -742,6 +886,7 @@ impl From<AppSettings> for AppSettingsResponse {
             observability_retention: settings.observability_retention,
             geo: GeoSettingsMasked::from(settings.geo),
             insecure_tls: settings.insecure_tls,
+            trusted_private_networks: settings.trusted_private_networks,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
             on_demand_tls: settings.on_demand_tls,
@@ -864,6 +1009,7 @@ impl AppSettingsResponse {
         revoke_enrollment_token,
         rotate_cluster_ca,
         refresh_route_table,
+        get_public_ingress_status,
     ),
     components(schemas(
         AppSettings,
@@ -896,6 +1042,8 @@ impl AppSettingsResponse {
         RotateClusterCaRequest,
         RotateClusterCaResponse,
         RouteRefreshResponse,
+        PublicIngressStatusResponse,
+        temps_core::public_ingress::PublicIngressSource,
         UpdateStatusResponse,
         UpdateCapabilityResponse,
         StartUpdateRequest,
@@ -945,6 +1093,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
         )
         .route("/settings/cluster-ca/rotate", post(rotate_cluster_ca))
         .route("/settings/routes/refresh", post(refresh_route_table))
+        .route("/settings/public-ingress", get(get_public_ingress_status))
 }
 
 /// Return the build-time compatibility promise for every user-facing feature.
@@ -1976,6 +2125,9 @@ fn preserve_masked_secrets(
     if is_mask_or_blank(incoming.agent_sandbox.api_key_encrypted.as_deref()) {
         incoming.agent_sandbox.api_key_encrypted = current.agent_sandbox.api_key_encrypted.clone();
     }
+    // Sandbox placement nodes (ADR-048) are owned by
+    // `PUT /sandboxes/placement`; `ConfigService` restores them from the
+    // locked settings row on every generic save.
     if incoming.preview_gateway.shared_secret.is_empty() {
         incoming.preview_gateway.shared_secret = current.preview_gateway.shared_secret.clone();
     }
@@ -2138,6 +2290,11 @@ fn preserve_cloud_settings_not_sent_by_every_client(
     incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
     incoming.cloud.backups_enabled = current.cloud.backups_enabled;
     incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+    // ADR-045 §5: same reasoning as the three consent flags above -- enabling
+    // console access requires `PATCH /cloud/features` (and, on the
+    // unattended bootstrap path, is set exactly once and audited there), so
+    // a generic settings write must never be able to flip it either way.
+    incoming.cloud.console_access_enabled = current.cloud.console_access_enabled;
 
     if !sent.backend_url {
         incoming.cloud.backend_url = current.cloud.backend_url.clone();
@@ -2162,6 +2319,135 @@ fn preserve_cloud_settings_not_sent_by_every_client(
 /// fail with a 400 on any instance that had never configured it. Kept as a
 /// small pure helper (shared by both URL fields) so the two can't drift
 /// apart again and the invariant is unit-testable.
+/// Validate a submitted `public_ingress_url` (ADR-051 D1).
+///
+/// Blank clears the setting. A value identical to the stored one is passed
+/// through, so an unrelated save never fails over a field the client did not
+/// change (the rules may have tightened since it was stored); it is only
+/// checked against the preview domain, which the same save may be changing.
+/// A new value must be a bare, internet-reachable origin outside the preview
+/// domain's generated namespace, whose hostname no application uses: the
+/// route table reserves it for the platform, and reserving a hostname that is
+/// serving an application would take that application down without anyone
+/// having asked for it.
+///
+/// "In use" is decided in two places, and both must agree the name is free:
+///
+/// - the stored domain records, exact or wildcard, which also cover a domain
+///   attached to an environment that was never deployed;
+/// - the route table, freshly loaded, which is the only place that knows the
+///   names generated from an environment's subdomain, wildcard matches as
+///   the proxy resolves them, stopped deployments and sleeping environments.
+///
+/// Without a route table there is no way to rule those out, so the change is
+/// refused rather than accepted unchecked.
+async fn validate_public_ingress_url(
+    config_service: &ConfigService,
+    route_table: Option<&dyn temps_core::route_table::RouteTableRefresher>,
+    submitted: Option<String>,
+    stored: Option<&str>,
+    preview_domain: &str,
+) -> Result<Option<String>, Problem> {
+    let Some(raw) = submitted
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(None);
+    };
+    if stored.map(str::trim) == Some(raw.as_str()) {
+        // Unchanged, so not re-validated — with one exception. The preview
+        // domain may be what changed in this save, and moving it onto the
+        // stored ingress hostname creates the same collision as moving the
+        // ingress hostname into it: generated names and workspace previews
+        // would share a namespace with the callback host.
+        let stored_host = url::Url::parse(&raw)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default();
+        if let Some(conflict) =
+            temps_core::public_ingress::preview_namespace_conflict(&stored_host, preview_domain)
+        {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Preview Domain Conflicts With Public Ingress URL")
+                .detail(format!(
+                    "{conflict}. Change the public ingress URL first, or choose a preview \
+                     domain that does not contain it."
+                ))
+                .value("field", "preview_domain")
+                .build());
+        }
+        return Ok(Some(raw));
+    }
+
+    let normalized = temps_core::public_ingress::normalize_public_ingress_url(&raw, preview_domain)
+        .map_err(|e| {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Public Ingress URL")
+                .detail(e.to_string())
+                .value("field", "public_ingress_url")
+                .build()
+        })?;
+
+    let host = url::Url::parse(&normalized)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+
+    let in_use = |owner: &str| {
+        ErrorBuilder::new(StatusCode::CONFLICT)
+            .title("Public Ingress Hostname In Use")
+            .detail(format!(
+                "'{host}' is already used by {owner}. The public ingress hostname is \
+                 reserved for Temps itself, so setting it would take that application \
+                 offline. Choose a hostname no application uses, or remove the route first."
+            ))
+            .value("field", "public_ingress_url")
+            .build()
+    };
+    let unverifiable = |why: String| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Settings Save Aborted")
+            .detail(format!(
+                "Could not check whether '{host}' is already used by an application, so the \
+                 public ingress URL was not saved: {why}"
+            ))
+            .build()
+    };
+
+    match config_service.hostname_claimed_by(&host).await {
+        Ok(None) => {}
+        Ok(Some(owner)) => return Err(in_use(owner)),
+        Err(e) => {
+            error!(
+                "Could not check stored domains for public ingress hostname '{}': {}",
+                host, e
+            );
+            return Err(unverifiable(e.to_string()));
+        }
+    }
+
+    let Some(route_table) = route_table else {
+        error!(
+            "No route table is available to check public ingress hostname '{}'; refusing the change",
+            host
+        );
+        return Err(unverifiable(
+            "the route table is not available in this process".to_string(),
+        ));
+    };
+    match route_table.application_serving_host(&host).await {
+        Ok(None) => Ok(Some(normalized)),
+        Ok(Some(owner)) => Err(in_use(&owner)),
+        Err(e) => {
+            error!(
+                "Could not check the route table for public ingress hostname '{}': {}",
+                host, e
+            );
+            Err(unverifiable(e.to_string()))
+        }
+    }
+}
+
 fn sanitize_optional_url(
     field_label: &str,
     url: Option<String>,
@@ -2403,6 +2689,25 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
     Ok(())
 }
 
+/// Host-default sandbox backend accepted in platform settings. Selecting a
+/// backend this host can't run is allowed (the settings page shows its
+/// onboarding state); the agents plugin only routes to registered backends.
+fn validate_sandbox_backend(backend: Option<&str>) -> Result<(), Problem> {
+    let Some(backend) = backend.map(str::trim) else {
+        return Ok(());
+    };
+    if matches!(backend, "docker" | "firecracker" | "microsandbox") {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .title("Invalid Sandbox Backend")
+        .detail(format!(
+            "sandbox_backend must be \"docker\", \"firecracker\" or \"microsandbox\", got \"{}\"",
+            backend
+        ))
+        .build())
+}
+
 fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
     if monitoring.scrape_interval_secs < 15 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -2583,6 +2888,49 @@ fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Re
     Ok(())
 }
 
+/// Upper bound on trusted private network entries. A handful of CIDRs covers
+/// any real LAN/overlay layout; the cap keeps the per-request check trivial.
+const MAX_TRUSTED_PRIVATE_NETWORKS: usize = 64;
+
+/// Validate the trusted private networks and rewrite them to their canonical
+/// CIDR form (`10.1.2.3/16` becomes `10.1.0.0/16`, a bare address gets `/32`
+/// or `/128`), dropping blanks and duplicates so the stored list and the
+/// audit record show exactly what is enforced.
+fn normalize_trusted_private_networks(networks: &mut Vec<String>) -> Result<(), Problem> {
+    let parsed =
+        temps_core::url_validation::parse_trusted_private_networks(networks).map_err(|error| {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Trusted Private Network")
+                .detail(format!(
+                    "trusted_private_networks: {error}. Nothing was saved."
+                ))
+                .build()
+        })?;
+
+    let mut normalized: Vec<String> = Vec::with_capacity(parsed.len());
+    for network in parsed {
+        let canonical = network.to_string();
+        if !normalized.contains(&canonical) {
+            normalized.push(canonical);
+        }
+    }
+
+    if normalized.len() > MAX_TRUSTED_PRIVATE_NETWORKS {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Too Many Trusted Private Networks")
+            .detail(format!(
+                "trusted_private_networks has {} entries; at most {} are allowed. Use \
+                 broader CIDRs (for example 10.0.0.0/8) instead of individual hosts.",
+                normalized.len(),
+                MAX_TRUSTED_PRIVATE_NETWORKS
+            ))
+            .build());
+    }
+
+    *networks = normalized;
+    Ok(())
+}
+
 fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
     if let Some(hours) = geo.refresh_interval_hours {
         if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
@@ -2683,6 +3031,8 @@ async fn update_settings(
     // Dedicated SystemAdmin plugin endpoint owns this consent. Strip it from
     // generic SettingsWrite requests, including full-document round trips.
     discard_plugin_reporting_consent(&mut body);
+    // Capture presence before omitted fields are filled from the cached GET.
+    let trusted_private_networks_sent = body.get("trusted_private_networks").is_some();
     let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
     let node_failover_sent =
         SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
@@ -2772,11 +3122,16 @@ async fn update_settings(
         cloud_fields_sent,
     );
 
+    // Checked on the merged document so a partial save that turns on one
+    // provider while the other is stored as on is still caught.
+    validate_delivery_defaults(&app_state.config_service, &stored_settings, &settings).await?;
+
     let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
     let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
+    let previous_public_ingress_url = stored_settings.public_ingress_url.clone();
 
     // Whether this request asked to store, rotate, or clear the MaxMind
     // license key. Set inside the preservation block below (where the
@@ -2805,6 +3160,9 @@ async fn update_settings(
             preserve_omitted_security_fields(&mut settings, &current_settings);
             settings.plugin_installation_reporting_enabled =
                 current_settings.plugin_installation_reporting_enabled;
+            // Anonymous product telemetry consent is owned by the SystemAdmin-only
+            // `PATCH /settings/telemetry` endpoint (audit-logged there).
+            settings.anonymous_telemetry_enabled = current_settings.anonymous_telemetry_enabled;
             // The `cloud` block was already merged, further up: the ADR-042
             // guard authorization depends on the merged value, so it cannot
             // wait until here.
@@ -2871,18 +3229,7 @@ async fn update_settings(
         }
     }
 
-    if let Some(ref backend) = settings.agent_sandbox.sandbox_backend {
-        let backend = backend.trim();
-        if backend != "docker" && backend != "firecracker" {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .title("Invalid Sandbox Backend")
-                .detail(format!(
-                    "sandbox_backend must be \"docker\" or \"firecracker\", got \"{}\"",
-                    backend
-                ))
-                .build());
-        }
-    }
+    validate_sandbox_backend(settings.agent_sandbox.sandbox_backend.as_deref())?;
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
@@ -2893,9 +3240,19 @@ async fn update_settings(
     validate_observability_retention(&settings.observability_retention)?;
     validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
+    normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    settings.public_ingress_url = validate_public_ingress_url(
+        &app_state.config_service,
+        app_state.route_table_refresher.as_deref(),
+        settings.public_ingress_url.take(),
+        previous_public_ingress_url.as_deref(),
+        &settings.preview_domain,
+    )
+    .await?;
+    let next_public_ingress_url = settings.public_ingress_url.clone();
     settings.registry_mirror_prefix =
         sanitize_registry_mirror_prefix(settings.registry_mirror_prefix)?;
     // Validate and sanitize external_url
@@ -2946,13 +3303,24 @@ async fn update_settings(
     normalize_edge_target(&mut settings);
 
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
+    let trusted_private_networks_intent = if trusted_private_networks_sent {
+        TrustedPrivateNetworksIntent::Replace(settings.trusted_private_networks.clone())
+    } else {
+        TrustedPrivateNetworksIntent::Unchanged
+    };
 
     match app_state
         .config_service
-        .update_settings_with_geo_intent(settings, geo_license_key_intent)
+        .update_settings_with_intents(
+            settings,
+            geo_license_key_intent,
+            trusted_private_networks_intent,
+        )
         .await
     {
-        Ok(_) => {
+        Ok(saved) => {
+            let previous_trusted_private_networks = saved.previous_trusted_private_networks;
+            let next_trusted_private_networks = saved.trusted_private_networks;
             let audit = SettingsUpdatedAudit {
                 context: AuditContext {
                     user_id: auth.user_id(),
@@ -3056,12 +3424,90 @@ async fn update_settings(
                 }
             }
 
+            if next_public_ingress_url != previous_public_ingress_url {
+                info!(
+                    previous_url = previous_public_ingress_url.as_deref().unwrap_or(""),
+                    new_url = next_public_ingress_url.as_deref().unwrap_or(""),
+                    "Public ingress URL changed"
+                );
+                let ingress_audit = PublicIngressUrlUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_url: previous_public_ingress_url,
+                    new_url: next_public_ingress_url,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&ingress_audit)
+                    .await
+                {
+                    error!("Failed to create the public ingress URL audit log: {}", e);
+                }
+                // The ingress hostname is a reserved platform host in the
+                // route table. Reload now so the proxy pins it to the
+                // public-only surface without waiting for the next reconcile;
+                // a failure only delays that, it does not undo the save.
+                if let Some(refresher) = app_state.route_table_refresher.as_ref() {
+                    if let Err(e) = refresher.refresh_routes().await {
+                        warn!(
+                            "Failed to refresh the route table after a public ingress URL \
+                             change; the proxy picks it up on its next reload: {}",
+                            e
+                        );
+                    }
+                }
+            }
+
+            if next_trusted_private_networks != previous_trusted_private_networks {
+                warn!(
+                    previous_networks = ?previous_trusted_private_networks,
+                    new_networks = ?next_trusted_private_networks,
+                    "Trusted private networks for outbound requests changed"
+                );
+                let trusted_networks_audit = TrustedPrivateNetworksUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_networks: previous_trusted_private_networks,
+                    new_networks: next_trusted_private_networks,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&trusted_networks_audit)
+                    .await
+                {
+                    error!(
+                        "Failed to create the trusted private networks audit log: {}",
+                        e
+                    );
+                }
+            }
+
             Ok((
                 StatusCode::OK,
                 Json(SettingsUpdateResponse {
                     message: "Settings updated successfully".to_string(),
                 }),
             ))
+        }
+        Err(crate::ConfigServiceError::PublicIngressHostnameInUse { hostname }) => {
+            // A status page claimed the hostname after this request checked
+            // it. Same response as the up-front check (owner not disclosed
+            // beyond the kind of resource).
+            Err(ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Public Ingress Hostname In Use")
+                .detail(format!(
+                    "'{hostname}' is already used by a status page custom domain. The public \
+                     ingress hostname is reserved for Temps itself. Choose another hostname, or \
+                     remove it from the status page first."
+                ))
+                .value("field", "public_ingress_url")
+                .build())
         }
         Err(e) => {
             tracing::error!("Failed to update settings: {}", e);
@@ -3353,9 +3799,549 @@ async fn refresh_route_table(
     }))
 }
 
+/// Where third-party callbacks are sent, and whether they can arrive.
+///
+/// The console reads callback URLs from here instead of deriving them from
+/// the address the operator happens to be browsing, which is the console host
+/// and may be private.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublicIngressStatusResponse {
+    /// Base URL third parties are given, with no trailing slash. Callback
+    /// paths (`/api/webhook/git/...`, `/api/emails/...`) are appended to it.
+    #[schema(example = "https://hooks.example.com")]
+    pub effective_url: String,
+    /// Whether `effective_url` is the explicit setting or the `external_url`
+    /// fallback.
+    pub source: temps_core::public_ingress::PublicIngressSource,
+    /// `false` when Temps can tell from its own configuration that a third
+    /// party cannot reach `effective_url`. `true` is not a guarantee: a
+    /// firewall, VPN or identity-aware proxy in front of the host is
+    /// invisible from here.
+    pub configured: bool,
+    /// Why callbacks will not arrive, when `configured` is false.
+    pub reason: Option<String>,
+    /// Console path that fixes it, when `configured` is false.
+    #[schema(example = "/settings#public-ingress")]
+    pub setup_path: Option<String>,
+}
+
+impl From<&AppSettings> for PublicIngressStatusResponse {
+    fn from(settings: &AppSettings) -> Self {
+        let resolved = settings.resolve_public_ingress();
+        let reason = resolved.unreachable_reason.map(|why| {
+            format!(
+                "Callback URLs point at {}, which third parties cannot reach: {}. Email opens \
+                 and clicks, provider webhooks and delivery events will not arrive until a \
+                 publicly reachable URL is configured.",
+                resolved.effective_url, why
+            )
+        });
+        Self {
+            effective_url: resolved.effective_url,
+            source: resolved.source,
+            configured: reason.is_none(),
+            setup_path: reason
+                .is_some()
+                .then(|| temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+            reason,
+        }
+    }
+}
+
+/// Get where third-party callbacks are sent
+///
+/// Returns the base URL Temps hands to third parties that call back into it
+/// (email open/click tracking, git provider webhooks, SES/SNS delivery
+/// events, revenue webhooks, the Sentry DSN) and whether Temps can tell that
+/// URL is unreachable for them. Unlike a 404, `configured: false` means the
+/// feature exists but needs setting up; `setup_path` says where.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/public-ingress",
+    responses(
+        (status = 200, description = "Effective public ingress URL and its reachability", body = PublicIngressStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_public_ingress_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Deliberately not `SettingsRead`: this is read by everyone who wires a
+    // callback (a project member pasting a revenue webhook URL into a
+    // provider), not only by whoever may read the settings document. The
+    // response holds nothing confidential — the URL is printed in every
+    // tracked email Temps sends.
+    permission_guard!(auth, ProjectsRead);
+
+    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+        error!(
+            "Failed to load settings for the public ingress status: {}",
+            e
+        );
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .type_("https://temps.sh/probs/settings-error")
+            .title("Settings Error")
+            .detail(format!(
+                "Failed to load settings for the public ingress status: {}",
+                e
+            ))
+            .build()
+    })?;
+
+    Ok(Json(PublicIngressStatusResponse::from(&settings)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ingress_status_reports_the_explicit_url_as_configured() {
+        let settings = AppSettings {
+            external_url: Some("https://console.example.com".into()),
+            public_ingress_url: Some("https://hooks.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PublicIngressStatusResponse::from(&settings),
+            PublicIngressStatusResponse {
+                effective_url: "https://hooks.example.com".into(),
+                source: temps_core::public_ingress::PublicIngressSource::Explicit,
+                configured: true,
+                reason: None,
+                setup_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn public_ingress_status_falls_back_to_the_external_url() {
+        let settings = AppSettings {
+            external_url: Some("https://console.example.com/".into()),
+            ..Default::default()
+        };
+        let status = PublicIngressStatusResponse::from(&settings);
+        assert_eq!(status.effective_url, "https://console.example.com");
+        assert_eq!(
+            status.source,
+            temps_core::public_ingress::PublicIngressSource::ExternalUrlFallback
+        );
+        assert!(status.configured);
+    }
+
+    #[test]
+    fn public_ingress_status_onboards_when_the_host_is_unreachable() {
+        let status = PublicIngressStatusResponse::from(&AppSettings::default());
+        assert!(!status.configured);
+        assert_eq!(status.effective_url, "http://localho.st");
+        assert_eq!(
+            status.setup_path.as_deref(),
+            Some("/settings#public-ingress")
+        );
+        let reason = status.reason.expect("an unreachable host states why");
+        assert!(reason.contains("http://localho.st"), "{reason}");
+        assert!(reason.contains("loopback"), "{reason}");
+    }
+
+    fn ingress_config_service(db: sea_orm::MockDatabase) -> ConfigService {
+        ConfigService::new(
+            Arc::new(
+                crate::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            Arc::new(db.into_connection()),
+        )
+    }
+
+    /// A route table that reports one fixed answer and records what it was
+    /// asked, so a test can also prove it was not consulted at all.
+    #[derive(Default)]
+    struct StubRouteTable {
+        serving: Option<&'static str>,
+        fails: bool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::route_table::RouteTableRefresher for StubRouteTable {
+        async fn refresh_routes(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(0)
+        }
+
+        async fn application_serving_host(
+            &self,
+            host: &str,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.asked.lock().unwrap().push(host.to_string());
+            if self.fails {
+                return Err("route table reload failed".into());
+            }
+            Ok(self.serving.map(str::to_string))
+        }
+    }
+
+    fn free_route_table() -> StubRouteTable {
+        StubRouteTable::default()
+    }
+
+    fn free_hostname_db() -> sea_orm::MockDatabase {
+        use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
+            .append_query_results(vec![Vec::<environment_domains::Model>::new()])
+            .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_is_normalized_when_the_hostname_is_free() {
+        let svc = ingress_config_service(free_hostname_db());
+        let saved = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some("  https://Hooks.Example.com/ ".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect("a free, public hostname is accepted");
+        assert_eq!(saved.as_deref(), Some("https://hooks.example.com"));
+    }
+
+    #[tokio::test]
+    async fn blank_public_ingress_url_clears_the_setting_without_a_lookup() {
+        // Nothing queued: a database read would fail the test.
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        for submitted in [None, Some(String::new()), Some("   ".to_string())] {
+            let saved = validate_public_ingress_url(
+                &svc,
+                Some(&free_route_table()),
+                submitted,
+                Some("https://hooks.example.com"),
+                "apps.example.com",
+            )
+            .await
+            .expect("blank clears the setting");
+            assert_eq!(saved, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_public_ingress_url_is_not_revalidated() {
+        // A value that would be refused today must not fail an unrelated save.
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let saved = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some("http://10.0.0.5".into()),
+            Some("http://10.0.0.5"),
+            "apps.example.com",
+        )
+        .await
+        .expect("the stored value passes through");
+        assert_eq!(saved.as_deref(), Some("http://10.0.0.5"));
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_with_a_path_or_private_host_is_a_bad_request() {
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        for url in [
+            "https://hooks.example.com/api",
+            "https://hooks.example.com?x=1",
+            "http://127.0.0.1:8080",
+            "http://hooks.localho.st",
+            "https://apps.example.com",
+        ] {
+            let problem = validate_public_ingress_url(
+                &svc,
+                Some(&free_route_table()),
+                Some(url.into()),
+                None,
+                "apps.example.com",
+            )
+            .await
+            .expect_err("an invalid ingress URL must be rejected");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{url}");
+            assert_eq!(
+                problem.body.get("field").and_then(|v| v.as_str()),
+                Some("public_ingress_url"),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_on_a_project_hostname_is_a_conflict() {
+        use temps_entities::{environment_domains, project_custom_domains};
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
+            .append_query_results(vec![vec![environment_domains::Model {
+                id: 1,
+                environment_id: 2,
+                domain: "shop.example.com".into(),
+                created_at: chrono::Utc::now(),
+            }]]);
+        let svc = ingress_config_service(db);
+        let problem = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some("https://shop.example.com".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect_err("a hostname an environment routes must be refused");
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("shop.example.com"), "{detail}");
+        assert!(detail.contains("an environment domain"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_is_not_saved_when_the_hostname_check_fails() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())]);
+        let svc = ingress_config_service(db);
+        let problem = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some("https://hooks.example.com".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect_err("an unverifiable hostname must not be saved");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // The stored domain rows say nothing about a name a wildcard route covers
+    // or one generated from an environment's subdomain. The route table does,
+    // and reserving such a name would stop serving the application behind it.
+    #[tokio::test]
+    async fn public_ingress_url_on_a_host_the_route_table_serves_is_a_conflict() {
+        for owner in [
+            "a deployed application",
+            "an environment's generated hostname",
+            "a sleeping on-demand environment",
+        ] {
+            let svc = ingress_config_service(free_hostname_db());
+            let route_table = StubRouteTable {
+                serving: Some(owner),
+                ..Default::default()
+            };
+            let problem = validate_public_ingress_url(
+                &svc,
+                Some(&route_table),
+                Some("https://App.Example.com".into()),
+                None,
+                "apps.example.com",
+            )
+            .await
+            .expect_err("a hostname the proxy serves must be refused");
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{owner}");
+            let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+            assert!(detail.contains("app.example.com"), "{detail}");
+            assert!(detail.contains(owner), "{detail}");
+            assert_eq!(
+                route_table.asked.lock().unwrap().as_slice(),
+                ["app.example.com"],
+                "the route table is asked about the normalized hostname"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_is_not_saved_when_the_route_table_cannot_answer() {
+        // A failed reload, or no route table at all: either way nothing rules
+        // out an application on that name, so the change is refused.
+        let svc = ingress_config_service(free_hostname_db());
+        let failing = StubRouteTable {
+            fails: true,
+            ..Default::default()
+        };
+        let problem = validate_public_ingress_url(
+            &svc,
+            Some(&failing),
+            Some("https://hooks.example.com".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect_err("an unverifiable hostname must not be saved");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let svc = ingress_config_service(free_hostname_db());
+        let problem = validate_public_ingress_url(
+            &svc,
+            None,
+            Some("https://hooks.example.com".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect_err("without a route table the hostname cannot be verified");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("route table"), "{detail}");
+    }
+
+    // The generated namespace is refused outright, before any lookup: a name
+    // directly under the preview domain can belong to an environment that
+    // exists now or one created later, and a `ws-` shaped one is a sandbox
+    // preview to the proxy.
+    #[tokio::test]
+    async fn public_ingress_url_inside_the_preview_namespace_is_refused_without_a_lookup() {
+        // Nothing queued and a route table that records being asked.
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let route_table = free_route_table();
+        for url in [
+            "https://hooks.apps.example.com",
+            "https://shop-production.apps.example.com",
+            "https://ws-0123456789abcdef-3000.apps.example.com",
+        ] {
+            let problem = validate_public_ingress_url(
+                &svc,
+                Some(&route_table),
+                Some(url.into()),
+                None,
+                "*.apps.example.com",
+            )
+            .await
+            .expect_err("a name inside the generated namespace must be refused");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{url}");
+            let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+            assert!(detail.contains("inside the preview domain"), "{detail}");
+        }
+        assert!(route_table.asked.lock().unwrap().is_empty());
+    }
+
+    // The collision can also be created from the other side, by moving the
+    // preview domain onto an ingress hostname that was fine when it was saved.
+    #[tokio::test]
+    async fn a_preview_domain_moved_onto_the_stored_ingress_hostname_is_refused() {
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let stored = "https://hooks.example.com";
+
+        let problem = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some(stored.into()),
+            Some(stored),
+            "example.com",
+        )
+        .await
+        .expect_err("the unchanged ingress host is now inside the preview namespace");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("field").and_then(|v| v.as_str()),
+            Some("preview_domain")
+        );
+
+        // An unrelated save, with the preview domain where it was, still passes.
+        let saved = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some(stored.into()),
+            Some(stored),
+            "apps.example.com",
+        )
+        .await
+        .expect("an unchanged pair is not re-validated");
+        assert_eq!(saved.as_deref(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn clearing_or_keeping_the_public_ingress_url_never_reloads_routes() {
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let route_table = free_route_table();
+        for (submitted, stored) in [
+            (None, Some("https://hooks.example.com")),
+            (
+                Some("https://hooks.example.com".to_string()),
+                Some("https://hooks.example.com"),
+            ),
+        ] {
+            validate_public_ingress_url(
+                &svc,
+                Some(&route_table),
+                submitted,
+                stored,
+                "apps.example.com",
+            )
+            .await
+            .expect("an unchanged or cleared value needs no check");
+        }
+        assert!(route_table.asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_ingress_url_change_has_its_own_audit_event() {
+        let audit = PublicIngressUrlUpdatedAudit {
+            context: AuditContext {
+                user_id: 4,
+                ip_address: Some("198.51.100.7".into()),
+                user_agent: "test".into(),
+            },
+            previous_url: None,
+            new_url: Some("https://hooks.example.com".into()),
+        };
+        assert_eq!(audit.operation_type(), "PUBLIC_INGRESS_URL_UPDATED");
+        let serialized: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).unwrap()).unwrap();
+        assert_eq!(serialized["previous_url"], serde_json::Value::Null);
+        assert_eq!(serialized["new_url"], "https://hooks.example.com");
+    }
+
+    #[test]
+    fn settings_get_response_reports_the_public_ingress_url() {
+        let settings = AppSettings {
+            public_ingress_url: Some("https://hooks.example.com".into()),
+            ..Default::default()
+        };
+        let response = serde_json::to_value(AppSettingsResponse::from(settings)).unwrap();
+        assert_eq!(response["public_ingress_url"], "https://hooks.example.com");
+    }
+
+    #[test]
+    fn sandbox_backend_setting_accepts_the_three_public_backends() {
+        assert!(validate_sandbox_backend(None).is_ok());
+        for backend in ["docker", "firecracker", "microsandbox", " microsandbox "] {
+            assert!(
+                validate_sandbox_backend(Some(backend)).is_ok(),
+                "{backend:?} must be accepted"
+            );
+        }
+        for backend in ["local", "libkrun", ""] {
+            let problem = validate_sandbox_backend(Some(backend))
+                .expect_err("non-public backends must be rejected");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        }
+    }
 
     #[test]
     fn partial_settings_updates_preserve_omitted_fields_and_respect_explicit_values() {
@@ -3400,6 +4386,7 @@ mod tests {
             external_url: Some("https://temps.example.test".into()),
             console_version: Some("v9.9.9".into()),
             plugin_installation_reporting_enabled: true,
+            anonymous_telemetry_enabled: Some(false),
             trust_loopback_forwarded_ip: Some(true),
             self_update: Some(temps_core::SelfUpdateSettings {
                 enabled: false,
@@ -3454,6 +4441,7 @@ mod tests {
         preserve_self_recorded_fields(&mut merged, stored);
         preserve_omitted_security_fields(&mut merged, stored);
         merged.plugin_installation_reporting_enabled = stored.plugin_installation_reporting_enabled;
+        merged.anonymous_telemetry_enabled = stored.anonymous_telemetry_enabled;
         preserve_provider_credential_proof(&mut merged, stored);
         merged.geo.preserve_recorded_state(&stored.geo);
         preserve_masked_secrets(&mut merged, stored, node_failover_sent);
@@ -3532,6 +4520,27 @@ mod tests {
             incoming.multi_node.cluster_ca_key_encrypted,
             stored.multi_node.cluster_ca_key_encrypted
         );
+    }
+
+    #[test]
+    fn generic_settings_write_cannot_change_anonymous_telemetry_consent() {
+        // An admin turned telemetry off from Settings › Telemetry; a client
+        // that round-trips the whole document with the field flipped (or
+        // omitted) must not undo that decision.
+        let stored = AppSettings {
+            anonymous_telemetry_enabled: Some(false),
+            ..Default::default()
+        };
+        for body in [
+            serde_json::json!({
+                "preview_domain": "apps.example.test",
+                "anonymous_telemetry_enabled": true
+            }),
+            serde_json::json!({ "preview_domain": "apps.example.test" }),
+        ] {
+            let merged = merge_settings_put(body, &stored);
+            assert_eq!(merged.anonymous_telemetry_enabled, Some(false));
+        }
     }
 
     #[test]
@@ -3978,6 +4987,12 @@ mod tests {
         incoming.cloud.telemetry_enabled = true;
         incoming.cloud.backups_enabled = true;
         incoming.cloud.notifications_enabled = true;
+        // ADR-045 §5: console access is exactly as unwritable through this
+        // endpoint as the three consent flags above -- it is a
+        // resource-specific `PATCH /cloud/features` decision (or the
+        // bootstrap default), never a side effect of an unrelated settings
+        // save.
+        incoming.cloud.console_access_enabled = true;
 
         preserve_cloud_settings_not_sent_by_every_client(
             &mut incoming,
@@ -3988,6 +5003,7 @@ mod tests {
         assert!(!incoming.cloud.telemetry_enabled);
         assert!(!incoming.cloud.backups_enabled);
         assert!(!incoming.cloud.notifications_enabled);
+        assert!(!incoming.cloud.console_access_enabled);
     }
 
     #[test]
@@ -3996,6 +5012,7 @@ mod tests {
         current.cloud.telemetry_enabled = true;
         current.cloud.backups_enabled = true;
         current.cloud.notifications_enabled = true;
+        current.cloud.console_access_enabled = true;
         let mut incoming = AppSettings::default();
 
         preserve_cloud_settings_not_sent_by_every_client(
@@ -4007,6 +5024,7 @@ mod tests {
         assert!(incoming.cloud.telemetry_enabled);
         assert!(incoming.cloud.backups_enabled);
         assert!(incoming.cloud.notifications_enabled);
+        assert!(incoming.cloud.console_access_enabled);
     }
 
     /// A settings row whose operator-tuned Cloud fields have all been moved off
@@ -4620,6 +5638,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trusted_private_networks_are_normalized_and_deduplicated() {
+        let mut networks = vec![
+            " 10.1.2.3/8 ".to_string(),
+            "10.0.0.0/8".to_string(),
+            "192.168.1.20".to_string(),
+            "".to_string(),
+            "fd12:3456::1/48".to_string(),
+        ];
+        normalize_trusted_private_networks(&mut networks).expect("valid networks");
+        assert_eq!(
+            networks,
+            vec!["10.0.0.0/8", "192.168.1.20/32", "fd12:3456::/48"]
+        );
+    }
+
+    #[test]
+    fn trusted_private_networks_reject_public_or_metadata_ranges() {
+        for entry in [
+            "0.0.0.0/0",
+            "8.8.8.8",
+            "169.254.169.254",
+            "fe80::/10",
+            "nope",
+        ] {
+            let mut networks = vec![entry.to_string()];
+            let error = normalize_trusted_private_networks(&mut networks)
+                .expect_err("non-private entries must be refused");
+            assert_eq!(error.status_code, StatusCode::BAD_REQUEST, "{entry}");
+            let detail = error
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert!(detail.contains(entry), "{entry}: {detail}");
+            assert_eq!(
+                networks,
+                vec![entry.to_string()],
+                "nothing is rewritten on error"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_private_networks_are_capped() {
+        let mut networks: Vec<String> = (0..=MAX_TRUSTED_PRIVATE_NETWORKS)
+            .map(|index| format!("10.0.{}.{}", index / 256, index % 256))
+            .collect();
+        let error = normalize_trusted_private_networks(&mut networks)
+            .expect_err("more than the cap must be refused");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+    }
+
     // Regression: the GET /api/settings response must surface agent_sandbox,
     // ai_config, preview_gateway, multi_node, and insecure_tls so the UI can
     // render (and round-trip) resource/runtime/network settings. An earlier
@@ -4653,6 +5725,7 @@ mod tests {
                 memory_limit_mb: 16_384,
                 network_mode: "restricted".into(),
                 sandbox_backend: None,
+                allowed_node_ids: None,
             },
             ..Default::default()
         };
@@ -5119,5 +6192,46 @@ mod tests {
             "console_version must not appear in the settings response"
         );
         assert!(!json.contains("v0.1.0"));
+    }
+
+    #[test]
+    fn only_off_to_on_delivery_defaults_are_checked_for_availability() {
+        let off = AppSettings::default();
+        let cloudflare_on = AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        let bunny_on = AppSettings {
+            bunny_new_projects: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            newly_enabled_delivery_defaults(&off, &cloudflare_on),
+            vec!["cloudflare"]
+        );
+        assert_eq!(
+            newly_enabled_delivery_defaults(&off, &bunny_on),
+            vec!["bunny"]
+        );
+        assert_eq!(
+            newly_enabled_delivery_defaults(&cloudflare_on, &bunny_on),
+            vec!["bunny"]
+        );
+        // An unrelated save that keeps a stored default unchanged is not
+        // re-validated, nor is switching a default off.
+        assert!(newly_enabled_delivery_defaults(&cloudflare_on, &cloudflare_on).is_empty());
+        assert!(newly_enabled_delivery_defaults(&bunny_on, &off).is_empty());
+    }
+
+    #[test]
+    fn one_future_project_delivery_provider_is_allowed() {
+        let mut settings = AppSettings::default();
+        assert!(!conflicting_delivery_defaults(&settings));
+        settings.cloudflare_new_projects = true;
+        assert!(!conflicting_delivery_defaults(&settings));
+        settings.bunny_new_projects = true;
+        assert!(conflicting_delivery_defaults(&settings));
+        settings.cloudflare_new_projects = false;
+        assert!(!conflicting_delivery_defaults(&settings));
     }
 }

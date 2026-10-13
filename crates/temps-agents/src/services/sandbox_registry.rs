@@ -106,11 +106,17 @@ impl SandboxRegistry {
         let sandboxes = self.sandboxes.read().await;
         let handle = sandboxes
             .get(&run_id)
-            .ok_or(AgentError::SandboxNotFound { run_id })?;
+            .ok_or_else(|| AgentError::SandboxNotFound {
+                run_id,
+                sandbox: format!("for run {}", run_id),
+            })?;
 
         // Verify it's still alive
         if !self.provider.is_alive(handle).await.unwrap_or(false) {
-            return Err(AgentError::SandboxNotFound { run_id });
+            return Err(AgentError::SandboxNotFound {
+                run_id,
+                sandbox: format!("{} for run {} (not running)", handle.sandbox_name, run_id),
+            });
         }
 
         Ok(handle.clone())
@@ -146,6 +152,19 @@ impl SandboxRegistry {
         let handle = self.get(run_id).await?;
         self.provider
             .write_directory(&handle, local_dir, target_path)
+            .await
+    }
+
+    /// Bring a run's sandbox work dir back into its host checkout
+    /// (see [`SandboxProvider::sync_workspace_to_host`]).
+    pub async fn sync_workspace_to_host(
+        &self,
+        run_id: i32,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        let handle = self.get(run_id).await?;
+        self.provider
+            .sync_workspace_to_host(&handle, host_dir)
             .await
     }
 
@@ -243,6 +262,7 @@ mod tests {
     fn test_config(run_id: i32) -> SandboxCreateConfig {
         let work_dir = std::env::temp_dir().join(format!("test-registry-{}", run_id));
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,
@@ -302,7 +322,7 @@ mod tests {
         let result = registry.get(999).await;
         assert!(matches!(
             result,
-            Err(AgentError::SandboxNotFound { run_id: 999 })
+            Err(AgentError::SandboxNotFound { run_id: 999, .. })
         ));
     }
 
@@ -326,7 +346,7 @@ mod tests {
         // Should no longer exist in registry
         assert!(matches!(
             registry.get(3).await,
-            Err(AgentError::SandboxNotFound { run_id: 3 })
+            Err(AgentError::SandboxNotFound { run_id: 3, .. })
         ));
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;

@@ -559,6 +559,18 @@ pub async fn lookup_sandbox(
         .await
     {
         Ok(Some(row)) if row.status == "destroyed" => PreviewSandboxLookup::NotFound,
+        // Sandboxes on worker nodes (ADR-048) have no preview routing: the
+        // gateway can only reach control-plane containers. Answer exactly
+        // like an unknown sandbox rather than asking for a password that
+        // could never lead anywhere.
+        Ok(Some(row)) if row.node_id.is_some() => {
+            debug!(
+                public_id = %full_public_id,
+                node_id = ?row.node_id,
+                "preview-auth: sandbox runs on a worker node, which has no preview routing"
+            );
+            PreviewSandboxLookup::NotFound
+        }
         Ok(Some(row)) => match row.preview_password_hash {
             Some(hash) => PreviewSandboxLookup::Protected {
                 password_hash: hash,
@@ -1185,6 +1197,7 @@ mod tests {
         let now = Utc::now();
         sandboxes::Model {
             id: 1,
+            node_id: None,
             public_id: public_id.to_string(),
             user_id: Some(1),
             agent_run_id: None,
@@ -1293,6 +1306,40 @@ mod tests {
             "expected cached Protected, got {:?}",
             second
         );
+    }
+
+    /// ADR-048: a sandbox on a worker node has no preview routing, so it
+    /// resolves exactly like an unknown sandbox, password or not.
+    #[tokio::test]
+    async fn worker_node_sandboxes_resolve_as_not_found() {
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let on_worker = |password: Option<&str>| sandboxes::Model {
+            node_id: Some(3),
+            ..sandbox_model("sbx_aabbccdd11223344", "running", password)
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![on_worker(None)],
+                    vec![on_worker(Some(hash))],
+                    vec![sandbox_model("sbx_aabbccdd11223344", "running", None)],
+                ])
+                .into_connection(),
+        );
+
+        let open = lookup_sandbox(&db, "aabbccdd11223344").await;
+        assert!(
+            matches!(open, PreviewSandboxLookup::NotFound),
+            "an unprotected worker sandbox must not be Open: {open:?}"
+        );
+        let protected = lookup_sandbox(&db, "aabbccdd11223344").await;
+        assert!(
+            matches!(protected, PreviewSandboxLookup::NotFound),
+            "a protected worker sandbox must not ask for a password: {protected:?}"
+        );
+        // The same sandbox on the control plane is still served.
+        let local = lookup_sandbox(&db, "aabbccdd11223344").await;
+        assert!(matches!(local, PreviewSandboxLookup::Open), "{local:?}");
     }
 
     /// A missing sandbox resolves to NotFound which is also cached so repeated

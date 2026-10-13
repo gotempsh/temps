@@ -22,6 +22,7 @@ use temps_entities::{git_provider_connections, git_providers, projects, reposito
 // OAuth scope constants
 const GITLAB_OAUTH_SCOPES: &str = "api read_api read_repository";
 const MAX_DOCKERFILES_TO_SCAN: usize = 16;
+const INITIAL_INSTALLATION_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 // Create JWT token for authentication
 use octocrab::models::{AppId, InstallationId, InstallationToken};
 use octocrab::params::apps::CreateInstallationAccessToken;
@@ -3344,6 +3345,93 @@ impl GitProviderManager {
         Ok(preset_data)
     }
 
+    /// Check that `directory` exists in `owner/repo` at `branch`, through the
+    /// connection's provider API.
+    ///
+    /// Never fails: anything that prevents a definite answer (the connection
+    /// or provider cannot be loaded, the provider has no listing API, the API
+    /// is unreachable or slow) is
+    /// [`RepositoryDirectoryCheck::Unverified`](super::repository_directory::RepositoryDirectoryCheck::Unverified),
+    /// so a flaky provider never blocks saving a project. The whole walk is
+    /// bounded by `REPOSITORY_DIRECTORY_CHECK_TIMEOUT` and issues one listing
+    /// per path component.
+    pub async fn check_repository_directory(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        directory: &str,
+    ) -> super::repository_directory::RepositoryDirectoryCheck {
+        use super::repository_directory::{
+            check_repository_directory, DirectoryListingEntry, RepositoryDirectoryCheck,
+            REPOSITORY_DIRECTORY_CHECK_TIMEOUT,
+        };
+
+        let walk = async {
+            let provider_service = match self.get_connection(connection_id).await {
+                Ok(connection) => match self.get_provider_service(connection.provider_id).await {
+                    Ok(service) => service,
+                    Err(error) => {
+                        return RepositoryDirectoryCheck::Unverified {
+                            reason: format!(
+                                "the Git provider of connection {connection_id} could not be \
+                                 loaded: {error}"
+                            ),
+                        }
+                    }
+                },
+                Err(error) => {
+                    return RepositoryDirectoryCheck::Unverified {
+                        reason: format!(
+                            "Git connection {connection_id} could not be loaded: {error}"
+                        ),
+                    }
+                }
+            };
+            if matches!(provider_service.provider_type(), GitProviderType::Generic) {
+                return RepositoryDirectoryCheck::Unverified {
+                    reason: "generic Git providers have no API to list repository directories"
+                        .to_string(),
+                };
+            }
+            check_repository_directory(directory, |path| {
+                let provider_service = provider_service.clone();
+                async move {
+                    self.execute_with_refresh(connection_id, |access_token| {
+                        let provider_service = provider_service.clone();
+                        let path = path.clone();
+                        async move {
+                            provider_service
+                                .list_directory(&access_token, owner, repo, &path, Some(branch))
+                                .await
+                        }
+                    })
+                    .await
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| DirectoryListingEntry {
+                                name: entry.name,
+                                is_dir: entry.is_dir,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                }
+            })
+            .await
+        };
+        match tokio::time::timeout(REPOSITORY_DIRECTORY_CHECK_TIMEOUT, walk).await {
+            Ok(check) => check,
+            Err(_) => RepositoryDirectoryCheck::Unverified {
+                reason: format!(
+                    "listing {owner}/{repo} at '{branch}' did not finish within {}s",
+                    REPOSITORY_DIRECTORY_CHECK_TIMEOUT.as_secs()
+                ),
+            },
+        }
+    }
+
     /// Calculate repository preset in real-time without storing it
     pub async fn calculate_repository_preset_live(
         &self,
@@ -4175,6 +4263,55 @@ impl GitProviderManager {
         self.persist_health_status(connection_id, status, message)
             .await?;
         Ok(())
+    }
+
+    /// Check a newly created GitHub App connection before repository syncing.
+    /// The caller supplies installation verification because App credentials
+    /// cannot use the PAT/OAuth token probe. Timeouts and upstream failures are
+    /// persisted as unhealthy without undoing connection creation.
+    pub(crate) async fn probe_and_record_initial_installation_health<F>(
+        &self,
+        connection: &git_provider_connections::Model,
+        probe: F,
+    ) -> Result<(), GitProviderManagerError>
+    where
+        F: std::future::Future<Output = Result<bool, super::github::GithubAppServiceError>>,
+    {
+        use super::connection_health::{HEALTH_STATUS_HEALTHY, HEALTH_STATUS_UNHEALTHY};
+
+        if connection.last_health_check_at.is_some() {
+            return Ok(());
+        }
+
+        let (status, message) =
+            match tokio::time::timeout(INITIAL_INSTALLATION_HEALTH_TIMEOUT, probe).await {
+                Ok(Ok(true)) => (HEALTH_STATUS_HEALTHY, None),
+                Ok(Ok(false)) => (
+                    HEALTH_STATUS_UNHEALTHY,
+                    Some(format!(
+                        "GitHub App installation no longer exists or was suspended (connection {})",
+                        connection.id
+                    )),
+                ),
+                Ok(Err(error)) => (
+                    HEALTH_STATUS_UNHEALTHY,
+                    Some(format!(
+                        "GitHub API error while verifying installation for connection {}: {}",
+                        connection.id, error
+                    )),
+                ),
+                Err(_) => (
+                    HEALTH_STATUS_UNHEALTHY,
+                    Some(format!(
+                        "GitHub App health check for connection {} timed out after {} seconds",
+                        connection.id,
+                        INITIAL_INSTALLATION_HEALTH_TIMEOUT.as_secs()
+                    )),
+                ),
+            };
+
+        self.persist_health_status(connection.id, status, message)
+            .await
     }
 
     /// Write the health result onto the connection row. Shared helper used by
@@ -5619,13 +5756,51 @@ impl GitProviderManagerTrait for GitProviderManager {
         //      its recorded expiry.
         // libgit2's credential callback only fires once, so we have to retry
         // the whole operation rather than refreshing inside the callback.
-        let target_str = target_dir.to_str().ok_or_else(|| {
+        target_dir.to_str().ok_or_else(|| {
             TraitError::CloneError("target directory contains invalid UTF-8".to_string())
         })?;
-        let clone_result = provider_service
-            .clone_repository(&repo.clone_url, target_str, Some(&access_token))
-            .await;
-
+        // Branch/tag deployments only need the selected tip, not every
+        // historical object. Keep full clones for pinned commit checkouts.
+        let shallow_ref = branch_or_ref.filter(|reference| {
+            !reference.eq_ignore_ascii_case("HEAD")
+                && !(matches!(reference.len(), 7..=64)
+                    && reference.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        let username =
+            Self::clone_username_for_provider_type(&provider_service.provider_type().to_string());
+        let clone_with_token = |token: String| {
+            let provider_service = provider_service.clone();
+            let clone_url = repo.clone_url.clone();
+            let target_dir = target_dir.to_path_buf();
+            let shallow_ref = shallow_ref.map(str::to_string);
+            async move {
+                if let Some(reference) = shallow_ref {
+                    // Dropping this future terminates Git and its transport
+                    // process group before the checkout can be cleaned up.
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        super::git_ops::clone_named_ref_with_credentials(
+                            &clone_url,
+                            &target_dir,
+                            username,
+                            &token,
+                            &reference,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        TraitError::CloneError("Git shallow clone timed out after 300s".to_string())
+                    })?
+                    .map_err(|error| TraitError::CloneError(error.to_string()))
+                } else {
+                    provider_service
+                        .clone_repository(&clone_url, &target_dir.to_string_lossy(), Some(&token))
+                        .await
+                        .map_err(|error| TraitError::CloneError(error.to_string()))
+                }
+            }
+        };
+        let clone_result = clone_with_token(access_token.clone()).await;
         if let Err(e) = clone_result {
             if Self::is_auth_failure(&e.to_string()) {
                 tracing::warn!(
@@ -5658,12 +5833,9 @@ impl GitProviderManagerTrait for GitProviderManager {
                     .await
                     .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
 
-                provider_service
-                    .clone_repository(&repo.clone_url, target_str, Some(&refreshed))
-                    .await
-                    .map_err(|err| {
-                        TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
-                    })?;
+                clone_with_token(refreshed).await.map_err(|err| {
+                    TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
+                })?;
             } else {
                 return Err(TraitError::CloneError(format!("Failed to clone: {}", e)));
             }
@@ -5671,7 +5843,7 @@ impl GitProviderManagerTrait for GitProviderManager {
 
         // Checkout specific ref if provided
         if let Some(ref_name) = branch_or_ref {
-            if ref_name != repo.default_branch {
+            if shallow_ref.is_none() && ref_name != repo.default_branch {
                 let target_dir_owned = target_dir.to_path_buf();
                 let ref_name_owned = ref_name.to_string();
                 tokio::task::spawn_blocking(move || {
@@ -6483,6 +6655,174 @@ mod tests {
             last_sync_error_at: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn initial_installation_health_fixture() -> (
+        GitProviderManager,
+        Arc<DatabaseConnection>,
+        git_provider_connections::Model,
+    ) {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut connection = connection_fixture(11, None);
+        connection.installation_id = Some("456".to_string());
+        connection.health_status = "unknown".to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[connection.clone()], [connection.clone()]])
+                .into_connection(),
+        );
+        let manager = initial_installation_health_manager(db.clone());
+        (manager, db, connection)
+    }
+
+    fn initial_installation_health_manager(db: Arc<DatabaseConnection>) -> GitProviderManager {
+        GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+        )
+    }
+
+    fn initial_installation_health_update(
+        manager: GitProviderManager,
+        db: Arc<DatabaseConnection>,
+    ) -> String {
+        drop(manager);
+        let transactions = Arc::try_unwrap(db)
+            .expect("health test should own its mock database")
+            .into_transaction_log();
+        let updates: Vec<_> = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| statement.sql.starts_with("UPDATE"))
+            .collect();
+        assert_eq!(updates.len(), 1, "health should be recorded once");
+        let update = updates[0].to_string();
+        assert!(update.contains("\"last_health_check_at\" = '"));
+        assert!(!update.contains("\"is_active\" ="));
+        update
+    }
+
+    #[tokio::test]
+    async fn initial_installation_health_records_success() {
+        let (manager, db, connection) = initial_installation_health_fixture();
+        manager
+            .probe_and_record_initial_installation_health(&connection, async { Ok(true) })
+            .await
+            .unwrap();
+
+        let update = initial_installation_health_update(manager, db);
+        assert!(update.contains("\"health_status\" = 'healthy'"));
+        assert!(update.contains("\"health_message\" = NULL"));
+        assert!(update.contains("\"consecutive_health_failures\" = 0"));
+    }
+
+    #[tokio::test]
+    async fn initial_installation_health_records_missing_installation() {
+        let (manager, db, connection) = initial_installation_health_fixture();
+        manager
+            .probe_and_record_initial_installation_health(&connection, async { Ok(false) })
+            .await
+            .unwrap();
+
+        let update = initial_installation_health_update(manager, db);
+        assert!(update.contains("\"health_status\" = 'unhealthy'"));
+        assert!(update.contains("installation no longer exists"));
+        assert!(update.contains("\"consecutive_health_failures\" = 1"));
+    }
+
+    #[tokio::test]
+    async fn initial_installation_health_records_upstream_error() {
+        let (manager, db, connection) = initial_installation_health_fixture();
+        manager
+            .probe_and_record_initial_installation_health(&connection, async {
+                Err(super::super::github::GithubAppServiceError::GithubApiError(
+                    "temporary upstream failure".to_string(),
+                ))
+            })
+            .await
+            .unwrap();
+
+        let update = initial_installation_health_update(manager, db);
+        assert!(update.contains("\"health_status\" = 'unhealthy'"));
+        assert!(update.contains("temporary upstream failure"));
+        assert!(update.contains("\"consecutive_health_failures\" = 1"));
+    }
+
+    #[tokio::test]
+    async fn initial_installation_health_times_out_and_records_failure() {
+        let (manager, db, connection) = initial_installation_health_fixture();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            manager
+                .probe_and_record_initial_installation_health(&connection, std::future::pending()),
+        )
+        .await
+        .expect("initial health probe must finish within its deadline")
+        .unwrap();
+
+        let update = initial_installation_health_update(manager, db);
+        assert!(update.contains("\"health_status\" = 'unhealthy'"));
+        assert!(update.contains("timed out after 10 seconds"));
+        assert!(update.contains("\"consecutive_health_failures\" = 1"));
+    }
+
+    #[tokio::test]
+    async fn initial_installation_health_skips_already_checked_connection() {
+        let (manager, db, mut connection) = initial_installation_health_fixture();
+        connection.last_health_check_at = Some(chrono::Utc::now());
+        manager
+            .probe_and_record_initial_installation_health(&connection, async {
+                panic!("an already checked installation must not be probed again")
+            })
+            .await
+            .unwrap();
+
+        drop(manager);
+        assert!(Arc::try_unwrap(db)
+            .expect("health test should own its mock database")
+            .into_transaction_log()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_installation_health_propagates_recording_errors() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+
+        let connection = connection_fixture(11, None);
+        let databases = [
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<git_provider_connections::Model>::new()]),
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("health read failed".to_string())]),
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[connection.clone()]])
+                .append_query_errors([DbErr::Custom("health write failed".to_string())]),
+        ];
+
+        for (index, database) in databases.into_iter().enumerate() {
+            let manager = initial_installation_health_manager(Arc::new(database.into_connection()));
+            let error = manager
+                .probe_and_record_initial_installation_health(&connection, async { Ok(true) })
+                .await
+                .unwrap_err();
+            match (index, error) {
+                (0, GitProviderManagerError::ConnectionNotFound(message)) => {
+                    assert!(message.contains("11"));
+                }
+                (1 | 2, GitProviderManagerError::DatabaseError(DbErr::Custom(message))) => {
+                    assert!(message.contains("health"));
+                }
+                (_, error) => panic!("unexpected recording error: {error}"),
+            }
         }
     }
 

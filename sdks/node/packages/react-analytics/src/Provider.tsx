@@ -3,6 +3,7 @@
 
 "use client";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef } from "react";
+import type { ReactElement } from "react";
 import type { AnalyticsContextValue, TempsAnalyticsProviderProps } from "./types";
 import { isLocalhostLike, isTestEnvironment, sendAnalytics, sendAnalyticsReliable } from "./utils";
 import { useSpeedAnalytics } from "./useSpeedAnalytics";
@@ -30,14 +31,16 @@ export function TempsAnalyticsProvider({
   domain,
   ingestKey,
   children,
-}: TempsAnalyticsProviderProps) {
+}: TempsAnalyticsProviderProps): ReactElement {
   const enabled = useMemo(() => {
     if (disabled) return false;
     if (typeof window === "undefined") return false;
     if (ignoreLocalhost && (isLocalhostLike() || isTestEnvironment())) return false;
     try {
       if (window.localStorage?.temps_ignore === "true") return false;
-    } catch {}
+    } catch {
+      // Storage blocked: there is no opt-out flag to honour.
+    }
     return true;
   }, [disabled, ignoreLocalhost]);
 
@@ -48,6 +51,7 @@ export function TempsAnalyticsProvider({
         event_name: eventName,
         request_query: window.location.search,
         request_path: window.location.pathname,
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty domain falls back too
         domain: domain || window.location.hostname,
         language: navigator.language,
         event_data: data,
@@ -63,6 +67,7 @@ export function TempsAnalyticsProvider({
         event_name: "page_view",
         request_query: window.location.search,
         request_path: window.location.pathname,
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty domain falls back too
         domain: domain || window.location.hostname,
         language: navigator.language,
         event_data: {
@@ -88,7 +93,7 @@ export function TempsAnalyticsProvider({
     let initialLoad = true;
     const originalPushState = window.history?.pushState?.bind(window.history) as History["pushState"] | undefined;
 
-    function maybeTrack() {
+    function maybeTrack(): void {
       const nextPath = window.location.pathname;
       if (currentPathRef.current !== nextPath) {
         currentPathRef.current = nextPath;
@@ -97,15 +102,15 @@ export function TempsAnalyticsProvider({
     }
 
     if (originalPushState) {
-      window.history.pushState = ((data: any, unused: string, url?: string | URL | null) => {
-        originalPushState(data, unused, url as any);
+      window.history.pushState = ((data: unknown, unused: string, url?: string | URL | null) => {
+        originalPushState(data, unused, url);
         maybeTrack();
       }) as History["pushState"];
 
-      const onPop = () => maybeTrack();
+      const onPop = (): void => maybeTrack();
       window.addEventListener("popstate", onPop);
 
-      const cleanup = () => {
+      const cleanup = (): void => {
         window.removeEventListener("popstate", onPop);
         if (originalPushState) {
           window.history.pushState = originalPushState;
@@ -114,7 +119,7 @@ export function TempsAnalyticsProvider({
 
       // Initial load or prerender visibility handling
       if ((document.visibilityState as unknown as string) === "prerender") {
-        const onVisibility = () => {
+        const onVisibility = (): void => {
           if (document.visibilityState === "visible") {
             if (initialLoad) {
               initialLoad = false;
@@ -140,7 +145,7 @@ export function TempsAnalyticsProvider({
   // Click delegation for [temps-event-name] with temps-data-* attributes
   useEffect(() => {
     if (!enabled) return;
-    const onClick = (event: MouseEvent) => {
+    const onClick = (event: MouseEvent): void => {
       const target = event.target as Element | null;
       const eventElement = target?.closest?.("[temps-event-name]");
       if (!(eventElement instanceof HTMLElement)) return;
@@ -184,9 +189,9 @@ export function TempsAnalyticsProvider({
     // Legacy page leave tracking without engagement metrics
     else if (autoTrackPageLeave) {
       let hasTracked = false;
-      let startTime = Date.now();
+      const startTime = Date.now();
 
-      const trackPageLeave = () => {
+      const trackPageLeave = (): void => {
         if (hasTracked) return;
         hasTracked = true;
 
@@ -196,6 +201,7 @@ export function TempsAnalyticsProvider({
           event_name: pageLeaveEventName,
           request_query: window.location.search,
           request_path: window.location.pathname,
+          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty domain falls back too
           domain: domain || window.location.hostname,
           language: navigator.language,
           event_data: {
@@ -208,7 +214,7 @@ export function TempsAnalyticsProvider({
       };
 
       // Use pagehide as primary (most reliable), with beforeunload as fallback
-      const handlePageLeave = () => trackPageLeave();
+      const handlePageLeave = (): void => trackPageLeave();
 
       // pagehide is the most reliable for modern browsers
       window.addEventListener("pagehide", handlePageLeave);
@@ -242,22 +248,14 @@ export function TempsAnalyticsProvider({
       <SessionRecordingProvider defaultEnabled={enableSessionRecording}>
         {children}
         {enabled && (
+          // Forward the whole config; the provider-level values go last so the
+          // config cannot override them.
           <SessionRecorder
+            {...sessionRecordingConfig}
             basePath={basePath}
             ingestKey={ingestKey}
             domain={domain}
             enabled={isRecordingEnabled}
-            excludedPaths={sessionRecordingConfig.excludedPaths}
-            sessionSampleRate={sessionRecordingConfig.sessionSampleRate}
-            maskAllInputs={sessionRecordingConfig.maskAllInputs}
-            maskTextSelector={sessionRecordingConfig.maskTextSelector}
-            blockClass={sessionRecordingConfig.blockClass}
-            ignoreClass={sessionRecordingConfig.ignoreClass}
-            maskTextClass={sessionRecordingConfig.maskTextClass}
-            recordCanvas={sessionRecordingConfig.recordCanvas}
-            collectFonts={sessionRecordingConfig.collectFonts}
-            batchSize={sessionRecordingConfig.batchSize}
-            flushInterval={sessionRecordingConfig.flushInterval}
           />
         )}
       </SessionRecordingProvider>

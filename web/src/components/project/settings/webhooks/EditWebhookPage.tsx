@@ -39,6 +39,7 @@ import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 const formSchema = z.object({
   url: z.string().min(1, 'URL is required').url('Must be a valid URL'),
@@ -107,7 +108,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
     ...updateWebhookMutation(),
     onSuccess: () => {
       toast.success('Webhook updated successfully')
-      navigate(`/projects/${project.slug}/settings/webhooks`)
+      navigate(settingsSectionHref(project.slug, 'integrations', 'webhooks'))
     },
     onError: (error: any) => {
       toast.error(error?.message || 'Failed to update webhook')
@@ -135,7 +136,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" disabled>
+          <Button aria-label="Back" variant="ghost" size="icon" disabled>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="flex-1">
@@ -168,10 +169,13 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
       <div className="space-y-6">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() =>
-              navigate(`/projects/${project.slug}/settings/webhooks`)
+              navigate(
+                settingsSectionHref(project.slug, 'integrations', 'webhooks')
+              )
             }
           >
             <ArrowLeft className="h-4 w-4" />
@@ -201,10 +205,13 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
     <div className="space-y-6">
       <div className="flex items-center gap-4">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>
-            navigate(`/projects/${project.slug}/settings/webhooks`)
+            navigate(
+              settingsSectionHref(project.slug, 'integrations', 'webhooks')
+            )
           }
         >
           <ArrowLeft className="h-4 w-4" />
@@ -442,7 +449,9 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
               type="button"
               variant="outline"
               onClick={() =>
-                navigate(`/projects/${project.slug}/settings/webhooks`)
+                navigate(
+                  settingsSectionHref(project.slug, 'integrations', 'webhooks')
+                )
               }
               disabled={updateWebhook.isPending}
             >

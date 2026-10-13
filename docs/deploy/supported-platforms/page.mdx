@@ -159,21 +159,23 @@ All monorepo tools work with all four package managers (npm, Yarn, pnpm, Bun). S
 
 When auto-detecting from your project files, Temps checks in this order. The first match wins:
 
-1. `Dockerfile` exists → **Dockerfile** preset
-2. `docusaurus.config.js` / `.ts` → **Docusaurus**
-3. `next.config.js` / `.mjs` / `.ts` → **Next.js**
-4. `vite.config.js` / `.ts` → **Vite**
-5. `react-scripts` in `package.json` → **Create React App**
-6. `rsbuild.config.ts` → **Rsbuild**
-7. `Cargo.toml` → **Rust**
-8. `go.mod` → **Go**
-9. `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile` → **Python**
-10. `pom.xml`, `build.gradle`, `build.gradle.kts` → **Java**
-11. `nixpacks.toml` → **Nixpacks** (explicit)
-12. No match → no preset selected (you must choose one manually)
+1. `docker-compose.yml`, `docker-compose.yaml`, `compose.yml` or `compose.yaml` → **Docker Compose**
+2. `Dockerfile` exists → **Dockerfile** preset
+3. `docusaurus.config.js` / `.ts` → **Docusaurus**
+4. `next.config.js` / `.mjs` / `.ts` → **Next.js**
+5. `vite.config.js` / `.ts` → **Vite**
+6. `react-scripts` in `package.json` → **Create React App**
+7. `rsbuild.config.ts` → **Rsbuild**
+8. `Cargo.toml` → **Rust**
+9. `go.mod` → **Go**
+10. `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile` → **Python**
+11. `pom.xml`, `build.gradle`, `build.gradle.kts` → **Java**
+12. `nixpacks.toml` → **Nixpacks** (explicit)
+13. `index.html`, when nothing else matched → static site
+14. No match → no preset selected (you must choose one manually)
 
 <Note>
-  If a `Dockerfile` exists in your repository root, it always takes priority — even if Temps would otherwise detect a framework like Next.js or Flask. Rename or remove the `Dockerfile` to use auto-detection.
+  If a `Dockerfile` exists in your repository root, it takes priority over framework and language detection — even if Temps would otherwise detect a framework like Next.js or Flask. Rename or remove the `Dockerfile` to use auto-detection. A Docker Compose file ranks above a `Dockerfile`: a repository with both is deployed as a Compose stack unless you choose another preset.
 </Note>
 
 ---
@@ -208,10 +210,9 @@ Every deployed container runs with these defaults:
 
 | Setting | Default | Configurable |
 |---------|---------|-------------|
-| CPU | 1 core | Yes |
-| Memory | 512 MB | Yes |
-| Disk | 1024 MB | Yes |
-| Restart policy | On failure | Yes |
+| CPU | No limit | Yes, per environment |
+| Memory | 512 MB limit for new projects | Yes, per environment |
+| Restart policy | Always | No |
 | Log retention | 50 MB x 3 files (150 MB total) | No |
 | Network binding | `127.0.0.1` (localhost only) | No |
 | Init process | Enabled (`--init`) | No |
@@ -227,12 +228,9 @@ Security is enforced at the container level:
 
 ## What is not supported {{ anchor: true, id: 'not-supported' }}
 
-Temps is a **single-container deployment platform**. It handles one application per project, built and deployed as a single container (or static file bundle). The following are explicitly **not supported**:
+Apart from Docker Compose projects, Temps deploys one application per project, built and deployed as a single container (or static file bundle). A repository with a `docker-compose.yml`, `docker-compose.yaml`, `compose.yml` or `compose.yaml` file is detected as a **Docker Compose** project and deployed as a stack, subject to the Compose security checks; only the services you mark as public get a hostname. For databases, caches and object storage, prefer [Managed Services](/docs/managed-services), which Temps creates, backs up and links for you. The following are **not supported**:
 
 <Properties>
-  <Property name="Docker Compose" type="Not supported">
-    Temps does not read `docker-compose.yml` / `compose.yaml` files. Each project deploys one container. If your application needs a database, cache, or message queue, use [Managed Services](/docs/managed-services) — Temps creates and manages those containers separately and injects connection details as environment variables.
-  </Property>
   <Property name="Multi-container pods" type="Not supported">
     There is no sidecar pattern or pod grouping. Each deployment runs exactly one container. Separate services (databases, Redis, etc.) are managed independently through the Services feature.
   </Property>

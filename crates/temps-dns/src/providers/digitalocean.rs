@@ -9,32 +9,50 @@
 //! Create token at: https://cloud.digitalocean.com/account/api/tokens
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use tracing::{debug, info, warn};
 
 use super::credentials::DigitalOceanCredentials;
 use super::traits::{
-    DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,
-    DnsRecordRequest, DnsRecordType, DnsZone,
+    dns_names_equal, truncate_error_body, DnsProvider, DnsProviderCapabilities, DnsProviderType,
+    DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType, DnsZone,
 };
 use crate::errors::DnsError;
 
 const DO_API_BASE: &str = "https://api.digitalocean.com/v2";
+/// Items per listing page; DigitalOcean's maximum (its default is only 20).
+const PAGE_SIZE: usize = 200;
+/// Hard cap on pages read by any listing; reaching it is an error, never a
+/// silently truncated result.
+const MAX_PAGES: usize = 1000;
 
 /// DigitalOcean DNS provider
 pub struct DigitalOceanProvider {
     client: Client,
     credentials: DigitalOceanCredentials,
-    #[allow(dead_code)]
     base_url: String,
+    /// Page cap for listings ([`MAX_PAGES`]; lowered in tests).
+    max_pages: usize,
 }
 
 /// DigitalOcean API response structures
 #[derive(Debug, Deserialize)]
 struct DomainsResponse {
     domains: Vec<DoDomain>,
+    #[serde(default)]
+    links: Option<DoLinks>,
+    #[serde(default)]
+    meta: Option<DoMeta>,
+}
+
+/// `GET /domains/{name}` response.
+#[derive(Debug, Deserialize)]
+struct DomainResponse {
+    domain: DoDomain,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +65,66 @@ struct DoDomain {
 #[derive(Debug, Deserialize)]
 struct DomainRecordsResponse {
     domain_records: Vec<DoDomainRecord>,
+    #[serde(default)]
+    links: Option<DoLinks>,
+    #[serde(default)]
+    meta: Option<DoMeta>,
+}
+
+/// `links` of a paginated DigitalOcean response; `pages.next` is present
+/// while more pages follow.
+#[derive(Debug, Deserialize)]
+struct DoLinks {
+    #[serde(default)]
+    pages: Option<DoPageLinks>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoPageLinks {
+    #[serde(default)]
+    next: Option<String>,
+}
+
+/// `meta` of a paginated DigitalOcean response.
+#[derive(Debug, Deserialize)]
+struct DoMeta {
+    #[serde(default)]
+    total: Option<u64>,
+}
+
+/// One page of a paginated DigitalOcean list response.
+trait DoListPage: DeserializeOwned {
+    type Item;
+    /// Identity of an item, used to drop repeats across pages.
+    type Key: Eq + Hash;
+    /// What the items are, for error messages.
+    const NOUN: &'static str;
+    fn key(item: &Self::Item) -> Self::Key;
+    fn into_parts(self) -> (Vec<Self::Item>, Option<DoLinks>, Option<DoMeta>);
+}
+
+impl DoListPage for DomainsResponse {
+    type Item = DoDomain;
+    type Key = String;
+    const NOUN: &'static str = "domains";
+    fn key(domain: &DoDomain) -> String {
+        domain.name.to_ascii_lowercase()
+    }
+    fn into_parts(self) -> (Vec<DoDomain>, Option<DoLinks>, Option<DoMeta>) {
+        (self.domains, self.links, self.meta)
+    }
+}
+
+impl DoListPage for DomainRecordsResponse {
+    type Item = DoDomainRecord;
+    type Key = i64;
+    const NOUN: &'static str = "records";
+    fn key(record: &DoDomainRecord) -> i64 {
+        record.id
+    }
+    fn into_parts(self) -> (Vec<DoDomainRecord>, Option<DoLinks>, Option<DoMeta>) {
+        (self.domain_records, self.links, self.meta)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +190,7 @@ impl DigitalOceanProvider {
             client,
             credentials,
             base_url: DO_API_BASE.to_string(),
+            max_pages: MAX_PAGES,
         })
     }
 
@@ -130,17 +209,26 @@ impl DigitalOceanProvider {
             client,
             credentials,
             base_url,
+            max_pages: MAX_PAGES,
         })
     }
 
-    /// Make an authenticated request to DigitalOcean API
-    async fn api_request<T: serde::de::DeserializeOwned>(
+    /// `path` without its query string: page/filter parameters stay out of
+    /// log lines and error messages.
+    fn without_query(path: &str) -> &str {
+        path.split('?').next().unwrap_or(path)
+    }
+
+    /// Send one authenticated request and return its status and body,
+    /// whatever the status.
+    async fn send(
         &self,
         method: &str,
-        path: &str,
+        path_and_query: &str,
         body: Option<&impl Serialize>,
-    ) -> Result<T, DnsError> {
-        let url = format!("{}{}", self.base_url, path);
+    ) -> Result<(StatusCode, String), DnsError> {
+        let url = format!("{}{}", self.base_url, path_and_query);
+        let path = Self::without_query(path_and_query);
 
         debug!("DigitalOcean API request: {} {}", method, path);
 
@@ -151,8 +239,7 @@ impl DigitalOceanProvider {
             "DELETE" => self.client.delete(&url),
             _ => {
                 return Err(DnsError::ApiError(format!(
-                    "Unsupported method: {}",
-                    method
+                    "Unsupported method {method} for DigitalOcean API {path}"
                 )))
             }
         };
@@ -168,43 +255,175 @@ impl DigitalOceanProvider {
             request = request.json(body);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| DnsError::ApiError(format!("API request failed: {}", e)))?;
+        let response = request.send().await.map_err(|e| {
+            DnsError::ApiError(format!("DigitalOcean API {method} {path} failed: {e}"))
+        })?;
 
         let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            DnsError::ApiError(format!(
+                "Failed to read DigitalOcean API response for {method} {path} (HTTP {status}): {e}"
+            ))
+        })?;
+        Ok((status, response_text))
+    }
 
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            if let Ok(error) = serde_json::from_str::<DoErrorResponse>(&error_body) {
-                return Err(DnsError::ApiError(format!(
-                    "DigitalOcean API error ({}): {}",
-                    error.id, error.message
-                )));
-            }
-            return Err(DnsError::ApiError(format!(
-                "API returned status {}: {}",
-                status, error_body
-            )));
+    /// Error for a non-success response: status, operation, bounded body.
+    fn status_error(method: &str, path: &str, status: StatusCode, body: &str) -> DnsError {
+        if let Ok(error) = serde_json::from_str::<DoErrorResponse>(body) {
+            return DnsError::ApiError(format!(
+                "DigitalOcean API error for {} {} (HTTP {}, {}): {}",
+                method,
+                path,
+                status,
+                truncate_error_body(&error.id),
+                truncate_error_body(&error.message)
+            ));
         }
+        DnsError::ApiError(format!(
+            "DigitalOcean API returned status {} for {} {}: {}",
+            status,
+            method,
+            path,
+            truncate_error_body(body)
+        ))
+    }
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to read response: {}", e)))?;
+    /// Make an authenticated request to DigitalOcean API
+    async fn api_request<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&impl Serialize>,
+    ) -> Result<T, DnsError> {
+        let (status, response_text) = self.send(method, path_and_query, body).await?;
+        let path = Self::without_query(path_and_query);
+        if !status.is_success() {
+            return Err(Self::status_error(method, path, status, &response_text));
+        }
 
         if response_text.is_empty() {
             // For DELETE requests that return no content
-            return serde_json::from_str("{}").map_err(|e| DnsError::ApiError(e.to_string()));
+            return serde_json::from_str("{}").map_err(|e| {
+                DnsError::ApiError(format!(
+                    "Failed to parse the empty DigitalOcean API response for {method} {path}: {e}"
+                ))
+            });
         }
 
         serde_json::from_str(&response_text).map_err(|e| {
             DnsError::ApiError(format!(
-                "Failed to parse response: {} - Body: {}",
-                e, response_text
+                "Failed to parse DigitalOcean API response for {} {}: {} - Body: {}",
+                method,
+                path,
+                e,
+                truncate_error_body(&response_text)
             ))
         })
+    }
+
+    /// Every item of the paginated list at `path` — optionally narrowed by
+    /// the already-encoded server-side `filter_query` (`&key=value...`) —
+    /// reading [`PAGE_SIZE`] items per page until `links.pages.next` is
+    /// gone.
+    ///
+    /// Never returns a partial list: reaching the page cap, an empty page
+    /// that still has a next link, a page holding only items already seen,
+    /// or (for an unfiltered listing) fewer items than `meta.total` is an
+    /// error. Items repeated across pages by a concurrent change are
+    /// returned once.
+    async fn list_all<P: DoListPage>(
+        &self,
+        path: &str,
+        filter_query: &str,
+        context: &str,
+    ) -> Result<Vec<P::Item>, DnsError> {
+        let mut items = Vec::new();
+        let mut seen: HashSet<P::Key> = HashSet::new();
+
+        for page in 1..=self.max_pages {
+            let page_path = format!("{path}?per_page={PAGE_SIZE}&page={page}{filter_query}");
+            let response: P = self.api_request("GET", &page_path, None::<&()>).await?;
+            let (page_items, links, meta) = response.into_parts();
+
+            let page_len = page_items.len();
+            let before = items.len();
+            for item in page_items {
+                if seen.insert(P::key(&item)) {
+                    items.push(item);
+                }
+            }
+            let has_next = links
+                .and_then(|links| links.pages)
+                .and_then(|pages| pages.next)
+                .is_some_and(|next| !next.is_empty());
+
+            if !has_next {
+                if filter_query.is_empty() {
+                    if let Some(total) = meta.and_then(|meta| meta.total) {
+                        if (items.len() as u64) < total {
+                            return Err(DnsError::ApiError(format!(
+                                "{context}: DigitalOcean reported {total} {} but only {} were returned across {page} page(s); refusing a partial result",
+                                P::NOUN,
+                                items.len()
+                            )));
+                        }
+                    }
+                }
+                return Ok(items);
+            }
+            if page_len == 0 {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: DigitalOcean returned empty page {page} with a next link; refusing a partial result"
+                )));
+            }
+            if items.len() == before {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: DigitalOcean returned page {page} with only {} already seen and a next link; refusing a partial result",
+                    P::NOUN
+                )));
+            }
+        }
+        Err(DnsError::ApiError(format!(
+            "{context} exceeded {} pages; refusing a partial result",
+            self.max_pages
+        )))
+    }
+
+    /// Every domain record DigitalOcean returns for `domain`, optionally
+    /// narrowed by the server-side `filter` query parameters (`type`,
+    /// `name`); see [`Self::list_all`].
+    async fn list_domain_records(
+        &self,
+        domain: &str,
+        filter: &[(&str, String)],
+        context: &str,
+    ) -> Result<Vec<DoDomainRecord>, DnsError> {
+        let filter_query: String = filter
+            .iter()
+            .map(|(key, value)| format!("&{key}={}", urlencoding::encode(value)))
+            .collect();
+        self.list_all::<DomainRecordsResponse>(
+            &format!("/domains/{domain}/records"),
+            &filter_query,
+            context,
+        )
+        .await
+    }
+
+    /// A DigitalOcean domain as a [`DnsZone`] (`id` = domain name).
+    fn dns_zone(domain: DoDomain) -> DnsZone {
+        DnsZone {
+            id: domain.name.clone(),
+            name: domain.name,
+            status: "active".to_string(),
+            nameservers: vec![
+                "ns1.digitalocean.com".to_string(),
+                "ns2.digitalocean.com".to_string(),
+                "ns3.digitalocean.com".to_string(),
+            ],
+            metadata: HashMap::new(),
+        }
     }
 
     /// Make a DELETE request (returns no body)
@@ -431,7 +650,12 @@ fn map_delete_failure(path: &str, status: reqwest::StatusCode, body: &str) -> Dn
     if status == reqwest::StatusCode::NOT_FOUND {
         DnsError::RecordNotFound(path.to_string())
     } else {
-        DnsError::ApiError(format!("API returned status {}: {}", status, body))
+        DnsError::ApiError(format!(
+            "DigitalOcean API returned status {} for DELETE {}: {}",
+            status,
+            path,
+            truncate_error_body(body)
+        ))
     }
 }
 
@@ -471,37 +695,59 @@ impl DnsProvider for DigitalOceanProvider {
         }
     }
 
+    /// Every domain on the account, reading [`PAGE_SIZE`] per page until
+    /// `links.pages.next` is gone.
+    ///
+    /// Never returns a partial list: reaching the page cap, an empty page
+    /// that still has a next link, a page holding only domains already seen,
+    /// or fewer domains than `meta.total` is an error.
     async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
-        let response: DomainsResponse = self.api_request("GET", "/domains", None::<&()>).await?;
-
-        Ok(response
-            .domains
+        Ok(self
+            .list_all::<DomainsResponse>("/domains", "", "DigitalOcean domain listing")
+            .await?
             .into_iter()
-            .map(|d| DnsZone {
-                id: d.name.clone(),
-                name: d.name,
-                status: "active".to_string(),
-                nameservers: vec![
-                    "ns1.digitalocean.com".to_string(),
-                    "ns2.digitalocean.com".to_string(),
-                    "ns3.digitalocean.com".to_string(),
-                ],
-                metadata: HashMap::new(),
-            })
+            .map(Self::dns_zone)
             .collect())
     }
 
+    /// The domain named exactly `domain` (case-insensitive, trailing dot
+    /// ignored), read directly with `GET /domains/{domain}` instead of a
+    /// listing. HTTP 404 means the account has no such domain; any other
+    /// failure is an error, never "absent".
     async fn get_zone(&self, domain: &str) -> Result<Option<DnsZone>, DnsError> {
-        let zones = self.list_zones().await?;
-        Ok(zones.into_iter().find(|z| z.name == domain))
+        let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let path = format!("/domains/{}", urlencoding::encode(&normalized));
+        let (status, body) = self.send("GET", &path, None::<&()>).await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(Self::status_error("GET", &path, status, &body));
+        }
+
+        let response: DomainResponse = serde_json::from_str(&body).map_err(|e| {
+            DnsError::ApiError(format!(
+                "Failed to parse DigitalOcean API response for GET {path}: {e} - Body: {}",
+                truncate_error_body(&body)
+            ))
+        })?;
+        if !dns_names_equal(&response.domain.name, &normalized) {
+            return Err(DnsError::ApiError(format!(
+                "DigitalOcean answered the lookup of domain {normalized} with domain {}; refusing to use it",
+                truncate_error_body(&response.domain.name)
+            )));
+        }
+        Ok(Some(Self::dns_zone(response.domain)))
     }
 
     async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
-        let path = format!("/domains/{}/records", domain);
-        let response: DomainRecordsResponse = self.api_request("GET", &path, None::<&()>).await?;
-
-        Ok(response
-            .domain_records
+        let context = format!("DigitalOcean record listing for zone {domain}");
+        Ok(self
+            .list_domain_records(domain, &[], &context)
+            .await?
             .iter()
             .filter_map(|r| Self::convert_record(r, domain))
             .collect())
@@ -513,13 +759,56 @@ impl DnsProvider for DigitalOceanProvider {
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<Option<DnsRecord>, DnsError> {
-        let records = self.list_records(domain).await?;
-
-        Ok(records
+        Ok(self
+            .get_records(domain, name, record_type)
+            .await?
             .into_iter()
-            .find(|r| r.name == name && r.content.record_type() == record_type))
+            .next())
     }
 
+    /// Every value at (name, type), read with DigitalOcean's server-side
+    /// `type` and fully-qualified `name` filters instead of a zone listing.
+    ///
+    /// The zone apex is looked up by `type` alone and matched client-side:
+    /// DigitalOcean stores apex records as `@`, so the result never depends
+    /// on how the API's `name` filter treats the bare zone name. Every
+    /// result is matched again client-side (case-insensitively), so a filter
+    /// the API ignored cannot leak other records.
+    async fn get_records(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<DnsRecord>, DnsError> {
+        let relative = name.trim_end_matches('.');
+        let apex = relative.is_empty() || relative == "@";
+        let wanted = if apex { "@" } else { relative };
+
+        let mut filter = vec![("type", record_type.to_string())];
+        if !apex {
+            filter.push((
+                "name",
+                format!("{relative}.{}", domain.trim_end_matches('.')).to_ascii_lowercase(),
+            ));
+        }
+        let context = format!("DigitalOcean lookup of {record_type} '{wanted}' in zone {domain}");
+
+        Ok(self
+            .list_domain_records(domain, &filter, &context)
+            .await?
+            .iter()
+            .filter_map(|r| Self::convert_record(r, domain))
+            .filter(|r| dns_names_equal(&r.name, wanted) && r.content.record_type() == record_type)
+            .collect())
+    }
+
+    /// Not create-only: DigitalOcean has no conditional create, and
+    /// `POST /domains/{domain}/records` always adds a value — next to any
+    /// values already at that (name, type), which turns the name into a
+    /// round-robin set with them. Callers that must never touch a foreign
+    /// record (the ownership-guarded core) prove the name is free with a
+    /// complete [`DnsProvider::get_records`] read under their per-record lock
+    /// immediately before calling this.
     async fn create_record(
         &self,
         domain: &str,
@@ -874,7 +1163,8 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use serde_json::{json, Value};
+    use wiremock::matchers::{any, header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn create_mock_provider(mock_server: &MockServer) -> DigitalOceanProvider {
@@ -883,6 +1173,583 @@ mod integration_tests {
         };
 
         DigitalOceanProvider::with_base_url(creds, mock_server.uri()).unwrap()
+    }
+
+    fn do_record(id: i64, record_type: &str, name: &str, data: &str) -> Value {
+        json!({"id": id, "type": record_type, "name": name, "data": data, "ttl": 300})
+    }
+
+    /// A records page; `next_page` adds `links.pages.next`.
+    fn records_page(records: Vec<Value>, next_page: Option<usize>, total: Option<u64>) -> Value {
+        let mut body = json!({"domain_records": records, "links": {}});
+        if let Some(next) = next_page {
+            body["links"] = json!({"pages": {
+                "next": format!("https://api.example.com/v2/domains/example.com/records?page={next}&per_page=200")
+            }});
+        }
+        if let Some(total) = total {
+            body["meta"] = json!({"total": total});
+        }
+        body
+    }
+
+    /// Page `page` of the unfiltered zone listing.
+    async fn mount_listing_page(server: &MockServer, page: &str, body: Value) {
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .and(query_param("per_page", "200"))
+            .and(query_param("page", page))
+            .and(query_param_is_missing("type"))
+            .and(header("Authorization", "Bearer test_token_12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_records_follows_next_links_with_full_pages() {
+        let server = MockServer::start().await;
+        mount_listing_page(
+            &server,
+            "1",
+            records_page(
+                vec![do_record(1, "A", "www", "203.0.113.1")],
+                Some(2),
+                Some(3),
+            ),
+        )
+        .await;
+        mount_listing_page(
+            &server,
+            "2",
+            records_page(
+                vec![do_record(2, "A", "api", "203.0.113.2")],
+                Some(3),
+                Some(3),
+            ),
+        )
+        .await;
+        // The registry TXT only exists on the last page: a one-page read
+        // would report it absent.
+        mount_listing_page(
+            &server,
+            "3",
+            records_page(
+                vec![do_record(3, "TXT", "_temps-owned-a.app", "marker")],
+                None,
+                Some(3),
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server).await;
+        let records = provider.list_records("example.com").await.unwrap();
+
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["www", "api", "_temps-owned-a.app"]);
+    }
+
+    #[tokio::test]
+    async fn list_records_returns_records_repeated_across_pages_once() {
+        let server = MockServer::start().await;
+        mount_listing_page(
+            &server,
+            "1",
+            records_page(
+                vec![
+                    do_record(1, "A", "www", "203.0.113.1"),
+                    do_record(2, "A", "api", "203.0.113.2"),
+                ],
+                Some(2),
+                None,
+            ),
+        )
+        .await;
+        // A concurrent insert shifted record 2 onto the next page.
+        mount_listing_page(
+            &server,
+            "2",
+            records_page(
+                vec![
+                    do_record(2, "A", "api", "203.0.113.2"),
+                    do_record(3, "A", "mail", "203.0.113.3"),
+                ],
+                None,
+                None,
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server).await;
+        let records = provider.list_records("example.com").await.unwrap();
+
+        let ids: Vec<Option<String>> = records.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("1".to_string()),
+                Some("2".to_string()),
+                Some("3".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_on_an_empty_page_with_a_next_link() {
+        let server = MockServer::start().await;
+        mount_listing_page(&server, "1", records_page(vec![], Some(2), None)).await;
+
+        let provider = create_mock_provider(&server).await;
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message)
+                if message.contains("empty page 1 with a next link")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_on_a_page_of_already_seen_records() {
+        let server = MockServer::start().await;
+        let page = || records_page(vec![do_record(1, "A", "www", "203.0.113.1")], Some(2), None);
+        mount_listing_page(&server, "1", page()).await;
+        mount_listing_page(&server, "2", page()).await;
+
+        let provider = create_mock_provider(&server).await;
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message)
+                if message.contains("page 2 with only records already seen")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_below_the_reported_total() {
+        let server = MockServer::start().await;
+        mount_listing_page(
+            &server,
+            "1",
+            records_page(vec![do_record(1, "A", "www", "203.0.113.1")], None, Some(5)),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server).await;
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message)
+                if message.contains("reported 5 records but only 1 were returned")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_at_the_page_cap() {
+        let server = MockServer::start().await;
+        mount_listing_page(
+            &server,
+            "1",
+            records_page(vec![do_record(1, "A", "a", "203.0.113.1")], Some(2), None),
+        )
+        .await;
+        mount_listing_page(
+            &server,
+            "2",
+            records_page(vec![do_record(2, "A", "b", "203.0.113.2")], Some(3), None),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(query_param("page", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![],
+                None,
+                None,
+            )))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut provider = create_mock_provider(&server).await;
+        provider.max_pages = 2;
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message)
+                if message.contains("DigitalOcean record listing for zone example.com exceeded 2 pages")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_records_uses_the_type_and_fqdn_filters() {
+        let server = MockServer::start().await;
+        // A zone listing must never be used for an exact lookup.
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .and(query_param_is_missing("type"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![],
+                None,
+                None,
+            )))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .and(query_param("type", "A"))
+            .and(query_param("name", "app.example.com"))
+            .and(query_param("per_page", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![
+                    do_record(1, "A", "app", "203.0.113.1"),
+                    do_record(2, "A", "App", "203.0.113.2"),
+                    // Never returned for this filter; must not leak through.
+                    do_record(3, "A", "other", "203.0.113.9"),
+                ],
+                None,
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server).await;
+        let records = provider
+            .get_records("example.com", "APP", DnsRecordType::A)
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = records.iter().filter_map(|r| r.id.clone()).collect();
+        assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_records_follows_pages_of_a_filtered_lookup() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .and(query_param("name", "_acme-challenge.example.com"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![do_record(1, "TXT", "_acme-challenge", "token-a")],
+                Some(2),
+                None,
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .and(query_param("name", "_acme-challenge.example.com"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![do_record(2, "TXT", "_acme-challenge", "token-b")],
+                None,
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server).await;
+        let records = provider
+            .get_records("example.com", "_acme-challenge", DnsRecordType::TXT)
+            .await
+            .unwrap();
+
+        let values: Vec<String> = records
+            .iter()
+            .map(|r| r.content.to_value_string())
+            .collect();
+        assert_eq!(values, vec!["token-a", "token-b"]);
+    }
+
+    #[tokio::test]
+    async fn get_records_looks_up_the_apex_by_type_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .and(query_param("type", "TXT"))
+            .and(query_param_is_missing("name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![
+                    do_record(1, "TXT", "@", "v=spf1 -all"),
+                    do_record(2, "TXT", "www", "unrelated"),
+                ],
+                None,
+                None,
+            )))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server).await;
+        for apex in ["@", ""] {
+            let records = provider
+                .get_records("example.com", apex, DnsRecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].id, Some("1".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn api_errors_embed_a_bounded_slice_of_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500).set_body_string("e".repeat(20_000)))
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server).await;
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("500"), "{message}");
+        assert!(
+            message.contains("truncated, 20000 bytes total"),
+            "{message}"
+        );
+        assert!(message.len() < 1_000, "error is {} bytes", message.len());
+        // Page parameters stay out of the message.
+        assert!(!message.contains("per_page"), "{message}");
+    }
+
+    fn do_domain(name: &str) -> Value {
+        json!({"name": name, "ttl": 1800, "zone_file": ""})
+    }
+
+    /// A domains page; `next_page` adds `links.pages.next`.
+    fn domains_page(domains: Vec<Value>, next_page: Option<usize>, total: Option<u64>) -> Value {
+        let mut body = json!({"domains": domains, "links": {}});
+        if let Some(next) = next_page {
+            body["links"] = json!({"pages": {
+                "next": format!("https://api.example.com/v2/domains?page={next}&per_page=200")
+            }});
+        }
+        if let Some(total) = total {
+            body["meta"] = json!({"total": total});
+        }
+        body
+    }
+
+    /// Page `page` of the domain listing.
+    async fn mount_domains_page(server: &MockServer, page: &str, body: Value) {
+        Mock::given(method("GET"))
+            .and(path("/domains"))
+            .and(query_param("per_page", "200"))
+            .and(query_param("page", page))
+            .and(header("Authorization", "Bearer test_token_12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_zones_follows_next_links() {
+        let server = MockServer::start().await;
+        mount_domains_page(
+            &server,
+            "1",
+            domains_page(vec![do_domain("example.com")], Some(2), Some(2)),
+        )
+        .await;
+        mount_domains_page(
+            &server,
+            "2",
+            domains_page(vec![do_domain("example.net")], None, Some(2)),
+        )
+        .await;
+
+        let zones = create_mock_provider(&server)
+            .await
+            .list_zones()
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = zones.iter().map(|zone| zone.name.as_str()).collect();
+        assert_eq!(names, vec!["example.com", "example.net"]);
+    }
+
+    #[tokio::test]
+    async fn list_zones_fails_closed() {
+        // An empty page that still has a next link.
+        let server = MockServer::start().await;
+        mount_domains_page(&server, "1", domains_page(vec![], Some(2), None)).await;
+        let error = create_mock_provider(&server)
+            .await
+            .list_zones()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("empty page 1 with a next link"),
+            "{error}"
+        );
+
+        // A page holding only domains already seen.
+        let server = MockServer::start().await;
+        let page = || domains_page(vec![do_domain("example.com")], Some(2), None);
+        mount_domains_page(&server, "1", page()).await;
+        mount_domains_page(&server, "2", page()).await;
+        let error = create_mock_provider(&server)
+            .await
+            .list_zones()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("page 2 with only domains already seen"),
+            "{error}"
+        );
+
+        // Fewer domains than the reported total.
+        let server = MockServer::start().await;
+        mount_domains_page(
+            &server,
+            "1",
+            domains_page(vec![do_domain("example.com")], None, Some(3)),
+        )
+        .await;
+        let error = create_mock_provider(&server)
+            .await
+            .list_zones()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reported 3 domains but only 1 were returned"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_zones_fails_closed_at_the_page_cap() {
+        let server = MockServer::start().await;
+        mount_domains_page(
+            &server,
+            "1",
+            domains_page(vec![do_domain("example.com")], Some(2), None),
+        )
+        .await;
+        mount_domains_page(
+            &server,
+            "2",
+            domains_page(vec![do_domain("example.net")], Some(3), None),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/domains"))
+            .and(query_param("page", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(domains_page(
+                vec![],
+                None,
+                None,
+            )))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut provider = create_mock_provider(&server).await;
+        provider.max_pages = 2;
+        let error = provider.list_zones().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("DigitalOcean domain listing exceeded 2 pages"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_zone_reads_the_domain_directly() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com"))
+            .and(header("Authorization", "Bearer test_token_12345"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"domain": do_domain("example.com")})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/domains/missing.example.com"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "id": "not_found",
+                "message": "The resource you were accessing could not be found."
+            })))
+            .mount(&server)
+            .await;
+        // Neither the listing nor another endpoint is ever reached.
+        Mock::given(method("GET"))
+            .and(path("/domains"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com/records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(records_page(
+                vec![],
+                None,
+                None,
+            )))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server).await;
+        let zone = provider.get_zone("Example.COM.").await.unwrap().unwrap();
+        assert_eq!(zone.id, "example.com");
+        assert_eq!(zone.name, "example.com");
+
+        assert!(provider
+            .get_zone("missing.example.com")
+            .await
+            .unwrap()
+            .is_none());
+        // A name that is not a single path segment stays one: the lookup
+        // misses instead of reaching the records endpoint.
+        assert!(provider
+            .get_zone("example.com/records")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn get_zone_fails_closed_on_errors_and_mismatched_answers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.com"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal failure"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/domains/example.net"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"domain": do_domain("other.example.net")})),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server).await;
+        let error = provider.get_zone("example.com").await.unwrap_err();
+        assert!(error.to_string().contains("500"), "{error}");
+
+        let error = provider.get_zone("example.net").await.unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "answered the lookup of domain example.net with domain other.example.net"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1047,12 +1914,17 @@ mod integration_tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/domains"))
+            .and(path("/domains/example.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "domains": [
-                    {"name": "example.com", "ttl": 1800},
-                    {"name": "test.org", "ttl": 3600}
-                ]
+                "domain": {"name": "example.com", "ttl": 1800}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/domains/missing.example.com"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "id": "not_found",
+                "message": "The resource you were accessing could not be found."
             })))
             .mount(&mock_server)
             .await;
@@ -1063,7 +1935,7 @@ mod integration_tests {
         assert!(zone.is_some());
         assert_eq!(zone.unwrap().name, "example.com");
 
-        let zone = provider.get_zone("notfound.com").await.unwrap();
+        let zone = provider.get_zone("missing.example.com").await.unwrap();
         assert!(zone.is_none());
     }
 

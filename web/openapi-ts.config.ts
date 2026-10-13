@@ -43,6 +43,9 @@ export default {
         // consumer yet; exclude until real SSE consumption is built and
         // this can be revisited.
         exclude: [
+          // The OpenAI-compatible operation has mixed JSON/SSE media. Use the
+          // explicit /responses/json and /responses/stream generated bindings.
+          'POST /ai/v1/responses',
           'POST /projects/{project_id}/ai/structured-output/stream',
           'POST /settings/sandbox-rebuild',
         ],

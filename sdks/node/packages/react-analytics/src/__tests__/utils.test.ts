@@ -166,9 +166,17 @@ describe("utils", () => {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ event_name: "test" }),
         })
       );
+      // The payload is enriched with the client-side visitor/session identity.
+      const body = JSON.parse(
+        (fetchSpy.mock.calls[0][1] as RequestInit).body as string
+      );
+      expect(body).toMatchObject({
+        event_name: "test",
+        visitorId: expect.any(String),
+        sessionId: expect.any(String),
+      });
     });
 
     it("should use custom base path", async () => {
@@ -221,13 +229,20 @@ describe("utils", () => {
       );
     });
 
-    it("should return false when sendBeacon fails", () => {
+    it("should fall back to fetch when sendBeacon cannot queue the request", () => {
       const sendBeaconSpy = vi.spyOn(navigator, "sendBeacon").mockReturnValue(false);
+      const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValue(
+        new Response("ok", { status: 200 })
+      );
 
       const result = sendAnalyticsReliable("event", { event_name: "test" }, DEFAULT_BASE_PATH);
 
       expect(sendBeaconSpy).toHaveBeenCalled();
-      expect(result).toBe(false);
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `${DEFAULT_BASE_PATH}/event`,
+        expect.objectContaining({ keepalive: true })
+      );
+      expect(result).toBe(true);
     });
 
     it("should use fetch when sendBeacon is not available", () => {

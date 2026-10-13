@@ -28,6 +28,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import { resourceUpdateMessages } from './resource-limits-feedback'
 
 interface EditResourceLimitsDialogProps {
   open: boolean
@@ -208,40 +209,11 @@ export function EditResourceLimitsDialog({
       // next start; "missing" = container doesn't exist yet; "failed" = the
       // Docker daemon rejected the update (typically: new memory cap is
       // below current usage).
-      const members = response.applied ?? []
-      const live = members.filter((m) => m.outcome === 'applied').length
-      const stopped = members.filter((m) => m.outcome === 'stopped').length
-      const missing = members.filter((m) => m.outcome === 'missing').length
-      const failed = members.filter((m) => m.outcome === 'failed')
-      // Docker can't remove a memory cap on a running container — when
-      // the operator switches from limited → unlimited, the live update
-      // is a no-op and only a container recreate picks up the change.
-      const recreate = members.filter((m) => m.outcome === 'requires_recreate')
-
-      if (failed.length > 0) {
-        toast.warning('Limits saved, but some containers rejected the update', {
-          description: failed
-            .map((f) => `${f.container_name}: ${f.error ?? 'failed'}`)
-            .join('\n'),
-        })
-      } else if (recreate.length > 0) {
-        toast.warning('Limits saved — restart required', {
-          description:
-            "Some changes (shared memory, or removing a memory cap) can't be applied live. Restart the service to recreate the container and apply them.",
-        })
-      } else if (members.length === 0) {
-        toast.success('Resource limits saved', {
-          description:
-            'No running containers found — caps will apply on next start.',
-        })
-      } else {
-        const parts = [
-          live > 0 ? `${live} live` : null,
-          stopped > 0 ? `${stopped} on next start` : null,
-          missing > 0 ? `${missing} not yet created` : null,
-        ].filter(Boolean) as string[]
-        toast.success('Resource limits applied', {
-          description: parts.join(' · '),
+      for (const message of resourceUpdateMessages(response)) {
+        const show = message.kind === 'success' ? toast.success : toast.warning
+        show(message.title, {
+          description: message.description,
+          duration: message.duration,
         })
       }
 

@@ -17,6 +17,7 @@ use sea_orm::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use temps_deployer::ContainerDeployer;
 use temps_entities::{deployment_containers, deployments};
 use temps_metrics::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
@@ -56,6 +57,113 @@ struct ContainerState {
 
 type RuntimeCache =
     HashMap<i32, Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError>>;
+
+/// A per-container write the poll loop retries every cycle while it fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ContainerOp {
+    PersistRuntimeInfo,
+    PersistExitInfo,
+    ClearStopMarker,
+    RestoreRunningStatus,
+    FireStatusAlarm,
+    FireResourceAlarm,
+}
+
+impl ContainerOp {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::PersistRuntimeInfo => "persist container runtime information and refresh routes",
+            Self::PersistExitInfo => "persist container exit information",
+            Self::ClearStopMarker => "clear the stopped marker of a running container",
+            Self::RestoreRunningStatus => {
+                "mark a restarted container as running again and refresh routes"
+            }
+            Self::FireStatusAlarm => "fire the container status alarm",
+            Self::FireResourceAlarm => "fire the container resource alarm",
+        }
+    }
+}
+
+/// Log-on-transition state for conditions the poll loop re-observes every
+/// [`ContainerHealthConfig::poll_interval_secs`] (see
+/// [`temps_core::log_transitions`]). A crashed user container, a write that
+/// keeps failing or an unreachable worker used to log the same line for
+/// every container on every poll, which made this monitor one of the
+/// noisiest modules on a fleet with a single broken app.
+#[derive(Default)]
+struct HealthLogState {
+    /// Loading the container set failed (database unreachable).
+    cycle: FailureLatch,
+    /// Per-container write failures, keyed by `(deployment_container.id, op)`.
+    container_ops: KeyedFailureLatch<(i32, ContainerOp)>,
+    /// Containers currently observed exited/dead, keyed by
+    /// `deployment_container.id`. The exit is the user's workload, not a
+    /// Temps fault: WARN when it is first seen, quiet while it stays down.
+    exited: KeyedFailureLatch<i32>,
+    /// Worker nodes whose runtime could not be resolved, keyed by node ID.
+    unresolved_nodes: KeyedFailureLatch<i32>,
+    /// Writing container metrics to the metrics store.
+    metrics_writes: FailureLatch,
+}
+
+impl HealthLogState {
+    /// Forget containers that are no longer live so the latches stay bounded.
+    fn retain_containers(&self, active_ids: &std::collections::HashSet<i32>) {
+        self.container_ops.retain(|(id, _)| active_ids.contains(id));
+        self.exited.retain(|id| active_ids.contains(id));
+    }
+
+    /// Report a failed per-container write. These are database or alarm
+    /// pipeline failures — Temps faults — so ERROR, but once per failing
+    /// container/op (plus an hourly reminder) rather than every poll.
+    fn report_op_failure(
+        &self,
+        container: &deployment_containers::Model,
+        op: ContainerOp,
+        error: &dyn std::fmt::Display,
+    ) -> FailureLog {
+        let outcome = self.container_ops.record_failure((container.id, op));
+        match outcome {
+            FailureLog::Started => error!(
+                container_id = container.id,
+                deployment_id = container.deployment_id,
+                container_name = %container.container_name,
+                %error,
+                "Failed to {}",
+                op.describe()
+            ),
+            FailureLog::Reminder { consecutive } => error!(
+                container_id = container.id,
+                deployment_id = container.deployment_id,
+                container_name = %container.container_name,
+                consecutive_failures = consecutive,
+                %error,
+                "Still failing to {}",
+                op.describe()
+            ),
+            FailureLog::Suppressed { consecutive } => debug!(
+                container_id = container.id,
+                consecutive_failures = consecutive,
+                %error,
+                "Failed to {}",
+                op.describe()
+            ),
+        }
+        outcome
+    }
+
+    /// Report a successful per-container write, logging a recovery.
+    fn report_op_success(&self, container: &deployment_containers::Model, op: ContainerOp) {
+        if let Some(failures) = self.container_ops.record_success(&(container.id, op)) {
+            info!(
+                container_id = container.id,
+                previous_failures = failures,
+                "Recovered: able to {} again",
+                op.describe()
+            );
+        }
+    }
+}
 
 struct ContainerCheckJob {
     container: deployment_containers::Model,
@@ -150,6 +258,12 @@ fn is_intentionally_stopped(status: Option<&str>) -> bool {
     status.is_some_and(|status| status == "stopped" || status.starts_with("retained:"))
 }
 
+/// Statuses the poll loop itself writes when Docker reports a container
+/// down without anyone having stopped it on purpose (see `persist_exit_info`).
+/// The route table only routes NULL/`"running"` rows, so one of these left
+/// behind after the container runs again keeps its app off the network.
+const UNINTENDED_EXIT_STATUSES: [&str; 2] = ["exited", "dead"];
+
 /// Truncate a timestamp to the microsecond precision Postgres stores.
 /// Docker reports nanoseconds, so comparing a live Docker timestamp with its
 /// own stored copy would otherwise see the copy as older (or different) by
@@ -228,6 +342,8 @@ pub struct ContainerHealthMonitor {
     container_states: tokio::sync::RwLock<HashMap<i32, ContainerState>>,
     /// Consecutive high-resource checks keyed by (container_db_id, alarm_type_str)
     resource_counters: tokio::sync::RwLock<HashMap<(i32, &'static str), u32>>,
+    /// Log-on-transition state for conditions re-observed every poll.
+    log_state: HealthLogState,
 }
 
 impl ContainerHealthMonitor {
@@ -246,6 +362,7 @@ impl ContainerHealthMonitor {
             runtime_resolver: None,
             container_states: tokio::sync::RwLock::new(HashMap::new()),
             resource_counters: tokio::sync::RwLock::new(HashMap::new()),
+            log_state: HealthLogState::default(),
         }
     }
 
@@ -297,8 +414,26 @@ impl ContainerHealthMonitor {
         );
 
         loop {
-            if let Err(e) = self.check_all_containers().await {
-                error!("Container health check cycle failed: {}", e);
+            match self.check_all_containers().await {
+                Ok(()) => {
+                    if let Some(failures) = self.log_state.cycle.record_success() {
+                        info!(
+                            previous_failures = failures,
+                            "Container health check cycles recovered"
+                        );
+                    }
+                }
+                Err(e) => match self.log_state.cycle.record_failure() {
+                    FailureLog::Started => error!("Container health check cycle failed: {}", e),
+                    FailureLog::Reminder { consecutive } => error!(
+                        consecutive_failures = consecutive,
+                        "Container health check cycles are still failing: {}", e
+                    ),
+                    FailureLog::Suppressed { consecutive } => debug!(
+                        consecutive_failures = consecutive,
+                        "Container health check cycle failed: {}", e
+                    ),
+                },
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(
@@ -317,7 +452,16 @@ impl ContainerHealthMonitor {
             .await
             .map_err(|e| format!("Failed to query deployment_containers: {}", e))?;
 
+        let active_nodes: std::collections::HashSet<i32> = containers
+            .iter()
+            .filter_map(|container| container.node_id)
+            .collect();
+        self.log_state
+            .unresolved_nodes
+            .retain(|id| active_nodes.contains(id));
         if containers.is_empty() {
+            self.log_state
+                .retain_containers(&std::collections::HashSet::new());
             debug!("No active containers to monitor");
             return Ok(());
         }
@@ -332,6 +476,7 @@ impl ContainerHealthMonitor {
             let mut counters = self.resource_counters.write().await;
             counters.retain(|(id, _), _| active_ids.contains(id));
         }
+        self.log_state.retain_containers(&active_ids);
 
         debug!("Checking {} active containers", containers.len());
 
@@ -372,16 +517,45 @@ impl ContainerHealthMonitor {
                         .runtime_for_node(container.node_id, &mut remote_runtimes)
                         .await
                     {
-                        Ok(deployer) => deployer,
+                        Ok(deployer) => {
+                            if let Some(node_id) = container.node_id {
+                                if let Some(failures) =
+                                    self.log_state.unresolved_nodes.record_success(&node_id)
+                                {
+                                    info!(
+                                        node_id,
+                                        previous_failures = failures,
+                                        "Worker container runtime resolves again; resuming its health checks"
+                                    );
+                                }
+                            }
+                            deployer
+                        }
                         Err(resolution_error) => {
-                            warn!(
-                                node_id = container.node_id,
-                                container_id = container.id,
-                                container_runtime_id = %container.container_id,
-                                deployment_id = container.deployment_id,
-                                error = %resolution_error,
-                                "Skipping worker container health check because its runtime could not be resolved"
-                            );
+                            // One unreachable worker skips every container on
+                            // it, every poll: report it once per node.
+                            let outcome = self
+                                .log_state
+                                .unresolved_nodes
+                                .record_failure(resolution_error.node_id);
+                            if outcome.should_log() {
+                                warn!(
+                                    node_id = container.node_id,
+                                    container_id = container.id,
+                                    container_runtime_id = %container.container_id,
+                                    deployment_id = container.deployment_id,
+                                    consecutive_failures = outcome.consecutive(),
+                                    error = %resolution_error,
+                                    "Skipping worker container health checks because the node's runtime could not be resolved"
+                                );
+                            } else {
+                                debug!(
+                                    node_id = container.node_id,
+                                    container_id = container.id,
+                                    error = %resolution_error,
+                                    "Skipping worker container health check because its runtime could not be resolved"
+                                );
+                            }
                             continue;
                         }
                     };
@@ -535,9 +709,40 @@ impl ContainerHealthMonitor {
         // Persist runtime metadata (started_at, cpu_limit_cores) once they're
         // observed. These don't change while a container is running, so the
         // diff check in persist_runtime_info skips writes after the first hit.
-        if let Err(error) = self.persist_runtime_info(container, info).await {
-            error!(container_id = container.id, deployment_id = container.deployment_id,
-                %error, "Failed to persist container runtime information and refresh routes");
+        let runtime_persisted = match self.persist_runtime_info(container, info).await {
+            Ok(()) => {
+                self.log_state
+                    .report_op_success(container, ContainerOp::PersistRuntimeInfo);
+                true
+            }
+            Err(error) => {
+                self.log_state.report_op_failure(
+                    container,
+                    ContainerOp::PersistRuntimeInfo,
+                    &error,
+                );
+                false
+            }
+        };
+
+        // A crashed (or `docker stop`ped) container that runs again must be
+        // made routable again, otherwise the route table keeps excluding it
+        // and its app stays down for good. Only once its current published
+        // port is recorded: restoring it after a failed runtime write would
+        // reload routes onto the stale port. The next poll retries both.
+        if runtime_persisted && Self::needs_running_status_restore(container, info) {
+            match self.restore_running_status(container).await {
+                Ok(_) => self
+                    .log_state
+                    .report_op_success(container, ContainerOp::RestoreRunningStatus),
+                Err(error) => {
+                    self.log_state.report_op_failure(
+                        container,
+                        ContainerOp::RestoreRunningStatus,
+                        &error,
+                    );
+                }
+            }
         }
 
         // Check container status (exited, dead, OOM)
@@ -742,13 +947,27 @@ impl ContainerHealthMonitor {
                     return;
                 }
 
-                warn!(
-                    "Container {} ({}) is in '{}' state (reason: {})",
-                    container.id,
-                    container.container_name,
-                    status_str,
-                    info.exit_reason.as_deref().unwrap_or("unknown")
-                );
+                // The user's workload exited: WARN when first observed, quiet
+                // on later polls while it stays down (the alarm carries the
+                // details and has its own cooldown).
+                let exit_outcome = self.log_state.exited.record_failure(container.id);
+                if exit_outcome.should_log() {
+                    warn!(
+                        container_id = container.id,
+                        deployment_id = deployment.id,
+                        consecutive_polls = exit_outcome.consecutive(),
+                        "Container {} ({}) is in '{}' state (reason: {})",
+                        container.id,
+                        container.container_name,
+                        status_str,
+                        info.exit_reason.as_deref().unwrap_or("unknown")
+                    );
+                } else {
+                    debug!(
+                        "Container {} ({}) is still in '{}' state",
+                        container.id, container.container_name, status_str
+                    );
+                }
 
                 // Pick OOM alarm only when Docker actually flagged OOMKilled;
                 // a plain non-zero exit is a different signal.
@@ -792,25 +1011,104 @@ impl ContainerHealthMonitor {
                     })),
                 };
 
-                if let Err(e) = self.alarm_service.fire_alarm(request).await {
-                    error!(
-                        "Failed to fire status alarm for container {}: {}",
-                        container.id, e
-                    );
+                match self.alarm_service.fire_alarm(request).await {
+                    Ok(_) => self
+                        .log_state
+                        .report_op_success(container, ContainerOp::FireStatusAlarm),
+                    Err(e) => {
+                        self.log_state.report_op_failure(
+                            container,
+                            ContainerOp::FireStatusAlarm,
+                            &e,
+                        );
+                    }
                 }
             }
             temps_deployer::ContainerStatus::Running
                 if container.status.as_deref() == Some("stopped") =>
             {
+                self.note_container_up(container);
                 // A user-stopped container is running again (started by
                 // hand, or by Docker's restart policy). Drop the stale
                 // marker, otherwise its next crash would be mistaken for
                 // the earlier intentional stop and never alarm.
                 self.clear_user_stop_marker(container).await;
             }
-            _ => {
-                // Container is in a healthy state, nothing to do
-            }
+            temps_deployer::ContainerStatus::Running => self.note_container_up(container),
+            _ => {}
+        }
+    }
+
+    /// Whether Docker reports `container` running while its row still holds
+    /// a non-intentional exit status (`"exited"`/`"dead"`).
+    fn needs_running_status_restore(
+        container: &deployment_containers::Model,
+        info: &temps_deployer::ContainerInfo,
+    ) -> bool {
+        matches!(info.status, temps_deployer::ContainerStatus::Running)
+            && container
+                .status
+                .as_deref()
+                .is_some_and(|status| UNINTENDED_EXIT_STATUSES.contains(&status))
+    }
+
+    /// Replace an `"exited"`/`"dead"` status with `"running"` and reload the
+    /// route table in the same transaction, so a failed notification leaves
+    /// the old status in place and the next poll retries both. Conditional on
+    /// the old status still being there, so a concurrent stop or pause
+    /// (`"stopped"`, `"retained:*"`) is never overwritten. Returns whether
+    /// the row changed.
+    async fn restore_running_status(
+        &self,
+        container: &deployment_containers::Model,
+    ) -> Result<bool, DbErr> {
+        let txn = self.db.begin().await?;
+        let updated = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value("running"),
+            )
+            .filter(deployment_containers::Column::Id.eq(container.id))
+            .filter(deployment_containers::Column::Status.is_in(UNINTENDED_EXIT_STATUSES))
+            .exec(&txn)
+            .await?;
+        if updated.rows_affected == 0 {
+            // Someone else changed the status since this poll read it.
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_notify('route_table_changes', '')".to_string(),
+        ))
+        .await?;
+        txn.commit().await?;
+        info!(
+            container_id = container.id,
+            deployment_id = container.deployment_id,
+            previous_status = container.status.as_deref().unwrap_or_default(),
+            "Container {} ({}) is running again; restored its route",
+            container.id,
+            container.container_name
+        );
+        Ok(true)
+    }
+
+    /// Log once when a container previously reported as exited is up again.
+    fn note_container_up(&self, container: &deployment_containers::Model) {
+        if self
+            .log_state
+            .exited
+            .record_success(&container.id)
+            .is_some()
+        {
+            info!(
+                container_id = container.id,
+                deployment_id = container.deployment_id,
+                "Container {} ({}) is no longer exited",
+                container.id,
+                container.container_name
+            );
         }
     }
 
@@ -826,11 +1124,14 @@ impl ContainerHealthMonitor {
             .filter(deployment_containers::Column::Status.eq("stopped"))
             .exec(self.db.as_ref())
             .await;
-        if let Err(e) = result {
-            error!(
-                "Failed to clear stopped marker for running container {} ({}): {}",
-                container.id, container.container_name, e
-            );
+        match result {
+            Ok(_) => self
+                .log_state
+                .report_op_success(container, ContainerOp::ClearStopMarker),
+            Err(e) => {
+                self.log_state
+                    .report_op_failure(container, ContainerOp::ClearStopMarker, &e);
+            }
         }
     }
 
@@ -880,14 +1181,17 @@ impl ContainerHealthMonitor {
             ..Default::default()
         };
 
-        if let Err(e) = deployment_containers::Entity::update(active)
+        match deployment_containers::Entity::update(active)
             .exec(self.db.as_ref())
             .await
         {
-            error!(
-                "Failed to persist exit info for container {} ({}): {}",
-                container.id, container.container_name, e
-            );
+            Ok(_) => self
+                .log_state
+                .report_op_success(container, ContainerOp::PersistExitInfo),
+            Err(e) => {
+                self.log_state
+                    .report_op_failure(container, ContainerOp::PersistExitInfo, &e);
+            }
         }
     }
 
@@ -1208,10 +1512,29 @@ impl ContainerHealthMonitor {
             MetricKind::Gauge,
         ));
 
-        store
-            .write_batch(points)
-            .await
-            .unwrap_or_else(|e| warn!("container metrics write for container {container_id}: {e}"));
+        match store.write_batch(points).await {
+            Ok(_) => {
+                if let Some(failures) = self.log_state.metrics_writes.record_success() {
+                    info!(
+                        previous_failures = failures,
+                        "Container metrics writes recovered"
+                    );
+                }
+            }
+            // One metrics-store outage fails the write for every container on
+            // every poll; report the outage, not each container.
+            Err(e) => {
+                let outcome = self.log_state.metrics_writes.record_failure();
+                if outcome.should_log() {
+                    warn!(
+                        consecutive_failures = outcome.consecutive(),
+                        "container metrics write for container {container_id}: {e}"
+                    );
+                } else {
+                    debug!("container metrics write for container {container_id}: {e}");
+                }
+            }
+        }
     }
 
     /// Handle a resource threshold breach. Only fires alarm after N consecutive breaches.
@@ -1259,11 +1582,14 @@ impl ContainerHealthMonitor {
             metadata: Some(metadata),
         };
 
-        if let Err(e) = self.alarm_service.fire_alarm(request).await {
-            error!(
-                "Failed to fire resource alarm for container {}: {}",
-                container.id, e
-            );
+        match self.alarm_service.fire_alarm(request).await {
+            Ok(_) => self
+                .log_state
+                .report_op_success(container, ContainerOp::FireResourceAlarm),
+            Err(e) => {
+                self.log_state
+                    .report_op_failure(container, ContainerOp::FireResourceAlarm, &e);
+            }
         }
 
         // Reset counter after firing (cooldown in AlarmService prevents spam)
@@ -1484,6 +1810,58 @@ mod tests {
                     reason: "worker is not configured in the test resolver".to_string(),
                 })
         }
+    }
+
+    #[test]
+    fn failing_container_write_is_logged_once_per_container_and_op() {
+        let state = HealthLogState::default();
+        let a = make_container_model(1);
+        let b = make_container_model(2);
+        let error = "connection refused";
+
+        assert_eq!(
+            state.report_op_failure(&a, ContainerOp::PersistRuntimeInfo, &error),
+            FailureLog::Started
+        );
+        // Same container + op on later polls: suppressed.
+        for _ in 0..10 {
+            assert!(!state
+                .report_op_failure(&a, ContainerOp::PersistRuntimeInfo, &error)
+                .should_log());
+        }
+        // A different op or a different container is its own transition.
+        assert_eq!(
+            state.report_op_failure(&a, ContainerOp::FireStatusAlarm, &error),
+            FailureLog::Started
+        );
+        assert_eq!(
+            state.report_op_failure(&b, ContainerOp::PersistRuntimeInfo, &error),
+            FailureLog::Started
+        );
+
+        // Recovery re-arms the latch.
+        state.report_op_success(&a, ContainerOp::PersistRuntimeInfo);
+        assert_eq!(
+            state.report_op_failure(&a, ContainerOp::PersistRuntimeInfo, &error),
+            FailureLog::Started
+        );
+    }
+
+    #[test]
+    fn removed_containers_are_forgotten() {
+        let state = HealthLogState::default();
+        let a = make_container_model(1);
+        let b = make_container_model(2);
+        state.report_op_failure(&a, ContainerOp::PersistExitInfo, &"db down");
+        state.report_op_failure(&b, ContainerOp::PersistExitInfo, &"db down");
+        state.exited.record_failure(1);
+        state.exited.record_failure(2);
+
+        state.retain_containers(&std::collections::HashSet::from([2]));
+
+        assert_eq!(state.container_ops.failing_count(), 1);
+        assert!(!state.exited.is_failing(&1));
+        assert!(state.exited.is_failing(&2));
     }
 
     fn make_container_model(id: i32) -> deployment_containers::Model {
@@ -1747,6 +2125,164 @@ mod tests {
             transactions.len(),
             1,
             "update and notification share a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_running_status_and_route_notification_share_a_transaction() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+
+        assert!(monitor.restore_running_status(&container).await.unwrap());
+
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let sql = format!("{transactions:?}");
+        assert!(sql.contains("running"), "status must be restored: {sql}");
+        assert!(
+            sql.contains("exited") && sql.contains("dead"),
+            "only a non-intentional exit status may be replaced: {sql}"
+        );
+        assert!(
+            sql.contains("pg_notify"),
+            "the proxy must reload to route the container again: {sql}"
+        );
+        assert_eq!(
+            transactions.len(),
+            1,
+            "update and notification share a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrently_changed_status_is_not_restored_and_does_not_notify() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+
+        assert!(!monitor.restore_running_status(&container).await.unwrap());
+
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(
+            !sql.contains("pg_notify"),
+            "nothing changed, so routes need no reload: {sql}"
+        );
+    }
+
+    /// Docker info for a running container now published on host port 32001.
+    async fn running_info_on_new_port() -> temps_deployer::ContainerInfo {
+        let deployer = MockDeployer::new(0, ContainerStatus::Running);
+        let mut info = deployer.get_container_info("abc123").await.unwrap();
+        info.ports = vec![temps_deployer::PortMapping {
+            host_port: 32001,
+            container_port: 3000,
+            protocol: temps_deployer::Protocol::Tcp,
+            host_ip: None,
+        }];
+        info
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_write_does_not_restore_routing_onto_the_stale_port() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        let info = running_info_on_new_port().await;
+
+        monitor
+            .process_container_info(&container, &make_deployment_model(), &info)
+            .await;
+
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("32001"), "the port write was attempted: {sql}");
+        assert!(
+            !sql.contains("running") && !sql.contains("pg_notify"),
+            "routes must not be restored while the old port is still recorded: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_container_records_its_port_before_routing_is_restored() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let mut updated = container.clone();
+        updated.host_port = Some(32001);
+        let exec_ok = || sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .append_exec_results([exec_ok(), exec_ok(), exec_ok()])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        let info = running_info_on_new_port().await;
+
+        monitor
+            .process_container_info(&container, &make_deployment_model(), &info)
+            .await;
+
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(transactions.len(), 2, "{transactions:?}");
+        let port_write = format!("{:?}", transactions[0]);
+        let restore = format!("{:?}", transactions[1]);
+        assert!(port_write.contains("32001"), "{port_write}");
+        assert!(
+            restore.contains("running") && restore.contains("pg_notify"),
+            "the status is restored only after the new port is recorded: {restore}"
         );
     }
 
@@ -2276,6 +2812,32 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn paused_and_created_containers_do_not_report_recovery() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let monitor = make_monitor(deployer.clone());
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+        monitor.log_state.exited.record_failure(container.id);
+        let mut info = deployer.get_container_info("abc123").await.unwrap();
+        for status in [
+            ContainerStatus::Created,
+            ContainerStatus::Paused,
+            ContainerStatus::Stopped,
+        ] {
+            info.status = status;
+            monitor
+                .check_container_status(&container, &deployment, &info)
+                .await;
+            assert!(monitor.log_state.exited.is_failing(&container.id));
+        }
+        info.status = ContainerStatus::Running;
+        monitor
+            .check_container_status(&container, &deployment, &info)
+            .await;
+        assert!(!monitor.log_state.exited.is_failing(&container.id));
+    }
+
     // ── Resource threshold tests ──────────────────────────────────────
 
     /// Build a monitor over a mock deployer, with no metrics store.
@@ -2770,6 +3332,88 @@ mod tests {
             1,
             "a crash after the restart is a real crash: {alarms:?}"
         );
+    }
+
+    /// Issue #1334: a container that crashed or was `docker stop`ped is
+    /// recorded as "exited", which the route table never routes. Once it runs
+    /// again the poll must mark it "running" (and reload routes), otherwise
+    /// its app stays off the network after recovering.
+    #[tokio::test]
+    async fn restarted_exited_container_is_running_again() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let crashed = fixture.container(&current, "exited").await;
+        let died = fixture
+            .container(&fixture.deployment("app-9", "completed").await, "dead")
+            .await;
+        let retained = fixture
+            .container(
+                &fixture.deployment("app-10", "failed").await,
+                "retained:stopped-after-failed-readiness",
+            )
+            .await;
+
+        fixture.poll_with_status(ContainerStatus::Running).await;
+
+        for (id, expected) in [
+            (crashed.id, "running"),
+            (died.id, "running"),
+            // An intentional marker is not a crash status: unchanged.
+            (retained.id, "retained:stopped-after-failed-readiness"),
+        ] {
+            let row = deployment_containers::Entity::find_by_id(id)
+                .one(fixture.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status.as_deref(), Some(expected), "container {id}");
+        }
+
+        // Back to normal: its next crash is a real crash.
+        fixture.poll_with_exited_containers().await;
+        let alarms = fixture.alarms().await;
+        assert!(
+            alarms
+                .iter()
+                .any(|alarm| alarm.container_id == Some(crashed.id)),
+            "a crash after the recovery must alarm: {alarms:?}"
+        );
+    }
+
+    /// The restore is conditional on the status the poll read: a container
+    /// stopped by the user in the meantime keeps its marker.
+    #[tokio::test]
+    async fn restoring_running_status_never_overwrites_a_concurrent_stop() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let stopped = fixture.container(&current, "stopped").await;
+        // The poll's snapshot still says "exited"; the user stopped it since.
+        let mut stale_snapshot = stopped.clone();
+        stale_snapshot.status = Some("exited".to_string());
+
+        let monitor = ContainerHealthMonitor::new(
+            fixture.db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(fixture.db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        assert!(!monitor
+            .restore_running_status(&stale_snapshot)
+            .await
+            .unwrap());
+
+        let row = deployment_containers::Entity::find_by_id(stopped.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
     }
 
     #[tokio::test]

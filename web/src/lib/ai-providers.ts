@@ -7,4 +7,8 @@ export { AI_PROVIDERS } from './ai-providers-shared'
 export { getAiProvider } from './ai-providers-shared'
 export { aiProviderName } from './ai-providers-shared'
 export { aiProviderModels } from './ai-providers-shared'
+export {
+  SELF_HOSTED_PROVIDER_ID,
+  isSelfHostedProvider,
+} from './ai-providers-shared'
 export { AiProviderIcon } from './ai-providers-components'

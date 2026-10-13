@@ -169,6 +169,25 @@ describe('projectHealthIndicator', () => {
     ).toMatchObject({ tone: 'down', label: 'Uptime down' })
   })
 
+  test('a never-deployed project is neutral, not down', () => {
+    const indicator = projectHealthIndicator({
+      health: summary({
+        status: 'unknown',
+        total_requests: 0,
+        total_errors: 0,
+        error_rate: 0,
+        avg_response_time_ms: 0,
+      }),
+      monitor: { status: 'not_deployed' },
+    })
+    expect(indicator).toMatchObject({
+      tone: 'idle',
+      label: 'Not deployed yet',
+    })
+    expect(indicator.detail).toContain('first production deployment')
+    expect(indicator.detail).not.toContain('failing')
+  })
+
   test('falls back to traffic when the project has no monitors', () => {
     expect(
       projectHealthIndicator({

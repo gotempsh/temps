@@ -33,6 +33,9 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import {
   Collapsible,
   CollapsibleContent,
@@ -64,8 +67,18 @@ import {
 } from '@/lib/date'
 import {
   STATUS_ACTIVE_RENEWAL_FAILED,
+  type FailedRetryAction,
+  domainRefetchInterval,
+  failedRetryAction,
+  isIssuanceInFlight,
   isServingCert,
+  isTerminalOrderStatus,
+  orderRefetchInterval,
 } from '@/lib/domain-status'
+import {
+  selectCustomDomainLookup,
+  selectDomainOrder,
+} from '@/lib/empty-state-selectors'
 import {
   useIsFetching,
   useInfiniteQuery,
@@ -95,8 +108,8 @@ import {
   Wand2,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { useEffect, useRef, useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 type ChallengeData = {
@@ -124,16 +137,29 @@ export function DomainDetail() {
     path: { domain_id: Number(id) },
   }).queryKey
 
-  const { data: domain, isLoading: isDomainLoading } = useQuery({
+  const domainQuery = useQuery({
     ...getDomainByIdOptions({ path: { domain: Number(id) } }),
     enabled: !!id,
+    retry: false,
+    // The backend moves a domain between statuses on its own (a failed
+    // validation flips it to `failed` while the page still shows
+    // `challenge_requested`). Poll while issuance is in flight; the interval
+    // is `false` for settled statuses, so polling stops by itself.
+    refetchInterval: (query) =>
+      domainRefetchInterval(
+        query.state.data?.status,
+        query.state.dataUpdateCount
+      ),
   })
+  const domain = domainQuery.data
 
   const assignmentOptions = getVisibleCustomDomainByHostnameOptions({
     path: { hostname: domain?.domain || '' },
   })
+  // `null` once loaded means the hostname is not attached to any project.
   const assignmentQuery = useQuery({
     ...assignmentOptions,
+    select: selectCustomDomainLookup,
     enabled: !!domain?.domain,
     retry: false,
   })
@@ -229,13 +255,34 @@ export function DomainDetail() {
     })
   }
 
-  const { data: order, isLoading: isOrderLoading } = useQuery({
+  const orderRequired = !!domain && !isServingCert(domain.status)
+  const orderQuery = useQuery({
     ...getDomainOrderOptions({ path: { domain_id: Number(id) } }),
     // Only fetch an in-progress ACME order when the domain isn't already serving a
     // cert. "active_renewal_failed" is still serving, so treat it like "active".
-    enabled: !!id && !isServingCert(domain?.status),
+    enabled: orderRequired,
+    // `null` once loaded means the domain has no ACME order (not an error).
+    select: selectDomainOrder,
     retry: false,
+    // The order carries the per-authorization error. It follows the domain's
+    // polling and keeps going until the order itself has settled, so a domain
+    // seen as `failed` between two order reads never sits beside a stale
+    // `pending` order.
+    refetchInterval: (query) =>
+      orderRefetchInterval(
+        domain?.status,
+        // `state.data` is the raw response, ahead of `select`.
+        query.state.data?.order?.status,
+        query.state.dataUpdateCount,
+        // The domain stops polling when it settles, so its last read is the
+        // moment it was seen settled; the order's own last read, relative to
+        // that, is how long the catch-up has been running.
+        query.state.dataUpdatedAt -
+          (queryClient.getQueryState(domainQueryKey)?.dataUpdatedAt ?? 0)
+      ),
   })
+
+  const order = orderQuery.data ?? undefined
 
   const { data: httpDebugInfo } = useQuery({
     ...getHttpChallengeDebugOptions({
@@ -260,7 +307,7 @@ export function DomainDetail() {
         domain?.status === 'pending_http'),
   })
 
-  const { data: dnsProviders } = useQuery({
+  const dnsProvidersQuery = useQuery({
     ...listProvidersOptions(),
     enabled:
       !!domain &&
@@ -270,7 +317,19 @@ export function DomainDetail() {
         domain?.status === 'pending'),
   })
 
-  const { canManageCertificates, isUsingCloudflare } = usePlatformCapabilities()
+  const {
+    canManageCertificates: platformCanManageCertificates,
+    isUsingCloudflare,
+  } = usePlatformCapabilities()
+  // Disabled queries retain their errors. Once a certificate is serving, an
+  // earlier pending-order failure must not block renewal or show an obsolete alert.
+  const orderReadFailed = orderRequired && orderQuery.isError
+  const orderKnown = !orderRequired || orderQuery.isSuccess
+  const canManageCertificates =
+    platformCanManageCertificates &&
+    domainQuery.isSuccess &&
+    orderKnown &&
+    !orderReadFailed
 
   const fetchingCount = useIsFetching({
     predicate: (q) => {
@@ -321,6 +380,27 @@ export function DomainDetail() {
 
   usePageTitle(domain ? `${domain.domain} - Domain Details` : 'Domain Details')
 
+  // Tell the operator when a certificate they were waiting on lands, even if
+  // they never saw the intermediate statuses.
+  const previousStatus = useRef<string | undefined>(undefined)
+  const currentStatus = domain?.status
+  useEffect(() => {
+    if (
+      currentStatus === 'active' &&
+      isIssuanceInFlight(previousStatus.current)
+    ) {
+      toast.success('TLS certificate is now active!')
+    }
+    previousStatus.current = currentStatus
+  }, [currentStatus])
+
+  // A failed mutation usually leaves the backend in a new state (a failed
+  // validation sets `failed` and `last_error`), so re-read instead of keeping
+  // the status the page was showing before the attempt.
+  const refreshAfterFailure = async () => {
+    await refreshAll()
+  }
+
   const createOrder = useMutation({
     ...createOrRecreateOrderMutation(),
     meta: { errorTitle: 'Failed to create ACME order' },
@@ -328,29 +408,24 @@ export function DomainDetail() {
       toast.success('ACME order created successfully')
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const finalizeOrder = useMutation({
     ...finalizeOrderMutation(),
     meta: { errorTitle: 'Failed to verify DNS challenge' },
+    // A failed verification changes server state (the domain moves to `failed`
+    // with the error, and the CA may invalidate the order). Refetch right away
+    // so the page does not keep showing `challenge_requested` until a reload.
+    // A failed validation is returned as an error, so `onSuccess` never runs.
+    onError: refreshAfterFailure,
     onSuccess: async () => {
       toast.success(
         'DNS challenge verified! TLS certificate provisioning in progress.'
       )
+      // The domain query keeps polling while issuance is in flight and the
+      // effect above announces the active certificate.
       await refreshAll()
-
-      const pollInterval = setInterval(async () => {
-        await refreshAll()
-        const latest = queryClient.getQueryData(domainQueryKey) as
-          { status?: string } | undefined
-        if (latest?.status === 'active') {
-          clearInterval(pollInterval)
-          toast.success('TLS certificate is now active!')
-          await refreshAll()
-        }
-      }, 3000)
-
-      setTimeout(() => clearInterval(pollInterval), 120000)
     },
   })
 
@@ -380,6 +455,7 @@ export function DomainDetail() {
       }
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const setupDns = useMutation({
@@ -398,6 +474,7 @@ export function DomainDetail() {
       })
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const handleCreateOrder = () => {
@@ -471,13 +548,17 @@ export function DomainDetail() {
     }
   }
 
-  const isLoading = isDomainLoading || isOrderLoading
-
-  if (isLoading && !domain) {
+  if (domainQuery.isPending && !domain) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="flex items-center justify-center min-h-[400px]">
-          <Loader2 className="size-8 animate-spin text-muted-foreground" />
+        <div
+          role="status"
+          className="space-y-4 p-6"
+          aria-label="Loading domain"
+          aria-busy="true"
+        >
+          <Skeleton className="h-8 w-64" />
+          <Skeleton className="h-48 w-full" />
         </div>
       </div>
     )
@@ -487,13 +568,22 @@ export function DomainDetail() {
     return (
       <div className="flex-1 overflow-auto">
         <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
-          <Alert variant="warning">
-            <AlertTriangle className="size-4" />
-            <AlertTitle>Domain not found</AlertTitle>
-            <AlertDescription>
-              The requested domain could not be found.
-            </AlertDescription>
-          </Alert>
+          {isVerifiedNotFound(domainQuery.error) ? (
+            <Alert variant="warning">
+              <AlertTriangle className="size-4" />
+              <AlertTitle>Domain not found</AlertTitle>
+              <AlertDescription>
+                The requested domain could not be found.
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <ReadFailure
+              resource="Domain"
+              error={domainQuery.error}
+              onRetry={() => domainQuery.refetch()}
+              retrying={domainQuery.isFetching}
+            />
+          )}
           <Button className="mt-4" onClick={() => navigate('/domains')}>
             <ArrowLeft className="mr-2 size-4" />
             Back to Domains
@@ -507,15 +597,7 @@ export function DomainDetail() {
   // When the order is in any of these, no further action is possible on it — the user
   // must create a new order. Treat the order as "absent" for UI gating purposes so we
   // don't strand the user with hidden actions.
-  const TERMINAL_ORDER_STATUSES = [
-    'cancelled',
-    'canceled',
-    'invalid',
-    'revoked',
-    'deactivated',
-  ]
-  const isOrderTerminal =
-    !!order && TERMINAL_ORDER_STATUSES.includes(order.status)
+  const isOrderTerminal = !!order && isTerminalOrderStatus(order.status)
   const activeOrder = order && !isOrderTerminal ? order : undefined
 
   const challengeData = activeOrder?.authorizations as ChallengeData | undefined
@@ -551,7 +633,8 @@ export function DomainDetail() {
 
   // The user can (re)create an order when the domain is awaiting issuance and either
   // no order exists or the existing order is in a terminal state.
-  const canCreateOrder = isPendingState && !activeOrder
+  const canCreateOrder =
+    isPendingState && !activeOrder && orderKnown && !orderReadFailed
 
   // Renew is meaningful for any ACME-issued certificate. DNS-01 renewals
   // require the user to re-add TXT records, so we expose it as "Start renewal"
@@ -646,7 +729,12 @@ export function DomainDetail() {
                     {domain.status}
                   </Badge>
                 </div>
-                {!activeOrder ? (
+                {!orderKnown || orderReadFailed ? (
+                  <p className="text-sm text-muted-foreground">
+                    Certificate order status is unavailable. Wait for a
+                    successful read before changing it.
+                  </p>
+                ) : !activeOrder ? (
                   <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
                     <p className="text-sm text-muted-foreground">
                       {isOrderTerminal
@@ -713,7 +801,11 @@ export function DomainDetail() {
                         records={dnsTxtRecords}
                       />
                       <DnsAutoProvision
-                        providers={dnsProviders ?? []}
+                        providers={dnsProvidersQuery.data ?? []}
+                        loading={dnsProvidersQuery.isLoading}
+                        failed={dnsProvidersQuery.isError}
+                        retrying={dnsProvidersQuery.isFetching}
+                        onRetry={() => dnsProvidersQuery.refetch()}
                         selectedProvider={selectedDnsProvider}
                         onProviderChange={setSelectedDnsProvider}
                         onSetup={handleSetupDnsRecords}
@@ -777,6 +869,11 @@ export function DomainDetail() {
                     canManage={canManageCertificates}
                     withHeader
                   />
+                ) : !orderKnown || orderReadFailed ? (
+                  <p className="text-sm text-muted-foreground">
+                    Certificate order status is unavailable. Retry before
+                    changing it.
+                  </p>
                 ) : !activeOrder ? (
                   <>
                     <div className="flex items-center justify-between">
@@ -844,11 +941,13 @@ export function DomainDetail() {
                 </div>
                 <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
                   <p className="text-sm text-muted-foreground">
-                    {!activeOrder
-                      ? isOrderTerminal
-                        ? `Previous order ended with status "${order?.status}". Create a new ACME order to continue.`
-                        : 'Create an ACME order to begin certificate provisioning for this domain.'
-                      : 'An ACME order exists for this domain. Once any required DNS or HTTP records are in place, verify to finalize the certificate.'}
+                    {!orderKnown || orderReadFailed
+                      ? 'Certificate order status is unavailable. Retry before changing it.'
+                      : !activeOrder
+                        ? isOrderTerminal
+                          ? `Previous order ended with status "${order?.status}". Create a new ACME order to continue.`
+                          : 'Create an ACME order to begin certificate provisioning for this domain.'
+                        : 'An ACME order exists for this domain. Once any required DNS or HTTP records are in place, verify to finalize the certificate.'}
                   </p>
                   <div className="flex flex-wrap gap-2">
                     {canCreateOrder ? (
@@ -923,9 +1022,17 @@ export function DomainDetail() {
               <FailedPanel
                 domain={domain}
                 dnsTxtRecords={dnsTxtRecords}
+                retryAction={
+                  // Until the order is known, claiming the CA rejected the
+                  // challenge would be a guess; fall back to the neutral copy.
+                  orderKnown && !orderReadFailed
+                    ? failedRetryAction(order)
+                    : 'verify'
+                }
                 onRetry={handleCompleteDns}
+                onNewOrder={handleCreateOrder}
                 onCancel={handleCancelOrder}
-                retrying={finalizeOrder.isPending}
+                retrying={finalizeOrder.isPending || createOrder.isPending}
                 canManage={canManageCertificates}
                 keyPrefix="current-failed"
                 withHeader
@@ -966,7 +1073,7 @@ export function DomainDetail() {
                 <KeyFact
                   label="Certificate"
                   value={
-                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                    <span className="text-emerald-700 dark:text-emerald-400 font-medium">
                       Present
                     </span>
                   }
@@ -979,7 +1086,7 @@ export function DomainDetail() {
                     <span
                       className={
                         isExpiringSoon(domain.expiration_time)
-                          ? 'text-amber-600 dark:text-amber-400 font-medium'
+                          ? 'text-amber-700 dark:text-amber-400 font-medium'
                           : ''
                       }
                     >
@@ -1038,6 +1145,30 @@ export function DomainDetail() {
   return (
     <div className="flex-1 overflow-auto">
       <div className="w-full space-y-6 p-4 sm:p-6">
+        {domainQuery.isError && (
+          <ReadFailure
+            resource="Domain"
+            error={domainQuery.error}
+            cached
+            onRetry={() => domainQuery.refetch()}
+            retrying={domainQuery.isFetching}
+          />
+        )}
+        {orderReadFailed && (
+          <ReadFailure
+            resource="Certificate order"
+            error={orderQuery.error}
+            cached={!!order}
+            onRetry={() => orderQuery.refetch()}
+            retrying={orderQuery.isFetching}
+          />
+        )}
+        {orderReadFailed && (
+          <p className="text-sm text-muted-foreground">
+            The existing certificate or order may still be available. A failed
+            read does not require a new order.
+          </p>
+        )}
         {/* Header (shared across variants) */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">
@@ -1045,6 +1176,7 @@ export function DomainDetail() {
               variant="ghost"
               size="icon"
               className="shrink-0"
+              aria-label="Back to Domains"
               onClick={() => navigate('/domains')}
             >
               <ArrowLeft className="size-4" />
@@ -1398,14 +1530,14 @@ function DnsRecordsList({
               minimal
               className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
             >
-              <span className="hidden sm:inline">Name</span>
+              <span className="max-sm:sr-only">Name</span>
             </CopyButton>
             <CopyButton
               value={record.value}
               minimal
               className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
             >
-              <span className="hidden sm:inline">Value</span>
+              <span className="max-sm:sr-only">Value</span>
             </CopyButton>
           </div>
         </div>
@@ -1416,6 +1548,10 @@ function DnsRecordsList({
 
 function DnsAutoProvision({
   providers,
+  loading,
+  failed,
+  retrying,
+  onRetry,
   selectedProvider,
   onProviderChange,
   onSetup,
@@ -1423,16 +1559,18 @@ function DnsAutoProvision({
   canManage,
 }: {
   providers: DnsProviderResponse[]
+  loading: boolean
+  failed: boolean
+  retrying: boolean
+  onRetry: () => void
   selectedProvider: string
   onProviderChange: (value: string) => void
   onSetup: () => void
   pending: boolean
   canManage: boolean
 }) {
-  if (providers.length === 0) return null
-
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-gray-950/10 bg-muted/40 p-4 sm:flex-row sm:items-center">
+    <div className="flex flex-col gap-3 rounded-md bg-muted/40 p-4 sm:flex-row sm:items-center">
       <div className="flex flex-1 items-start gap-3">
         <div className="shrink-0 rounded-md bg-primary/10 p-2">
           <Wand2 className="size-4 text-primary" />
@@ -1444,38 +1582,84 @@ function DnsAutoProvision({
           </p>
         </div>
       </div>
-      <div className="flex flex-col gap-2 sm:shrink-0 sm:flex-row">
-        <Select value={selectedProvider} onValueChange={onProviderChange}>
-          <SelectTrigger className="w-full sm:w-[200px]">
-            <SelectValue placeholder="Select provider" />
-          </SelectTrigger>
-          <SelectContent>
-            {providers.map((provider) => (
-              <SelectItem key={provider.id} value={provider.id.toString()}>
-                {provider.name} ({provider.provider_type})
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={onSetup}
-          disabled={!selectedProvider || pending || !canManage}
-        >
-          {pending ? (
-            <>
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Creating…
-            </>
-          ) : (
-            <>
-              <Wand2 className="mr-2 size-4" />
-              Auto-create
-            </>
+      {loading && providers.length === 0 ? (
+        <Skeleton
+          role="status"
+          className="h-8 w-full sm:w-48"
+          aria-label="Loading DNS providers"
+        />
+      ) : failed && providers.length === 0 ? (
+        <div className="space-y-2">
+          <p role="alert" className="text-sm text-destructive">
+            Could not load DNS providers. Try again.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            aria-disabled={retrying}
+            onClick={() => {
+              if (!retrying) onRetry()
+            }}
+          >
+            {retrying ? 'Retrying…' : 'Retry DNS providers'}
+          </Button>
+        </div>
+      ) : providers.length === 0 ? (
+        <div className="space-y-2">
+          <p className="text-sm text-muted-foreground">
+            No DNS provider is configured. Add one to create these TXT records
+            automatically.
+          </p>
+          <Button size="sm" variant="outline" asChild>
+            <Link to="/dns-providers">Add DNS provider</Link>
+          </Button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2 sm:shrink-0 sm:flex-row">
+          {failed && (
+            <Button
+              size="sm"
+              variant="outline"
+              aria-disabled={retrying}
+              onClick={() => {
+                if (!retrying) onRetry()
+              }}
+            >
+              {retrying ? 'Retrying…' : 'Retry DNS providers'}
+            </Button>
           )}
-        </Button>
-      </div>
+          <Select value={selectedProvider} onValueChange={onProviderChange}>
+            <SelectTrigger className="w-full sm:w-[200px]">
+              <SelectValue placeholder="Select provider" />
+            </SelectTrigger>
+            <SelectContent>
+              {providers.map((provider) => (
+                <SelectItem key={provider.id} value={provider.id.toString()}>
+                  {provider.name} ({provider.provider_type})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onSetup}
+            disabled={!selectedProvider || pending || !canManage}
+          >
+            {pending ? (
+              <>
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                Creating…
+              </>
+            ) : (
+              <>
+                <Wand2 className="mr-2 size-4" />
+                Auto-create
+              </>
+            )}
+          </Button>
+        </div>
+      )}
     </div>
   )
 }
@@ -1715,7 +1899,7 @@ function InlineStepStrip({ steps }: { steps: InlineStep[] }) {
             ? 'text-foreground'
             : step.state === 'complete'
               ? 'text-muted-foreground'
-              : 'text-muted-foreground/70'
+              : 'text-muted-foreground'
         const indicatorClasses =
           step.state === 'current'
             ? 'bg-foreground text-background'
@@ -1837,7 +2021,10 @@ function ActiveCertificateInner({
             />
           </div>
           <CollapsibleContent>
-            <pre className="mt-2 p-4 bg-muted rounded-lg text-xs font-mono overflow-x-auto max-h-64 overflow-y-auto">
+            <pre
+              tabIndex={0}
+              className="mt-2 p-4 bg-muted rounded-lg text-xs font-mono overflow-x-auto max-h-64 overflow-y-auto"
+            >
               {domain.certificate}
             </pre>
           </CollapsibleContent>
@@ -2043,7 +2230,9 @@ function DnsKvRow({
 function FailedPanel({
   domain,
   dnsTxtRecords,
+  retryAction,
   onRetry,
+  onNewOrder,
   onCancel,
   retrying,
   canManage,
@@ -2052,7 +2241,10 @@ function FailedPanel({
 }: {
   domain: Domain
   dnsTxtRecords: { name: string; value: string }[]
+  /** `new-order` when the CA invalidated the challenge and it cannot be resubmitted. */
+  retryAction: FailedRetryAction
   onRetry: () => void
+  onNewOrder: () => void
   onCancel: () => void
   retrying: boolean
   canManage: boolean
@@ -2077,12 +2269,27 @@ function FailedPanel({
             'Certificate provisioning failed. Verify your DNS records and try again.'}
         </AlertDescription>
       </Alert>
+      {retryAction === 'new-order' && (
+        <p className="text-sm text-muted-foreground">
+          The certificate authority rejected this challenge and it cannot be
+          verified again. Start a new order to get fresh DNS records (or HTTP
+          token) to publish before verifying.
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
-        <Button onClick={onRetry} disabled={retrying || !canManage}>
+        <Button
+          onClick={retryAction === 'new-order' ? onNewOrder : onRetry}
+          disabled={retrying || !canManage}
+        >
           {retrying ? (
             <>
               <Loader2 className="mr-2 size-4 animate-spin" />
               Retrying…
+            </>
+          ) : retryAction === 'new-order' ? (
+            <>
+              <Shield className="mr-2 size-4" />
+              Start new order
             </>
           ) : (
             <>

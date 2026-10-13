@@ -20,26 +20,35 @@ const baseCfg = {
   apiToken: 'temps_pat_fake',
 };
 
+/** `POST`/`GET /v1/sandboxes` wrap the sandbox as `{ sandbox, routes }`. */
+function envelope(extra: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    sandbox: {
+      id: 'sbx_abc',
+      name: 'my-sbx',
+      status: 'running',
+      image: null,
+      cwd: '/workspace',
+      createdAt: Date.parse('2026-04-19T00:00:00Z'),
+      timeout: 2 * 60 * 60 * 1000,
+      preview_url_template: 'https://sbx-abc-{port}.preview.example.com',
+      ...extra,
+    },
+    routes: [],
+  });
+}
+
 describe('Sandbox.create', () => {
   it('posts camelCase → snake_case body and returns a live handle', async () => {
     let capturedBody: unknown;
     const fetch = mockFetch((url, init) => {
-      expect(url).toBe('https://api.temps.test/v1/sandbox');
+      expect(url).toBe('https://api.temps.test/v1/sandboxes');
       expect(init?.method).toBe('POST');
       capturedBody = JSON.parse(init?.body as string);
-      return new Response(
-        JSON.stringify({
-          id: 'sbx_abc',
-          name: 'my-sbx',
-          status: 'running',
-          image: null,
-          work_dir: '/workspace',
-          created_at: '2026-04-19T00:00:00Z',
-          expires_at: '2026-04-19T02:00:00Z',
-          preview_url_template: 'https://sbx-abc-{port}.preview.example.com',
-        }),
-        { status: 201, headers: { 'Content-Type': 'application/json' } }
-      );
+      return new Response(envelope(), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      });
     });
 
     const sbx = await Sandbox.create({
@@ -55,6 +64,8 @@ describe('Sandbox.create', () => {
     });
 
     expect(sbx.id).toBe('sbx_abc');
+    expect(sbx.info.workDir).toBe('/workspace');
+    expect(sbx.info.expiresAt).toBe('2026-04-19T02:00:00.000Z');
     expect(sbx.info.previewUrlTemplate).toContain('{port}');
     expect(sbx.domain(3000)).toBe('https://sbx-abc-3000.preview.example.com');
     expect(capturedBody).toMatchObject({
@@ -66,6 +77,23 @@ describe('Sandbox.create', () => {
         git_connection_id: 42,
       },
     });
+    // Unset: the server places the sandbox.
+    expect(capturedBody).not.toHaveProperty('node');
+  });
+
+  it('sends node to run the sandbox on a specific node', async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const fetch = mockFetch((_url, init) => {
+      capturedBody = JSON.parse(init?.body as string);
+      return new Response(envelope({ node_id: 3, node_name: 'worker-1' }), {
+        status: 201,
+      });
+    });
+
+    const sbx = await Sandbox.create({ ...baseCfg, fetch, node: 'worker-1' });
+
+    expect(capturedBody.node).toBe('worker-1');
+    expect(sbx.info.nodeName).toBe('worker-1');
   });
 
   it('throws a SandboxError with the RFC 7807 detail', async () => {
@@ -105,22 +133,10 @@ describe('Sandbox.create', () => {
 describe('Sandbox.exec', () => {
   it('unwraps the exec response', async () => {
     const fetch = mockFetch((url) => {
-      if (url.endsWith('/v1/sandbox')) {
-        return new Response(
-          JSON.stringify({
-            id: 'sbx_abc',
-            name: '',
-            status: 'running',
-            image: null,
-            work_dir: '/workspace',
-            created_at: '',
-            expires_at: '',
-            preview_url_template: '',
-          }),
-          { status: 201 }
-        );
+      if (url.endsWith('/v1/sandboxes')) {
+        return new Response(envelope(), { status: 201 });
       }
-      if (url.endsWith('/v1/sandbox/sbx_abc/exec')) {
+      if (url.endsWith('/v1/sandboxes/sbx_abc/exec')) {
         return new Response(
           JSON.stringify({ exit_code: 0, stdout: 'v20.1.0\n', stderr: '' }),
           { status: 200 }
@@ -139,19 +155,7 @@ describe('Sandbox.domain', () => {
   it('returns null when the install has no preview template configured', async () => {
     const fetch = mockFetch(
       () =>
-        new Response(
-          JSON.stringify({
-            id: 'sbx_abc',
-            name: '',
-            status: 'running',
-            image: null,
-            work_dir: '/workspace',
-            created_at: '',
-            expires_at: '',
-            preview_url_template: '',
-          }),
-          { status: 201 }
-        )
+        new Response(envelope({ preview_url_template: '' }), { status: 201 })
     );
     const sbx = await Sandbox.create({ ...baseCfg, fetch });
     expect(sbx.domain(3000)).toBeNull();

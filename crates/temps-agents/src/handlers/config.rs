@@ -103,6 +103,21 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Provider Unavailable")
                     .with_detail(error.to_string())
             }
+            AgentError::SandboxNodeUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Sandbox Node Unavailable")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxUnsupportedOnNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
+                    .with_title("Not Available For Sandboxes On Worker Nodes")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SandboxConflictOnNode { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/sandbox-node-conflict")
+                .with_title("Sandbox Conflict On Worker Node")
+                .with_detail(error.to_string()),
             AgentError::SecretNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Secret Not Found")
                 .with_detail(error.to_string()),

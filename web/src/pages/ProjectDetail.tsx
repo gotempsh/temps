@@ -3,6 +3,7 @@
 
 import { useServiceGroup } from '@/components/project-groups/ServiceGroupControl'
 import { groupHref, TERMS } from '@/lib/terminology'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import {
   getLastDeploymentOptions,
   getEnvironmentVariablesOptions,
@@ -15,6 +16,13 @@ import {
   deployFromImageMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  MonitoringProjectOverview,
+  MonitoringProjectHeader,
+} from '@/components/project/MonitoringProjectOverview'
+import { AddProjectHosting } from '@/components/project/AddProjectHosting'
+import { GeneralSettings } from '@/components/project/settings/GeneralSettings'
+import { TelemetrySettings } from '@/components/project/settings/TelemetrySettings'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
@@ -29,17 +37,19 @@ import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { EnvironmentVariablePage } from '@/components/project/settings/EnvironmentVariablePage'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
-import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
+import { ChangeRepositoryPage } from '@/components/project/settings/GitSettings'
 import {
-  ChangeRepositoryPage,
-  GitSettings,
-} from '@/components/project/settings/GitSettings'
-import { BuildDeploySettings } from '@/components/project/settings/BuildDeploySettings'
+  LegacyProjectRouteRedirect,
+  RenamedProjectRouteRedirect,
+} from '@/components/project/LegacyProjectRouteRedirect'
+import { ProjectPageNotFound } from '@/components/project/ProjectPageNotFound'
 import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
+import { ProjectStatusPages } from '@/components/project/status-pages/ProjectStatusPages'
+import { StatusPageDetail } from '@/components/project/status-pages/StatusPageDetail'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { ErrorTrackingSetup } from '@/components/project/setup/ErrorTrackingSetup'
@@ -56,10 +66,17 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
+import { projectLoadState } from '@/lib/project-load-state'
+import {
+  readFailureExplanation,
+  readFailureServerDetail,
+} from '@/lib/read-failure'
 import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
+  projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
@@ -72,13 +89,10 @@ import Traces from './Traces'
 import LogsList from './LogsList'
 import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
-import { ProjectSetup } from './ProjectSetup'
 import { ProjectAgentActivity } from './AiGateway'
-import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
 import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
-import { AutopilotPage } from '@/components/agents/AutopilotPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
@@ -109,9 +123,12 @@ export function ProjectDetail() {
 
   // Check for confetti query parameter
   const showConfetti = searchParams.get('showConfetti') === 'true'
+  // Uses the shared retry policy: a 404 or 403 settles at once, while a
+  // transient 5xx or dropped connection is retried before the page gives up.
   const {
     data: project,
     isLoading,
+    isFetching,
     error,
     refetch,
   } = useQuery({
@@ -120,7 +137,6 @@ export function ProjectDetail() {
         slug: slug || '',
       },
     }),
-    retry: false,
     enabled: !!slug,
   })
 
@@ -148,16 +164,19 @@ export function ProjectDetail() {
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
 
-  const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
-    {
+  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } =
+    useQuery({
       ...getLastDeploymentOptions({
         path: {
           id: project?.id || 0,
         },
       }),
-      enabled: !!project?.id,
+      select: selectLastDeployment,
+      enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
-        const data = query.state.data
+        // `state.data` is the raw response; the deployment is `null` until the
+        // first deploy.
+        const data = query.state.data?.deployment
         // Poll more frequently for active deployments
         if (
           data &&
@@ -172,8 +191,10 @@ export function ProjectDetail() {
       },
       // Also refetch when window regains focus
       refetchOnWindowFocus: true,
-    }
-  )
+    })
+  // The API answers 200 with `deployment: null` for a project that has never
+  // deployed; consumers take `undefined` for "nothing yet".
+  const lastDeployment = lastDeploymentOrNull ?? undefined
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({
@@ -277,7 +298,7 @@ export function ProjectDetail() {
   }) => {
     if (!project) return
 
-    if (project.source_type === 'docker_image') {
+    if (projectDeploysImage(project)) {
       const savedRuntime = serviceTemplateDeployOverrides(project)
       const imageRef =
         editedImageRef?.trim() ||
@@ -320,7 +341,7 @@ export function ProjectDetail() {
       },
       ...(isVariableRoute
         ? [
-            { label: 'Environment variables', href: variablesPath },
+            { label: 'Environment Variables', href: variablesPath },
             ...(breadcrumbVariableId
               ? [
                   {
@@ -359,27 +380,35 @@ export function ProjectDetail() {
 
   usePageTitle(project?.slug ? `${project.slug}` : '')
 
-  if (error?.message?.includes('404') || (!isLoading && !project)) {
+  const loadState = projectLoadState({
+    slug,
+    error,
+    isLoading,
+    hasProject: !!project,
+  })
+
+  // Only a verified 404 means the project is gone. A 5xx, a 403 or a dropped
+  // connection says nothing about whether it exists, so those offer a retry.
+  if (loadState === 'not-found') {
     return <NotFound />
   }
 
-  if (error) {
+  if (loadState === 'failed') {
     return (
       <div className="p-4 sm:p-6">
         <ErrorAlert
           title="Failed to load service"
           description={
-            error instanceof Error
-              ? error.message
-              : 'An unexpected error occurred'
+            readFailureServerDetail(error) ?? readFailureExplanation(error)
           }
           retry={() => refetch()}
+          retrying={isFetching}
         />
       </div>
     )
   }
 
-  if (isLoading) {
+  if (loadState === 'loading') {
     return (
       <div className="flex-1">
         <div className="p-0 sm:p-4 space-y-6 md:p-6">
@@ -447,6 +476,146 @@ export function ProjectDetail() {
     return <NotFound />
   }
 
+  if (project.source_type === 'external') {
+    return (
+      <div className="flex h-full min-w-0 flex-col overflow-hidden">
+        <MonitoringProjectHeader project={project} />
+        <div className="min-w-0 flex-1 overflow-y-auto p-4">
+          <ProjectSectionLayout project={project}>
+            <Routes>
+              <Route index element={<RedirectWithQuery to="project" />} />
+              {['project', 'integrations', 'setup'].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={<MonitoringProjectOverview project={project} />}
+                />
+              ))}
+              <Route
+                path="hosting"
+                element={<AddProjectHosting project={project} />}
+              />
+              {[
+                'connect-repository',
+                'connect-repository/connections/:connectionId',
+                'connect-repository/connections/:connectionId/repositories/:repositoryId',
+              ].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={
+                    <ChangeRepositoryPage project={project} refetch={refetch} />
+                  }
+                />
+              ))}
+              <Route
+                path="analytics/*"
+                element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="speed"
+                element={<ProjectSpeedInsights project={project} />}
+              />
+              <Route
+                path="revenue"
+                element={<ProjectRevenue project={project} />}
+              />
+              <Route
+                path="errors"
+                element={<ErrorTracking project={project} />}
+              />
+              <Route
+                path="errors/setup"
+                element={<ErrorTrackingSetup project={project} />}
+              />
+              <Route
+                path="errors/alert-rules"
+                element={<AlertRulesManagement projectId={project.id} />}
+              />
+              <Route
+                path="errors/alert-rules/new"
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
+              />
+              <Route
+                path="errors/alert-rules/:ruleId/edit"
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
+              />
+              <Route
+                path="errors/:errorGroupId"
+                element={<ErrorGroupDetail project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/event/:eventId"
+                element={<ErrorEventDetail project={project} />}
+              />
+              <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="ai-gateway"
+                element={
+                  <ProjectAgentActivity
+                    projectId={project.id}
+                    projectSlug={project.slug}
+                  />
+                }
+              />
+              <Route
+                path="telemetry-logs"
+                element={<LogsList project={project} />}
+              />
+              <Route path="metrics/*" element={<Metrics project={project} />} />
+              <Route
+                path="monitors"
+                element={<ProjectMonitors project={project} />}
+              />
+              <Route
+                path="monitors/:monitorId"
+                element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="status-pages"
+                element={<ProjectStatusPages project={project} />}
+              />
+              <Route
+                path="status-pages/:statusPageId"
+                element={<StatusPageDetail project={project} />}
+              />
+              <Route
+                path="settings/telemetry"
+                element={<TelemetrySettings project={project} />}
+              />
+              {/* General settings has its own route so links to it never
+                  depend on the fallback below, which stands in for the
+                  hosting-only settings pages a monitoring project lacks. */}
+              {['settings/general', 'settings/*'].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={
+                    <GeneralSettings project={project} refetch={refetch} />
+                  }
+                />
+              ))}
+              <Route
+                path="*"
+                element={<AddProjectHosting project={project} />}
+              />
+            </Routes>
+          </ProjectSectionLayout>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-full w-full overflow-hidden">
       <Confetti active={showConfetti} duration={4000} particleCount={100} />
@@ -508,7 +677,15 @@ export function ProjectDetail() {
           <ProjectTour />
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
+              <Route
+                path="hosting"
+                element={<RedirectWithQuery to="../settings/delivery" />}
+              />
+              <Route
+                path="integrations"
+                element={<MonitoringProjectOverview project={project} />}
+              />
               <Route
                 path="project"
                 element={
@@ -520,11 +697,16 @@ export function ProjectDetail() {
               />
               <Route
                 path="tools"
-                element={<Navigate to="../settings/general" replace />}
+                element={<RedirectWithQuery to="../settings/general" />}
               />
               <Route
                 path="setup"
-                element={<ProjectSetup project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="setup"
+                  />
+                }
               />
               <Route
                 path="deployments"
@@ -551,7 +733,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="flags"
-                element={<ProjectFeatureFlags project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="flags"
+                  />
+                }
               />
               <Route
                 path="domains"
@@ -559,12 +746,20 @@ export function ProjectDetail() {
               />
               <Route
                 path="git"
-                element={<GitSettings project={project} refetch={refetch} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="git"
+                  />
+                }
               />
               <Route
                 path="build"
                 element={
-                  <BuildDeploySettings project={project} refetch={refetch} />
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="build"
+                  />
                 }
               />
               <Route
@@ -632,7 +827,13 @@ export function ProjectDetail() {
               />
               <Route
                 path="logs/*"
-                element={<RequestLogs project={project} />}
+                element={
+                  <RenamedProjectRouteRedirect
+                    projectSlug={project.slug}
+                    from="logs"
+                    to="request-logs"
+                  />
+                }
               />
               <Route
                 path="request-logs/*"
@@ -650,6 +851,14 @@ export function ProjectDetail() {
                 path="monitors/:monitorId"
                 element={<MonitorDetail project={project} />}
               />
+              <Route
+                path="status-pages"
+                element={<ProjectStatusPages project={project} />}
+              />
+              <Route
+                path="status-pages/:statusPageId"
+                element={<StatusPageDetail project={project} />}
+              />
               <Route path="traces/*" element={<Traces project={project} />} />
               <Route
                 path="telemetry-logs"
@@ -660,7 +869,7 @@ export function ProjectDetail() {
                   any lingering /dashboards links. */}
               <Route
                 path="dashboards/*"
-                element={<Navigate to="../metrics/dashboards" replace />}
+                element={<RedirectWithQuery to="../metrics/dashboards" />}
               />
               <Route
                 path="ai-gateway"
@@ -677,7 +886,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="agents"
-                element={<AutopilotPage project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="agents"
+                  />
+                }
               />
               <Route
                 path="agents/detail/:agentSlug"
@@ -693,7 +907,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="autofixer"
-                element={<AutofixerPage project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="autofixer"
+                  />
+                }
               />
               <Route
                 path="errors"
@@ -709,11 +928,21 @@ export function ProjectDetail() {
               />
               <Route
                 path="errors/alert-rules/new"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/alert-rules/:ruleId/edit"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/:errorGroupId"
@@ -739,6 +968,10 @@ export function ProjectDetail() {
               <Route
                 path="environments/*"
                 element={<EnvironmentsTabsView project={project} />}
+              />
+              <Route
+                path="*"
+                element={<ProjectPageNotFound project={project} />}
               />
             </Routes>
           </ProjectSectionLayout>

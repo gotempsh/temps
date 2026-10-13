@@ -1628,7 +1628,7 @@ function QueryErrorState({ label, error }: { label: string; error?: unknown }) {
         {problem?.title ?? `Could not load ${label}.`}
       </p>
       {detail ? <p className="text-destructive/90">{detail}</p> : null}
-      <p className="text-destructive/80">
+      <p className="text-destructive">
         {isClientError
           ? 'Adjust the time range or filters above — retrying the same request will fail again.'
           : `Could not load ${label}. Refresh to try again.`}
@@ -1714,7 +1714,7 @@ function ApiTrafficSummaryCard({
               {data?.anomalies ? (
                 data.anomalies.length > 0 && (
                   <div className="space-y-1 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
-                    <p className="flex items-center gap-1.5 text-sm font-medium text-amber-600 dark:text-amber-400">
+                    <p className="flex items-center gap-1.5 text-sm font-medium text-amber-700 dark:text-amber-400">
                       <AlertTriangle className="h-3.5 w-3.5" />
                       Anomalies
                     </p>

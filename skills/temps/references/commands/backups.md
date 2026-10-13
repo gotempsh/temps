@@ -51,7 +51,7 @@ Create a backup schedule
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Schedule name | - | No |
 | `-t, --type <type>` | Backup type (full, incremental) | - | No |
-| `-s, --schedule <cron>` | Schedule expression (cron format) | - | No |
+| `-s, --schedule <cron>` | Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *" | - | No |
 | `-r, --retention <days>` | Retention period in days | - | No |
 | `-d, --description <desc>` | Description | - | No |
 | `--s3-source-id <id>` | S3 Source ID | - | No |
@@ -260,3 +260,4 @@ Run a backup for an external service
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
+| `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |

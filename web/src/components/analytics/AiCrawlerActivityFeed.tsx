@@ -184,7 +184,10 @@ export function AiCrawlerActivityFeed({
             setSearchParams(next, { replace: true })
           }}
         >
-          <SelectTrigger className="w-full sm:w-[180px]">
+          <SelectTrigger
+            aria-label="AI provider"
+            className="w-full sm:w-[180px]"
+          >
             <SelectValue placeholder="All providers" />
           </SelectTrigger>
           <SelectContent>
@@ -201,7 +204,7 @@ export function AiCrawlerActivityFeed({
           value={agent || ALL}
           onValueChange={(v) => setParam('ai_agent', v === ALL ? null : v)}
         >
-          <SelectTrigger className="w-full sm:w-[200px]">
+          <SelectTrigger aria-label="AI agent" className="w-full sm:w-[200px]">
             <SelectValue placeholder="All agents" />
           </SelectTrigger>
           <SelectContent>

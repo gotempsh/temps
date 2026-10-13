@@ -41,6 +41,9 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         edge_public_key: None,
         compute_cidr: None,
         underlay_address: None,
+        mesh_wg_public_key: None,
+        mesh_wg_endpoint: None,
+        mesh_wg_address: None,
         failover_at: None,
         last_heartbeat: Some(chrono::Utc::now() - chrono::Duration::seconds(heartbeat_age_secs)),
         dns_resolver_running: None,
@@ -337,7 +340,12 @@ async fn test_health_check_marks_stale_nodes_offline() {
         .into_connection();
 
     let node_service = NodeService::new(Arc::new(service_db));
-    let marked = check_node_health(&node_service, &db).await;
+    let marked = check_node_health(
+        &node_service,
+        &db,
+        chrono::Utc::now() - chrono::Duration::days(1),
+    )
+    .await;
 
     assert_eq!(marked, vec![1], "Stale node should be marked offline");
 }
@@ -353,7 +361,12 @@ async fn test_health_check_ignores_fresh_nodes() {
     let service_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
     let node_service = NodeService::new(Arc::new(service_db));
 
-    let marked = check_node_health(&node_service, &db).await;
+    let marked = check_node_health(
+        &node_service,
+        &db,
+        chrono::Utc::now() - chrono::Duration::days(1),
+    )
+    .await;
     assert!(
         marked.is_empty(),
         "Fresh nodes should not be marked offline"

@@ -1257,7 +1257,7 @@ function MetricChart({
       <div className="flex flex-col gap-2">
         {header}
         <div className="flex h-[300px] flex-col items-center justify-center gap-2 text-center">
-          <p className="text-sm font-medium text-rose-500">
+          <p className="text-sm font-medium text-rose-700 dark:text-rose-500">
             Failed to load metric series
           </p>
           <p className="text-xs text-muted-foreground">{errorMessage}</p>

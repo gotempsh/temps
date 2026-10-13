@@ -73,8 +73,9 @@ pub struct SandboxCreateCommand {
     /// Extra env vars as KEY=VALUE. Repeatable.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
-    /// Isolation backend: "docker" (default) or "firecracker" (ADR-029;
-    /// requires a host provisioned via `temps firecracker setup`).
+    /// Isolation backend: "docker" (default), "firecracker" (ADR-029;
+    /// requires a host provisioned via `temps firecracker setup`) or
+    /// "microsandbox" (ADR-050, experimental; `temps microsandbox setup`).
     #[arg(long)]
     pub backend: Option<String>,
     /// Output the server response as JSON instead of a table.

@@ -39,6 +39,8 @@ import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
 import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
 import { markdownCommand } from './commands/markdown.ts'
+import { firstRunScenarioCommand, FIRST_RUN_STEPS } from './commands/first-run-scenario.ts'
+import { quietLogsFixtureCommand } from './commands/quiet-logs-fixture.ts'
 import { aiChatPromptsCommand } from './commands/ai-chat-prompts.ts'
 
 const program = new Command()
@@ -539,11 +541,18 @@ program
       'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
       'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
       'channel, proves app-to-app and managed-Postgres *.temps.local DNS from deployed containers, drains ' +
-      'the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'the worker, runs sandboxes on it (ADR-048: placement, exec/files/stop-start, control-plane restart, ' +
+      'offline node, eviction), and removes it from the cluster -- the first e2e coverage this feature ' +
       'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
       'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
   )
-  .option('--compose-file <path>', 'path to the cluster docker-compose.yml', undefined)
+  .option(
+    '--topology <name>',
+    "cluster to run against: 'bridge' (both nodes on one Docker network, tools/e2e-multinode-cluster/) or " +
+      "'wireguard' (nodes in isolated networks behind NAT, joined only by a WireGuard tunnel, tools/e2e-wireguard-cluster/)",
+    'bridge',
+  )
+  .option('--compose-file <path>', "override the topology's docker-compose.yml", undefined)
   .option('--build-timeout <ms>', 'max wait for the cluster/worker to come up (real cargo build inside Docker)', '1800000')
   .option('--keep', 'do not tear down the cluster (leaves the entire 2-node cluster running, not just one container)')
   .option('--json', 'machine-readable output')
@@ -567,6 +576,44 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await markdownCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('first-run-scenario')
+  .description(
+    'First-run suite: deploy a public image, a git Dockerfile app, a Node preset app, a compose stack and a static site, then link managed Postgres + Redis -- each timed to its first response through the proxy',
+  )
+  .option('--only <steps...>', `run only these steps (${FIRST_RUN_STEPS.join(', ')})`)
+  .option('--skip <steps...>', 'skip these steps')
+  .option('--image <ref>', 'public image for the docker-image step', 'traefik/whoami:v1.10')
+  .option('--image-port <port>', 'container port of --image', '80')
+  .option('--git-url <url>', 'public https git URL holding examples/first-run', 'https://github.com/gotempsh/temps.git')
+  .option('--git-branch <branch>', 'branch to deploy from --git-url', 'main')
+  .option('--git-directory <dir>', 'directory with the Dockerfile app', 'examples/first-run/dockerfile-app')
+  .option('--examples-dir <dir>', 'local examples/first-run directory (default: resolved from this checkout)')
+  .option('--deploy-timeout <ms>', 'max wait for an image/compose/static deployment', '300000')
+  .option('--build-timeout <ms>', 'max wait for a deployment that builds from source', '900000')
+  .option('--report <file>', 'write the JSON report here (and a Markdown summary next to it)')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await firstRunScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('quiet-logs-fixture')
+  .description(
+    'Create (or --teardown) the quiet-logs soak workload: one deployed app, one linked managed Postgres, one alert rule and one uptime monitor',
+  )
+  .requiredOption('--state <file>', 'file recording the created resource ids')
+  .option('--teardown', 'delete the resources recorded in --state')
+  .option('--verify', 'verify the recorded workload is still healthy')
+  .option('--image <ref>', 'public image to deploy', 'traefik/whoami:v1.10')
+  .option('--image-port <port>', 'container port of --image', '80')
+  .option('--deploy-timeout <ms>', 'max wait for the deployment / service', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await quietLogsFixtureCommand({ ...opts, connection: connection() })
   })
 
 program.parseAsync().catch((err: unknown) => {

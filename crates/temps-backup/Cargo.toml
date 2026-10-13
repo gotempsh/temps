@@ -35,11 +35,17 @@ aws-sdk-s3 = { workspace = true }
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
 webpki-root-certs = "1.0"
 pem = "4"
+# `Content-MD5` on every upload (see `ContentMd5Interceptor` in
+# engines/v2_common.rs): the interceptor reads the operation name from the
+# SDK's config bag, which `aws-sdk-s3` does not re-export.
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+md5 = "0.8"
+base64 = { workspace = true }
 sea-orm = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
 thiserror = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
@@ -55,6 +61,7 @@ utoipa = { workspace = true }
 axum = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
+tar = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 urlencoding = { workspace = true }

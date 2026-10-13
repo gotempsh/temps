@@ -1,12 +1,20 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEffect, useRef, useState } from 'react'
 import { traceDetailPath } from '@/lib/traces-time-window'
 import { Layers } from 'lucide-react'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { formatTraceDuration } from '@/lib/trace-presentation'
 import { useGlobalView } from '@/hooks/useGlobalView'
+import { useDebounce } from '@/hooks/useDebounce'
+import { useAttributeFilter } from '@/hooks/useAttributeFilter'
+import {
+  type AttributeUrlFilter,
+  canonicalAttributeFilter,
+  planAttributeUrlSync,
+} from '@/lib/attribute-facets'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -40,6 +48,55 @@ export default function GlobalTraces() {
       sort: field,
       order: sort === field && order === 'desc' ? 'asc' : 'desc',
     })
+  // Attribute filter. Typing is local and debounced into the URL and the
+  // request, so each keystroke neither refetches nor resets the page.
+  const urlKey = view.params.get('attr_key') ?? ''
+  const urlValue = view.params.get('attr_value') ?? ''
+  const [attrKey, setAttrKey] = useState(urlKey)
+  const [attrValue, setAttrValue] = useState(urlValue)
+  const attribute = useAttributeFilter({
+    attrKey,
+    attrValue,
+    facetedOnly: false,
+    onKeyChange: setAttrKey,
+    onValueChange: setAttrValue,
+  })
+  const attributes = useDebounce(attribute.query, 300)
+  const debouncedKey = useDebounce(attrKey, 300)
+  const debouncedValue = useDebounce(attrValue, 300)
+  const lastSeenUrl = useRef<AttributeUrlFilter>({
+    key: urlKey,
+    value: urlValue,
+  })
+  const patchView = view.patch
+  useEffect(() => {
+    const url = { key: urlKey, value: urlValue }
+    const sync = planAttributeUrlSync({
+      url,
+      lastSeenUrl: lastSeenUrl.current,
+      typed: canonicalAttributeFilter(attrKey, attrValue),
+      settled: canonicalAttributeFilter(debouncedKey, debouncedValue),
+    })
+    lastSeenUrl.current = url
+    if (sync.action === 'adopt') {
+      // The URL changed from outside (a link, back/forward): follow it.
+      setAttrKey(sync.filter.key)
+      setAttrValue(sync.filter.value)
+    } else if (sync.action === 'write') {
+      patchView({
+        attr_key: sync.filter.key || undefined,
+        attr_value: sync.filter.value || undefined,
+      })
+    }
+  }, [
+    attrKey,
+    attrValue,
+    debouncedKey,
+    debouncedValue,
+    urlKey,
+    urlValue,
+    patchView,
+  ])
   const query = useQuery({
     ...queryGlobalTraceSummariesOptions({
       query: {
@@ -47,6 +104,7 @@ export default function GlobalTraces() {
         start_time: view.from,
         end_time: view.to,
         name_pattern: view.search || undefined,
+        attributes,
         status: status === 'all' ? undefined : status,
         sort_by: sort,
         sort_order: order,
@@ -78,8 +136,10 @@ export default function GlobalTraces() {
       fetching={query.isFetching}
       refresh={() => void query.refetch()}
       searchLabel="Search span names"
+      filterNotice={attribute.notice}
       filters={
         <>
+          {attribute.controls}
           <FilterSelect
             label="Trace status"
             value={status}

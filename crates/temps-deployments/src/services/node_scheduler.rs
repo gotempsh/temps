@@ -22,13 +22,40 @@ use temps_entities::nodes;
 pub const NODE_ROLE_LABEL: &str = "temps.sh/role";
 /// Value of [`NODE_ROLE_LABEL`] that marks a build-only node.
 pub const BUILDER_NODE_ROLE: &str = "builder";
+/// Value of [`NODE_ROLE_LABEL`] that marks a dedicated node.
+///
+/// A node joined with `--labels temps.sh/role=dedicated` only runs
+/// environments that name it by ID in `target_nodes`. Unpinned placement,
+/// label-selector placement, the worker-build fallback and automatic sandbox
+/// placement all pass it over, so a hardware host (KVM, GPU) or an isolated
+/// machine never fills up with arbitrary workloads. Workloads already running
+/// on a node when it becomes dedicated are left where they are; the label only
+/// affects future placement decisions.
+pub const DEDICATED_NODE_ROLE: &str = "dedicated";
 
-/// Whether `node` is reserved for image builds.
-pub fn is_build_only_node(node: &nodes::Model) -> bool {
+/// The node's `temps.sh/role` label value, if it has one.
+fn node_role(node: &nodes::Model) -> Option<&str> {
     node.labels
         .get(NODE_ROLE_LABEL)
         .and_then(|value| value.as_str())
-        .is_some_and(|role| role == BUILDER_NODE_ROLE)
+}
+
+/// Whether `node` is reserved for image builds.
+pub fn is_build_only_node(node: &nodes::Model) -> bool {
+    node_role(node) == Some(BUILDER_NODE_ROLE)
+}
+
+/// Whether `node` only runs environments that pin it by ID.
+pub fn is_dedicated_node(node: &nodes::Model) -> bool {
+    node_role(node) == Some(DEDICATED_NODE_ROLE)
+}
+
+/// Whether a placement may use `node` as far as the dedicated role goes:
+/// always for an ordinary node, and for a dedicated node only when
+/// `target_node_ids` names it. A label selector matching the node is not
+/// enough — matching `gpu=true` is not the same as asking for this machine.
+fn dedicated_node_admits(node: &nodes::Model, target_node_ids: Option<&[i32]>) -> bool {
+    !is_dedicated_node(node) || target_node_ids.is_some_and(|ids| ids.contains(&node.id))
 }
 
 /// Describes where a replica should be deployed.
@@ -112,6 +139,17 @@ pub enum ExclusionReason {
     /// The node is labelled `temps.sh/role=builder`: it builds images and
     /// never hosts application replicas.
     BuildOnlyNode,
+    /// The node is labelled `temps.sh/role=dedicated` and this placement does
+    /// not name it in `target_nodes`.
+    DedicatedNode,
+    /// `target_nodes` names an ID that no node has: the node was removed (a
+    /// machine that rejoins gets a new ID). Permanent until the placement is
+    /// edited, so it counts toward the anti-affinity shortfall.
+    TargetNodeMissing,
+    /// `target_nodes` names a node that exists but cannot take replicas now
+    /// (offline, draining, no recent heartbeat). Transient, so like load it
+    /// does not fail an anti-affinity placement; it is reported instead.
+    TargetNodeUnavailable { state: String },
 }
 
 impl std::fmt::Display for ExclusionReason {
@@ -142,6 +180,20 @@ impl std::fmt::Display for ExclusionReason {
                 f,
                 "is a build-only node ({NODE_ROLE_LABEL}={BUILDER_NODE_ROLE}) and never hosts \
                  application replicas"
+            ),
+            ExclusionReason::DedicatedNode => write!(
+                f,
+                "is dedicated ({NODE_ROLE_LABEL}={DEDICATED_NODE_ROLE}) and only runs \
+                 environments that pin it in target_nodes"
+            ),
+            ExclusionReason::TargetNodeMissing => write!(
+                f,
+                "is listed in target_nodes but does not exist (it was removed; a machine \
+                 that rejoins gets a new node ID) — update the environment's target nodes"
+            ),
+            ExclusionReason::TargetNodeUnavailable { state } => write!(
+                f,
+                "is listed in target_nodes but is {state}, so it cannot take replicas right now"
             ),
         }
     }
@@ -200,6 +252,10 @@ pub struct ReplicaPlacementRequest<'a> {
     /// behaviour, and the right answer for callers that are not placing an
     /// application deployment.
     pub project_slug: Option<&'a str>,
+    /// Keep the control plane out of the pool, so only worker nodes are
+    /// considered. Used to pick a worker to take a build off the control
+    /// plane; `false` for every replica placement.
+    pub exclude_control_plane: bool,
 }
 
 /// Result of a scheduling pass: where the replicas go, plus what was left out.
@@ -218,6 +274,9 @@ pub struct SchedulingOutcome {
     /// instead of quietly running a service without the thing it exists to
     /// use. `false` on every ordinary placement.
     pub docker_socket_required: bool,
+    /// Placement-wide warnings for the deploy log, e.g. anti-affinity that
+    /// had to put more than one replica on a node.
+    pub warnings: Vec<String>,
 }
 
 /// Scheduling strategy for distributing replicas across nodes.
@@ -553,6 +612,33 @@ impl NodeScheduler {
         Ok(pick_builder_node(active_nodes, platform))
     }
 
+    /// Pick a build-only node of any buildable architecture, for builds
+    /// whose output does not depend on the architecture (a static site,
+    /// whose image never runs). Same deterministic lowest-id rule as
+    /// [`Self::select_builder_node`].
+    /// Every build-only node of `platform`, lowest id first: the candidates,
+    /// in the order [`Self::select_builder_node`] would prefer them, for a
+    /// caller that falls back to the next one when a builder cannot be
+    /// reached.
+    pub async fn select_builder_nodes(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(builder_nodes_for(active_nodes, Some(platform)))
+    }
+
+    pub async fn select_any_builder_node(&self) -> Result<Option<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(pick_builder_node_for(active_nodes, None))
+    }
+
     /// Container platforms a build must cover for this deployment to be
     /// schedulable everywhere it could land.
     ///
@@ -632,6 +718,11 @@ impl NodeScheduler {
             if is_build_only_node(&node) {
                 continue;
             }
+            // An unpinned dedicated node never takes a replica of this
+            // deployment, so building for its architecture would be wasted.
+            if !dedicated_node_admits(&node, target_node_ids) {
+                continue;
+            }
             if let Some(target_ids) = target_node_ids {
                 if !target_ids.contains(&node.id) {
                     continue;
@@ -690,7 +781,7 @@ impl NodeScheduler {
                 // architecture yet. Say so — a silent empty vec here becomes
                 // a native build producing an image no target can run.
                 tracing::warn!(
-                    "No eligible worker node reported an architecture, and this process runs no                      local workloads, so no build platform could be derived. The build will run                      for the builder's own architecture, which may not match any node. Check                      that a node is active and has completed a heartbeat (`temps join`)."
+                    "No eligible worker node reported an architecture, and this process runs no local workloads, so no build platform could be derived. The build will run for the builder's own architecture, which may not match any node. Check that a node is active and has completed a heartbeat (`temps join`)."
                 );
             }
             return Ok(Vec::new());
@@ -791,6 +882,7 @@ impl NodeScheduler {
             exclude_node_ids,
             image_platforms,
             project_slug: None,
+            exclude_control_plane: false,
         })
         .await
     }
@@ -812,6 +904,7 @@ impl NodeScheduler {
             exclude_node_ids,
             image_platforms,
             project_slug,
+            exclude_control_plane,
         } = request;
         let target_node_ids = placement_node_ids(target_node_ids);
         let targets_control_plane =
@@ -838,6 +931,22 @@ impl NodeScheduler {
         } else {
             active_nodes
         };
+        // Targets that are not active nodes. Counted here, before any other
+        // filter, so a node dropped later for its labels or architecture is
+        // not misreported as missing.
+        let inactive_target_ids: Vec<i32> = target_node_ids
+            .map(|ids| {
+                ids.iter()
+                    .copied()
+                    .filter(|id| {
+                        *id != CONTROL_PLANE_NODE_ID
+                            && !eligible_nodes.iter().any(|node| node.id == *id)
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Filter by label selectors if specified
         if let (Some(selector), Some(selector_map)) = (labels, selector_map) {
@@ -850,6 +959,66 @@ impl NodeScheduler {
         // deploy log, which is the only place the user can see them.
         let mut exclusions: Vec<NodeExclusion> = Vec::new();
 
+        // A target that is not an active node used to vanish from the pool
+        // without a word, and anti-affinity then quietly stacked replicas on
+        // the targets that were left. Name each one and why.
+        if !inactive_target_ids.is_empty() {
+            // Only to say *why*; a failed read must not fail the placement.
+            let known = match self.node_service.list_all().await {
+                Ok(known) => Some(known),
+                Err(error) => {
+                    tracing::warn!(
+                        target_node_ids = ?inactive_target_ids,
+                        "Could not read nodes to explain inactive placement targets: {error}"
+                    );
+                    None
+                }
+            };
+            for id in &inactive_target_ids {
+                let exclusion = match known
+                    .as_ref()
+                    .map(|known| known.iter().find(|node| node.id == *id))
+                {
+                    None => NodeExclusion {
+                        node_id: *id,
+                        node_name: format!("node {id}"),
+                        reason: ExclusionReason::TargetNodeUnavailable {
+                            state: "not an active node".to_string(),
+                        },
+                        excluded: true,
+                    },
+                    Some(Some(node)) => NodeExclusion {
+                        node_id: node.id,
+                        node_name: node.name.clone(),
+                        reason: ExclusionReason::TargetNodeUnavailable {
+                            state: if node.status == "active" {
+                                format!(
+                                    "not sending heartbeats (none in the last {}s)",
+                                    self.heartbeat_threshold_secs
+                                )
+                            } else {
+                                node.status.clone()
+                            },
+                        },
+                        excluded: true,
+                    },
+                    Some(None) => NodeExclusion {
+                        node_id: *id,
+                        node_name: format!("node {id}"),
+                        reason: ExclusionReason::TargetNodeMissing,
+                        excluded: true,
+                    },
+                };
+                tracing::warn!(
+                    node_id = exclusion.node_id,
+                    node_name = %exclusion.node_name,
+                    "Placement target is not an active node: {}",
+                    exclusion.reason
+                );
+                exclusions.push(exclusion);
+            }
+        }
+
         // Build-only nodes are never placement targets, even when named
         // explicitly: they exist to keep build load off application hosts.
         eligible_nodes.retain(|node| {
@@ -860,6 +1029,29 @@ impl NodeScheduler {
                 node_id: node.id,
                 node_name: node.name.clone(),
                 reason: ExclusionReason::BuildOnlyNode,
+                excluded: true,
+            });
+            false
+        });
+
+        // Dedicated nodes only take environments that pin them by ID. With
+        // `target_nodes` set, nodes it does not name are already gone, so in
+        // practice this drops dedicated nodes from unpinned placements —
+        // including ones whose label selector matches them.
+        eligible_nodes.retain(|node| {
+            if dedicated_node_admits(node, target_node_ids) {
+                return true;
+            }
+            tracing::info!(
+                node_id = node.id,
+                node_name = %node.name,
+                "Excluding node from scheduling: it is dedicated and this placement does not \
+                 pin it in target_nodes"
+            );
+            exclusions.push(NodeExclusion {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                reason: ExclusionReason::DedicatedNode,
                 excluded: true,
             });
             false
@@ -924,8 +1116,8 @@ impl NodeScheduler {
                     } else {
                         format!(
                             "the only host(s) that grant it ({}) are not schedulable right now \
-                             — inactive, draining, or excluded by the requested node/label \
-                             placement",
+                             — inactive, draining, dedicated to environments that pin them, or \
+                             excluded by the requested node/label placement",
                             gate.granting_node_names.join(", ")
                         )
                     },
@@ -1017,6 +1209,25 @@ impl NodeScheduler {
         // keeps the message honest about which it was.
         let hard_exclusions: Vec<&NodeExclusion> =
             exclusions.iter().filter(|e| e.excluded).collect();
+        // The anti-affinity shortfall check below ignores dedicated nodes: a
+        // node that never belonged to this deployment's pool is no different
+        // from a node that does not exist. Counting it would make marking a
+        // node dedicated break every unpinned multi-replica deployment that
+        // previously wrapped around on the nodes it has.
+        // Nor a targeted node that is offline or draining: that is transient,
+        // like load, and failing would also stop the failover redeploy that
+        // moves its replicas while it is down. It is reported in the deploy
+        // log, and the stacking is warned about below.
+        let shortfall_exclusions: Vec<&NodeExclusion> = hard_exclusions
+            .iter()
+            .copied()
+            .filter(|e| {
+                !matches!(
+                    e.reason,
+                    ExclusionReason::DedicatedNode | ExclusionReason::TargetNodeUnavailable { .. }
+                )
+            })
+            .collect();
         let has_node_constraints = target_node_ids.is_some()
             || selector_map.is_some_and(|selector_map| !selector_map.is_empty());
         // The control plane is represented by synthetic node ID 0 in the API,
@@ -1027,12 +1238,14 @@ impl NodeScheduler {
         let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
         let local_matches_constraints =
             !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
-        // Four independent reasons Local can drop out of the pool: it cannot
-        // run the image, it does not satisfy an explicit placement constraint,
+        // Five independent reasons Local can drop out of the pool: the caller
+        // wants a worker (a build moved off the control plane), it cannot run
+        // the image, it does not satisfy an explicit placement constraint,
         // this process is not allowed to run workloads at all, or — for a
         // project granted host Docker access somewhere — this control plane's
         // own environment does not grant it (ADR 045).
-        let include_local = self.local_workloads_enabled
+        let include_local = !exclude_control_plane
+            && self.local_workloads_enabled
             && local_compatible
             && local_matches_constraints
             && local_grants_socket;
@@ -1043,6 +1256,25 @@ impl NodeScheduler {
         if targets_control_plane && !self.local_workloads_enabled {
             return Err(NodeError::LocalWorkloadsDisabled {
                 requested_replicas: replica_count,
+            });
+        }
+
+        // Every node that could have taken this deployment is dedicated to
+        // other environments. Name them, and how to use one, rather than
+        // reporting a generic "no node" that sends the operator looking for a
+        // broken worker.
+        if eligible_nodes.is_empty()
+            && !include_local
+            && hard_exclusions
+                .iter()
+                .any(|e| e.reason == ExclusionReason::DedicatedNode)
+        {
+            return Err(NodeError::DedicatedNodesNotPinned {
+                excluded: hard_exclusions
+                    .iter()
+                    .map(|e| format!("node {} ({}) {}", e.node_id, e.node_name, e.reason))
+                    .collect::<Vec<_>>()
+                    .join("; "),
             });
         }
 
@@ -1059,13 +1291,15 @@ impl NodeScheduler {
             return Err(NodeError::PlacementConstraintsUnsatisfied { excluded });
         }
         let compatible_slots = usize::from(include_local) + eligible_nodes.len();
-        if anti_affinity && !hard_exclusions.is_empty() && (compatible_slots as u32) < replica_count
+        if anti_affinity
+            && !shortfall_exclusions.is_empty()
+            && (compatible_slots as u32) < replica_count
         {
             return Err(NodeError::InsufficientCompatibleNodes {
                 replicas: replica_count,
                 available: compatible_slots,
-                cause: exclusion_cause(&hard_exclusions).to_string(),
-                excluded: hard_exclusions
+                cause: exclusion_cause(&shortfall_exclusions).to_string(),
+                excluded: shortfall_exclusions
                     .iter()
                     .map(|e| e.to_string())
                     .collect::<Vec<_>>()
@@ -1095,10 +1329,13 @@ impl NodeScheduler {
                         .unwrap_or_else(|| "unknown".to_string()),
                 });
             }
+            let assignments = vec![NodeAssignment::Local; replica_count as usize];
+            let warnings = anti_affinity_warnings(anti_affinity, &assignments);
             return Ok(SchedulingOutcome {
-                assignments: vec![NodeAssignment::Local; replica_count as usize],
+                assignments,
                 exclusions,
                 docker_socket_required,
+                warnings,
             });
         }
 
@@ -1117,7 +1354,7 @@ impl NodeScheduler {
                     node_id: node.id,
                     node_name: node.name.clone(),
                     address: node.address.clone(),
-                    private_address: node.private_address.clone(),
+                    private_address: node.data_address().to_string(),
                     platform: node.architecture.clone(),
                 },
                 load_score: compute_load_score(&node.capacity),
@@ -1155,7 +1392,7 @@ impl NodeScheduler {
                             node_id: node.id,
                             node_name: node.name.clone(),
                             address: node.address.clone(),
-                            private_address: node.private_address.clone(),
+                            private_address: node.data_address().to_string(),
                             platform: node.architecture.clone(),
                         },
                         load_score: compute_load_score(&node.capacity),
@@ -1201,7 +1438,7 @@ impl NodeScheduler {
                             node_id: node.id,
                             node_name: node.name.clone(),
                             address: node.address.clone(),
-                            private_address: node.private_address.clone(),
+                            private_address: node.data_address().to_string(),
                             platform: node.architecture.clone(),
                         },
                         load_score: compute_load_score(&node.capacity),
@@ -1244,10 +1481,12 @@ impl NodeScheduler {
             }
         };
 
+        let warnings = anti_affinity_warnings(anti_affinity, &assignments);
         Ok(SchedulingOutcome {
             assignments,
             exclusions,
             docker_socket_required,
+            warnings,
         })
     }
 
@@ -1300,6 +1539,31 @@ fn docker_socket_gate(
     })
 }
 
+/// A warning when anti-affinity was asked for but some replicas share a node,
+/// so the deploy log says so instead of only listing the placements.
+fn anti_affinity_warnings(anti_affinity: bool, assignments: &[NodeAssignment]) -> Vec<String> {
+    if !anti_affinity || assignments.len() < 2 {
+        return Vec::new();
+    }
+    let distinct: std::collections::HashSet<Option<i32>> = assignments
+        .iter()
+        .map(|assignment| match assignment {
+            NodeAssignment::Local => None,
+            NodeAssignment::Remote { node_id, .. } => Some(*node_id),
+        })
+        .collect();
+    if distinct.len() >= assignments.len() {
+        return Vec::new();
+    }
+    vec![format!(
+        "anti-affinity is on, but {} replicas share {} node(s): not enough eligible nodes for \
+         one replica each. Add an eligible node, lower the replica count, or check the \
+         skipped nodes above",
+        assignments.len(),
+        distinct.len()
+    )]
+}
+
 /// One phrase naming why these nodes were dropped from the pool.
 ///
 /// The exclusion list mixes causes — an architecture mismatch and the ADR-045
@@ -1312,14 +1576,28 @@ fn exclusion_cause(exclusions: &[&NodeExclusion]) -> &'static str {
     let mut architecture = false;
     let mut docker_socket = false;
     let mut build_only = false;
+    let mut missing_target = false;
     for exclusion in exclusions {
         match exclusion.reason {
             ExclusionReason::IncompatibleArchitecture { .. } => architecture = true,
             ExclusionReason::DockerSocketNotGranted { .. } => docker_socket = true,
             ExclusionReason::BuildOnlyNode => build_only = true,
+            // Filtered out before the shortfall check ever sees the list; a
+            // dedicated node is not part of an unpinned deployment's pool.
+            ExclusionReason::DedicatedNode => {}
             // Never `excluded: true`; it is a warning, not a drop.
             ExclusionReason::UnverifiedArchitecture => {}
+            ExclusionReason::TargetNodeMissing => missing_target = true,
+            // Filtered out before the shortfall check, like dedicated nodes.
+            ExclusionReason::TargetNodeUnavailable { .. } => {}
         }
+    }
+    if missing_target {
+        return if architecture || docker_socket || build_only {
+            "some are listed in target_nodes but no longer exist, and others cannot run it"
+        } else {
+            "they are listed in target_nodes but no longer exist"
+        };
     }
     if build_only && !architecture && !docker_socket {
         return "they are build-only nodes (temps.sh/role=builder), which never host replicas";
@@ -1488,17 +1766,33 @@ fn schedule_anti_affinity_least_loaded(
 /// Choose a build-only node for `platform` from `nodes` (see
 /// [`NodeScheduler::select_builder_node`]).
 fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::Model> {
-    nodes
+    pick_builder_node_for(nodes, Some(platform))
+}
+
+/// The lowest-id active build-only node whose architecture is buildable and,
+/// when `platform` is given, matches it.
+fn pick_builder_node_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Option<nodes::Model> {
+    builder_nodes_for(nodes, platform).into_iter().next()
+}
+
+/// Every active build-only node whose architecture is buildable and, when
+/// `platform` is given, matches it, lowest id first.
+fn builder_nodes_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Vec<nodes::Model> {
+    let mut builders: Vec<nodes::Model> = nodes
         .into_iter()
         .filter(|node| {
             is_build_only_node(node)
                 && node.id != CONTROL_PLANE_NODE_ID
                 && node.architecture.as_deref().is_some_and(|node_platform| {
                     temps_deployer::platform::is_buildable_platform(node_platform)
-                        && temps_deployer::platform::platforms_match(node_platform, platform)
+                        && platform.is_none_or(|platform| {
+                            temps_deployer::platform::platforms_match(node_platform, platform)
+                        })
                 })
         })
-        .min_by_key(|node| node.id)
+        .collect();
+    builders.sort_by_key(|node| node.id);
+    builders
 }
 
 /// Check if a node's labels match a label selector.
@@ -1583,6 +1877,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
@@ -1744,6 +2041,7 @@ mod tests {
                 exclude_node_ids: &[],
                 image_platforms: &[],
                 project_slug,
+                exclude_control_plane: false,
             }
         }
 
@@ -1910,6 +2208,7 @@ mod tests {
                     exclude_node_ids: &[],
                     image_platforms: &[],
                     project_slug: Some("node-daemon"),
+                    exclude_control_plane: false,
                 })
                 .await
                 .expect_err("three spread replicas cannot fit on two eligible hosts");
@@ -2458,6 +2757,130 @@ mod tests {
         assert!(assignments.iter().all(|a| a.is_local()));
     }
 
+    // ── Placement targets that are not active nodes (#1390) ──────────────
+
+    /// `list_active` answers `active`; the follow-up `list_all`, which tells
+    /// a removed target from an offline one, answers `all`.
+    fn scheduler_with_active_and_all(
+        active: Vec<nodes::Model>,
+        all: Vec<nodes::Model>,
+    ) -> NodeScheduler {
+        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![active, all])
+                .into_connection(),
+        ))))
+        .with_local_platform("linux/amd64")
+    }
+
+    /// The reported deploy: targets `[0, 1, 2]` after node 2 was removed and
+    /// its machine rejoined as node 3. It used to stack two replicas on
+    /// worker-1 despite anti-affinity and report success.
+    #[tokio::test]
+    async fn a_removed_target_node_fails_an_anti_affinity_placement_by_name() {
+        let workers = vec![make_node(1, "worker-1"), make_node(3, "worker-2")];
+        let scheduler = scheduler_with_active_and_all(workers.clone(), workers);
+
+        let error = scheduler
+            .schedule_replicas_excluding(3, None, Some(&[0, 1, 2]), true, &[], &[])
+            .await
+            .unwrap_err();
+
+        match error {
+            NodeError::InsufficientCompatibleNodes {
+                replicas,
+                available,
+                ref cause,
+                ref excluded,
+            } => {
+                assert_eq!(replicas, 3);
+                assert_eq!(available, 2, "the control plane and worker-1");
+                assert!(cause.contains("no longer exist"), "{cause}");
+                assert!(excluded.contains("'node 2'"), "{excluded}");
+                assert!(excluded.contains("does not exist"), "{excluded}");
+            }
+            other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_target_node_is_named_in_the_deploy_log_without_anti_affinity() {
+        let workers = vec![make_node(1, "worker-1"), make_node(3, "worker-2")];
+        let scheduler = scheduler_with_active_and_all(workers.clone(), workers);
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(2, None, Some(&[0, 1, 2]), false, &[], &[])
+            .await
+            .expect("without anti-affinity the remaining targets take the replicas");
+
+        assert_eq!(outcome.assignments.len(), 2);
+        assert!(outcome
+            .assignments
+            .iter()
+            .all(|a| a.is_local() || a.node_id() == Some(1)));
+        assert_eq!(
+            outcome
+                .exclusions
+                .iter()
+                .map(|e| (e.node_id, e.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, ExclusionReason::TargetNodeMissing)]
+        );
+    }
+
+    /// An offline target is transient: the failover redeploy that moves its
+    /// replicas must still run, so it is reported rather than fatal, and the
+    /// stacking it causes is warned about.
+    #[tokio::test]
+    async fn an_offline_target_node_is_reported_and_the_stacking_warned_about() {
+        let mut offline = make_node(2, "worker-2");
+        offline.status = "offline".to_string();
+        let scheduler = scheduler_with_active_and_all(
+            vec![make_node(1, "worker-1")],
+            vec![make_node(1, "worker-1"), offline],
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(3, None, Some(&[0, 1, 2]), true, &[], &[])
+            .await
+            .expect("an offline target does not fail the placement");
+
+        assert_eq!(outcome.assignments.len(), 3);
+        let excluded = &outcome.exclusions;
+        assert_eq!(excluded.len(), 1, "{excluded:?}");
+        assert_eq!(excluded[0].node_name, "worker-2");
+        assert_eq!(
+            excluded[0].reason,
+            ExclusionReason::TargetNodeUnavailable {
+                state: "offline".to_string()
+            }
+        );
+        assert!(excluded[0].to_string().contains("is offline"));
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            outcome.warnings[0].contains("3 replicas share 2 node(s)"),
+            "{}",
+            outcome.warnings[0]
+        );
+    }
+
+    #[test]
+    fn anti_affinity_warns_only_when_replicas_share_a_node() {
+        let remote = |id: i32| NodeAssignment::Remote {
+            node_id: id,
+            node_name: format!("worker-{id}"),
+            address: String::new(),
+            private_address: String::new(),
+            platform: None,
+        };
+        let spread = vec![NodeAssignment::Local, remote(1), remote(2)];
+        assert!(anti_affinity_warnings(true, &spread).is_empty());
+        let stacked = vec![NodeAssignment::Local, remote(1), remote(1)];
+        assert_eq!(anti_affinity_warnings(true, &stacked).len(), 1);
+        assert!(anti_affinity_warnings(false, &stacked).is_empty());
+        assert!(anti_affinity_warnings(true, &[NodeAssignment::Local]).is_empty());
+    }
+
     // ── Replica shortfall and exclusion reporting ────────────────────────
 
     /// Anti-affinity asks for one replica per node. When an architecture
@@ -2649,7 +3072,7 @@ mod tests {
     /// still enforced strictly, with no control-plane fallback.
     #[tokio::test]
     async fn test_non_empty_target_nodes_still_refuses_local_fallback() {
-        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+        let scheduler = scheduler_with_active_and_all(vec![], vec![]);
 
         let err = scheduler
             .schedule_replicas_excluding(
@@ -3377,8 +3800,9 @@ mod tests {
     async fn test_schedule_with_target_nodes_none_active_fails_closed() {
         let node_a = make_node(1, "worker-a");
 
+        // `list_active`, then `list_all` to say why node 99 is not usable.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![node_a]])
+            .append_query_results(vec![vec![node_a.clone()], vec![node_a]])
             .into_connection();
         let node_service = Arc::new(NodeService::new(Arc::new(db)));
         let scheduler = NodeScheduler::new(node_service);
@@ -4228,5 +4652,478 @@ mod tests {
         let mut unknown = builder_node(1, "builder", "linux/amd64");
         unknown.architecture = None;
         assert!(pick_builder_node(vec![unknown], "linux/amd64").is_none());
+    }
+
+    /// A static site may use a dedicated builder of any architecture; one
+    /// that has not reported an architecture is still never chosen.
+    #[test]
+    fn any_architecture_builder_is_picked_for_platform_independent_builds() {
+        let arm = builder_node(4, "builder-arm", "linux/arm64");
+        let amd = builder_node(3, "builder-amd", "linux/amd64");
+        let worker = make_node(1, "worker");
+        let mut unknown = builder_node(2, "builder-unknown", "linux/amd64");
+        unknown.architecture = None;
+
+        let picked = pick_builder_node_for(vec![arm, amd, worker.clone(), unknown.clone()], None)
+            .expect("a builder of either architecture qualifies");
+        assert_eq!(picked.id, 3);
+        assert!(pick_builder_node_for(vec![worker, unknown], None).is_none());
+    }
+
+    fn build_offload_placement(exclude_control_plane: bool) -> ReplicaPlacementRequest<'static> {
+        ReplicaPlacementRequest {
+            replica_count: 1,
+            labels: None,
+            target_node_ids: None,
+            anti_affinity: true,
+            exclude_node_ids: &[],
+            image_platforms: &[],
+            project_slug: None,
+            exclude_control_plane,
+        }
+    }
+
+    /// Without capacity data the control plane comes first in the pool, so
+    /// an ordinary single-replica placement lands on it. That is right for a
+    /// replica and wrong for a build being moved off the control plane.
+    #[tokio::test]
+    async fn build_offload_placement_never_picks_the_control_plane() {
+        let ordinary = scheduler_with_nodes(vec![make_node(1, "worker-1")], "linux/amd64")
+            .schedule_placement(build_offload_placement(false))
+            .await
+            .unwrap();
+        assert!(ordinary.assignments[0].is_local());
+
+        let offload = scheduler_with_nodes(vec![make_node(1, "worker-1")], "linux/amd64")
+            .schedule_placement(build_offload_placement(true))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                offload.assignments[0],
+                NodeAssignment::Remote { node_id: 1, .. }
+            ),
+            "{:?}",
+            offload.assignments
+        );
+    }
+
+    /// With no worker at all, excluding the control plane is an error the
+    /// caller turns into "build on the control plane, and say why" -- never a
+    /// silent `Local`.
+    #[tokio::test]
+    async fn build_offload_placement_without_workers_is_an_error() {
+        let error = scheduler_with_nodes(Vec::new(), "linux/amd64")
+            .schedule_placement(build_offload_placement(true))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NodeError::NoCompatibleNode { .. }),
+            "{error:?}"
+        );
+    }
+
+    // ── Dedicated nodes (temps.sh/role=dedicated) ────────────────────────
+
+    fn dedicated_node(id: i32, name: &str, architecture: &str) -> nodes::Model {
+        let mut node = make_node_with_arch(id, name, architecture);
+        node.labels = serde_json::json!({ NODE_ROLE_LABEL: DEDICATED_NODE_ROLE, "gpu": "true" });
+        node
+    }
+
+    fn placement<'a>(
+        replica_count: u32,
+        labels: Option<&'a serde_json::Value>,
+        target_node_ids: Option<&'a [i32]>,
+    ) -> ReplicaPlacementRequest<'a> {
+        ReplicaPlacementRequest {
+            replica_count,
+            labels,
+            target_node_ids,
+            anti_affinity: true,
+            exclude_node_ids: &[],
+            image_platforms: &[],
+            project_slug: None,
+            exclude_control_plane: false,
+        }
+    }
+
+    #[test]
+    fn dedicated_node_is_recognised_by_its_role_label() {
+        let dedicated = dedicated_node(7, "gpu-1", "linux/amd64");
+        assert!(is_dedicated_node(&dedicated));
+        assert!(!is_build_only_node(&dedicated));
+        assert!(!is_dedicated_node(&make_node(2, "w")));
+        assert!(!is_dedicated_node(&builder_node(3, "b", "linux/amd64")));
+        // A different label key that happens to say "dedicated" is not the role.
+        let mut lookalike = make_node(4, "x");
+        lookalike.labels = serde_json::json!({ "temps.dedicated": "true", "role": "dedicated" });
+        assert!(!is_dedicated_node(&lookalike));
+    }
+
+    #[tokio::test]
+    async fn pinned_dedicated_node_is_eligible() {
+        let scheduler = control_plane_scheduler(vec![
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ]);
+
+        let outcome = scheduler
+            .schedule_placement(placement(1, None, Some(&[7])))
+            .await
+            .expect("a pinned dedicated node takes the replica");
+
+        assert_eq!(outcome.assignments[0].node_id(), Some(7));
+        assert!(outcome.exclusions.is_empty(), "{:?}", outcome.exclusions);
+    }
+
+    #[tokio::test]
+    async fn pinned_dedicated_node_shares_the_pool_with_other_pinned_nodes() {
+        let scheduler = control_plane_scheduler(vec![
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ]);
+
+        let outcome = scheduler
+            .schedule_placement(placement(2, None, Some(&[2, 7])))
+            .await
+            .expect("both pinned nodes are eligible");
+
+        let mut ids: Vec<_> = outcome
+            .assignments
+            .iter()
+            .filter_map(NodeAssignment::node_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 7]);
+    }
+
+    #[tokio::test]
+    async fn unpinned_placement_excludes_a_dedicated_node() {
+        let scheduler = control_plane_scheduler(vec![
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ]);
+
+        let outcome = scheduler
+            .schedule_placement(placement(3, None, None))
+            .await
+            .expect("the normal worker takes every replica");
+
+        assert!(outcome
+            .assignments
+            .iter()
+            .all(|assignment| assignment.node_id() == Some(2)));
+        assert_eq!(
+            outcome.exclusions,
+            vec![NodeExclusion {
+                node_id: 7,
+                node_name: "gpu-1".to_string(),
+                reason: ExclusionReason::DedicatedNode,
+                excluded: true,
+            }]
+        );
+    }
+
+    /// The deploy log line for a skipped dedicated node names the label and
+    /// the way to use the node.
+    #[test]
+    fn dedicated_exclusion_explains_how_to_use_the_node() {
+        let line = NodeExclusion {
+            node_id: 7,
+            node_name: "gpu-1".to_string(),
+            reason: ExclusionReason::DedicatedNode,
+            excluded: true,
+        }
+        .to_string();
+        assert_eq!(
+            line,
+            "'gpu-1' is dedicated (temps.sh/role=dedicated) and only runs environments that \
+             pin it in target_nodes"
+        );
+    }
+
+    #[tokio::test]
+    async fn label_selector_alone_never_selects_a_dedicated_node() {
+        let mut gpu_worker = make_node_with_arch(2, "gpu-shared", "linux/amd64");
+        gpu_worker.labels = serde_json::json!({ "gpu": "true" });
+        let scheduler =
+            control_plane_scheduler(vec![dedicated_node(7, "gpu-1", "linux/amd64"), gpu_worker]);
+        let selector = serde_json::json!({ "gpu": "true" });
+
+        let outcome = scheduler
+            .schedule_placement(placement(1, Some(&selector), None))
+            .await
+            .expect("the non-dedicated GPU worker matches the selector");
+
+        assert_eq!(outcome.assignments[0].node_id(), Some(2));
+        assert!(outcome
+            .exclusions
+            .iter()
+            .any(|e| e.node_id == 7 && e.reason == ExclusionReason::DedicatedNode));
+    }
+
+    /// Even a selector on the role label itself does not pin the node: a
+    /// pin is an explicit ID, never a label match.
+    #[tokio::test]
+    async fn selector_matching_only_dedicated_nodes_is_a_typed_error_naming_them() {
+        let scheduler = scheduler_with_nodes(
+            vec![dedicated_node(7, "gpu-1", "linux/amd64")],
+            "linux/amd64",
+        );
+        let selector = serde_json::json!({ NODE_ROLE_LABEL: DEDICATED_NODE_ROLE });
+
+        let error = scheduler
+            .schedule_placement(placement(1, Some(&selector), None))
+            .await
+            .expect_err("a label selector does not pin a dedicated node");
+
+        match error {
+            NodeError::DedicatedNodesNotPinned { ref excluded } => assert_eq!(
+                excluded,
+                "node 7 (gpu-1) is dedicated (temps.sh/role=dedicated) and only runs \
+                 environments that pin it in target_nodes"
+            ),
+            other => panic!("expected DedicatedNodesNotPinned, got {other:?}"),
+        }
+        assert!(error.to_string().contains("pin the environment to it"));
+    }
+
+    #[tokio::test]
+    async fn only_dedicated_pool_unpinned_is_a_typed_error_naming_every_node() {
+        let scheduler = control_plane_scheduler(vec![
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+            dedicated_node(9, "kvm-1", "linux/amd64"),
+        ]);
+
+        let error = scheduler
+            .schedule_placement(placement(1, None, None))
+            .await
+            .expect_err("no node may take an unpinned deployment");
+
+        let NodeError::DedicatedNodesNotPinned { excluded } = error else {
+            panic!("expected DedicatedNodesNotPinned, got {error:?}");
+        };
+        assert!(
+            excluded.contains("node 7 (gpu-1) is dedicated"),
+            "{excluded}"
+        );
+        assert!(
+            excluded.contains("node 9 (kvm-1) is dedicated"),
+            "{excluded}"
+        );
+    }
+
+    /// With local workloads allowed the control plane is still a valid,
+    /// unpinned placement, so the dedicated node is skipped, not an error.
+    #[tokio::test]
+    async fn only_dedicated_workers_fall_back_to_the_control_plane_when_it_runs_workloads() {
+        let scheduler = scheduler_with_nodes(
+            vec![dedicated_node(7, "gpu-1", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_placement(placement(2, None, None))
+            .await
+            .expect("the control plane takes the replicas");
+
+        assert!(outcome.assignments.iter().all(NodeAssignment::is_local));
+        assert!(outcome
+            .exclusions
+            .iter()
+            .any(|e| e.node_id == 7 && e.reason == ExclusionReason::DedicatedNode));
+    }
+
+    /// A dedicated node is not part of an unpinned deployment's pool, so it
+    /// must not turn the documented anti-affinity wrap-around into a
+    /// shortfall error.
+    #[tokio::test]
+    async fn dedicated_exclusion_does_not_trigger_the_anti_affinity_shortfall() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                dedicated_node(7, "gpu-1", "linux/amd64"),
+                make_node_with_arch(2, "worker", "linux/amd64"),
+            ],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_placement(placement(3, None, None))
+            .await
+            .expect("three replicas wrap around the control plane and the worker");
+
+        assert_eq!(outcome.assignments.len(), 3);
+        assert!(outcome
+            .assignments
+            .iter()
+            .all(|assignment| assignment.node_id() != Some(7)));
+    }
+
+    #[tokio::test]
+    async fn pinning_another_node_still_excludes_the_dedicated_node() {
+        let scheduler = control_plane_scheduler(vec![
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ]);
+
+        let outcome = scheduler
+            .schedule_placement(placement(2, None, Some(&[2])))
+            .await
+            .expect("the pinned worker takes the replicas");
+
+        assert!(outcome
+            .assignments
+            .iter()
+            .all(|assignment| assignment.node_id() == Some(2)));
+    }
+
+    /// The builder role is unaffected: a builder never hosts a replica, and
+    /// the shortfall message still blames the builder role, not the
+    /// dedicated one.
+    #[tokio::test]
+    async fn builder_semantics_are_unchanged_next_to_dedicated_nodes() {
+        let scheduler = control_plane_scheduler(vec![
+            builder_node(1, "builder", "linux/amd64"),
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ]);
+
+        let outcome = scheduler
+            .schedule_placement(placement(1, None, None))
+            .await
+            .expect("the worker takes the replica");
+        assert_eq!(outcome.assignments[0].node_id(), Some(2));
+        assert!(outcome
+            .exclusions
+            .iter()
+            .any(|e| e.node_id == 1 && e.reason == ExclusionReason::BuildOnlyNode));
+
+        // Pinning a builder is still refused, even alongside a dedicated pin.
+        let scheduler = control_plane_scheduler(vec![
+            builder_node(1, "builder", "linux/amd64"),
+            dedicated_node(7, "gpu-1", "linux/amd64"),
+        ]);
+        let outcome = scheduler
+            .schedule_placement(placement(1, None, Some(&[1, 7])))
+            .await
+            .expect("the pinned dedicated node is eligible; the builder is not");
+        assert_eq!(outcome.assignments[0].node_id(), Some(7));
+
+        // The builder pick never returns a dedicated node.
+        assert!(pick_builder_node(
+            vec![dedicated_node(7, "gpu-1", "linux/amd64")],
+            "linux/amd64"
+        )
+        .is_none());
+        assert!(
+            pick_builder_node_for(vec![dedicated_node(7, "gpu-1", "linux/amd64")], None).is_none()
+        );
+    }
+
+    /// The build-location fallback (#1321) asks for a worker with the
+    /// control plane excluded. An unpinned environment never gets a dedicated
+    /// node, so the build stays on the control plane with the reason logged.
+    #[tokio::test]
+    async fn build_offload_never_picks_an_unpinned_dedicated_node() {
+        let mixed = scheduler_with_nodes(
+            vec![
+                dedicated_node(1, "gpu-1", "linux/amd64"),
+                make_node_with_arch(2, "worker", "linux/amd64"),
+            ],
+            "linux/amd64",
+        )
+        .schedule_placement(build_offload_placement(true))
+        .await
+        .expect("the normal worker builds");
+        assert_eq!(mixed.assignments[0].node_id(), Some(2));
+
+        let error = scheduler_with_nodes(
+            vec![dedicated_node(1, "gpu-1", "linux/amd64")],
+            "linux/amd64",
+        )
+        .schedule_placement(build_offload_placement(true))
+        .await
+        .expect_err("no worker may build for an unpinned environment");
+        assert!(
+            matches!(error, NodeError::DedicatedNodesNotPinned { ref excluded }
+                if excluded.contains("node 1 (gpu-1)")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_offload_uses_a_dedicated_node_its_environment_pins() {
+        let outcome = scheduler_with_nodes(
+            vec![
+                dedicated_node(1, "gpu-1", "linux/amd64"),
+                make_node_with_arch(2, "worker", "linux/amd64"),
+            ],
+            "linux/amd64",
+        )
+        .schedule_placement(ReplicaPlacementRequest {
+            target_node_ids: Some(&[1]),
+            ..build_offload_placement(true)
+        })
+        .await
+        .expect("the pinned dedicated node builds");
+        assert_eq!(outcome.assignments[0].node_id(), Some(1));
+    }
+
+    /// Cross-build discovery only builds for architectures a replica can land
+    /// on; an unpinned dedicated node's architecture is not one of them.
+    #[tokio::test]
+    async fn build_platforms_skip_an_unpinned_dedicated_node() {
+        let nodes_list = vec![
+            dedicated_node(7, "gpu-arm", "linux/arm64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ];
+
+        let unpinned = scheduler_with_nodes(nodes_list.clone(), "linux/amd64")
+            .required_build_platforms(None, None)
+            .await
+            .expect("platforms");
+        assert!(unpinned.is_empty(), "{unpinned:?}");
+
+        let selector = serde_json::json!({ "gpu": "true" });
+        let selector_only = scheduler_with_nodes(nodes_list.clone(), "linux/amd64")
+            .required_build_platforms(Some(&selector), None)
+            .await
+            .expect("platforms");
+        assert!(selector_only.is_empty(), "{selector_only:?}");
+
+        let pinned = scheduler_with_nodes(nodes_list, "linux/amd64")
+            .required_build_platforms(None, Some(&[7]))
+            .await
+            .expect("platforms");
+        assert_eq!(pinned, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// The no-daemon control plane builds on a worker chosen by the same
+    /// discovery + placement pair; an unpinned environment must not land
+    /// that build on a dedicated node.
+    #[tokio::test]
+    async fn worker_build_platforms_without_local_workloads_skip_unpinned_dedicated_nodes() {
+        let nodes_list = vec![
+            dedicated_node(7, "gpu-arm", "linux/arm64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ];
+        let unpinned = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(nodes_list.clone()),
+        ))))
+        .with_local_workloads_enabled(false)
+        .required_build_platforms(None, None)
+        .await
+        .expect("platforms");
+        assert_eq!(unpinned, vec!["linux/amd64"]);
+
+        let pinned = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(mock_db_with_nodes(
+            nodes_list,
+        )))))
+        .with_local_workloads_enabled(false)
+        .required_build_platforms(None, Some(&[7]))
+        .await
+        .expect("platforms");
+        assert_eq!(pinned, vec!["linux/arm64"]);
     }
 }

@@ -7,6 +7,7 @@
 //! - `GET  /external-services/{id}/restore-runs`
 //! - `POST /external-services/{id}/restore`
 //! - `GET  /restore-runs/{id}`
+//! - `POST /restore-runs/{id}/cancel`
 
 use axum::{
     extract::{Extension, Path, State},
@@ -25,11 +26,11 @@ use temps_core::SensitiveAction;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{AuditContext, RestoreRunAudit};
+use crate::handlers::audit::{AuditContext, RestoreRunAudit, RestoreRunCancelledAudit};
 use crate::handlers::types::BackupAppState;
 use crate::services::{
-    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode, RestoreRunView,
-    RestoreService,
+    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode,
+    RestoreRunSourceBackup, RestoreRunView, RestoreService,
 };
 use temps_providers::externalsvc::{RecoveryTarget, RestoreCapabilities};
 
@@ -42,9 +43,56 @@ impl From<RestoreError> for Problem {
             | RestoreError::RestoreRunNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
+            RestoreError::ServiceNameConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Service Name Conflict")
+                .with_detail(error.to_string()),
             RestoreError::BackupDeleting { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Backup deletion in progress")
                 .with_detail(error.to_string()),
+            RestoreError::CrossServiceRestoreNotConfirmed { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/cross-service-restore-not-confirmed")
+                    .with_title("Cross-Service Restore Not Confirmed")
+                    .with_detail(error.to_string())
+            }
+            RestoreError::RestoreAlreadyActive { restore_run_id, .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-already-active")
+                    .with_title("Restore Already In Progress")
+                    .with_detail(error.to_string())
+                    .with_value("active_restore_run_id", restore_run_id)
+            }
+            RestoreError::DataImportActive {
+                data_import_run_id, ..
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/data-import-active")
+                .with_title("Data Import In Progress")
+                .with_detail(error.to_string())
+                .with_value("active_data_import_run_id", data_import_run_id),
+            RestoreError::RestoreNotActive { ref status, .. } => {
+                let status = status.clone();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-not-active")
+                    .with_title("Restore Already Finished")
+                    .with_detail(error.to_string())
+                    .with_value("run_status", status)
+            }
+            RestoreError::RestoreNotCancellable { ref phase, .. } => {
+                let phase = phase.clone();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-not-cancellable")
+                    .with_title("Restore Cannot Be Cancelled")
+                    .with_detail(error.to_string())
+                    .with_value("phase", phase)
+            }
+            // Worker outcomes; a request only sees them if it races the
+            // worker, and then the run was cancelled.
+            RestoreError::RestoreCancelled { .. } | RestoreError::Cancelled { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-cancelled")
+                    .with_title("Restore Cancelled")
+                    .with_detail(error.to_string())
+            }
             RestoreError::BackupHasNoService { .. }
             | RestoreError::Validation { .. }
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -53,6 +101,8 @@ impl From<RestoreError> for Problem {
             internal_error @ (RestoreError::Database(_)
             | RestoreError::Encryption { .. }
             | RestoreError::ExternalService { .. }
+            | RestoreError::WorkerCrashed { .. }
+            | RestoreError::StagedRestoreStillRunning { .. }
             | RestoreError::Internal { .. }) => {
                 error!(error = %internal_error, "restore request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -70,6 +120,7 @@ impl From<RestoreError> for Problem {
         list_restore_runs_for_service,
         start_restore,
         get_restore_run,
+        cancel_restore_run,
         plan_restore,
     ),
     components(
@@ -79,6 +130,7 @@ impl From<RestoreError> for Problem {
             RecoveryTarget,
             RestoreCapabilities,
             RestoreRunView,
+            RestoreRunSourceBackup,
             RestoreCapabilitiesResponse,
             RestorePlan,
             PlanTarget,
@@ -118,6 +170,16 @@ pub struct StartRestoreRequest {
     /// is used.
     #[serde(default)]
     pub s3_source_id: Option<i32>,
+    /// Explicit confirmation for a destructive cross-service restore.
+    ///
+    /// Restoring in place (or PITR in place) onto a service that did not
+    /// produce the backup — or from a raw backup location whose origin is
+    /// unknown — overwrites the target with another service's data. Such a
+    /// request is rejected with `409 Conflict` unless this is `true`. The
+    /// confirmation is recorded in the audit log. Ignored for modes that
+    /// provision a new service and for same-service restores.
+    #[serde(default)]
+    pub confirm_cross_service: bool,
     /// Requested restore mode. See `RestoreRequestMode`.
     #[serde(flatten)]
     pub mode: RestoreRequestMode,
@@ -323,6 +385,7 @@ use crate::handlers::authz::{
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
+        (status = 409, description = "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -350,9 +413,10 @@ async fn start_restore(
     // Resolve which backup the caller is pointing at. The URL's `{id}`
     // is the TARGET service — where the data will land. The backup
     // itself may have been produced by a completely different (or no
-    // longer existing) service, so we do NOT validate source/target
-    // linkage here — cross-service restore is a supported disaster-recovery
-    // path. We *do* require the caller to be entitled to the source as well,
+    // longer existing) service — cross-service restore is a supported
+    // disaster-recovery path, but a destructive one must be confirmed
+    // explicitly (see the origin binding below). We also require the caller
+    // to be entitled to the source as well,
     // otherwise a restore is an arbitrary read of another project's data into
     // a service the caller controls. The orchestrator enforces engine
     // compatibility.
@@ -409,6 +473,21 @@ async fn start_restore(
     )
     .await?;
     require_restore_source_access(&app_state, &auth, &selector, Permission::BackupsWrite).await?;
+
+    // Bind the restore to the backup's source service identity: a
+    // destructive restore onto a service that did not produce the backup must
+    // be confirmed explicitly. Checked after authorization (so the origin
+    // linkage is only disclosed to callers entitled to both ends) and before
+    // step-up verification (so the caller is not asked for MFA for a request
+    // that will be refused anyway).
+    let origin_binding = app_state
+        .restore_service
+        .resolve_origin_binding(id, &selector)
+        .await
+        .map_err(Problem::from)?;
+    origin_binding
+        .require_confirmation(id, &selector, &request.mode, request.confirm_cross_service)
+        .map_err(Problem::from)?;
 
     // Destructive restore modes overwrite the live service — require step-up
     // verification only after project authorization, but before any service
@@ -485,6 +564,9 @@ async fn start_restore(
         source_backup_id: request.backup_id.unwrap_or(0),
         mode: mode_str,
         target_service_name: target_name,
+        backup_origin_service_ids: origin_binding.origin_service_ids.clone(),
+        cross_service: origin_binding.cross_service,
+        cross_service_confirmed: origin_binding.cross_service && request.confirm_cross_service,
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -522,9 +604,27 @@ async fn get_restore_run(
         .get_restore_run(id)
         .await
         .map_err(Problem::from)?;
+    require_restore_run_read_access(&app_state, &auth, &run, "read a restore run").await?;
 
+    Ok(Json(run))
+}
+
+/// Authorize reading `run`: the caller must reach its target service, any
+/// service it created, and every service that produced its backup. A run
+/// over a raw S3 location or an ownerless (control-plane) backup is
+/// administrators-only. Shared by every endpoint that returns a run.
+async fn require_restore_run_read_access(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    run: &RestoreRunView,
+    operation: &str,
+) -> Result<(), Problem> {
     if run.source_backup_id <= 0 {
-        require_ownerless_restore_admin(&app_state, &auth, "read a raw-location restore run")?;
+        require_ownerless_restore_admin(
+            app_state,
+            auth,
+            &format!("{operation} that reads a raw backup location"),
+        )?;
     }
 
     let mut related_service_ids = vec![run.source_service_id];
@@ -552,16 +652,106 @@ async fn get_restore_run(
         related_service_ids.extend(producer_service_ids);
     }
     require_services_access(
-        &app_state,
-        &auth,
+        app_state,
+        auth,
         &related_service_ids,
         Permission::BackupsRead,
         "restore run services",
-        "read restore run",
+        operation,
     )
     .await?;
 
-    Ok(Json(run))
+    Ok(())
+}
+
+#[utoipa::path(
+    tag = "Restore",
+    post,
+    path = "/restore-runs/{id}/cancel",
+    params(("id" = i32, Path, description = "Restore run id")),
+    responses(
+        (status = 202, description = "Cancellation recorded (or already recorded); the run stops at its next check and ends as `cancelled`", body = RestoreRunView),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Restore run not found", body = ProblemDetails),
+        (status = 409, description = "Conflict: the run already finished (`restore-not-active`, with `run_status`), or it can no longer be stopped safely (`restore-not-cancellable`, with `phase`): an in-place restore has started writing data, or a new service is being registered", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn cancel_restore_run(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BackupsWrite);
+
+    let run = app_state
+        .restore_service
+        .get_restore_run(id)
+        .await
+        .map_err(Problem::from)?;
+    if run.source_backup_id <= 0 {
+        require_ownerless_restore_admin(&app_state, &auth, "cancel a raw-location restore run")?;
+    }
+    require_restore_run_read_access(&app_state, &auth, &run, "cancel a restore run").await?;
+
+    // Stopping a restore takes the same entitlement as starting one onto the
+    // same service in the same mode.
+    let destructive =
+        crate::services::run_is_destructive(&run.mode, run.target_service_name.as_deref());
+    let target_permission = if destructive {
+        permission_guard!(auth, ExternalServicesWrite);
+        Permission::ExternalServicesWrite
+    } else {
+        permission_guard!(auth, ExternalServicesCreate);
+        Permission::ExternalServicesCreate
+    };
+    require_service_access(
+        &app_state,
+        &auth,
+        run.source_service_id,
+        target_permission,
+        "target service",
+        "cancel restore",
+    )
+    .await?;
+
+    let service = app_state
+        .restore_service
+        .get_service_identity(run.source_service_id)
+        .await
+        .map_err(Problem::from)?;
+
+    let cancelled = app_state
+        .restore_service
+        .cancel_restore_run(id, auth.user_id())
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = RestoreRunCancelledAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        restore_run_id: id,
+        service_id: service.id,
+        service_name: service.name,
+        service_type: service.service_type,
+        source_backup_id: run.source_backup_id,
+        mode: run.mode.clone(),
+        phase: run.phase.clone(),
+        target_service_name: run.target_service_name.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for cancellation of restore run {}: {}",
+            id, e
+        );
+    }
+
+    Ok((StatusCode::ACCEPTED, Json(cancelled)))
 }
 
 /// Authorize the *source* of a restore: what the caller is about to read.
@@ -740,6 +930,7 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
         .route("/external-services/{id}/restore-plan", post(plan_restore))
         .route("/external-services/{id}/restore", post(start_restore))
         .route("/restore-runs/{id}", get(get_restore_run))
+        .route("/restore-runs/{id}/cancel", post(cancel_restore_run))
 }
 
 #[cfg(test)]
@@ -767,6 +958,168 @@ mod tests {
     fn status_for(err: RestoreError) -> StatusCode {
         let p: Problem = err.into();
         p.status_code
+    }
+
+    /// Cancelling a run that already finished is a conflict that names the
+    /// run's final status, which the console renders.
+    #[test]
+    fn cancelling_a_finished_run_maps_to_restore_not_active() {
+        let problem: Problem = RestoreError::RestoreNotActive {
+            restore_run_id: 42,
+            status: "completed".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-not-active")
+        );
+        assert_eq!(
+            problem.body.get("run_status").and_then(|s| s.as_str()),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn unconfirmed_cross_service_restore_maps_to_409() {
+        let problem: Problem = RestoreError::CrossServiceRestoreNotConfirmed {
+            target_service_id: 7,
+            backup: "backup 42".to_string(),
+            origin: "produced by service(s) 3".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("confirm_cross_service"), "{detail}");
+    }
+
+    /// A restore past its last safe point answers 409 with a type the
+    /// console recognises and the phase it is in.
+    #[test]
+    fn not_cancellable_restore_maps_to_409_with_phase() {
+        let problem: Problem = RestoreError::RestoreNotCancellable {
+            restore_run_id: 42,
+            phase: "restore".to_string(),
+            reason: "The restore has started writing data to the service".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-not-cancellable")
+        );
+        assert_eq!(
+            problem.body.get("phase").and_then(|p| p.as_str()),
+            Some("restore")
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            detail.contains("Restore run 42") && detail.contains("started writing data"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn cancelled_restore_outcome_maps_to_409_not_500() {
+        let problem: Problem = RestoreError::Cancelled {
+            restore_run_id: 42,
+            phase: "download".to_string(),
+            message: "Restore cancelled during phase 'download'.".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-cancelled")
+        );
+    }
+
+    /// A restore onto a service that is receiving imported data is a
+    /// conflict naming the import, so the client can open it.
+    #[test]
+    fn active_data_import_maps_to_409_naming_the_import() {
+        let problem: Problem = RestoreError::DataImportActive {
+            service_id: 7,
+            data_import_run_id: 13,
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/data-import-active")
+        );
+        assert_eq!(
+            problem
+                .body
+                .get("active_data_import_run_id")
+                .and_then(|id| id.as_i64()),
+            Some(13)
+        );
+    }
+
+    /// A second restore onto a service that already has one active is a
+    /// conflict the client can act on (attach to the running restore), not
+    /// the opaque 500 the unique index used to produce.
+    #[test]
+    fn active_restore_conflict_maps_to_409_naming_the_run() {
+        let problem: Problem = RestoreError::RestoreAlreadyActive {
+            service_id: 7,
+            restore_run_id: 42,
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-already-active")
+        );
+        assert_eq!(
+            problem
+                .body
+                .get("active_restore_run_id")
+                .and_then(|id| id.as_i64()),
+            Some(42)
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("run 42"), "{detail}");
+        assert!(detail.contains("Service 7"), "{detail}");
+    }
+
+    #[test]
+    fn worker_crash_maps_to_500_without_leaking_details() {
+        let problem: Problem = RestoreError::WorkerCrashed {
+            restore_run_id: 3,
+            phase: "restore".into(),
+            reason: "task panicked".into(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn confirm_cross_service_defaults_to_false_and_parses() {
+        let req: StartRestoreRequest =
+            serde_json::from_str(r#"{"backup_id": 42, "mode": "in_place"}"#).unwrap();
+        assert!(!req.confirm_cross_service);
+        let req: StartRestoreRequest = serde_json::from_str(
+            r#"{"backup_id": 42, "mode": "in_place", "confirm_cross_service": true}"#,
+        )
+        .unwrap();
+        assert!(req.confirm_cross_service);
+        assert!(matches!(req.mode, RestoreRequestMode::InPlace));
     }
 
     #[test]

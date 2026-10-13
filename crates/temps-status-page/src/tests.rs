@@ -69,6 +69,7 @@ mod unit_tests {
         let request = UpdateIncidentStatusRequest {
             status: "resolved".to_string(),
             message: "Issue has been fixed".to_string(),
+            is_public: false,
         };
 
         assert_eq!(request.status, "resolved");
@@ -520,6 +521,7 @@ mod integration_tests {
         let update = UpdateIncidentStatusRequest {
             status: "resolved".to_string(),
             message: "Issue has been fixed by scaling up the servers".to_string(),
+            is_public: false,
         };
 
         let updated = incident_service
@@ -1079,6 +1081,7 @@ mod integration_tests {
             tls_address: None,
             console_address: "127.0.0.1:8080".to_string(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

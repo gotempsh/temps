@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { ChevronDown, ChevronRight, Terminal } from 'lucide-react'
 
 import {
@@ -14,16 +15,21 @@ import {
 import { CodeBlock } from '@/components/ui/code-block'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-// Inline docs for creating sandboxes. Lives on the /sandboxes page because
-// we don't yet have a "New sandbox" UI flow — users go through the CLI,
-// REST, or the SDK. Keep the three examples behaviorally identical so a
-// reader can pick whichever fits their workflow and expect the same result.
+// Inline docs for creating sandboxes from outside the console. Lives on the
+// /sandboxes page next to the "New sandbox" button, so a reader can pick the
+// CLI, REST or SDK equivalent. Keep the three examples behaviorally identical
+// so whichever fits their workflow gives the same result.
 
 export const SANDBOX_CLI_EXAMPLE = `# Authenticate once (cached in ~/.temps/.contexts.json)
 bunx @temps-sdk/cli login https://your-temps-instance.com --context my-instance
 
 # Create a sandbox with a 2h idle timeout
-bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout-secs 7200 --name my-sandbox
+bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout 7200 --name my-sandbox
+
+# Run it on a specific worker node instead of letting Temps place it.
+# \`sandbox nodes\` lists every node and whether it may run sandboxes.
+bunx @temps-sdk/cli --target-context my-instance sandbox nodes
+bunx @temps-sdk/cli --target-context my-instance sandbox create --node worker-1
 
 # List, show details, or exec a command inside it
 bunx @temps-sdk/cli --target-context my-instance sandbox list
@@ -60,27 +66,33 @@ bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace -e A
 
 bunx @temps-sdk/cli --target-context my-instance sandbox list --workspace`
 
-const REST_EXAMPLE = `# Create
-curl -X POST https://your-temps-instance.com/v1/sandbox \\
+export const SANDBOX_REST_EXAMPLE = `# Create
+# "node" is optional: a worker node name, id, or "control-plane".
+# Omit it to let Temps place the sandbox on an allowed node.
+curl -X POST https://your-temps-instance.com/api/v1/sandboxes \\
   -H "Authorization: Bearer $TEMPS_API_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{
     "name": "my-sandbox",
     "timeout_secs": 7200,
+    "node": "worker-1",
     "env": { "NODE_ENV": "development" },
     "source": {
       "type": "git",
-      "repo_url": "https://github.com/org/repo.git",
-      "branch": "main"
+      "url": "https://github.com/org/repo.git",
+      "revision": "main"
     }
   }'
 
 # Response
 # {
-#   "id": "sbx_abc123",
-#   "status": "running",
-#   "preview_url_template": "https://sbx-abc123-{port}.preview.example.com",
-#   ...
+#   "sandbox": {
+#     "id": "sbx_abc123",
+#     "status": "running",
+#     "node_name": "worker-1",
+#     ...
+#   },
+#   "routes": [...]
 # }`
 
 const SDK_EXAMPLE = `import { Sandbox } from '@temps-sdk/sandbox'
@@ -114,6 +126,19 @@ interface CreateSandboxDocsProps {
   /// `compact` renders a collapsible banner above the list so the docs
   /// are still reachable once sandboxes exist, without crowding the page.
   variant?: Variant
+}
+
+export function SandboxRestIntro() {
+  return (
+    <p className="text-xs text-muted-foreground">
+      Authenticate with a personal access token (create one under{' '}
+      <Link to="/settings/keys" className="underline">
+        API Keys
+      </Link>
+      ). Full schema is in the OpenAPI spec at{' '}
+      <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
+    </p>
+  )
 }
 
 export function CreateSandboxDocs({
@@ -150,15 +175,8 @@ export function CreateSandboxDocs({
         <CodeBlock code={SANDBOX_WORKSPACE_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="rest" className="space-y-2">
-        <p className="text-xs text-muted-foreground">
-          Authenticate with a personal access token (create one under{' '}
-          <a href="/keys" className="underline">
-            API Keys
-          </a>
-          ). Full schema is in the OpenAPI spec at{' '}
-          <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
-        </p>
-        <CodeBlock code={REST_EXAMPLE} language="bash" />
+        <SandboxRestIntro />
+        <CodeBlock code={SANDBOX_REST_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="sdk" className="space-y-2">
         <p className="text-xs text-muted-foreground">
@@ -183,12 +201,12 @@ export function CreateSandboxDocs({
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <Terminal className="h-4 w-4" />
-            Create your first sandbox
+            Create sandboxes from your terminal or code
           </CardTitle>
           <CardDescription>
-            Sandboxes are created via the CLI, REST API, or SDK — there is no
-            create-in-UI flow yet. Pick whichever fits your workflow; all three
-            hit the same endpoint.
+            Use <strong>New sandbox</strong> above, or script it: the CLI, REST
+            API and SDK all hit the same endpoint, so pick whichever fits your
+            workflow.
           </CardDescription>
         </CardHeader>
         <CardContent>{body}</CardContent>

@@ -386,37 +386,32 @@ pub struct ProviderDeletionCheckResponse {
     pub message: String,
 }
 
-// Helper function to convert preset cache to Vec<ProjectPresetResponse>
-// This flattens all presets from all branches into a single list
-fn convert_preset_json(cache: Option<sea_orm::JsonValue>) -> Option<Vec<ProjectPresetResponse>> {
-    cache.and_then(|json| {
-        // Deserialize Json to RepositoryPresetCache
-        let cache: temps_entities::repositories::RepositoryPresetCache =
-            serde_json::from_value(json).ok()?;
-
-        // Flatten all presets from all branches into a single list
-        Some(
-            cache
-                .branches
-                .into_values()
-                .flat_map(|branch_data| {
-                    branch_data
-                        .presets
-                        .into_iter()
-                        .map(|p| ProjectPresetResponse {
-                            path: p.path,
-                            preset: p.preset,
-                            preset_label: p.preset_label,
-                            exposed_port: p.exposed_port.map(|port| port as i32),
-                            icon_url: p.icon_url,
-                            project_type: p.project_type,
-                            compose_files: p.compose_files,
-                            dockerfile_path: p.dockerfile_path,
-                        })
-                })
-                .collect(),
-        )
-    })
+// A repository row describes its default branch; other cached branches must
+// not appear as detections for that row. None means not inspected; [] means
+// inspected with no matching preset.
+fn convert_preset_json(
+    cache: Option<sea_orm::JsonValue>,
+    default_branch: &str,
+) -> Option<Vec<ProjectPresetResponse>> {
+    let json = cache?;
+    let branch: temps_entities::repositories::BranchPresetData =
+        serde_json::from_value(json.get(default_branch)?.clone()).ok()?;
+    Some(
+        branch
+            .presets
+            .into_iter()
+            .map(|p| ProjectPresetResponse {
+                path: p.path,
+                preset: p.preset,
+                preset_label: p.preset_label,
+                exposed_port: p.exposed_port.map(i32::from),
+                icon_url: p.icon_url,
+                project_type: p.project_type,
+                compose_files: p.compose_files,
+                dockerfile_path: p.dockerfile_path,
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -590,6 +585,10 @@ pub struct RepositoryListQuery {
     pub owner: Option<String>,
     pub language: Option<String>,
     pub private: Option<bool>,
+    /// Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+    pub preset: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -602,6 +601,10 @@ pub struct SyncedRepositoryListQuery {
     pub owner: Option<String>,
     pub language: Option<String>,
     pub private: Option<bool>,
+    /// Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+    pub preset: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
     pub git_provider_connection_id: Option<i32>,
 }
 
@@ -973,7 +976,9 @@ pub async fn sync_repositories(
         ("search" = Option<String>, Query, description = "Search term to filter repositories"),
         ("owner" = Option<String>, Query, description = "Filter by repository owner"),
         ("language" = Option<String>, Query, description = "Filter by programming language"),
-        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)")
+        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)"),
+        ("preset" = Option<String>, Query, description = "Cached default-branch preset slug; __undetected__ means not inspected"),
+        ("updated_after" = Option<String>, Query, description = "Updated on or after this RFC3339 timestamp")
     ),
     responses(
         (status = 200, description = "List of repositories", body = RepositoryListResponse),
@@ -1036,6 +1041,8 @@ pub async fn list_repositories_by_connection(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
         offset: Some((page - 1) * per_page),
@@ -1053,6 +1060,8 @@ pub async fn list_repositories_by_connection(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort: None,
         limit: None,
         offset: None,
@@ -1072,12 +1081,12 @@ pub async fn list_repositories_by_connection(
             full_name: r.full_name,
             description: r.description,
             private: r.private,
-            default_branch: r.default_branch,
+            default_branch: r.default_branch.clone(),
             language: r.language,
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
+            preset: convert_preset_json(r.preset.clone(), &r.default_branch),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
             git_provider_connection_id: r.git_provider_connection_id,
@@ -1106,7 +1115,9 @@ pub async fn list_repositories_by_connection(
         ("search" = Option<String>, Query, description = "Search term to filter repositories"),
         ("owner" = Option<String>, Query, description = "Filter by repository owner"),
         ("language" = Option<String>, Query, description = "Filter by programming language"),
-        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)")
+        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)"),
+        ("preset" = Option<String>, Query, description = "Cached default-branch preset slug; __undetected__ means not inspected"),
+        ("updated_after" = Option<String>, Query, description = "Updated on or after this RFC3339 timestamp")
     ),
     responses(
         (status = 200, description = "List of repositories", body = RepositoryListResponse),
@@ -1166,6 +1177,8 @@ pub async fn list_repositories_by_provider(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
         offset: Some((page - 1) * per_page),
@@ -1182,6 +1195,8 @@ pub async fn list_repositories_by_provider(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         ..Default::default()
     };
     let total_count = state
@@ -1199,12 +1214,12 @@ pub async fn list_repositories_by_provider(
             full_name: r.full_name,
             description: r.description,
             private: r.private,
-            default_branch: r.default_branch,
+            default_branch: r.default_branch.clone(),
             language: r.language,
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
+            preset: convert_preset_json(r.preset.clone(), &r.default_branch),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
             git_provider_connection_id: r.git_provider_connection_id,
@@ -1232,6 +1247,8 @@ pub async fn list_repositories_by_provider(
         ("owner" = Option<String>, Query, description = "Filter by repository owner"),
         ("language" = Option<String>, Query, description = "Filter by programming language"),
         ("private" = Option<bool>, Query, description = "Filter by private status (true/false)"),
+        ("preset" = Option<String>, Query, description = "Cached default-branch preset slug; __undetected__ means not inspected"),
+        ("updated_after" = Option<String>, Query, description = "Updated on or after this RFC3339 timestamp"),
         ("git_provider_connection_id" = Option<i32>, Query, description = "Filter by git provider connection ID")
     ),
     responses(
@@ -1284,6 +1301,8 @@ pub async fn list_synced_repositories(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
         offset: Some((page - 1) * per_page),
@@ -1301,6 +1320,8 @@ pub async fn list_synced_repositories(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort: None,
         limit: None,
         offset: None,
@@ -1320,12 +1341,12 @@ pub async fn list_synced_repositories(
             full_name: r.full_name,
             description: r.description,
             private: r.private,
-            default_branch: r.default_branch,
+            default_branch: r.default_branch.clone(),
             language: r.language,
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
+            preset: convert_preset_json(r.preset.clone(), &r.default_branch),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
             git_provider_connection_id: r.git_provider_connection_id,
@@ -1481,12 +1502,12 @@ pub async fn get_repository_by_name(
             full_name: repository.full_name,
             description: repository.description,
             private: repository.private,
-            default_branch: repository.default_branch,
+            default_branch: repository.default_branch.clone(),
             language: repository.language,
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: convert_preset_json(repository.preset),
+            preset: convert_preset_json(repository.preset, &repository.default_branch),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
             git_provider_connection_id: repository.git_provider_connection_id,
@@ -1540,12 +1561,12 @@ pub async fn get_repository_by_id(
             full_name: repository.full_name,
             description: repository.description,
             private: repository.private,
-            default_branch: repository.default_branch,
+            default_branch: repository.default_branch.clone(),
             language: repository.language,
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: convert_preset_json(repository.preset),
+            preset: convert_preset_json(repository.preset, &repository.default_branch),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
             git_provider_connection_id: repository.git_provider_connection_id,
@@ -1607,12 +1628,12 @@ pub async fn get_all_repositories_by_name(
             full_name: repository.full_name,
             description: repository.description,
             private: repository.private,
-            default_branch: repository.default_branch,
+            default_branch: repository.default_branch.clone(),
             language: repository.language,
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: convert_preset_json(repository.preset),
+            preset: convert_preset_json(repository.preset, &repository.default_branch),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
             git_provider_connection_id: repository.git_provider_connection_id,
@@ -3458,7 +3479,7 @@ mod convert_preset_json_tests {
         let cache = RepositoryPresetCache { branches };
         let json = serde_json::to_value(&cache).unwrap();
 
-        let converted = convert_preset_json(Some(json)).expect("cache should convert");
+        let converted = convert_preset_json(Some(json), "main").expect("cache should convert");
         assert_eq!(converted.len(), 1);
         assert_eq!(
             converted[0].dockerfile_path.as_deref(),
@@ -3488,7 +3509,42 @@ mod convert_preset_json_tests {
         let cache = RepositoryPresetCache { branches };
         let json = serde_json::to_value(&cache).unwrap();
 
-        let converted = convert_preset_json(Some(json)).expect("cache should convert");
+        let converted = convert_preset_json(Some(json), "main").expect("cache should convert");
         assert_eq!(converted[0].dockerfile_path, None);
+    }
+    #[test]
+    fn repository_presets_only_use_default_branch() {
+        let entry = |slug: &str| {
+            serde_json::json!({
+                "presets": [{"path": "./", "preset": slug, "presetLabel": slug,
+                    "projectType": "backend"}],
+                "calculatedAt": "2026-01-01T00:00:00Z"
+            })
+        };
+        let cache = serde_json::json!({"main": entry("nextjs"), "feature": entry("django")});
+        let result = convert_preset_json(Some(cache.clone()), "main").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].preset, "nextjs");
+        assert!(convert_preset_json(Some(cache), "missing").is_none());
+        let empty =
+            serde_json::json!({"main": {"presets": [], "calculatedAt": "2026-01-01T00:00:00Z"}});
+        assert!(convert_preset_json(Some(empty), "main").unwrap().is_empty());
+        assert!(convert_preset_json(None, "main").is_none());
+    }
+
+    #[test]
+    fn repository_updated_after_rejects_invalid_timestamp() {
+        assert!(serde_json::from_value::<RepositoryListQuery>(
+            serde_json::json!({"updated_after": "yesterday"})
+        )
+        .is_err());
+        let query: RepositoryListQuery = serde_json::from_value(
+            serde_json::json!({"updated_after": "2026-01-01T01:00:00+01:00", "preset": "nextjs"}),
+        )
+        .unwrap();
+        assert_eq!(
+            query.updated_after.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
     }
 }

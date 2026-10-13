@@ -9,12 +9,12 @@ use std::time::Duration;
 use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
-use crate::providers::{external_http_client, AiProvider, ProviderCapability, ProviderInfo};
+use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
 
 pub struct GeminiProvider {
     info: ProviderInfo,
-    client: reqwest::Client,
+    client: ProviderHttpClient,
 }
 
 impl Default for GeminiProvider {
@@ -25,7 +25,7 @@ impl Default for GeminiProvider {
 
 impl GeminiProvider {
     pub fn new() -> Self {
-        let client = external_http_client(Duration::from_secs(300));
+        let client = ProviderHttpClient::new(Duration::from_secs(300));
 
         Self {
             info: ProviderInfo {
@@ -680,6 +680,11 @@ impl AiProvider for GeminiProvider {
         let translated = async_stream::stream! {
             use tokio_stream::StreamExt;
             let mut stream = stream;
+            // Gemini marks the end of a reply with a candidate `finishReason`.
+            // A byte stream that closes without one was cut short, and must not
+            // be presented to the caller as a completed reply.
+            let mut saw_finish = false;
+            let mut transport_failed = false;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -718,6 +723,14 @@ impl AiProvider for GeminiProvider {
                                         }
                                     }
 
+                                    if gemini_chunk
+                                        .candidates
+                                        .iter()
+                                        .any(|candidate| candidate.finish_reason.is_some())
+                                    {
+                                        saw_finish = true;
+                                    }
+
                                     // Use the shared translation helper
                                     let events = GeminiProvider::translate_stream_chunk(
                                         &gemini_chunk, &model, &request_id,
@@ -732,6 +745,7 @@ impl AiProvider for GeminiProvider {
                         }
                     }
                     Err(e) => {
+                        transport_failed = true;
                         yield Err(AiGatewayError::StreamError {
                             model: model.clone(),
                             reason: e.to_string(),
@@ -740,8 +754,14 @@ impl AiProvider for GeminiProvider {
                 }
             }
 
-            // Send final DONE
-            yield Ok(Bytes::from("data: [DONE]\n\n"));
+            if saw_finish {
+                yield Ok(Bytes::from("data: [DONE]\n\n"));
+            } else if !transport_failed {
+                yield Err(AiGatewayError::StreamError {
+                    model: model.clone(),
+                    reason: "upstream stream ended without a finish reason".to_string(),
+                });
+            }
         };
 
         Ok(Box::pin(translated))
@@ -1461,6 +1481,80 @@ mod tests {
         let last_event = String::from_utf8_lossy(&events[events.len() - 1]);
         // usage should not appear (skip_serializing_if = None)
         assert!(!last_event.contains("\"prompt_tokens\""));
+    }
+
+    /// Collect every item of a streamed Gemini reply served by a local mock.
+    async fn collect_stream(body: &str) -> Vec<Result<String, AiGatewayError>> {
+        use tokio_stream::StreamExt;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body.to_string()),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new();
+        let request = make_request(vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hi".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        let mut stream = provider
+            .chat_completion_stream("test-key", Some(&server.uri()), &request)
+            .await
+            .expect("stream opens");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        items
+    }
+
+    #[tokio::test]
+    async fn stream_without_a_finish_reason_is_reported_as_interrupted() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Based on the\"}]}}]}\n\n";
+        let items = collect_stream(body).await;
+
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, Ok(chunk) if chunk.contains("Based on the"))),
+            "the partial text is still delivered: {items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(chunk) if chunk.contains("[DONE]"))),
+            "a truncated reply must not be terminated with [DONE]: {items:?}"
+        );
+        assert!(
+            matches!(items.last(), Some(Err(AiGatewayError::StreamError { reason, .. }))
+                if reason.contains("finish reason")),
+            "a truncated reply ends with a stream error: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_a_finish_reason_ends_with_done() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Done.\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let items = collect_stream(body).await;
+
+        assert!(
+            items.iter().all(|item| item.is_ok()),
+            "a complete reply has no error: {items:?}"
+        );
+        assert!(
+            matches!(items.last(), Some(Ok(chunk)) if chunk.contains("[DONE]")),
+            "a complete reply is terminated with [DONE]: {items:?}"
+        );
     }
 
     #[test]

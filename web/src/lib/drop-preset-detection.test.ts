@@ -3,9 +3,33 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  DROP_NO_PROJECT_PROBLEM_TYPE,
+  dropDetectionGap,
+  mergeLeftOut,
   prepareAndInspectDrop,
   presetConfigForDropCandidate,
 } from './drop-preset-detection'
+
+describe('dropDetectionGap', () => {
+  test('returns what Temps looks for when nothing in the archive is deployable', () => {
+    expect(
+      dropDetectionGap({
+        type: DROP_NO_PROJECT_PROBLEM_TYPE,
+        title: 'No Deployable Project Found',
+        detail: 'No deployable project was found in the archive.',
+        supported_files: ['Dockerfile', 'mix.exs', 42],
+      })
+    ).toEqual(['Dockerfile', 'mix.exs'])
+  })
+
+  test('is null for every other failure, which may be worth retrying', () => {
+    expect(
+      dropDetectionGap({ title: 'Too Many Drop Inspections', status: 429 })
+    ).toBeNull()
+    expect(dropDetectionGap(new Error('network down'))).toBeNull()
+    expect(dropDetectionGap(undefined)).toBeNull()
+  })
+})
 
 describe('prepareAndInspectDrop', () => {
   test('preserves a detected modern Compose filename for project creation', () => {
@@ -110,5 +134,28 @@ describe('prepareAndInspectDrop', () => {
       )
     ).rejects.toMatchObject({ name: 'AbortError' })
     expect(inspectCalled).toBe(false)
+  })
+})
+
+describe('mergeLeftOut', () => {
+  test('the left-out total comes from both totals, not the listed paths', () => {
+    const merged = mergeLeftOut(
+      {
+        leftOut: [{ path: '.env', reason: 'environment_file', files: 1 }],
+        leftOutFileCount: 51,
+      },
+      {
+        skippedEntries: [
+          { path: 'node_modules/', reason: 'dependencies', files: 3 },
+        ],
+        skippedFileCount: 120,
+      }
+    )
+
+    expect(merged.leftOutFileCount).toBe(171)
+    expect(merged.leftOut.map(({ path }) => path)).toEqual([
+      '.env',
+      'node_modules/',
+    ])
   })
 })

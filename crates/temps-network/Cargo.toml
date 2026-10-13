@@ -23,12 +23,15 @@ uuid = { workspace = true, features = ["serde"] }
 
 # CIDR math — small, dependency-free, ubiquitous in the Rust networking ecosystem.
 ipnet = { version = "2.10", features = ["serde"] }
+temps-wireguard = { path = "../temps-wireguard" }
 
 # Control-plane feature dependencies. Gated so workers / single-host installs
 # don't pull sea-orm into temps-network unnecessarily.
 sea-orm = { workspace = true, optional = true }
 temps-entities = { path = "../temps-entities", optional = true }
 chrono = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 
 # Linux-only kernel data-plane control. We gate every use behind cfg(target_os = "linux")
 # so the crate still compiles on macOS/Windows for type-checking and shared logic tests.
@@ -40,6 +43,7 @@ nix = { version = "0.31", features = ["net", "sched", "fs"] }
 libc = "0.2"
 
 [dev-dependencies]
+base64 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 mockall = "0.15"
 tempfile = "3"
@@ -62,4 +66,4 @@ integration_kernel = []
 # Control-plane allocator + peer-list helpers. Pulled in by the server crate
 # (`temps-cli serve`) but NOT by workers, who only need the data-plane
 # surface. Keeps worker build trees lean.
-control_plane = ["dep:sea-orm", "dep:temps-entities", "dep:chrono"]
+control_plane = ["dep:sea-orm", "dep:temps-entities", "dep:chrono", "dep:sha2", "dep:hex"]

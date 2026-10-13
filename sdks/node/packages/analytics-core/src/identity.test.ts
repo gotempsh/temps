@@ -66,3 +66,28 @@ describe("getOrCreateSessionId", () => {
     expect(second).toBe(first);
   });
 });
+
+describe("identity with unusable localStorage", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("returns undefined instead of throwing when storage is full", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    });
+    expect(getOrCreateVisitorId()).toBeUndefined();
+    expect(getOrCreateSessionId()).toBeUndefined();
+  });
+
+  it("returns undefined instead of throwing when storage access is denied", () => {
+    // Chrome with site data blocked, or a sandboxed iframe: merely reading
+    // `window.localStorage` throws.
+    vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+      throw new DOMException("access denied", "SecurityError");
+    });
+    expect(getOrCreateVisitorId()).toBeUndefined();
+    expect(getOrCreateSessionId()).toBeUndefined();
+  });
+});

@@ -63,6 +63,17 @@ pub trait NotificationService: Send + Sync {
     async fn is_email_provider_configured(&self) -> Result<bool, NotificationError> {
         Ok(false)
     }
+
+    /// How many destinations a notification at `severity` (e.g. `"critical"`)
+    /// would reach *right now*: enabled providers on an enabled route whose
+    /// severity range covers it, plus Temps Cloud when it delivers.
+    ///
+    /// This describes current configuration only; it says nothing about
+    /// whether any earlier notification was delivered. `None` means this
+    /// service cannot tell, which callers must not present as "zero".
+    async fn destination_count(&self, _severity: &str) -> Result<Option<usize>, NotificationError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

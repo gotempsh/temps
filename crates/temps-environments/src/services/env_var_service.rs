@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    sea_query::LockType, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -431,22 +432,17 @@ impl EnvVarService {
                 let encryption_service = encryption_service.clone();
 
                 Box::pin(async move {
-                    // SELECT ... FOR UPDATE. Every decision below is derived
-                    // from this row — whether the flag may change, and
+                    // Row lock (see `lock_for_write`). Every decision below is
+                    // derived from this row — whether the flag may change, and
                     // whether an empty value is about to be sealed — so the
                     // read has to be serialized with concurrent updates.
                     // Without the lock, a promotion committing between this
                     // read and our own write lets a deliberate blank land on
                     // a row that has since become secret, which is the
                     // unrecoverable state both guards exist to prevent.
-                    let env_var = env_vars::Entity::find_by_id(var_id)
-                        .filter(env_vars::Column::ProjectId.eq(project_id))
-                        .lock_exclusive()
-                        .one(txn)
-                        .await?
-                        .ok_or(EnvVarError::Other(
-                            "Environment variable not found".to_string(),
-                        ))?;
+                    let env_var = Self::lock_for_write(txn, project_id, var_id).await?.ok_or(
+                        EnvVarError::Other("Environment variable not found".to_string()),
+                    )?;
                     let scoped_environments =
                         Self::environments_in_project(txn, project_id, &environment_ids).await?;
 
@@ -566,6 +562,35 @@ impl EnvVarService {
         Ok(result)
     }
 
+    /// Locks an env var for update or delete, together with the credential
+    /// checks that read it. A check writing its result inserts env var history,
+    /// which key-share locks the variable while holding the check row. `FOR NO
+    /// KEY UPDATE` still serializes concurrent writes to the variable but does
+    /// not conflict with that key-share lock, and taking the check rows before
+    /// modifying the variable (rotation resets them, deletion cascades to them)
+    /// keeps the lock order the same as a running check's, so the two cannot
+    /// deadlock.
+    async fn lock_for_write(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        var_id: i32,
+    ) -> Result<Option<env_vars::Model>, EnvVarError> {
+        let env_var = env_vars::Entity::find_by_id(var_id)
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .lock(LockType::NoKeyUpdate)
+            .one(txn)
+            .await?;
+        if env_var.is_some() {
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM http_checks WHERE env_var_id = $1 ORDER BY id FOR UPDATE",
+                [var_id.into()],
+            ))
+            .await?;
+        }
+        Ok(env_var)
+    }
+
     pub async fn delete_environment_variable(
         &self,
         project_id: i32,
@@ -574,10 +599,7 @@ impl EnvVarService {
         self.db
             .transaction::<_, (), EnvVarError>(|txn| {
                 Box::pin(async move {
-                    let env_var = env_vars::Entity::find_by_id(var_id)
-                        .filter(env_vars::Column::ProjectId.eq(project_id))
-                        .lock_exclusive()
-                        .one(txn)
+                    let env_var = Self::lock_for_write(txn, project_id, var_id)
                         .await?
                         .ok_or_else(|| {
                             EnvVarError::NotFound(format!(
@@ -1107,8 +1129,18 @@ mod tests {
         ));
     }
 
-    /// Building a mock that walks the update transaction: SELECT the row,
-    /// UPDATE ... RETURNING the new row, then DELETE the environment links.
+    /// The `SELECT ... FOR UPDATE` of the variable's checks that follows
+    /// locking the variable (see `lock_for_write`).
+    fn checks_locked() -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }
+    }
+
+    /// Building a mock that walks the update transaction: SELECT the row and
+    /// lock its checks, UPDATE ... RETURNING the new row, then DELETE the
+    /// environment links.
     /// `environment_ids` is empty in these tests so no link inserts follow.
     fn mock_update_db(
         before: env_vars::Model,
@@ -1117,6 +1149,7 @@ mod tests {
         Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
+                .append_exec_results([checks_locked()])
                 .append_query_results(vec![vec![after]])
                 .append_exec_results(vec![MockExecResult {
                     last_insert_id: 0,
@@ -1132,6 +1165,7 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![before]])
+                .append_exec_results([checks_locked()])
                 .append_query_results([Vec::<environments::Model>::new()])
                 .into_connection(),
         );
@@ -1256,6 +1290,7 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
+                .append_exec_results([checks_locked()])
                 .into_connection(),
         );
         let service = EnvVarService::new(db, encryption_service);
@@ -1295,6 +1330,7 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
+                .append_exec_results([checks_locked()])
                 .into_connection(),
         );
         let service = EnvVarService::new(db, encryption_service);
@@ -1329,6 +1365,7 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
+                .append_exec_results([checks_locked()])
                 .into_connection(),
         );
         let service = EnvVarService::new(db, encryption_service);
@@ -1371,6 +1408,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![before]])
+            .append_exec_results([checks_locked()])
             .append_query_results(vec![vec![after]])
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
@@ -1424,5 +1462,121 @@ mod tests {
             encryption_service.decrypt_string(&written).unwrap(),
             "plain_secret_value"
         );
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use chrono::Utc;
+    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_entities::{preset::Preset, projects};
+
+    const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn env_var_writes_and_running_checks_never_deadlock() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable, skipping env var lock-order test: {error:#}");
+                return;
+            }
+            Err(error) => panic!("env var lock-order test database setup failed: {error:#}"),
+        };
+        let project = projects::ActiveModel {
+            name: Set("Env var lock order".to_string()),
+            repo_name: Set("repo-env-lock-order".to_string()),
+            repo_owner: Set("temps-tests".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set("env-var-lock-order".to_string()),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("project fixture should insert");
+        let encryption =
+            Arc::new(EncryptionService::new(ENCRYPTION_KEY).expect("test key should be valid"));
+        for operation in ["update", "delete"] {
+            let service = EnvVarService::new(test_db.connection_arc(), encryption.clone());
+            let key = format!("LOCK_ORDER_{}", operation.to_uppercase());
+            let variable = service
+                .create_environment_variable(
+                    project.id,
+                    vec![],
+                    key.clone(),
+                    "first".into(),
+                    false,
+                    false,
+                )
+                .await
+                .expect("env var fixture should insert");
+            test_db
+                .connection()
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO http_checks(project_id,env_var_id,kind,name,encrypted_spec) VALUES($1,$2,'local','Credential expiry','ciphertext')",
+                    [project.id.into(), variable.id.into()],
+                ))
+                .await
+                .expect("check fixture should insert");
+            // A running check holds its row before it records a result.
+            let check = test_db
+                .connection()
+                .begin()
+                .await
+                .expect("check transaction should begin");
+            check
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id FROM http_checks WHERE env_var_id = $1 FOR UPDATE",
+                    [variable.id.into()],
+                ))
+                .await
+                .expect("check row should lock");
+            let (project_id, var_id) = (project.id, variable.id);
+            let write = tokio::spawn(async move {
+                if operation == "update" {
+                    service
+                        .update_environment_variable(
+                            project_id,
+                            var_id,
+                            key,
+                            Some("rotated".into()),
+                            vec![],
+                            false,
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    service
+                        .delete_environment_variable(project_id, var_id)
+                        .await
+                }
+            });
+            // Let the write lock the variable and queue behind the check row.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Recording the result inserts env var history, which key-share locks the variable.
+            check
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"UPDATE http_checks SET last_checked_at=NOW(),last_result='{"status":"healthy","findings":[],"checked_at":"2026-10-03T00:00:00Z"}' WHERE env_var_id = $1"#,
+                    [variable.id.into()],
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("recording a result during an env var {operation} failed: {e}"));
+            check.commit().await.expect("check should commit");
+            write
+                .await
+                .expect("write task should complete")
+                .unwrap_or_else(|e| {
+                    panic!("env var {operation} after a running check failed: {e}")
+                });
+        }
     }
 }

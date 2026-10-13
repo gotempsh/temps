@@ -87,6 +87,8 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   localStorage.clear();
+  // Tests navigate (some onto excluded paths); start each one from "/".
+  window.history.replaceState({}, "", "/");
 });
 
 /** Requests to the events endpoint, in order. */
@@ -293,5 +295,108 @@ describe("buffer bound", () => {
     const internal = recorder as unknown as { pending: unknown[] };
     expect(internal.pending).toHaveLength(10);
     expect(recorder.getDroppedEventCount()).toBe(15);
+  });
+});
+
+/** Requests to the init endpoint. */
+function initPosts(): unknown[] {
+  return fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/session-replay/init"));
+}
+
+/** Touch history so a recorder whose init failed tries again. */
+function navigate(path: string): void {
+  window.history.pushState({}, "", path);
+}
+
+describe("session init response handling", () => {
+  it("treats a 200 from a same-origin proxy as success", async () => {
+    // Regression: only 201 was accepted, so a proxy relaying 200 had each
+    // retry create another server-side session while nothing was recorded.
+    fetchMock.mockResolvedValueOnce({ status: 200, ok: true });
+    await startedRecorder();
+    expect(initPosts()).toHaveLength(1);
+  });
+});
+
+describe("failure reporting", () => {
+  it("warns once, not on every retry, while the endpoint is unreachable", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    newRecorder({ enabled: true });
+    await vi.waitFor(() => expect(initPosts()).toHaveLength(1));
+    navigate("/second");
+    await vi.waitFor(() => expect(initPosts()).toHaveLength(2));
+    navigate("/third");
+    await vi.waitFor(() => expect(initPosts()).toHaveLength(3));
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("session replay init failed");
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it("reports a rejected init (e.g. a wrong ingest key) instead of staying silent", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fetchMock.mockResolvedValue({ status: 401, ok: false });
+
+    newRecorder({ enabled: true });
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    expect(String(warn.mock.calls[0][1])).toContain("HTTP 401");
+  });
+
+  it("reports a rejected upload once", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { emit } = await startedRecorder({ batchSize: 1, flushInterval: 500 });
+
+    fetchMock.mockResolvedValue({ status: 500, ok: false });
+    emit(mkEvent(1));
+    await vi.waitFor(() => expect(eventPosts()).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(4000);
+    await vi.waitFor(() => expect(eventPosts().length).toBeGreaterThanOrEqual(2));
+
+    const uploadWarnings = warn.mock.calls.filter(([message]) =>
+      String(message).includes("upload failed"),
+    );
+    expect(uploadWarnings).toHaveLength(1);
+  });
+
+  it("logs every failure and the reason a page is skipped in debug mode", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    newRecorder({ enabled: true, debug: true });
+    await vi.waitFor(() => expect(initPosts()).toHaveLength(1));
+    navigate("/second");
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(2));
+
+    navigate("/login");
+    await vi.waitFor(() =>
+      expect(debug.mock.calls.some(([m]) => String(m).includes("excluded path"))).toBe(true),
+    );
+  });
+});
+
+describe("unusable localStorage", () => {
+  it("still records into the server session when storage writes throw", async () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    });
+
+    const { emit } = await startedRecorder({ batchSize: 1 });
+    const initBody = JSON.parse(
+      String((fetchMock.mock.calls.find(([url]) => String(url).endsWith("/init"))?.[1] as {
+        body: string;
+      }).body),
+    ) as { sessionId: string };
+
+    emit(mkEvent(1));
+    await vi.waitFor(() => expect(eventPosts()).toHaveLength(1));
+
+    // The upload is attributed to the session the server created, not to an
+    // empty id left behind by a failed storage write.
+    expect(eventPosts()[0].sessionId).toBe(initBody.sessionId);
+    expect(initBody.sessionId).not.toBe("");
   });
 });

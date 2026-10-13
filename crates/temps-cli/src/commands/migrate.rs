@@ -56,6 +56,24 @@ pub struct MigrateCommand {
     #[arg(long, short = 'y')]
     pub yes: bool,
 
+    /// Data directory of the installation (same as `temps serve`). With
+    /// `--pre-migration-backup` the backup is written to
+    /// `<data dir>/backups/pre-migration/`. Defaults to `~/.temps`.
+    #[arg(long, env = "TEMPS_DATA_DIR")]
+    pub data_dir: Option<std::path::PathBuf>,
+
+    /// Before applying the migrations, dump the database to
+    /// `<data dir>/backups/pre-migration/` so you can roll back to the
+    /// previous release; nothing is applied if that dump fails. Off by
+    /// default.
+    #[arg(long, conflicts_with = "skip_pre_migration_backup")]
+    pub pre_migration_backup: bool,
+
+    /// No-op, kept so existing scripts keep working: the pre-migration
+    /// backup is now off unless `--pre-migration-backup` is passed.
+    #[arg(long, hide = true)]
+    pub skip_pre_migration_backup: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "TEMPS_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -307,6 +325,62 @@ impl MigrateCommand {
                 return Ok(());
             }
 
+            // Schema guard + pre-migration backup, after the operator agreed
+            // to the plan and before the first migration is applied.
+            let data_dir = resolve_data_dir(self.data_dir.as_deref())?;
+            if !use_json {
+                if self.pre_migration_backup {
+                    println!(
+                        "{}",
+                        format!(
+                            "Backing up the database to {} before migrating…",
+                            temps_backup::pre_migration::pre_migration_backup_dir(&data_dir)
+                                .display()
+                        )
+                        .dimmed()
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        format!(
+                            "Migrating without a pre-migration backup (pass {} to take one).",
+                            crate::commands::schema_upgrade::BACKUP_FLAG
+                        )
+                        .dimmed()
+                    );
+                }
+            }
+            let prepared = crate::commands::schema_upgrade::prepare_schema_upgrade(
+                &db,
+                &self.database_url,
+                &data_dir,
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if let Some(backup) = &prepared.backup {
+                if use_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&BackupCompletedLine {
+                            event: "backup_completed",
+                            path: backup.dump_path.display().to_string(),
+                            size_bytes: backup.size_bytes,
+                            elapsed_ms: backup.elapsed.as_millis() as u64,
+                        })?
+                    );
+                    let _ = std::io::stdout().flush();
+                } else {
+                    println!(
+                        "  {} {} ({}, {})",
+                        "✓".green(),
+                        backup.dump_path.display(),
+                        format_size(backup.size_bytes),
+                        format_elapsed(backup.elapsed)
+                    );
+                }
+            }
+
             if !use_json {
                 println!();
                 println!("{}", "Applying…".bold());
@@ -399,6 +473,40 @@ impl MigrateCommand {
             }
             Ok::<(), anyhow::Error>(())
         })
+    }
+}
+
+/// `backup_completed` NDJSON line for `--progress-format=json`.
+#[derive(serde::Serialize)]
+struct BackupCompletedLine {
+    event: &'static str,
+    path: String,
+    size_bytes: u64,
+    elapsed_ms: u64,
+}
+
+/// `--data-dir`/`TEMPS_DATA_DIR`, else `~/.temps` — the same resolution as
+/// `temps serve`.
+fn resolve_data_dir(configured: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
+    match configured {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => dirs::home_dir()
+            .map(|home| home.join(".temps"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot determine the data directory for the pre-migration backup: \
+                     no home directory. Pass --data-dir or set TEMPS_DATA_DIR."
+                )
+            }),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }
 
@@ -749,6 +857,42 @@ fn format_elapsed(d: std::time::Duration) -> String {
 mod tests {
     use super::{race_maintenance, MaintenanceRace};
 
+    #[test]
+    fn data_dir_prefers_the_configured_directory() {
+        let configured = std::path::Path::new("/srv/temps-data");
+        assert_eq!(
+            super::resolve_data_dir(Some(configured)).expect("configured dir"),
+            configured
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                super::resolve_data_dir(None).expect("home default"),
+                home.join(".temps")
+            );
+        }
+    }
+
+    #[test]
+    fn backup_sizes_are_human_readable() {
+        assert_eq!(super::format_size(512), "0.5 KiB");
+        assert_eq!(super::format_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MiB");
+    }
+
+    #[test]
+    fn backup_completed_line_is_ndjson_the_updater_ignores_safely() {
+        let line = serde_json::to_string(&super::BackupCompletedLine {
+            event: "backup_completed",
+            path: "/data/backups/pre-migration/x.dump".to_string(),
+            size_bytes: 10,
+            elapsed_ms: 5,
+        })
+        .expect("serializes");
+        assert_eq!(
+            line,
+            r#"{"event":"backup_completed","path":"/data/backups/pre-migration/x.dump","size_bytes":10,"elapsed_ms":5}"#
+        );
+    }
+
     #[tokio::test]
     async fn maintenance_race_observes_interrupts_after_migrations_finish() {
         let result = race_maintenance(std::future::pending::<()>(), std::future::ready(())).await;
@@ -805,5 +949,54 @@ mod tests {
     async fn maintenance_race_returns_completed_work() {
         let result = race_maintenance(std::future::ready(42), std::future::pending::<()>()).await;
         assert!(matches!(result, MaintenanceRace::Completed(42)));
+    }
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        migrate: super::MigrateCommand,
+    }
+
+    fn parse(extra: &[&str]) -> Result<super::MigrateCommand, clap::Error> {
+        use clap::Parser;
+        let mut args = vec!["temps", "--database-url", "postgres://localhost/temps"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).map(|cli| cli.migrate)
+    }
+
+    #[test]
+    fn the_pre_migration_backup_is_opt_in() {
+        let default = parse(&[]).expect("no flags parse");
+        assert!(!default.pre_migration_backup);
+        let enabled = parse(&["--pre-migration-backup"]).expect("opt-in parses");
+        assert!(enabled.pre_migration_backup);
+    }
+
+    #[test]
+    fn the_update_child_arguments_parse() {
+        use crate::commands::serve::self_update::migrate_child_args;
+        let data_dir = std::path::Path::new("/srv/temps-data");
+        for backup in [None, Some(data_dir)] {
+            let args = migrate_child_args(backup);
+            assert_eq!(args[0], "migrate");
+            let rest: Vec<&str> = args[1..]
+                .iter()
+                .map(|arg| arg.to_str().expect("utf-8 argument"))
+                .collect();
+            let migrate = parse(&rest).expect("the update's migrate child arguments parse");
+            assert!(migrate.yes);
+            assert_eq!(migrate.pre_migration_backup, backup.is_some());
+            assert_eq!(migrate.data_dir.as_deref(), backup);
+        }
+    }
+
+    #[test]
+    fn the_retired_skip_flag_is_still_accepted() {
+        let skipped = parse(&["--skip-pre-migration-backup"]).expect("old scripts keep working");
+        assert!(!skipped.pre_migration_backup);
+        assert!(
+            parse(&["--pre-migration-backup", "--skip-pre-migration-backup"]).is_err(),
+            "asking for and against the backup at once must be rejected"
+        );
     }
 }

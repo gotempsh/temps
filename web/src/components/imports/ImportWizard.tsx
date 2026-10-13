@@ -667,6 +667,7 @@ export function ImportWizard({
               </div>
             ) : (
               <RadioGroup
+                aria-label="Import source"
                 value={selectedSource || ''}
                 onValueChange={(value) =>
                   handleSourceSelect(value as ImportSource)
@@ -699,7 +700,10 @@ export function ImportWizard({
                               </CardDescription>
                             </div>
                           </div>
-                          <RadioGroupItem value={source.source} />
+                          <RadioGroupItem
+                            value={source.source}
+                            aria-label={source.name}
+                          />
                         </div>
                       </CardHeader>
                       <CardContent>
@@ -853,6 +857,7 @@ export function ImportWizard({
                     />
                     {workloadSearchTerm && (
                       <Button
+                        aria-label="Clear search"
                         variant="ghost"
                         size="sm"
                         className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0"
@@ -970,6 +975,7 @@ export function ImportWizard({
                   </Card>
                 ) : (
                   <RadioGroup
+                    aria-label="Workload to import"
                     value={selectedWorkload?.id || ''}
                     onValueChange={(value) => {
                       const workload = filteredWorkloads.find(
@@ -1002,7 +1008,10 @@ export function ImportWizard({
                                   </CardDescription>
                                 </div>
                               </div>
-                              <RadioGroupItem value={workload.id} />
+                              <RadioGroupItem
+                                value={workload.id}
+                                aria-label={workload.name || workload.id}
+                              />
                             </div>
                           </CardHeader>
                           <CardContent className="pt-0">

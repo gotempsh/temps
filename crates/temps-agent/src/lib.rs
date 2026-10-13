@@ -17,6 +17,7 @@ mod output_buffer;
 pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
+pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
 
@@ -57,6 +58,14 @@ pub enum AgentError {
 
     #[error("TLS configuration failed ({context}): {reason}")]
     TlsConfig { context: String, reason: String },
+
+    #[error(
+        "Cannot resolve the agent data directory from dns_data_dir '{dns_data_dir}': {reason}"
+    )]
+    DataDirResolution {
+        dns_data_dir: String,
+        reason: String,
+    },
 }
 
 /// Health report sent in heartbeats and returned from GET /agent/health.
@@ -80,6 +89,129 @@ pub struct NodeHealthReport {
     /// heartbeated), so it can validate an image before transferring it.
     #[serde(default)]
     pub platform: String,
+}
+
+/// How this node verifies the control plane's TLS certificate.
+///
+/// The cluster CA also signs every worker's own leaf, for the names the
+/// worker registered under, so trusting it for a URL lets any enrolled worker
+/// present a certificate for that URL. It is therefore trusted only by nodes
+/// whose join pinned it to the control plane, and for those it replaces the
+/// public roots rather than adding to them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlPlaneTrust {
+    /// Public roots only: every node joined over a public control-plane URL,
+    /// and every `agent.json` written before this field existed.
+    #[default]
+    PublicRoots,
+    /// The cluster CA only: a node paired over the mesh (ADR 048 D3), which
+    /// reaches the control plane at `https://<mesh address>`, or a relay join
+    /// pinned with `--ca-fingerprint`.
+    ClusterCa,
+}
+
+/// The cluster CA as the only trust root for calls to the control plane, with
+/// the control plane verified by its reserved name
+/// ([`temps_core::node_pki::CONTROL_PLANE_SERVER_NAME`]) rather than by the
+/// address in `control_plane_url`.
+///
+/// The cluster CA signs every worker's leaf for the name and addresses that
+/// worker registered, so checking the URL's address (the control plane's mesh
+/// address) would accept any worker that holds a leaf for that address. No
+/// worker can hold one for the reserved name.
+#[derive(Clone)]
+pub struct ControlPlaneCa {
+    tls: Option<rustls::ClientConfig>,
+}
+
+impl std::fmt::Debug for ControlPlaneCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneCa")
+            .field(
+                "server_name",
+                &temps_core::node_pki::CONTROL_PLANE_SERVER_NAME,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneCa {
+    /// The cluster CA certificate(s) in `pem`.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, temps_core::node_pki::PkiError> {
+        Ok(Self {
+            tls: Some(temps_core::node_pki::control_plane_client_config(pem)?),
+        })
+    }
+
+    /// The cluster CA certificate in `der`.
+    pub fn from_der(der: &[u8]) -> Result<Self, temps_core::node_pki::PkiError> {
+        Ok(Self {
+            tls: Some(temps_core::node_pki::control_plane_client_config_from_der(
+                der,
+            )?),
+        })
+    }
+}
+
+/// The cluster CA as the trust root for calls to the control plane, when this
+/// node's join pinned it ([`ControlPlaneTrust::ClusterCa`]) and it holds it.
+/// `None` for every other node, which verifies the control plane against the
+/// public roots only.
+///
+/// A client given this trust root uses it instead of the public roots, as
+/// [`with_control_plane_trust`] does.
+pub fn control_plane_ca(config: &AgentConfig) -> Option<ControlPlaneCa> {
+    if config.effective_control_plane_trust() != ControlPlaneTrust::ClusterCa {
+        return None;
+    }
+    let Some(path) = config.cluster_ca_path.as_ref() else {
+        tracing::warn!(node = %config.node_name, "cluster-CA trust requires cluster_ca_path; control-plane TLS connections are refused");
+        return Some(ControlPlaneCa { tls: None });
+    };
+    let result = std::fs::read(path)
+        .map_err(|error| error.to_string())
+        .and_then(|pem| {
+            if let Some(pin_path) = config.control_plane_legacy_cert_path.as_ref() {
+                let pinned = std::fs::read(pin_path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|pin| temps_core::node_pki::control_plane_client_config_with_legacy_pin(&pem, &pin)
+                        .map_err(|error| error.to_string()));
+                match pinned {
+                    Ok(tls) => return Ok(ControlPlaneCa { tls: Some(tls) }),
+                    Err(error) => tracing::warn!(path = %pin_path.display(), %error,
+                        "legacy pin is unusable; retaining strict cluster-CA reserved-name verification"),
+                }
+            }
+            ControlPlaneCa::from_pem(&pem).map_err(|error| error.to_string())
+        });
+    Some(match result {
+        Ok(ca) => ca,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error,
+                "cluster CA is unusable; control-plane TLS connections are refused");
+            ControlPlaneCa { tls: None }
+        }
+    })
+}
+
+/// A client builder for calls to the control plane: see [`control_plane_ca`].
+pub fn control_plane_client_builder(config: &AgentConfig) -> reqwest::ClientBuilder {
+    with_control_plane_trust(reqwest::Client::builder(), control_plane_ca(config))
+}
+
+/// Apply the trust from [`control_plane_ca`] to `builder`: the cluster CA,
+/// verifying the control plane by its reserved name, *instead of* the public
+/// roots when given; the public roots otherwise.
+pub fn with_control_plane_trust(
+    builder: reqwest::ClientBuilder,
+    cluster_ca: Option<ControlPlaneCa>,
+) -> reqwest::ClientBuilder {
+    match cluster_ca {
+        Some(ControlPlaneCa { tls: Some(tls) }) => builder.use_preconfigured_tls(tls),
+        Some(ControlPlaneCa { tls: None }) => builder.tls_built_in_root_certs(false),
+        None => builder,
+    }
 }
 
 /// Configuration for the agent server.
@@ -168,6 +300,25 @@ pub struct AgentConfig {
     pub public_ingress_http_port: u16,
     #[serde(default = "default_public_https_port")]
     pub public_ingress_https_port: u16,
+    /// Directory holding this node's WireGuard mesh private key (`0600`).
+    #[serde(default = "default_mesh_key_dir")]
+    pub mesh_key_dir: std::path::PathBuf,
+    /// `ip:port` other nodes dial to reach this node's WireGuard socket.
+    /// `None` uses the registered `private_address` on the mesh port; set it
+    /// when that address is not what other nodes can reach (NAT with a
+    /// forwarded port, a different public IP).
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
+    /// How control-plane calls verify its certificate; see
+    /// [`ControlPlaneTrust`]. Written by `temps join`; `None` in an
+    /// `agent.json` written before it existed, see
+    /// [`AgentConfig::effective_control_plane_trust`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_trust: Option<ControlPlaneTrust>,
+    /// Temporary, independently provisioned leaf pin for worker-first upgrades
+    /// against an older IP-only control plane. Never downloaded automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_legacy_cert_path: Option<std::path::PathBuf>,
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
@@ -182,6 +333,129 @@ fn default_public_https_port() -> u16 {
 
 fn default_dns_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/temps/dns")
+}
+
+fn default_mesh_key_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/temps/wireguard")
+}
+
+/// Sandbox work root (ADR-048) for a given `dns_data_dir`:
+/// `<agent data dir>/sandboxes`, where the agent data dir is the parent of
+/// `dns_data_dir` (`temps agent` always sets it to `<agent data dir>/dns`).
+///
+/// The result is always absolute: sandbox work dirs become Docker bind-mount
+/// sources, and Docker rejects a relative source, so a relative
+/// `TEMPS_DATA_DIR` (e.g. `data`) is resolved against the current directory
+/// here rather than surfacing as a failed create on every sandbox request.
+/// A `dns_data_dir` with no parent directory (empty, or a filesystem root)
+/// is rejected instead of being replaced by a guessed default.
+pub fn sandbox_work_root_for(
+    dns_data_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, AgentError> {
+    let absolute = absolute_dns_data_dir(dns_data_dir)?;
+    let data_dir = absolute
+        .parent()
+        .ok_or_else(|| AgentError::DataDirResolution {
+            dns_data_dir: dns_data_dir.display().to_string(),
+            reason: format!(
+                "'{}' is a filesystem root and has no parent agent data directory; \
+                 expected '<agent data dir>/dns'",
+                absolute.display()
+            ),
+        })?;
+    Ok(data_dir.join("sandboxes"))
+}
+
+/// `dns_data_dir` made absolute against the current directory, without
+/// touching the filesystem (no symlink resolution, no existence check).
+fn absolute_dns_data_dir(dns_data_dir: &std::path::Path) -> Result<std::path::PathBuf, AgentError> {
+    if dns_data_dir.as_os_str().is_empty() {
+        return Err(AgentError::DataDirResolution {
+            dns_data_dir: String::new(),
+            reason: "the path is empty; expected '<agent data dir>/dns'".to_string(),
+        });
+    }
+    std::path::absolute(dns_data_dir).map_err(|e| AgentError::DataDirResolution {
+        dns_data_dir: dns_data_dir.display().to_string(),
+        reason: format!("failed to make the path absolute against the current directory: {e}"),
+    })
+}
+
+impl AgentConfig {
+    /// The trust this node's control-plane calls use. An `agent.json`
+    /// written before `control_plane_trust` existed has none recorded, so it
+    /// is read from what only a mesh pairing (`temps join --pair`) writes: a
+    /// WireGuard endpoint, the cluster CA, and a control-plane URL that is an
+    /// IP literal (the control plane's mesh address). Every other legacy
+    /// config is a direct or relay join and keeps the public roots, as it
+    /// did before.
+    pub fn effective_control_plane_trust(&self) -> ControlPlaneTrust {
+        if let Some(trust) = self.control_plane_trust {
+            return trust;
+        }
+        let url_is_ip = reqwest::Url::parse(&self.control_plane_url).is_ok_and(|url| {
+            url.host_str().is_some_and(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok()
+            })
+        });
+        if self.wg_endpoint.is_some() && self.cluster_ca_path.is_some() && url_is_ip {
+            ControlPlaneTrust::ClusterCa
+        } else {
+            ControlPlaneTrust::PublicRoots
+        }
+    }
+
+    /// Resolve this config's on-disk paths once at startup, before the agent
+    /// serves any request: `dns_data_dir` is made absolute in place and the
+    /// sandbox work root derived from it is validated. Fails with
+    /// [`AgentError::DataDirResolution`] when either cannot be resolved, so a
+    /// misconfigured data dir stops `temps agent` with a clear error instead
+    /// of failing every sandbox create later. Already-absolute paths are
+    /// left unchanged.
+    ///
+    /// Returns the effective sandbox work root, which is also what
+    /// [`AgentConfig::sandbox_work_root`] returns afterwards.
+    pub fn resolve_paths(&mut self) -> Result<std::path::PathBuf, AgentError> {
+        let work_root = sandbox_work_root_for(&self.dns_data_dir)?;
+        self.dns_data_dir = absolute_dns_data_dir(&self.dns_data_dir)?;
+        tracing::info!(
+            node = %self.node_name,
+            dns_data_dir = %self.dns_data_dir.display(),
+            sandbox_work_root = %work_root.display(),
+            "Resolved agent data paths; sandbox work directories on this node live under sandbox_work_root"
+        );
+        Ok(work_root)
+    }
+
+    /// Root for the work directories of sandboxes hosted on this node
+    /// (ADR-048): `<agent data dir>/sandboxes`, always absolute.
+    ///
+    /// `temps agent` calls [`AgentConfig::resolve_paths`] at startup, which
+    /// fails fast on a data dir that cannot be resolved, so the error branch
+    /// here is unreachable for a running agent. It is still handled without
+    /// producing a relative path: a config that skipped `resolve_paths` gets
+    /// `/var/lib/temps/sandboxes` and an error log naming the cause, never a
+    /// relative bind-mount source.
+    pub fn sandbox_work_root(&self) -> std::path::PathBuf {
+        match sandbox_work_root_for(&self.dns_data_dir) {
+            Ok(work_root) => work_root,
+            Err(error) => {
+                let fallback = std::path::PathBuf::from("/var/lib/temps/sandboxes");
+                tracing::error!(
+                    node = %self.node_name,
+                    %error,
+                    fallback = %fallback.display(),
+                    "Sandbox work root could not be resolved from dns_data_dir; \
+                     using the default. AgentConfig::resolve_paths should have \
+                     rejected this config at startup."
+                );
+                fallback
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +810,10 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: default_mesh_key_dir(),
+            wg_endpoint: None,
+            control_plane_trust: Some(ControlPlaneTrust::PublicRoots),
+            control_plane_legacy_cert_path: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -578,5 +856,425 @@ mod tests {
         let parsed: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.underlay_mtu, None);
         assert!(!parsed.require_mtls);
+    }
+
+    fn config_with_dns_data_dir(dns_data_dir: &str) -> AgentConfig {
+        let json = serde_json::json!({
+            "listen_address": "0.0.0.0:3100",
+            "token": "test-token",
+            "node_name": "worker-1",
+            "control_plane_url": "https://control:3000",
+            "node_id": 1,
+            "dns_data_dir": dns_data_dir,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_sandbox_work_root_relative_data_dir_becomes_absolute() {
+        // TEMPS_DATA_DIR=data => dns_data_dir = data/dns. The work root must
+        // not be the relative `data/sandboxes`, which Docker rejects as a
+        // bind-mount source.
+        let cwd = std::env::current_dir().unwrap();
+        let mut config = config_with_dns_data_dir("data/dns");
+
+        let expected = cwd.join("data").join("sandboxes");
+        assert_eq!(config.sandbox_work_root(), expected);
+
+        let resolved = config.resolve_paths().unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, expected);
+        assert_eq!(config.dns_data_dir, cwd.join("data").join("dns"));
+        assert_eq!(config.sandbox_work_root(), expected);
+    }
+
+    #[test]
+    fn test_sandbox_work_root_single_component_relative_dns_dir() {
+        // `dns` has an empty (not missing) parent; it must resolve to the
+        // current directory rather than a relative `sandboxes`.
+        let cwd = std::env::current_dir().unwrap();
+        let mut config = config_with_dns_data_dir("dns");
+
+        assert_eq!(config.resolve_paths().unwrap(), cwd.join("sandboxes"));
+        assert_eq!(config.sandbox_work_root(), cwd.join("sandboxes"));
+    }
+
+    #[test]
+    fn test_sandbox_work_root_absolute_data_dir_unchanged() {
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+
+        let resolved = config.resolve_paths().unwrap();
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("/var/lib/temps/sandboxes")
+        );
+        assert_eq!(
+            config.dns_data_dir,
+            std::path::PathBuf::from("/var/lib/temps/dns")
+        );
+        assert_eq!(config.sandbox_work_root(), resolved);
+
+        // The serde default is absolute too.
+        let default_config = AgentConfig {
+            dns_data_dir: default_dns_data_dir(),
+            ..config
+        };
+        assert_eq!(
+            default_config.sandbox_work_root(),
+            std::path::PathBuf::from("/var/lib/temps/sandboxes")
+        );
+    }
+
+    #[test]
+    fn test_sandbox_work_root_dns_dir_directly_under_root() {
+        let mut config = config_with_dns_data_dir("/dns");
+        assert_eq!(
+            config.resolve_paths().unwrap(),
+            std::path::PathBuf::from("/sandboxes")
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_rejects_filesystem_root_dns_dir() {
+        let mut config = config_with_dns_data_dir("/");
+
+        let error = config.resolve_paths().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::DataDirResolution { dns_data_dir, reason }
+                    if dns_data_dir == "/" && reason.contains("filesystem root")
+            ),
+            "unexpected error: {error}"
+        );
+        // Not rewritten on failure.
+        assert_eq!(config.dns_data_dir, std::path::PathBuf::from("/"));
+        // The infallible accessor never yields a relative path either.
+        let fallback = config.sandbox_work_root();
+        assert!(fallback.is_absolute());
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from("/var/lib/temps/sandboxes")
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_rejects_empty_dns_dir() {
+        let mut config = config_with_dns_data_dir("");
+
+        let error = config.resolve_paths().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::DataDirResolution { reason, .. } if reason.contains("empty")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(config.sandbox_work_root().is_absolute());
+    }
+
+    /// A config holding a readable cluster CA, with the given trust.
+    fn config_with_cluster_ca(trust: ControlPlaneTrust) -> (AgentConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let path = dir.path().join("cluster-ca.pem");
+        std::fs::write(&path, &ca.cert_pem).unwrap();
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+        config.cluster_ca_path = Some(path);
+        config.control_plane_trust = Some(trust);
+        (config, dir)
+    }
+
+    #[test]
+    fn agent_json_without_control_plane_trust_trusts_public_roots_only() {
+        // Every agent.json written before the field existed, including every
+        // node that joined directly and holds the cluster CA only for mTLS.
+        let config = config_with_dns_data_dir("/var/lib/temps/dns");
+        assert_eq!(config.control_plane_trust, None);
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::PublicRoots
+        );
+    }
+
+    #[test]
+    fn control_plane_trust_round_trips_through_agent_json() {
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        config.control_plane_legacy_cert_path =
+            Some("/var/lib/temps/control-plane-legacy.pem".into());
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["control_plane_trust"], "cluster_ca");
+        let back: AgentConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.control_plane_trust, Some(ControlPlaneTrust::ClusterCa));
+        assert_eq!(
+            back.control_plane_legacy_cert_path,
+            config.control_plane_legacy_cert_path
+        );
+    }
+
+    #[test]
+    fn cluster_ca_is_not_trusted_for_the_control_plane_unless_the_join_pinned_it() {
+        // A directly joined node holds the cluster CA for its agent's mTLS.
+        // Any enrolled worker can get a leaf from that CA, so it must not
+        // also vouch for the control plane.
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::PublicRoots);
+        assert!(control_plane_ca(&config).is_none());
+    }
+
+    #[test]
+    fn a_pinned_node_trusts_the_cluster_ca_for_the_control_plane() {
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        assert!(control_plane_ca(&config).is_some());
+        assert!(control_plane_client_builder(&config).build().is_ok());
+    }
+
+    /// An HTTPS server on 127.0.0.1 presenting a leaf the cluster CA in
+    /// `ca` signed for `sans`, answering every request with 200.
+    async fn https_server(ca: &temps_core::node_pki::ClusterCa, sans: &[String]) -> String {
+        https_server_with_leaf(ca, sans).await.0
+    }
+
+    async fn https_server_with_leaf(
+        ca: &temps_core::node_pki::ClusterCa,
+        sans: &[String],
+    ) -> (String, String) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let csr = temps_core::node_pki::generate_node_keypair_csr("leaf", sans).unwrap();
+        let leaf =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, sans)
+                .unwrap();
+        let chain: Vec<CertificateDer<'static>> = [leaf.cert_pem.as_str(), &ca.cert_pem]
+            .iter()
+            .flat_map(|pem| rustls_pemfile::certs(&mut pem.as_bytes()).collect::<Vec<_>>())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut csr.key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = [0u8; 4096];
+                    let _ = tls.read(&mut request).await;
+                    let body = r#"{"generation":0,"full_snapshot":false,"records":[]}"#;
+                    let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let _ = tls.write_all(response.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        (format!("https://{address}"), leaf.cert_pem)
+    }
+
+    /// The control plane is reached at an address (its mesh address), but a
+    /// pinned node verifies it by the reserved name: a worker leaf the same
+    /// CA signed for that address -- e.g. one registered with it before the
+    /// mesh existed -- cannot stand in for the control plane.
+    #[tokio::test]
+    async fn a_pinned_node_verifies_the_control_plane_by_its_reserved_name() {
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let ca_pem = std::fs::read(config.cluster_ca_path.as_ref().unwrap()).unwrap();
+        // The same CA, with its key, to sign the server leaves.
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        std::fs::write(config.cluster_ca_path.as_ref().unwrap(), &ca.cert_pem).unwrap();
+        assert_ne!(ca_pem, ca.cert_pem.as_bytes());
+        let address: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        let control_plane = https_server(
+            &ca,
+            &temps_core::node_pki::control_plane_node_api_sans(address),
+        )
+        .await;
+        config.control_plane_url = control_plane.clone();
+        let client = control_plane_client_builder(&config).build().unwrap();
+        let response = client
+            .get(format!("{control_plane}/api/internal/nodes/1/heartbeat"))
+            .send()
+            .await
+            .expect("the control plane's leaf verifies by the reserved name");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let impostor = https_server(&ca, &["127.0.0.1".to_string(), "worker-7".to_string()]).await;
+        let client = control_plane_client_builder(&config).build().unwrap();
+        let error = client
+            .get(format!("{impostor}/api/internal/nodes/1/heartbeat"))
+            .send()
+            .await
+            .expect_err("a worker leaf for the control plane's address is refused");
+        assert!(error.is_connect(), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_worker_first_upgrade_uses_only_the_independently_provisioned_legacy_leaf() {
+        let (mut config, dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        std::fs::write(config.cluster_ca_path.as_ref().unwrap(), &ca.cert_pem).unwrap();
+        let (legacy_url, legacy_leaf) = https_server_with_leaf(&ca, &["127.0.0.1".into()]).await;
+        let pin_path = dir.path().join("control-plane-legacy.pem");
+        std::fs::write(&pin_path, legacy_leaf).unwrap();
+        config.control_plane_legacy_cert_path = Some(pin_path);
+        config.control_plane_url = legacy_url.clone();
+        let client = control_plane_client_builder(&config).build().unwrap();
+        assert!(client
+            .get(&legacy_url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        let mut dns = temps_dns_resolver::ResolverConfig::new(
+            1,
+            "token".into(),
+            legacy_url.clone(),
+            "127.0.0.1".parse().unwrap(),
+            dir.path().join("dns"),
+        );
+        crate::network_sync::apply_dns_control_plane_trust(&config, &mut dns).await;
+        let sync = temps_dns_resolver::SyncClient::new(
+            dns,
+            std::sync::Arc::new(temps_dns_resolver::ZoneStore::new(
+                dir.path().join("zone.json"),
+            )),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                temps_dns_resolver::SyncStatus::default(),
+            )),
+        )
+        .unwrap();
+        sync.tick_once().await.unwrap();
+        let worker_url = https_server(&ca, &["127.0.0.1".into()]).await;
+        assert!(client.get(worker_url).send().await.is_err());
+        let new_url = https_server(
+            &ca,
+            &temps_core::node_pki::control_plane_node_api_sans("127.0.0.1".parse().unwrap()),
+        )
+        .await;
+        assert!(client
+            .get(new_url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+
+    #[tokio::test]
+    async fn unusable_legacy_pins_keep_cluster_trust_for_http_and_dns() {
+        let (mut config, dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        std::fs::write(config.cluster_ca_path.as_ref().unwrap(), &ca.cert_pem).unwrap();
+        let url = https_server(
+            &ca,
+            &temps_core::node_pki::control_plane_node_api_sans("127.0.0.1".parse().unwrap()),
+        )
+        .await;
+        config.control_plane_url = url.clone();
+        let pin_path = dir.path().join("missing-legacy.pem");
+        config.control_plane_legacy_cert_path = Some(pin_path.clone());
+        for malformed in [false, true] {
+            if malformed {
+                std::fs::write(&pin_path, "not a certificate").unwrap();
+            }
+            let trust = control_plane_ca(&config).unwrap();
+            assert!(trust.tls.is_some());
+            assert!(control_plane_client_builder(&config)
+                .build()
+                .unwrap()
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+            let mut dns = temps_dns_resolver::ResolverConfig::new(
+                1,
+                "token".into(),
+                url.clone(),
+                "127.0.0.1".parse().unwrap(),
+                dir.path().join("dns"),
+            );
+            crate::network_sync::apply_dns_control_plane_trust(&config, &mut dns).await;
+            let sync = temps_dns_resolver::SyncClient::new(
+                dns,
+                std::sync::Arc::new(temps_dns_resolver::ZoneStore::new(
+                    dir.path().join("zone.json"),
+                )),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                std::sync::Arc::new(std::sync::RwLock::new(
+                    temps_dns_resolver::SyncStatus::default(),
+                )),
+            )
+            .unwrap();
+            sync.tick_once().await.unwrap();
+        }
+        // An unreadable CA also stays fail-closed instead of choosing public roots.
+        config.cluster_ca_path = Some(dir.path().join("missing-ca.pem"));
+        assert!(control_plane_ca(&config).unwrap().tls.is_none());
+        assert!(control_plane_client_builder(&config)
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn a_pinned_node_without_a_cluster_ca_path_refuses_all_roots() {
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+        config.control_plane_trust = Some(ControlPlaneTrust::ClusterCa);
+        assert!(control_plane_ca(&config).unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn a_node_paired_before_the_field_existed_keeps_trusting_the_cluster_ca() {
+        // `temps join --pair` wrote the control plane's mesh URL, a WireGuard
+        // endpoint and the cluster CA, but no `control_plane_trust`.
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        config.control_plane_trust = None;
+        config.control_plane_url = "https://10.201.0.1:51820".to_string();
+        config.wg_endpoint = Some("203.0.113.7:51820".to_string());
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::ClusterCa
+        );
+        assert!(control_plane_ca(&config).is_some());
+    }
+
+    #[test]
+    fn a_legacy_direct_join_keeps_public_roots() {
+        // Holds the cluster CA for its agent's mTLS, but joined a public URL.
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::PublicRoots);
+        config.control_plane_trust = None;
+        config.control_plane_url = "https://temps.example.com".to_string();
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::PublicRoots
+        );
+        // A WireGuard endpoint alone (e.g. set with `--wg-endpoint`) does not
+        // make a public URL a mesh one.
+        config.wg_endpoint = Some("203.0.113.7:51820".to_string());
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::PublicRoots
+        );
+        assert!(control_plane_ca(&config).is_none());
     }
 }

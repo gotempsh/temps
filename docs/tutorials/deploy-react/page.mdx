@@ -1,281 +1,101 @@
 export const metadata = {
-  title: 'Deploy a React App',
-  description: 'Deploy a React application built with Vite or Create React App on Temps with SPA routing and automatic HTTPS.',
+  title: "Deploy a React App Built With Vite or CRA",
+  description: "Deploy React apps built with Vite or Create React App to your own VPS, with automatic HTTPS, preview deployments and built-in analytics. No Vercel needed.",
   alternates: {
-    canonical: '/docs/deploy-react',
+    canonical: "/docs/deploy-react",
   },
-}
-
-# Deploy a React App
-
-This tutorial walks you through deploying a React single-page application on Temps. Whether you use Vite or Create React App, your static build is served directly from the proxy with SPA routing, gzip compression, and cache headers — no container running at runtime. {{ className: 'lead' }}
-
----
-
-## What you will build {{ anchor: true, id: 'what-you-will-build' }}
-
-- A React app deployed as a static site
-- SPA routing that works on all paths
-- Environment variables embedded at build time
-- Automatic HTTPS and deployment on every push
-
-**Time required:** 5 minutes.
-
-**Prerequisites:**
-- A running Temps instance ([install guide](/docs/your-first-deployment))
-- A React app (Vite or CRA) in a Git repository
-
----
-
-## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
-
-### Vite (recommended)
-
-Verify your `package.json` has a `build` script:
-
-```json {{ title: 'package.json' }}
-{
-  "name": "my-react-app",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+  openGraph: {
+    title: "Deploy a React App Built With Vite or CRA",
+    description: "Deploy React apps built with Vite or Create React App to your own VPS, with automatic HTTPS, preview deployments and built-in analytics. No Vercel needed.",
+    images: [{ url: "/og/docs/deploy-react.png", width: 1200, height: 630, alt: "Deploy React" }],
   },
-  "dependencies": {
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
-  },
-  "devDependencies": {
-    "vite": "^7.0.0",
-    "@vitejs/plugin-react": "^4.0.0"
+  twitter: {
+    card: "summary_large_image",
+    title: "Deploy a React App Built With Vite or CRA",
+    description: "Deploy React apps built with Vite or Create React App to your own VPS, with automatic HTTPS, preview deployments and built-in analytics. No Vercel needed.",
+    images: ["/og/docs/deploy-react.png"],
   }
-}
-```
+};
 
-No other configuration is needed. Temps detects Vite and knows the output directory is `dist/`.
+export const sections = [
+  { title: 'Quickstart', id: 'quickstart' },
+  { title: 'What Temps handles automatically', id: 'what-temps-handles-automatically' },
+  { title: 'Environment variables', id: 'environment-variables' },
+  { title: 'Backend API', id: 'backend-api' },
+  { title: 'SPA routing', id: 'spa-routing' },
+  { title: 'Caching', id: 'compression-and-caching' },
+]
 
-### Create React App
+# Deploy React on Your Own Server
 
-CRA projects work the same way. Temps detects `react-scripts` and uses `build/` as the output directory:
-
-```json {{ title: 'package.json' }}
-{
-  "name": "my-cra-app",
-  "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build"
-  },
-  "dependencies": {
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "react-scripts": "5.0.1"
-  }
-}
-```
+**Deploy your React app and Temps serves it as static files** — running your build, serving the `dist/` or `build/` output from the Temps proxy with no container running, and routing all paths through `index.html` for client-side navigation. {{ className: 'lead' }}
 
 ---
 
-## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+## Quickstart {{ anchor: true, id: 'quickstart' }}
 
-1. Open the Temps dashboard
-2. Click **New Project**
-3. Select your Git provider and repository
-4. Choose the branch to deploy
+From your project root, deploy with your preferred package manager:
 
-Temps detects your framework:
-- **Vite** — if `vite` is in `package.json` dependencies
-- **Create React App** — if `react-scripts` is in `package.json` dependencies
+<CliCommands commands={[
+  { args: "up" },
+]} />
 
----
+Temps detects a Vite app from its `vite.config.js` or `vite.config.ts` and uses the **Vite** preset. Create React App projects aren't detected from the repository, so choose the **React App** preset (`react-app`), with `up --preset react-app` or under **Project → Settings → Build & deploy → Build → Framework**.
 
-## Step 3: Configure environment variables {{ anchor: true, id: 'environment-variables' }}
-
-React apps embed environment variables in the JavaScript bundle at build time. Variables must use the correct prefix to be included:
-
-### Vite
-
-Variables must start with `VITE_`:
-
-```bash
-VITE_API_URL=https://api.example.com
-VITE_PUBLIC_KEY=pk_live_abc123
-```
-
-Access them in your code:
-
-```typescript
-const apiUrl = import.meta.env.VITE_API_URL;
-```
-
-### Create React App
-
-Variables must start with `REACT_APP_`:
-
-```bash
-REACT_APP_API_URL=https://api.example.com
-REACT_APP_PUBLIC_KEY=pk_live_abc123
-```
-
-Access them in your code:
-
-```typescript
-const apiUrl = process.env.REACT_APP_API_URL;
-```
-
-<Note>
-  Because variables are embedded at build time, changing an environment variable in the dashboard requires a new deployment. The variable is baked into the JavaScript bundle — there is no runtime injection for static sites.
-</Note>
-
-### Variables without the prefix
-
-Variables without the required prefix (e.g. `DATABASE_URL`, `SECRET_KEY`) are available during the Docker build step but are NOT included in the client bundle. Use this for build-time secrets that should not be exposed to users.
+Both presets install dependencies with the package manager your lockfile points to, so commit your lockfile (for example `package-lock.json`). They then run its `build` script (for example `npm run build`) and serve the output. Your app is live with HTTPS in a few minutes.
 
 ---
 
-## Step 4: Deploy {{ anchor: true, id: 'deploy' }}
+## What Temps handles automatically {{ anchor: true, id: 'what-temps-handles-automatically' }}
 
-Push a commit or click **Deploy**. Temps:
-
-1. Clones your repository
-2. Detects Vite (or CRA) and generates a Dockerfile
-3. Installs dependencies using the detected package manager
-4. Runs the build command (`vite build` or `react-scripts build`)
-5. Extracts the static files from the build container
-6. Serves them directly from the Temps proxy
-
-A typical React build takes 30-60 seconds.
+| Feature | How Temps handles it |
+| ------- | -------------------- |
+| Build | Your package manager's `build` script |
+| Output | Serves `dist/` (Vite, or the `build.output_dir` set in `.temps.yaml`) or `build/` (Create React App) |
+| HTTPS | Let's Encrypt certificate, auto-renewed |
+| Client-side routing | 404 → index.html fallback configured automatically |
+| Cache headers | Hashed assets get long-lived cache headers |
+| Preview deployments | Opt-in; once enabled, each branch gets its own preview environment |
 
 ---
 
-## Step 5: Verify {{ anchor: true, id: 'verify' }}
+## Environment variables {{ anchor: true, id: 'environment-variables' }}
 
-Open the generated URL. Your React app should load and client-side routing should work on all paths.
+Vite environment variables (prefixed `VITE_`) are embedded at build time:
 
-Test a few things:
-- Navigate to different routes — they should work without 404 errors
-- Refresh the page on a deep route (e.g. `/dashboard/settings`) — it should still work
-- Check the browser console for environment variable issues
+<CliCommands commands={[
+  { args: "environments vars set VITE_API_URL \"https://api.example.com\" -e production" },
+]} />
+
+These values are baked into the bundle when it's built. Changing a variable doesn't redeploy the app; deploy again for the new value to take effect. Create React App works the same way with `REACT_APP_` variables.
+
+---
+
+## Backend API {{ anchor: true, id: 'backend-api' }}
+
+If your React app calls a backend API, deploy your backend as a separate Temps project and set `VITE_API_URL` to its URL. For full-stack apps in a monorepo, set the **Root directory** in project settings for each app — see [Deploy a Project](/docs/your-first-deployment).
 
 ---
 
 ## SPA routing {{ anchor: true, id: 'spa-routing' }}
 
-Single-page applications handle routing in the browser with React Router, TanStack Router, or similar. When a user navigates to `/about`, there is no `about.html` file on disk — the JavaScript router handles it.
-
-Temps handles this automatically. When a request arrives for a path that:
-1. Has no file extension
-2. Does not match a file on disk
-
-The proxy serves `index.html`, and your client-side router takes over.
-
-You do not need `_redirects`, `vercel.json`, `netlify.toml`, or any rewrite configuration.
-
-```typescript {{ title: 'React Router example' }}
-import { BrowserRouter, Routes, Route } from 'react-router';
-
-function App() {
-  return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<Home />} />
-        <Route path="/about" element={<About />} />
-        <Route path="/dashboard/*" element={<Dashboard />} />
-      </Routes>
-    </BrowserRouter>
-  );
-}
-```
+<SpaRouting />
 
 ---
 
-## Connecting to a backend {{ anchor: true, id: 'backend' }}
+## Caching {{ anchor: true, id: 'compression-and-caching' }}
 
-React apps typically call a separate API. Set the API URL as an environment variable:
-
-```bash
-VITE_API_URL=https://api.your-domain.com
-```
-
-```typescript {{ title: 'src/api.ts' }}
-const API_URL = import.meta.env.VITE_API_URL;
-
-export async function fetchUsers() {
-  const response = await fetch(`${API_URL}/api/users`);
-  return response.json();
-}
-```
-
-If your API is also deployed on Temps, both the frontend and API can share the same base domain with different subdomains (e.g. `app.example.com` and `api.example.com`). Configure CORS on the API to allow requests from the frontend domain.
+<StaticAssets />
 
 ---
 
-## Custom build configuration {{ anchor: true, id: 'custom-build' }}
+## Next Steps
 
-Override the defaults in `.temps.yaml`:
-
-```yaml {{ title: '.temps.yaml' }}
-build:
-  install_command: pnpm install --frozen-lockfile
-  build_command: pnpm run build:production
-  output_dir: dist
-```
-
-This is useful when:
-- You have multiple build scripts (e.g. `build:staging`, `build:production`)
-- Your output directory is non-standard
-- You want to use a specific package manager command
-
----
-
-## Performance {{ anchor: true, id: 'performance' }}
-
-Temps applies these optimizations to static sites automatically:
-
-- **Gzip compression** for HTML, CSS, JS, JSON, and SVG files over 1 KB
-- **Immutable cache headers** (`max-age=31536000, immutable`) for hashed assets in `/assets/`, `/static/`, and `/_next/static/`
-- **ETag support** for cache validation with `304 Not Modified` responses
-- **Must-revalidate** for `index.html` and non-hashed files so new deployments take effect immediately
-
-To maximize these benefits, ensure your build tool produces hashed filenames. Vite does this by default (e.g. `assets/index-a1b2c3.js`). CRA also hashes by default.
-
----
-
-## Troubleshooting {{ anchor: true, id: 'troubleshooting' }}
-
-### Blank page
-
-The build output is missing or `index.html` is not in the expected directory. Check the build logs to see where files are written. If your Vite config uses `build.outDir`, set the same value in `.temps.yaml`:
-
-```yaml
-build:
-  output_dir: out  # Must match vite.config.ts build.outDir
-```
-
-### Environment variables are undefined
-
-Check that:
-1. Variables use the correct prefix (`VITE_` for Vite, `REACT_APP_` for CRA)
-2. You triggered a new deployment after adding/changing the variable
-3. You are using the right API (`import.meta.env` for Vite, `process.env` for CRA)
-
-### Assets return 404
-
-If images or other assets in `public/` are not loading, check that the `base` option in `vite.config.ts` is set correctly. For most deployments, leave it as the default (`/`):
-
-```javascript {{ title: 'vite.config.ts' }}
-export default defineConfig({
-  base: '/',  // Default — correct for most deployments
-  plugins: [react()],
-});
-```
-
-Setting `base` to a subdirectory (e.g. `/app/`) changes the URL prefix for all assets.
-
----
-
-## What to explore next {{ anchor: true, id: 'next-steps' }}
-
-<Button href="/docs/custom-domain">Add a custom domain</Button>
-<Button href="/docs/environment-variables">Environment variable management</Button>
-<Button href="/docs/analytics">Add analytics to your app</Button>
-<Button href="/docs/deploy-nodejs">Deploy a backend API</Button>
+<div className="not-prose">
+  <Button href="/docs/environment-variables" variant="text" arrow="right">
+    Environment variables
+  </Button>
+  <Button href="/docs/set-up-preview-deployments" variant="text" arrow="right">
+    Preview deployments
+  </Button>
+</div>

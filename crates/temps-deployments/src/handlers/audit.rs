@@ -220,6 +220,143 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+/// An operator removed a node, or asked to and was refused after Temps had
+/// already cleaned up containers on it. Container removal on the host is a
+/// write even when the node row stays.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeRemovalAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+    /// Whether the operator chose to remove the node even with containers
+    /// Temps could not confirm are gone.
+    pub force: bool,
+    /// `removed`, `refused_unconfirmed_containers`, `refused_still_serving`,
+    /// `cleanup_interrupted` (containers may already have been removed; the
+    /// counts say how many), `cleanup_failed` or `failed`.
+    pub outcome: String,
+    /// Leftover containers removed from the host, or confirmed already gone.
+    pub containers_confirmed_gone: usize,
+    /// Containers that may still exist on the host. With `force` they are
+    /// recorded as orphaned.
+    pub containers_unconfirmed: usize,
+    /// Placements whose `target_nodes` named the node and were rewritten
+    /// without it, each with the target nodes left.
+    pub placements_updated: Vec<String>,
+}
+
+/// An operator drained a node: redeploys were queued elsewhere and the
+/// node's other containers removed and retired.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeDrainAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+    /// `draining`, or `incomplete` when some redeploys could not be queued.
+    pub outcome: String,
+    pub redeployed_environments: usize,
+    pub retired_containers: usize,
+    pub failed_redeploys: usize,
+}
+
+/// An operator turned on the cluster's WireGuard mesh from the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshEnabledAudit {
+    pub context: AuditContext,
+    pub cidr: String,
+    pub listen_port: u16,
+}
+
+/// An operator started pairing a node the control plane will dial (ADR 048
+/// D2b): whoever runs the returned command at that address joins the mesh.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairingCreatedAudit {
+    pub context: AuditContext,
+    pub pairing_id: i32,
+    pub name: String,
+    pub node_endpoint: String,
+}
+
+/// An operator cancelled a pending node pairing.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairingCancelledAudit {
+    pub context: AuditContext,
+    pub pairing_id: i32,
+    pub name: String,
+}
+
+/// An operator made a mesh member the hub, or removed it (ADR 048 D4).
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshHubChangedAudit {
+    pub context: AuditContext,
+    /// `none`, `control-plane` or `node <id>`.
+    pub hub: String,
+}
+
+/// An operator started adding a server over SSH (ADR 048 D2c). The
+/// credentials are not recorded; the host key they confirmed is.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentStartedAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    pub ssh_user: String,
+    pub auth_method: String,
+    pub host_key_fingerprint: String,
+}
+
+/// A server added over SSH joined and its agent runs. Recorded when the
+/// background enrollment ends, with the context (user, IP, user agent) of
+/// the operator who started it.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentSucceededAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    /// The node the server registered as.
+    pub node_id: Option<i32>,
+    /// `service` or `detached`.
+    pub agent_mode: String,
+}
+
+/// Adding a server over SSH failed. Recorded when the background enrollment
+/// ends, with the context of the operator who started it.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentFailedAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    /// The step it was on when it failed.
+    pub step: String,
+    /// Why it failed, as the enrollment shows it (secrets already masked).
+    pub error: String,
+}
+
+/// An operator read a server's SSH host key (`POST /nodes/ssh/host-key`).
+/// Not a write, but it opens a connection from the control plane to an
+/// address the caller chooses, so every attempt is recorded, whatever its
+/// outcome. Never carries credentials: reading a host key takes none.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshHostKeyProbedAudit {
+    pub context: AuditContext,
+    /// The host as the operator typed it.
+    pub host: String,
+    pub port: u16,
+    /// `ip:port` it resolved to, when it did.
+    pub address: Option<String>,
+    /// `host_key_read`, `refused_target` (invalid or not allowed),
+    /// `unreachable` (no SSH server answered) or `error`.
+    pub outcome: String,
+    /// The fingerprint read, when one was.
+    pub fingerprint: Option<String>,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -335,6 +472,19 @@ impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
+impl_audit_operation!(NodeRemovalAudit, "NODE_REMOVAL");
+impl_audit_operation!(NodeDrainAudit, "NODE_DRAIN");
+impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
+impl_audit_operation!(WireguardMeshHubChangedAudit, "WIREGUARD_MESH_HUB_CHANGED");
+impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
+impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
+impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
+impl_audit_operation!(
+    NodeSshEnrollmentSucceededAudit,
+    "NODE_SSH_ENROLLMENT_SUCCEEDED"
+);
+impl_audit_operation!(NodeSshEnrollmentFailedAudit, "NODE_SSH_ENROLLMENT_FAILED");
+impl_audit_operation!(NodeSshHostKeyProbedAudit, "NODE_SSH_HOST_KEY_PROBED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"
@@ -351,3 +501,89 @@ impl_audit_operation!(
     TraefikDiscoveredRouteCertDeauthorizedAudit,
     "TRAEFIK_DISCOVERED_ROUTE_CERT_DEAUTHORIZED"
 );
+
+/// A node replaced the WireGuard mesh key it had registered.
+///
+/// Recorded rather than only logged: the key is what every mesh member
+/// trusts as this node, it is supplied by the node itself, and a change
+/// means either the agent re-keyed (a reinstall, a lost key file) or
+/// something holding the node's token took its place on the mesh. Public
+/// keys are not secret, so both are kept in full to compare with
+/// `wg show` on the node. Not recorded on a node's first registration or
+/// when only the endpoint moves.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeMeshKeyChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+    pub old_public_key: String,
+    pub new_public_key: String,
+    pub old_endpoint: Option<String>,
+    pub new_endpoint: String,
+}
+
+impl_audit_operation!(NodeMeshKeyChangedAudit, "NODE_MESH_KEY_CHANGED");
+
+#[cfg(test)]
+mod node_audit_tests {
+    use super::*;
+
+    fn context() -> AuditContext {
+        AuditContext {
+            user_id: 3,
+            ip_address: None,
+            user_agent: "temps-api".to_string(),
+        }
+    }
+
+    /// Node removal records who removed which node, whether they forced it,
+    /// and what happened to the containers on the host.
+    #[test]
+    fn node_removal_audit_records_force_outcome_and_containers() {
+        let audit = NodeRemovalAudit {
+            context: context(),
+            node_id: 7,
+            node_name: "worker-a".to_string(),
+            force: true,
+            outcome: "removed".to_string(),
+            containers_confirmed_gone: 4,
+            containers_unconfirmed: 2,
+            placements_updated: vec![
+                "environment 'production' (id 4) of project 'shop' now targets [0, 1]".to_string(),
+            ],
+        };
+        assert_eq!(audit.operation_type(), "NODE_REMOVAL");
+        assert_eq!(AuditOperation::user_id(&audit), Some(3));
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).unwrap()).unwrap();
+        assert_eq!(json["node_id"], 7);
+        assert_eq!(json["force"], true);
+        assert_eq!(json["outcome"], "removed");
+        assert_eq!(json["containers_confirmed_gone"], 4);
+        assert_eq!(json["containers_unconfirmed"], 2);
+        assert_eq!(
+            json["placements_updated"][0],
+            "environment 'production' (id 4) of project 'shop' now targets [0, 1]"
+        );
+    }
+
+    #[test]
+    fn node_drain_audit_records_what_moved() {
+        let audit = NodeDrainAudit {
+            context: context(),
+            node_id: 7,
+            node_name: "worker-a".to_string(),
+            outcome: "incomplete".to_string(),
+            redeployed_environments: 2,
+            retired_containers: 5,
+            failed_redeploys: 1,
+        };
+        assert_eq!(audit.operation_type(), "NODE_DRAIN");
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).unwrap()).unwrap();
+        assert_eq!(json["outcome"], "incomplete");
+        assert_eq!(json["redeployed_environments"], 2);
+        assert_eq!(json["retired_containers"], 5);
+        assert_eq!(json["failed_redeploys"], 1);
+    }
+}

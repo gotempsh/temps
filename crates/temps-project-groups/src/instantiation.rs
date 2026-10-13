@@ -1936,6 +1936,8 @@ impl InstantiationEngine {
                     defer_initial_deployment: true,
                     instantiation_token: Some(token),
                     deploy_mode,
+                    cloudflare_enabled: None,
+                    delivery_provider: None,
                 },
                 &caller,
             )
@@ -2298,7 +2300,7 @@ routes:
 "#;
 
     fn template() -> ProjectTemplate {
-        serde_yaml::from_str(APP).expect("template")
+        yaml_serde::from_str(APP).expect("template")
     }
 
     fn planned(template: &ProjectTemplate) -> Vec<PlannedService> {

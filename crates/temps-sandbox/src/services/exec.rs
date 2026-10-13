@@ -155,17 +155,8 @@ impl SandboxService {
             let state = state_for_callback.clone();
             let tx = log_tx_for_callback.clone();
             let fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-                {
-                    let mut s = state.lock().await;
-                    let buf = match stream {
-                        ExecStream::Stdout => &mut s.stdout,
-                        ExecStream::Stderr => &mut s.stderr,
-                    };
-                    buf.push_str(&line);
-                    if !line.ends_with('\n') {
-                        buf.push('\n');
-                    }
-                }
+                // Kept to a bounded tail: a job may print for days.
+                state.lock().await.append_line(stream, &line);
                 let _ = tx.send(JobLogEvent { stream, line });
             });
             fut
@@ -195,10 +186,10 @@ impl SandboxService {
                     // streaming callback produced an empty buffer (e.g.
                     // provider didn't call it).
                     if s.stdout.is_empty() && !r.stdout.is_empty() {
-                        s.stdout = r.stdout;
+                        s.set_output(ExecStream::Stdout, r.stdout);
                     }
                     if s.stderr.is_empty() && !r.stderr.is_empty() {
-                        s.stderr = r.stderr;
+                        s.set_output(ExecStream::Stderr, r.stderr);
                     }
                 }
                 Err(e) => {

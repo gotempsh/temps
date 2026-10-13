@@ -14,6 +14,17 @@ describe('buildPlatformSettingsUpdateBody', () => {
     expect(body.trust_loopback_forwarded_ip).toBe(true)
   })
 
+  test('sends the trusted private networks the Security page edits', () => {
+    const body = buildPlatformSettingsUpdateBody({
+      trusted_private_networks: ['10.0.0.0/8', 'fd12:3456::/48'],
+    } as PlatformSettings)
+
+    expect(body.trusted_private_networks).toEqual([
+      '10.0.0.0/8',
+      'fd12:3456::/48',
+    ])
+  })
+
   test('includes Docker registry configuration in the settings request', () => {
     const dockerRegistry = {
       enabled: true,
@@ -74,5 +85,21 @@ describe('buildPlatformSettingsUpdateBody', () => {
     } as PlatformSettings)
 
     expect(body.container_logs).toEqual(containerLogs)
+  })
+
+  test('sends the on-demand TLS block the settings page edits', () => {
+    const onDemandTls = {
+      enabled: true,
+      zone: 'apps.example.test',
+      max_concurrent: 4,
+      hourly_cap: 25,
+      deployment_url_mode: 'redirect_to_env',
+    }
+
+    const body = buildPlatformSettingsUpdateBody({
+      on_demand_tls: onDemandTls,
+    } as PlatformSettings)
+
+    expect(body.on_demand_tls).toEqual(onDemandTls)
   })
 })

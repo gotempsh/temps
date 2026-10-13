@@ -15,6 +15,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -63,9 +64,11 @@ export function UserDetail() {
     null
   )
 
-  const { data: users, isLoading: isLoadingUser } = useQuery(
+  // There is no single-user endpoint: the user is looked up in the list.
+  const usersQuery = useQuery(
     listUsersOptions({ query: { include_deleted: true } })
   )
+  const { data: users, isLoading: isLoadingUser } = usersQuery
 
   const target = useMemo(
     () => users?.find((u) => u.user.id === parsedId),
@@ -169,6 +172,32 @@ export function UserDetail() {
     )
   }
 
+  // A failed or refused list read says nothing about whether this user
+  // exists. Report the failure instead of "User not found", and do not render
+  // placeholder stats for a user we could not load.
+  if (usersQuery.isError && !target) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => navigate('/settings/users')}
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to users
+          </Button>
+        </div>
+        <ReadFailure
+          resource="User"
+          error={usersQuery.error}
+          onRetry={() => usersQuery.refetch()}
+          retrying={usersQuery.isFetching}
+        />
+      </div>
+    )
+  }
+
   const lastLoginLocation = stats?.lastLogin
     ? [stats.lastLogin.city, stats.lastLogin.country].filter(Boolean).join(', ')
     : ''
@@ -189,6 +218,16 @@ export function UserDetail() {
           Back to users
         </Button>
       </div>
+
+      {usersQuery.isError && (
+        <ReadFailure
+          resource="User"
+          error={usersQuery.error}
+          cached
+          onRetry={() => usersQuery.refetch()}
+          retrying={usersQuery.isFetching}
+        />
+      )}
 
       {/* Profile card */}
       <Card>
@@ -236,7 +275,7 @@ export function UserDetail() {
                   {target.user.mfa_enabled && (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                      className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
                     >
                       <Shield className="h-3 w-3" />
                       MFA
@@ -245,7 +284,7 @@ export function UserDetail() {
                   {target.user.email_verified ? (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                      className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
                     >
                       <MailCheck className="h-3 w-3" />
                       Verified
@@ -253,7 +292,7 @@ export function UserDetail() {
                   ) : (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
                     >
                       <MailWarning className="h-3 w-3" />
                       Unverified
@@ -262,7 +301,7 @@ export function UserDetail() {
                   {target.user.must_change_password && (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
                     >
                       <KeyRound className="h-3 w-3" />
                       Must change password
@@ -536,7 +575,7 @@ function StatCard({ icon, label, value, hint, loading, tone }: StatCardProps) {
           <div
             className={
               tone === 'warning'
-                ? 'mt-1 text-lg font-semibold text-amber-600 dark:text-amber-400'
+                ? 'mt-1 text-lg font-semibold text-amber-700 dark:text-amber-400'
                 : 'mt-1 text-lg font-semibold'
             }
           >

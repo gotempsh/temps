@@ -13,6 +13,7 @@ use utoipa::ToSchema;
 /// Source type for project deployments
 ///
 /// Determines where the deployment artifacts come from:
+/// - `External`: Telemetry only, without hosting
 /// - `Git`: Source code from a Git repository (traditional flow)
 /// - `DockerImage`: Pre-built Docker image from external registry
 /// - `StaticFiles`: Pre-built static files uploaded as a bundle
@@ -35,6 +36,10 @@ use utoipa::ToSchema;
 #[sea_orm(rs_type = "String", db_type = "Text")]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
+    /// Telemetry-only project. Hosting must be explicitly configured before deployment.
+    #[sea_orm(string_value = "external")]
+    External,
+
     /// Traditional Git-based deployments
     /// Source code is pulled from a Git repository, built, and deployed
     #[default]
@@ -66,6 +71,7 @@ pub enum SourceType {
 impl std::fmt::Display for SourceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SourceType::External => write!(f, "external"),
             SourceType::Git => write!(f, "git"),
             SourceType::DockerImage => write!(f, "docker_image"),
             SourceType::StaticFiles => write!(f, "static_files"),
@@ -117,21 +123,41 @@ impl SourceType {
 
     /// Returns true if this project source type allows the given deployment method
     ///
-    /// All project types accept any deployment method. The `source_type` indicates
+    /// Hosted project types accept any deployment method. External projects must
+    /// explicitly configure hosting first. The `source_type` indicates
     /// the primary/configured source, not a restriction on deployment methods.
     /// This allows:
     /// - Git projects to accept Docker images for hotfixes or CI/CD-built images
     /// - Any project to use alternative deployment methods when needed
     /// - Hybrid workflows where different environments use different methods
-    pub fn allows_deployment_method(&self, _method: &SourceType) -> bool {
-        // All source types accept any deployment method
-        true
+    pub fn allows_deployment_method(&self, method: &SourceType) -> bool {
+        !matches!(self, SourceType::External) && !matches!(method, SourceType::External)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_projects_require_explicit_hosting() {
+        let external: SourceType = serde_json::from_str("\"external\"").unwrap();
+        assert_eq!(external.to_string(), "external");
+        assert!(!external.requires_git_info());
+        assert!(!external.is_container_based());
+        assert!(!external.supports_crons());
+        for method in [
+            SourceType::Git,
+            SourceType::DockerImage,
+            SourceType::StaticFiles,
+            SourceType::UploadedSource,
+            SourceType::Manual,
+            SourceType::External,
+        ] {
+            assert!(!external.allows_deployment_method(&method));
+            assert!(!method.allows_deployment_method(&external));
+        }
+    }
 
     #[test]
     fn test_source_type_default() {

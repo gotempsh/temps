@@ -201,10 +201,14 @@ export type PublicHostnameStrategy = 'standard' | 'flat'
 export interface PlatformSettings extends AppSettingsResponse {
   external_url: string | null
   internal_url: string | null
+  /** Base URL handed to third parties that call back (ADR-051); null = use external_url. */
+  public_ingress_url?: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
   /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
   edge_target?: string | null
+  cloudflare_new_projects: boolean
+  bunny_new_projects: boolean
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
@@ -213,6 +217,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
+  /** Private networks user-configured outbound requests may reach. */
+  trusted_private_networks: string[]
   build_limits: BuildLimitsSettings
   /** Enabled, running services included in the metrics scrape cycle. */
   monitored_services_count: number | null
@@ -286,7 +292,11 @@ export async function updatePlatformSettings(
   // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
   // the UI actually reads back.
   if (updated.geo) {
-    const { maxmind_license_key: _key, clear_maxmind_license_key: _clear, ...maskedGeo } = updated.geo
+    const {
+      maxmind_license_key: _key,
+      clear_maxmind_license_key: _clear,
+      ...maskedGeo
+    } = updated.geo
     return { ...updated, geo: maskedGeo as GeoSettings }
   }
   return updated
@@ -299,9 +309,14 @@ export function buildPlatformSettingsUpdateBody(
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
+    // Sent explicitly so clearing the field (null) reaches the server; an
+    // omitted key would keep the stored value.
+    public_ingress_url: updated.public_ingress_url ?? null,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,
+    cloudflare_new_projects: updated.cloudflare_new_projects,
+    bunny_new_projects: updated.bunny_new_projects,
     // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
     // omitting this would silently reset the console's HTTPS policy back to
     // "automatic" whenever any other settings page is saved.
@@ -310,6 +325,9 @@ export function buildPlatformSettingsUpdateBody(
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
     trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
+    // Edited on the Security page; the server also preserves an omitted
+    // value, but the page's own save must carry it to take effect.
+    trusted_private_networks: updated.trusted_private_networks,
     // The settings endpoint replaces the full AppSettings document. Omitting
     // this field makes serde restore DockerRegistrySettings::default(), so a
     // successful save immediately clears the registry configuration.
@@ -364,6 +382,10 @@ export function buildPlatformSettingsUpdateBody(
     // Same reasoning: omitting this would silently disable the MCP server on
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
+    // The server preserves an omitted block (#1171), but the On-demand TLS
+    // page edits it through this builder, so it must be sent for a save
+    // there to take effect.
+    on_demand_tls: updated.on_demand_tls,
   }
   return body
 }
@@ -374,6 +396,9 @@ export function buildPlatformSettingsUpdateBody(
  * @throws Error if settings are invalid
  */
 function validateSettings(settings: PlatformSettings): void {
+  if (settings.cloudflare_new_projects && settings.bunny_new_projects) {
+    throw new Error('Choose Cloudflare or Bunny for new projects, not both')
+  }
   // Validate external URL format
   if (settings.external_url && !isValidUrl(settings.external_url)) {
     throw new Error('Invalid external URL format')

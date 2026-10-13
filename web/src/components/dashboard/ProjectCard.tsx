@@ -69,9 +69,9 @@ const HEALTH_TONE_STYLES: Record<
 > = {
   healthy: {
     dot: 'bg-emerald-500',
-    text: 'text-emerald-600 dark:text-emerald-400',
+    text: 'text-emerald-700 dark:text-emerald-400',
   },
-  degraded: { dot: 'bg-amber-500', text: 'text-amber-600 dark:text-amber-400' },
+  degraded: { dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-400' },
   down: { dot: 'bg-red-500', text: 'text-red-700 dark:text-red-400' },
   idle: { dot: 'bg-zinc-300', text: 'text-muted-foreground' },
   unavailable: { dot: 'bg-zinc-400', text: 'text-muted-foreground' },
@@ -256,6 +256,7 @@ export function ProjectCard({
           )}
         </div>
         <div
+          role="group"
           className="min-w-16 flex-1"
           title={trafficSparklineLabel}
           aria-label={trafficSparklineLabel}
@@ -268,6 +269,50 @@ export function ProjectCard({
         </div>
       </div>
     )
+
+  if (project.source_type === 'external') {
+    return (
+      <Link
+        to={`/projects/${project.slug}/project`}
+        className="group flex min-h-44 min-w-0 flex-col gap-4 rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <span className="truncate font-semibold">{project.name}</span>
+          <Badge variant="secondary">External</Badge>
+        </div>
+        <div
+          role="group"
+          className="rounded-lg bg-muted/30 p-3"
+          aria-label="Visitors in the last 24 hours"
+        >
+          {analyticsLoading ? (
+            <Skeleton className="h-5 w-28" />
+          ) : analyticsError ? (
+            <span className="text-sm text-muted-foreground">
+              Analytics unavailable
+            </span>
+          ) : (
+            <div className="flex items-center gap-3">
+              <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs">
+                <Users className="size-3.5 text-muted-foreground" />
+                <strong className="tabular-nums">
+                  {totalVisitors.toLocaleString()}
+                </strong>
+                <span className="text-muted-foreground">visitors</span>
+              </span>
+              <div className="min-w-0 flex-1">
+                <VisitorSparkline
+                  data={projectCardTraffic(analytics?.hourly_visits).data}
+                  className="w-full"
+                  height={30}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </Link>
+    )
+  }
 
   if (layout === 'compact') {
     return (

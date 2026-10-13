@@ -18,6 +18,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Select,
   SelectContent,
@@ -112,14 +113,17 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
   })
 
   const isLoading = flagsQuery.isPending || environmentsQuery.isPending
+  // A failed read says nothing about how many flags exist. Only a successful
+  // read with zero rows may show the "No feature flags yet" onboarding --
+  // including when the last good read was itself empty, since the failed
+  // refresh is the current answer. Cached rows stay under a stale banner.
+  const flagsReadFailed = flagsQuery.isError && flags.length === 0
+  const flagsStale = flagsQuery.isError && flags.length > 0
 
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div className="space-y-1">
-          <h2 className="text-2xl font-semibold tracking-tight">
-            Feature flags
-          </h2>
           <p className="text-sm text-muted-foreground">
             Change how your app behaves at runtime. Unlike environment
             variables, a flag takes effect in seconds without a redeploy.
@@ -196,7 +200,34 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
             </Button>
           </div>
 
-          {isLoading ? (
+          {environmentsQuery.isError && (
+            <ReadFailure
+              resource="Environments"
+              error={environmentsQuery.error}
+              cached={environmentsQuery.data !== undefined}
+              onRetry={() => void environmentsQuery.refetch()}
+              retrying={environmentsQuery.isFetching}
+            />
+          )}
+
+          {flagsStale && (
+            <ReadFailure
+              resource="Feature flags"
+              error={flagsQuery.error}
+              cached
+              onRetry={refetchFlags}
+              retrying={flagsQuery.isFetching}
+            />
+          )}
+
+          {flagsReadFailed ? (
+            <ReadFailure
+              resource="Feature flags"
+              error={flagsQuery.error}
+              onRetry={refetchFlags}
+              retrying={flagsQuery.isFetching}
+            />
+          ) : isLoading ? (
             <FlagTableSkeleton />
           ) : flags.length === 0 ? (
             <EmptyPlaceholder
@@ -451,7 +482,7 @@ function SourceBadge({
     return (
       <Badge
         variant="outline"
-        className="text-amber-600 dark:text-amber-400"
+        className="text-amber-700 dark:text-amber-400"
         title="Disabled in this environment — the default value is served"
       >
         Disabled

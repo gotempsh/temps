@@ -38,16 +38,23 @@ function randomId(prefix: string): string {
 
 /**
  * Returns a stable visitor id, generating and persisting one on first call.
- * `undefined` outside a browser (no `localStorage`).
+ * `undefined` when `localStorage` is missing or unusable: outside a browser,
+ * blocked by the user's cookie settings or a sandboxed iframe (merely reading
+ * `localStorage` throws), or full. An id that cannot be persisted would be a
+ * new visitor on every event, so the server's own identity is used instead.
  */
 export function getOrCreateVisitorId(): string | undefined {
-  if (typeof localStorage === "undefined") return undefined;
-  let visitorId = localStorage.getItem(VISITOR_ID_KEY);
-  if (!visitorId) {
-    visitorId = randomId("visitor");
-    localStorage.setItem(VISITOR_ID_KEY, visitorId);
+  try {
+    if (typeof localStorage === "undefined") return undefined;
+    let visitorId = localStorage.getItem(VISITOR_ID_KEY);
+    if (!visitorId) {
+      visitorId = randomId("visitor");
+      localStorage.setItem(VISITOR_ID_KEY, visitorId);
+    }
+    return visitorId;
+  } catch {
+    return undefined;
   }
-  return visitorId;
 }
 
 /**
@@ -56,14 +63,19 @@ export function getOrCreateVisitorId(): string | undefined {
  * outbound request so `lastSeen` tracks real activity.
  */
 export function getOrCreateSessionId(): string | undefined {
-  if (typeof localStorage === "undefined") return undefined;
-  const now = Date.now();
-  const lastSeen = Number(localStorage.getItem(SESSION_LAST_SEEN_KEY));
-  let sessionId = localStorage.getItem(SESSION_ID_KEY);
-  if (!sessionId || !Number.isFinite(lastSeen) || now - lastSeen > SESSION_MAX_AGE_MS) {
-    sessionId = randomId("session");
-    localStorage.setItem(SESSION_ID_KEY, sessionId);
+  try {
+    if (typeof localStorage === "undefined") return undefined;
+    const now = Date.now();
+    const lastSeen = Number(localStorage.getItem(SESSION_LAST_SEEN_KEY));
+    let sessionId = localStorage.getItem(SESSION_ID_KEY);
+    if (!sessionId || !Number.isFinite(lastSeen) || now - lastSeen > SESSION_MAX_AGE_MS) {
+      sessionId = randomId("session");
+      localStorage.setItem(SESSION_ID_KEY, sessionId);
+    }
+    localStorage.setItem(SESSION_LAST_SEEN_KEY, String(now));
+    return sessionId;
+  } catch {
+    // Same reasoning as getOrCreateVisitorId.
+    return undefined;
   }
-  localStorage.setItem(SESSION_LAST_SEEN_KEY, String(now));
-  return sessionId;
 }

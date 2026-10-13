@@ -68,7 +68,9 @@ export interface UseScrollVisibilityOptions {
  * @param options - Configuration options
  * @returns A ref callback to attach to the element you want to track
  */
-export function useScrollVisibility(options: UseScrollVisibilityOptions = {}) {
+export function useScrollVisibility(
+  options: UseScrollVisibilityOptions = {}
+): (node: HTMLElement | null) => void {
   const {
     eventName = "component_visible",
     eventData,

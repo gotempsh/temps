@@ -83,7 +83,7 @@ describe('semantic artifact renderers', () => {
 
     expect(html).toContain('STRIPE_SECRET_KEY')
     expect(html).toContain('Open secret settings')
-    expect(html).toContain('/projects/7/settings/environment-variables')
+    expect(html).toContain('/projects/7/environment-variables')
   })
 
   test('renders forms as bound form controls', () => {
@@ -106,7 +106,7 @@ describe('semantic artifact renderers', () => {
       })
     )
 
-    expect(html).toContain('text-red-600')
+    expect(html).toContain('text-red-700')
     expect(html).not.toContain('stroke-success')
   })
 })

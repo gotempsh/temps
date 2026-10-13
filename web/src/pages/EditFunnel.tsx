@@ -114,7 +114,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
     return (
       <div className="w-full space-y-6 p-6">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" disabled>
+          <Button aria-label="Back" variant="ghost" size="icon" disabled>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="space-y-2">
@@ -140,6 +140,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
       <div className="w-full space-y-6 p-6">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate(`/projects/${project.slug}/analytics`)}
@@ -175,6 +176,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
     <div className="relative">
       <div className="absolute top-0 left-0 p-6 z-10">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>

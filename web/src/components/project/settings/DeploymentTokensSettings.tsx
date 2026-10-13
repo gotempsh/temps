@@ -26,7 +26,6 @@ import {
   CardContent,
   CardDescription,
   CardHeader,
-  CardTitle,
 } from '@/components/ui/card'
 import {
   Table,
@@ -252,10 +251,6 @@ export function DeploymentTokensSettings({
       <Card>
         <CardHeader className="flex flex-row items-start justify-between gap-4 border-b">
           <div className="space-y-1.5">
-            <CardTitle className="flex items-center gap-2">
-              <Key className="h-5 w-5" />
-              Deployment Tokens
-            </CardTitle>
             <CardDescription>
               Deployment tokens provide <code>TEMPS_API_URL</code> and{' '}
               <code>TEMPS_API_TOKEN</code> credentials that are automatically
@@ -369,9 +364,7 @@ export function DeploymentTokensSettings({
                             ) : (
                               <RefreshCw className="h-4 w-4" />
                             )}
-                            <span className="hidden sm:inline ml-1">
-                              Rotate
-                            </span>
+                            <span className="max-sm:sr-only ml-1">Rotate</span>
                           </Button>
                           <Button
                             size="sm"
@@ -388,9 +381,7 @@ export function DeploymentTokensSettings({
                             ) : (
                               <Trash2 className="h-4 w-4" />
                             )}
-                            <span className="hidden sm:inline ml-1">
-                              Delete
-                            </span>
+                            <span className="max-sm:sr-only ml-1">Delete</span>
                           </Button>
                         </div>
                       </TableCell>

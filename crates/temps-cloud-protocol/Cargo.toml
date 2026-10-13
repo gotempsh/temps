@@ -16,3 +16,8 @@ chrono.workspace = true
 # wire protocol is a Uuid, so it is enabled here rather than widened globally.
 uuid = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
+# The console-proxy binary data frame (`console_proxy::ConsoleDataFrame`) is
+# encoded/decoded as `Bytes` rather than `Vec<u8>` so a caller relaying frames
+# off a WebSocket can hand the same reference-counted buffer to `tungstenite`
+# without an extra copy.
+bytes.workspace = true

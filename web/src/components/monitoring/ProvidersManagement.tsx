@@ -31,15 +31,22 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Bell, EllipsisVertical } from 'lucide-react'
 import { useNavigate } from 'react-router'
+import { withReturnTo } from '@/lib/safe-return-to'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
+import {
+  providerTestFailureMessage,
+  providerTestSucceeded,
+  providerTestSuccessMessage,
+} from '@/lib/notification-provider-test'
 import { ProviderForm } from './ProviderForm'
 import { NotificationProviderIcon } from './NotificationProviderIcon'
 import { ProviderFormData, providerUpdateSchema } from './schemas'
@@ -73,8 +80,16 @@ interface ExtendedNotificationProvider extends NotificationProviderResponse {
   }
 }
 
-export function ProvidersManagement() {
+interface ProvidersManagementProps {
+  /** Forwarded to the add-provider wizard so it returns to the task. */
+  returnTo?: string | null
+}
+
+export function ProvidersManagement({
+  returnTo = null,
+}: ProvidersManagementProps = {}) {
   const navigate = useNavigate()
+  const addProviderHref = withReturnTo('/settings/notifications/new', returnTo)
   const [editingProvider, setEditingProvider] =
     useState<ExtendedNotificationProvider | null>(null)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -165,9 +180,9 @@ export function ProvidersManagement() {
 
   const testMutation = useMutation({
     ...testProviderMutation(),
-    meta: {
-      errorTitle: 'Failed to test provider',
-    },
+    // handleTest shows the failure with the provider's reason and a Retry
+    // action; the global error toast would only add a generic duplicate.
+    onError: () => {},
   })
 
   const editForm = useForm<ProviderFormData>({
@@ -182,71 +197,77 @@ export function ProvidersManagement() {
   const onEditSubmit = async (data: ProviderFormData) => {
     if (!editingProvider) return
 
-    if (data.provider_type === 'slack') {
-      await updateSlackMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            webhook_url: data.config.webhook_url!,
-            channel: data.config.channel ?? null,
+    try {
+      if (data.provider_type === 'slack') {
+        await updateSlackMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              webhook_url: data.config.webhook_url!,
+              channel: data.config.channel ?? null,
+            },
           },
-        },
-      })
-    } else if (data.provider_type === 'webhook') {
-      await updateWebhookMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            url: data.config.url!,
-            method: data.config.method || 'POST',
-            headers: (data.config.headers || {}) as Record<string, string>,
-            timeout_secs: data.config.timeout_secs || 30,
+        })
+      } else if (data.provider_type === 'webhook') {
+        await updateWebhookMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              url: data.config.url!,
+              method: data.config.method || 'POST',
+              headers: (data.config.headers || {}) as Record<string, string>,
+              timeout_secs: data.config.timeout_secs || 30,
+            },
           },
-        },
-      })
-    } else if (data.provider_type === 'cloudflare') {
-      await updateCloudflareMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            account_id: data.config.account_id!,
-            api_token: data.config.api_token!,
-            from_address: data.config.from_address!,
-            from_name: data.config.from_name || undefined,
-            to_addresses: data.config.to_addresses!,
+        })
+      } else if (data.provider_type === 'cloudflare') {
+        await updateCloudflareMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              account_id: data.config.account_id!,
+              api_token: data.config.api_token!,
+              from_address: data.config.from_address!,
+              from_name: data.config.from_name || undefined,
+              to_addresses: data.config.to_addresses!,
+            },
           },
-        },
-      })
-    } else {
-      await updateEmailMutation.mutateAsync({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            smtp_host: data.config.smtp_host!,
-            smtp_port: data.config.smtp_port!,
-            username: data.config.use_credentials
-              ? data.config.smtp_username || ''
-              : '',
-            password: data.config.use_credentials
-              ? data.config.password || ''
-              : '',
-            from_address: data.config.from_address!,
-            to_addresses: data.config.to_addresses!,
-            from_name: data.config.from_name || undefined,
-            tls_mode: data.config.tls_mode || undefined,
-            starttls_required: data.config.starttls_required,
-            accept_invalid_certs: data.config.accept_invalid_certs,
+        })
+      } else {
+        await updateEmailMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              smtp_host: data.config.smtp_host!,
+              smtp_port: data.config.smtp_port!,
+              username: data.config.use_credentials
+                ? data.config.smtp_username || ''
+                : '',
+              password: data.config.use_credentials
+                ? data.config.password || ''
+                : '',
+              from_address: data.config.from_address!,
+              to_addresses: data.config.to_addresses!,
+              from_name: data.config.from_name || undefined,
+              tls_mode: data.config.tls_mode || undefined,
+              starttls_required: data.config.starttls_required,
+              accept_invalid_certs: data.config.accept_invalid_certs,
+            },
           },
-        },
-      })
+        })
+      }
+    } catch {
+      // The mutation's error handler already shows the failure toast; the
+      // rejection must not escape react-hook-form's submit handler as an
+      // unhandled promise rejection.
     }
   }
 
@@ -265,40 +286,48 @@ export function ProvidersManagement() {
     return data.value
   }
 
-  const handleDelete = async (provider: ExtendedNotificationProvider) => {
-    await deleteMutation.mutateAsync({
-      path: { id: provider.id },
-    })
+  const [providerToDelete, setProviderToDelete] =
+    useState<ExtendedNotificationProvider | null>(null)
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!providerToDelete) return
+    deleteMutation.mutate({ path: { id: providerToDelete.id } })
+    setProviderToDelete(null)
   }
 
   const handleTest = async (provider: ExtendedNotificationProvider) => {
-    toast.promise(
-      testMutation.mutateAsync({
+    const toastId = toast.loading('Sending test notification...')
+    const retry = { label: 'Retry', onClick: () => void handleTest(provider) }
+    try {
+      const result = await testMutation.mutateAsync({
         path: { id: provider.id },
-      }),
-      {
-        loading: 'Sending test notification...',
-        success: (data) =>
-          data.success
-            ? 'Test notification sent successfully!'
-            : data.message || 'Failed to send test notification',
-        error: (error) => {
-          const message =
-            error?.response?.data?.detail || 'Failed to send test notification'
-          return message
-        },
+      })
+      if (providerTestSucceeded(result)) {
+        toast.success(providerTestSuccessMessage(result), { id: toastId })
+      } else {
+        toast.error('Test notification failed', {
+          id: toastId,
+          description: providerTestFailureMessage(result),
+          action: retry,
+        })
       }
-    )
+    } catch (error) {
+      toast.error('Test notification failed', {
+        id: toastId,
+        description: providerTestFailureMessage(undefined, error),
+        action: retry,
+      })
+    }
   }
 
   const handleEdit = (provider: ExtendedNotificationProvider) => {
     navigate(`/settings/notifications/${provider.id}`)
   }
 
-  const handleToggleEnabled = async (
-    provider: ExtendedNotificationProvider
-  ) => {
-    await toggleEnabledMutation.mutateAsync({
+  const handleToggleEnabled = (provider: ExtendedNotificationProvider) => {
+    toggleEnabledMutation.mutate({
       path: { id: provider.id },
       body: {
         name: provider.name,
@@ -334,12 +363,16 @@ export function ProvidersManagement() {
   )
   return (
     <div className="space-y-4">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-4">
+        <p className="text-sm text-muted-foreground">
+          Providers apply to all projects. A route decides which alerts reach
+          each one.
+        </p>
         {/* Only one of this and the empty-state button is ever mounted, so
             the `N` shortcut is registered exactly once either way. */}
         {hasProviders && (
           <CreateActionButton
-            onClick={() => navigate('/settings/notifications/new')}
+            onClick={() => navigate(addProviderHref)}
             label="Add Provider"
           />
         )}
@@ -352,7 +385,7 @@ export function ProvidersManagement() {
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
             <CreateActionButton
-              onClick={() => navigate('/settings/notifications/new')}
+              onClick={() => navigate(addProviderHref)}
               label="Add Provider"
             />
           }
@@ -454,7 +487,7 @@ export function ProvidersManagement() {
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(typedProvider)}
+                        onClick={() => setProviderToDelete(typedProvider)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -487,6 +520,14 @@ export function ProvidersManagement() {
           </div>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={providerToDelete !== null}
+        onOpenChange={(open) => !open && setProviderToDelete(null)}
+        title={`Delete ${providerToDelete?.name ?? 'provider'}?`}
+        description="This permanently deletes the notification provider. Notification routes that use it will stop delivering to it. This cannot be undone."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

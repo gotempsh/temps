@@ -36,7 +36,7 @@ export function canonicalize(value: unknown): unknown {
     return Object.fromEntries(
       Object.keys(source)
         .sort()
-        .map((key) => [key, canonicalize(source[key])])
+        .map((key) => [key, canonicalize(source[key])]),
     )
   }
   return value
@@ -61,4 +61,54 @@ export function pathCount(spec: unknown): number {
     return 0
   }
   return Object.keys(paths).length
+}
+
+/** Keep browser-only installation progress out of the CLI SDK. */
+export function cliSpec(document: unknown): unknown {
+  const spec = structuredClone(document) as {
+    paths: Record<string, unknown>
+    components?: { schemas?: Record<string, unknown> }
+  }
+  const excluded = spec.paths['/x/plugins/install/progress/{id}']
+  delete spec.paths['/x/plugins/install/progress/{id}']
+  const schemas = spec.components?.schemas ?? {}
+  function references(value: unknown): string[] {
+    if (Array.isArray(value)) return value.flatMap(references)
+    if (!value || typeof value !== 'object') return []
+    const object = value as Record<string, unknown>
+    const ref = object.$ref
+    return [
+      ...(typeof ref === 'string' && ref.startsWith('#/components/schemas/')
+        ? [ref.slice('#/components/schemas/'.length)]
+        : []),
+      ...Object.values(object).flatMap(references),
+    ]
+  }
+  const candidates = new Set<string>()
+  const pending = references(excluded)
+  while (pending.length) {
+    const name = pending.pop()!
+    if (candidates.has(name)) continue
+    candidates.add(name)
+    pending.push(...references(schemas[name]))
+  }
+  const used = new Set<string>()
+  const roots = {
+    ...spec,
+    components: {
+      ...spec.components,
+      schemas: Object.fromEntries(
+        Object.entries(schemas).filter(([name]) => !candidates.has(name)),
+      ),
+    },
+  }
+  const queue = references(roots)
+  while (queue.length) {
+    const name = queue.pop()!
+    if (used.has(name)) continue
+    used.add(name)
+    queue.push(...references(schemas[name]))
+  }
+  for (const name of candidates) if (!used.has(name)) delete schemas[name]
+  return spec
 }

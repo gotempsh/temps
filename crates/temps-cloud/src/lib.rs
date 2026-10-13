@@ -7,12 +7,17 @@
 
 mod backup_credential_rotation;
 mod backup_mirror;
+/// ADR-045 §4: the `ConsoleOidcSink` adapter provisioning the managed
+/// console-access OIDC provider. See the module doc for the wiring point
+/// once `temps-cloud-client`'s console-proxy worker exists.
+pub mod console_oidc;
 mod console_oidc_bootstrap;
 mod handler;
 mod lifecycle_notify;
 mod plugin;
 mod service;
 
+pub use console_oidc::ConsoleOidcAdapter;
 pub use console_oidc_bootstrap::{
     parse_console_oidc_bootstrap_file, ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome,
     ConsoleOidcBootstrapParseError, CONSOLE_OIDC_BOOTSTRAP_FILENAME,

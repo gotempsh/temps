@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tower::ServiceExt;
 
-use temps_otel::handlers::configure_routes;
+use temps_otel::handlers::{configure_ingest_routes, configure_routes};
 use temps_otel::ingest::auth::OtelAuthService;
 use temps_otel::ingest::rate_limit::RateLimiter;
 use temps_otel::services::OtelService;
@@ -358,8 +358,10 @@ async fn setup_e2e_as_full(
         },
     );
 
-    let router = configure_routes()
-        .layer(auth_middleware)
+    // Mirrors production: ingest is a public route without the admin auth
+    // middleware, the query routes sit behind it.
+    let router = configure_ingest_routes()
+        .merge(configure_routes().layer(auth_middleware))
         .with_state(app_state);
 
     Some((test_db, router, project_id, metrics_store))
