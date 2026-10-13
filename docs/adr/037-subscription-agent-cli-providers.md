@@ -677,14 +677,33 @@ stores: the Settings card could report "authenticated" while every host turn was
 logged out, or the reverse.
 
 `ai_cli/host_cli.rs` is now the single place a host-side provider CLI command
-is built. It resolves one run user (`temps` if it exists, otherwise `nobody`,
-only when the server is root) and, once an operator has signed in through Temps,
-points the process at the Temps-owned directory
-`<data dir>/ai-cli/<provider>` through both `HOME` and the provider's own
+is built. It resolves one run user per provider (Claude Code: `temps` if it
+exists, otherwise `nobody`, only when the server is root; Codex keeps the
+server user it always ran as) and, once an operator has signed in through
+Temps, points the process at the Temps-owned directory
+`<data dir>/ai-cli/<provider>/home` through both `HOME` and the provider's own
 variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), so the result does not depend on
 whether `runuser -u` resets `HOME`. Status, discovery, turns and sign-in all use
 it. Hosts authenticated out of band keep working: the managed location is used
 only once a sign-in has produced a credential file there.
+
+Filesystem trust boundary. When the server is root, the CLI runs as an
+unprivileged user that owns `home/` and everything below it, so that user can
+rewrite any path inside it. The server therefore never `chown`s, `chmod`s or
+reads through a path inside `home/` with a symlink-following call:
+
+- `<data dir>/ai-cli` and `<data dir>/ai-cli/<provider>` stay owned by the
+  server (`0711`: traversable, not writable, by the run user) and are refused
+  if they are not real directories owned by the server;
+- each sign-in's scratch home is created by the server, locked to `0700` and
+  handed over with `lchown`; promotion renames the whole scratch home over the
+  live one, two renames of entries the run user cannot substitute;
+- credential files are read component by component with `O_NOFOLLOW`, so a
+  planted `.claude` or `.credentials.json` symlink cannot make the server
+  import another account's token;
+- Codex, which runs as the server user, keeps its directories owned by the
+  server user instead of being handed to an unprivileged user that a root
+  process would then execute configuration from.
 
 ### (b) Refresh-token rotation
 

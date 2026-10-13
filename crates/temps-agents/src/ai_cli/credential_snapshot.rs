@@ -270,7 +270,7 @@ pub async fn resolve_claude_oauth(
 
     // Another caller may have refreshed while this one waited for the lock, or
     // the CLI may have refreshed during a host turn.
-    let current = read_claude_snapshot(&location.credential_file).await?;
+    let current = read_claude_snapshot(&location).await?;
     if current.remaining(now_ms()) >= min_remaining {
         return Ok(from_store(current));
     }
@@ -278,7 +278,7 @@ pub async fn resolve_claude_oauth(
     super::claude::refresh_managed_login(&location, REFRESH_TIMEOUT)
         .await
         .map_err(|error| failed(error.to_string()))?;
-    let refreshed = read_claude_snapshot(&location.credential_file).await?;
+    let refreshed = read_claude_snapshot(&location).await?;
     if refreshed.remaining(now_ms()) < MIN_USABLE_REMAINING {
         return Err(failed(
             "the CLI did not produce a fresh access token".to_string(),
@@ -306,37 +306,47 @@ fn from_store(snapshot: ClaudeLoginSnapshot) -> ResolvedClaudeCredential {
 
 /// Read a CLI-owned Claude credential file and drop its refresh token.
 pub async fn read_claude_snapshot(
-    path: &std::path::Path,
+    location: &host_cli::ProviderLocation,
 ) -> Result<ClaudeLoginSnapshot, CredentialSnapshotError> {
-    let raw = read_bounded(path, "claude_cli").await?;
+    let raw = read_credential(location, "claude_cli").await?;
     ClaudeLoginSnapshot::parse(&raw)
 }
 
-async fn read_bounded(
-    path: &std::path::Path,
+/// Read the credential file of a CLI-owned directory without following a
+/// symlink at any component below its `HOME`: the run user owns that tree and
+/// could otherwise point the server's read at another secret.
+async fn read_credential(
+    location: &host_cli::ProviderLocation,
     provider_id: &str,
 ) -> Result<String, CredentialSnapshotError> {
-    use tokio::io::AsyncReadExt;
-
+    let home = location.home.clone();
+    let relative = location.credential_relative();
+    let display = location.credential_file.display().to_string();
     let io_error = |error: std::io::Error| CredentialSnapshotError::Io {
         provider_id: provider_id.to_string(),
-        path: path.display().to_string(),
+        path: display.clone(),
         reason: error.to_string(),
     };
-    let file = tokio::fs::File::open(path).await.map_err(io_error)?;
-    let mut raw = String::new();
-    let read = file
-        .take(MAX_CREDENTIAL_FILE_BYTES + 1)
-        .read_to_string(&mut raw)
-        .await
-        .map_err(io_error)?;
-    if read as u64 > MAX_CREDENTIAL_FILE_BYTES {
-        return Err(CredentialSnapshotError::TooLarge {
-            provider_id: provider_id.to_string(),
-            max_bytes: MAX_CREDENTIAL_FILE_BYTES,
-        });
-    }
-    Ok(raw)
+    let bytes = tokio::task::spawn_blocking(move || {
+        host_cli::read_regular_file_below(&home, &relative, MAX_CREDENTIAL_FILE_BYTES)
+    })
+    .await
+    .map_err(|error| io_error(std::io::Error::other(error)))?
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData
+            && error.to_string().contains("larger than")
+        {
+            return CredentialSnapshotError::TooLarge {
+                provider_id: provider_id.to_string(),
+                max_bytes: MAX_CREDENTIAL_FILE_BYTES,
+            };
+        }
+        io_error(error)
+    })?;
+    String::from_utf8(bytes).map_err(|error| CredentialSnapshotError::InvalidJson {
+        provider_id: provider_id.to_string(),
+        reason: format!("the credential file is not valid UTF-8: {error}"),
+    })
 }
 
 /// Remove the refresh token from a Codex `auth.json` before it is stored or
@@ -378,9 +388,9 @@ pub fn codex_has_subscription_tokens(raw: &str) -> bool {
 
 /// Read a CLI-owned Codex `auth.json` and return it without its refresh token.
 pub async fn read_codex_snapshot(
-    path: &std::path::Path,
+    location: &host_cli::ProviderLocation,
 ) -> Result<String, CredentialSnapshotError> {
-    let raw = read_bounded(path, "codex_cli").await?;
+    let raw = read_credential(location, "codex_cli").await?;
     if !codex_has_subscription_tokens(&raw) {
         return Err(CredentialSnapshotError::MissingAccessToken {
             provider_id: "codex_cli".to_string(),
@@ -459,14 +469,14 @@ pub async fn resolve_codex_auth(
     let location = host_cli::active_managed_location("codex_cli").ok_or_else(|| {
         failed("this server has no Temps-managed Codex sign-in to refresh from".to_string())
     })?;
-    let current = read_codex_snapshot(&location.credential_file).await?;
+    let current = read_codex_snapshot(&location).await?;
     if remaining(&current) >= min_remaining {
         return Ok(current);
     }
     super::codex::refresh_managed_login(&location, REFRESH_TIMEOUT)
         .await
         .map_err(|error| failed(error.to_string()))?;
-    let refreshed = read_codex_snapshot(&location.credential_file).await?;
+    let refreshed = read_codex_snapshot(&location).await?;
     if remaining(&refreshed) < MIN_USABLE_REMAINING {
         return Err(failed(
             "the CLI did not produce a fresh access token".to_string(),

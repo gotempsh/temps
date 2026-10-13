@@ -13,10 +13,22 @@
 //! directory below the Temps data directory:
 //!
 //! ```text
-//! <state root>/<provider id>/            HOME of the CLI process
-//!     .claude/                           CLAUDE_CONFIG_DIR (or .codex/ for CODEX_HOME)
-//!         .credentials.json              written and refreshed by the CLI only
+//! <state root>/                          owned by the Temps server, 0711
+//!     <provider id>/                     owned by the Temps server, 0711
+//!         home/                          HOME of the CLI process; owned by the run user
+//!             .claude/                   CLAUDE_CONFIG_DIR (or .codex/ for CODEX_HOME)
+//!                 .credentials.json      written and refreshed by the CLI only
+//!         login-<id>/                    scratch home for an in-flight sign-in
 //! ```
+//!
+//! Trust boundary. When the server is root the CLI runs as an unprivileged
+//! user that owns `home/` and everything below it. That user can therefore
+//! rewrite anything under `home/`, so the server never `chown`s, `chmod`s or
+//! reads through a path inside it with a symlink-following call: the shared
+//! parents stay server-owned (the run user cannot replace them with a
+//! symlink), new directories are created by the server and handed over with
+//! `lchown`, and credential files are read with `O_NOFOLLOW` component by
+//! component ([`read_regular_file_below`]).
 //!
 //! Hosts that were authenticated out of band keep working: the managed
 //! location is only used once a credential file exists in it.
@@ -75,6 +87,21 @@ impl ProviderLocation {
         })
     }
 
+    /// Path components of the credential file below `home`, for reads that
+    /// must not follow symlinks (see [`read_regular_file_below`]).
+    pub fn credential_relative(&self) -> Vec<String> {
+        self.credential_file
+            .strip_prefix(&self.home)
+            .map(|relative| {
+                relative
+                    .components()
+                    .filter_map(|component| component.as_os_str().to_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Inverse of [`Self::below_home`] for a caller that was handed the
     /// config directory: `HOME` is its parent.
     pub fn from_config_dir(provider_id: &str, config_dir: &Path) -> Option<Self> {
@@ -87,7 +114,12 @@ impl ProviderLocation {
 /// The canonical Temps-managed location for `provider_id`, whether or not a
 /// credential has been written to it yet.
 pub fn managed_location(provider_id: &str) -> Option<ProviderLocation> {
-    ProviderLocation::below_home(provider_id, &state_root()?.join(provider_id))
+    ProviderLocation::below_home(provider_id, &managed_home(state_root()?, provider_id))
+}
+
+/// `HOME` of the promoted sign-in for `provider_id` below `state_root`.
+pub fn managed_home(state_root: &Path, provider_id: &str) -> PathBuf {
+    state_root.join(provider_id).join("home")
 }
 
 /// The managed location, but only when a sign-in through Temps has produced a
@@ -128,6 +160,18 @@ impl HostIdentity {
         Self {
             run_user: Some(user.to_string()),
         }
+    }
+}
+
+/// The identity a provider's CLI runs as. Claude Code drops privileges (it
+/// refuses its bypass mode as root); Codex has always run as the server user,
+/// so its directories must stay owned by the server user too — handing them to
+/// an unprivileged user while a root process executes out of them would let
+/// that user plant configuration root then loads.
+pub fn identity_for(provider_id: &str) -> HostIdentity {
+    match provider_id {
+        "codex_cli" => HostIdentity::current(),
+        _ => HostIdentity::resolve(),
     }
 }
 
@@ -174,22 +218,153 @@ pub fn host_command(
     command
 }
 
-/// Create `path` (and parents) readable only by its owner, handing ownership
-/// of the leaf to the run user when privileges are dropped.
-pub fn prepare_private_dir(path: &Path, identity: &HostIdentity) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+/// Make `path` a server-owned directory that the run user may traverse but
+/// not modify. Used for the shared parents of every sign-in; because the run
+/// user cannot write to them it cannot replace them with a symlink, and
+/// because they are verified to be real directories owned by the server
+/// before any permission change, a symlink planted earlier is refused rather
+/// than followed.
+pub fn ensure_shared_dir(path: &Path, identity: &HostIdentity) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
+    std::fs::create_dir_all(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a directory (symlinks are refused)",
+                path.display()
+            ),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let server_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != server_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by uid {}, expected the server user (uid {})",
+                path.display(),
+                metadata.uid(),
+                server_uid
+            ),
+        ));
+    }
+    let mode = if identity.run_user.is_some() {
+        0o711
+    } else {
+        0o700
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Create a brand-new private directory and hand it to the run user.
+///
+/// `path` must not exist: the leaf is made by the server inside a shared
+/// parent the run user cannot write to, locked to `0700`, and only then given
+/// to the run user with `lchown`, so there is no window in which the run user
+/// can substitute it.
+pub fn create_private_leaf(path: &Path, identity: &HostIdentity) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     if let Some(user) = identity.run_user.as_deref() {
         let uid = lookup_id(user, "-u")?;
         let gid = lookup_id(user, "-g")?;
-        std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
     }
     Ok(())
+}
+
+/// Read a regular file at `relative` below `home` without following a symlink
+/// at any component after `home` itself (which is opened with `O_NOFOLLOW`).
+///
+/// Used when the server reads a credential out of a directory the run user
+/// owns: a plain `File::open` would follow a planted `.claude -> /root/.claude`
+/// or `.credentials.json -> <other secret>` and import someone else's token.
+pub fn read_regular_file_below(
+    home: &Path,
+    relative: &[String],
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some((file_name, directories)) = relative.split_last() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no file name given",
+        ));
+    };
+    let invalid = |what: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid path component {what:?}"),
+        )
+    };
+
+    let open_dir = |dir: Option<&OwnedFd>, name: &std::ffi::OsStr| -> std::io::Result<OwnedFd> {
+        let name = CString::new(name.as_bytes()).map_err(|_| invalid("(nul byte)"))?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `name` is a valid NUL-terminated string that outlives the
+        // call, and `dir` (when present) is a live descriptor we own.
+        let fd = unsafe {
+            match dir {
+                Some(dir) => libc::openat(dir.as_raw_fd(), name.as_ptr(), flags),
+                None => libc::open(name.as_ptr(), flags),
+            }
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by open(2) and is owned by no one else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+
+    let mut current = open_dir(None, home.as_os_str())?;
+    for component in directories {
+        if component.is_empty() || component.contains('/') || component == ".." || component == "."
+        {
+            return Err(invalid(component));
+        }
+        current = open_dir(Some(&current), std::ffi::OsStr::new(component))?;
+    }
+    if file_name.is_empty() || file_name.contains('/') || file_name == ".." || file_name == "." {
+        return Err(invalid(file_name));
+    }
+    let name = CString::new(file_name.as_bytes()).map_err(|_| invalid("(nul byte)"))?;
+    // SAFETY: as above.
+    let fd = unsafe {
+        libc::openat(
+            current.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat(2) and is owned by no one else.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "credential path is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file is larger than {max_bytes} bytes"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn lookup_id(user: &str, flag: &str) -> std::io::Result<u32> {
@@ -228,9 +403,9 @@ pub async fn prepare_login_location(
         operation: operation.to_string(),
         reason: error.to_string(),
     };
-    prepare_private_dir(&location.home, identity)
+    create_private_leaf(&location.home, identity)
         .map_err(|error| io_error("preparing the sign-in home directory", error))?;
-    prepare_private_dir(&location.config_dir, identity)
+    create_private_leaf(&location.config_dir, identity)
         .map_err(|error| io_error("preparing the sign-in config directory", error))?;
     if !run_user_can_write(identity, &location.config_dir).await {
         return Err(LoginError::StateDirectoryInaccessible {
@@ -347,16 +522,129 @@ mod tests {
     }
 
     #[test]
-    fn private_dir_is_owner_only() {
+    fn private_leaf_is_owner_only_and_must_be_new() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("tempdir");
-        let dir = temp.path().join("a").join("b");
-        prepare_private_dir(&dir, &HostIdentity::current()).expect("prepare");
+        let dir = temp.path().join("leaf");
+        create_private_leaf(&dir, &HostIdentity::current()).expect("create");
         let mode = std::fs::metadata(&dir)
             .expect("metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700);
+        assert!(
+            create_private_leaf(&dir, &HostIdentity::current()).is_err(),
+            "an existing path must never be adopted"
+        );
+    }
+
+    #[test]
+    fn shared_dir_refuses_a_symlink_instead_of_following_it() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("victim");
+        std::fs::create_dir(&target).expect("victim");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod victim");
+        let link = temp.path().join("shared");
+        symlink(&target, &link).expect("symlink");
+
+        let error = ensure_shared_dir(&link, &HostIdentity::current())
+            .expect_err("a symlink must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        // The symlink target was left exactly as it was.
+        let mode = std::fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn shared_dir_is_created_and_traversable_when_privileges_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("a").join("b");
+        let dropped = HostIdentity {
+            run_user: Some("temps".to_string()),
+        };
+        ensure_shared_dir(&dir, &dropped).expect("ensure");
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o711);
+        ensure_shared_dir(&dir, &HostIdentity::current()).expect("idempotent");
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn credential_reads_refuse_symlinked_components() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let config = home.join(".claude");
+        std::fs::create_dir_all(&config).expect("config");
+        let relative = vec![".claude".to_string(), ".credentials.json".to_string()];
+
+        // A regular file is read.
+        std::fs::write(config.join(".credentials.json"), b"{\"ok\":true}").expect("write");
+        assert_eq!(
+            read_regular_file_below(&home, &relative, 1024).expect("read"),
+            b"{\"ok\":true}"
+        );
+
+        // A symlinked file is refused even though its target is readable.
+        let secret = temp.path().join("secret.json");
+        std::fs::write(&secret, b"{\"stolen\":true}").expect("secret");
+        std::fs::remove_file(config.join(".credentials.json")).expect("rm");
+        symlink(&secret, config.join(".credentials.json")).expect("symlink file");
+        assert!(read_regular_file_below(&home, &relative, 1024).is_err());
+
+        // A symlinked config directory is refused too.
+        std::fs::remove_file(config.join(".credentials.json")).expect("rm");
+        std::fs::remove_dir(&config).expect("rmdir");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).expect("other");
+        std::fs::write(other.join(".credentials.json"), b"{\"stolen\":true}").expect("w");
+        symlink(&other, &config).expect("symlink dir");
+        assert!(read_regular_file_below(&home, &relative, 1024).is_err());
+    }
+
+    #[test]
+    fn credential_reads_are_size_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).expect("config");
+        std::fs::write(home.join(".claude/.credentials.json"), vec![b'x'; 100]).expect("w");
+        let relative = vec![".claude".to_string(), ".credentials.json".to_string()];
+        assert!(read_regular_file_below(&home, &relative, 50).is_err());
+        assert_eq!(
+            read_regular_file_below(&home, &relative, 100)
+                .expect("fits")
+                .len(),
+            100
+        );
+    }
+
+    #[test]
+    fn codex_keeps_the_server_identity_so_its_files_never_change_owner() {
+        assert_eq!(identity_for("codex_cli"), HostIdentity::current());
+    }
+
+    #[test]
+    fn managed_home_sits_below_a_server_owned_provider_directory() {
+        assert_eq!(
+            managed_home(Path::new("/state"), "claude_cli"),
+            Path::new("/state/claude_cli/home")
+        );
     }
 }

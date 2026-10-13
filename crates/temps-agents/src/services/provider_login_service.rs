@@ -24,7 +24,7 @@
 //! `timeout`, and a process group is killed on cancel, timeout or drop.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -196,7 +196,7 @@ impl Session {
 
 pub struct ProviderLoginService {
     state_root: PathBuf,
-    identity: HostIdentity,
+    identity_override: Option<HostIdentity>,
     limits: LoginLimits,
     resolver: LoginProviderResolver,
     sink: Arc<dyn LoginCredentialSink>,
@@ -210,23 +210,25 @@ impl ProviderLoginService {
     pub fn new(state_root: PathBuf, sink: Arc<dyn LoginCredentialSink>) -> Self {
         Self::with_parts(
             state_root,
-            HostIdentity::resolve(),
+            None,
             LoginLimits::default(),
             Arc::new(crate::ai_cli::create_provider),
             sink,
         )
     }
 
+    /// `identity_override` replaces the per-provider identity from
+    /// [`host_cli::identity_for`]; production passes `None`.
     pub fn with_parts(
         state_root: PathBuf,
-        identity: HostIdentity,
+        identity_override: Option<HostIdentity>,
         limits: LoginLimits,
         resolver: LoginProviderResolver,
         sink: Arc<dyn LoginCredentialSink>,
     ) -> Self {
         Self {
             state_root,
-            identity,
+            identity_override,
             limits,
             resolver,
             sink,
@@ -308,7 +310,10 @@ impl ProviderLoginService {
             provider,
             sink: self.sink.clone(),
             actor,
-            identity: self.identity.clone(),
+            identity: self
+                .identity_override
+                .clone()
+                .unwrap_or_else(|| host_cli::identity_for(provider_id)),
             state_root: self.state_root.clone(),
             scratch_home,
             timeout: self.limits.timeout,
@@ -480,12 +485,10 @@ impl Driver {
         };
 
         let scratch = self.scratch_location()?;
-        // Every directory on the path must be reachable by the CLI's user.
-        for dir in [
-            self.state_root.as_path(),
-            self.state_root.join(&provider_id).as_path(),
-        ] {
-            host_cli::prepare_private_dir(dir, &self.identity)
+        // The shared parents stay owned by the server (traversable, not
+        // writable, by the run user); only the per-sign-in leaf is handed over.
+        for dir in [self.state_root.clone(), self.state_root.join(&provider_id)] {
+            host_cli::ensure_shared_dir(&dir, &self.identity)
                 .map_err(|error| io_error("preparing the CLI state directory", error))?;
         }
 
@@ -585,7 +588,7 @@ impl Driver {
             });
         }
 
-        let credential = read_snapshot(provider_id, &scratch.credential_file).await?;
+        let credential = read_snapshot(provider_id, scratch).await?;
         let auth_type = "subscription";
         self.sink
             .store(StoreLoginCredential {
@@ -596,12 +599,14 @@ impl Driver {
             })
             .await?;
 
-        let canonical =
-            ProviderLocation::below_home(provider_id, &self.state_root.join(provider_id))
-                .ok_or_else(|| LoginError::NotSupported {
-                    provider_id: provider_id.to_string(),
-                })?;
-        promote(scratch, &canonical, &self.identity).map_err(|error| LoginError::Io {
+        let canonical = ProviderLocation::below_home(
+            provider_id,
+            &host_cli::managed_home(&self.state_root, provider_id),
+        )
+        .ok_or_else(|| LoginError::NotSupported {
+            provider_id: provider_id.to_string(),
+        })?;
+        promote(scratch, &canonical).map_err(|error| LoginError::Io {
             provider_id: provider_id.to_string(),
             operation: "activating the new sign-in".to_string(),
             reason: error.to_string(),
@@ -614,12 +619,15 @@ impl Driver {
     }
 }
 
-async fn read_snapshot(provider_id: &str, file: &Path) -> Result<String, LoginError> {
+async fn read_snapshot(
+    provider_id: &str,
+    location: &ProviderLocation,
+) -> Result<String, LoginError> {
     let result = match provider_id {
-        "claude_cli" => read_claude_snapshot(file)
+        "claude_cli" => read_claude_snapshot(location)
             .await
             .map(|snapshot| snapshot.to_stored_json()),
-        "codex_cli" => read_codex_snapshot(file).await,
+        "codex_cli" => read_codex_snapshot(location).await,
         other => {
             return Err(LoginError::NotSupported {
                 provider_id: other.to_string(),
@@ -627,7 +635,7 @@ async fn read_snapshot(provider_id: &str, file: &Path) -> Result<String, LoginEr
         }
     };
     result.map_err(|error| match error {
-        CredentialSnapshotError::Io { ref reason, .. } if !file.exists() => {
+        CredentialSnapshotError::Io { ref reason, .. } if !location.credential_file.exists() => {
             tracing::debug!(provider_id, %reason, "credential file missing after sign-in");
             LoginError::CredentialFileMissing {
                 provider_id: provider_id.to_string(),
@@ -640,22 +648,26 @@ async fn read_snapshot(provider_id: &str, file: &Path) -> Result<String, LoginEr
     })
 }
 
-/// Replace the live CLI directory with the scratch one. The previous
-/// directory is moved aside first and restored if the swap fails, so a
-/// working sign-in is never left half-replaced.
-fn promote(
-    scratch: &ProviderLocation,
-    canonical: &ProviderLocation,
-    identity: &HostIdentity,
-) -> std::io::Result<()> {
-    host_cli::prepare_private_dir(&canonical.home, identity)?;
-    if !canonical.config_dir.exists() {
-        return std::fs::rename(&scratch.config_dir, &canonical.config_dir);
+/// Replace the live CLI home with the scratch one, whole.
+///
+/// Both homes sit directly in the server-owned provider directory, which the
+/// run user cannot write to, so the swap is two renames of entries the run
+/// user cannot substitute. The previous home is moved aside first and restored
+/// if the swap fails, so a working sign-in is never left half-replaced.
+fn promote(scratch: &ProviderLocation, canonical: &ProviderLocation) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(&canonical.home).is_err() {
+        return std::fs::rename(&scratch.home, &canonical.home);
     }
-    let aside = canonical.home.join(format!(".replaced-{}", random_hex(4)));
-    std::fs::rename(&canonical.config_dir, &aside)?;
-    if let Err(error) = std::fs::rename(&scratch.config_dir, &canonical.config_dir) {
-        let _ = std::fs::rename(&aside, &canonical.config_dir);
+    let parent = canonical.home.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the live sign-in directory has no parent",
+        )
+    })?;
+    let aside = parent.join(format!(".replaced-{}", random_hex(4)));
+    std::fs::rename(&canonical.home, &aside)?;
+    if let Err(error) = std::fs::rename(&scratch.home, &canonical.home) {
+        let _ = std::fs::rename(&aside, &canonical.home);
         return Err(error);
     }
     let _ = std::fs::remove_dir_all(&aside);
@@ -671,6 +683,7 @@ mod tests {
     use crate::ai_cli::{AiCliStatus, AiRunConfig, AiRunResult};
     use crate::error::AgentError;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     /// A provider whose CLI is a shell script, driven through the real Claude
     /// login driver so process handling, link scraping and kill-on-cancel are
@@ -843,7 +856,7 @@ exit 1"#;
         });
         ProviderLoginService::with_parts(
             fixture.root.clone(),
-            HostIdentity::current(),
+            Some(HostIdentity::current()),
             limits,
             resolver,
             fixture.sink.clone(),
@@ -945,7 +958,9 @@ exit 1"#;
         );
 
         // The CLI-owned store was promoted and the scratch directory removed.
-        let live = fixture.root.join("claude_cli/.claude/.credentials.json");
+        let live = fixture
+            .root
+            .join("claude_cli/home/.claude/.credentials.json");
         assert!(live.is_file(), "promoted credential missing");
         let leftovers = std::fs::read_dir(fixture.root.join("claude_cli"))
             .expect("read dir")
@@ -978,7 +993,7 @@ exit 1"#;
         assert_eq!(done.phase, LoginPhase::Failed);
         assert!(done.detail.contains("rejected the code"), "{}", done.detail);
         assert!(fixture.sink.stored.lock().expect("lock").is_empty());
-        assert!(!fixture.root.join("claude_cli/.claude").exists());
+        assert!(!fixture.root.join("claude_cli/home").exists());
     }
 
     #[tokio::test]
@@ -1183,7 +1198,7 @@ exit 1"#;
             Arc::new(|id| (id == "opencode").then(|| Box::new(NoLogin) as Box<dyn AiCliProvider>));
         let service = ProviderLoginService::with_parts(
             fixture.root.clone(),
-            HostIdentity::current(),
+            Some(HostIdentity::current()),
             LoginLimits::default(),
             resolver,
             fixture.sink.clone(),
@@ -1236,7 +1251,7 @@ exit 1"#;
             ..Default::default()
         });
         // A previously working sign-in must survive a failed replacement.
-        let live = fixture.root.join("claude_cli/.claude");
+        let live = fixture.root.join("claude_cli/home/.claude");
         std::fs::create_dir_all(&live).expect("live dir");
         std::fs::write(live.join(".credentials.json"), "previous").expect("previous");
         let script = write_script(
@@ -1306,7 +1321,10 @@ done
             !stored[0].1.contains("codex-rotating"),
             "the refresh token must never reach the saved snapshot"
         );
-        assert!(fixture.root.join("codex_cli/.codex/auth.json").is_file());
+        assert!(fixture
+            .root
+            .join("codex_cli/home/.codex/auth.json")
+            .is_file());
     }
 
     #[tokio::test]
@@ -1338,10 +1356,11 @@ done
     }
 
     #[test]
-    fn promote_swaps_directories_and_removes_the_old_one() {
+    fn promote_swaps_homes_and_removes_the_old_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let canonical = ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli"))
-            .expect("canonical");
+        let canonical =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/home"))
+                .expect("canonical");
         let scratch =
             ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/login-1"))
                 .expect("scratch");
@@ -1350,15 +1369,57 @@ done
         std::fs::create_dir_all(&scratch.config_dir).expect("new");
         std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
 
-        promote(&scratch, &canonical, &HostIdentity::current()).expect("promote");
+        promote(&scratch, &canonical).expect("promote");
 
         assert!(canonical.config_dir.join("new").is_file());
         assert!(!canonical.config_dir.join("old").exists());
-        let aside = std::fs::read_dir(&canonical.home)
+        assert!(
+            !scratch.home.exists(),
+            "the scratch home was moved, not copied"
+        );
+        let aside = std::fs::read_dir(dir.path().join("claude_cli"))
             .expect("read")
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with(".replaced-"))
             .count();
         assert_eq!(aside, 0);
+    }
+
+    #[test]
+    fn promote_installs_the_first_sign_in_without_a_previous_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/home"))
+                .expect("canonical");
+        let scratch =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/login-1"))
+                .expect("scratch");
+        std::fs::create_dir_all(&scratch.config_dir).expect("new");
+        std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
+
+        promote(&scratch, &canonical).expect("promote");
+        assert!(canonical.config_dir.join("new").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_planted_symlink_is_never_imported_as_the_credential() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.json");
+        std::fs::write(
+            &victim,
+            r#"{"claudeAiOauth":{"accessToken":"someone-elses-token"}}"#,
+        )
+        .expect("victim");
+        let location =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("home")).expect("location");
+        std::fs::create_dir_all(&location.config_dir).expect("config");
+        symlink(&victim, &location.credential_file).expect("symlink");
+
+        let error = read_snapshot("claude_cli", &location)
+            .await
+            .expect_err("a symlinked credential must be refused");
+        assert!(!error.to_string().contains("someone-elses-token"));
     }
 }
