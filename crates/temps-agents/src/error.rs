@@ -77,6 +77,17 @@ pub enum AgentError {
     #[error("Sandbox not found: {sandbox}")]
     SandboxNotFound { run_id: i32, sandbox: String },
 
+    /// A guest did not answer a terminal request in time. Kept apart from
+    /// [`AgentError::SandboxExecFailed`] so callers can tell "the guest is
+    /// stalled" (retry, restart the sandbox: a 504) from "this sandbox has no
+    /// terminal support" (a setup problem: a 409 with the fix).
+    #[error("Terminal {operation} for sandbox {sandbox_id} did not finish within {timeout_secs}s")]
+    SandboxTerminalTimeout {
+        sandbox_id: String,
+        operation: String,
+        timeout_secs: u64,
+    },
+
     #[error("Sandbox exec failed for run {run_id} in sandbox {sandbox_id}: {reason}")]
     SandboxExecFailed {
         run_id: i32,
@@ -230,6 +241,21 @@ pub fn image_pull_failure_reason(image: &str, cause: &str) -> String {
 }
 
 impl AgentError {
+    /// A terminal request to the guest of `sandbox_id` that did not finish
+    /// within `timeout`; `operation` says which step ("agent handshake on
+    /// vsock port 5000", "agent bootstrap", …).
+    pub fn terminal_timeout(
+        sandbox_id: &str,
+        operation: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        AgentError::SandboxTerminalTimeout {
+            sandbox_id: sandbox_id.to_string(),
+            operation: operation.into(),
+            timeout_secs: timeout.as_secs().max(1),
+        }
+    }
+
     /// When this error is a sandbox creation that failed because the image
     /// could not be pulled, return `(image, cause)`.
     pub fn image_pull_failure(&self) -> Option<(&str, &str)> {
@@ -287,6 +313,31 @@ mod image_pull_tests {
         assert_eq!(error.image_pull_failure(), None);
         let error = creation_failed("Failed to pull image : empty".into());
         assert_eq!(error.image_pull_failure(), None);
+    }
+
+    #[test]
+    fn terminal_timeout_names_the_sandbox_step_and_limit() {
+        let error = AgentError::terminal_timeout(
+            "sbx_test",
+            "agent handshake on vsock port 5000",
+            std::time::Duration::from_secs(10),
+        );
+        let message = error.to_string();
+        assert!(message.contains("sbx_test"), "{message}");
+        assert!(message.contains("vsock port 5000"), "{message}");
+        assert!(message.contains("10s"), "{message}");
+        // Kept apart from exec failures so a handler can answer 504, not 409.
+        assert!(!matches!(error, AgentError::SandboxExecFailed { .. }));
+    }
+
+    #[test]
+    fn terminal_timeout_never_reports_a_zero_second_limit() {
+        let error = AgentError::terminal_timeout(
+            "sbx_test",
+            "handshake",
+            std::time::Duration::from_millis(50),
+        );
+        assert!(error.to_string().contains("within 1s"), "{error}");
     }
 
     #[test]

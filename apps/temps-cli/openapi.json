@@ -32904,11 +32904,16 @@
               "string",
               "null"
             ]
+          },
+          "terminal": {
+            "$ref": "#/components/schemas/TerminalCapability",
+            "description": "Whether `temps sandbox shell` / the terminal endpoint can attach to\nmicrosandbox sandboxes. Independent of `configured`: the guest\nterminal agent is a separate artifact staged on the host."
           }
         },
         "required": [
           "configured",
-          "runtime_version"
+          "runtime_version",
+          "terminal"
         ],
         "type": "object"
       },
@@ -46648,6 +46653,10 @@
           "firecracker_available": {
             "type": "boolean"
           },
+          "firecracker_terminal": {
+            "$ref": "#/components/schemas/TerminalCapability",
+            "description": "Whether Firecracker sandboxes can open interactive terminals (the\nguest terminal agent must be staged). Always present, with the reason\nand fix when not, so clients never have to infer it from a 409."
+          },
           "image_name": {
             "type": "string"
           },
@@ -46664,7 +46673,8 @@
           "image_ready",
           "image_name",
           "firecracker_available",
-          "microsandbox"
+          "microsandbox",
+          "firecracker_terminal"
         ],
         "type": "object"
       },
@@ -54204,6 +54214,33 @@
             "type": "integer"
           }
         },
+        "type": "object"
+      },
+      "TerminalCapability": {
+        "description": "Whether interactive terminals (`SandboxProvider::attach_pty`) can be\nopened on a backend right now, and if not, what to do about it.\n\nReported next to each backend's availability so the console and CLI can\nsay \"terminals need X\" up front instead of discovering it as a bare 409\nwhen someone opens one.",
+        "properties": {
+          "reason": {
+            "description": "Why not, when `supported` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_command": {
+            "description": "Shell command that fixes it, when running one is the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "description": "Whether a terminal can be attached to a sandbox on this backend.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supported"
+        ],
         "type": "object"
       },
       "TestEmailRequest": {
@@ -131051,7 +131088,13 @@
             "description": "Sandbox not found"
           },
           "409": {
-            "description": "Sandbox is not in a state that can be attached to"
+            "description": "Terminal unavailable: the sandbox is not running, or its backend's guest terminal agent is missing (the problem detail names the fix)"
+          },
+          "429": {
+            "description": "Too many concurrent terminals for this instance or account"
+          },
+          "504": {
+            "description": "The sandbox's guest did not accept a terminal in time"
           }
         },
         "security": [

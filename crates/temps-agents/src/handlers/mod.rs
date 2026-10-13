@@ -149,6 +149,7 @@ use crate::services::secret_service::SecretService;
         trigger::WebhookTriggerResponse,
         trigger::SandboxStatusResponse,
         crate::sandbox::microsandbox::MicrosandboxCapability,
+        crate::sandbox::TerminalCapability,
         trigger::SmokeTestResponse,
         trigger::SaveAgentTokenRequest,
         trigger::SaveAgentTokenResponse,

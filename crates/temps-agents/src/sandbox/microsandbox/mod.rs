@@ -37,6 +37,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::{TerminalCapability, PTY_AGENT_BINARY_NAME};
 use crate::error::AgentError;
 
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
@@ -61,6 +62,12 @@ pub const SETUP_PATH: &str = "/agent-sandbox/sandbox";
 
 /// Command that installs the runtime pair for this backend.
 pub const SETUP_COMMAND: &str = "temps microsandbox setup";
+
+/// The fix for a missing or unusable guest terminal agent. Plain
+/// [`SETUP_COMMAND`] is not enough: without a `temps-pty-agent` next to the
+/// running executable it only warns, so the operator also has to say where
+/// the static Linux build is.
+pub const TERMINAL_SETUP_COMMAND: &str = "temps microsandbox setup --pty-agent-bin <path>";
 
 /// Working directory inside the guest. Shared with the Firecracker backend
 /// (`temps_vm_agent::WORK_DIR`) so callers see one layout for both microVM
@@ -122,10 +129,17 @@ pub struct MicrosandboxCapability {
     pub setup_command: Option<String>,
     /// Runtime version this build of Temps expects.
     pub runtime_version: String,
+    /// Whether `temps sandbox shell` / the terminal endpoint can attach to
+    /// microsandbox sandboxes. Independent of `configured`: the guest
+    /// terminal agent is a separate artifact staged on the host.
+    pub terminal: TerminalCapability,
 }
 
 impl MicrosandboxCapability {
-    fn from_probe(probe: Result<(), MicrosandboxUnavailable>) -> Self {
+    fn from_probe(
+        probe: Result<(), MicrosandboxUnavailable>,
+        terminal: TerminalCapability,
+    ) -> Self {
         match probe {
             Ok(()) => Self {
                 configured: true,
@@ -133,6 +147,7 @@ impl MicrosandboxCapability {
                 setup_path: None,
                 setup_command: None,
                 runtime_version: MICROSANDBOX_VERSION.to_string(),
+                terminal,
             },
             Err(error) => {
                 // Only a missing runtime is fixed by the setup command; a host
@@ -150,6 +165,7 @@ impl MicrosandboxCapability {
                     setup_path: Some(SETUP_PATH.to_string()),
                     setup_command,
                     runtime_version: MICROSANDBOX_VERSION.to_string(),
+                    terminal,
                 }
             }
         }
@@ -176,6 +192,12 @@ impl MicrosandboxSandboxConfig {
     /// SDK home: runtime pair, image cache, SDK database and VM state.
     pub fn home(&self) -> PathBuf {
         self.data_dir.join("microsandbox")
+    }
+
+    /// Static Linux `temps-pty-agent` that is written into a guest the first
+    /// time a terminal is opened on it. Staged by `temps microsandbox setup`.
+    pub fn pty_agent_bin(&self) -> PathBuf {
+        self.home().join("guest").join(PTY_AGENT_BINARY_NAME)
     }
 }
 
@@ -269,7 +291,12 @@ pub(crate) fn host_virtualization() -> Result<(), MicrosandboxUnavailable> {
 /// endpoint and by the standalone sandbox API to explain a rejected request.
 pub fn microsandbox_capability(data_dir: &Path) -> MicrosandboxCapability {
     let config = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
-    MicrosandboxCapability::from_probe(host_virtualization().and_then(|()| runtime_probe(&config)))
+    let terminal =
+        TerminalCapability::from_staged_binary(&config.pty_agent_bin(), TERMINAL_SETUP_COMMAND);
+    MicrosandboxCapability::from_probe(
+        host_virtualization().and_then(|()| runtime_probe(&config)),
+        terminal,
+    )
 }
 
 /// Whether the pinned runtime pair is installed under the config's home.
@@ -361,31 +388,75 @@ mod tests {
 
     #[test]
     fn capability_onboards_instead_of_hiding() {
-        let ready = MicrosandboxCapability::from_probe(Ok(()));
+        let ready = MicrosandboxCapability::from_probe(Ok(()), TerminalCapability::supported());
         assert!(ready.configured);
         assert!(ready.reason.is_none());
+        assert!(ready.terminal.supported);
 
-        let missing =
-            MicrosandboxCapability::from_probe(Err(MicrosandboxUnavailable::RuntimeNotInstalled {
+        let missing = MicrosandboxCapability::from_probe(
+            Err(MicrosandboxUnavailable::RuntimeNotInstalled {
                 home: "/d".into(),
                 version: MICROSANDBOX_VERSION.into(),
                 detail: "absent".into(),
-            }));
+            }),
+            TerminalCapability::supported(),
+        );
         assert!(!missing.configured);
         assert_eq!(missing.setup_path.as_deref(), Some(SETUP_PATH));
         assert_eq!(missing.setup_command.as_deref(), Some(SETUP_COMMAND));
 
         // Installing the runtime can't fix a host without a hypervisor; the
         // reason explains it and no misleading command is offered.
-        let no_hv = MicrosandboxCapability::from_probe(Err(
-            MicrosandboxUnavailable::HypervisorUnavailable {
+        let no_hv = MicrosandboxCapability::from_probe(
+            Err(MicrosandboxUnavailable::HypervisorUnavailable {
                 detail: "no kvm".into(),
-            },
-        ));
+            }),
+            TerminalCapability::supported(),
+        );
         assert!(!no_hv.configured);
         assert!(no_hv.reason.unwrap().contains("no kvm"));
         assert_eq!(no_hv.setup_path.as_deref(), Some(SETUP_PATH));
         assert!(no_hv.setup_command.is_none());
+    }
+
+    #[test]
+    fn terminal_capability_follows_the_staged_guest_agent() {
+        // Terminals are reported independently of the runtime: an operator
+        // who installed the runtime but never staged the guest agent must
+        // see exactly that, with the command that fixes it.
+        let dir = tempfile::tempdir().unwrap();
+        let cap = microsandbox_capability(dir.path());
+        assert!(!cap.terminal.supported);
+        assert!(cap
+            .terminal
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not staged"));
+        assert_eq!(
+            cap.terminal.setup_command.as_deref(),
+            Some(TERMINAL_SETUP_COMMAND)
+        );
+        assert!(
+            TERMINAL_SETUP_COMMAND.contains("--pty-agent-bin"),
+            "the terminal fix must name the flag that stages the agent"
+        );
+
+        let config = MicrosandboxSandboxConfig::from_data_dir(dir.path().to_path_buf());
+        let staged = config.pty_agent_bin();
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, crate::sandbox::test_elf::static_for_host(b"")).unwrap();
+        assert!(microsandbox_capability(dir.path()).terminal.supported);
+    }
+
+    #[test]
+    fn staged_guest_agent_lives_outside_the_runtime_pair_directories() {
+        // `bin/` and `lib/` belong to the SDK's pinned runtime installer.
+        let config = MicrosandboxSandboxConfig::from_data_dir(PathBuf::from("/d"));
+        assert_eq!(
+            config.pty_agent_bin(),
+            PathBuf::from("/d/microsandbox/guest/temps-pty-agent")
+        );
     }
 
     #[test]
@@ -406,10 +477,12 @@ mod tests {
 
     #[test]
     fn unsupported_build_offers_no_setup_command() {
-        let cap =
-            MicrosandboxCapability::from_probe(Err(MicrosandboxUnavailable::UnsupportedBuild {
+        let cap = MicrosandboxCapability::from_probe(
+            Err(MicrosandboxUnavailable::UnsupportedBuild {
                 target: "musl".into(),
-            }));
+            }),
+            TerminalCapability::supported(),
+        );
         assert!(!cap.configured);
         let reason = cap.reason.unwrap();
         assert!(reason.contains("musl"), "{reason}");

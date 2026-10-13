@@ -35,3 +35,6 @@ nix = { version = "0.31", features = ["fs", "ioctl", "process", "signal", "term"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

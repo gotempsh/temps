@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -383,6 +383,311 @@ pub struct PtyAttachment {
 /// Fixed by the sandbox Dockerfile (`RUN mkdir -p /run/temps-pty …`), so it
 /// is a property of the image rather than something a caller chooses.
 pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
+
+/// File name of the static Linux `temps-pty-agent` build that the microVM
+/// backends inject into guests. `temps firecracker setup` and
+/// `temps microsandbox setup` look for it next to the running executable
+/// (release archives ship it there) unless told otherwise.
+pub const PTY_AGENT_BINARY_NAME: &str = "temps-pty-agent";
+
+/// Whether interactive terminals (`SandboxProvider::attach_pty`) can be
+/// opened on a backend right now, and if not, what to do about it.
+///
+/// Reported next to each backend's availability so the console and CLI can
+/// say "terminals need X" up front instead of discovering it as a bare 409
+/// when someone opens one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct TerminalCapability {
+    /// Whether a terminal can be attached to a sandbox on this backend.
+    pub supported: bool,
+    /// Why not, when `supported` is false.
+    pub reason: Option<String>,
+    /// Shell command that fixes it, when running one is the fix.
+    pub setup_command: Option<String>,
+}
+
+impl TerminalCapability {
+    pub fn supported() -> Self {
+        Self {
+            supported: true,
+            reason: None,
+            setup_command: None,
+        }
+    }
+
+    pub fn unsupported(reason: impl Into<String>, setup_command: Option<&str>) -> Self {
+        Self {
+            supported: false,
+            reason: Some(reason.into()),
+            setup_command: setup_command.map(str::to_string),
+        }
+    }
+
+    /// Capability for a microVM backend whose guests get `temps-pty-agent`
+    /// injected from a binary staged on the host at `staged`.
+    ///
+    /// A binary that is not a Linux ELF (for instance the macOS build of
+    /// `temps-pty-agent` copied next to a development `temps`) is reported
+    /// as unusable rather than discovered when a guest fails to exec it.
+    pub fn from_staged_binary(staged: &Path, setup_command: &str) -> Self {
+        match read_guest_agent_prefix(staged) {
+            Ok(prefix) => match check_guest_agent(&prefix) {
+                Ok(()) => Self::supported(),
+                Err(rejection) => Self::unsupported(
+                    format!(
+                        "the staged guest terminal agent {} {}",
+                        staged.display(),
+                        rejection
+                    ),
+                    Some(setup_command),
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::unsupported(
+                format!(
+                    "the guest terminal agent (temps-pty-agent) is not staged at {}",
+                    staged.display()
+                ),
+                Some(setup_command),
+            ),
+            Err(e) => Self::unsupported(
+                format!(
+                    "the guest terminal agent at {} is unreadable: {}",
+                    staged.display(),
+                    e
+                ),
+                Some(setup_command),
+            ),
+        }
+    }
+}
+
+/// Why a file cannot run as the guest terminal agent.
+///
+/// Guests are Linux on the host's CPU architecture and boot arbitrary user
+/// images, so the agent has to be a static executable for that architecture:
+/// anything else installs cleanly and then fails to exec inside the guest.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GuestAgentRejection {
+    #[error("is not a Linux executable; the guest needs the static Linux (musl) build of temps-pty-agent")]
+    NotElf,
+
+    #[error(
+        "is not a 64-bit little-endian ELF executable, which is what the guest architecture runs"
+    )]
+    UnsupportedElfClass,
+
+    #[error(
+        "is built for {found}, but sandboxes on this host run {expected}; \
+         stage the {expected} static (musl) build of temps-pty-agent"
+    )]
+    WrongArchitecture {
+        found: String,
+        expected: &'static str,
+    },
+
+    #[error(
+        "is dynamically linked (it asks for the loader {interpreter}), which a guest image \
+         may not provide; stage the static (musl) build of temps-pty-agent"
+    )]
+    DynamicallyLinked { interpreter: String },
+
+    #[error("has a malformed or truncated ELF program header table")]
+    Malformed,
+}
+
+/// `e_machine` value for the guest architecture this host runs, or `None`
+/// for a host architecture we have no expectation for (then the machine type
+/// is not checked rather than guessed at).
+fn expected_guest_machine() -> Option<(u16, &'static str)> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some((62, "x86_64")),
+        "aarch64" => Some((183, "aarch64")),
+        _ => None,
+    }
+}
+
+fn machine_name(machine: u16) -> String {
+    match machine {
+        3 => "i386".to_string(),
+        40 => "arm".to_string(),
+        62 => "x86_64".to_string(),
+        183 => "aarch64".to_string(),
+        243 => "riscv".to_string(),
+        other => format!("ELF machine type {other}"),
+    }
+}
+
+/// Bytes of a file's head read to validate it. The ELF header plus its
+/// program-header table sit at the start of any real executable; this bounds
+/// the read.
+const GUEST_AGENT_PREFIX_BYTES: u64 = 64 * 1024;
+
+fn read_guest_agent_prefix(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let mut prefix = Vec::new();
+    file.take(GUEST_AGENT_PREFIX_BYTES)
+        .read_to_end(&mut prefix)?;
+    Ok(prefix)
+}
+
+/// Check that `bytes` (the start of a candidate agent) is an executable the
+/// guest can run: ELF, 64-bit little-endian, for this host's architecture,
+/// with no program interpreter (a statically linked binary).
+///
+/// Only `PT_INTERP` is looked for, deliberately: a binary that names a
+/// loader depends on the guest image shipping that exact loader, and the
+/// guest is whatever image the user picked. musl static-pie builds have none.
+pub fn check_guest_agent(bytes: &[u8]) -> Result<(), GuestAgentRejection> {
+    const PT_INTERP: u32 = 3;
+    const EI_CLASS_64: u8 = 2;
+    const EI_DATA_LSB: u8 = 1;
+    const MAX_PROGRAM_HEADERS: usize = 256;
+
+    if !is_linux_elf(bytes) {
+        return Err(GuestAgentRejection::NotElf);
+    }
+    // e_ident (16) + type/machine/version (8) + entry/phoff/shoff (24) +
+    // flags/ehsize/phentsize/phnum (10) = 58 bytes of header we read.
+    if bytes.len() < 58 {
+        return Err(GuestAgentRejection::Malformed);
+    }
+    if bytes[4] != EI_CLASS_64 || bytes[5] != EI_DATA_LSB {
+        return Err(GuestAgentRejection::UnsupportedElfClass);
+    }
+    let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    let u32_at =
+        |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    let u64_at = |at: usize| {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[at..at + 8]);
+        u64::from_le_bytes(raw)
+    };
+
+    let machine = u16_at(18);
+    if let Some((expected_machine, expected)) = expected_guest_machine() {
+        if machine != expected_machine {
+            return Err(GuestAgentRejection::WrongArchitecture {
+                found: machine_name(machine),
+                expected,
+            });
+        }
+    }
+
+    let phoff = u64_at(32);
+    let phentsize = usize::from(u16_at(54));
+    let phnum = usize::from(u16_at(56));
+    if phnum == 0 {
+        return Ok(());
+    }
+    // An ELF64 program header is 56 bytes; the type is its first field.
+    if phentsize < 56 || phnum > MAX_PROGRAM_HEADERS {
+        return Err(GuestAgentRejection::Malformed);
+    }
+    let table_start = usize::try_from(phoff).map_err(|_| GuestAgentRejection::Malformed)?;
+    let table_end = phnum
+        .checked_mul(phentsize)
+        .and_then(|len| table_start.checked_add(len))
+        .ok_or(GuestAgentRejection::Malformed)?;
+    if table_end > bytes.len() {
+        return Err(GuestAgentRejection::Malformed);
+    }
+    for index in 0..phnum {
+        let header = table_start + index * phentsize;
+        if u32_at(header) != PT_INTERP {
+            continue;
+        }
+        let offset = u64_at(header + 8);
+        let size = u64_at(header + 32);
+        let interpreter = usize::try_from(offset)
+            .ok()
+            .zip(usize::try_from(size).ok())
+            .and_then(|(start, len)| bytes.get(start..start.checked_add(len)?))
+            .map(|raw| {
+                String::from_utf8_lossy(raw)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+            .unwrap_or_else(|| "an unknown loader".to_string());
+        return Err(GuestAgentRejection::DynamicallyLinked { interpreter });
+    }
+    Ok(())
+}
+
+/// Why a guest terminal agent could not be staged on the host.
+#[derive(Debug, thiserror::Error)]
+pub enum PtyAgentStagingError {
+    #[error("guest terminal agent {path} does not exist")]
+    Missing { path: PathBuf },
+
+    #[error("{path} {reason}")]
+    Rejected {
+        path: PathBuf,
+        reason: GuestAgentRejection,
+    },
+
+    #[error("cannot stage guest terminal agent {source_path} at {dest}: {reason}")]
+    Io {
+        source_path: PathBuf,
+        dest: PathBuf,
+        reason: String,
+    },
+}
+
+/// Copy a guest terminal agent from `source` to `dest` (mode 0755),
+/// refusing anything the guest cannot run — not a Linux ELF, built for
+/// another CPU, or dynamically linked — so a wrong build fails at setup
+/// instead of at the first terminal (see [`check_guest_agent`]).
+///
+/// Both microVM backends' setup commands stage through this, so they agree on
+/// what a valid agent is.
+pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgentStagingError> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    let io_err = |e: std::io::Error| PtyAgentStagingError::Io {
+        source_path: source.to_path_buf(),
+        dest: dest.to_path_buf(),
+        reason: e.to_string(),
+    };
+    let mut file = match std::fs::File::open(source) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PtyAgentStagingError::Missing {
+                path: source.to_path_buf(),
+            })
+        }
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut prefix = Vec::new();
+    std::io::Read::take(&mut file, GUEST_AGENT_PREFIX_BYTES)
+        .read_to_end(&mut prefix)
+        .map_err(io_err)?;
+    // A file shorter than a header cannot be an ELF; check_guest_agent
+    // reports that as "not a Linux executable" rather than as an I/O failure.
+    check_guest_agent(&prefix).map_err(|reason| PtyAgentStagingError::Rejected {
+        path: source.to_path_buf(),
+        reason,
+    })?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    // Write beside the destination and rename, so a running server never
+    // reads a half-copied agent.
+    let tmp = dest.with_extension("staging");
+    std::fs::copy(source, &tmp).map_err(io_err)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(io_err)?;
+    std::fs::rename(&tmp, dest).map_err(io_err)?;
+    Ok(())
+}
+
+/// Whether `header` (a file's leading bytes) starts an ELF image. The guests
+/// are Linux, so an ELF header is the cheapest check that a staged agent is
+/// not, say, a Mach-O build for the developer's laptop.
+pub fn is_linux_elf(header: &[u8]) -> bool {
+    header.starts_with(b"\x7fELF")
+}
 
 /// Pluggable sandbox backend. Implementations provide container/VM isolation
 /// for agent runs. The executor and autofixer interact only with this trait,
@@ -1114,11 +1419,253 @@ done
     }
 }
 
+/// Builders for ELF images that exercise [`check_guest_agent`], shared by the
+/// backends' tests so they all agree on what "a usable agent" looks like.
+#[cfg(test)]
+pub(crate) mod test_elf {
+    /// `e_machine` of the architecture tests run on, which is what the
+    /// guest check expects.
+    pub(crate) fn host_machine() -> u16 {
+        match std::env::consts::ARCH {
+            "aarch64" => 183,
+            _ => 62,
+        }
+    }
+
+    /// A minimal 64-bit little-endian ELF: header, one program header, then
+    /// `payload`. With `interpreter` the program header is `PT_INTERP` and the
+    /// loader path follows it; otherwise it is a plain `PT_LOAD` (static).
+    pub(crate) fn elf(machine: u16, interpreter: Option<&str>, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 64 + 56];
+        out[0..8].copy_from_slice(b"\x7fELF\x02\x01\x01\x00");
+        out[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        out[18..20].copy_from_slice(&machine.to_le_bytes());
+        out[20..24].copy_from_slice(&1u32.to_le_bytes());
+        out[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        out[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        out[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        out[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        match interpreter {
+            Some(path) => {
+                let bytes = path.as_bytes();
+                out[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+                out[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+                out[96..104].copy_from_slice(&((bytes.len() + 1) as u64).to_le_bytes());
+                out.extend_from_slice(bytes);
+                out.push(0);
+            }
+            None => out[64..68].copy_from_slice(&1u32.to_le_bytes()), // PT_LOAD
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A static executable for this host: what `temps-pty-agent` is.
+    pub(crate) fn static_for_host(payload: &[u8]) -> Vec<u8> {
+        elf(host_machine(), None, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
+
+    #[test]
+    fn staged_agent_capability_distinguishes_missing_foreign_and_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(PTY_AGENT_BINARY_NAME);
+        let cmd = "temps example setup";
+
+        let missing = TerminalCapability::from_staged_binary(&staged, cmd);
+        assert!(!missing.supported);
+        let reason = missing.reason.unwrap();
+        assert!(reason.contains("not staged"), "{reason}");
+        assert!(reason.contains(&staged.display().to_string()), "{reason}");
+        assert_eq!(missing.setup_command.as_deref(), Some(cmd));
+
+        // A Mach-O header (macOS build) must not be mistaken for a guest binary.
+        std::fs::write(&staged, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        let foreign = TerminalCapability::from_staged_binary(&staged, cmd);
+        assert!(!foreign.supported);
+        assert!(foreign.reason.unwrap().contains("not a Linux executable"));
+
+        std::fs::write(&staged, test_elf::static_for_host(b"")).unwrap();
+        assert_eq!(
+            TerminalCapability::from_staged_binary(&staged, cmd),
+            TerminalCapability::supported()
+        );
+
+        // A valid Linux ELF that the guest still cannot run is not "ready".
+        let other_machine = if test_elf::host_machine() == 62 {
+            183
+        } else {
+            62
+        };
+        std::fs::write(&staged, test_elf::elf(other_machine, None, b"")).unwrap();
+        let wrong_arch = TerminalCapability::from_staged_binary(&staged, cmd);
+        assert!(!wrong_arch.supported);
+        assert_eq!(wrong_arch.setup_command.as_deref(), Some(cmd));
+        let reason = wrong_arch.reason.unwrap();
+        assert!(reason.contains("sandboxes on this host run"), "{reason}");
+
+        std::fs::write(
+            &staged,
+            test_elf::elf(
+                test_elf::host_machine(),
+                Some("/lib64/ld-linux-x86-64.so.2"),
+                b"",
+            ),
+        )
+        .unwrap();
+        let dynamic = TerminalCapability::from_staged_binary(&staged, cmd);
+        assert!(!dynamic.supported);
+        assert!(dynamic.reason.unwrap().contains("dynamically linked"));
+
+        // Too short to hold a header: unreadable, not "ready".
+        std::fs::write(&staged, b"\x7f").unwrap();
+        assert!(!TerminalCapability::from_staged_binary(&staged, cmd).supported);
+    }
+
+    #[test]
+    fn guest_agent_check_distinguishes_static_dynamic_and_malformed() {
+        let host = test_elf::host_machine();
+        assert_eq!(check_guest_agent(&test_elf::static_for_host(b"x")), Ok(()));
+
+        assert_eq!(check_guest_agent(b""), Err(GuestAgentRejection::NotElf));
+        assert_eq!(
+            check_guest_agent(b"MZ\x90\x00 not an elf at all"),
+            Err(GuestAgentRejection::NotElf)
+        );
+
+        // 32-bit and big-endian images are rejected before any field is read.
+        let mut class32 = test_elf::static_for_host(b"");
+        class32[4] = 1;
+        assert_eq!(
+            check_guest_agent(&class32),
+            Err(GuestAgentRejection::UnsupportedElfClass)
+        );
+        let mut big_endian = test_elf::static_for_host(b"");
+        big_endian[5] = 2;
+        assert_eq!(
+            check_guest_agent(&big_endian),
+            Err(GuestAgentRejection::UnsupportedElfClass)
+        );
+
+        // The loader path is reported, so the message can name it.
+        assert_eq!(
+            check_guest_agent(&test_elf::elf(host, Some("/lib/ld-musl-x86_64.so.1"), b"")),
+            Err(GuestAgentRejection::DynamicallyLinked {
+                interpreter: "/lib/ld-musl-x86_64.so.1".to_string()
+            })
+        );
+
+        // A header table pointing past what was read, or an absurd count.
+        let mut truncated = test_elf::static_for_host(b"");
+        truncated.truncate(80);
+        assert_eq!(
+            check_guest_agent(&truncated),
+            Err(GuestAgentRejection::Malformed)
+        );
+        let mut huge = test_elf::static_for_host(b"");
+        huge[56..58].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            check_guest_agent(&huge),
+            Err(GuestAgentRejection::Malformed)
+        );
+        let mut far = test_elf::static_for_host(b"");
+        far[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(check_guest_agent(&far), Err(GuestAgentRejection::Malformed));
+    }
+
+    #[test]
+    fn staging_installs_an_elf_and_rejects_everything_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("guest").join(PTY_AGENT_BINARY_NAME);
+
+        let missing = stage_pty_agent_binary(&dir.path().join("absent"), &dest).unwrap_err();
+        assert!(matches!(missing, PtyAgentStagingError::Missing { .. }));
+        assert!(missing.to_string().contains("absent"));
+        assert!(!dest.exists(), "a failed stage must not leave a file");
+
+        let foreign = dir.path().join("macho");
+        std::fs::write(&foreign, [0xcf, 0xfa, 0xed, 0xfe, 1, 2, 3, 4]).unwrap();
+        let err = stage_pty_agent_binary(&foreign, &dest).unwrap_err();
+        assert!(matches!(
+            err,
+            PtyAgentStagingError::Rejected {
+                reason: GuestAgentRejection::NotElf,
+                ..
+            }
+        ));
+        assert!(!dest.exists());
+
+        // Right format, wrong CPU or needing a loader: refused at setup, not
+        // discovered as an exec failure inside the first guest.
+        let wrong_cpu = dir.path().join("wrong-cpu");
+        let other_machine = if test_elf::host_machine() == 62 {
+            183
+        } else {
+            62
+        };
+        std::fs::write(&wrong_cpu, test_elf::elf(other_machine, None, b"")).unwrap();
+        assert!(matches!(
+            stage_pty_agent_binary(&wrong_cpu, &dest).unwrap_err(),
+            PtyAgentStagingError::Rejected {
+                reason: GuestAgentRejection::WrongArchitecture { .. },
+                ..
+            }
+        ));
+        let glibc = dir.path().join("glibc");
+        std::fs::write(
+            &glibc,
+            test_elf::elf(
+                test_elf::host_machine(),
+                Some("/lib64/ld-linux-x86-64.so.2"),
+                b"",
+            ),
+        )
+        .unwrap();
+        let err = stage_pty_agent_binary(&glibc, &dest).unwrap_err();
+        assert!(err.to_string().contains("ld-linux"), "{err}");
+        assert!(!dest.exists());
+
+        let tiny = dir.path().join("tiny");
+        std::fs::write(&tiny, b"\x7f").unwrap();
+        assert!(matches!(
+            stage_pty_agent_binary(&tiny, &dest).unwrap_err(),
+            PtyAgentStagingError::Rejected {
+                reason: GuestAgentRejection::NotElf,
+                ..
+            }
+        ));
+
+        let elf = dir.path().join("agent");
+        let payload = test_elf::static_for_host(b"payload");
+        std::fs::write(&elf, &payload).unwrap();
+        std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        stage_pty_agent_binary(&elf, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the staged agent must be executable whatever the source mode"
+        );
+        // No temporary left behind, and re-staging over an existing file works.
+        assert!(!dest.with_extension("staging").exists());
+        stage_pty_agent_binary(&elf, &dest).unwrap();
+    }
+
+    #[test]
+    fn vm_agent_and_docker_agree_on_the_pty_socket_path() {
+        // The microVM guests run the same agent as the Docker sandboxes and
+        // the host handler dials one fixed path; a drift would silently
+        // break terminals on one backend only.
+        assert_eq!(temps_vm_agent::PTY_AGENT_SOCKET, PTY_AGENT_SOCKET);
+    }
 
     #[test]
     fn sandbox_backend_round_trips_through_its_string_form() {

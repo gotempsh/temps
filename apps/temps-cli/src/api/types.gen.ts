@@ -15271,6 +15271,12 @@ export type MicrosandboxCapability = {
      * Console path that shows status and setup instructions.
      */
     setup_path?: string | null;
+    /**
+     * Whether `temps sandbox shell` / the terminal endpoint can attach to
+     * microsandbox sandboxes. Independent of `configured`: the guest
+     * terminal agent is a separate artifact staged on the host.
+     */
+    terminal: TerminalCapability;
 };
 
 /**
@@ -21859,6 +21865,12 @@ export type SandboxStatusResponse = {
     docker_available: boolean;
     error?: string | null;
     firecracker_available: boolean;
+    /**
+     * Whether Firecracker sandboxes can open interactive terminals (the
+     * guest terminal agent must be staged). Always present, with the reason
+     * and fix when not, so clients never have to infer it from a 409.
+     */
+    firecracker_terminal: TerminalCapability;
     image_name: string;
     image_ready: boolean;
     /**
@@ -25419,6 +25431,29 @@ export type TenantResourceCeilings = {
      * host, not merely a large number.
      */
     max_memory_limit_mb?: number;
+};
+
+/**
+ * Whether interactive terminals (`SandboxProvider::attach_pty`) can be
+ * opened on a backend right now, and if not, what to do about it.
+ *
+ * Reported next to each backend's availability so the console and CLI can
+ * say "terminals need X" up front instead of discovering it as a bare 409
+ * when someone opens one.
+ */
+export type TerminalCapability = {
+    /**
+     * Why not, when `supported` is false.
+     */
+    reason?: string | null;
+    /**
+     * Shell command that fixes it, when running one is the fix.
+     */
+    setup_command?: string | null;
+    /**
+     * Whether a terminal can be attached to a sandbox on this backend.
+     */
+    supported: boolean;
 };
 
 /**
@@ -71363,9 +71398,17 @@ export type TerminalErrors = {
      */
     404: unknown;
     /**
-     * Sandbox is not in a state that can be attached to
+     * Terminal unavailable: the sandbox is not running, or its backend's guest terminal agent is missing (the problem detail names the fix)
      */
     409: unknown;
+    /**
+     * Too many concurrent terminals for this instance or account
+     */
+    429: unknown;
+    /**
+     * The sandbox's guest did not accept a terminal in time
+     */
+    504: unknown;
 };
 
 export type CmdKillData = {
