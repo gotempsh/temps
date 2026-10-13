@@ -12,11 +12,13 @@
 //! project row exactly as they do for a standalone project. Each member keeps
 //! its own directory and preset.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
+use sea_orm::sea_query::LockType;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
     TransactionTrait,
 };
 use serde::Serialize;
@@ -33,6 +35,7 @@ use temps_projects::ProjectService;
 use utoipa::ToSchema;
 
 use crate::error::ProjectGroupError;
+use crate::service::ProjectGroupService;
 
 const MAX_FIELD_LEN: usize = 255;
 
@@ -384,23 +387,6 @@ impl GroupRepositoryService {
         }))
     }
 
-    async fn inheriting_members(
-        &self,
-        group_id: i32,
-    ) -> Result<Vec<projects::Model>, ProjectGroupError> {
-        let rows = project_group_members::Entity::find()
-            .filter(project_group_members::Column::GroupId.eq(group_id))
-            .filter(project_group_members::Column::InheritsRepository.eq(true))
-            .find_also_related(projects::Entity)
-            .filter(projects::Column::IsDeleted.eq(false))
-            .all(self.db.as_ref())
-            .await
-            .map_err(ProjectGroupError::db(format!(
-                "loading members of project group {group_id} that follow its repository"
-            )))?;
-        Ok(rows.into_iter().filter_map(|(_, p)| p).collect())
-    }
-
     /// Points `project` at the group's repository and branch through the
     /// same path as the project's own git settings, keeping its directory.
     async fn write_through(
@@ -545,35 +531,88 @@ impl GroupRepositoryService {
     /// Sets the group's repository and writes it through to every member
     /// that follows it. Members are updated one by one; one failing does not
     /// stop the rest, and each outcome is reported.
+    ///
+    /// `authorized_follower_ids` is the set of followers the caller was
+    /// checked to have write access on. The provider round trip below can
+    /// take a while, and another member may start following during it; the
+    /// followers are therefore read again under lock, and when one of them
+    /// is not in the set nothing is changed and
+    /// [`ProjectGroupError::RepositoryFollowersChanged`] is returned.
+    /// Followers that left in the meantime are simply skipped.
     pub async fn set_repository(
         &self,
         group_id: i32,
         input: GroupRepositoryInput,
+        authorized_follower_ids: &HashSet<i32>,
         caller: DeployCaller,
     ) -> Result<(project_groups::Model, Vec<MemberSyncResult>), ProjectGroupError> {
-        let group = self.find_group(group_id).await?;
+        // A missing group fails before the provider round trip.
+        self.find_group(group_id).await?;
         let repo = self.validate(input).await?;
+        self.apply_repository(group_id, &repo, authorized_follower_ids, caller)
+            .await
+    }
 
-        let mut active: project_groups::ActiveModel = group.into();
-        active.git_provider_connection_id = Set(repo.git_provider_connection_id);
-        active.public_provider = Set(repo.public_provider.clone());
-        active.repo_owner = Set(Some(repo.repo_owner.clone()));
-        active.repo_name = Set(Some(repo.repo_name.clone()));
-        active.main_branch = Set(Some(repo.main_branch.clone()));
-        active.updated_at = Set(Utc::now());
-        let group = active
-            .update(self.db.as_ref())
+    /// Stores `repo` on the group and writes it through, once the followers
+    /// have been checked under lock (see [`Self::set_repository`]).
+    ///
+    /// The group row and the follower check share one transaction, so a
+    /// refused change leaves the group as it was. The write-through runs
+    /// after it commits (it goes through other connections and the git
+    /// provider) but only for the followers that transaction saw, all of
+    /// them authorized; a project that starts following later is written by
+    /// its own [`Self::set_inheritance`], which reads the group after this
+    /// commit.
+    async fn apply_repository(
+        &self,
+        group_id: i32,
+        repo: &GroupRepository,
+        authorized_follower_ids: &HashSet<i32>,
+        caller: DeployCaller,
+    ) -> Result<(project_groups::Model, Vec<MemberSyncResult>), ProjectGroupError> {
+        let txn = self
+            .db
+            .begin()
             .await
             .map_err(ProjectGroupError::db(format!(
-                "saving the repository of project group {group_id}"
+                "starting transaction to set the repository of project group {group_id}"
             )))?;
+        let result = async {
+            let locked = ProjectGroupService::lock_repository_followers(
+                &txn,
+                group_id,
+                authorized_follower_ids,
+            )
+            .await?;
+            let mut active: project_groups::ActiveModel = locked.group.into();
+            active.git_provider_connection_id = Set(repo.git_provider_connection_id);
+            active.public_provider = Set(repo.public_provider.clone());
+            active.repo_owner = Set(Some(repo.repo_owner.clone()));
+            active.repo_name = Set(Some(repo.repo_name.clone()));
+            active.main_branch = Set(Some(repo.main_branch.clone()));
+            active.updated_at = Set(Utc::now());
+            let group = active
+                .update(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "saving the repository of project group {group_id}"
+                )))?;
+            Ok::<_, ProjectGroupError>((group, locked.followers))
+        }
+        .await;
+        let (group, followers) = ProjectGroupService::end_transaction(
+            txn,
+            result,
+            format!("repository change of project group {group_id}"),
+        )
+        .await?;
 
-        let mut results = Vec::new();
-        for project in self.inheriting_members(group_id).await? {
+        let mut results = Vec::with_capacity(followers.len());
+        for project in followers {
             let error = if follows(&group, &project) {
                 None
             } else {
-                self.write_through(&repo, &project, caller)
+                self.write_through(repo, &project, caller)
                     .await
                     .err()
                     .map(|e| e.to_string())
@@ -591,14 +630,19 @@ impl GroupRepositoryService {
     /// Removes the group's repository. Members stop following it and keep
     /// the repository and branch they have now; nothing is redeployed.
     ///
+    /// Detaching changes every follower, so the caller must have been
+    /// checked on exactly `authorized_follower_ids`: the followers are read
+    /// again under lock, and one that is not in the set fails the call with
+    /// [`ProjectGroupError::RepositoryFollowersChanged`], changing nothing.
+    ///
     /// Both writes (detach members, clear group row) happen inside a single
     /// transaction so a partial failure cannot leave some members still marked
     /// as inheriting a repository that the group no longer has.
     pub async fn clear_repository(
         &self,
         group_id: i32,
+        authorized_follower_ids: &HashSet<i32>,
     ) -> Result<project_groups::Model, ProjectGroupError> {
-        let group = self.find_group(group_id).await?;
         let txn = self
             .db
             .begin()
@@ -606,39 +650,59 @@ impl GroupRepositoryService {
             .map_err(ProjectGroupError::db(format!(
                 "starting transaction for clearing repository of project group {group_id}"
             )))?;
-        project_group_members::Entity::update_many()
-            .col_expr(
-                project_group_members::Column::InheritsRepository,
-                sea_orm::sea_query::Expr::value(false),
+        let result = async {
+            let locked = ProjectGroupService::lock_repository_followers(
+                &txn,
+                group_id,
+                authorized_follower_ids,
             )
-            .filter(project_group_members::Column::GroupId.eq(group_id))
-            .exec(&txn)
-            .await
-            .map_err(ProjectGroupError::db(format!(
-                "detaching members of project group {group_id} from its repository"
-            )))?;
-        let mut active: project_groups::ActiveModel = group.into();
-        active.git_provider_connection_id = Set(None);
-        active.public_provider = Set(None);
-        active.repo_owner = Set(None);
-        active.repo_name = Set(None);
-        active.main_branch = Set(None);
-        active.updated_at = Set(Utc::now());
-        let updated = active
-            .update(&txn)
-            .await
-            .map_err(ProjectGroupError::db(format!(
-                "clearing the repository of project group {group_id}"
-            )))?;
-        txn.commit().await.map_err(ProjectGroupError::db(format!(
-            "committing clear-repository transaction for project group {group_id}"
-        )))?;
-        Ok(updated)
+            .await?;
+            project_group_members::Entity::update_many()
+                .col_expr(
+                    project_group_members::Column::InheritsRepository,
+                    sea_orm::sea_query::Expr::value(false),
+                )
+                .filter(project_group_members::Column::GroupId.eq(group_id))
+                .exec(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "detaching members of project group {group_id} from its repository"
+                )))?;
+            let mut active: project_groups::ActiveModel = locked.group.into();
+            active.git_provider_connection_id = Set(None);
+            active.public_provider = Set(None);
+            active.repo_owner = Set(None);
+            active.repo_name = Set(None);
+            active.main_branch = Set(None);
+            active.updated_at = Set(Utc::now());
+            active
+                .update(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "clearing the repository of project group {group_id}"
+                )))
+        }
+        .await;
+        ProjectGroupService::end_transaction(
+            txn,
+            result,
+            format!("clearing the repository of project group {group_id}"),
+        )
+        .await
     }
 
     /// Makes a member follow the group's repository (pointing it there now)
     /// or stop following it (keeping its current settings). The flag only
     /// changes once the member's git settings were updated successfully.
+    ///
+    /// Only `project_id` is rewritten, so the caller needs write access to
+    /// that project alone. The flag is set under the lock order of
+    /// [`ProjectGroupService`], re-reading the membership and the group: a
+    /// project that was moved to another group meanwhile is not marked as
+    /// following this one, and a repository that changed after the project
+    /// was pointed at it fails with
+    /// [`ProjectGroupError::RepositoryChanged`] instead of leaving the
+    /// project following a repository the group no longer has.
     pub async fn set_inheritance(
         &self,
         group_id: i32,
@@ -662,6 +726,7 @@ impl GroupRepositoryService {
             return Ok(());
         }
 
+        let mut pointed_at: Option<GroupRepository> = None;
         if inherit {
             let repo = self
                 .repository_of(&group)
@@ -678,18 +743,78 @@ impl GroupRepositoryService {
             if !follows(&group, &project) {
                 self.write_through(&repo, &project, caller).await?;
             }
+            pointed_at = Some(repo);
         }
 
-        let mut active: project_group_members::ActiveModel = membership.into();
-        active.inherits_repository = Set(inherit);
-        active
-            .update(self.db.as_ref())
+        let txn = self
+            .db
+            .begin()
             .await
             .map_err(ProjectGroupError::db(format!(
-                "updating repository inheritance of project {project_id}"
+                "starting transaction to change repository inheritance of project {project_id}"
             )))?;
-        Ok(())
+        let result = async {
+            // Lock order: the project, the group row, then the membership.
+            let locked = ProjectGroupService::lock_projects(&txn, &[project_id]).await?;
+            if inherit && locked.get(&project_id) != Some(&false) {
+                return Err(ProjectGroupError::ProjectNotFound { project_id });
+            }
+            let current = project_groups::Entity::find_by_id(group_id)
+                .lock(LockType::NoKeyUpdate)
+                .one(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "loading project group {group_id}"
+                )))?
+                .ok_or(ProjectGroupError::NotFound { group_id })?;
+            let membership = project_group_members::Entity::find_by_id(project_id)
+                .filter(project_group_members::Column::GroupId.eq(group_id))
+                .lock_exclusive()
+                .one(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "locking group membership of project {project_id}"
+                )))?
+                .ok_or(ProjectGroupError::NotAMember {
+                    group_id,
+                    project_id,
+                })?;
+            if let Some(repo) = &pointed_at {
+                if !is_repository_of(&current, repo) {
+                    return Err(ProjectGroupError::RepositoryChanged {
+                        group_id,
+                        project_id,
+                    });
+                }
+            }
+            let mut active: project_group_members::ActiveModel = membership.into();
+            active.inherits_repository = Set(inherit);
+            active
+                .update(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "updating repository inheritance of project {project_id}"
+                )))?;
+            Ok::<_, ProjectGroupError>(())
+        }
+        .await;
+        ProjectGroupService::end_transaction(
+            txn,
+            result,
+            format!("repository inheritance change of project {project_id}"),
+        )
+        .await
     }
+}
+
+/// Whether `group` still stores exactly `repo` (as returned by
+/// [`GroupRepositoryService::repository_of`]).
+fn is_repository_of(group: &project_groups::Model, repo: &GroupRepository) -> bool {
+    group.git_provider_connection_id == repo.git_provider_connection_id
+        && group.public_provider == repo.public_provider
+        && group.repo_owner.as_deref() == Some(repo.repo_owner.as_str())
+        && group.repo_name.as_deref() == Some(repo.repo_name.as_str())
+        && group.main_branch.as_deref() == Some(repo.main_branch.as_str())
 }
 
 #[cfg(test)]
@@ -1172,7 +1297,11 @@ pub(crate) mod tests {
         let group = followed_group(&conn, "Mono", [9301, 9302]).await;
         assert_eq!(following(&conn, group.id).await, vec![9301, 9302]);
 
-        let cleared = repos.clear_repository(group.id).await.expect("clear");
+        let followers: HashSet<i32> = [9301, 9302].into_iter().collect();
+        let cleared = repos
+            .clear_repository(group.id, &followers)
+            .await
+            .expect("clear");
         assert!(cleared.repo_owner.is_none() && cleared.repo_name.is_none());
         assert!(cleared.main_branch.is_none() && cleared.public_provider.is_none());
         assert!(repos.repository_of(&cleared).await.unwrap().is_none());
@@ -1193,7 +1322,7 @@ pub(crate) mod tests {
         assert_eq!(web.directory, "apps/web");
 
         assert!(matches!(
-            repos.clear_repository(987_654).await,
+            repos.clear_repository(987_654, &HashSet::new()).await,
             Err(ProjectGroupError::NotFound { .. })
         ));
     }
@@ -1231,11 +1360,470 @@ pub(crate) mod tests {
         ));
 
         // With the repository gone there is nothing to follow.
-        repos.clear_repository(group.id).await.expect("clear");
+        let followers: HashSet<i32> = [9312].into_iter().collect();
+        repos
+            .clear_repository(group.id, &followers)
+            .await
+            .expect("clear");
         assert!(matches!(
             repos.set_inheritance(group.id, 9311, true, caller).await,
             Err(ProjectGroupError::RepositoryNotSet { .. })
         ));
         assert!(following(&conn, group.id).await.is_empty());
+    }
+    // -----------------------------------------------------------------
+    // Followers that appear after authorization. Each test holds an
+    // uncommitted transaction ("B") that did what a concurrent request
+    // would, starts the call under test ("A") while it is open, and checks
+    // that A waited for it and then acted on what B committed.
+    // -----------------------------------------------------------------
+
+    use std::time::Duration;
+
+    /// A group on `acme/shop@develop` with no connection or provider (so a
+    /// member already pointing at `acme/shop@main` is written through only
+    /// when the group moves to another branch) holding `members`; only
+    /// `followers` follow it.
+    async fn group_with_followers(
+        conn: &Arc<DatabaseConnection>,
+        name: &str,
+        members: &[i32],
+        followers: &[i32],
+    ) -> project_groups::Model {
+        for id in members {
+            insert_project(conn.as_ref(), *id, &format!("svc{id}")).await;
+        }
+        let group = ProjectGroupService::new(conn.clone())
+            .create_group(CreateProjectGroupRequest {
+                name: name.into(),
+                slug: None,
+                description: None,
+                project_ids: members.to_vec(),
+            })
+            .await
+            .expect("create group")
+            .group;
+        let mut active: project_groups::ActiveModel = group.into();
+        active.repo_owner = Set(Some("acme".into()));
+        active.repo_name = Set(Some("shop".into()));
+        active.main_branch = Set(Some("develop".into()));
+        let group = active.update(conn.as_ref()).await.expect("set repository");
+        project_group_members::Entity::update_many()
+            .col_expr(
+                project_group_members::Column::InheritsRepository,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(project_group_members::Column::GroupId.eq(group.id))
+            .filter(project_group_members::Column::ProjectId.is_in(followers.iter().copied()))
+            .exec(conn.as_ref())
+            .await
+            .expect("follow repository");
+        group
+    }
+
+    /// What the group moves to: the branch every member already points at,
+    /// so following members are in sync and nothing is written through.
+    fn main_branch_repository() -> GroupRepository {
+        GroupRepository {
+            git_provider_connection_id: None,
+            public_provider: None,
+            repo_owner: "acme".into(),
+            repo_name: "shop".into(),
+            main_branch: "main".into(),
+            repository_id: None,
+            clone_url: None,
+        }
+    }
+
+    async fn set_following(conn: &impl ConnectionTrait, project_id: i32, follows: bool) {
+        conn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE project_group_members SET inherits_repository = $1 WHERE project_id = $2",
+            [follows.into(), project_id.into()],
+        ))
+        .await
+        .expect("change inheritance");
+    }
+
+    async fn branch_of(conn: &DatabaseConnection, group_id: i32) -> Option<String> {
+        project_groups::Entity::find_by_id(group_id)
+            .one(conn)
+            .await
+            .expect("load group")
+            .expect("group exists")
+            .main_branch
+    }
+
+    /// Runs `fut` on its own task and asserts it is still waiting after a
+    /// pause, i.e. blocked on a lock the open transaction holds.
+    async fn blocked<T, F>(what: &str, fut: F) -> tokio::task::JoinHandle<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let handle = tokio::spawn(fut);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !handle.is_finished(),
+            "{what} must wait for the concurrent transaction instead of reading around it"
+        );
+        handle
+    }
+
+    async fn done<T>(handle: tokio::task::JoinHandle<T>) -> T {
+        match tokio::time::timeout(Duration::from_secs(20), handle).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => panic!("task failed: {e}"),
+            Err(_) => panic!("task still blocked 20s after the other transaction committed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_that_appears_after_authorization_is_rejected_and_nothing_changes() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let repos = Arc::new(repos);
+        // 9401 follows and was authorized; 9402 is a member that is not
+        // following when the caller is checked.
+        let group = group_with_followers(&conn, "Late follower", &[9401, 9402], &[9401]).await;
+        let authorized: HashSet<i32> = [9401].into_iter().collect();
+
+        // B: 9402 starts following (as `set_inheritance` would), uncommitted.
+        let b = conn.begin().await.unwrap();
+        set_following(&b, 9402, true).await;
+
+        let a = {
+            let repos = repos.clone();
+            let group_id = group.id;
+            blocked("changing the repository", async move {
+                repos
+                    .apply_repository(
+                        group_id,
+                        &main_branch_repository(),
+                        &authorized,
+                        DeployCaller::from_instance_admin(false),
+                    )
+                    .await
+            })
+            .await
+        };
+        b.commit().await.unwrap();
+
+        let err = done(a).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProjectGroupError::RepositoryFollowersChanged { group_id, project_ids }
+                    if *group_id == group.id && project_ids == &vec![9402]
+            ),
+            "got {err:?}"
+        );
+        // Nothing moved: the group keeps its branch, both projects keep
+        // theirs, and 9402 keeps the flag B gave it.
+        assert_eq!(branch_of(&conn, group.id).await.as_deref(), Some("develop"));
+        for id in [9401, 9402] {
+            let project = projects::Entity::find_by_id(id)
+                .one(conn.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(project.main_branch, "main");
+        }
+        assert_eq!(following(&conn, group.id).await, vec![9401, 9402]);
+    }
+
+    #[tokio::test]
+    async fn the_authorized_followers_are_written_through() {
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let group =
+            group_with_followers(&conn, "Authorized", &[9411, 9412, 9413], &[9411, 9412]).await;
+        let authorized: HashSet<i32> = [9411, 9412].into_iter().collect();
+
+        let (updated, results) = repos
+            .apply_repository(
+                group.id,
+                &main_branch_repository(),
+                &authorized,
+                DeployCaller::from_instance_admin(false),
+            )
+            .await
+            .expect("every follower was authorized");
+        assert_eq!(updated.main_branch.as_deref(), Some("main"));
+        assert_eq!(branch_of(&conn, group.id).await.as_deref(), Some("main"));
+        let ids: Vec<i32> = results.iter().map(|r| r.project_id).collect();
+        assert_eq!(ids, vec![9411, 9412], "non-followers are not reported");
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn a_follower_that_leaves_after_authorization_is_tolerated() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let repos = Arc::new(repos);
+        let group = group_with_followers(&conn, "Leaver", &[9421, 9422], &[9421, 9422]).await;
+        let authorized: HashSet<i32> = [9421, 9422].into_iter().collect();
+
+        // B: 9422 stops following, uncommitted.
+        let b = conn.begin().await.unwrap();
+        set_following(&b, 9422, false).await;
+        let a = {
+            let repos = repos.clone();
+            let group_id = group.id;
+            blocked("changing the repository", async move {
+                repos
+                    .apply_repository(
+                        group_id,
+                        &main_branch_repository(),
+                        &authorized,
+                        DeployCaller::from_instance_admin(false),
+                    )
+                    .await
+            })
+            .await
+        };
+        b.commit().await.unwrap();
+
+        let (_, results) = done(a)
+            .await
+            .expect("a follower that left is not a conflict");
+        let ids: Vec<i32> = results.iter().map(|r| r.project_id).collect();
+        assert_eq!(ids, vec![9421]);
+        assert_eq!(branch_of(&conn, group.id).await.as_deref(), Some("main"));
+        assert_eq!(following(&conn, group.id).await, vec![9421]);
+    }
+
+    #[tokio::test]
+    async fn clearing_with_a_follower_that_appeared_after_authorization_changes_nothing() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let repos = Arc::new(repos);
+        let group = group_with_followers(&conn, "Late clear", &[9431, 9432], &[9431]).await;
+        let authorized: HashSet<i32> = [9431].into_iter().collect();
+
+        let b = conn.begin().await.unwrap();
+        set_following(&b, 9432, true).await;
+        let a = {
+            let repos = repos.clone();
+            let group_id = group.id;
+            let authorized = authorized.clone();
+            blocked("clearing the repository", async move {
+                repos.clear_repository(group_id, &authorized).await
+            })
+            .await
+        };
+        b.commit().await.unwrap();
+
+        let err = done(a).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProjectGroupError::RepositoryFollowersChanged { project_ids, .. }
+                    if project_ids == &vec![9432]
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(branch_of(&conn, group.id).await.as_deref(), Some("develop"));
+        assert_eq!(following(&conn, group.id).await, vec![9431, 9432]);
+
+        // Checked on both followers, the same call goes through.
+        let both: HashSet<i32> = [9431, 9432].into_iter().collect();
+        let cleared = repos
+            .clear_repository(group.id, &both)
+            .await
+            .expect("clear");
+        assert!(cleared.main_branch.is_none());
+        assert!(following(&conn, group.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn following_waits_for_a_concurrent_repository_change_and_does_not_follow_a_stale_one() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let repos = Arc::new(repos);
+        // The member already points at acme/shop@main and the group is
+        // moved to main by A, so following it writes nothing through.
+        let group = group_with_followers(&conn, "Stale", &[9441], &[]).await;
+        project_groups::Entity::update_many()
+            .col_expr(
+                project_groups::Column::MainBranch,
+                sea_orm::sea_query::Expr::value("main"),
+            )
+            .filter(project_groups::Column::Id.eq(group.id))
+            .exec(conn.as_ref())
+            .await
+            .unwrap();
+
+        // B moves the group to another branch and has not committed.
+        let b = conn.begin().await.unwrap();
+        b.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE project_groups SET main_branch = 'release' WHERE id = $1",
+            [group.id.into()],
+        ))
+        .await
+        .unwrap();
+
+        let a = {
+            let repos = repos.clone();
+            let group_id = group.id;
+            blocked("following the repository", async move {
+                repos
+                    .set_inheritance(
+                        group_id,
+                        9441,
+                        true,
+                        DeployCaller::from_instance_admin(false),
+                    )
+                    .await
+            })
+            .await
+        };
+        b.commit().await.unwrap();
+
+        let err = done(a).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProjectGroupError::RepositoryChanged { group_id, project_id }
+                    if group_id == group.id && project_id == 9441
+            ),
+            "got {err:?}"
+        );
+        assert!(following(&conn, group.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn following_does_not_mark_a_project_that_moved_to_another_group() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let repos = Arc::new(repos);
+        let svc = ProjectGroupService::new(conn.clone());
+        let group = group_with_followers(&conn, "Origin", &[9451], &[]).await;
+        project_groups::Entity::update_many()
+            .col_expr(
+                project_groups::Column::MainBranch,
+                sea_orm::sea_query::Expr::value("main"),
+            )
+            .filter(project_groups::Column::Id.eq(group.id))
+            .exec(conn.as_ref())
+            .await
+            .unwrap();
+        let elsewhere = svc
+            .create_group(CreateProjectGroupRequest {
+                name: "Elsewhere".into(),
+                slug: None,
+                description: None,
+                project_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .group
+            .id;
+
+        // B moves the project to another group and has not committed.
+        let b = conn.begin().await.unwrap();
+        ProjectGroupService::lock_projects(&b, &[9451])
+            .await
+            .unwrap();
+        b.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE project_group_members SET group_id = $1 WHERE project_id = 9451",
+            [elsewhere.into()],
+        ))
+        .await
+        .unwrap();
+
+        let a = {
+            let repos = repos.clone();
+            let group_id = group.id;
+            blocked("following the repository", async move {
+                repos
+                    .set_inheritance(
+                        group_id,
+                        9451,
+                        true,
+                        DeployCaller::from_instance_admin(false),
+                    )
+                    .await
+            })
+            .await
+        };
+        b.commit().await.unwrap();
+
+        let err = done(a).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProjectGroupError::NotAMember { group_id, project_id }
+                    if group_id == group.id && project_id == 9451
+            ),
+            "got {err:?}"
+        );
+        assert!(following(&conn, elsewhere).await.is_empty());
+    }
+
+    #[test]
+    fn a_repository_matches_only_the_group_row_it_was_read_from() {
+        let mut g = group(Some(7), Some(("acme", "shop", "main")));
+        let repo = GroupRepository {
+            git_provider_connection_id: Some(7),
+            public_provider: None,
+            repo_owner: "acme".into(),
+            repo_name: "shop".into(),
+            main_branch: "main".into(),
+            repository_id: None,
+            clone_url: None,
+        };
+        assert!(is_repository_of(&g, &repo));
+        g.main_branch = Some("develop".into());
+        assert!(!is_repository_of(&g, &repo));
+        g.main_branch = Some("main".into());
+        g.public_provider = Some("github".into());
+        assert!(!is_repository_of(&g, &repo));
+        g.public_provider = None;
+        g.git_provider_connection_id = None;
+        assert!(!is_repository_of(&g, &repo));
     }
 }

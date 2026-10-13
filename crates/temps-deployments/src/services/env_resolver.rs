@@ -62,14 +62,9 @@ pub enum DeploymentEnvResolutionError {
         reason: String,
     },
 
-    #[error(
-        "Failed to load variables inherited from the project group of project {project_id}, environment {environment_id}: {reason}"
-    )]
-    InheritedGroupVariables {
-        project_id: i32,
-        environment_id: i32,
-        reason: String,
-    },
+    /// Already names the project, environment, group and variable key.
+    #[error(transparent)]
+    InheritedGroupVariables(#[from] super::group_env::GroupEnvError),
 
     #[error(
         "Failed to query linked services for project {project_id}, environment {environment_id}: {source}"
@@ -516,12 +511,7 @@ impl DeploymentEnvResolver {
             project.id,
             environment,
         )
-        .await
-        .map_err(|e| DeploymentEnvResolutionError::InheritedGroupVariables {
-            project_id: project.id,
-            environment_id: environment.id,
-            reason: e.to_string(),
-        })?;
+        .await?;
         for (key, value) in inherited {
             explicit_project_vars.entry(key).or_insert(value);
         }

@@ -533,22 +533,15 @@ impl WorkflowPlanner {
 
         // 1b. Variables inherited from the project's group sit beneath the
         // project's own values (which win) and above linked-service defaults.
+        // A failure is a `GroupEnvError`, which names the project,
+        // environment, group and variable key.
         let inherited = crate::services::group_env::inherited_group_env_vars(
             self.db.as_ref(),
             self.encryption_service.as_ref(),
             project.id,
             environment,
         )
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to load variables inherited from the project group of project {} \
-                 (environment {}): {}",
-                project.id,
-                environment.id,
-                e
-            )
-        })?;
+        .await?;
         for (key, value) in inherited {
             explicit_project_vars.entry(key).or_insert(value);
         }

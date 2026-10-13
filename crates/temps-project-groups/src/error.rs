@@ -121,6 +121,30 @@ pub enum ProjectGroupError {
     )]
     MembershipChanged { group_id: i32, project_id: i32 },
 
+    /// Projects started following the group's repository after the caller's
+    /// write access to its followers was checked, so the change would have
+    /// rewritten (or detached) projects the caller was never authorized on.
+    /// The ids are kept for logs; the message gives only the count, because
+    /// the caller may not be allowed to see those projects.
+    #[error(
+        "{} project(s) started following the repository of project group {group_id} while \
+         this request was being authorized; retry the request",
+        .project_ids.len()
+    )]
+    RepositoryFollowersChanged {
+        group_id: i32,
+        project_ids: Vec<i32>,
+    },
+
+    /// The group's repository was changed while a project was being pointed
+    /// at the one it had when the request started, so the project would have
+    /// been left following a repository the group no longer has.
+    #[error(
+        "The repository of project group {group_id} changed while project {project_id} was being \
+         pointed at it; retry the request"
+    )]
+    RepositoryChanged { group_id: i32, project_id: i32 },
+
     #[error("{source_name} already sends {path_prefix} to another service")]
     RouteConflict {
         source_name: String,
@@ -209,6 +233,18 @@ impl From<ProjectGroupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectGroupError::RepositoryFollowersChanged { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Repository Followers Changed")
+                    .with_detail(error.to_string())
+            }
+
+            ProjectGroupError::RepositoryChanged { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Repository Changed")
+                    .with_detail(error.to_string())
+            }
+
             ProjectGroupError::EnvVarConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Variable Already Exists")
                 .with_detail(error.to_string()),
@@ -230,5 +266,39 @@ impl From<ProjectGroupError> for Problem {
                     .with_detail("An internal error occurred; check server logs for details")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unauthorized_followers_are_a_conflict_that_counts_but_does_not_name_them() {
+        let error = ProjectGroupError::RepositoryFollowersChanged {
+            group_id: 7,
+            project_ids: vec![41, 42],
+        };
+        let message = error.to_string();
+        assert!(message.contains("2 project(s)"), "got {message}");
+        assert!(message.contains("project group 7"), "got {message}");
+        // The caller may not be able to see those projects.
+        assert!(!message.contains("41") && !message.contains("42"));
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn a_repository_changed_under_a_project_is_a_conflict_naming_both_ids() {
+        let error = ProjectGroupError::RepositoryChanged {
+            group_id: 7,
+            project_id: 41,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("project group 7") && message.contains("project 41"),
+            "got {message}"
+        );
+        assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
     }
 }

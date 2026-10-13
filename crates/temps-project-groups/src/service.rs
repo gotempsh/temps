@@ -86,6 +86,14 @@ struct LoadedMembers {
     inherits_repository: HashSet<i32>,
 }
 
+/// A group and the live projects that follow its repository, as read under
+/// the locks of [`ProjectGroupService::lock_repository_followers`]. Nothing
+/// can change who follows before the transaction that holds them ends.
+pub(crate) struct LockedFollowers {
+    pub(crate) group: project_groups::Model,
+    pub(crate) followers: Vec<projects::Model>,
+}
+
 /// What a set of projects is in right now, and what leaving it would drop.
 struct LeavingState {
     /// `project_id -> group_id` for every listed project that has a
@@ -112,10 +120,17 @@ struct LeavingState {
 ///    deployments, take `KEY SHARE` and are not blocked.) The route trigger
 ///    takes the same rows `FOR SHARE`.
 /// 2. The destination `project_groups` row, `FOR KEY SHARE` when placing into
-///    it, `FOR UPDATE` when deleting it.
+///    it, `FOR UPDATE` when deleting it, `FOR NO KEY UPDATE` when its
+///    repository changes ([`Self::lock_repository_followers`]).
 /// 3. `project_group_members` rows, `FOR UPDATE`, in ascending project id.
 /// 4. `project_group_routes` rows (read after 3, deleted by the membership
 ///    trigger or by the group's cascade).
+///
+/// Writing a change through to the projects themselves
+/// (`ProjectService::update_git_settings`) happens on other connections and
+/// calls the git provider, so it cannot run inside these transactions: the
+/// repository services lock, re-read and authorize in one short transaction,
+/// commit, and then write through only the projects that transaction saw.
 ///
 /// Everything that reads memberships or routes to *decide* something (which
 /// routes a move drops, whether they were authorized) does so only after
@@ -784,7 +799,7 @@ impl ProjectGroupService {
     /// transaction, `FOR NO KEY UPDATE`, in ascending id. Returns
     /// `id -> is_deleted` for the ids that exist; callers that need live
     /// projects check it, because the answer cannot change afterwards.
-    async fn lock_projects<C: ConnectionTrait>(
+    pub(crate) async fn lock_projects<C: ConnectionTrait>(
         conn: &C,
         project_ids: &[i32],
     ) -> Result<HashMap<i32, bool>, ProjectGroupError> {
@@ -806,6 +821,97 @@ impl ProjectGroupService {
             )))?
             .into_iter()
             .collect())
+    }
+
+    /// Locks `group_id` and its memberships in the lock order and returns
+    /// the live members that follow its repository, for a change that
+    /// rewrites or detaches them (`set_repository`, `clear_repository`).
+    ///
+    /// The caller checked write access on exactly `authorized_follower_ids`.
+    /// The followers are read again here, under the locks: one that is not
+    /// in the set started following after the check (a membership row can
+    /// only change after this transaction ends), so nothing is changed and
+    /// [`ProjectGroupError::RepositoryFollowersChanged`] is returned. A
+    /// follower that stopped following is fine: it is simply not in the
+    /// result. The check and the write must run in this transaction.
+    ///
+    /// Order: the member projects (step 1, ascending id), the group row
+    /// `FOR NO KEY UPDATE` (step 2: its repository columns are updated, but
+    /// placements, which only key-share it, are not blocked), then the
+    /// membership rows (step 3). Which projects are members is read before
+    /// the locks to know which rows to take; one that joined in between is
+    /// covered by the membership locks, and it cannot be a follower yet.
+    pub(crate) async fn lock_repository_followers<C: ConnectionTrait>(
+        conn: &C,
+        group_id: i32,
+        authorized_follower_ids: &HashSet<i32>,
+    ) -> Result<LockedFollowers, ProjectGroupError> {
+        let member_ids: Vec<i32> = project_group_members::Entity::find()
+            .filter(project_group_members::Column::GroupId.eq(group_id))
+            .select_only()
+            .column(project_group_members::Column::ProjectId)
+            .order_by_asc(project_group_members::Column::ProjectId)
+            .into_tuple::<i32>()
+            .all(conn)
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "listing members of project group {group_id}"
+            )))?;
+        Self::lock_projects(conn, &member_ids).await?;
+        let group = project_groups::Entity::find_by_id(group_id)
+            .lock(LockType::NoKeyUpdate)
+            .one(conn)
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "loading project group {group_id}"
+            )))?
+            .ok_or(ProjectGroupError::NotFound { group_id })?;
+        let follower_ids: Vec<i32> = project_group_members::Entity::find()
+            .filter(project_group_members::Column::GroupId.eq(group_id))
+            .order_by_asc(project_group_members::Column::ProjectId)
+            .lock_exclusive()
+            .all(conn)
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "locking memberships of project group {group_id}"
+            )))?
+            .into_iter()
+            .filter(|m| m.inherits_repository)
+            .map(|m| m.project_id)
+            .collect();
+        // Soft-deleted projects are neither rewritten nor shown to callers,
+        // so they are not part of what was authorized.
+        let followers = if follower_ids.is_empty() {
+            Vec::new()
+        } else {
+            projects::Entity::find()
+                .filter(projects::Column::Id.is_in(follower_ids))
+                .filter(projects::Column::IsDeleted.eq(false))
+                .order_by_asc(projects::Column::Id)
+                .all(conn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "loading the projects that follow the repository of project group {group_id}"
+                )))?
+        };
+        let unauthorized: Vec<i32> = followers
+            .iter()
+            .map(|p| p.id)
+            .filter(|id| !authorized_follower_ids.contains(id))
+            .collect();
+        if !unauthorized.is_empty() {
+            tracing::warn!(
+                group_id,
+                project_ids = ?unauthorized,
+                "project groups: projects started following the group's repository after the \
+                 caller's access was checked; refusing the change"
+            );
+            return Err(ProjectGroupError::RepositoryFollowersChanged {
+                group_id,
+                project_ids: unauthorized,
+            });
+        }
+        Ok(LockedFollowers { group, followers })
     }
 
     /// Places `project_id` at the end of `group_id`, moving it out of any
@@ -1212,7 +1318,7 @@ impl ProjectGroupService {
     /// transaction is rolled back explicitly rather than by dropping it, so
     /// its row locks are released now and the connection does not go back to
     /// the pool "idle in transaction" holding them.
-    async fn end_transaction<T>(
+    pub(crate) async fn end_transaction<T>(
         txn: sea_orm::DatabaseTransaction,
         result: Result<T, ProjectGroupError>,
         operation: String,

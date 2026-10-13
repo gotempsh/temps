@@ -475,11 +475,15 @@ pub(crate) fn require_access_to_all_members(
 /// rewritten (or detached) by repository changes, so the caller needs write
 /// access to each of them. Visibility alone is not enough where access is
 /// granted per project.
+///
+/// Returns the ids that were checked. The service compares them with the
+/// followers it finds under lock, so a project that starts following after
+/// this check cannot be rewritten or detached without having been checked.
 async fn require_write_on_followers(
     state: &ProjectGroupsAppState,
     auth: &temps_auth::context::AuthContext,
     group: &ProjectGroupWithMembers,
-) -> Result<(), Problem> {
+) -> Result<HashSet<i32>, Problem> {
     let followers: Vec<i32> = group
         .members
         .iter()
@@ -492,7 +496,8 @@ async fn require_write_on_followers(
         &followers,
         MemberPermission::ProjectsWrite,
     )
-    .await
+    .await?;
+    Ok(followers.into_iter().collect())
 }
 
 /// Per-project permissions a group operation can require of its members.
@@ -1507,6 +1512,7 @@ pub async fn get_group_repository(
         (status = 400, description = "Connection, repository or branch not usable"),
         (status = 403, description = "Insufficient permissions, or no access to every project in the group"),
         (status = 404, description = "Project group not found"),
+        (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1530,7 +1536,7 @@ pub async fn set_group_repository(
     // that follows it, so the caller must be able to reach all of them and
     // change each follower, not merely see it.
     require_access_to_all_members(&group, &hidden)?;
-    require_write_on_followers(&state, &auth, &group).await?;
+    let authorized_followers = require_write_on_followers(&state, &auth, &group).await?;
 
     let source = match (req.git_provider_connection_id, req.public_provider) {
         (Some(connection_id), None) => RepositorySource::Connection(connection_id),
@@ -1552,6 +1558,7 @@ pub async fn set_group_repository(
                 repo_name: req.repo_name,
                 main_branch: req.main_branch,
             },
+            &authorized_followers,
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
                 auth.is_instance_admin(),
             ),
@@ -1600,6 +1607,7 @@ pub async fn set_group_repository(
         (status = 200, description = "Repository removed; projects keep their current git settings and stop following", body = ProjectGroupResponse),
         (status = 403, description = "Insufficient permissions, or no access to every project in the group"),
         (status = 404, description = "Project group not found"),
+        (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1618,9 +1626,12 @@ pub async fn clear_group_repository(
         ProjectGroupError::NotFound { group_id },
     )?;
     require_access_to_all_members(&group, &hidden)?;
-    require_write_on_followers(&state, &auth, &group).await?;
+    let authorized_followers = require_write_on_followers(&state, &auth, &group).await?;
 
-    state.repository.clear_repository(group_id).await?;
+    state
+        .repository
+        .clear_repository(group_id, &authorized_followers)
+        .await?;
     let group = state.service.get_group(group_id).await?;
     ProjectGroupAudit::new(
         "PROJECT_GROUP_REPOSITORY_CLEARED",
@@ -1648,7 +1659,7 @@ pub async fn clear_group_repository(
         (status = 400, description = "The project cannot follow the repository (not deployed from Git, branch missing, …)"),
         (status = 403, description = "Insufficient permissions on the project"),
         (status = 404, description = "Project group not found, or the project is not in it"),
-        (status = 409, description = "The group has no repository yet"),
+        (status = 409, description = "The group has no repository yet, or its repository changed while the project was being pointed at it; retry the request"),
     ),
     security(("bearer_auth" = []))
 )]

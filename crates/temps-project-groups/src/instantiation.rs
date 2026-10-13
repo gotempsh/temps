@@ -1635,6 +1635,10 @@ impl InstantiationEngine {
                                 repo_name: target.repo_name.clone(),
                                 main_branch: target.branch.clone(),
                             },
+                            // The group has no repository, so nothing follows
+                            // it and nothing was authorized: a project that
+                            // starts following before this lands fails it.
+                            &HashSet::new(),
                             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
                                 auth.is_instance_admin(),
                             ),
