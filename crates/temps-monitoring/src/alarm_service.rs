@@ -3047,7 +3047,6 @@ mod tests {
         drop(service);
 
         let log = Arc::try_unwrap(db)
-            .ok()
             .expect("service dropped its connection clone")
             .into_transaction_log();
         // `Debug` escapes the quotes inside the statement text; undo that so the

@@ -976,7 +976,7 @@ impl CertificateProvider for LetsEncryptProvider {
                 // deactivated are all terminal on the ACME side.
                 if handle.status != AuthorizationStatus::Pending {
                     let identifier = handle.identifier().to_string();
-                    let status = handle.status.clone();
+                    let status = handle.status;
                     let mut detail = Self::challenge_error_summary(&identifier, &handle);
                     if detail.is_empty() {
                         detail = format!(

@@ -1373,10 +1373,8 @@ mod tests {
     #[test]
     fn full_create_environment_variable_command_resolves_with_an_array_body() {
         let op = env_var_operation();
-        let mut index_ops = Vec::new();
-        index_ops.push(op);
         let tokens = tokenize("--key K --value V --environment_ids 15");
-        let object = parse_flags(&tokens, Some(&index_ops[0])).unwrap();
+        let object = parse_flags(&tokens, Some(&op)).unwrap();
         assert_eq!(
             object,
             serde_json::json!({"key": "K", "value": "V", "environment_ids": [15]})

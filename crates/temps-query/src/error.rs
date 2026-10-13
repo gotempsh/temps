@@ -139,6 +139,8 @@ impl DataError {
     }
 }
 
+pub type Result<T> = std::result::Result<T, DataError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +170,3 @@ mod tests {
         assert!(message.contains("at most 2 level(s)"), "{message}");
     }
 }
-
-pub type Result<T> = std::result::Result<T, DataError>;
