@@ -434,26 +434,7 @@ pub async fn terminal(
             .attach_pty(&handle),
     )
     .await?
-    .map_err(|e| {
-        // A sandbox on a worker node: terminals are not available there
-        // yet (ADR-048). Say exactly that — the PTY-agent hint below
-        // would send the user hunting for an image problem.
-        if let temps_agents::error::AgentError::SandboxUnsupportedOnNode { .. } = e {
-            return Problem::from(crate::error::from_agent_error(&id, e));
-        }
-        // Say what is actually missing for *this* backend, rather than
-        // leaving the user with a bare 409 or a terminal that never
-        // echoes. The provider's own message already carries the
-        // specific cause; the hint adds where to fix it.
-        problemdetails::new(StatusCode::CONFLICT)
-            .with_title("Terminal Unavailable")
-            .with_detail(format!(
-                "Could not attach a terminal to sandbox {}: {}. {}",
-                id,
-                e,
-                terminal_unavailable_hint(handle.backend)
-            ))
-    })?;
+    .map_err(|e| attach_failure_problem(&id, handle.backend, e))?;
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
@@ -834,9 +815,62 @@ async fn send_error(ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>, 
     let _ = ws_tx.close().await;
 }
 
+/// The 504 for a guest that did not accept a terminal in time. Shared by the
+/// handler's own deadline and by providers that report their own step
+/// timeouts, so a stalled guest always looks the same to a client — and is
+/// never answered with the 409 "terminal unavailable" setup advice, which
+/// would send the operator to fix something that is not broken.
+fn attach_timeout_problem(sandbox_id: &str, what: &str) -> Problem {
+    problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+        .with_title("Terminal Attach Timed Out")
+        .with_detail(format!(
+            "Sandbox {} did not accept a terminal: {}. Its guest may be overloaded or \
+             unresponsive; retry in a moment, or restart the sandbox if this persists.",
+            sandbox_id, what
+        ))
+}
+
+/// Map a provider's `attach_pty` failure to the response a client should see.
+///
+/// Three different situations, three different answers:
+/// - the sandbox lives on a worker node, where terminals are not available
+///   yet (ADR-048): the node-specific 422, not a hunt for an image problem;
+/// - the guest stalled past a provider deadline: a 504 to retry or restart;
+/// - anything else is a missing capability for *this* backend: a 409 whose
+///   detail carries the provider's own cause plus where to fix it.
+fn attach_failure_problem(
+    sandbox_id: &str,
+    backend: temps_agents::sandbox::SandboxBackend,
+    error: temps_agents::error::AgentError,
+) -> Problem {
+    use temps_agents::error::AgentError;
+
+    match error {
+        unsupported @ AgentError::SandboxUnsupportedOnNode { .. } => {
+            Problem::from(crate::error::from_agent_error(sandbox_id, unsupported))
+        }
+        timeout @ AgentError::SandboxTerminalTimeout { .. } => {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error = %timeout,
+                "terminal attach timed out in the guest"
+            );
+            attach_timeout_problem(sandbox_id, &timeout.to_string())
+        }
+        other => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Terminal Unavailable")
+            .with_detail(format!(
+                "Could not attach a terminal to sandbox {}: {}. {}",
+                sandbox_id,
+                other,
+                terminal_unavailable_hint(backend)
+            )),
+    }
+}
+
 /// Run an `attach_pty` future under `deadline`, answering 504 when the guest
 /// does not respond in time. The inner result is returned untouched so the
-/// caller keeps its backend-specific 409 mapping.
+/// caller keeps its backend-specific mapping.
 async fn bounded_attach<T>(
     sandbox_id: &str,
     deadline: Duration,
@@ -848,15 +882,10 @@ async fn bounded_attach<T>(
             deadline_secs = deadline.as_secs(),
             "terminal attach timed out"
         );
-        problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-            .with_title("Terminal Attach Timed Out")
-            .with_detail(format!(
-                "Sandbox {} did not accept a terminal within {}s. Its guest may be \
-                 overloaded or unresponsive; retry in a moment, or restart the sandbox \
-                 if this persists.",
-                sandbox_id,
-                deadline.as_secs()
-            ))
+        attach_timeout_problem(
+            sandbox_id,
+            &format!("no answer within {}s", deadline.as_secs()),
+        )
     })
 }
 
@@ -1088,6 +1117,59 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("sbx_test"), "{body}");
+    }
+
+    #[test]
+    fn provider_step_timeouts_are_504_not_409() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        // A Firecracker handshake (10s) and a microsandbox bootstrap (60s)
+        // both fail well before the handler's 100s deadline. They must not
+        // surface as "terminal unavailable" with setup advice.
+        for backend in [SandboxBackend::Firecracker, SandboxBackend::Microsandbox] {
+            let problem = attach_failure_problem(
+                "sbx_test",
+                backend,
+                AgentError::terminal_timeout(
+                    "sbx_test",
+                    "agent handshake on vsock port 5000",
+                    Duration::from_secs(10),
+                ),
+            );
+            assert_eq!(problem.status_code, StatusCode::GATEWAY_TIMEOUT);
+            let body = format!("{problem:?}");
+            assert!(body.contains("Terminal Attach Timed Out"), "{body}");
+            assert!(body.contains("vsock port 5000"), "{body}");
+            assert!(
+                !body.contains("setup"),
+                "a stalled guest is not a setup problem: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_terminal_support_stays_409_with_the_backend_hint() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        let problem = attach_failure_problem(
+            "sbx_test",
+            SandboxBackend::Firecracker,
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: "sbx_test".into(),
+                reason: "no terminal listener answered on vsock port 5000".into(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = format!("{problem:?}");
+        assert!(body.contains("Terminal Unavailable"), "{body}");
+        assert!(body.contains("no terminal listener"), "{body}");
+        assert!(
+            body.contains(terminal_unavailable_hint(SandboxBackend::Firecracker)),
+            "{body}"
+        );
     }
 
     #[tokio::test]

@@ -668,14 +668,13 @@ impl MicrosandboxSandboxProvider {
                 // The guest never answered; the cached connection may be
                 // wedged with it, so the next call reconnects.
                 self.evict(name);
-                Err(Self::err(
+                Err(AgentError::terminal_timeout(
                     name,
-                    "terminal",
                     format!(
-                        "guest command did not finish within {:?} (script: {})",
-                        PTY_GUEST_EXEC_TIMEOUT,
-                        script.lines().next().unwrap_or_default()
+                        "guest command ({})",
+                        script.lines().next().unwrap_or_default().trim()
                     ),
+                    PTY_GUEST_EXEC_TIMEOUT,
                 ))
             }
         }
@@ -726,13 +725,10 @@ impl MicrosandboxSandboxProvider {
         match tokio::time::timeout(PTY_BOOTSTRAP_TIMEOUT, self.ensure_pty_agent_inner(handle)).await
         {
             Ok(result) => result,
-            Err(_) => Err(Self::err(
+            Err(_) => Err(AgentError::terminal_timeout(
                 name,
-                "terminal",
-                format!(
-                    "preparing the guest terminal agent did not finish within {:?}",
-                    PTY_BOOTSTRAP_TIMEOUT
-                ),
+                "guest terminal agent preparation",
+                PTY_BOOTSTRAP_TIMEOUT,
             )),
         }
     }
@@ -1273,13 +1269,10 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
             }
             Err(_) => {
                 self.evict(name);
-                return Err(Self::err(
+                return Err(AgentError::terminal_timeout(
                     name,
-                    "terminal relay exec",
-                    format!(
-                        "starting the relay did not finish within {:?}",
-                        PTY_GUEST_EXEC_TIMEOUT
-                    ),
+                    "relay start",
+                    PTY_GUEST_EXEC_TIMEOUT,
                 ));
             }
         };

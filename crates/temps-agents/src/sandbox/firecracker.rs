@@ -336,6 +336,114 @@ impl FirecrackerSandboxProvider {
         let _ = self.write_taps(&taps);
     }
 
+    /// [`SandboxProvider::attach_pty`] with an explicit handshake deadline,
+    /// so the timeout path is testable without waiting out the real one.
+    ///
+    /// A guest that does not answer in time is a
+    /// [`AgentError::SandboxTerminalTimeout`], not an exec failure: it is
+    /// stalled rather than missing terminal support, and callers answer the
+    /// two differently.
+    async fn attach_pty_within(
+        &self,
+        handle: &SandboxHandle,
+        handshake_timeout: Duration,
+    ) -> Result<PtyAttachment, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let sock = self.config.vm_dir(name).join("v.sock");
+
+        if !sock.exists() {
+            return Err(self.err(
+                name,
+                format!(
+                    "cannot attach a terminal: sandbox is not running (no vsock socket at {})",
+                    sock.display()
+                ),
+            ));
+        }
+
+        let stream =
+            match tokio::time::timeout(handshake_timeout, vsock_connect(&sock, PTY_PORT)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    // The VMM drops the connection when the guest has nothing
+                    // listening on the port, so a handshake failure here almost
+                    // always means this guest was built without the PTY agent.
+                    let terminal = firecracker_terminal_capability_for(&self.config);
+                    let remedy = if terminal.supported {
+                        "this sandbox was created before terminal support, or from a \
+                     snapshot taken before it; recreate the sandbox to get it"
+                            .to_string()
+                    } else {
+                        format!(
+                            "{} — run `{}`, then recreate the sandbox",
+                            terminal
+                                .reason
+                                .as_deref()
+                                .unwrap_or("the guest terminal agent is unusable"),
+                            PTY_AGENT_SETUP_COMMAND
+                        )
+                    };
+                    tracing::warn!(
+                        sandbox = %name,
+                        vsock_port = PTY_PORT,
+                        error = %e,
+                        "firecracker terminal attach failed"
+                    );
+                    return Err(self.err(
+                        name,
+                        format!(
+                            "no terminal listener answered on vsock port {} ({}): {}",
+                            PTY_PORT, e, remedy
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        sandbox = %name,
+                        vsock_port = PTY_PORT,
+                        timeout_secs = handshake_timeout.as_secs(),
+                        "firecracker terminal handshake timed out"
+                    );
+                    return Err(AgentError::terminal_timeout(
+                        name,
+                        format!("agent handshake on vsock port {}", PTY_PORT),
+                        handshake_timeout,
+                    ));
+                }
+            };
+
+        let (reader, writer) = stream.into_split();
+        let sandbox_id = handle.sandbox_id.clone();
+        // `None` after an error so a failed read ends the stream instead of
+        // being retried in a loop.
+        let output = futures::stream::unfold(Some(reader), move |state| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let mut reader = state?;
+                let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
+                match reader.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok(bytes::Bytes::from(buf)), Some(reader)))
+                    }
+                    Err(e) => Some((
+                        Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id,
+                            reason: format!("terminal stream read failed: {}", e),
+                        }),
+                        None,
+                    )),
+                }
+            }
+        });
+        Ok(PtyAttachment {
+            output: Box::pin(output),
+            input: Box::pin(writer),
+        })
+    }
+
     fn err(&self, sandbox_id: &str, reason: impl std::fmt::Display) -> AgentError {
         AgentError::SandboxExecFailed {
             run_id: 0,
@@ -2180,95 +2288,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     /// `socat`. Dropping the returned `input` closes the vsock connection;
     /// the agent — and every tab — keeps running in the guest.
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
-        let name = handle.sandbox_name.as_str();
-        let sock = self.config.vm_dir(name).join("v.sock");
-        if !sock.exists() {
-            return Err(self.err(
-                name,
-                format!(
-                    "cannot attach a terminal: sandbox is not running (no vsock socket at {})",
-                    sock.display()
-                ),
-            ));
-        }
-
-        let stream =
-            match tokio::time::timeout(PTY_ATTACH_TIMEOUT, vsock_connect(&sock, PTY_PORT)).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => {
-                    // The VMM drops the connection when the guest has nothing
-                    // listening on the port, so a handshake failure here almost
-                    // always means this guest was built without the PTY agent.
-                    let terminal = firecracker_terminal_capability_for(&self.config);
-                    let remedy = if terminal.supported {
-                        "this sandbox was created before terminal support, or from a \
-                     snapshot taken before it; recreate the sandbox to get it"
-                            .to_string()
-                    } else {
-                        format!(
-                            "{} — run `{}`, then recreate the sandbox",
-                            terminal
-                                .reason
-                                .as_deref()
-                                .unwrap_or("the guest terminal agent is unusable"),
-                            PTY_AGENT_SETUP_COMMAND
-                        )
-                    };
-                    tracing::warn!(
-                        sandbox = %name,
-                        vsock_port = PTY_PORT,
-                        error = %e,
-                        "firecracker terminal attach failed"
-                    );
-                    return Err(self.err(
-                        name,
-                        format!(
-                            "no terminal listener answered on vsock port {} ({}): {}",
-                            PTY_PORT, e, remedy
-                        ),
-                    ));
-                }
-                Err(_) => {
-                    return Err(self.err(
-                        name,
-                        format!(
-                            "terminal attach timed out after {:?} on vsock port {}",
-                            PTY_ATTACH_TIMEOUT, PTY_PORT
-                        ),
-                    ));
-                }
-            };
-
-        let (reader, writer) = stream.into_split();
-        let sandbox_id = handle.sandbox_id.clone();
-        // `None` after an error so a failed read ends the stream instead of
-        // being retried in a loop.
-        let output = futures::stream::unfold(Some(reader), move |state| {
-            let sandbox_id = sandbox_id.clone();
-            async move {
-                let mut reader = state?;
-                let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
-                match reader.read(&mut buf).await {
-                    Ok(0) => None,
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Some((Ok(bytes::Bytes::from(buf)), Some(reader)))
-                    }
-                    Err(e) => Some((
-                        Err(AgentError::SandboxExecFailed {
-                            run_id: 0,
-                            sandbox_id,
-                            reason: format!("terminal stream read failed: {}", e),
-                        }),
-                        None,
-                    )),
-                }
-            }
-        });
-        Ok(PtyAttachment {
-            output: Box::pin(output),
-            input: Box::pin(writer),
-        })
+        self.attach_pty_within(handle, PTY_ATTACH_TIMEOUT).await
     }
 
     fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
@@ -2879,6 +2899,36 @@ mod tests {
             line.push(b);
         }
         String::from_utf8(line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn attach_pty_handshake_that_never_answers_is_a_timeout_not_an_exec_failure() {
+        // The VMM accepts the connection but the guest never acknowledges.
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            // Hold the connection open without answering.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .attach_pty_within(&handle, Duration::from_millis(150))
+            .await
+            .err()
+            .expect("an unanswered handshake must fail");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match error {
+            AgentError::SandboxTerminalTimeout {
+                sandbox_id,
+                operation,
+                ..
+            } => {
+                assert_eq!(sandbox_id, "sbx_test");
+                assert!(operation.contains("vsock port"), "{operation}");
+            }
+            other => panic!("expected a terminal timeout, got {other:?}"),
+        }
     }
 
     #[tokio::test]
