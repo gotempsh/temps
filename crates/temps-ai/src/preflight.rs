@@ -119,3 +119,25 @@ mod tests {
         assert_eq!(value["checks"][0]["status"], "not_tested");
     }
 }
+
+/// Installed and latest version of a provider's harness CLI inside the
+/// caller's persistent workspace.
+///
+/// A harness that is behind the latest release cannot offer models released
+/// after it, so the console shows this and lets the operator update it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct HarnessUpdateStatus {
+    pub provider_id: String,
+    /// Version reported by the CLI in the workspace, when it could be read.
+    pub installed_version: Option<String>,
+    /// Latest version published for the CLI, when it could be looked up.
+    pub latest_version: Option<String>,
+    /// True only when both versions are known and `latest_version` is newer.
+    pub update_available: bool,
+    /// An update is running right now.
+    pub updating: bool,
+    /// When the versions were last read from the workspace (RFC 3339).
+    pub checked_at: Option<String>,
+    /// Why the versions could not be determined, when they could not.
+    pub detail: Option<String>,
+}

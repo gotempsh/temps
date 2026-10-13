@@ -768,7 +768,7 @@ pub(crate) fn ensure_provider_runtime_permission(
     Ok(())
 }
 
-fn ensure_workspace_model_discovery_permission(
+pub(crate) fn ensure_workspace_model_discovery_permission(
     auth: &temps_auth::AuthContext,
 ) -> Result<(), Problem> {
     permission_guard!(auth, SandboxesWrite);

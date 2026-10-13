@@ -296,6 +296,41 @@ impl AiService for AiProviderRegistry {
             .await
     }
 
+    async fn workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+        refresh: bool,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .workspace_harness_update_status(provider, principal_id, refresh)
+            .await
+    }
+
+    async fn update_workspace_harness(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .update_workspace_harness(provider, principal_id)
+            .await
+    }
+
     async fn capabilities_snapshot_for(
         &self,
         provider: Option<&str>,
