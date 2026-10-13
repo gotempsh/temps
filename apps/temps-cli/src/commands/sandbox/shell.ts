@@ -22,6 +22,7 @@
  * to keep the idle sweep away, so this only bites if you disconnect and
  * leave it idle past the timeout.
  */
+import type { IncomingMessage } from 'node:http'
 import WebSocket from 'ws'
 
 import { requireAuth, credentials, config } from '../../config/store.js'
@@ -52,6 +53,67 @@ export function terminalWsUrl(
     .map(([k, v]) => `${k}=${encodeURIComponent(v as string)}`)
     .join('&')
   return query ? `${ws}?${query}` : ws
+}
+
+/** Most of a rejected upgrade's response body we will buffer. */
+const MAX_REJECTION_BODY_BYTES = 16 * 1024
+
+/**
+ * Turn a rejected WebSocket upgrade into the sentence the user should see.
+ *
+ * The server refuses before upgrading with an RFC 7807 problem document, and
+ * its `detail` says what is actually wrong for this sandbox's backend ("the
+ * guest terminal agent is not staged — run `temps firecracker setup`…").
+ * The `ws` client reports only "Unexpected server response: 409" and drops
+ * the body, which left the user with a bare status code and no next step.
+ *
+ * Bodies that are not problem documents (a proxy's HTML error page, an empty
+ * response) fall back to the status line, so this never makes things worse.
+ */
+export function describeUpgradeRejection(
+  status: number,
+  body: string,
+  id: string,
+): string {
+  let title: string | undefined
+  let detail: string | undefined
+  try {
+    const parsed: unknown = JSON.parse(body)
+    if (parsed !== null && typeof parsed === 'object') {
+      const problem = parsed as { title?: unknown; detail?: unknown }
+      if (typeof problem.title === 'string') title = problem.title
+      if (typeof problem.detail === 'string') detail = problem.detail
+    }
+  } catch {
+    // Not JSON — fall through to the generic message.
+  }
+  if (detail) {
+    return `Could not open a terminal in ${id}: ${title ? `${title} — ` : ''}${detail}`
+  }
+  if (title) {
+    return `Could not open a terminal in ${id}: ${title} (HTTP ${status})`
+  }
+  return (
+    `Could not open a terminal in ${id}: the server refused the connection ` +
+    `(HTTP ${status}). Check the sandbox with: temps sandbox show ${id}`
+  )
+}
+
+/** Read a response body, bounded, for error reporting. */
+function readRejectionBody(res: IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    const done = () => resolve(Buffer.concat(chunks).toString('utf8'))
+    res.on('data', (chunk: Buffer) => {
+      if (size >= MAX_REJECTION_BODY_BYTES) return
+      chunks.push(chunk)
+      size += chunk.length
+    })
+    res.on('end', done)
+    res.on('error', done)
+    res.on('close', done)
+  })
 }
 
 /** Current terminal size, falling back to a sane default when not a TTY. */
@@ -231,6 +293,18 @@ function runSession(
       }
       // 'ready' needs no output: the shell's own prompt is the signal, and
       // announcing it would corrupt a reattached screen's replayed state.
+    })
+
+    // The server answers a refused attach (409 terminal unavailable, 429 too
+    // many terminals, 404, …) with a problem document *instead of*
+    // upgrading. Without a listener `ws` raises a generic error that drops
+    // that body, so read it here — the `detail` is the actionable part.
+    socket.on('unexpected-response', (_req, res: IncomingMessage) => {
+      const status = res.statusCode ?? 0
+      void readRejectionBody(res).then((body) => {
+        res.destroy()
+        finish(new Error(describeUpgradeRejection(status, body, id)))
+      })
     })
 
     socket.on('error', (err: Error) => {

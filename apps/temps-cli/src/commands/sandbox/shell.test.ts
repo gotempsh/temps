@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { sandboxUrl, toSandboxView } from './index.js'
-import { terminalWsUrl } from './shell.js'
+import { describeUpgradeRejection, terminalWsUrl } from './shell.js'
 
 describe('toSandboxView', () => {
   // The response types in this module were written against an older, flat
@@ -98,5 +98,59 @@ describe('terminalWsUrl', () => {
   test('encodes the sandbox id rather than trusting it', () => {
     const url = terminalWsUrl('https://x.test/api', 'sbx a/b', {})
     expect(url).toBe('wss://x.test/api/v1/sandboxes/sbx%20a%2Fb/terminal')
+  })
+})
+
+describe('describeUpgradeRejection', () => {
+  test('surfaces the problem document detail the server sent', () => {
+    // The 409 body is the only place the actionable instruction lives; the
+    // ws client's own error message carries just the status code.
+    const body = JSON.stringify({
+      type: 'about:blank',
+      title: 'Terminal Unavailable',
+      status: 409,
+      detail:
+        'Could not attach a terminal to sandbox sbx_test: temps-pty-agent is not staged. Run `temps firecracker setup`.',
+    })
+    const message = describeUpgradeRejection(409, body, 'sbx_test')
+    expect(message).toContain('sbx_test')
+    expect(message).toContain('Terminal Unavailable')
+    expect(message).toContain('temps firecracker setup')
+    expect(message).not.toContain('HTTP 409')
+  })
+
+  test('falls back to the title when there is no detail', () => {
+    const message = describeUpgradeRejection(
+      429,
+      JSON.stringify({ title: 'Too Many Terminals' }),
+      'sbx_test',
+    )
+    expect(message).toContain('Too Many Terminals')
+    expect(message).toContain('HTTP 429')
+  })
+
+  test('does not trust a non-problem body', () => {
+    // A reverse proxy's HTML error page must not be echoed at the user.
+    const message = describeUpgradeRejection(
+      502,
+      '<html><body>Bad Gateway</body></html>',
+      'sbx_test',
+    )
+    expect(message).toContain('HTTP 502')
+    expect(message).toContain('temps sandbox show sbx_test')
+    expect(message).not.toContain('<html>')
+  })
+
+  test('ignores non-string problem fields', () => {
+    const message = describeUpgradeRejection(
+      409,
+      JSON.stringify({ title: 7, detail: { nested: true } }),
+      'sbx_test',
+    )
+    expect(message).toContain('HTTP 409')
+  })
+
+  test('copes with an empty body', () => {
+    expect(describeUpgradeRejection(409, '', 'sbx_test')).toContain('HTTP 409')
   })
 })
