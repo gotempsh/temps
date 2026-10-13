@@ -12,10 +12,13 @@ import { encodeText, filePropertiesArgv } from './sandbox-files'
 installBrowserWindow()
 afterEach(cleanup)
 
-function cardTree(
-  client: QueryClient,
-  props: { status?: string; lifecycle?: string }
-) {
+interface CardProps {
+  status?: string
+  lifecycle?: string
+  backend?: string | null
+}
+
+function cardTree(client: QueryClient, props: CardProps) {
   return (
     <QueryClientProvider client={client}>
       <SandboxFilesCard
@@ -23,6 +26,8 @@ function cardTree(
         workDir="/home/temps/workspace"
         status={props.status ?? 'running'}
         lifecycle={props.lifecycle}
+        // Docker unless a test says otherwise; the save warnings depend on it.
+        backend={props.backend === undefined ? 'docker' : props.backend}
       />
     </QueryClientProvider>
   )
@@ -34,7 +39,7 @@ function newClient() {
   })
 }
 
-function renderCard(props: { status?: string; lifecycle?: string } = {}) {
+function renderCard(props: CardProps = {}) {
   return render(cardTree(newClient(), props))
 }
 
@@ -719,5 +724,44 @@ test('declining the warning writes nothing and keeps the text', async () => {
   expect(
     (view.getByLabelText(`Contents of ${PATH}`) as HTMLTextAreaElement).value
   ).toBe('kept')
+  api.restore()
+})
+
+test('on a Firecracker sandbox a symlinked file is written through without a warning', async () => {
+  const writes: Array<{ mode: number }> = []
+  const api = mockApi(fileRoutes(PATH, '644 1000\nsymlink\n', writes))
+  const view = renderCard({ backend: 'firecracker' })
+
+  await openAndSave(view, PATH, 'new')
+
+  // No dialog: that backend writes in place, so nothing but the text changes.
+  await waitFor(() => expect(writes).toHaveLength(1))
+  expect(view.queryByText(/replaces the link/)).toBeNull()
+  expect(view.queryByRole('button', { name: 'Save anyway' })).toBeNull()
+  expect(writes[0]!.mode).toBe(0o644)
+  api.restore()
+})
+
+test('on a Firecracker sandbox a root-owned file keeps its owner, so no ownership warning', async () => {
+  const writes: Array<{ mode: number }> = []
+  const api = mockApi(fileRoutes(PATH, '644 0\n', writes))
+  const view = renderCard({ backend: 'firecracker' })
+
+  await openAndSave(view, PATH, 'new')
+
+  await waitFor(() => expect(writes).toHaveLength(1))
+  expect(view.queryByText(/currently owned by uid 0/)).toBeNull()
+  api.restore()
+})
+
+test('a backend with undocumented write semantics gets a hedged warning', async () => {
+  const writes: Array<{ mode: number }> = []
+  const api = mockApi(fileRoutes(PATH, '644 1000\nsymlink\n', writes))
+  const view = renderCard({ backend: 'microsandbox' })
+
+  await openAndSave(view, PATH, 'new')
+
+  await view.findByText(/Depending on the sandbox backend/)
+  expect(writes).toHaveLength(0)
   api.restore()
 })

@@ -74,6 +74,8 @@ interface SandboxFilesCardProps {
   workDir: string
   status: string
   lifecycle?: string
+  /** Isolation backend ("docker", "firecracker", ...); decides save warnings. */
+  backend?: string | null
 }
 
 /**
@@ -87,6 +89,7 @@ export function SandboxFilesCard({
   workDir,
   status,
   lifecycle,
+  backend,
 }: SandboxFilesCardProps) {
   const [openPath, setOpenPath] = useState<string | null>(null)
   // Bumped when the operator re-opens the open path, after the fresh stat and
@@ -252,6 +255,7 @@ export function SandboxFilesCard({
           }
           properties={propertiesQuery.isSuccess ? propertiesQuery.data : null}
           readFreshProperties={readFreshProperties}
+          backend={backend}
           readError={readQuery.isError ? readQuery.error : null}
           contentsB64={readQuery.data?.contents_b64}
           generation={generation}
@@ -278,6 +282,7 @@ interface FileSectionProps {
   /** Mode and owner of an existing file; `null` when they could not be read. */
   properties: FileProperties | null
   readFreshProperties: () => Promise<FileProperties | null>
+  backend: string | null | undefined
   generation: number
 }
 
@@ -293,6 +298,7 @@ function FileSection({
   contentsB64,
   properties,
   readFreshProperties,
+  backend,
   generation,
 }: FileSectionProps) {
   if (path === null) return null
@@ -374,6 +380,7 @@ function FileSection({
       initial={initial}
       properties={properties}
       readFreshProperties={readFreshProperties}
+      backend={backend}
       locked={locked}
     />
   )
@@ -386,6 +393,7 @@ function FileEditor({
   initial,
   properties,
   readFreshProperties,
+  backend,
   locked,
 }: {
   sandboxId: string
@@ -396,6 +404,8 @@ function FileEditor({
   properties: FileProperties | null
   /** Probes the file again, at the moment of saving. */
   readFreshProperties: () => Promise<FileProperties | null>
+  /** Decides which save warnings are true; see `writeSemantics`. */
+  backend: string | null | undefined
   locked: boolean
 }) {
   const queryClient = useQueryClient()
@@ -432,7 +442,12 @@ function FileEditor({
       // loading state and the next save compares against what is there now.
       queryClient.setQueryData(
         filePropertiesQueryKey(sandboxId, path),
-        propertiesAfterSave(path, variables.body.mode ?? DEFAULT_FILE_MODE)
+        propertiesAfterSave(
+          path,
+          variables.body.mode ?? DEFAULT_FILE_MODE,
+          backend,
+          properties
+        )
       )
       void queryClient.invalidateQueries({
         predicate: (query) =>
@@ -466,7 +481,7 @@ function FileEditor({
     mutationFn: readFreshProperties,
     meta: { errorTitle: 'Failed to check the file before saving' },
     onSuccess: (fresh) => {
-      const risks = saveRisks(path, fresh)
+      const risks = saveRisks(path, fresh, backend)
       const mode = writeMode(fresh)
       if (risks.length > 0) setReview({ risks, mode })
       else send(mode)

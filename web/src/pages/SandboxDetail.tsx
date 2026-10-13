@@ -1121,6 +1121,7 @@ export default function SandboxDetail() {
               workDir={sandbox.work_dir}
               status={sandbox.status}
               lifecycle={sandbox.lifecycle}
+              backend={sandbox.backend}
             />
           </>
         }

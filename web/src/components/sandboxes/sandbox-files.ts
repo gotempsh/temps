@@ -136,50 +136,95 @@ export function writeMode(properties: FileProperties | null): number {
 }
 
 /**
- * True when the provider hands `path` to the sandbox user. This mirrors
- * `runtime_user_owns_uploaded_file` (a plain prefix test on `/home/temps`, so
- * `/home/temps-other/x` counts too): the console warns about what the provider
- * will really do, not about what a stricter rule would have done.
+ * True when the Docker provider's tar upload hands `path` to the sandbox user.
+ * This is the prefix rule of `runtime_user_owns_uploaded_file` (a plain
+ * `starts_with` on `/home/temps`, so `/home/temps-other/x` counts too): the
+ * console warns about what the provider really does, not about what a
+ * stricter rule would have done. The platform's own `/run/secrets/temps-chat-*`
+ * files take a different write path and are not modelled here.
  */
 export function isUnderSandboxHome(path: string): boolean {
   return path.startsWith(SANDBOX_HOME)
 }
 
-/** The numeric owner `fs/write` gives `path`, whatever owned it before. */
+/** The numeric owner a Docker `fs/write` gives `path`, whoever owned it before. */
 export function ownerAfterWrite(path: string): number {
   return isUnderSandboxHome(path) ? SANDBOX_USER_UID : 0
 }
 
 /**
+ * What `fs/write` does to a file that already exists, which depends on the
+ * sandbox backend and decides which save warnings are true.
+ *
+ * - `recreate`: the file is replaced by a fresh one (Docker uploads a tar), so
+ *   a symlink at the path is replaced and the owner is set from the path.
+ * - `in-place`: the existing file is written and chmod'd where it is
+ *   (Firecracker's VM agent and the local backend use `std::fs::write` and
+ *   `set_permissions`), so a symlink is written through and the owner stays.
+ * - `unknown`: not documented for this backend (microsandbox) or not recorded
+ *   (legacy rows). Warnings are then worded as possibilities, not facts.
+ */
+export type WriteSemantics = 'recreate' | 'in-place' | 'unknown'
+
+export function writeSemantics(
+  backend: string | null | undefined
+): WriteSemantics {
+  switch (backend) {
+    case 'docker':
+      return 'recreate'
+    case 'firecracker':
+    case 'local':
+      return 'in-place'
+    default:
+      return 'unknown'
+  }
+}
+
+/**
  * What saving would change besides the text, for an existing file. Empty means
- * the save is faithful and needs no confirmation.
+ * the save is faithful and needs no confirmation. Only consequences that are
+ * true for `backend` are reported: an in-place backend never replaces a link or
+ * changes an owner, and an unknown one is described in terms of "may".
  */
 export function saveRisks(
   path: string,
-  properties: FileProperties | null
+  properties: FileProperties | null,
+  backend: string | null | undefined
 ): string[] {
   if (!properties) {
     return [
       'Its permissions could not be read, so it will be reset to 0644 (rw-r--r--).',
     ]
   }
+  const semantics = writeSemantics(backend)
   const risks: string[] = []
-  if (properties.symlink) {
+  if (properties.symlink && semantics !== 'in-place') {
     risks.push(
-      'This path is a symbolic link. Saving replaces the link with a regular file holding your text; the file it pointed to is not changed.'
+      semantics === 'recreate'
+        ? 'This path is a symbolic link. Saving replaces the link with a regular file holding your text; the file it pointed to is not changed.'
+        : 'This path is a symbolic link. Depending on the sandbox backend, saving either replaces the link with a regular file or writes through it to the file it points to.'
     )
   }
-  // Every write re-creates the file, so its owner becomes whoever the provider
-  // writes as for this path -- including inside the home, where a file the
-  // sandbox user did not own (a root-owned 0644, say) is handed to uid 1000.
+  // A recreating write gives the file whoever the provider writes as for this
+  // path -- inside the home that is the sandbox user, so a root-owned 0644
+  // there is handed over; elsewhere it is root.
   const writtenUid = ownerAfterWrite(path)
-  if (properties.uid !== writtenUid) {
-    risks.push(
-      writtenUid === 0
-        ? `Outside ${SANDBOX_HOME} the sandbox writes files as root, so the sandbox user may lose access to it (this matters most for 0600 files).`
-        : `Saving makes the sandbox user (uid ${writtenUid}) the owner of this file; it is currently owned by uid ${properties.uid}.`
-    )
+  if (semantics !== 'in-place' && properties.uid !== writtenUid) {
+    if (semantics === 'unknown') {
+      risks.push(
+        `Saving may change who owns this file: it is owned by uid ${properties.uid} and this sandbox backend might write it as uid ${writtenUid}.`
+      )
+    } else if (writtenUid === 0) {
+      risks.push(
+        `Outside ${SANDBOX_HOME} the sandbox writes files as root, so the sandbox user may lose access to it (this matters most for 0600 files).`
+      )
+    } else {
+      risks.push(
+        `Saving makes the sandbox user (uid ${writtenUid}) the owner of this file; it is currently owned by uid ${properties.uid}.`
+      )
+    }
   }
+  // Every backend writes the mode explicitly, rwx bits only.
   if ((properties.mode & ~0o777) !== 0) {
     risks.push(
       'Its setuid, setgid or sticky bit is not kept; only the rwx permissions are written back.'
@@ -188,16 +233,22 @@ export function saveRisks(
   return risks
 }
 
-/** Properties a file has right after the console wrote it (for the cache). */
+/**
+ * Properties a file has right after the console wrote it (for the cache).
+ * Decisions are not made from this -- Save probes the file again -- but the
+ * cache should not claim an owner the write did not produce: an in-place write
+ * leaves the previous owner and link status as they were.
+ */
 export function propertiesAfterSave(
   path: string,
-  mode: number
+  mode: number,
+  backend: string | null | undefined,
+  previous: FileProperties | null
 ): FileProperties {
-  return {
-    mode,
-    uid: ownerAfterWrite(path),
-    symlink: false,
+  if (previous && writeSemantics(backend) !== 'recreate') {
+    return { mode, uid: previous.uid, symlink: previous.symlink }
   }
+  return { mode, uid: ownerAfterWrite(path), symlink: false }
 }
 
 /** `0o755` -> `"0755"`, as `ls`/`chmod` users write it. */

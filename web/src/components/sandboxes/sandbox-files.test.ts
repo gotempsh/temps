@@ -12,6 +12,7 @@ import {
   parseFileProperties,
   propertiesAfterSave,
   saveRisks,
+  writeSemantics,
   writeMode,
   isEditableFile,
   MAX_EDITABLE_BYTES,
@@ -167,61 +168,164 @@ describe('saveRisks', () => {
 
   test('a plain sandbox-user file inside the home is a faithful save', () => {
     expect(
-      saveRisks('/home/temps/workspace/a.sh', file({ mode: 0o755 }))
+      saveRisks('/home/temps/workspace/a.sh', file({ mode: 0o755 }), 'docker')
     ).toEqual([])
   })
 
   test('warns when permissions are unknown', () => {
-    expect(saveRisks('/home/temps/a', null)[0]).toContain('could not be read')
+    expect(saveRisks('/home/temps/a', null, 'docker')[0]).toContain(
+      'could not be read'
+    )
   })
 
   test('warns that a symlink is replaced by a regular file', () => {
-    const risks = saveRisks('/home/temps/link', file({ symlink: true }))
+    const risks = saveRisks(
+      '/home/temps/link',
+      file({ symlink: true }),
+      'docker'
+    )
     expect(risks).toHaveLength(1)
     expect(risks[0]).toContain('symbolic link')
   })
 
   test('warns when a sandbox-user file outside the home would become root-owned', () => {
-    const risks = saveRisks('/srv/app/.env', file({ mode: 0o600 }))
+    const risks = saveRisks('/srv/app/.env', file({ mode: 0o600 }), 'docker')
     expect(risks).toHaveLength(1)
     expect(risks[0]).toContain('as root')
   })
 
   test('warns when a save would hand a file inside the home to the sandbox user', () => {
     // A root-owned 0644 under /home/temps is re-created as uid 1000.
-    const risks = saveRisks('/home/temps/workspace/conf', file({ uid: 0 }))
+    const risks = saveRisks(
+      '/home/temps/workspace/conf',
+      file({ uid: 0 }),
+      'docker'
+    )
     expect(risks).toHaveLength(1)
     expect(risks[0]).toContain('uid 1000')
     expect(risks[0]).toContain('currently owned by uid 0')
     // Some other account's file is handed over just the same.
-    expect(saveRisks('/home/temps/x', file({ uid: 33 }))).toHaveLength(1)
+    expect(
+      saveRisks('/home/temps/x', file({ uid: 33 }), 'docker')
+    ).toHaveLength(1)
   })
 
   test('follows the provider rule, a plain prefix test on the home', () => {
     // Mirrors `runtime_user_owns_uploaded_file`: /home/temps-other/x is
     // written as uid 1000 too, so a uid 1000 file there is a faithful save.
-    expect(saveRisks('/home/temps-other/x', file({}))).toEqual([])
-    expect(saveRisks('/home/temps-other/x', file({ uid: 0 }))).toHaveLength(1)
+    expect(saveRisks('/home/temps-other/x', file({}), 'docker')).toEqual([])
+    expect(
+      saveRisks('/home/temps-other/x', file({ uid: 0 }), 'docker')
+    ).toHaveLength(1)
   })
 
   test('a root-owned file outside the home is already root, so nothing changes', () => {
-    expect(saveRisks('/etc/motd', file({ uid: 0 }))).toEqual([])
+    expect(saveRisks('/etc/motd', file({ uid: 0 }), 'docker')).toEqual([])
   })
 
   test('warns that setuid/setgid/sticky bits are not kept', () => {
-    const risks = saveRisks('/home/temps/bin/tool', file({ mode: 0o4755 }))
+    const risks = saveRisks(
+      '/home/temps/bin/tool',
+      file({ mode: 0o4755 }),
+      'docker'
+    )
     expect(risks).toHaveLength(1)
     expect(risks[0]).toContain('setuid')
   })
 })
 
+describe('writeSemantics', () => {
+  test('is known for the backends whose write path is in this repository', () => {
+    expect(writeSemantics('docker')).toBe('recreate')
+    expect(writeSemantics('firecracker')).toBe('in-place')
+    expect(writeSemantics('local')).toBe('in-place')
+  })
+
+  test('is unknown for microsandbox and for legacy rows with no backend', () => {
+    expect(writeSemantics('microsandbox')).toBe('unknown')
+    expect(writeSemantics(null)).toBe('unknown')
+    expect(writeSemantics(undefined)).toBe('unknown')
+  })
+})
+
+describe('saveRisks by backend', () => {
+  const file = (
+    over: Partial<{ mode: number; uid: number; symlink: boolean }>
+  ) => ({
+    mode: 0o644,
+    uid: 1000,
+    symlink: false,
+    ...over,
+  })
+
+  test('an in-place backend writes through a link and keeps the owner, so neither is warned about', () => {
+    for (const backend of ['firecracker', 'local']) {
+      expect(
+        saveRisks('/home/temps/link', file({ symlink: true }), backend)
+      ).toEqual([])
+      expect(
+        saveRisks('/srv/app/.env', file({ mode: 0o600 }), backend)
+      ).toEqual([])
+      expect(saveRisks('/home/temps/conf', file({ uid: 0 }), backend)).toEqual(
+        []
+      )
+    }
+  })
+
+  test('the mode is written explicitly on every backend, so dropped setuid bits are always reported', () => {
+    for (const backend of ['docker', 'firecracker', 'local', 'microsandbox']) {
+      const risks = saveRisks(
+        '/home/temps/bin/tool',
+        file({ mode: 0o4755 }),
+        backend
+      )
+      expect(risks).toHaveLength(1)
+      expect(risks[0]).toContain('setuid')
+    }
+  })
+
+  test('an unknown backend gets hedged wording, not claims about what happens', () => {
+    const link = saveRisks(
+      '/home/temps/link',
+      file({ symlink: true }),
+      'microsandbox'
+    )
+    expect(link).toHaveLength(1)
+    expect(link[0]).toContain('Depending on the sandbox backend')
+    expect(link[0]).not.toContain('Saving replaces the link')
+
+    const owner = saveRisks('/srv/app/.env', file({}), null)
+    expect(owner).toHaveLength(1)
+    expect(owner[0]).toContain('may change who owns')
+    expect(owner[0]).not.toContain('as root')
+  })
+
+  test('a file the write would leave as it is stays quiet on an unknown backend', () => {
+    expect(saveRisks('/home/temps/a.sh', file({}), 'microsandbox')).toEqual([])
+  })
+})
+
 describe('propertiesAfterSave', () => {
-  test('is sandbox-user owned inside the home and root outside it', () => {
-    expect(propertiesAfterSave('/home/temps/a', 0o600)).toEqual({
+  const before = { mode: 0o644, uid: 33, symlink: true }
+
+  test('a recreating backend gives the owner the path decides and drops the link', () => {
+    expect(
+      propertiesAfterSave('/home/temps/a', 0o600, 'docker', before)
+    ).toEqual({ mode: 0o600, uid: 1000, symlink: false })
+    expect(propertiesAfterSave('/tmp/a', 0o600, 'docker', before).uid).toBe(0)
+  })
+
+  test('an in-place backend keeps the previous owner and link status', () => {
+    expect(
+      propertiesAfterSave('/home/temps/a', 0o600, 'firecracker', before)
+    ).toEqual({ mode: 0o600, uid: 33, symlink: true })
+  })
+
+  test('with nothing known beforehand it falls back to the path rule', () => {
+    expect(propertiesAfterSave('/tmp/a', 0o600, 'firecracker', null)).toEqual({
       mode: 0o600,
-      uid: 1000,
+      uid: 0,
       symlink: false,
     })
-    expect(propertiesAfterSave('/tmp/a', 0o600).uid).toBe(0)
   })
 })
