@@ -733,7 +733,7 @@ function ConnectionProblems({
   if (!connection.is_active)
     return (
       <Callout tone="warning" title="This connection is inactive">
-        Projects can't deploy from it and its repositories won't sync. Activate
+        Services can't deploy from it and its repositories won't sync. Activate
         it from the{' '}
         <Link to={`/git-providers/${providerId}`} className="underline">
           provider's connections

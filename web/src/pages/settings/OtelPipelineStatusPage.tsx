@@ -562,9 +562,9 @@ function ActivationJumpLink({
         {JOB_STATUS_LABELS[job.status].toLowerCase()}
       </AlertTitle>
       <AlertDescription>
-        {job.projects_done} of {job.projects_total} project
+        {job.projects_done} of {job.projects_total} service
         {job.projects_total === 1 ? '' : 's'} switched so far. Spans for those
-        projects are no longer counted in the throughput figures below.{' '}
+        services are no longer counted in the throughput figures below.{' '}
         <a
           href={`#${ACTIVATION_SECTION_ANCHOR}`}
           onClick={scrollToActivation}
@@ -754,7 +754,7 @@ export function OtelPipelineStatusPage() {
           </div>
           <CardDescription>
             Ingest requests turned away since the server started. Non-zero
-            values mean projects are hitting their quotas or rate limits.
+            values mean services are hitting their quotas or rate limits.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -778,7 +778,7 @@ export function OtelPipelineStatusPage() {
               <AlertTriangle className="h-4 w-4 text-amber-500" />
               <AlertTitle>Rejections detected</AlertTitle>
               <AlertDescription className="flex items-center gap-2">
-                Projects are being rate-limited or have exceeded their storage
+                Services are being rate-limited or have exceeded their storage
                 quota. Check the{' '}
                 <Link
                   to="/monitoring/alarms"

@@ -108,7 +108,7 @@ export function KvService({ project }: KvServiceProps) {
         </div>
         <div className="flex items-center gap-2">
           <CopyAiPromptButton
-            prompt={`Add @temps-sdk/kv to project ${project.slug}. Inspect the existing framework and package manager, install the SDK, and implement a small server-side KV read/write/delete integration following the app's conventions. The SDK reads TEMPS_API_URL and TEMPS_TOKEN, plus TEMPS_PROJECT_ID when using an API key. Use environment variables and never expose credentials in browser code or commit secrets. Verify KV is enabled on Temps; explain required setup if it is not. Add appropriate error handling and verify the integration.`}
+            prompt={`Add @temps-sdk/kv to service ${project.slug}. Inspect the existing framework and package manager, install the SDK, and implement a small server-side KV read/write/delete integration following the app's conventions. The SDK reads TEMPS_API_URL and TEMPS_TOKEN, plus TEMPS_PROJECT_ID when using an API key. Use environment variables and never expose credentials in browser code or commit secrets. Verify KV is enabled on Temps; explain required setup if it is not. Add appropriate error handling and verify the integration.`}
           />
           <Badge
             variant={isEnabled ? 'default' : 'secondary'}
@@ -151,7 +151,7 @@ export function KvService({ project }: KvServiceProps) {
               <CardTitle>Service Status</CardTitle>
               <CardDescription>
                 Cluster-wide status of the KV service. Once enabled, every
-                project on this instance can use it through the SDK below.
+                service on this instance can use it through the SDK below.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -205,7 +205,7 @@ export function KvService({ project }: KvServiceProps) {
                       An administrator must enable the KV service from{' '}
                       <strong>Storage Settings → Platform Services</strong>.
                       Once enabled, the SDK on the Documentation tab works out
-                      of the box — no further per-project setup needed.
+                      of the box — no further per-service setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
@@ -307,7 +307,7 @@ TEMPS_PROJECT_ID=42`}
                   language="bash"
                 />
                 <p className="text-sm text-muted-foreground">
-                  Need an isolated client (multiple projects, custom timeouts,
+                  Need an isolated client (multiple services, custom timeouts,
                   testing)? Use{' '}
                   <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
                     createClient

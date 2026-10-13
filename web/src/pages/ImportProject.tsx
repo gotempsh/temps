@@ -12,6 +12,7 @@ import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -34,8 +35,8 @@ export function ImportProject() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
-      { label: 'New Project', href: '/projects/new' },
-      { label: 'Import Project' },
+      { label: 'New service', href: '/projects/new' },
+      { label: 'Import repository' },
     ])
   }, [setBreadcrumbs])
 
@@ -76,17 +77,24 @@ export function ImportProject() {
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
+  // `?group=<id>`: the new service joins that project.
+  const {
+    groupId: targetGroupId,
+    finish,
+    joinGroupDialog,
+  } = useJoinGroupAfterCreate()
+
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
-      errorTitle: 'Failed to import project',
+      errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
-      // Invalidate projects queries to refresh the command palette
+      // Invalidate services queries to refresh the command palette
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
-      toast.success('Project imported successfully')
-      navigate(`/projects/${data.slug}?new=true`)
+      toast.success('Service created')
+      await finish(data, `/projects/${data.slug}?new=true`)
     },
   })
 
@@ -101,9 +109,16 @@ export function ImportProject() {
   return (
     <PageContainer>
       {verificationDialog}
+      {joinGroupDialog}
       <NewProjectShell
         activeSource="browse"
-        onSelectSource={(source) => navigate(`/projects/new?source=${source}`)}
+        onSelectSource={(source) =>
+          navigate(
+            targetGroupId === null
+              ? `/projects/new?source=${source}`
+              : `/projects/new?source=${source}&group=${targetGroupId}`
+          )
+        }
       >
         {/* Repository context bar — same card language as the picker */}
         <div className="mb-6 flex flex-col gap-3 rounded-lg border bg-card px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -122,7 +137,7 @@ export function ImportProject() {
             <div
               className={`w-2 h-2 rounded-full ${selectedRepository ? 'bg-primary' : 'bg-muted'}`}
             ></div>
-            <span>Configure Project</span>
+            <span>Configure service</span>
             <div className="w-2 h-2 bg-muted rounded-full ml-4"></div>
             <span>Deploy</span>
           </div>
@@ -149,9 +164,9 @@ export function ImportProject() {
           ) : isRepositoryPending || !selectedRepository || !branchesData ? (
             <div className="space-y-6">
               <div>
-                <h2 className="text-2xl font-bold">Configure Project</h2>
+                <h2 className="text-2xl font-bold">Configure service</h2>
                 <p className="text-sm text-muted-foreground mt-1">
-                  Loading project configuration...
+                  Loading service configuration...
                 </p>
               </div>
               <Card>
@@ -283,7 +298,7 @@ export function ImportProject() {
                     ) {
                       return
                     }
-                    console.error('Project import error:', error)
+                    console.error('Service import error:', error)
                   }
                 }
                 await submit()

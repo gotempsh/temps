@@ -477,7 +477,7 @@ export function CreateServiceForm({
                         Advanced configuration
                         <span className="text-xs text-muted-foreground/70">
                           (default DB / credentials — Temps auto-creates a
-                          per-project database for each linked project)
+                          per-service database for each linked service)
                         </span>
                       </button>
                     </CollapsibleTrigger>

@@ -39,7 +39,7 @@ export function AiWorkflowsOverview() {
             AI Workflows
           </h1>
           <p className="text-sm text-muted-foreground">
-            Autofixer and agent runs, configured per project.
+            Autofixer and agent runs, configured per service.
           </p>
         </div>
         <Button variant="outline" asChild>
@@ -59,15 +59,15 @@ export function AiWorkflowsOverview() {
       ) : projects.length === 0 ? (
         <EmptyState
           icon={Workflow}
-          title="No projects yet"
-          description="Workflows run inside a project. Create a project first, then open its Workflows tab to configure an agent."
+          title="No services yet"
+          description="Workflows run inside a service. Create a service first, then open its Workflows tab to configure an agent."
         />
       ) : (
         <Card>
           <CardHeader>
-            <CardTitle>Projects</CardTitle>
+            <CardTitle>Services</CardTitle>
             <CardDescription>
-              Open a project&apos;s Workflows tab to configure or run its
+              Open a service&apos;s Workflows tab to configure or run its
               agents.
             </CardDescription>
           </CardHeader>

@@ -29,6 +29,8 @@ syntax may have changed.
 - [`users`](users.md)
 - [`teams`](teams.md)
 - [`access`](access.md)
+- [`project-groups`](project-groups.md)
+- [`instantiations`](instantiations.md)
 - [`apikeys`](apikeys.md)
 - [`monitors`](monitors.md)
 - [`webhooks`](webhooks.md)

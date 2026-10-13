@@ -527,7 +527,7 @@ prompt: |
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Trigger a one-off run from a local YAML file — nothing is
-                  stored in the project config. Great for experimenting before
+                  stored in the service config. Great for experimenting before
                   committing.
                 </p>
                 <CodeBlock
@@ -655,7 +655,7 @@ prompt: |
                         {run.source === 'cli_ephemeral' && (
                           <span
                             className="text-[10px] uppercase tracking-wide bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-medium"
-                            title="Triggered from the CLI with --from-file. Not stored in project_agents."
+                            title="Triggered from the CLI with --from-file. Not stored in the service's workflows."
                           >
                             Ephemeral
                           </span>

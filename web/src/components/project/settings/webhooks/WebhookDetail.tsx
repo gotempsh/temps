@@ -405,7 +405,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
               <h3 className="text-lg font-semibold mb-2">No deliveries yet</h3>
               <p className="text-sm text-muted-foreground max-w-md">
                 Webhook deliveries will appear here when events matching your
-                subscriptions occur in this project.
+                subscriptions occur in this service.
               </p>
             </div>
           )}

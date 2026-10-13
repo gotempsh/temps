@@ -411,7 +411,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Monitors</h2>
           <p className="text-muted-foreground">
-            Monitor your project&apos;s uptime and performance
+            Monitor your service&apos;s uptime and performance
           </p>
         </div>
         {monitors && monitors.length > 0 && (
@@ -425,7 +425,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             <DialogHeader>
               <DialogTitle>Create Monitor</DialogTitle>
               <DialogDescription>
-                Set up a new monitor to track your project&apos;s uptime and
+                Set up a new monitor to track your service&apos;s uptime and
                 performance.
               </DialogDescription>
             </DialogHeader>
@@ -592,7 +592,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
           size="compact"
           icon={Activity}
           title="No monitors yet"
-          description="Create a monitor to track this project's uptime and response time."
+          description="Create a monitor to track this service's uptime and response time."
           action={
             <Button onClick={() => setIsCreateDialogOpen(true)}>
               <Plus className="mr-2 size-4" />

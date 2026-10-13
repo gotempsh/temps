@@ -15136,6 +15136,7 @@ mod tests {
             source_type: Default::default(),
             project_type: temps_entities::types::ProjectType::Server,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             template_slug: None,
             service_template: None,
             gitlab_webhook_id: None,

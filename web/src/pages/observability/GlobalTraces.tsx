@@ -73,7 +73,7 @@ export default function GlobalTraces() {
   return (
     <GlobalPage
       title="Traces"
-      description="Follow requests across services and projects."
+      description="Follow requests across services."
       view={view}
       fetching={query.isFetching}
       refresh={() => void query.refetch()}
@@ -120,7 +120,7 @@ export default function GlobalTraces() {
             <TableHeader>
               <TableRow>
                 <TableHead>Trace</TableHead>
-                <TableHead className="hidden md:table-cell">Project</TableHead>
+                <TableHead className="hidden md:table-cell">Service</TableHead>
                 <TableHead>Status</TableHead>
                 <SortableTableHead
                   label="Duration"
@@ -169,7 +169,7 @@ export default function GlobalTraces() {
                       className="text-xs text-muted-foreground underline whitespace-nowrap"
                       to={`/traces/global/${traceDetailPath(trace)}`}
                     >
-                      Cross-project waterfall
+                      Cross-service waterfall
                     </Link>
                   </TableCell>
                   <TableCell className="hidden md:table-cell">

@@ -66,6 +66,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`users`](#users) - Manage platform users
 - [`teams`](#teams) - Manage teams and project access
 - [`access`](#access) - Manage which teams can reach a project
+- [`project-groups`](#project-groups) - Group services that ship together into one project and share variables between them (shown as "Projects" in the console)
+- [`instantiations`](#instantiations) - Follow and retry template creations and imports
 - [`apikeys`](#apikeys) - Manage API keys for programmatic access
 - [`monitors`](#monitors) - Manage uptime monitors for status pages
 - [`webhooks`](#webhooks) - Manage webhooks for project events
@@ -99,7 +101,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
 - [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
-- [`templates`](#templates) - Browse deployment templates
+- [`templates`](#templates) - Browse templates and create them
 - [`platform`](#platform) - View platform and server information
 - [`presets`](#presets) - Browse available build presets
 - [`analytics`](#analytics) - View project analytics
@@ -273,6 +275,7 @@ Manage projects
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
 - `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+- `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
 
@@ -374,6 +377,7 @@ Create a new project (git-based or manual deployment)
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
+| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
 ### `projects show` (alias: `get`)
@@ -453,6 +457,17 @@ Show or change how a project is deployed (primary source, and whether it also ac
 | `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
 | `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
 | `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects hosting`
+
+Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects config`
@@ -2873,6 +2888,284 @@ Revoke a team's access to a project
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
+
+## `project-groups` (alias: `pg`)
+
+Group services that ship together into one project and share variables between them (shown as "Projects" in the console)
+
+**Subcommands:**
+
+- `list` (`ls`) - List project groups and their services
+- `show` (`get`) - Show a project group (id or slug)
+- `create` (`new`) - Create a project group, optionally with services
+- `update` (`edit`) - Rename a project group or change its description
+- `delete` (`rm`) - Delete a project group; its services keep running, ungrouped
+- `add` - Add services (project slugs or ids) to a group, moving them out of any other group
+- `remove` - Remove a service from a group; it becomes standalone
+- `repo` - The repository a project deploys its services from (monorepos)
+- `import` - Scan the project's repository and add its apps as services that follow it
+- `follow` - Make a service follow the project's repository and branch (keeps its directory)
+- `unfollow` - Stop a service following the project's repository; it keeps its current settings
+- `routes` - Serve a path of one service's domains from another service (e.g. /api → backend)
+- `vars` - Variables shared by every service in a group
+
+### `project-groups list` (alias: `ls`)
+
+List project groups and their services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups show` (alias: `get`)
+
+Show a project group (id or slug)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups create` (alias: `new`)
+
+Create a project group, optionally with services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Group name | - | No |
+| `-s, --slug <slug>` | URL slug (derived from the name when omitted) | - | No |
+| `-d, --description <text>` | What the services do together | - | No |
+| `--service <service...>` | Services (project slugs or ids) to put in the group | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups update` (alias: `edit`)
+
+Rename a project group or change its description
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | New name | - | No |
+| `-s, --slug <slug>` | New slug | - | No |
+| `-d, --description <text>` | New description ("" clears it) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups delete` (alias: `rm`)
+
+Delete a project group; its services keep running, ungrouped
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups add`
+
+Add services (project slugs or ids) to a group, moving them out of any other group
+
+### `project-groups remove`
+
+Remove a service from a group; it becomes standalone
+
+### `project-groups repo`
+
+The repository a project deploys its services from (monorepos)
+
+**Subcommands:**
+
+- `show` - Show the project's repository and which services follow it
+- `set` - Point the project at a repository and branch; services that follow it are updated to match
+- `unset` - Remove the repository; services keep their current settings and stop following
+
+#### `project-groups repo show`
+
+Show the project's repository and which services follow it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups repo set`
+
+Point the project at a repository and branch; services that follow it are updated to match
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-c, --connection <id>` | Git connection id (see: git-providers / connections) | - | No |
+| `--public <provider>` | Use a public repository without a connection: github or gitlab | - | No |
+| `-r, --repo <owner/name|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
+| `-b, --branch <branch>` | Branch to deploy from, e.g. main | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups repo unset`
+
+Remove the repository; services keep their current settings and stop following
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups import`
+
+Scan the project's repository and add its apps as services that follow it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
+| `--dry-run` | List what would be created without creating anything | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups follow`
+
+Make a service follow the project's repository and branch (keeps its directory)
+
+### `project-groups unfollow`
+
+Stop a service following the project's repository; it keeps its current settings
+
+### `project-groups routes`
+
+Serve a path of one service's domains from another service (e.g. /api → backend)
+
+**Subcommands:**
+
+- `list` (`ls`) - List path routes and how each applies per environment
+- `add` - Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+- `remove` (`rm`) - Stop routing <prefix>; <source> serves it itself again
+
+#### `project-groups routes list` (alias: `ls`)
+
+List path routes and how each applies per environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups routes add`
+
+Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--strip-prefix` | Forward /api/users as /users (default: keep the full path) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups routes remove` (alias: `rm`)
+
+Stop routing <prefix>; <source> serves it itself again
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups vars`
+
+Variables shared by every service in a group
+
+**Subcommands:**
+
+- `list` (`ls`) - List shared variables (values are masked)
+- `set` - Create or update a shared variable; a service's own variable still wins
+- `unset` - Remove a shared variable
+
+#### `project-groups vars list` (alias: `ls`)
+
+List shared variables (values are masked)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars set`
+
+Create or update a shared variable; a service's own variable still wins
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environment <slug>` | Only this environment (e.g. production); default: all | - | No |
+| `--secret` | Write-only: the value can never be read back | - | No |
+| `--no-preview` | Do not send an all-environments variable to preview deployments | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars unset`
+
+Remove a shared variable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environment <slug>` | The environment it was scoped to; default: all | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+## `instantiations` (alias: `inst`)
+
+Follow and retry template creations and imports
+
+**Subcommands:**
+
+- `list` (`ls`) - List your recent template creations and imports
+- `show` - Show every step of a template creation or import
+- `retry` - Continue from the step that failed; finished steps are not repeated
+
+### `instantiations list` (alias: `ls`)
+
+List your recent template creations and imports
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--group <id>` | Only those that added services to this project (group id) | - | No |
+| `--limit <n>` | At most this many (default 20) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `instantiations show`
+
+Show every step of a template creation or import
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--wait` | Wait until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `instantiations retry`
+
+Continue from the step that failed; finished steps are not repeated
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `apikeys` (alias: `keys`)
 
@@ -6084,11 +6377,12 @@ Show a stored import session (the plan it was created with)
 
 ## `templates` (alias: `tpl`)
 
-Browse deployment templates
+Browse templates and create them
 
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
+- `create` - Create a template: every service, the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
@@ -6100,7 +6394,31 @@ List available templates
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--kind <kind>` | Filter by template gallery (starter, service) | - | No |
+| `--kind <kind>` | Filter by kind: starter or app | - | No |
+
+### `templates create`
+
+Create a template: every service, the databases it needs, its shared variables and path routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <name>` | Put the services in a new project with this name (default for several services) | - | No |
+| `--into <project>` | Add the services to an existing project (slug or id) | - | No |
+| `--standalone` | Create a one-service template without a project (default for one service) | - | No |
+| `--name <service=name...>` | Name a created service; a one-service template also takes a bare name | - | No |
+| `--env <[service:]KEY=VALUE...>` | Set a variable; prefix the service when the template cannot tell | - | No |
+| `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored) | - | No |
+| `--database <type=new|type=new:name|type=id...>` | Create or link each database the template needs (default: create) | - | No |
+| `--fork-connection <id>` | Starters only: copy the code into a new repository on this git connection | - | No |
+| `--repo-name <name>` | Name of the new repository (with --fork-connection) | - | No |
+| `--repo-owner <owner>` | Account or organization for the new repository | - | No |
+| `--public-repo` | Make the new repository public (private by default) | - | No |
+| `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
+| `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
+| `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `templates validate`
 

@@ -113,6 +113,24 @@ pub trait PublicRepoProvider: Send + Sync {
         repo: &str,
     ) -> Result<Vec<PublicBranch>, PublicRepoError>;
 
+    /// Look up one branch by name; `Ok(None)` when the repository has no
+    /// such branch. Providers answer this with a single request, so it works
+    /// for repositories with thousands of branches, where
+    /// [`Self::list_branches`] stops at its safety cap and would report an
+    /// existing branch as missing.
+    async fn get_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PublicBranch>, PublicRepoError> {
+        Ok(self
+            .list_branches(owner, repo)
+            .await?
+            .into_iter()
+            .find(|b| b.name == branch))
+    }
+
     /// Get the file tree for preset detection
     async fn get_file_tree(
         &self,
@@ -169,6 +187,11 @@ impl GitHubPublicProvider {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // GitHub API URLs are known-safe origins, but never follow
+            // redirects: a compromised or SSRF-susceptible redirect target
+            // could reach internal services (GitHub tokens sent via auth header
+            // would follow the redirect too).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 
@@ -184,6 +207,9 @@ impl GitHubPublicProvider {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // Same redirect guard as `new()`: the auth token follows the
+            // request; never allow a redirect to carry it to a third party.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 
@@ -325,7 +351,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
         owner: &str,
         repo: &str,
     ) -> Result<PublicRepoInfo, PublicRepoError> {
-        let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
+        let url = format!(
+            "{}/repos/{}/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo)
+        );
 
         let response = Self::validate_response(
             self.send_with_retry(|| self.client.get(&url)).await?,
@@ -404,7 +435,11 @@ impl PublicRepoProvider for GitHubPublicProvider {
         loop {
             let url = format!(
                 "{}/repos/{}/{}/branches?per_page={}&page={}",
-                self.api_url, owner, repo, per_page, page
+                self.api_url,
+                urlencoding::encode(owner),
+                urlencoding::encode(repo),
+                per_page,
+                page
             );
 
             let response = Self::validate_response(
@@ -435,6 +470,52 @@ impl PublicRepoProvider for GitHubPublicProvider {
         Ok(all_branches)
     }
 
+    async fn get_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PublicBranch>, PublicRepoError> {
+        #[derive(Deserialize)]
+        struct GitHubBranch {
+            name: String,
+            commit: GitHubCommit,
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitHubCommit {
+            sha: String,
+        }
+
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = Self::validate_response(
+            response,
+            self.token.is_some(),
+            &format!("get branch {} of {}/{}", branch, owner, repo),
+        )
+        .await?;
+        let b: GitHubBranch = response
+            .json()
+            .await
+            .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse branch: {}", e)))?;
+        Ok(Some(PublicBranch {
+            name: b.name,
+            commit_sha: b.commit.sha,
+            protected: b.protected,
+        }))
+    }
+
     async fn get_file_tree(
         &self,
         owner: &str,
@@ -443,7 +524,10 @@ impl PublicRepoProvider for GitHubPublicProvider {
     ) -> Result<Vec<String>, PublicRepoError> {
         let url = format!(
             "{}/repos/{}/{}/git/trees/{}?recursive=1",
-            self.api_url, owner, repo, reference
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(reference)
         );
 
         let response = Self::validate_response(
@@ -496,8 +580,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
         let url = format!(
             "{}/repos/{}/{}/contents/{}?ref={}",
             self.api_url,
-            owner,
-            repo,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
             encoded_path,
             urlencoding::encode(reference)
         );
@@ -908,6 +992,48 @@ impl PublicRepoProvider for GitLabPublicProvider {
         }
 
         Ok(all_branches)
+    }
+
+    async fn get_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PublicBranch>, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
+        #[derive(Deserialize)]
+        struct GitLabBranch {
+            name: String,
+            commit: GitLabCommit,
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitLabCommit {
+            id: String,
+        }
+
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/branches/{}",
+            self.base_url,
+            Self::encode_project_path(owner, repo),
+            urlencoding::encode(branch)
+        );
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check_response_status(
+            response.status(),
+            &format!("Branch {} of {}/{}", branch, owner, repo),
+        )?;
+        let (b, _): (GitLabBranch, _) =
+            Self::decode_bounded_json(response, Self::MAX_LIST_BYTES, "repository branch").await?;
+        Ok(Some(PublicBranch {
+            name: b.name,
+            commit_sha: b.commit.id,
+            protected: b.protected,
+        }))
     }
 
     async fn get_file_tree(
@@ -1401,6 +1527,59 @@ mod tests {
 
         assert!(matches!(error, PublicRepoError::RateLimitExceeded));
         response.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn github_branch_lookup_is_one_request_by_name() {
+        let mut server = mockito::Server::new_async().await;
+        let found = server
+            .mock("GET", "/repos/example/monorepo/branches/release%2F2026")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "name": "release/2026",
+                    "commit": { "sha": "abc123" },
+                    "protected": false
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let missing = server
+            .mock("GET", "/repos/example/monorepo/branches/nope")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        // Never page through the branch list.
+        let listing = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex("^/repos/example/monorepo/branches\\?".into()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+
+        let branch = provider
+            .get_branch("example", "monorepo", "release/2026")
+            .await
+            .unwrap()
+            .expect("the branch exists");
+        assert_eq!(branch.commit_sha, "abc123");
+        assert!(provider
+            .get_branch("example", "monorepo", "nope")
+            .await
+            .unwrap()
+            .is_none());
+
+        found.assert_async().await;
+        missing.assert_async().await;
+        listing.assert_async().await;
     }
 
     #[tokio::test]

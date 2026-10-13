@@ -1319,7 +1319,7 @@ function NodeDetail({
                     <TableHead>Container</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead className="hidden md:table-cell">
-                      Project
+                      Service
                     </TableHead>
                     <TableHead className="hidden md:table-cell">
                       Environment

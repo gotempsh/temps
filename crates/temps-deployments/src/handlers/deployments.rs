@@ -136,6 +136,25 @@ fn public_compose_service_urls(
         .collect()
 }
 
+/// Refuse to create a deployment for a project whose app runs outside Temps.
+async fn refuse_if_external(state: &AppState, project_id: i32) -> Result<(), Problem> {
+    use sea_orm::EntityTrait;
+    let project = temps_entities::projects::Entity::find_by_id(project_id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, project_id, "Could not load project before deploying");
+            temps_core::error_builder::internal_server_error()
+                .title("Database Error")
+                .detail("Could not load the project")
+                .build()
+        })?;
+    match project {
+        Some(project) => super::remote_deployments::refuse_external_project(&project),
+        None => Ok(()),
+    }
+}
+
 /// Build deployment responses with their environment's public Compose service
 /// URLs, so deployment views list every public service port and not just the
 /// primary environment URL.
@@ -797,6 +816,7 @@ pub async fn rollback_to_deployment(
         project_id,
         state.project_access_checker
     );
+    refuse_if_external(&state, project_id).await?;
 
     let deployment = state
         .deployment_service
@@ -862,6 +882,7 @@ pub async fn promote_deployment(
         project_id,
         state.project_access_checker
     );
+    refuse_if_external(&state, project_id).await?;
 
     info!(
         "Promoting deployment {} to environment {} (project {})",

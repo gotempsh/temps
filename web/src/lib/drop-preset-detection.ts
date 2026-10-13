@@ -48,7 +48,7 @@ export async function prepareAndInspectDrop(
     throw new Error('Preset detection returned no result')
   }
   if (inspection.candidates.length === 0) {
-    throw new Error('No deployable project preset was detected')
+    throw new Error('No deployable app preset was detected')
   }
 
   return { archive: prepared.file, inspection }

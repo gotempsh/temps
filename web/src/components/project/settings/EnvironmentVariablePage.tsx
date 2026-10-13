@@ -42,7 +42,7 @@ export function EnvironmentVariablePage({
         <div className="space-y-3">
           <h2 className="text-xl font-semibold">Variable not found</h2>
           <p className="text-sm text-muted-foreground">
-            This variable may have been deleted or is not part of this project.
+            This variable may have been deleted or is not part of this service.
           </p>
           <Button asChild variant="outline">
             <Link to={listPath}>Back to environment variables</Link>

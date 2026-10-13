@@ -28,7 +28,7 @@ export const HOST_DOCKER_ACCESS_SHORT_LABEL = 'Host root'
  * support channel to ask what "host Docker access" means.
  */
 export const HOST_DOCKER_ACCESS_EXPLANATION =
-  "Mounts /var/run/docker.sock into this project's containers so it can manage containers on its host — for operator-owned infrastructure services only. A granted project is root-equivalent on every host that grants it."
+  "Mounts /var/run/docker.sock into this service's containers so it can manage containers on its host — only for operator-owned infrastructure. A granted service is root-equivalent on every host that grants it."
 
 /**
  * Whether a project holds host Docker access, cannot be told, or plainly does
@@ -98,7 +98,7 @@ export function describeDockerSocket(
     // restart; only fall back when an older server sends none.
     detail:
       capability.reason ||
-      'No host grants this project access to the Docker socket.',
+      'No host grants this service access to the Docker socket.',
     nodes,
   }
 }

@@ -77,6 +77,19 @@
         "Uses an explicit production target context and preflight whoami",
         "Waits for deployment health and fails on a bounded timeout"
       ]
+    },
+    {
+      "id": 7,
+      "prompt": "This repo has apps/web and apps/api. Put both on Temps as one project so the web app can call /api.",
+      "expected_output": "Creates a project (group), connects the repository, dry-runs then runs the monorepo import, adds a /api path route from web to api, and verifies membership and routes.",
+      "files": [],
+      "expectations": [
+        "Routes to projects-and-monorepos and the project-groups reference",
+        "Explains that the console's Project is `project-groups` in the CLI and each app is a service",
+        "Runs `project-groups import --dry-run` before importing",
+        "Uses a path route instead of CORS or a custom proxy for /api",
+        "Follows up with `instantiations show <id> --wait` or `retry` instead of re-running the import"
+      ]
     }
   ]
 }

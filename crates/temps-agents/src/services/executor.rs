@@ -4263,6 +4263,7 @@ mod tests {
             ai_debug_chat_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_write_actions_enabled: false,
             error_source_context_enabled: true,
             vulnerability_scanning_enabled: false,

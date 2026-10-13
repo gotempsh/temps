@@ -133,6 +133,12 @@ pub trait ProjectContextResolver: Send + Sync {
 
     /// Get static file path for a host (if it serves static files)
     async fn get_static_path(&self, host: &str) -> Option<String>;
+
+    /// The path route (ADR 050) that hands `path` on `host` to another
+    /// service, if any. Must be an in-memory lookup: it runs per request.
+    fn match_path_route(&self, _host: &str, _path: &str) -> Option<temps_routes::PathRoute> {
+        None
+    }
 }
 
 /// First-visit attribution data for a new visitor

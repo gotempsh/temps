@@ -30,8 +30,8 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
     return (
       <div className="w-full py-4">
         <ErrorAlert
-          title="Failed to load project setup"
-          description="Temps could not check the current setup state for this project."
+          title="Failed to load service setup"
+          description="Temps could not check the current setup state for this service."
           retry={() => setup.refetch()}
         />
       </div>
@@ -47,7 +47,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
             Production readiness
           </div>
           <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-            Project setup
+            Service setup
           </h1>
           <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-muted-foreground">
             Connect the pieces that make {project.name} observable, reachable,
@@ -84,10 +84,10 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
                       Setup complete
                     </p>
                     <h2 className="mt-0.5 text-lg font-semibold tracking-tight">
-                      This project is production-ready
+                      This service is production-ready
                     </h2>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      Every recommended project integration is connected and
+                      Every recommended service integration is connected and
                       reporting.
                     </p>
                   </div>
@@ -145,7 +145,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
 
       <section className="space-y-3">
         <div>
-          <h2 className="text-sm font-semibold">All project setup items</h2>
+          <h2 className="text-sm font-semibold">All service setup items</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
             Completed items remain available so you can revisit their
             configuration at any time.

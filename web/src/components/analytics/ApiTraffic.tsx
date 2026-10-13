@@ -699,7 +699,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
 
   const investigateWithAi = React.useCallback(() => {
     const scope = [
-      `Project: ${project.name} (${project.slug}, id ${project.id})`,
+      `Service: ${project.name} (project slug ${project.slug}, project id ${project.id})`,
       `Window: ${startIso ?? 'unknown'} to ${endIso ?? 'unknown'}`,
       selectedEnvironment == null
         ? 'Environment: all environments'

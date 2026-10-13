@@ -327,6 +327,10 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
         let route_info = self.route_table.get_route(host)?;
         route_info.static_dir().map(|s| s.to_string())
     }
+
+    fn match_path_route(&self, host: &str, path: &str) -> Option<temps_routes::PathRoute> {
+        self.route_table.match_path_route(host, path)
+    }
 }
 
 #[cfg(test)]
@@ -485,5 +489,70 @@ mod dns_sync_tests {
             },
         ))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod path_route_tests {
+    use super::*;
+    use temps_routes::{BackendType, PathRoute, RouteInfo};
+
+    fn environment(id: i32) -> Arc<temps_entities::environments::Model> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": "production", "slug": "production", "subdomain": "production",
+                "last_deployment": null, "host": "", "upstreams": [],
+                "created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
+                "project_id": 1, "current_deployment_id": null, "branch": null,
+                "deleted_at": null, "deployment_config": null, "is_preview": false,
+                "protected": false, "sleeping": false, "attack_mode": null,
+                "force_https": null, "last_activity_at": null
+            }))
+            .expect("environment fixture"),
+        )
+    }
+
+    /// The proxy resolves path routes through the context resolver, which
+    /// every proxy has; the load balancer's own route-table handle is only
+    /// wired when on-demand TLS is configured.
+    #[test]
+    fn context_resolver_matches_path_routes_in_memory() {
+        let table = Arc::new(CachedPeerTable::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        )));
+        table.insert_route_for_test(
+            "web.example.com",
+            RouteInfo {
+                backend: BackendType::StaticDir {
+                    path: "web".to_string(),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: Some(environment(10)),
+                deployment: None,
+                cert_eligible: true,
+            },
+        );
+        table.insert_path_routes_for_test(
+            10,
+            vec![PathRoute {
+                prefix: "/api".to_string(),
+                strip_prefix: false,
+                target_service: "api".to_string(),
+                target: None,
+                sleeping_environment_id: None,
+            }],
+        );
+        let resolver = ProjectContextResolverImpl::new(table);
+
+        let matched = resolver.match_path_route("web.example.com", "/api/status");
+        assert_eq!(matched.map(|r| r.prefix), Some("/api".to_string()));
+        assert!(resolver
+            .match_path_route("web.example.com", "/about")
+            .is_none());
+        assert!(resolver
+            .match_path_route("other.example.com", "/api/status")
+            .is_none());
     }
 }

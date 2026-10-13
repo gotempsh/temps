@@ -44,7 +44,7 @@ describe('semantic artifact renderers', () => {
     )
 
     expect(html).toContain('Storefront')
-    expect(html).toContain('1 project')
+    expect(html).toContain('1 service')
     expect(html).not.toContain('href=')
   })
 
@@ -68,7 +68,7 @@ describe('semantic artifact renderers', () => {
       })
     )
 
-    expect(html).toContain('Deploy project')
+    expect(html).toContain('Deploy service')
     expect(html).toContain('Queued')
     expect(html).toContain('Environment 11')
   })

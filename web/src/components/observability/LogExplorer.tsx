@@ -235,14 +235,14 @@ export function LogExplorer({
       values: map(facetValues(facets, 'level'), (value) => value),
     },
     {
-      title: 'Project',
+      title: 'Service',
       key: 'project_id',
       values: map(
         projectFacet,
         (value) =>
           names.projects.get(value) ??
           projectLabels[value] ??
-          `Project ${value}`
+          `Service ${value}`
       ),
     },
     {
@@ -510,7 +510,7 @@ export function LogExplorer({
                       </TableHead>
                       <TableHead className="w-16">Level</TableHead>
                       <TableHead className="hidden w-32 lg:table-cell">
-                        Project / service
+                        Service / container
                       </TableHead>
                       <TableHead>Message</TableHead>
                       {visibleColumns.map((column) => (

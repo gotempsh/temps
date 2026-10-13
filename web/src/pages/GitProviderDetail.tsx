@@ -563,7 +563,7 @@ export default function GitProviderDetail() {
               Are you sure you want to delete &quot;{provider.name}&quot;? This
               action cannot be undone. Its {connections?.length ?? 0}{' '}
               connection(s) and their synced repositories are deleted with it.
-              Projects still deployed from this provider block the delete — the
+              Services still deployed from this provider block the delete — the
               error names them.
             </DialogDescription>
           </DialogHeader>

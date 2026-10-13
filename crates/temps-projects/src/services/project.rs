@@ -17,7 +17,7 @@ use temps_core::{
 };
 use temps_entities::{
     env_var_environments, env_vars, environments, external_services, git_provider_connections,
-    git_providers, project_services, projects, types::ProjectType,
+    git_providers, project_group_members, project_services, projects, types::ProjectType,
 };
 use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
 
@@ -32,6 +32,15 @@ use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
 use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
+
+/// Optional group membership filter for [`ProjectService::get_projects_paginated_excluding_search`].
+#[derive(Debug, Clone, Copy)]
+pub enum GroupFilter {
+    /// Return only services that are **not** members of any project group.
+    Ungrouped,
+    /// Return only services that are members of the given project group.
+    InGroup(i32),
+}
 
 /// A project row plus the provider type of the Git connection it is linked to.
 ///
@@ -671,7 +680,7 @@ fn apply_new_template_default_when_unmodified<T: Clone + PartialEq>(
 }
 
 fn template_resource_value(
-    template: &temps_core::templates::ProjectTemplate,
+    template: &temps_core::templates::TemplateServiceSpec,
     select: impl FnOnce(&temps_core::templates::TemplateResources) -> Option<i32>,
 ) -> Option<i32> {
     template.resources.as_ref().and_then(select)
@@ -695,11 +704,11 @@ fn missing_required_service_types(required: &[String], linked: &HashSet<String>)
 /// used by an older release. That keeps a rollback's database credentials
 /// compatible without guessing from the live catalog.
 fn validate_service_binding_compatibility(
-    applied: &temps_core::templates::ProjectTemplate,
-    target: &temps_core::templates::ProjectTemplate,
+    applied: &temps_core::templates::TemplateServiceSpec,
+    target: &temps_core::templates::TemplateServiceSpec,
 ) -> Result<(), ProjectError> {
-    for required_service in &applied.services {
-        if !target.services.iter().any(|target_service| {
+    for required_service in &applied.databases {
+        if !target.databases.iter().any(|target_service| {
             temps_core::templates::managed_service_types_compatible(
                 required_service,
                 target_service,
@@ -710,9 +719,9 @@ fn validate_service_binding_compatibility(
             )));
         }
     }
-    for (service_type, applied_bindings) in &applied.managed_service_bindings {
+    for (service_type, applied_bindings) in &applied.database_bindings {
         let target_bindings = target
-            .managed_service_bindings
+            .database_bindings
             .iter()
             .find(|(target_service_type, _)| {
                 temps_core::templates::managed_service_types_compatible(
@@ -899,7 +908,7 @@ impl ProjectService {
         request: CreateProjectRequest,
         caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
-        self.create_project_with_identity(request, None, caller)
+        self.create_project_with_identity(request, None, caller, false)
             .await
     }
 
@@ -927,7 +936,36 @@ impl ProjectService {
         service_template: temps_core::templates::ServiceTemplateInstance,
         caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
-        if service_template.template.kind != temps_core::templates::TemplateKind::Service {
+        Self::check_service_release(&request, &service_template)?;
+        self.create_project_with_identity(request, Some(service_template), caller, false)
+            .await
+    }
+
+    /// Create one service of a template (ADR-051). An app's services carry
+    /// their release; a starter's do not. With `defer_initial_deployment`,
+    /// a source-built service does not deploy until
+    /// [`Self::queue_initial_deployment`] is called, so a service created
+    /// as part of a larger app first gets its project, shared variables and
+    /// routes.
+    pub async fn create_template_service_as(
+        &self,
+        request: CreateProjectRequest,
+        release: Option<temps_core::templates::ServiceTemplateInstance>,
+        caller: &SlugClaimCaller<'_>,
+        defer_initial_deployment: bool,
+    ) -> Result<Project, ProjectError> {
+        if let Some(release) = release.as_ref() {
+            Self::check_service_release(&request, release)?;
+        }
+        self.create_project_with_identity(request, release, caller, defer_initial_deployment)
+            .await
+    }
+
+    fn check_service_release(
+        request: &CreateProjectRequest,
+        service_template: &temps_core::templates::ServiceTemplateInstance,
+    ) -> Result<(), ProjectError> {
+        if service_template.template.kind != temps_core::templates::TemplateKind::App {
             return Err(ProjectError::InvalidInput(format!(
                 "Template '{}' is not a service template",
                 service_template.slug
@@ -945,7 +983,36 @@ impl ProjectService {
                 service_template.slug
             )));
         }
-        self.create_project_with_identity(request, Some(service_template), caller)
+        Ok(())
+    }
+
+    /// Queue the first deployment of a source-built project whose creation
+    /// deferred it. Image projects deploy through their image job instead.
+    pub async fn queue_initial_deployment(&self, project_id: i32) -> Result<(), ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {project_id} not found")))?;
+        if !project.source_type.requires_git_info()
+            || project.repo_owner.is_empty()
+            || project.repo_name.is_empty()
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Project {} does not build from a repository",
+                project.slug
+            )));
+        }
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("project {} has no environment", project.slug))
+            })?;
+        self.queue_initial_deployment_job(&project, &environment)
             .await
     }
 
@@ -954,6 +1021,7 @@ impl ProjectService {
         request: CreateProjectRequest,
         service_template: Option<temps_core::templates::ServiceTemplateInstance>,
         caller: &SlugClaimCaller<'_>,
+        defer_initial_deployment: bool,
     ) -> Result<Project, ProjectError> {
         if request.template_slug.as_deref().is_some_and(|slug| {
             slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
@@ -1027,7 +1095,15 @@ impl ProjectService {
         )?;
         let preset = resolved.preset;
         let preset_config = resolved.config.clone();
-        let project_type = if service_template.is_some() {
+        // An app's image services are service projects: their runtime is the
+        // pinned release. Services an app builds from source keep the type
+        // their preset gives them (a static frontend stays static); their
+        // snapshot still records the release and its database bindings.
+        let project_type = if service_template
+            .as_ref()
+            .and_then(|release| release.spec())
+            .is_some_and(|spec| spec.is_image())
+        {
             ProjectType::Service
         } else {
             project_type_for_resolved_preset(&resolved)?
@@ -1100,6 +1176,7 @@ impl ProjectService {
             project_type: Set(project_type),
             template_slug: Set(request.template_slug),
             service_template: Set(service_template_json),
+            hosting: Set(request.hosting),
             ..Default::default()
         };
 
@@ -1180,7 +1257,17 @@ impl ProjectService {
         }
         // Queue initial deployment/pipeline job only for Git-based projects with repository information
         // For docker_image and static_files source types, deployments are triggered via API
-        if project_found_db.source_type.requires_git_info()
+        if defer_initial_deployment {
+            info!(
+                "Deferring initial deployment for project {} until its template is assembled",
+                project_found_db.id
+            );
+        } else if project_found_db.hosting == temps_entities::types::Hosting::External {
+            info!(
+                "Project {} runs outside Temps; it is never deployed",
+                project_found_db.id
+            );
+        } else if project_found_db.source_type.requires_git_info()
             && !project_found_db.repo_owner.is_empty()
             && !project_found_db.repo_name.is_empty()
         {
@@ -2144,6 +2231,35 @@ impl ProjectService {
 
         let mut active_project: projects::ActiveModel = project.into();
         active_project.allow_alternate_sources = Set(Some(allow));
+        active_project.updated_at = Set(chrono::Utc::now());
+        let updated = active_project.update(self.db.as_ref()).await?;
+        Ok(self.map_written_project(updated).await)
+    }
+
+    /// Mark whether Temps runs the project's app (`hosted`) or only observes
+    /// an app running elsewhere (`external`). An external project is never
+    /// deployed; deployments already running keep running until stopped.
+    pub async fn set_hosting(
+        &self,
+        project_id: i32,
+        hosting: temps_entities::types::Hosting,
+        caller: DeployCaller,
+    ) -> Result<Project, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+        if project.hosting == hosting {
+            return Ok(self.map_written_project(project).await);
+        }
+        // Switching back to hosted re-enables deploys, so it is gated like
+        // the other settings that widen what can deploy the project.
+        if hosting == temps_entities::types::Hosting::Hosted {
+            self.guard_granted_project_write(&project.slug, "whether Temps hosts it", caller)?;
+        }
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.hosting = Set(hosting);
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
         Ok(self.map_written_project(updated).await)
@@ -4090,6 +4206,25 @@ impl ProjectService {
         hidden: &[i32],
         search: Option<&str>,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_filtered(page, per_page, hidden, search, None)
+            .await
+    }
+
+    /// Paginated project list with an optional group-membership filter.
+    ///
+    /// `group_filter`:
+    /// - `None` — all projects (existing behaviour)
+    /// - `Some(GroupFilter::Ungrouped)` — services not in any project group
+    /// - `Some(GroupFilter::InGroup(id))` — services that are members of
+    ///   the given project group
+    pub async fn get_projects_paginated_filtered(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+        search: Option<&str>,
+        group_filter: Option<GroupFilter>,
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
         use sea_orm::sea_query::extension::postgres::PgExpr;
         use sea_orm::sea_query::LikeExpr;
         use sea_orm::PaginatorTrait;
@@ -4113,6 +4248,25 @@ impl ProjectService {
             .ok_or_else(|| {
                 ProjectError::InvalidInput("page produces an invalid pagination offset".to_string())
             })?;
+
+        // Build subquery for member project_ids once; reused for both count and
+        // page queries so the filter is consistently applied to both.
+        let group_member_subquery = || {
+            sea_orm::sea_query::Query::select()
+                .column(project_group_members::Column::ProjectId)
+                .from(project_group_members::Entity)
+                .to_owned()
+        };
+        let group_member_subquery_for_group = |group_id: i32| {
+            sea_orm::sea_query::Query::select()
+                .column(project_group_members::Column::ProjectId)
+                .from(project_group_members::Entity)
+                .and_where(
+                    sea_orm::sea_query::Expr::col(project_group_members::Column::GroupId)
+                        .eq(group_id),
+                )
+                .to_owned()
+        };
 
         let filtered = || {
             let mut query = projects::Entity::find();
@@ -4141,6 +4295,20 @@ impl ProjectService {
                             .ilike(LikeExpr::new(pattern.clone())),
                         ),
                 );
+            }
+            // Apply group-membership filter using a subquery so we never join
+            // into the page query (that already has a git_providers join).
+            match group_filter {
+                None => {}
+                Some(GroupFilter::Ungrouped) => {
+                    query =
+                        query.filter(projects::Column::Id.not_in_subquery(group_member_subquery()));
+                }
+                Some(GroupFilter::InGroup(group_id)) => {
+                    query = query.filter(
+                        projects::Column::Id.in_subquery(group_member_subquery_for_group(group_id)),
+                    );
+                }
             }
             query
         };
@@ -4595,7 +4763,7 @@ impl ProjectService {
                 "Only service projects can apply service-template upgrades".to_string(),
             ));
         }
-        if target.template.kind != temps_core::templates::TemplateKind::Service {
+        if target.template.kind != temps_core::templates::TemplateKind::App {
             return Err(ProjectError::InvalidInput(format!(
                 "Template '{}' is not a service release",
                 target.slug
@@ -4628,7 +4796,20 @@ impl ProjectService {
                 applied.slug, applied.version, target.slug, target.version
             )));
         }
-        validate_service_binding_compatibility(&applied.template, &target.template)?;
+        let applied_spec = applied.spec().cloned().ok_or_else(|| {
+            ProjectError::Other(format!(
+                "Stored service template for project {project_id} names a service it does not define"
+            ))
+        })?;
+        let target_spec = target.spec().cloned().ok_or_else(|| {
+            ProjectError::InvalidInput(format!(
+                "Template {}@{} has no '{}' service",
+                target.slug,
+                target.version,
+                target.service.as_deref().unwrap_or_default()
+            ))
+        })?;
+        validate_service_binding_compatibility(&applied_spec, &target_spec)?;
         if project.source_type != temps_entities::source_type::SourceType::DockerImage
             || project.preset != temps_entities::preset::Preset::Dockerfile
         {
@@ -4648,7 +4829,7 @@ impl ProjectService {
             .map(|service| service.service_type.to_ascii_lowercase())
             .collect::<HashSet<_>>();
         let missing_services =
-            missing_required_service_types(&target.template.services, &linked_service_types);
+            missing_required_service_types(&target_spec.databases, &linked_service_types);
         if !missing_services.is_empty() {
             return Err(ProjectError::InvalidInput(format!(
                 "Template {}@{} requires linked managed service(s): {}",
@@ -4657,7 +4838,7 @@ impl ProjectService {
                 missing_services.join(", ")
             )));
         }
-        for required in &target.template.services {
+        for required in &target_spec.databases {
             let count = linked_services
                 .iter()
                 .filter_map(|(_, service)| service.as_ref())
@@ -4691,7 +4872,7 @@ impl ProjectService {
                 "Service project {project_id} has no persisted image runtime"
             ))
         })?;
-        let target_image = target.template.image.clone().ok_or_else(|| {
+        let target_image = target_spec.image.clone().ok_or_else(|| {
             ProjectError::InvalidInput(format!(
                 "Target service template {}@{} has no image",
                 target.slug, target.version
@@ -4701,23 +4882,21 @@ impl ProjectService {
         config.image_runtime = Some(temps_entities::preset::ImageRuntimeConfig {
             image_ref: apply_new_template_default_when_unmodified(
                 current_runtime.image_ref,
-                applied.template.image.clone().unwrap_or_default(),
+                applied_spec.image.clone().unwrap_or_default(),
                 target_image,
             ),
             command: apply_new_template_default_when_unmodified(
                 current_runtime.command,
-                applied.template.command.clone(),
-                target.template.command.clone(),
+                applied_spec.command.clone(),
+                target_spec.command.clone(),
             ),
             health_check_path: apply_new_template_default_when_unmodified(
                 current_runtime.health_check_path,
-                applied
-                    .template
+                applied_spec
                     .health_check_path
                     .clone()
                     .or_else(|| Some("/".to_string())),
-                target
-                    .template
+                target_spec
                     .health_check_path
                     .clone()
                     .or_else(|| Some("/".to_string())),
@@ -4728,8 +4907,8 @@ impl ProjectService {
         })?;
 
         let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
-        let applied_resources = &applied.template;
-        let target_resources = &target.template;
+        let applied_resources = &applied_spec;
+        let target_resources = &target_spec;
         deployment_config.cpu_request = apply_new_template_default_when_unmodified(
             deployment_config.cpu_request,
             template_resource_value(applied_resources, |resources| resources.cpu_request),
@@ -4752,8 +4931,8 @@ impl ProjectService {
         );
         deployment_config.exposed_port = apply_new_template_default_when_unmodified(
             deployment_config.exposed_port,
-            applied.template.exposed_port,
-            target.template.exposed_port,
+            applied_spec.exposed_port,
+            target_spec.exposed_port,
         );
         deployment_config.validate().map_err(|error| {
             ProjectError::InvalidInput(format!("Invalid target deployment config: {error}"))
@@ -4853,9 +5032,8 @@ impl ProjectService {
             }
         }
 
-        let definitions = target
-            .template
-            .env_vars
+        let target_variables = target.service_variables();
+        let definitions = target_variables
             .iter()
             .map(|definition| (definition.name.as_str(), definition))
             .collect::<BTreeMap<_, _>>();
@@ -4878,9 +5056,7 @@ impl ProjectService {
                 pending_non_empty_keys.insert(variable.key.clone());
             }
         }
-        for definition in target
-            .template
-            .env_vars
+        for definition in target_variables
             .iter()
             .filter(|definition| definition.required)
         {
@@ -4898,9 +5074,7 @@ impl ProjectService {
         // credential. Sensitivity is project/key-wide, so promote matching
         // rows in every scope before the snapshot changes; never leave a
         // preview/staging duplicate readable or demote an existing secret.
-        for definition in target
-            .template
-            .env_vars
+        for definition in target_variables
             .iter()
             .filter(|definition| definition.is_secret())
         {
@@ -5274,6 +5448,7 @@ impl ProjectService {
             preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
             allow_alternate_sources: db_project.allow_alternate_sources,
+            hosting: db_project.hosting,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
             image_retention_hours: db_project.image_retention_hours,
@@ -5575,8 +5750,10 @@ impl ProjectService {
                     )),
                 })?;
 
-            let branches = provider
-                .list_branches(&project.repo_owner, &project.repo_name)
+            // One lookup by name: listing every branch stops at a safety cap
+            // and reports existing branches of large repositories as missing.
+            let branch_info = provider
+                .get_branch(&project.repo_owner, &project.repo_name, &branch_to_use)
                 .await
                 .map_err(|e| match e {
                     PublicRepoError::RateLimitExceeded => ProjectError::PublicRepoRateLimited {
@@ -5585,27 +5762,14 @@ impl ProjectService {
                         provider: provider_name.to_string(),
                     },
                     e => ProjectError::Other(format!(
-                        "Failed to fetch branches from public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
-                        project.repo_owner, project.repo_name, e
+                        "Failed to fetch branch '{}' from public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
+                        branch_to_use, project.repo_owner, project.repo_name, e
                     )),
-                })?;
-
-            // Find the target branch
-            let branch_info = branches
-                .iter()
-                .find(|b| b.name == branch_to_use)
+                })?
                 .ok_or_else(|| {
                     ProjectError::NotFound(format!(
-                        "Branch '{}' not found in public repo {}/{}. Available branches: {}",
-                        branch_to_use,
-                        project.repo_owner,
-                        project.repo_name,
-                        branches
-                            .iter()
-                            .take(10)
-                            .map(|b| b.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        "Branch '{}' not found in public repo {}/{}",
+                        branch_to_use, project.repo_owner, project.repo_name
                     ))
                 })?;
 
@@ -6425,6 +6589,78 @@ mod tests {
         assert!(fenced.deleted_at.is_some());
     }
 
+    /// A project whose app runs elsewhere is never deployed: creating it
+    /// queues no first deployment even with a repository, and it can be
+    /// switched to hosted and back.
+    #[tokio::test]
+    async fn an_external_project_is_not_deployed_on_creation() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let queue = Arc::new(MockJobQueue::new());
+        let service = create_test_services(db.clone(), queue.clone()).await;
+
+        let project = service
+            .create_project(CreateProjectRequest {
+                name: "Marketing Site".to_string(),
+                expected_slug: None,
+                repo_name: Some("site".to_string()),
+                repo_owner: Some("acme".to_string()),
+                directory: "/".to_string(),
+                main_branch: "main".to_string(),
+                preset: Preset::Nixpacks.to_string(),
+                preset_config: None,
+                environment_variables: None,
+                git_url: None,
+                git_provider_connection_id: None,
+                automatic_deploy: false,
+                exposed_port: None,
+                cpu_request: None,
+                cpu_limit: None,
+                memory_request: None,
+                memory_limit: None,
+                is_public_repo: None,
+                storage_service_ids: vec![],
+                storage_service_claim_ids: vec![],
+                storage_service_claim_user_id: None,
+                source_type: temps_entities::source_type::SourceType::Git,
+                template_slug: None,
+                hosting: temps_entities::types::Hosting::External,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(project.hosting, temps_entities::types::Hosting::External);
+        let deploys = queue
+            .get_jobs()
+            .await
+            .into_iter()
+            .filter(|job| matches!(job, Job::GitPushEvent(_)))
+            .count();
+        assert_eq!(deploys, 0, "an external project must not be deployed");
+
+        let hosted = service
+            .set_hosting(
+                project.id,
+                temps_entities::types::Hosting::Hosted,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hosted.hosting, temps_entities::types::Hosting::Hosted);
+        let external = service
+            .set_hosting(
+                project.id,
+                temps_entities::types::Hosting::External,
+                temps_core::docker_socket_grant::DeployCaller::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external.hosting, temps_entities::types::Hosting::External);
+    }
+
     /// Opting a Git project into alternate sources must leave everything that
     /// makes it a Git project intact. If `source_type` flipped here, the
     /// project would lose rollback rebuild-from-source (which keys off
@@ -6685,6 +6921,7 @@ mod tests {
             storage_service_claim_user_id: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
+            hosting: Default::default(),
         };
 
         let result = project_service
@@ -7174,6 +7411,7 @@ mod tests {
             memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
+            hosting: Default::default(),
         };
 
         project_service
@@ -7418,8 +7656,7 @@ mod tests {
             temps_core::templates::bundled_template_by_slug("browserless")
                 .expect("bundled Browserless release"),
         );
-        applied
-            .template
+        applied.template.services[0]
             .env_vars
             .push(temps_core::templates::EnvVarTemplate {
                 name: "OPTIONAL_SETTING".to_string(),
@@ -7440,32 +7677,28 @@ mod tests {
                     image_runtime: Some(temps_entities::preset::ImageRuntimeConfig {
                         // User customization: an upgrade must not replace this.
                         image_ref: "registry.example/browserless-custom:7".to_string(),
-                        command: applied.template.command.clone(),
-                        health_check_path: applied.template.health_check_path.clone(),
+                        command: applied.template.services[0].command.clone(),
+                        health_check_path: applied.template.services[0].health_check_path.clone(),
                     }),
                     ..Default::default()
                 },
             ))
             .expect("Dockerfile config serialization"),
         );
-        request.exposed_port = applied.template.exposed_port;
-        request.cpu_request = applied
-            .template
+        request.exposed_port = applied.template.services[0].exposed_port;
+        request.cpu_request = applied.template.services[0]
             .resources
             .as_ref()
             .and_then(|resources| resources.cpu_request);
-        request.cpu_limit = applied
-            .template
+        request.cpu_limit = applied.template.services[0]
             .resources
             .as_ref()
             .and_then(|resources| resources.cpu_limit);
-        request.memory_request = applied
-            .template
+        request.memory_request = applied.template.services[0]
             .resources
             .as_ref()
             .and_then(|resources| resources.memory_request);
-        request.memory_limit = applied
-            .template
+        request.memory_limit = applied.template.services[0]
             .resources
             .as_ref()
             .and_then(|resources| resources.memory_limit);
@@ -7580,15 +7813,18 @@ mod tests {
         let mut target = applied.clone();
         target.version = "1.1.0".to_string();
         target.template.version = target.version.clone();
-        target.template.image = Some(
+        target.template.services[0].image = Some(
             "ghcr.io/browserless/chromium@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
         );
-        target.template.exposed_port = Some(3100);
-        target.template.health_check_path = Some("/ready".to_string());
-        target.template.resources.as_mut().unwrap().memory_limit = Some(2_560);
-        let promoted_definition = target
-            .template
+        target.template.services[0].exposed_port = Some(3100);
+        target.template.services[0].health_check_path = Some("/ready".to_string());
+        target.template.services[0]
+            .resources
+            .as_mut()
+            .unwrap()
+            .memory_limit = Some(2_560);
+        let promoted_definition = target.template.services[0]
             .env_vars
             .iter_mut()
             .find(|definition| definition.name == "OPTIONAL_SETTING")
@@ -9209,6 +9445,7 @@ mod tests {
             storage_service_claim_user_id: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
+            hosting: Default::default(),
         }
     }
 
@@ -9233,10 +9470,12 @@ mod tests {
     #[test]
     fn service_upgrade_may_add_but_not_remap_managed_service_bindings() {
         let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
-            .expect("bundled Keycloak release");
+            .expect("bundled Keycloak release")
+            .primary()
+            .clone();
         let mut target = applied.clone();
         target
-            .managed_service_bindings
+            .database_bindings
             .entry("postgres".to_string())
             .or_default()
             .insert("NEW_ALIAS".to_string(), "POSTGRES_HOST".to_string());
@@ -9244,12 +9483,12 @@ mod tests {
             .expect("adding a managed-service alias is rollback-safe");
 
         let existing_alias = applied
-            .managed_service_bindings
+            .database_bindings
             .get_mut("postgres")
             .and_then(|bindings| bindings.keys().next().cloned())
             .expect("Keycloak declares a PostgreSQL binding");
         target
-            .managed_service_bindings
+            .database_bindings
             .get_mut("postgres")
             .expect("target PostgreSQL bindings")
             .insert(existing_alias, "REMAPPED_SOURCE".to_string());
@@ -9262,10 +9501,12 @@ mod tests {
     #[test]
     fn service_upgrade_cannot_remove_required_service_without_custom_bindings() {
         let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
-            .expect("bundled Keycloak release");
-        applied.managed_service_bindings.clear();
+            .expect("bundled Keycloak release")
+            .primary()
+            .clone();
+        applied.database_bindings.clear();
         let mut target = applied.clone();
-        target.services.clear();
+        target.databases.clear();
 
         assert!(matches!(
             validate_service_binding_compatibility(&applied, &target),
@@ -11131,5 +11372,26 @@ mod tests {
             normalize_project_directory("apps/../../etc"),
             Err(ProjectError::InvalidInput(_))
         ));
+    }
+
+    // ── GroupFilter enum tests ──────────────────────────────────────────────
+
+    #[test]
+    fn group_filter_ungrouped_and_in_group_are_distinct_variants() {
+        // Regression: ensure GroupFilter::Ungrouped and InGroup(id) are
+        // distinct and don't accidentally match each other.
+        assert!(
+            !matches!(GroupFilter::Ungrouped, GroupFilter::InGroup(_)),
+            "Ungrouped must not match InGroup"
+        );
+        assert!(
+            !matches!(GroupFilter::InGroup(1), GroupFilter::Ungrouped),
+            "InGroup must not match Ungrouped"
+        );
+        // InGroup preserves the group id.
+        assert!(
+            matches!(GroupFilter::InGroup(42), GroupFilter::InGroup(42)),
+            "InGroup(42) must match InGroup(42)"
+        );
     }
 }

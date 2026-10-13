@@ -82,6 +82,11 @@ const PlatformTools = lazy(() =>
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
+const ProjectGroupDetail = lazy(() =>
+  import('./pages/ProjectGroupDetail').then((m) => ({
+    default: m.ProjectGroupDetail,
+  }))
+)
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
 )
@@ -612,6 +617,7 @@ const FullAppRoutes = () => {
                     <Route path="/setup/ai" element={<AiOnboarding />} />
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
+                    <Route path="/p/:slug" element={<ProjectGroupDetail />} />
                     <Route
                       path="/drop"
                       element={

@@ -1211,7 +1211,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
   const assistantContext = deployment
     ? [
         'The user is viewing a deployment in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
         `Deployment #${deployment.id} — status: ${deployment.status ?? 'unknown'}${deployment.environment ? `, environment: ${deployment.environment}` : ''}.`,
         deployment.branch ? `Branch: ${deployment.branch}.` : '',
         deployment.commit_hash

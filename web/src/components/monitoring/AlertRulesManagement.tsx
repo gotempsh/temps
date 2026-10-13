@@ -181,8 +181,8 @@ export function AlertRulesManagement({
     return (
       <EmptyState
         icon={ShieldAlert}
-        title="No projects found"
-        description="Create a project first to configure error alert rules."
+        title="No services found"
+        description="Create a service first to configure error alert rules."
       />
     )
   }
@@ -203,8 +203,8 @@ export function AlertRulesManagement({
               value={String(projectId)}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-[200px]" aria-label="Project">
-                <SelectValue placeholder="Select project" />
+              <SelectTrigger className="w-[200px]" aria-label="Service">
+                <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
                 {projectList!.map((p) => (

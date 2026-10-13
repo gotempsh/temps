@@ -95,7 +95,7 @@ export function Revenue() {
 
   const projectOptions = useMemo<SearchableSelectOption[]>(() => {
     const opts: SearchableSelectOption[] = [
-      { value: ALL_PROJECTS, label: 'All projects' },
+      { value: ALL_PROJECTS, label: 'All services' },
     ]
     for (const p of projectsQuery.data?.projects ?? []) {
       opts.push({ value: String(p.id), label: p.name })
@@ -158,7 +158,7 @@ export function Revenue() {
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">Revenue</h1>
         <p className="text-sm text-muted-foreground">
-          Transactions, invoices, and subscription events across every project.
+          Transactions, invoices, and subscription events across every service.
         </p>
       </div>
 
@@ -266,9 +266,9 @@ export function Revenue() {
               value={projectFilter}
               onValueChange={setProjectFilter}
               options={projectOptions}
-              placeholder="Filter by project"
-              searchPlaceholder="Search projects..."
-              emptyText="No projects."
+              placeholder="Filter by service"
+              searchPlaceholder="Search services..."
+              emptyText="No services."
               className="w-full sm:w-[220px]"
               disabled={projectsQuery.isLoading}
             />
@@ -302,7 +302,7 @@ export function Revenue() {
             <TableHeader>
               <TableRow>
                 <TableHead>Event</TableHead>
-                <TableHead className="hidden md:table-cell">Project</TableHead>
+                <TableHead className="hidden md:table-cell">Service</TableHead>
                 <TableHead className="hidden lg:table-cell">Customer</TableHead>
                 <TableHead className="text-right">Amount</TableHead>
                 <TableHead className="text-right">MRR Δ</TableHead>
@@ -346,7 +346,7 @@ export function Revenue() {
                       description={
                         hasFilters
                           ? 'Try widening the date range or clearing filters.'
-                          : 'Connect Stripe or LemonSqueezy on a project to start capturing invoices and subscription changes.'
+                          : 'Connect Stripe or LemonSqueezy on a service to start capturing invoices and subscription changes.'
                       }
                       action={
                         hasFilters ? (

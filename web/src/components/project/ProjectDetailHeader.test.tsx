@@ -6,10 +6,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { getEnvironmentsQueryKey } from '@/api/client/@tanstack/react-query.gen'
-import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import type { ProjectResponse } from '@/api/client'
 import { ProjectDetailHeader } from './ProjectDetailHeader'
 
-function renderHeader(status: string, currentId: number | null | undefined) {
+function renderHeader(
+  currentId: number | null | undefined,
+  hosting: ProjectResponse['hosting'] = 'hosted'
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -23,10 +26,12 @@ function renderHeader(status: string, currentId: number | null | undefined) {
       <MemoryRouter>
         <ProjectDetailHeader
           project={
-            { id: 1, slug: 'temps-cloud-api', name: 'Temps' } as ProjectResponse
-          }
-          lastDeployment={
-            { id: 3513, status, is_current: false } as DeploymentResponse
+            {
+              id: 1,
+              slug: 'temps-cloud-api',
+              name: 'Temps',
+              hosting,
+            } as ProjectResponse
           }
           onDeploy={() => {}}
         />
@@ -37,18 +42,22 @@ function renderHeader(status: string, currentId: number | null | undefined) {
   return html
 }
 
-for (const status of ['running', 'failed', 'completed', 'stopped']) {
-  test(`current deployment remains Deployed when latest is ${status}`, () => {
-    const html = renderHeader(status, 3500)
-    expect(html).toContain('>Deployed<')
-    expect(html).not.toContain('Not deployed')
-  })
-}
+test('an environment with a current deployment reads Deployed', () => {
+  const html = renderHeader(3500)
+  expect(html).toContain('>Deployed<')
+  expect(html).not.toContain('Not deployed')
+})
 test('a completed historical build does not imply a current deployment', () => {
-  expect(renderHeader('completed', null)).toContain('Not deployed')
+  expect(renderHeader(null)).toContain('Not deployed')
 })
 test('loading environments does not flash Not deployed', () => {
-  const html = renderHeader('running', undefined)
+  const html = renderHeader(undefined)
   expect(html).toContain('Checking deployment')
   expect(html).not.toContain('Not deployed')
+})
+test('a service hosted elsewhere shows External and no deploy button', () => {
+  const html = renderHeader(null, 'external')
+  expect(html).toContain('External')
+  expect(html).not.toContain('Not deployed')
+  expect(html).not.toContain('>Deploy<')
 })

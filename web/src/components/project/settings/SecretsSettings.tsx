@@ -109,7 +109,7 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               fs.readFileSync(&apos;/run/secrets/DB_PASSWORD&apos;,
               &apos;utf8&apos;)
             </code>
-            . Docker Compose projects get the same mount in every service. A
+            . Docker Compose services get the same mount in every container. A
             redeploy is required for new or updated secrets to take effect.
           </p>
         </div>
@@ -455,7 +455,7 @@ function CreateSecretDialog({
               <p className="text-xs text-muted-foreground mt-2">
                 This secret will be mounted in every service. To restrict it to
                 specific containers — so a database or sidecar can&apos;t read
-                an application&apos;s credentials — sync this project&apos;s
+                an application&apos;s credentials — sync this service&apos;s
                 compose services from Git settings, then edit the secret.
               </p>
             </div>

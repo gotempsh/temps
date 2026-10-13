@@ -526,4 +526,113 @@ describe("readAndValidateTemplatePath", () => {
       result.errors.some((error) => error.includes("Symbolic links")),
     ).toBeTrue();
   });
+
+  test("accepts a template that lists several services", () => {
+    const result = validateNativeTemplateConfig({
+      version: "3",
+      templates: [
+        {
+          slug: "secrets-manager",
+          name: "Secrets manager",
+          kind: "app",
+          version: "1.0.0",
+          git: { url: "https://github.com/example/secrets.git", ref: "v1.2.3" },
+          databases: ["postgres", "redis"],
+          shared_env_vars: [
+            { name: "ENCRYPTION_KEY", secret: true, default_generator: "random_hex_32" },
+          ],
+          services: [
+            {
+              name: "backend",
+              directory: "backend",
+              preset: "dockerfile",
+              exposed_port: 8080,
+              database_bindings: {
+                postgres: { DB_CONNECTION_URI: "POSTGRES_URL" },
+                redis: { REDIS_URL: "REDIS_URL" },
+              },
+            },
+            { name: "frontend", directory: "frontend", preset: "vite" },
+          ],
+          routes: [{ source: "frontend", prefix: "/api", target: "backend" }],
+        },
+      ],
+    });
+    expect(result).toEqual({ valid: true, errors: [], templateCount: 1 });
+  });
+
+  test("rejects routes to unknown services and unused databases", () => {
+    const result = validateNativeTemplateConfig({
+      version: "3",
+      templates: [
+        {
+          slug: "broken",
+          name: "Broken",
+          kind: "starter",
+          git: { url: "https://github.com/example/broken.git" },
+          preset: "vite",
+          databases: ["postgres"],
+          services: [
+            { name: "web", preset: "vite" },
+            { name: "api", preset: "nixpacks-node" },
+          ],
+          routes: [{ source: "web", prefix: "api", target: "worker" }],
+        },
+      ],
+    });
+    expect(result.errors).toContain(
+      "templates[0].preset belongs to one of the services, not to the template",
+    );
+    expect(result.errors).toContain(
+      "templates[0].routes[0].target must name a service of the template",
+    );
+    expect(result.errors).toContain(
+      "templates[0].routes[0].prefix must be a path such as /api",
+    );
+    expect(result.errors).toContain(
+      'templates[0].databases lists "postgres", but no service uses it; list it in a service\'s databases or database_bindings',
+    );
+  });
+  test("requires source-built services of a multi-service app to pin a git ref", () => {
+    const template = (git: Record<string, unknown>, apiGit?: Record<string, unknown>) => ({
+      version: "3",
+      templates: [
+        {
+          slug: "shop",
+          name: "Shop",
+          kind: "app",
+          version: "1.0.0",
+          git,
+          services: [
+            { name: "web", directory: "web", preset: "vite" },
+            { name: "api", directory: "api", preset: "dockerfile", ...(apiGit ? { git: apiGit } : {}) },
+          ],
+        },
+      ],
+    });
+    const url = "https://github.com/example/shop.git";
+
+    // An explicit empty ref is unpinned; the server rejects it.
+    const unpinned = validateNativeTemplateConfig(template({ url, ref: "" }));
+    expect(unpinned.valid).toBeFalse();
+    expect(unpinned.errors).toContain(
+      "templates[0].services[0] is built from source and must pin the git ref it builds (git.ref on the service or the template)",
+    );
+    expect(unpinned.errors).toContain(
+      "templates[0].services[1] is built from source and must pin the git ref it builds (git.ref on the service or the template)",
+    );
+
+    // A service's own git replaces the template's, ref included.
+    const own = validateNativeTemplateConfig(template({ url, ref: "v2.0.0" }, { url, ref: " " }));
+    expect(own.errors).toEqual([
+      "templates[0].services[1] is built from source and must pin the git ref it builds (git.ref on the service or the template)",
+    ]);
+    expect(validateNativeTemplateConfig(template({ url, ref: "" }, { url, ref: "v2.0.0" })).errors).toEqual([
+      "templates[0].services[0] is built from source and must pin the git ref it builds (git.ref on the service or the template)",
+    ]);
+
+    // Like the server, a git block without ref builds `main`.
+    expect(validateNativeTemplateConfig(template({ url })).valid).toBeTrue();
+    expect(validateNativeTemplateConfig(template({ url, ref: "v2.0.0" })).valid).toBeTrue();
+  });
 });

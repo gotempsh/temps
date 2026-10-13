@@ -219,7 +219,7 @@ export default function GlobalLogs() {
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title="Logs"
-        description={`${view.projectId ? 'Selected project' : 'All projects'} · application and database logs`}
+        description={`${view.projectId ? 'Selected service' : 'All services'} · application and database logs`}
       />
       <LogCollectionNotice
         collection={capabilities.data?.collection}
@@ -285,8 +285,8 @@ export default function GlobalLogs() {
               <span className="text-[11px] text-muted-foreground">UTC</span>
               <HelpPopover label="About log search">
                 <p>
-                  Search messages or use project:, env:, source:, and level:
-                  filters.
+                  Search messages or use project: (service), env:, source:, and
+                  level: filters.
                 </p>
                 <p>
                   Counts and groups describe the loaded page. Times are in UTC.

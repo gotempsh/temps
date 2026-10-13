@@ -2058,6 +2058,13 @@ async fn process_git_push_event(
         }
     };
 
+    // A push to the repository of an app that runs outside Temps is not a
+    // deploy request; skip it rather than record a refused deployment.
+    if let Some(reason) = project.hosting.deploy_refusal(&project.name) {
+        info!(project_id = project.id, "Ignoring git push: {reason}");
+        return Ok(());
+    }
+
     // Resolve the deploy target(s). A manual trigger that names an explicit
     // environment (`target_environment_id`) deploys to exactly that environment,
     // bypassing branch → environment matching. Otherwise (webhook push, or a

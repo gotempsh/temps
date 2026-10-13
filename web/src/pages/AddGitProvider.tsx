@@ -51,7 +51,7 @@ export function AddGitProvider() {
           <div>
             <h1 className="text-xl sm:text-2xl font-bold">Add Git Provider</h1>
             <p className="text-sm sm:text-base text-muted-foreground">
-              Connect a Git provider to deploy and manage your projects
+              Connect a Git provider to deploy and manage your services
             </p>
           </div>
         </div>

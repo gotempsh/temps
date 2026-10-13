@@ -133,7 +133,7 @@ async function fetchEmailStats(domainId: number): Promise<EmailStatsResponse> {
 async function fetchAuthorizedProjects(domainId: number): Promise<AuthorizedEmailDomainProjectResponse[]> {
   const response = await listEmailDomainProjects({ path: { id: domainId } })
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch authorized projects'))
+    throw new Error(problemMessage(response.error, 'Failed to fetch authorized services'))
   }
   return response.data ?? []
 }
@@ -455,32 +455,32 @@ export function EmailDomainDetail() {
     mutationFn: async (projectId: number) => {
       const response = await authorizeEmailDomainProject({ path: { id: id!, project_id: projectId } })
       if (response.error) {
-        throw new Error(problemMessage(response.error, 'Failed to authorize project'))
+        throw new Error(problemMessage(response.error, 'Failed to authorize service'))
       }
     },
     onSuccess: () => {
       setProjectToAuthorize(null)
       queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
-      toast.success('Project authorized', {
-        description: 'Deployments in this project can now send from this domain.',
+      toast.success('Service authorized', {
+        description: 'Deployments in this service can now send from this domain.',
       })
     },
-    onError: (error: Error) => toast.error('Failed to authorize project', { description: error.message }),
+    onError: (error: Error) => toast.error('Failed to authorize service', { description: error.message }),
   })
 
   const revokeProjectMutation = useMutation({
     mutationFn: async (projectId: number) => {
       const response = await revokeEmailDomainProject({ path: { id: id!, project_id: projectId } })
       if (response.error) {
-        throw new Error(problemMessage(response.error, 'Failed to revoke project'))
+        throw new Error(problemMessage(response.error, 'Failed to revoke service'))
       }
     },
     onSuccess: () => {
       setProjectToRevoke(null)
       queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
-      toast.success('Project access revoked')
+      toast.success('Service access revoked')
     },
-    onError: (error: Error) => toast.error('Failed to revoke project', { description: error.message }),
+    onError: (error: Error) => toast.error('Failed to revoke service', { description: error.message }),
   })
 
   const backAction = (
@@ -766,10 +766,10 @@ export function EmailDomainDetail() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <KeyRound className="size-4" />
-                Authorized projects
+                Authorized services
               </CardTitle>
               <CardDescription>
-                Choose which project deployment tokens may send email from {domain.domain}.
+                Choose which service deployment tokens may send email from {domain.domain}.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -782,7 +782,7 @@ export function EmailDomainDetail() {
                     }}
                     allowAll={false}
                     excludeIds={authorizedProjects.map((p) => p.id)}
-                    placeholder="Search projects by name or slug"
+                    placeholder="Search services by name or slug"
                     disabled={authorizeProjectMutation.isPending}
                     className="w-full sm:w-full"
                   />
@@ -795,7 +795,7 @@ export function EmailDomainDetail() {
               {isLoadingAuthorizations ? (
                 <Skeleton className="h-16 w-full" />
               ) : authorizationsError ? (
-                <Callout tone="error" title="Could not load project authorizations">
+                <Callout tone="error" title="Could not load service authorizations">
                   <div className="flex items-center justify-between gap-3">
                     <span>{authorizationsError.message}</span>
                     <Button variant="outline" size="sm" onClick={() => refetchAuthorizations()}>
@@ -805,7 +805,7 @@ export function EmailDomainDetail() {
                 </Callout>
               ) : authorizedProjects.length === 0 ? (
                 <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                  No projects are authorized yet. Deployment tokens cannot send from this domain until you add one.
+                  No services are authorized yet. Deployment tokens cannot send from this domain until you add one.
                 </div>
               ) : (
                 <div className="divide-y rounded-md border">
@@ -829,7 +829,7 @@ export function EmailDomainDetail() {
               )}
               {!canManageAuthorizations && (
                 <p className="text-sm text-muted-foreground">
-                  Only an instance or platform administrator can change sender-domain project access.
+                  Only an instance or platform administrator can change sender-domain service access.
                 </p>
               )}
             </CardContent>
@@ -847,7 +847,7 @@ export function EmailDomainDetail() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Revoke project access?</AlertDialogTitle>
+            <AlertDialogTitle>Revoke service access?</AlertDialogTitle>
             <AlertDialogDescription>
               <span className="font-medium text-foreground">{projectToRevoke?.name}</span>
               {' '}will no longer be able to send email from{' '}
@@ -885,14 +885,14 @@ export function EmailDomainDetail() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Authorize project to send email?</AlertDialogTitle>
+            <AlertDialogTitle>Authorize service to send email?</AlertDialogTitle>
             <AlertDialogDescription>
               <span className="font-medium text-foreground">
-                {projectToAuthorizeName ?? 'This project'}
+                {projectToAuthorizeName ?? 'This service'}
               </span>
               {' '}will be able to send email from{' '}
               <span className="font-medium text-foreground">{domain.domain}</span>.
-              Every deployment token in that project gains this ability immediately.
+              Every deployment token in that service gains this ability immediately.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

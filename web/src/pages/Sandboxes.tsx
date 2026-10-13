@@ -302,7 +302,7 @@ export default function Sandboxes({
         title={workspacesOnly ? 'Workspaces' : 'Sandboxes'}
         description={
           workspacesOnly
-            ? 'Persistent projects and working context, with compute when you need it.'
+            ? 'Persistent services and working context, with compute when you need it.'
             : 'Standalone compute environments managed through the CLI, API, or SDK.'
         }
         actions={
@@ -595,7 +595,7 @@ export function ManagedApplicationWorkspaces({
             <p className="text-sm text-muted-foreground">
               {computeOnly
                 ? 'Compute attached to a workspace. Manage its lifecycle from the owning workspace.'
-                : 'Projects and persistent context, with optional compute and AI threads.'}
+                : 'Services and persistent context, with optional compute and AI threads.'}
             </p>
           </div>
           {entries.length > 0 && (

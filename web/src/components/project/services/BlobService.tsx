@@ -142,7 +142,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
             <CardHeader>
               <CardTitle>Service Status</CardTitle>
               <CardDescription>
-                Cluster-wide status of Blob Storage. Once enabled, every project
+                Cluster-wide status of Blob Storage. Once enabled, every service
                 on this instance can store files through the SDK below.
               </CardDescription>
             </CardHeader>
@@ -194,7 +194,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                       An administrator must enable the Blob service from{' '}
                       <strong>Storage Settings → Platform Services</strong>.
                       Once enabled, the SDK on the Documentation tab works out
-                      of the box — no further per-project setup needed.
+                      of the box — no further per-service setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
@@ -305,7 +305,7 @@ TEMPS_PROJECT_ID=42`}
                   language="bash"
                 />
                 <p className="text-sm text-muted-foreground">
-                  Need an isolated client (multiple projects, custom timeouts,
+                  Need an isolated client (multiple services, custom timeouts,
                   testing)? Use{' '}
                   <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
                     createClient
@@ -437,7 +437,7 @@ console.log(snapshot.url)`}
                 <CodeBlock
                   code={`interface BlobInfo {
   url: string         // Full URL to access the blob
-  pathname: string    // Path within project storage
+  pathname: string    // Path within service storage
   contentType: string // MIME type (e.g., 'image/png')
   size: number        // Size in bytes
   uploadedAt: string  // ISO 8601 timestamp

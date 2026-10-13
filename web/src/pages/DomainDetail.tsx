@@ -1160,14 +1160,14 @@ export function DomainDetail() {
             <AlertDialogHeader>
               <AlertDialogTitle>Move {domain.domain}</AlertDialogTitle>
               <AlertDialogDescription>
-                Choose the project first, then the environment that should
+                Choose the service first, then the environment that should
                 receive this hostname.
               </AlertDialogDescription>
             </AlertDialogHeader>
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="target-project">Target project</Label>
+                <Label htmlFor="target-project">Target service</Label>
                 <Select
                   value={targetProjectId}
                   onValueChange={(value) => {
@@ -1180,8 +1180,8 @@ export function DomainDetail() {
                     <SelectValue
                       placeholder={
                         projectsQuery.isPending
-                          ? 'Loading projects…'
-                          : 'Select a project'
+                          ? 'Loading services…'
+                          : 'Select a service'
                       }
                     />
                   </SelectTrigger>
@@ -1206,20 +1206,20 @@ export function DomainDetail() {
                     }
                   >
                     {projectsQuery.isFetchingNextPage
-                      ? 'Loading more projects…'
-                      : 'Load more projects'}
+                      ? 'Loading more services…'
+                      : 'Load more services'}
                   </Button>
                 )}
                 {!projectsQuery.isPending &&
                   !projectsQuery.isError &&
                   targetProjects.length === 0 && (
                     <p className="text-sm text-muted-foreground">
-                      No other accessible projects are available.
+                      No other accessible services are available.
                     </p>
                   )}
                 {projectsQuery.isError && (
                   <p className="text-sm text-destructive">
-                    Projects could not be loaded. Close and try again.
+                    Services could not be loaded. Close and try again.
                   </p>
                 )}
               </div>
@@ -1239,7 +1239,7 @@ export function DomainDetail() {
                     <SelectValue
                       placeholder={
                         !targetProjectId
-                          ? 'Select a project first'
+                          ? 'Select a service first'
                           : environmentsQuery.isPending
                             ? 'Loading environments…'
                             : 'Select an environment'
@@ -1259,7 +1259,7 @@ export function DomainDetail() {
                 </Select>
                 {environmentsQuery.isError && (
                   <p className="text-sm text-destructive">
-                    Environments could not be loaded. Select the project again
+                    Environments could not be loaded. Select the service again
                     to retry.
                   </p>
                 )}

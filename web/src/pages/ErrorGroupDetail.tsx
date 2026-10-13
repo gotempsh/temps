@@ -174,7 +174,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const assistantContext = errorGroup
     ? [
         'The user is viewing an error group (error tracking) in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
         `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
         `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
         'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',

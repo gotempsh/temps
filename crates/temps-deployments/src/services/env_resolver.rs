@@ -63,6 +63,15 @@ pub enum DeploymentEnvResolutionError {
     },
 
     #[error(
+        "Failed to load variables inherited from the project group of project {project_id}, environment {environment_id}: {reason}"
+    )]
+    InheritedGroupVariables {
+        project_id: i32,
+        environment_id: i32,
+        reason: String,
+    },
+
+    #[error(
         "Failed to query linked services for project {project_id}, environment {environment_id}: {source}"
     )]
     LinkedServicesQuery {
@@ -295,10 +304,14 @@ fn apply_managed_service_bindings(
             reason: error.to_string(),
         },
     )?;
-    let template = instance.template;
-    let template_slug = template.slug.clone();
+    let template_slug = instance.slug.clone();
+    // The bindings of the service this project is (validated to exist).
+    let bindings_by_type = instance
+        .spec()
+        .map(|spec| spec.database_bindings.clone())
+        .unwrap_or_default();
 
-    for (service, bindings) in template.managed_service_bindings {
+    for (service, bindings) in bindings_by_type {
         let normalized_service = temps_core::templates::canonical_managed_service_type(&service);
         let service_candidates = linked_service_vars_by_type
             .get(&normalized_service)
@@ -494,6 +507,24 @@ impl DeploymentEnvResolver {
             "📦 Loaded {} effective project environment variables",
             explicit_project_vars.len()
         );
+
+        // 1b. Variables inherited from the project's group sit beneath the
+        // project's own values (which win) and above linked-service defaults.
+        let inherited = crate::services::group_env::inherited_group_env_vars(
+            self.db.as_ref(),
+            self.encryption_service.as_ref(),
+            project.id,
+            environment,
+        )
+        .await
+        .map_err(|e| DeploymentEnvResolutionError::InheritedGroupVariables {
+            project_id: project.id,
+            environment_id: environment.id,
+            reason: e.to_string(),
+        })?;
+        for (key, value) in inherited {
+            explicit_project_vars.entry(key).or_insert(value);
+        }
 
         // 2. Get runtime environment variables from external services
         // First, get all services linked to this project
@@ -1074,14 +1105,12 @@ mod tests {
                 keycloak_release_json(),
             )
             .expect("valid Keycloak service instance");
-        let bindings = instance
-            .template
-            .managed_service_bindings
+        let bindings = instance.template.services[0]
+            .database_bindings
             .remove("postgres")
             .expect("Keycloak PostgreSQL bindings");
-        instance
-            .template
-            .managed_service_bindings
+        instance.template.services[0]
+            .database_bindings
             .insert("Postgres".to_string(), bindings);
 
         let mut resolved = HashMap::new();
@@ -1099,6 +1128,65 @@ mod tests {
             resolved.get("KC_DB_URL_HOST"),
             Some(&"postgres-12".to_string())
         );
+    }
+
+    #[test]
+    fn each_service_of_an_app_gets_its_own_bindings() {
+        let template: temps_core::templates::ProjectTemplate = serde_yaml::from_str(
+            r#"
+slug: secrets-manager
+name: Secrets manager
+version: 1.0.0
+kind: app
+git:
+  url: https://github.com/example/secrets.git
+  ref: v1.2.3
+databases: [postgres]
+services:
+  - name: backend
+    preset: dockerfile
+    directory: backend
+    database_bindings:
+      postgres:
+        DB_CONNECTION_URI: POSTGRES_URL
+  - name: frontend
+    preset: vite
+    directory: frontend
+"#,
+        )
+        .expect("multi-service template");
+        let release = temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            template,
+        );
+        let linked = HashMap::from([(
+            "POSTGRES_URL".to_string(),
+            "postgres://db/secrets".to_string(),
+        )]);
+        let resolve = |service: &str| {
+            let mut resolved = HashMap::new();
+            merge_managed_service_environment(
+                &mut resolved,
+                BTreeMap::from([("postgres".to_string(), vec![linked.clone()])]),
+                HashMap::new(),
+                Some(
+                    &serde_json::to_value(release.clone().for_service(service))
+                        .expect("serialize release"),
+                ),
+                4,
+                8,
+            )
+            .expect("bindings resolve");
+            resolved
+        };
+
+        assert_eq!(
+            resolve("backend")
+                .get("DB_CONNECTION_URI")
+                .map(String::as_str),
+            Some("postgres://db/secrets")
+        );
+        assert!(!resolve("frontend").contains_key("DB_CONNECTION_URI"));
     }
 
     #[test]
@@ -1335,6 +1423,133 @@ mod tests {
                 "example-project"
             ),
             "Authorization=Bearer%20manual-token,X-Temps-Project-Slug-Hex=6578616d706c652d70726f6a656374"
+        );
+    }
+
+    // ── Group-layer merge-precedence tests (ADR 050) ───────────────────────
+    //
+    // Precedence from lowest to highest:
+    //   linked-service defaults < group vars < project vars < platform-owned
+    //
+    // `merge_environment_variable_layers` merges linked_service_vars first
+    // (lowest), then project vars (already include group vars merged with
+    // or_insert, so project wins over group). Platform-owned values are
+    // inserted last by the caller.
+
+    #[test]
+    fn service_var_overrides_group_var_with_same_key() {
+        // Simulate: group provides DATABASE_URL, project also sets DATABASE_URL
+        // → project must win (or_insert semantics: group is applied with
+        //   or_insert so that project's existing entry is kept).
+        let group_database_url = "postgres://group-host/db".to_string();
+        let project_database_url = "postgres://project-host/db".to_string();
+
+        // Start with group var as if group layer was applied first.
+        let mut project_vars: HashMap<String, String> =
+            HashMap::from([("DATABASE_URL".to_string(), project_database_url.clone())]);
+
+        // Group applies via or_insert: existing project key is kept.
+        project_vars
+            .entry("DATABASE_URL".to_string())
+            .or_insert(group_database_url);
+
+        assert_eq!(
+            project_vars.get("DATABASE_URL").map(String::as_str),
+            Some(project_database_url.as_str()),
+            "project var must win over group var with same key"
+        );
+    }
+
+    #[test]
+    fn group_var_fills_key_absent_from_project() {
+        // Group provides a key the project didn't set → group var should appear.
+        let group_redis_url = "redis://group-host:6379".to_string();
+        let mut project_vars: HashMap<String, String> = HashMap::new();
+
+        project_vars
+            .entry("REDIS_URL".to_string())
+            .or_insert(group_redis_url.clone());
+
+        assert_eq!(
+            project_vars.get("REDIS_URL").map(String::as_str),
+            Some(group_redis_url.as_str()),
+            "group var must reach the project when the project didn't set it"
+        );
+    }
+
+    #[test]
+    fn group_var_overrides_linked_service_default() {
+        // Merge order: linked-service defaults < group/project vars.
+        // merge_environment_variable_layers:
+        //   resolved.extend(linked_service_vars)  — linked-service defaults
+        //   resolved.extend(explicit_project_vars) — group + project (project wins)
+        let linked_service_default = "redis://linked-service/0".to_string();
+        let group_value = "redis://group-override/0".to_string();
+
+        let linked_service_vars =
+            HashMap::from([("REDIS_URL".to_string(), linked_service_default)]);
+        // Project vars contain the group value (or_insert kept it because
+        // project didn't override it).
+        let mut explicit_project_vars: HashMap<String, String> = HashMap::new();
+        explicit_project_vars
+            .entry("REDIS_URL".to_string())
+            .or_insert(group_value.clone());
+
+        let mut resolved = HashMap::new();
+        merge_environment_variable_layers(
+            &mut resolved,
+            linked_service_vars,
+            explicit_project_vars,
+        );
+
+        assert_eq!(
+            resolved.get("REDIS_URL").map(String::as_str),
+            Some(group_value.as_str()),
+            "group var must override linked-service default"
+        );
+    }
+
+    #[test]
+    fn platform_owned_var_overrides_group_and_project() {
+        // Platform-owned vars (e.g. PORT) are written last via
+        // apply_deployment_owned_variables, which uses direct insert (not
+        // or_insert), so they always win.
+        let group_port = "9000".to_string();
+        let platform_port = "3000".to_string();
+
+        let mut explicit_project_vars: HashMap<String, String> = HashMap::new();
+        // Group sets PORT.
+        explicit_project_vars
+            .entry("PORT".to_string())
+            .or_insert(group_port);
+
+        let mut resolved = HashMap::new();
+        merge_environment_variable_layers(&mut resolved, HashMap::new(), explicit_project_vars);
+        // Platform writes over it.
+        resolved.insert("PORT".to_string(), platform_port.clone());
+
+        assert_eq!(
+            resolved.get("PORT").map(String::as_str),
+            Some(platform_port.as_str()),
+            "platform-owned PORT must override group var"
+        );
+    }
+
+    #[test]
+    fn host_can_be_overridden_by_project_var() {
+        // HOST is not in the platform-owned set (apply_deployment_owned_variables
+        // sets PORT and a few others, but not HOST), so a project-level HOST
+        // variable must survive the merge.
+        let project_host = "0.0.0.0".to_string();
+        let explicit_project_vars = HashMap::from([("HOST".to_string(), project_host.clone())]);
+
+        let mut resolved = HashMap::new();
+        merge_environment_variable_layers(&mut resolved, HashMap::new(), explicit_project_vars);
+
+        assert_eq!(
+            resolved.get("HOST").map(String::as_str),
+            Some(project_host.as_str()),
+            "project-level HOST must reach the deployment"
         );
     }
 }

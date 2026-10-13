@@ -588,7 +588,7 @@ export function RedeploymentModal({
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
-            {mode === 'redeploy' ? 'Redeploy' : 'Deploy Project'}
+            {mode === 'redeploy' ? 'Redeploy' : 'Deploy Service'}
           </DialogTitle>
         </DialogHeader>
 

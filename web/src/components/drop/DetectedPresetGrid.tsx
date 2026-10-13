@@ -21,7 +21,7 @@ export function DetectedPresetGrid({
     <div
       className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3"
       role="radiogroup"
-      aria-label="Detected projects"
+      aria-label="Detected apps"
     >
       {candidates.map((candidate, index) => {
         const selected = index === selectedIndex

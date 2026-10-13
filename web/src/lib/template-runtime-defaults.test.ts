@@ -83,11 +83,11 @@ describe('template runtime defaults', () => {
       createTemplateRuntimeDefaultsSchema('starter').safeParse(values).success
     ).toBe(true)
     expect(
-      createTemplateRuntimeDefaultsSchema('service').safeParse(values).success
+      createTemplateRuntimeDefaultsSchema('app').safeParse(values).success
     ).toBe(false)
     values.image = `ghcr.io/gotempsh/observability-starter@sha256:${'a'.repeat(64)}`
     expect(
-      createTemplateRuntimeDefaultsSchema('service').safeParse(values).success
+      createTemplateRuntimeDefaultsSchema('app').safeParse(values).success
     ).toBe(true)
     for (const image of [
       '',

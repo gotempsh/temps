@@ -150,7 +150,7 @@ export function RequestTimeoutsPage() {
                 })}
               />
               <p className="text-xs text-muted-foreground">
-                No project/environment override, and no default below, can
+                No service/environment override, and no default below, can
                 exceed this — but only applies once a timeout is actually
                 configured. Min 5, max 86400 (24h). Default 600 (10m).
               </p>
@@ -266,14 +266,14 @@ export function RequestTimeoutsPage() {
         </SettingsGroup>
 
         <SettingsSection
-          title="Project Override Ceilings"
-          description="Bound the resource and timeout overrides projects and environments can configure"
+          title="Service Override Ceilings"
+          description="Bound the resource and timeout overrides services and environments can configure"
           icon={ShieldCheck}
           hasError={Boolean(errors.tenant_resource_ceilings)}
         >
           <div className="mb-6 text-sm text-muted-foreground">
             The two settings above are <em>defaults</em> — anyone who can edit a
-            project or environment&apos;s Deployment Config can override them,
+            service or environment&apos;s Deployment Config can override them,
             including overriding them to unlimited. These ceilings bound those
             overrides. All three are off by default, so nothing changes until
             you set one, and holders of the Settings write permission are never
@@ -284,9 +284,9 @@ export function RequestTimeoutsPage() {
             <strong>
               Applied when a config is saved, not retroactively.
             </strong>{' '}
-            Setting a ceiling here does not change projects that already exceed
+            Setting a ceiling here does not change services that already exceed
             it — they keep running as configured until someone next edits them.
-            Note also that the memory ceiling is per container, so a project
+            Note also that the memory ceiling is per container, so a service
             with several replicas can still total more than the ceiling.
           </div>
           <div className="space-y-6">
@@ -306,7 +306,7 @@ export function RequestTimeoutsPage() {
                   })}
                 />
                 <p className="text-xs text-muted-foreground">
-                  0 = no ceiling (default). When set, a project cannot request
+                  0 = no ceiling (default). When set, a service cannot request
                   more than this, nor set its memory limit to unlimited.
                 </p>
                 {errors.tenant_resource_ceilings?.max_memory_limit_mb && (
@@ -330,7 +330,7 @@ export function RequestTimeoutsPage() {
                   )}
                 />
                 <p className="text-xs text-muted-foreground">
-                  0 = no ceiling (default). Bounds the per-project override of
+                  0 = no ceiling (default). Bounds the per-service override of
                   the connection limit above.
                 </p>
                 {errors.tenant_resource_ceilings
@@ -345,12 +345,12 @@ export function RequestTimeoutsPage() {
             <div className="flex items-start justify-between gap-4">
               <div className="space-y-1">
                 <Label htmlFor="allow_unlimited_request_timeouts">
-                  Allow projects to disable timeouts
+                  Allow services to disable timeouts
                 </Label>
                 <p className="text-xs text-muted-foreground">
-                  On by default. Turn it off to stop a project from setting its
+                  On by default. Turn it off to stop a service from setting its
                   request, SSE, or WebSocket timeout to 0 — the value that opts
-                  out of the hard ceiling above entirely. Timeouts a project
+                  out of the hard ceiling above entirely. Timeouts a service
                   sets to a real number are already clamped to that ceiling.
                 </p>
               </div>

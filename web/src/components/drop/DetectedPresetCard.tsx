@@ -31,10 +31,10 @@ export function DetectedPresetCard({
   }, [isDetecting])
 
   const detectionTitle =
-    phase === 'packing' ? 'Packaging project files' : 'Inspecting project files'
+    phase === 'packing' ? 'Packaging source files' : 'Inspecting source files'
   const detectionDescription =
     elapsedSeconds >= 5
-      ? `Still working — larger projects can take a little longer. ${elapsedSeconds}s elapsed. You can cancel with the X.`
+      ? `Still working — larger codebases can take a little longer. ${elapsedSeconds}s elapsed. You can cancel with the X.`
       : phase === 'packing'
         ? 'Creating a secure archive in your browser…'
         : 'Uploading the archive and reading framework manifests…'

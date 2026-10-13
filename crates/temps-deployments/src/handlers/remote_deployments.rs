@@ -113,6 +113,18 @@ impl Drop for ArchiveUploadPermit {
     }
 }
 
+/// Refuse, before anything is written, to deploy a project whose app runs
+/// outside Temps.
+pub(crate) fn refuse_external_project(project: &projects::Model) -> Result<(), Problem> {
+    match project.hosting.deploy_refusal(&project.name) {
+        Some(reason) => Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_type("https://temps.sh/probs/project-hosted-externally")
+            .with_title("Project Runs Outside Temps")
+            .with_detail(reason)),
+        None => Ok(()),
+    }
+}
+
 async fn ensure_local_archive_deployments_supported(state: &AppState) -> Result<(), Problem> {
     let stateless = state
         .config_service
@@ -238,6 +250,7 @@ pub async fn deploy_from_uploaded_source(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {project_id} not found"))
         })?;
+    refuse_external_project(&project)?;
     // ADR 045, before the upload is consumed or any row is written: the
     // planner refuses this again (it is the enforcement point), but only after
     // a deployment row exists, and a 500 on a failed plan is the wrong answer
@@ -1065,6 +1078,7 @@ pub async fn deploy_from_image(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    refuse_external_project(&project)?;
     // ADR 045, before anything is resolved or written: this project's
     // containers receive `/var/run/docker.sock`, so the image and command in
     // this request would run as host root. The planner refuses it again — it
@@ -1434,6 +1448,7 @@ pub async fn deploy_from_static(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    refuse_external_project(&project)?;
     // ADR 045: see `deploy_from_image`. A static bundle still starts a
     // container for this project, so it is refused on the same terms.
     super::docker_socket::guard_deploy(&project.slug, &auth)?;
@@ -1715,6 +1730,7 @@ pub async fn deploy_from_image_upload(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    refuse_external_project(&project)?;
     // ADR 045: see `deploy_from_image`. An uploaded image tarball is the same
     // attacker-chosen image and command, arriving by a different route.
     super::docker_socket::guard_deploy(&project.slug, &auth)?;
@@ -2285,6 +2301,7 @@ pub async fn upload_static_bundle(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    refuse_external_project(&project)?;
 
     // Verify project source type allows static file deployments
     if !project
@@ -3271,5 +3288,129 @@ mod tests {
                 "handler {handler_name} must restrict deployment tokens to their project"
             );
         }
+    }
+
+    /// Build a minimal `projects::Model` for unit tests. All fields that are
+    /// not relevant to the test being written can stay at their defaults.
+    fn minimal_project(
+        id: i32,
+        name: &str,
+        hosting: temps_entities::types::Hosting,
+    ) -> projects::Model {
+        let now = Utc::now();
+        projects::Model {
+            id,
+            name: name.to_string(),
+            repo_name: "repo".to_string(),
+            repo_owner: "owner".to_string(),
+            directory: String::new(),
+            pull_only_root_directory: false,
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::Dockerfile,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: name.to_lowercase().replace(' ', "-"),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: Default::default(),
+            project_type: temps_entities::types::ProjectType::Server,
+            allow_alternate_sources: None,
+            hosting,
+            template_slug: None,
+            service_template: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: true,
+            ai_api_traffic_summary_enabled: None,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity: Default::default(),
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            cloud_telemetry_write_mode: Default::default(),
+            cloud_analytics_write_mode: Default::default(),
+        }
+    }
+
+    #[test]
+    fn hosted_project_passes_refuse_external() {
+        let project = minimal_project(1, "my-app", temps_entities::types::Hosting::Hosted);
+        assert!(
+            refuse_external_project(&project).is_ok(),
+            "a hosted project must not be refused"
+        );
+    }
+
+    #[test]
+    fn external_project_is_refused_with_conflict() {
+        let project = minimal_project(2, "their-app", temps_entities::types::Hosting::External);
+        let err =
+            refuse_external_project(&project).expect_err("an external project must be refused");
+        assert_eq!(
+            err.status_code,
+            StatusCode::CONFLICT,
+            "external project refusal must be 409 Conflict"
+        );
+    }
+
+    #[test]
+    fn external_project_refusal_names_the_project() {
+        let project = minimal_project(
+            3,
+            "ExternalService",
+            temps_entities::types::Hosting::External,
+        );
+        let err = refuse_external_project(&project).unwrap_err();
+        let detail = err
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            detail.contains("ExternalService"),
+            "refusal detail must name the project; got: {detail}"
+        );
+    }
+
+    #[test]
+    fn deploy_refusal_returns_none_for_hosted() {
+        assert_eq!(
+            temps_entities::types::Hosting::Hosted.deploy_refusal("proj"),
+            None
+        );
+    }
+
+    #[test]
+    fn deploy_refusal_returns_some_for_external() {
+        let reason = temps_entities::types::Hosting::External
+            .deploy_refusal("proj")
+            .expect("External hosting must produce a refusal reason");
+        assert!(
+            reason.contains("proj"),
+            "refusal reason must mention the project name; got: {reason}"
+        );
+        assert!(
+            reason.contains("external"),
+            "refusal reason must mention 'external'; got: {reason}"
+        );
     }
 }

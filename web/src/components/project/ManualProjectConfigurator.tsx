@@ -58,7 +58,6 @@ import {
 } from 'lucide-react'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import {
@@ -74,6 +73,7 @@ import {
   isLikelySecretProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import {
   normalizeTemplateServiceType,
   toggleDatabaseSelection,
@@ -112,7 +112,7 @@ const SOURCE_TYPE_OPTIONS: {
 
 // Form schema for manual projects
 const formSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
+  name: z.string().min(1, 'Service name is required'),
   sourceType: z.enum(['manual', 'docker_image', 'static_files'] as const),
   // Docker image specific
   imageUrl: z.string().optional(),
@@ -138,7 +138,6 @@ export function ManualProjectConfigurator({
   defaultValues,
   className,
 }: ManualProjectConfiguratorProps) {
-  const navigate = useNavigate()
   const queryClient = useQueryClient()
 
   // State management
@@ -199,17 +198,20 @@ export function ManualProjectConfigurator({
     return Array.from(servicesById.values())
   }, [existingServices, newlyCreatedServices])
 
-  // Project creation mutation
+  // `?group=<id>`: the new service joins that project.
+  const { finish, joinGroupDialog } = useJoinGroupAfterCreate()
+
+  // Service creation mutation
   const projectMutation = useMutation({
     ...createProjectMutation(),
     meta: {
-      errorTitle: 'Failed to create project',
+      errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
-      toast.success('Project created successfully!')
-      navigate(`/projects/${data.slug}?new=true&source=${sourceType}`)
+      toast.success('Service created')
+      await finish(data, `/projects/${data.slug}?new=true&source=${sourceType}`)
     },
   })
 
@@ -413,7 +415,7 @@ export function ManualProjectConfigurator({
         name="name"
         render={({ field }) => (
           <FormItem>
-            <FormLabel>Project Name</FormLabel>
+            <FormLabel>Service name</FormLabel>
             <FormControl>
               <Input {...field} placeholder="my-awesome-project" />
             </FormControl>
@@ -452,8 +454,8 @@ export function ManualProjectConfigurator({
         <Alert>
           <FileArchive className="h-4 w-4" />
           <AlertDescription>
-            After creating the project, you&apos;ll be able to upload your
-            static files (tar.gz or zip) through the project dashboard or API.
+            After creating the service, you&apos;ll be able to upload your
+            static files (tar.gz or zip) through the service dashboard or API.
           </AlertDescription>
         </Alert>
       )}
@@ -462,12 +464,12 @@ export function ManualProjectConfigurator({
         <Alert>
           <Settings className="h-4 w-4" />
           <AlertDescription>
-            <strong>Flexible Project:</strong> After creation, you can deploy
+            <strong>Flexible service:</strong> After creation, you can deploy
             using any method:
             <ul className="list-disc list-inside mt-2 text-xs">
               <li>Docker images from any registry</li>
               <li>Static files (tar.gz or zip uploads)</li>
-              <li>Git repository (configure later in project settings)</li>
+              <li>Git repository (configure later in service settings)</li>
             </ul>
           </AlertDescription>
         </Alert>
@@ -670,7 +672,7 @@ export function ManualProjectConfigurator({
               ).length > 1
                 ? 's'
                 : ''}{' '}
-              will be linked to this project
+              will be linked to this service
             </AlertDescription>
           </Alert>
         )}
@@ -924,8 +926,8 @@ export function ManualProjectConfigurator({
           {/* Project Configuration */}
           <Card>
             <CardHeader>
-              <CardTitle>Project Configuration</CardTitle>
-              <CardDescription>Configure your project settings</CardDescription>
+              <CardTitle>Service configuration</CardTitle>
+              <CardDescription>Configure your service settings</CardDescription>
             </CardHeader>
             <CardContent>{renderProjectConfig()}</CardContent>
           </Card>
@@ -997,18 +999,20 @@ export function ManualProjectConfigurator({
               {isSubmitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Creating Project...
+                  Creating service...
                 </>
               ) : (
                 <>
                   <CheckCircle2 className="mr-2 h-4 w-4" />
-                  Create Project
+                  Create service
                 </>
               )}
             </Button>
           </div>
         </form>
       </Form>
+
+      {joinGroupDialog}
 
       {/* Create Service Dialog */}
       <CreateServiceDialog

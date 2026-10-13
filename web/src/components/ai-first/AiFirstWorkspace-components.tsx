@@ -243,7 +243,7 @@ export function AiFirstWorkspace() {
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
             This stateless control plane cannot retain workspace files,
             attachments, or local imports across replacement. Use AI chat from a
-            project page for diagnostics, or run a full-profile instance for
+            service page for diagnostics, or run a full-profile instance for
             persistent workspaces.
           </p>
         </div>
@@ -1153,7 +1153,7 @@ function PersistentAiFirstWorkspace() {
         if (workspace.desired_state !== 'running') {
           setWorkspaceError(
             workspace.desired_state === 'quarantined'
-              ? 'This persistent workspace is quarantined because project access changed. Restore access, then resume it from Workspace settings.'
+              ? 'This persistent workspace is quarantined because service access changed. Restore access, then resume it from Workspace settings.'
               : 'This persistent workspace is paused. Resume it from Workspace settings to inspect its files.'
           )
           return
@@ -2173,7 +2173,7 @@ function PersistentAiFirstWorkspace() {
                   {activeGlobalConversation.title ?? 'Temps workspace'}
                 </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  All accessible projects ·{' '}
+                  All accessible services ·{' '}
                   {threadRuntimeLabel(activeGlobalConversation, harnesses)} ·
                   user-owned · current-role authorization
                 </p>
@@ -2185,7 +2185,7 @@ function PersistentAiFirstWorkspace() {
                   userScoped
                   contextType="global"
                   contextId={activeGlobalConversation.context_id}
-                  emptyHint="Ask about any project or platform resource you can access. Temps will gather evidence before proposing changes."
+                  emptyHint="Ask about any service or platform resource you can access. Temps will gather evidence before proposing changes."
                   placeholder="Ask Temps to inspect or operate your workspace…"
                   onLiveEvent={handleChatLiveEvent}
                   onConversationStatusInvalidated={refreshVisibleConversations}
@@ -2224,7 +2224,7 @@ function PersistentAiFirstWorkspace() {
                   {activeConversation.title ?? activeApplication.name}
                 </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  {activeApplication.projects.length} linked projects ·{' '}
+                  {activeApplication.projects.length} linked services ·{' '}
                   {threadRuntimeLabel(activeConversation, harnesses)} ·
                   user-owned · current-role authorization
                 </p>
@@ -2356,7 +2356,7 @@ function PersistentAiFirstWorkspace() {
           <SheetHeader className="sr-only">
             <SheetTitle>Application workspace</SheetTitle>
             <SheetDescription>
-              Inspect the application workspace, preview, projects, files, and
+              Inspect the application workspace, preview, services, files, and
               generated output.
             </SheetDescription>
           </SheetHeader>
@@ -2823,9 +2823,9 @@ function GlobalChatBoundary() {
           <Sparkles className="size-4 stroke-success" /> User workspace
         </div>
         <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-          This chat is yours and is not anchored to a project. Selectors are
+          This chat is yours and is not anchored to a service. Selectors are
           explicit, and every platform call re-checks your current role and
-          project memberships.
+          service memberships.
         </p>
       </section>
       <section className="rounded-lg border border-success/30 bg-success/5 p-4">
@@ -2887,9 +2887,9 @@ function GlobalChatStartScreen({
               Ask Temps across your platform.
             </h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-              This thread belongs to you, not a project. The harness runs in a
+              This thread belongs to you, not a service. The harness runs in a
               persistent managed sandbox and every platform operation inherits
-              your current role and project access.
+              your current role and service access.
             </p>
           </div>
           <Button onClick={onCancel} size="sm" type="button" variant="ghost">
@@ -2983,7 +2983,7 @@ function ApplicationBoundary({
           ))}
           {application.projects.length === 0 && (
             <p className="text-[11px] leading-5 text-muted-foreground">
-              No projects yet. Ask the thread to create the application topology
+              No services yet. Ask the thread to create the application topology
               when you are ready.
             </p>
           )}
@@ -3322,7 +3322,7 @@ export function ApplicationStartScreen({
       application.projects.find((candidate) => candidate.is_primary) ??
       application.projects[0]
     if (!project) {
-      throw new Error('The workspace was created without a starter project.')
+      throw new Error('The workspace was created without a starter service.')
     }
 
     setSavingStep('Starting persistent sandbox…')
@@ -3630,7 +3630,7 @@ export function ApplicationStartScreen({
                                 placeholder="Untitled workspace"
                               />
                               <p className="text-xs text-muted-foreground">
-                                Temps creates a deployable Autopack project and
+                                Temps creates a deployable Autopack service and
                                 keeps its files on this machine between threads.
                               </p>
                             </div>
@@ -3639,7 +3639,7 @@ export function ApplicationStartScreen({
                                 <Label>Start from</Label>
                                 <p className="mt-1 text-xs text-muted-foreground">
                                   Import code now, or let the assistant build
-                                  the project from scratch.
+                                  the app from scratch.
                                 </p>
                               </div>
                               <div className="grid gap-2 sm:grid-cols-3">
@@ -3647,7 +3647,7 @@ export function ApplicationStartScreen({
                                   [
                                     {
                                       id: 'blank',
-                                      label: 'Blank project',
+                                      label: 'Blank app',
                                       detail: 'Build with AI',
                                       icon: Sparkles,
                                     },

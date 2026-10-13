@@ -669,7 +669,7 @@ export function AgentSandboxSandboxPage() {
               />
               <p className="text-xs text-muted-foreground">
                 GitHub repo path. The repo must be accessible via the
-                project&apos;s git provider connection. Leave empty to disable.
+                service&apos;s git provider connection. Leave empty to disable.
               </p>
             </div>
             <div className="space-y-2">

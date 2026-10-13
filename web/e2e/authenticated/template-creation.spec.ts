@@ -42,7 +42,7 @@ test('observability starter submits its tagged image and exposes collapsed valid
     '/projects/new?source=templates&template=observability-starter'
   )
   const create = page.getByRole('button', {
-    name: 'Create Project from Template',
+    name: 'Create Service from Template',
     exact: true,
   })
   await expect(create).toBeEnabled()
@@ -64,7 +64,7 @@ test('observability starter submits its tagged image and exposes collapsed valid
     storage_service_ids: [101],
   })
   await expect(
-    page.getByText('Failed to create project: Template creation test response')
+    page.getByText('Failed to create service: Template creation test response')
   ).toBeVisible()
 
   const configure = page.getByRole('button', {

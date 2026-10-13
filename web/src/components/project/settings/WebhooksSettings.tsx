@@ -102,7 +102,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
           <h2 className="text-lg font-semibold">Webhooks</h2>
           <p className="text-sm text-muted-foreground mt-1">
             Configure webhooks to receive real-time notifications about events
-            in your project
+            in your service
           </p>
         </div>
         <CreateActionButton
@@ -276,7 +276,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
             </h3>
             <p className="text-sm text-muted-foreground text-center mb-4 max-w-md">
               Webhooks allow you to receive real-time HTTP notifications about
-              events in your project, such as deployments, errors, and more.
+              events in your service, such as deployments, errors, and more.
             </p>
             <Button
               onClick={() =>

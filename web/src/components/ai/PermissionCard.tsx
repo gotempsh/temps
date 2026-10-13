@@ -663,7 +663,7 @@ export function PermissionCard({
         })
       } else {
         if (projectId == null) {
-          throw new Error('Project permission resolution requires a project.')
+          throw new Error('Service permission resolution requires a service.')
         }
         await resolveProjectPermission({
           body: { decision },

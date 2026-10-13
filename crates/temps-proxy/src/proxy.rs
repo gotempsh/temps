@@ -940,6 +940,11 @@ pub struct ProxyContext {
     /// project/environment resolved for this request — e.g. console/preview
     /// traffic).
     pub connection_permit: Option<crate::connection_limiter::ConnectionPermit>,
+    /// Set when the host's environment hands this path to another service of
+    /// its project (ADR 050). Resolved once from the in-memory route table;
+    /// project context, static serving and the upstream peer all follow the
+    /// target instead of the host's own service.
+    pub path_route: Option<temps_routes::PathRoute>,
 }
 
 /// Main load balancer proxy implementation using traits
@@ -4111,6 +4116,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            path_route: None,
             streaming_session: false,
             connection_permit: None,
         }
@@ -5030,11 +5036,197 @@ impl ProxyHttp for LoadBalancer {
             }
         }
 
+        // Path routes (ADR 050): `frontend: /api -> backend` serves this
+        // path from another service of the project. In-memory lookup only.
+        if ctx.preview_route.is_none() {
+            ctx.path_route = self
+                .project_context_resolver
+                .match_path_route(&ctx.host, &ctx.path);
+        }
+
+        // Path-route wake-on-demand: if the target service is sleeping
+        // (scale-to-zero), wake it inline before resolving the route, using the
+        // same mechanism as host-level wake-on-demand.
+        if let Some(sleeping_env_id) = ctx
+            .path_route
+            .as_ref()
+            .and_then(|r| (r.target.is_none()).then_some(r.sleeping_environment_id))
+            .flatten()
+        {
+            if let Some(ref on_demand) = self.on_demand_manager {
+                if let Some(sleeping_info) =
+                    on_demand.get_sleeping_environment_by_id(sleeping_env_id)
+                {
+                    let wake_timeout = sleeping_info.wake_timeout_seconds;
+                    info!(
+                        environment_id = sleeping_env_id,
+                        host = %ctx.host,
+                        prefix = %ctx.path_route.as_ref().map(|r| r.prefix.as_str()).unwrap_or(""),
+                        "Path-route target is sleeping, waking inline"
+                    );
+                    let _wake_slot = match on_demand.try_acquire_wake_slot() {
+                        Some(permit) => permit,
+                        None => {
+                            warn!(
+                                environment_id = sleeping_env_id,
+                                host = %ctx.host,
+                                "Wake path at capacity for path-route target; returning retryable 503"
+                            );
+                            let mut response =
+                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                            response.insert_header("Retry-After", "2")?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "application/json")?;
+                            let body_bytes = Bytes::from_static(
+                                br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
+                            );
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session.write_response_body(Some(body_bytes), true).await?;
+                            ctx.routing_status = "wake_throttled".to_string();
+                            return Ok(true);
+                        }
+                    };
+                    match on_demand
+                        .wake_environment(sleeping_env_id, wake_timeout)
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                environment_id = sleeping_env_id,
+                                "Path-route target woke up, waiting for route reload"
+                            );
+                            let reload_timeout = std::time::Duration::from_secs(10);
+                            let reloaded = on_demand.wait_for_route_reload(reload_timeout).await;
+                            if !reloaded {
+                                warn!(
+                                    environment_id = sleeping_env_id,
+                                    "Route reload not observed within timeout after path-route wake"
+                                );
+                            }
+                            // Re-resolve the path route after the target is awake.
+                            let resolve_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            ctx.path_route = self
+                                .project_context_resolver
+                                .match_path_route(&ctx.host, &ctx.path);
+                            while ctx.path_route.as_ref().is_none_or(|r| r.target.is_none())
+                                && std::time::Instant::now() < resolve_deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                ctx.path_route = self
+                                    .project_context_resolver
+                                    .match_path_route(&ctx.host, &ctx.path);
+                            }
+                            if ctx.path_route.as_ref().is_none_or(|r| r.target.is_none()) {
+                                error!(
+                                    environment_id = sleeping_env_id,
+                                    host = %ctx.host,
+                                    "Path-route target woke but route did not resolve; returning retryable 503"
+                                );
+                                let mut response =
+                                    ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                                response.insert_header("Retry-After", "2")?;
+                                response.insert_header("Cache-Control", "no-store")?;
+                                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                                response.insert_header("Content-Type", "application/json")?;
+                                let body_bytes = Bytes::from_static(
+                                    br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
+                                );
+                                session
+                                    .write_response_header(Box::new(response), false)
+                                    .await?;
+                                session.write_response_body(Some(body_bytes), true).await?;
+                                ctx.routing_status = "wake_pending".to_string();
+                                return Ok(true);
+                            }
+                            // Fall through: ctx.path_route now has a live target.
+                        }
+                        Err(e) => {
+                            error!(
+                                environment_id = sleeping_env_id,
+                                error = %e,
+                                "Failed to wake path-route target environment"
+                            );
+                            let mut response =
+                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                            response.insert_header("Retry-After", "5")?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "application/json")?;
+                            let body_bytes = Bytes::from_static(
+                                br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#,
+                            );
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session.write_response_body(Some(body_bytes), true).await?;
+                            ctx.routing_status = "wake_failed".to_string();
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(path_route) = ctx.path_route.as_ref() {
+            if path_route.target.is_none() {
+                // Never let the host's own service (or another environment)
+                // answer in the target's place: that hides the problem
+                // behind the frontend's index.html. The body carries only
+                // the requested prefix; the service name goes to the log.
+                warn!(
+                    host = %ctx.host,
+                    prefix = %path_route.prefix,
+                    target_service = %path_route.target_service,
+                    "path route target has no running deployment in this environment"
+                );
+                let body = Bytes::from(
+                    serde_json::json!({
+                        "status": "path_route_unavailable",
+                        "message": format!(
+                            "The service that serves {} is not deployed in this environment",
+                            path_route.prefix
+                        ),
+                    })
+                    .to_string(),
+                );
+                let mut response = ResponseHeader::build(StatusCode::BAD_GATEWAY, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "application/json")?;
+                response.insert_header("Content-Length", body.len().to_string())?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "path_route_unavailable".to_string();
+                return Ok(true);
+            }
+        }
+
         // Resolve project context early to set routing status for all requests
-        let project_context = self
-            .project_context_resolver
-            .resolve_context(&ctx.host)
-            .await;
+        let path_target_context = ctx
+            .path_route
+            .as_ref()
+            .and_then(|route| route.target.as_ref())
+            .and_then(|target| {
+                Some(ProjectContext {
+                    project: target.project.clone()?,
+                    environment: target.environment.clone()?,
+                    deployment: target.deployment.clone()?,
+                })
+            });
+        let project_context = match path_target_context {
+            Some(context) => Some(context),
+            None => {
+                self.project_context_resolver
+                    .resolve_context(&ctx.host)
+                    .await
+            }
+        };
 
         if let Some(project_ctx) = &project_context {
             ctx.project = Some(project_ctx.project.clone());
@@ -5891,12 +6083,22 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true);
         }
 
-        // Check if this is a static deployment using route table
-        if let Some(static_dir) = self
-            .project_context_resolver
-            .get_static_path(&ctx.host)
-            .await
-        {
+        // Check if this is a static deployment using route table. A path
+        // route serves from its target instead: its files if the target is
+        // static, the upstream otherwise.
+        let static_dir = match ctx.path_route.as_ref() {
+            Some(route) => route
+                .target
+                .as_ref()
+                .and_then(|target| target.static_dir())
+                .map(str::to_string),
+            None => {
+                self.project_context_resolver
+                    .get_static_path(&ctx.host)
+                    .await
+            }
+        };
+        if let Some(static_dir) = static_dir {
             debug!(
                 "Static deployment detected for {}: {}",
                 ctx.host, static_dir
@@ -5905,8 +6107,21 @@ impl ProxyHttp for LoadBalancer {
             // IMPORTANT: Skip static file serving for /api/_temps/* paths
             // These must ALWAYS be proxied to the console address (admin API)
             if !ctx.path.starts_with("/api/_temps/") {
-                // Serve static file
-                match self.serve_static_file(session, ctx, &static_dir).await {
+                // Serve static file. A stripping path route looks the file
+                // up without its prefix; the log keeps the requested path.
+                let requested_path = ctx
+                    .path_route
+                    .as_ref()
+                    .filter(|route| route.strip_prefix)
+                    .map(|route| {
+                        let target_path = route.upstream_path(&ctx.path);
+                        std::mem::replace(&mut ctx.path, target_path)
+                    });
+                let served = self.serve_static_file(session, ctx, &static_dir).await;
+                if let Some(requested_path) = requested_path {
+                    ctx.path = requested_path;
+                }
+                match served {
                     Ok(StaticFileServeOutcome::Served) => {
                         debug!("Served static file: {}", ctx.path);
                         ctx.routing_status = "static_file".to_string();
@@ -6030,6 +6245,7 @@ impl ProxyHttp for LoadBalancer {
         // For container deployments where the upstream didn't have the asset,
         // check the path-keyed file store (stale-chunk fallback).
         if Self::is_cacheable_static_asset(&ctx.path)
+            && ctx.path_route.is_none()
             && !self
                 .project_context_resolver
                 .is_static_deployment(&ctx.host)
@@ -6359,6 +6575,41 @@ impl ProxyHttp for LoadBalancer {
         Ok(())
     }
 
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut PingoraSession,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // A stripping path route forwards `/api/users` as `/users` and tells
+        // the target where it is mounted, for apps that build absolute URLs.
+        // Only the platform sets that header on routed requests: a client
+        // could otherwise choose the mount path the target believes in.
+        if ctx.path_route.is_some() {
+            upstream_request.remove_header("X-Forwarded-Prefix");
+        }
+        if let Some(route) = ctx.path_route.as_ref().filter(|route| route.strip_prefix) {
+            let original = upstream_request
+                .uri
+                .path_and_query()
+                .map_or("/", |path_and_query| path_and_query.as_str());
+            let rewritten = route.upstream_path(original);
+            let uri = rewritten.parse::<axum::http::Uri>().map_err(|e| {
+                Error::because(
+                    pingora::ErrorType::InternalError,
+                    "path route produced an invalid upstream URI",
+                    e,
+                )
+            })?;
+            upstream_request.set_uri(uri);
+            upstream_request.insert_header("X-Forwarded-Prefix", route.prefix.as_str())?;
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut PingoraSession,
@@ -6423,17 +6674,43 @@ impl ProxyHttp for LoadBalancer {
             domain, path
         );
 
-        // Use the upstream resolver trait
-        // Pass SNI hostname for TLS-based routing
-        let selection = self
-            .upstream_resolver
-            .resolve_peer_for_request(
-                &domain,
-                &path,
-                session.req_header().method.as_str(),
-                ctx.sni_hostname.as_deref(),
-            )
-            .await?;
+        // A path route's target was resolved in `request_filter`; the
+        // request goes to its current deployment, not the host's service.
+        let path_target = ctx
+            .path_route
+            .as_ref()
+            .and_then(|route| route.target.as_ref());
+        let selection = if let Some(target) = path_target {
+            // Static targets are answered in `request_filter`; reaching here
+            // with one would otherwise fall back to the console address.
+            if target.is_static() {
+                return Err(Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    "path route target is static and has no upstream",
+                ));
+            }
+            let backend = target.select_backend();
+            PeerSelection {
+                peer: Box::new(HttpPeer::new(
+                    backend.address.as_str(),
+                    false,
+                    String::new(),
+                )),
+                container_id: backend.container_id,
+                container_name: backend.container_name,
+            }
+        } else {
+            // Use the upstream resolver trait
+            // Pass SNI hostname for TLS-based routing
+            self.upstream_resolver
+                .resolve_peer_for_request(
+                    &domain,
+                    &path,
+                    session.req_header().method.as_str(),
+                    ctx.sni_hostname.as_deref(),
+                )
+                .await?
+        };
 
         let mut peer = selection.peer;
 
@@ -7088,6 +7365,7 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            path_route: None,
             streaming_session: false,
             connection_permit: None,
         }
@@ -7622,6 +7900,7 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            path_route: None,
             streaming_session: false,
             connection_permit: None,
         }

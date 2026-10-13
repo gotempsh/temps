@@ -66,6 +66,7 @@ use temps_monitoring::{
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
 use temps_otel::plugin::OtelPlugin;
+use temps_project_groups::ProjectGroupsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
 use temps_proxy::ProxyPlugin;
@@ -3060,18 +3061,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let templates_override_path = config.data_dir.join("templates.yaml");
     let template_service = Arc::new(TemplateService::new(Some(templates_override_path))?);
 
-    // Load additional template files if specified
+    // Load additional template files if specified. `load_additional` warns and
+    // skips individual templates with unknown presets or other validation
+    // errors; it only returns `Err` when the file itself is missing or
+    // unparsable, which is always a boot-time configuration mistake.
     for additional_path in &additional_templates {
         info!("Loading additional templates from {:?}", additional_path);
         if let Err(e) = template_service.load_additional(additional_path).await {
             return Err(anyhow::anyhow!(
-                "❌ Failed to load additional templates from {:?}\n\n\
+                "Failed to load additional templates from {:?}\n\n\
                 Error: {}\n\n\
-                Please check the file exists and contains valid YAML with valid services.\n\
-                Valid services are: {}",
+                Check that the file exists and contains valid YAML. Templates with \
+                unrecognised presets are skipped with a warning; valid presets are: {}",
                 additional_path,
                 e,
-                temps_core::templates::VALID_SERVICES.join(", ")
+                temps_core::templates::VALID_PRESETS.join(", ")
             ));
         }
     }
@@ -3184,6 +3188,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering TeamsPlugin");
     let teams_plugin = Box::new(TeamsPlugin::new());
     plugin_manager.register_plugin(teams_plugin);
+
+    // 5.2. ProjectGroupsPlugin - optional parent grouping for projects. Its
+    // member lists are filtered through the ProjectAccessChecker above.
+    debug!("Registering ProjectGroupsPlugin");
+    plugin_manager.register_plugin(Box::new(ProjectGroupsPlugin::new()));
 
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");

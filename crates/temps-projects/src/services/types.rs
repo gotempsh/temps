@@ -113,6 +113,8 @@ pub struct Project {
     /// so a Git project can additionally be shipped from an uploaded archive
     /// (`drop`) without losing its repository. NULL/false means off.
     pub allow_alternate_sources: Option<bool>,
+    /// Whether Temps runs the app (`hosted`) or only observes it (`external`).
+    pub hosting: temps_entities::types::Hosting,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
     /// ADR-027 Phase 3: whether this project's traces appear in cross-project
@@ -411,6 +413,10 @@ pub struct CreateProjectRequest {
     /// persisted here.
     #[serde(default)]
     pub template_slug: Option<String>,
+    /// `external` creates a project Temps never deploys: the app runs
+    /// elsewhere and only sends its telemetry.
+    #[serde(default)]
+    pub hosting: temps_entities::types::Hosting,
 }
 
 #[derive(Error, Debug)]

@@ -184,7 +184,7 @@ function ProjectAlerts({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save project alerts
+            Save service alerts
           </Button>
         </div>
       </form>
@@ -655,7 +655,7 @@ function WeeklyDigest({
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
-            Receive a comprehensive weekly summary of your project&apos;s
+            Receive a comprehensive weekly summary of your services&apos;
             activity, performance, and health metrics
           </p>
 
@@ -669,7 +669,7 @@ function WeeklyDigest({
                     Enable Weekly Digest
                   </FormLabel>
                   <FormDescription>
-                    Get a weekly email with project insights and metrics
+                    Get a weekly email with service insights and metrics
                   </FormDescription>
                 </div>
                 <FormControl>
@@ -817,7 +817,7 @@ function WeeklyDigest({
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Project Updates
+                          Service Updates
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -880,9 +880,9 @@ export function MonitoringSettings() {
         },
       }),
       {
-        loading: 'Saving project alert settings...',
-        success: 'Project alert settings saved successfully',
-        error: 'Failed to save project alert settings',
+        loading: 'Saving service alert settings...',
+        success: 'Service alert settings saved successfully',
+        error: 'Failed to save service alert settings',
       }
     )
   }
@@ -1108,7 +1108,7 @@ export function MonitoringSettings() {
         return (
           <div className="max-w-5xl space-y-10">
             <SettingsGroup
-              title="Project Health"
+              title="Service Health"
               description="Choose which deployment and runtime events trigger alerts."
             >
               <ProjectAlerts

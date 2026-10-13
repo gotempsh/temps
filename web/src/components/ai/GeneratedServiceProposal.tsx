@@ -312,8 +312,8 @@ export function GeneratedServiceProposal({
         <ProposalValue label="Placement" value={proposal.placement} />
         {projectId != null && (
           <ProposalValue
-            label="Target project"
-            value={`Project ${projectId}`}
+            label="Target service"
+            value={`Service ${projectId}`}
             mono
           />
         )}
@@ -389,7 +389,7 @@ export function GeneratedServiceLinkProposal({
             Link existing database
           </h3>
           <p className="mt-1 text-sm text-muted-foreground sm:text-xs">
-            Make this database available to the selected project and its
+            Make this database available to the selected service and its
             application workspace.
           </p>
           <div className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
@@ -400,20 +400,20 @@ export function GeneratedServiceLinkProposal({
       </div>
       <dl className="grid min-w-0 grid-cols-1 border-t bg-background/40 @sm:grid-cols-2">
         <ProposalValue
-          label="Database service"
-          value={`Service ${proposal.serviceId}`}
+          label="Database"
+          value={`Database ${proposal.serviceId}`}
           mono
         />
         <ProposalValue
-          label="Target project"
-          value={`Project ${proposal.projectId}`}
+          label="Target service"
+          value={`Service ${proposal.projectId}`}
           mono
         />
       </dl>
       <div className="flex items-start gap-2 border-t px-3 py-2.5 text-sm text-muted-foreground sm:px-4 sm:text-xs">
         <Link2 className="mt-0.5 size-4 shrink-0 text-green-600 dark:text-green-400" />
         <span>
-          Temps will refresh workspace networking and project context after the
+          Temps will refresh workspace networking and service context after the
           link is created.
         </span>
       </div>

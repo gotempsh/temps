@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-project-groups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Project groups: an optional parent that gathers several projects into one unit"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-git = { path = "../temps-git" }
+temps-projects = { path = "../temps-projects" }
+temps-providers = { path = "../temps-providers" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+
+[dev-dependencies]
+temps-database = { path = "../temps-database" }
+temps-environments = { path = "../temps-environments" }
+bollard = { workspace = true }
+async-trait = { workspace = true }
+serde_yaml = { workspace = true }

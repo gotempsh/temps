@@ -174,11 +174,11 @@ export function FirstProjectOnboarding({
               </h2>
               <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
                 Connect Codex, Claude Code, Cursor, or another harness, then ask
-                it to create a project or PostgreSQL database and verify the
+                it to create a service or PostgreSQL database and verify the
                 result in Temps.
               </p>
               <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>Create a project</span>
+                <span>Create a service</span>
                 <span>Add PostgreSQL</span>
                 <span>Verify deployments</span>
               </div>
@@ -243,6 +243,11 @@ export function FirstProjectOnboarding({
             Read the deployment docs
           </a>
         </div>
+        <p className="-mt-2 mb-4 text-sm text-muted-foreground">
+          Each app you deploy becomes a service. Services that ship together,
+          like a frontend, an API and a worker, can later be grouped into a
+          project that shares their repository, variables and routes.
+        </p>
 
         {/* Three peer paths. Migrating from another platform has
             its own entry point in the page header above, so it isn't repeated
@@ -339,15 +344,14 @@ function EmptyStateDropCard() {
         setError(null)
         try {
           const files = await filesFromDrop(event)
-          if (files.length === 0)
-            throw new Error('Choose a project folder or ZIP')
+          if (files.length === 0) throw new Error('Choose a folder or ZIP')
           handOffDropFiles(files)
           navigate('/projects/new?source=drop')
         } catch (caught) {
           setError(
             caught instanceof Error
               ? caught.message
-              : 'Those project files could not be read'
+              : 'Those files could not be read'
           )
         }
       }}
@@ -357,7 +361,7 @@ function EmptyStateDropCard() {
           <UploadCloud className="h-4 w-4 text-muted-foreground group-hover:text-primary" />
         </div>
         <div className="min-w-0">
-          <h4 className="text-sm font-semibold">Drop project files</h4>
+          <h4 className="text-sm font-semibold">Drop your files</h4>
           <p className="text-xs text-muted-foreground">
             Package locally, then detect on this Temps instance
           </p>
@@ -367,7 +371,7 @@ function EmptyStateDropCard() {
       <div className="mt-4 flex flex-1 flex-col justify-center rounded-lg border border-dashed border-border/80 bg-muted/20 p-4 text-center transition-colors group-hover:border-muted-foreground/50">
         <p className="text-sm font-medium">
           {isDragging
-            ? 'Release to inspect your project'
+            ? 'Release to inspect your files'
             : 'Drop a folder or ZIP here'}
         </p>
         <p className="mt-1 text-xs text-muted-foreground">

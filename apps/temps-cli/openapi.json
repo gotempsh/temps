@@ -11926,6 +11926,66 @@
         },
         "type": "object"
       },
+      "CreateGroupEnvVarRequest": {
+        "properties": {
+          "environment_slug": {
+            "description": "Environment slug (e.g. `production`, `staging`) this applies to.\nOmit to apply to every environment.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_in_preview": {
+            "description": "Whether an unscoped variable also reaches preview environments.",
+            "type": "boolean"
+          },
+          "is_secret": {
+            "description": "Write-only: the value can never be read back through the API.",
+            "type": "boolean"
+          },
+          "key": {
+            "example": "SENTRY_ENVIRONMENT",
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "CreateGroupRouteRequest": {
+        "properties": {
+          "path_prefix": {
+            "description": "Path prefix handed to the target, e.g. `/api`. Matches the prefix\nitself and everything below it (`/api/users`), never `/apiary`.",
+            "example": "/api",
+            "type": "string"
+          },
+          "source_project_id": {
+            "description": "The service whose hostnames receive the requests.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "strip_prefix": {
+            "description": "Remove the prefix before forwarding (`/api/users` → `/users`). Off by\ndefault: most backends expect the path they were called with.",
+            "type": "boolean"
+          },
+          "target_project_id": {
+            "description": "The service that serves requests under the prefix.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_project_id",
+          "path_prefix",
+          "target_project_id"
+        ],
+        "type": "object"
+      },
       "CreateIncidentRequest": {
         "properties": {
           "description": {
@@ -12551,6 +12611,40 @@
         ],
         "type": "object"
       },
+      "CreateProjectGroupRequest": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "example": "Acme Shop",
+            "type": "string"
+          },
+          "project_ids": {
+            "description": "Projects to place in the group right away, in display order. A\nproject that is already in another group is moved.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "slug": {
+            "description": "URL-safe identifier. Derived from `name` when omitted.",
+            "example": "acme-shop",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateProjectRequest": {
         "properties": {
           "automatic_deploy": {
@@ -12612,6 +12706,10 @@
               "string",
               "null"
             ]
+          },
+          "hosting": {
+            "$ref": "#/components/schemas/Hosting",
+            "description": "`external` for an app that runs elsewhere and only sends Temps its\ntelemetry. Temps never deploys an external project. Defaults to\n`hosted`."
           },
           "install_command": {
             "type": [
@@ -13797,6 +13895,53 @@
           "potential-data-loss"
         ],
         "type": "string"
+      },
+      "DatabaseChoice": {
+        "description": "A managed database for the template: one that exists, or a new one.",
+        "oneOf": [
+          {
+            "description": "Link a managed database that already exists.",
+            "properties": {
+              "service_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "existing"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "service_id",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Create a managed database with default settings.",
+            "properties": {
+              "name": {
+                "description": "Name of the new database; derived from the project when omitted.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "create"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "DatabaseMetricsResponse": {
         "description": "Response for the per-database metrics breakdown.",
@@ -18489,7 +18634,7 @@
         "type": "object"
       },
       "EnvVarInput": {
-        "description": "Input for environment variable",
+        "description": "A variable value supplied when creating from a template.",
         "properties": {
           "is_secret": {
             "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
@@ -21584,6 +21729,38 @@
         ],
         "type": "object"
       },
+      "ForkRequest": {
+        "description": "Fork the template's repository into a git account, so the code becomes\nthe user's and pushes deploy. Starters only.",
+        "properties": {
+          "automatic_deploy": {
+            "description": "Deploy on push to the fork.",
+            "type": "boolean"
+          },
+          "git_provider_connection_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "repository_name": {
+            "description": "Name of the repository to create.",
+            "type": "string"
+          },
+          "repository_owner": {
+            "description": "Account or organization to create it in; the connection's user when\nomitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "git_provider_connection_id",
+          "repository_name"
+        ],
+        "type": "object"
+      },
       "FullError": {
         "properties": {
           "data": {
@@ -24558,6 +24735,56 @@
         ],
         "type": "object"
       },
+      "GroupEnvVarResponse": {
+        "description": "A group variable as returned by the API. `value` is `\"***\"` in lists,\nplaintext only in the create/update response of a non-secret variable,\nand always `null` for secrets.",
+        "properties": {
+          "created_at": {
+            "example": "2026-09-28T12:15:47.609192Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_slug": {
+            "description": "Environment slug this applies to; `null` means every environment.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "include_in_preview": {
+            "type": "boolean"
+          },
+          "is_secret": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "updated_at": {
+            "example": "2026-09-28T12:15:47.609192Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "is_secret",
+          "include_in_preview",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "GroupKey": {
         "description": "What to group or facet by.",
         "oneOf": [
@@ -24602,6 +24829,170 @@
             "type": "object"
           }
         ]
+      },
+      "GroupRepository": {
+        "description": "The repository a group points at, as stored plus what it resolves to.",
+        "properties": {
+          "clone_url": {
+            "description": "HTTPS clone URL, when known.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "git_provider_connection_id": {
+            "description": "The connection the repository is read through. Null for a public\nrepository (see `public_provider`), or when the git connection was\ndeleted; the repository must then be connected again before members\ncan follow it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "main_branch": {
+            "example": "main",
+            "type": "string"
+          },
+          "public_provider": {
+            "description": "`github` or `gitlab` when the repository is public and read without a\nconnection. Pushes to a public repository cannot trigger deploys.",
+            "example": "github",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo_name": {
+            "example": "shop",
+            "type": "string"
+          },
+          "repo_owner": {
+            "example": "acme",
+            "type": "string"
+          },
+          "repository_id": {
+            "description": "The synced repository record, used to scan a connected repo for apps.\nNull for public repositories, and when the connection's repository\nlist does not include it (yet).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "repo_owner",
+          "repo_name",
+          "main_branch"
+        ],
+        "type": "object"
+      },
+      "GroupRepositoryResponse": {
+        "properties": {
+          "repository": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GroupRepository",
+                "description": "Null when the group has no repository."
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GroupRouteEnvironment": {
+        "description": "How a route applies to one environment of its source service.",
+        "properties": {
+          "source_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "source_environment_slug": {
+            "example": "production",
+            "type": "string"
+          },
+          "target_deployed": {
+            "description": "Whether the target environment has a deployment to serve requests.",
+            "type": "boolean"
+          },
+          "target_environment_id": {
+            "description": "The target environment requests go to: the one with the same slug,\nor for a preview, the target's preview of the same branch. `None`\nmeans requests under the prefix are answered with an error instead of\nreaching another environment.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_environment_slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_environment_id",
+          "source_environment_slug",
+          "target_deployed"
+        ],
+        "type": "object"
+      },
+      "GroupRouteResponse": {
+        "properties": {
+          "created_at": {
+            "example": "2026-09-28T12:15:47.609192Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "environments": {
+            "items": {
+              "$ref": "#/components/schemas/GroupRouteEnvironment"
+            },
+            "type": "array"
+          },
+          "group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "path_prefix": {
+            "example": "/api",
+            "type": "string"
+          },
+          "source_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "source_project_name": {
+            "type": "string"
+          },
+          "strip_prefix": {
+            "type": "boolean"
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "group_id",
+          "source_project_id",
+          "source_project_name",
+          "path_prefix",
+          "target_project_id",
+          "target_project_name",
+          "strip_prefix",
+          "environments",
+          "created_at"
+        ],
+        "type": "object"
       },
       "GroupedPageMetric": {
         "properties": {
@@ -25323,6 +25714,14 @@
           "bucket_counts"
         ],
         "type": "object"
+      },
+      "Hosting": {
+        "description": "Whether Temps runs a project's app.\n\n`External` projects run elsewhere (Vercel, Netlify, a VPS) and only send\nTemps their analytics, errors and traces; they are never deployed.",
+        "enum": [
+          "hosted",
+          "external"
+        ],
+        "type": "string"
       },
       "HostnameChange": {
         "description": "A single generated-hostname change in a flatten preview/apply.",
@@ -26116,6 +26515,26 @@
         },
         "type": "object"
       },
+      "ImportServicesRequest": {
+        "description": "Add apps of a project's repository as services of the project.",
+        "properties": {
+          "apps": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedApp"
+            },
+            "type": "array"
+          },
+          "idempotency_key": {
+            "description": "Chosen by the client; see [`InstantiateTemplateRequest::idempotency_key`].",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apps",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
       "ImportSource": {
         "description": "Import source identifier",
         "enum": [
@@ -26378,6 +26797,36 @@
           "succeeded",
           "failed",
           "verdicts"
+        ],
+        "type": "object"
+      },
+      "ImportedApp": {
+        "description": "An app found in a project's repository, to add as a service.",
+        "properties": {
+          "directory": {
+            "description": "Directory of the app in the repository (`.` for the root).",
+            "type": "string"
+          },
+          "exposed_port": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Name of the service to create.",
+            "type": "string"
+          },
+          "preset": {
+            "type": "string"
+          },
+          "preset_config": {}
+        },
+        "required": [
+          "name",
+          "directory",
+          "preset"
         ],
         "type": "object"
       },
@@ -26701,6 +27150,81 @@
         ],
         "type": "object"
       },
+      "InheritedEnvVarResponse": {
+        "properties": {
+          "defined_on_project": {
+            "description": "The project also defines this key itself (in some environment), and\nits own value wins wherever both apply.",
+            "type": "boolean"
+          },
+          "environment_slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_in_preview": {
+            "type": "boolean"
+          },
+          "is_secret": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "is_secret",
+          "include_in_preview",
+          "defined_on_project"
+        ],
+        "type": "object"
+      },
+      "InheritedEnvVarsResponse": {
+        "description": "What a project inherits from its group. `group` is null when ungrouped.",
+        "properties": {
+          "group": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InheritedGroupRef"
+              }
+            ]
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/InheritedEnvVarResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "variables"
+        ],
+        "type": "object"
+      },
+      "InheritedGroupRef": {
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ],
+        "type": "object"
+      },
       "InitAuthResponse": {
         "properties": {
           "auth_url": {
@@ -26889,6 +27413,270 @@
           "message"
         ],
         "type": "object"
+      },
+      "InstantiateTemplateRequest": {
+        "description": "Create a template.",
+        "properties": {
+          "databases": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DatabaseChoice"
+            },
+            "description": "One choice per database type the template needs.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "environment_variables": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateVariableInput"
+            },
+            "type": "array"
+          },
+          "fork": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ForkRequest"
+              }
+            ]
+          },
+          "idempotency_key": {
+            "description": "Chosen by the client. Sending the same key again returns the same\ninstantiation instead of creating the template twice.",
+            "type": "string"
+          },
+          "runtime_overrides": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TemplateRuntimeOverrides"
+            },
+            "description": "Runtime overrides for services that run a prebuilt image, by the\ntemplate's service name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "service_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Names for the created services, by the template's service name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "target": {
+            "$ref": "#/components/schemas/InstantiationTarget"
+          }
+        },
+        "required": [
+          "target",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "InstantiatedService": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Set once the service exists.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": "string"
+          },
+          "template_service": {
+            "description": "Name of the service in the template.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_service",
+          "name",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "InstantiationResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "description": "Why it failed, when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_id": {
+            "description": "The project the services go into, once known.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "`template` or `import`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/InstantiatedService"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/InstantiationStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/InstantiationStep"
+            },
+            "type": "array"
+          },
+          "template_slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "name",
+          "status",
+          "services",
+          "steps",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "InstantiationStatus": {
+        "enum": [
+          "pending",
+          "running",
+          "succeeded",
+          "failed",
+          "interrupted"
+        ],
+        "type": "string"
+      },
+      "InstantiationStep": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "Stable identifier, such as `service:backend`.",
+            "type": "string"
+          },
+          "label": {
+            "description": "What the step does, for display.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepStatus"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "status"
+        ],
+        "type": "object"
+      },
+      "InstantiationTarget": {
+        "description": "Where the services of a template go.",
+        "oneOf": [
+          {
+            "description": "A new project named `name`.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "new_project"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A project that exists. Its services receive the template's shared\nvariables only where the project does not define them already.",
+            "properties": {
+              "group_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "existing_project"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "group_id",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "No project; only for templates with a single service.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "no_project"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "IntegrationResponse": {
         "properties": {
@@ -28240,7 +29028,7 @@
               },
               {
                 "$ref": "#/components/schemas/TemplateKind",
-                "description": "Filter by gallery (`starter` or `service`)."
+                "description": "Filter by kind (`starter` or `app`; `service` is accepted for `app`)."
               }
             ]
           },
@@ -29241,6 +30029,33 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "MemberSyncResult": {
+        "description": "What happened to one inheriting member when the group's repository\nchanged. `error` is set when that member could not be updated; it then\nstill points at its previous repository or branch.",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "name",
+          "slug"
+        ],
         "type": "object"
       },
       "MessageContent": {
@@ -36183,6 +36998,227 @@
         ],
         "type": "object"
       },
+      "ProjectGroupListResponse": {
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectGroupResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "groups",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "ProjectGroupMemberResponse": {
+        "description": "A project as it appears inside a group.",
+        "properties": {
+          "directory": {
+            "description": "Directory of the repository the project builds from.",
+            "example": "apps/web",
+            "type": "string"
+          },
+          "follows_repository": {
+            "description": "For a project that follows the group's repository: whether it points\nat it right now. False means a change could not be applied to it (or\nits git settings were edited directly); set the repository again.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "hosting": {
+            "$ref": "#/components/schemas/Hosting",
+            "description": "`external` for a service whose app runs outside Temps."
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "inherits_repository": {
+            "description": "Whether the project follows the group's repository and branch.",
+            "type": "boolean"
+          },
+          "last_deployment": {
+            "example": "2026-09-28T12:15:47.609192Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "main_branch": {
+            "description": "Branch the project deploys from.",
+            "example": "main",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "preset": {
+            "type": "string"
+          },
+          "project_type": {
+            "type": "string"
+          },
+          "repo_name": {
+            "type": "string"
+          },
+          "repo_owner": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "source_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "preset",
+          "project_type",
+          "source_type",
+          "repo_owner",
+          "repo_name",
+          "main_branch",
+          "directory",
+          "inherits_repository",
+          "hosting"
+        ],
+        "type": "object"
+      },
+      "ProjectGroupMembershipResponse": {
+        "description": "The group a project belongs to; `group` is null for an ungrouped project.",
+        "properties": {
+          "group": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectGroupResponse"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProjectGroupRepositoryRef": {
+        "description": "A group's repository as listed with the group. The full record (with the\nsynced repository id used to scan it) is at\n`GET /project-groups/{group_id}/repository`.",
+        "properties": {
+          "git_provider_connection_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "main_branch": {
+            "example": "main",
+            "type": "string"
+          },
+          "public_provider": {
+            "description": "`github` or `gitlab` for a public repository read without a\nconnection.",
+            "example": "github",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo_name": {
+            "example": "shop",
+            "type": "string"
+          },
+          "repo_owner": {
+            "example": "acme",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_owner",
+          "repo_name",
+          "main_branch"
+        ],
+        "type": "object"
+      },
+      "ProjectGroupResponse": {
+        "properties": {
+          "created_at": {
+            "example": "2026-09-28T12:15:47.609192Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "projects": {
+            "description": "Member projects the caller can access, in display order.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectGroupMemberResponse"
+            },
+            "type": "array"
+          },
+          "repository": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectGroupRepositoryRef",
+                "description": "The repository members can follow (monorepos); null when none is set."
+              }
+            ]
+          },
+          "slug": {
+            "type": "string"
+          },
+          "updated_at": {
+            "example": "2026-09-28T12:15:47.609192Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "projects",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "ProjectHealthSummary": {
         "description": "Health summary for a single project over the requested time range.",
         "properties": {
@@ -36488,6 +37524,10 @@
               "null"
             ]
           },
+          "hosting": {
+            "$ref": "#/components/schemas/Hosting",
+            "description": "`hosted`: Temps builds and runs the app. `external`: the app runs\nelsewhere (Vercel, Netlify, a VPS) and only sends Temps its analytics,\nerrors and traces; Temps never deploys it."
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -36625,6 +37665,7 @@
           "preview_envs_idle_timeout_seconds",
           "preview_envs_wake_timeout_seconds",
           "source_type",
+          "hosting",
           "cross_project_trace_sharing"
         ],
         "type": "object"
@@ -36786,37 +37827,19 @@
         "type": "object"
       },
       "ProjectTemplate": {
-        "description": "A curated project template",
+        "description": "A curated template: one or more services, the managed databases they use,\nthe variables they share and the routes between them (ADR-051).\n\nTwo YAML shapes load into it. The current one lists service definitions\nunder `services`. The original one-service shape keeps the service's\nfields at the top level and uses `services` for the managed databases; it\nloads as a template whose only service is named after the slug. Which\nshape a document uses is decided by its structure, never guessed.",
         "properties": {
-          "command": {
-            "description": "Optional command passed to the container image. This is needed for\nproduction images whose default command is intentionally a development\nmode (for example Keycloak).",
+          "databases": {
+            "description": "Managed databases the template needs (e.g., [\"postgres\", \"redis\"]).",
             "items": {
               "type": "string"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "description": {
             "description": "Short description",
             "type": [
               "string",
-              "null"
-            ]
-          },
-          "env_vars": {
-            "description": "Environment variables template",
-            "items": {
-              "$ref": "#/components/schemas/EnvVarTemplate"
-            },
-            "type": "array"
-          },
-          "exposed_port": {
-            "description": "Container port the prebuilt image listens on (used for routing when\ndeploying from `image`). Falls back to the image's EXPOSE / 3000 default.",
-            "format": "int32",
-            "type": [
-              "integer",
               "null"
             ]
           },
@@ -36829,21 +37852,7 @@
           },
           "git": {
             "$ref": "#/components/schemas/GitRef",
-            "description": "Git repository reference (supports any git provider). Always present as\nthe source-of-truth / build fallback, even for image-based templates."
-          },
-          "health_check_path": {
-            "description": "HTTP health-check path probed after the container starts (image deploys\ncan't read `.temps.yaml`). Must start with '/'. Defaults to \"/\".",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "image": {
-            "description": "Prebuilt Docker image reference (e.g. \"ghcr.io/org/app:latest\"). When set,\nthe one-click deploy pulls and runs this image directly (source_type\ndocker_image) instead of building from `git` — instant, no BuildKit. When\nabsent, the template builds from source.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "description": "Source repository shared by the services that don't declare their own.\nAlways present as the source-of-truth / build fallback, even for\nimage-based templates."
           },
           "image_url": {
             "description": "URL to template image/icon",
@@ -36862,45 +37871,18 @@
           },
           "kind": {
             "$ref": "#/components/schemas/TemplateKind",
-            "description": "Gallery this template belongs to. Older configurations default to a\nsource-code starter, preserving their existing behaviour."
-          },
-          "managed_service_bindings": {
-            "additionalProperties": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "propertyNames": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "description": "Environment aliases populated from a linked managed service. The outer\nkey is the Temps service type and each inner entry maps an application\nvariable to a variable supplied by that service.\n\nExample: `postgres.KC_DB_USERNAME: POSTGRES_USER`.",
-            "propertyNames": {
-              "type": "string"
-            },
-            "type": "object"
+            "description": "Who owns the code once the template is created."
           },
           "name": {
             "description": "Display name",
             "type": "string"
           },
-          "preset": {
-            "description": "Framework/preset to use (e.g., \"nextjs\", \"fastapi\", \"dockerfile\")",
-            "type": "string"
-          },
-          "preset_config": {
-            "description": "Preset-specific configuration"
-          },
-          "resources": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/TemplateResources",
-                "description": "Minimum/safe runtime resources for this application. These values are\nvalidated against operator-configured tenant ceilings before creation."
-              }
-            ]
+          "routes": {
+            "description": "Path routes between the services.",
+            "items": {
+              "$ref": "#/components/schemas/TemplateRoute"
+            },
+            "type": "array"
           },
           "screenshot_url": {
             "description": "URL to a full screenshot/banner preview of the deployed template (e.g.\n`/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the\ntemplate card; optional — templates without one show no banner.",
@@ -36910,9 +37892,16 @@
             ]
           },
           "services": {
-            "description": "Required external services (e.g., [\"postgres\", \"redis\"])",
+            "description": "The services the template creates; never empty.",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/TemplateServiceSpec"
+            },
+            "type": "array"
+          },
+          "shared_env_vars": {
+            "description": "Variables shared by every service. Created in a project, they become\nthe project's shared variables.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
             },
             "type": "array"
           },
@@ -36933,15 +37922,25 @@
             "type": "array"
           },
           "version": {
-            "description": "Version of this template release. Service projects pin this value and\nthe complete resolved definition so catalog updates are always an\nexplicit, reviewable upgrade rather than a silent runtime mutation.",
+            "description": "Version of this template release. Apps pin this value and the\ncomplete resolved definition so catalog updates are always an\nexplicit, reviewable upgrade rather than a silent runtime mutation.",
             "type": "string"
           }
         },
         "required": [
           "slug",
           "name",
+          "version",
+          "kind",
           "git",
-          "preset"
+          "tags",
+          "features",
+          "databases",
+          "shared_env_vars",
+          "services",
+          "routes",
+          "is_public",
+          "is_featured",
+          "sort_order"
         ],
         "type": "object"
       },
@@ -44262,19 +45261,26 @@
         "type": "string"
       },
       "ServiceTemplateInstance": {
-        "description": "Immutable template release attached to a service project.\n\nThe resolved definition is deliberately stored with the project. The live\ncatalog is only needed to discover a newer release; deployments, edits and\nrollbacks continue to work if the catalog later changes or disappears.",
+        "description": "Immutable app release attached to a service created from it.\n\nThe resolved definition is deliberately stored with the service. The live\ncatalog is only needed to discover a newer release; deployments, edits and\nrollbacks continue to work if the catalog later changes or disappears.",
         "properties": {
           "schema_version": {
             "description": "Catalog schema used to deserialize `template`.",
             "type": "string"
           },
+          "service": {
+            "description": "Which of the template's services this one is. Absent on snapshots\nwritten before templates could have several services: those are the\ntemplate's only service.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "slug": {
-            "description": "Stable service family identifier.",
+            "description": "Stable app family identifier.",
             "type": "string"
           },
           "template": {
             "$ref": "#/components/schemas/ProjectTemplate",
-            "description": "Exact resolved release from which this project was created/upgraded."
+            "description": "Exact resolved release from which this service was created/upgraded."
           },
           "version": {
             "description": "Applied template release.",
@@ -45373,6 +46379,63 @@
         },
         "type": "object"
       },
+      "SetGroupRepositoryRequest": {
+        "properties": {
+          "git_provider_connection_id": {
+            "description": "The connection to read the repository through. Set exactly one of\nthis and `public_provider`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "main_branch": {
+            "example": "main",
+            "type": "string"
+          },
+          "public_provider": {
+            "description": "`github` or `gitlab`, to use a public repository without a\nconnection. Pushes to it cannot trigger deploys.",
+            "example": "github",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo_name": {
+            "example": "shop",
+            "type": "string"
+          },
+          "repo_owner": {
+            "example": "acme",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_owner",
+          "repo_name",
+          "main_branch"
+        ],
+        "type": "object"
+      },
+      "SetGroupRepositoryResponse": {
+        "properties": {
+          "group": {
+            "$ref": "#/components/schemas/ProjectGroupResponse"
+          },
+          "services": {
+            "description": "One entry per project that follows the repository. An entry with an\n`error` still points at its previous repository or branch.",
+            "items": {
+              "$ref": "#/components/schemas/MemberSyncResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group",
+          "services"
+        ],
+        "type": "object"
+      },
       "SetHttpCheckEnabled": {
         "properties": {
           "enabled": {
@@ -45432,6 +46495,31 @@
         },
         "required": [
           "preview_password_hint"
+        ],
+        "type": "object"
+      },
+      "SetProjectHostingRequest": {
+        "description": "Whether Temps runs a project's app or only observes an app running\nelsewhere.",
+        "properties": {
+          "hosting": {
+            "$ref": "#/components/schemas/Hosting",
+            "description": "`external` stops Temps from deploying the project (deployments already\nrunning keep running until stopped); `hosted` lets it deploy again."
+          }
+        },
+        "required": [
+          "hosting"
+        ],
+        "type": "object"
+      },
+      "SetRepositoryInheritanceRequest": {
+        "properties": {
+          "inherit": {
+            "description": "True: the project follows the group's repository and branch (and is\npointed at them now, keeping its own directory). False: it keeps its\ncurrent git settings and stops following.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "inherit"
         ],
         "type": "object"
       },
@@ -47883,6 +48971,14 @@
         ],
         "type": "object"
       },
+      "StepStatus": {
+        "enum": [
+          "pending",
+          "done",
+          "failed"
+        ],
+        "type": "string"
+      },
       "StepUpResponse": {
         "properties": {
           "expires_at": {
@@ -48557,10 +49653,10 @@
         "type": "object"
       },
       "TemplateKind": {
-        "description": "Where a template is presented in the project creation flow.",
+        "description": "Who owns a template's code once it is created (ADR-051).",
         "enum": [
           "starter",
-          "service"
+          "app"
         ],
         "type": "string"
       },
@@ -48611,6 +49707,13 @@
               "null"
             ]
           },
+          "databases": {
+            "description": "Managed databases the template needs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "description": {
             "description": "Short description",
             "type": [
@@ -48619,7 +49722,7 @@
             ]
           },
           "env_vars": {
-            "description": "Environment variables template",
+            "description": "Variables of the first service, followed by the shared variables.",
             "items": {
               "$ref": "#/components/schemas/EnvVarTemplateResponse"
             },
@@ -48671,7 +49774,7 @@
           },
           "kind": {
             "$ref": "#/components/schemas/TemplateKind",
-            "description": "Gallery this template belongs to."
+            "description": "Who owns the code once the template is created."
           },
           "managed_service_bindings": {
             "additionalProperties": {
@@ -48683,7 +49786,7 @@
               },
               "type": "object"
             },
-            "description": "Managed-service environment aliases used at deployment time.",
+            "description": "Managed-service environment aliases of the first service, used at\ndeployment time.",
             "propertyNames": {
               "type": "string"
             },
@@ -48694,7 +49797,7 @@
             "type": "string"
           },
           "preset": {
-            "description": "Framework/preset to use",
+            "description": "Framework/preset of the first service.",
             "type": "string"
           },
           "resources": {
@@ -48708,6 +49811,13 @@
               }
             ]
           },
+          "routes": {
+            "description": "Path routes between the services.",
+            "items": {
+              "$ref": "#/components/schemas/TemplateRoute"
+            },
+            "type": "array"
+          },
           "screenshot_url": {
             "description": "URL to a wide screenshot/banner preview of the deployed template.\nAbsent for templates that don't have one captured yet.",
             "type": [
@@ -48715,10 +49825,24 @@
               "null"
             ]
           },
+          "service_definitions": {
+            "description": "Every service the template creates, in order.",
+            "items": {
+              "$ref": "#/components/schemas/TemplateServiceResponse"
+            },
+            "type": "array"
+          },
           "services": {
-            "description": "Required external services",
+            "description": "Managed databases the template needs. Same as `databases`; kept for\nclients written before templates could have several services.",
             "items": {
               "type": "string"
+            },
+            "type": "array"
+          },
+          "shared_env_vars": {
+            "description": "Variables shared by all services; they become project variables.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplateResponse"
             },
             "type": "array"
           },
@@ -48734,7 +49858,7 @@
             "type": "array"
           },
           "version": {
-            "description": "Immutable release identifier for service templates.",
+            "description": "Immutable release identifier for apps.",
             "type": "string"
           }
         },
@@ -48748,9 +49872,350 @@
           "tags",
           "features",
           "services",
+          "databases",
           "env_vars",
+          "service_definitions",
+          "shared_env_vars",
+          "routes",
           "is_featured",
           "managed_service_bindings"
+        ],
+        "type": "object"
+      },
+      "TemplateRoute": {
+        "description": "A path route between two services of the template (ADR-050).",
+        "properties": {
+          "prefix": {
+            "description": "Path prefix handed to `target`, such as `/api`.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Service whose hostnames receive the requests.",
+            "type": "string"
+          },
+          "strip_prefix": {
+            "description": "Forward `/api/users` as `/users`.",
+            "type": "boolean"
+          },
+          "target": {
+            "description": "Service that answers requests under `prefix`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "prefix",
+          "target"
+        ],
+        "type": "object"
+      },
+      "TemplateRuntimeOverrides": {
+        "description": "Runtime overrides for a service that runs a prebuilt image. Curated\ntemplate values are used for everything left unset.",
+        "properties": {
+          "command": {
+            "description": "Entrypoint arguments. An empty list uses the image's own command.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cpu_limit": {
+            "description": "CPU limit in microcores. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "description": "CPU request in microcores (1_000_000 = one CPU core).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exposed_port": {
+            "description": "Public container port.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "health_check_path": {
+            "description": "Relative HTTP health-check path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Image reference; must be pinned to a sha256 digest.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "description": "Memory limit in MiB. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "description": "Memory request in MiB.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TemplateServiceResponse": {
+        "description": "One service of a template.",
+        "properties": {
+          "database_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Managed-database environment aliases used at deployment time.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "databases": {
+            "description": "Managed databases linked to this service.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "directory": {
+            "description": "Directory of the source the service builds from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_vars": {
+            "description": "Variables of this service.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplateResponse"
+            },
+            "type": "array"
+          },
+          "exposed_port": {
+            "description": "Container port the service listens on.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "git": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GitRefResponse",
+                "description": "Repository, when it differs from the template's."
+              }
+            ]
+          },
+          "health_check_path": {
+            "description": "HTTP health-check path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Prebuilt image the service runs instead of building.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Name of the service within the template.",
+            "type": "string"
+          },
+          "preset": {
+            "description": "Framework/preset to use.",
+            "type": "string"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Curated CPU/memory profile."
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "preset",
+          "env_vars",
+          "databases",
+          "database_bindings"
+        ],
+        "type": "object"
+      },
+      "TemplateServiceSpec": {
+        "description": "One deployable unit of a template: it becomes one service (a `projects`\nrow) when the template is created.",
+        "properties": {
+          "command": {
+            "description": "Optional command passed to the container image. This is needed for\nproduction images whose default command is intentionally a development\nmode (for example Keycloak).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "database_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Environment aliases populated from a linked managed database. The outer\nkey is the database type and each inner entry maps an application\nvariable to a variable supplied by that database.\n\nExample: `postgres.KC_DB_USERNAME: POSTGRES_USER`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "databases": {
+            "description": "Managed databases (types listed in the template's `databases`) linked\nto this service. Filled in on load: a service is linked to every\ndatabase it binds, and a template's only service to all of them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "directory": {
+            "description": "Directory of the source this service builds from. Overrides the path\nof its repository reference.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_vars": {
+            "description": "Variables of this service only.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "exposed_port": {
+            "description": "Container port the service listens on. Falls back to the image's\nEXPOSE / 3000 default.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "git": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GitRef",
+                "description": "Source repository for this service when it differs from the template's."
+              }
+            ]
+          },
+          "health_check_path": {
+            "description": "HTTP health-check path probed after the container starts. Must start\nwith '/'. Defaults to \"/\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Prebuilt Docker image reference (e.g. \"ghcr.io/org/app@sha256:…\"). When\nset, the service pulls and runs this image instead of building from\nsource.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Name of the service, unique within the template. It names the created\nservice and is how routes and variable references point at it.",
+            "type": "string"
+          },
+          "preset": {
+            "description": "Framework/preset to use (e.g., \"nextjs\", \"python\", \"dockerfile\")",
+            "type": "string"
+          },
+          "preset_config": {
+            "description": "Preset-specific configuration"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Minimum/safe runtime resources for this service. These values are\nvalidated against operator-configured tenant ceilings before creation."
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "preset"
+        ],
+        "type": "object"
+      },
+      "TemplateVariableInput": {
+        "description": "A variable value for the template.",
+        "properties": {
+          "is_secret": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "service": {
+            "description": "The service the variable belongs to. Needed only when the name is not\ndeclared by the template, or is declared by several services.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
         ],
         "type": "object"
       },
@@ -52081,6 +53546,29 @@
         ],
         "type": "object"
       },
+      "UpdateGroupEnvVarRequest": {
+        "properties": {
+          "include_in_preview": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "is_secret": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateIncidentStatusRequest": {
         "properties": {
           "message": {
@@ -52549,6 +54037,30 @@
               {
                 "$ref": "#/components/schemas/CloudTelemetryWriteMode"
               }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateProjectGroupRequest": {
+        "properties": {
+          "description": {
+            "description": "An empty string clears the description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         },
@@ -81188,6 +82700,153 @@
         "x-maturity": "beta"
       }
     },
+    "/instantiations": {
+      "get": {
+        "operationId": "list_instantiations",
+        "parameters": [
+          {
+            "description": "Only instantiations that put services into this project.",
+            "in": "query",
+            "name": "group_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "At most this many, newest first (default 20, max 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/InstantiationResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List your recent template creations and imports",
+        "tags": [
+          "Templates"
+        ]
+      }
+    },
+    "/instantiations/{id}": {
+      "get": {
+        "operationId": "get_instantiation",
+        "parameters": [
+          {
+            "description": "Instantiation ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstantiationResponse"
+                }
+              }
+            },
+            "description": "Its status and every step"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Show a template creation or import",
+        "tags": [
+          "Templates"
+        ]
+      }
+    },
+    "/instantiations/{id}/retry": {
+      "post": {
+        "description": "Continues from the step that failed (or was interrupted by a restart);\nsteps that finished are not run again.",
+        "operationId": "retry_instantiation",
+        "parameters": [
+          {
+            "description": "Instantiation ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstantiationResponse"
+                }
+              }
+            },
+            "description": "Running again"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "It is running or already succeeded"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Retry a template creation or import",
+        "tags": [
+          "Templates"
+        ]
+      }
+    },
     "/internal/nodes": {
       "get": {
         "operationId": "admin_list_nodes",
@@ -92622,6 +94281,1036 @@
         ]
       }
     },
+    "/project-groups": {
+      "get": {
+        "operationId": "list_project_groups",
+        "parameters": [
+          {
+            "description": "1-indexed page",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "default 20, max 100",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupListResponse"
+                }
+              }
+            },
+            "description": "Project groups, ordered by name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "create_project_group",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Project group created"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "A listed project does not exist"
+          },
+          "409": {
+            "description": "Slug already taken"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/by-slug/{slug}": {
+      "get": {
+        "operationId": "get_project_group_by_slug",
+        "parameters": [
+          {
+            "description": "Project group slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Project group"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}": {
+      "delete": {
+        "operationId": "delete_project_group",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project group deleted; its projects are now ungrouped and otherwise unchanged"
+          },
+          "403": {
+            "description": "Insufficient permissions or no access to a member project"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "get_project_group",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Project group"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "patch": {
+        "operationId": "update_project_group",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Project group updated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "Insufficient permissions or no access to a member project"
+          },
+          "404": {
+            "description": "Project group not found"
+          },
+          "409": {
+            "description": "Slug already taken"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/env-vars": {
+      "get": {
+        "operationId": "list_group_env_vars",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GroupEnvVarResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Variables every project in the group inherits (values masked)"
+          },
+          "403": {
+            "description": "Insufficient permissions on a member project"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "create_group_env_var",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGroupEnvVarRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupEnvVarResponse"
+                }
+              }
+            },
+            "description": "Variable created; applies to each project's next deployment"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "Insufficient permissions on a member project"
+          },
+          "404": {
+            "description": "Project group not found"
+          },
+          "409": {
+            "description": "Variable already exists for that scope"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/env-vars/{var_id}": {
+      "delete": {
+        "operationId": "delete_group_env_var",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Variable ID",
+            "in": "path",
+            "name": "var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Variable deleted; projects stop receiving it on their next deployment"
+          },
+          "403": {
+            "description": "Insufficient permissions on a member project"
+          },
+          "404": {
+            "description": "Project group or variable not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "patch": {
+        "operationId": "update_group_env_var",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Variable ID",
+            "in": "path",
+            "name": "var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateGroupEnvVarRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupEnvVarResponse"
+                }
+              }
+            },
+            "description": "Variable updated; applies to each project's next deployment"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "Insufficient permissions on a member project"
+          },
+          "404": {
+            "description": "Project group or variable not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/import": {
+      "post": {
+        "description": "Creates one service per app, each building from its directory of the\nproject's repository and following it. Runs in the background like\n`POST /templates/{slug}/instantiate`: poll `GET /instantiations/{id}`.",
+        "operationId": "import_project_services",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportServicesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstantiationResponse"
+                }
+              }
+            },
+            "description": "The import already started with this idempotency key"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstantiationResponse"
+                }
+              }
+            },
+            "description": "Accepted; the services are being created"
+          },
+          "400": {
+            "description": "Invalid request, or the project has no repository"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project group not found"
+          },
+          "409": {
+            "description": "The idempotency key was used for a different request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import apps as services of a project",
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/projects/{project_id}": {
+      "delete": {
+        "operationId": "remove_project_from_group",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project removed from the group; it is now ungrouped"
+          },
+          "403": {
+            "description": "Insufficient permissions on the project"
+          },
+          "404": {
+            "description": "Project group not found, or the project is not in it"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "add_project_to_group",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Project placed in the group (moved out of any other group)"
+          },
+          "403": {
+            "description": "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them"
+          },
+          "404": {
+            "description": "Project group or project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/projects/{project_id}/repository-inheritance": {
+      "put": {
+        "operationId": "set_repository_inheritance",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetRepositoryInheritanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Inheritance updated"
+          },
+          "400": {
+            "description": "The project cannot follow the repository (not deployed from Git, branch missing, …)"
+          },
+          "403": {
+            "description": "Insufficient permissions on the project"
+          },
+          "404": {
+            "description": "Project group not found, or the project is not in it"
+          },
+          "409": {
+            "description": "The group has no repository yet"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/repository": {
+      "delete": {
+        "operationId": "clear_group_repository",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupResponse"
+                }
+              }
+            },
+            "description": "Repository removed; projects keep their current git settings and stop following"
+          },
+          "403": {
+            "description": "Insufficient permissions, or no access to every project in the group"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "get_group_repository",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupRepositoryResponse"
+                }
+              }
+            },
+            "description": "The group's repository, if any"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "set_group_repository",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGroupRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetGroupRepositoryResponse"
+                }
+              }
+            },
+            "description": "Repository set and written through to every project that follows it; see `services` for per-project outcomes"
+          },
+          "400": {
+            "description": "Connection, repository or branch not usable"
+          },
+          "403": {
+            "description": "Insufficient permissions, or no access to every project in the group"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/routes": {
+      "get": {
+        "operationId": "list_group_routes",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GroupRouteResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Path routes between the project's services, with how each applies per environment"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project group not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "create_group_route",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGroupRouteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupRouteResponse"
+                }
+              }
+            },
+            "description": "Route created; the proxy applies it within seconds, no redeploy needed"
+          },
+          "400": {
+            "description": "Invalid prefix, or source and target are the same service"
+          },
+          "403": {
+            "description": "Insufficient permissions on the source or target service"
+          },
+          "404": {
+            "description": "Project group not found, or a service is not in it"
+          },
+          "409": {
+            "description": "The source service already routes this prefix"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/project-groups/{group_id}/routes/{route_id}": {
+      "delete": {
+        "operationId": "delete_group_route",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Route ID",
+            "in": "path",
+            "name": "route_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Route removed; the source service serves the prefix itself again"
+          },
+          "403": {
+            "description": "Insufficient permissions on the source or target service"
+          },
+          "404": {
+            "description": "Project group or route not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/projects": {
       "get": {
         "operationId": "get_projects",
@@ -93259,6 +95948,67 @@
             "description": "Project not found"
           }
         },
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{id}/hosting": {
+      "patch": {
+        "description": "`external` marks a project whose app runs elsewhere (Vercel, Netlify, a\nVPS) and only sends Temps its analytics, errors and traces: Temps refuses\nto deploy it, and deployments already running keep running until stopped.\n`hosted` lets Temps deploy it again.",
+        "operationId": "set_project_hosting",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectHostingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Hosting updated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set whether Temps hosts a project",
         "tags": [
           "Projects"
         ]
@@ -105102,6 +107852,47 @@
         ]
       }
     },
+    "/projects/{project_id}/group": {
+      "get": {
+        "operationId": "get_project_group_membership",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGroupMembershipResponse"
+                }
+              }
+            },
+            "description": "The project's group, or null when ungrouped"
+          },
+          "403": {
+            "description": "Insufficient permissions on the project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/projects/{project_id}/has-error-groups": {
       "get": {
         "operationId": "has_error_groups",
@@ -106164,6 +108955,47 @@
         "tags": [
           "Status Page"
         ]
+      }
+    },
+    "/projects/{project_id}/inherited-env-vars": {
+      "get": {
+        "operationId": "get_inherited_env_vars",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InheritedEnvVarsResponse"
+                }
+              }
+            },
+            "description": "Variables this project inherits from its group (names only)"
+          },
+          "403": {
+            "description": "Insufficient permissions on the project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/logs": {
@@ -116454,6 +119286,79 @@
         ]
       }
     },
+    "/templates/{slug}/instantiate": {
+      "post": {
+        "description": "Creates every service of a template, the databases it needs, and, for a\ntemplate going into a project, its shared variables and path routes. The\nrequest is checked in full, then runs in the background: poll\n`GET /instantiations/{id}`. Sending the same `idempotency_key` again\nreturns the same instantiation.",
+        "operationId": "instantiate_template",
+        "parameters": [
+          {
+            "description": "Template slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstantiateTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstantiationResponse"
+                }
+              }
+            },
+            "description": "The instantiation already started with this idempotency key"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstantiationResponse"
+                }
+              }
+            },
+            "description": "Accepted; the services are being created"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "403": {
+            "description": "Insufficient permissions, or a reserved slug only an instance admin may claim"
+          },
+          "404": {
+            "description": "Template or project not found"
+          },
+          "409": {
+            "description": "The idempotency key was used for a different request"
+          },
+          "428": {
+            "description": "A reserved slug requires a recently MFA-verified session"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a template",
+        "tags": [
+          "Templates"
+        ]
+      }
+    },
     "/traefik-discovery/routes": {
       "get": {
         "operationId": "list_traefik_discovered_routes",
@@ -120685,6 +123590,14 @@
     {
       "description": "Teams and project-scoped access",
       "name": "Teams"
+    },
+    {
+      "description": "Group several projects into one unit",
+      "name": "Project Groups"
+    },
+    {
+      "description": "Create templates and import apps as services of a project",
+      "name": "Templates"
     },
     {
       "description": "Git provider management endpoints",

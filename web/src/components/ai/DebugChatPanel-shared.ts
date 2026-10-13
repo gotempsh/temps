@@ -793,7 +793,7 @@ export function chatApiPaths(userScoped: boolean, projectId?: number) {
     }
   }
   if (projectId == null) {
-    throw new Error('A project-scoped chat requires a project id.')
+    throw new Error('A service-scoped chat requires a service id.')
   }
   return {
     conversations: `/api/projects/${projectId}/ai/conversations`,

@@ -11,6 +11,10 @@ interface ProjectCardMediaProps {
   screenshotLocation?: string | null
   templateImageUrl?: string | null
   className?: string
+  /** Overrides the logo padding (favicons and template images). */
+  logoClassName?: string
+  /** Overrides the initial shown when there is no image. */
+  fallbackClassName?: string
 }
 
 export function ProjectCardMedia({
@@ -19,6 +23,8 @@ export function ProjectCardMedia({
   screenshotLocation,
   templateImageUrl,
   className,
+  logoClassName,
+  fallbackClassName,
 }: ProjectCardMediaProps) {
   return (
     <ProjectCardMediaContent
@@ -28,6 +34,8 @@ export function ProjectCardMedia({
       screenshotLocation={screenshotLocation}
       templateImageUrl={templateImageUrl}
       className={className}
+      logoClassName={logoClassName}
+      fallbackClassName={fallbackClassName}
     />
   )
 }
@@ -38,6 +46,8 @@ function ProjectCardMediaContent({
   screenshotLocation,
   templateImageUrl,
   className,
+  logoClassName,
+  fallbackClassName,
 }: ProjectCardMediaProps) {
   const sources = projectCardMediaSources(
     deploymentUrl,
@@ -53,7 +63,7 @@ function ProjectCardMediaContent({
         'relative flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-md border bg-muted/55',
         className
       )}
-      aria-label={`${name} project image`}
+      aria-label={`${name} service image`}
     >
       {source ? (
         <img
@@ -64,13 +74,13 @@ function ProjectCardMediaContent({
           className={cn(
             'size-full',
             source.kind === 'favicon' || source.kind === 'template'
-              ? 'object-contain p-2'
+              ? cn('object-contain p-2', logoClassName)
               : 'object-cover object-top'
           )}
           onError={() => setSourceIndex((current) => current + 1)}
         />
       ) : (
-        <span className="text-sm font-medium text-muted-foreground">
+        <span className={cn('text-sm font-medium text-muted-foreground', fallbackClassName)}>
           {name.slice(0, 1).toUpperCase()}
         </span>
       )}

@@ -6,7 +6,10 @@
 //! HTTP handlers for template-related endpoints.
 
 use serde::{Deserialize, Serialize};
-use temps_core::templates::{EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources};
+use temps_core::templates::{
+    EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources, TemplateRoute,
+    TemplateServiceSpec,
+};
 use utoipa::ToSchema;
 
 /// Query parameters for listing templates
@@ -16,7 +19,7 @@ pub struct ListTemplatesQuery {
     pub tag: Option<String>,
     /// Only return featured templates
     pub featured: Option<bool>,
-    /// Filter by gallery (`starter` or `service`).
+    /// Filter by kind (`starter` or `app`; `service` is accepted for `app`).
     pub kind: Option<TemplateKind>,
 }
 
@@ -27,9 +30,9 @@ pub struct TemplateResponse {
     pub slug: String,
     /// Display name
     pub name: String,
-    /// Immutable release identifier for service templates.
+    /// Immutable release identifier for apps.
     pub version: String,
-    /// Gallery this template belongs to.
+    /// Who owns the code once the template is created.
     pub kind: TemplateKind,
     /// Short description
     pub description: Option<String>,
@@ -40,16 +43,25 @@ pub struct TemplateResponse {
     pub screenshot_url: Option<String>,
     /// Git repository reference
     pub git: GitRefResponse,
-    /// Framework/preset to use
+    /// Framework/preset of the first service.
     pub preset: String,
     /// Tags/categories for filtering
     pub tags: Vec<String>,
     /// Feature highlights
     pub features: Vec<String>,
-    /// Required external services
+    /// Managed databases the template needs. Same as `databases`; kept for
+    /// clients written before templates could have several services.
     pub services: Vec<String>,
-    /// Environment variables template
+    /// Managed databases the template needs.
+    pub databases: Vec<String>,
+    /// Variables of the first service, followed by the shared variables.
     pub env_vars: Vec<EnvVarTemplateResponse>,
+    /// Every service the template creates, in order.
+    pub service_definitions: Vec<TemplateServiceResponse>,
+    /// Variables shared by all services; they become project variables.
+    pub shared_env_vars: Vec<EnvVarTemplateResponse>,
+    /// Path routes between the services.
+    pub routes: Vec<TemplateRoute>,
     /// Whether the template is featured/promoted
     pub is_featured: bool,
     /// Prebuilt Docker image reference. When set, the one-click deploy pulls and
@@ -63,9 +75,70 @@ pub struct TemplateResponse {
     pub exposed_port: Option<i32>,
     /// HTTP health-check path probed after the container starts (image deploys).
     pub health_check_path: Option<String>,
-    /// Managed-service environment aliases used at deployment time.
+    /// Managed-service environment aliases of the first service, used at
+    /// deployment time.
     pub managed_service_bindings:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+/// One service of a template.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TemplateServiceResponse {
+    /// Name of the service within the template.
+    pub name: String,
+    /// Directory of the source the service builds from.
+    pub directory: Option<String>,
+    /// Repository, when it differs from the template's.
+    pub git: Option<GitRefResponse>,
+    /// Framework/preset to use.
+    pub preset: String,
+    /// Prebuilt image the service runs instead of building.
+    pub image: Option<String>,
+    /// Container port the service listens on.
+    pub exposed_port: Option<i32>,
+    /// HTTP health-check path.
+    pub health_check_path: Option<String>,
+    /// Curated CPU/memory profile.
+    pub resources: Option<TemplateResources>,
+    /// Variables of this service.
+    pub env_vars: Vec<EnvVarTemplateResponse>,
+    /// Managed databases linked to this service.
+    pub databases: Vec<String>,
+    /// Managed-database environment aliases used at deployment time.
+    pub database_bindings:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+impl From<temps_core::templates::GitRef> for GitRefResponse {
+    fn from(git: temps_core::templates::GitRef) -> Self {
+        Self {
+            url: git.url,
+            path: git.path,
+            r#ref: git.r#ref,
+        }
+    }
+}
+
+impl From<TemplateServiceSpec> for TemplateServiceResponse {
+    fn from(service: TemplateServiceSpec) -> Self {
+        Self {
+            name: service.name,
+            directory: service.directory,
+            git: service.git.map(GitRefResponse::from),
+            preset: service.preset,
+            image: service.image,
+            exposed_port: service.exposed_port,
+            health_check_path: service.health_check_path,
+            resources: service.resources,
+            env_vars: service
+                .env_vars
+                .into_iter()
+                .map(EnvVarTemplateResponse::from)
+                .collect(),
+            databases: service.databases,
+            database_bindings: service.database_bindings,
+        }
+    }
 }
 
 /// Git repository reference response
@@ -101,6 +174,13 @@ pub struct EnvVarTemplateResponse {
 
 impl From<ProjectTemplate> for TemplateResponse {
     fn from(template: ProjectTemplate) -> Self {
+        let primary = template.primary().clone();
+        let shared_env_vars = template
+            .shared_env_vars
+            .iter()
+            .cloned()
+            .map(EnvVarTemplateResponse::from)
+            .collect::<Vec<_>>();
         Self {
             slug: template.slug,
             name: template.name,
@@ -109,27 +189,33 @@ impl From<ProjectTemplate> for TemplateResponse {
             description: template.description,
             image_url: template.image_url,
             screenshot_url: template.screenshot_url,
-            git: GitRefResponse {
-                url: template.git.url,
-                path: template.git.path,
-                r#ref: template.git.r#ref,
-            },
-            preset: template.preset,
+            // The first service's source: what a one-service template deploys.
+            git: GitRefResponse::from(primary.source(&template.git)),
+            preset: primary.preset,
             tags: template.tags,
             features: template.features,
-            services: template.services,
-            env_vars: template
+            services: template.databases.clone(),
+            databases: template.databases,
+            env_vars: primary
                 .env_vars
                 .into_iter()
+                .chain(template.shared_env_vars)
                 .map(EnvVarTemplateResponse::from)
                 .collect(),
+            service_definitions: template
+                .services
+                .into_iter()
+                .map(TemplateServiceResponse::from)
+                .collect(),
+            shared_env_vars,
+            routes: template.routes,
             is_featured: template.is_featured,
-            image: template.image,
-            command: template.command,
-            resources: template.resources,
-            exposed_port: template.exposed_port,
-            health_check_path: template.health_check_path,
-            managed_service_bindings: template.managed_service_bindings,
+            image: primary.image,
+            command: primary.command,
+            resources: primary.resources,
+            exposed_port: primary.exposed_port,
+            health_check_path: primary.health_check_path,
+            managed_service_bindings: primary.database_bindings,
         }
     }
 }
@@ -248,19 +334,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Input for environment variable
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct EnvVarInput {
-    /// Variable name
-    pub name: String,
-    /// Variable value
-    pub value: String,
-    /// Mark the variable as a secret. Secret values are encrypted at rest,
-    /// masked in list responses, and revealable only through an audited,
-    /// permission-checked endpoint. Defaults to `false`.
-    #[serde(default)]
-    pub is_secret: bool,
-}
+pub use crate::template_creation::EnvVarInput;
 
 /// Response after creating a project from template
 #[derive(Debug, Serialize, ToSchema)]
@@ -304,26 +378,26 @@ mod tests {
                 path: None,
                 r#ref: "main".to_string(),
             },
-            preset: "nextjs".to_string(),
-            preset_config: None,
-            resources: None,
-            image: None,
-            command: None,
-            exposed_port: None,
-            health_check_path: None,
             tags: vec!["test".to_string(), "example".to_string()],
             features: vec!["Feature 1".to_string(), "Feature 2".to_string()],
-            services: vec!["postgres".to_string()],
-            managed_service_bindings: Default::default(),
-            env_vars: vec![EnvVarTemplate {
-                name: "TEST_VAR".to_string(),
-                example: Some("test_value".to_string()),
-                default: None,
-                description: Some("A test variable".to_string()),
-                required: true,
-                secret: false,
-                default_generator: None,
+            databases: vec!["postgres".to_string()],
+            shared_env_vars: vec![],
+            services: vec![temps_core::templates::TemplateServiceSpec {
+                name: "test-template".to_string(),
+                preset: "nextjs".to_string(),
+                databases: vec!["postgres".to_string()],
+                env_vars: vec![EnvVarTemplate {
+                    name: "TEST_VAR".to_string(),
+                    example: Some("test_value".to_string()),
+                    default: None,
+                    description: Some("A test variable".to_string()),
+                    required: true,
+                    secret: false,
+                    default_generator: None,
+                }],
+                ..Default::default()
             }],
+            routes: vec![],
             is_public: true,
             is_featured: true,
             sort_order: 1,
@@ -348,7 +422,10 @@ mod tests {
         assert_eq!(response.tags.len(), 2);
         assert_eq!(response.features.len(), 2);
         assert_eq!(response.services.len(), 1);
+        assert_eq!(response.databases, vec!["postgres"]);
         assert_eq!(response.env_vars.len(), 1);
+        assert_eq!(response.service_definitions.len(), 1);
+        assert_eq!(response.service_definitions[0].preset, "nextjs");
         assert!(response.is_featured);
     }
 
@@ -404,7 +481,7 @@ templates:
     name: Test Template 2
     git:
       url: https://gitlab.com/test/repo2.git
-    preset: fastapi
+    preset: python
     tags:
       - backend
       - python

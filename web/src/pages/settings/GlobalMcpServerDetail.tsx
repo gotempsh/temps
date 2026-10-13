@@ -206,7 +206,7 @@ export function GlobalMcpServerDetail() {
               <Badge variant="outline" className="text-xs">
                 {mcp.project_id === null
                   ? 'Global'
-                  : `Project ${mcp.project_id}`}
+                  : `Service ${mcp.project_id}`}
               </Badge>
             </div>
             {mcp.description && (
@@ -377,7 +377,7 @@ export function GlobalMcpServerDetail() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete global MCP server?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete this MCP server. All projects that
+              This will permanently delete this MCP server. All services that
               reference it will lose access.
             </AlertDialogDescription>
           </AlertDialogHeader>

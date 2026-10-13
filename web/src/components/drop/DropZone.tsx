@@ -98,10 +98,10 @@ export function DropZone({
               <UploadCloud className="size-10 text-primary" strokeWidth={1.5} />
             </div>
             <h2 className="text-2xl font-semibold tracking-tight">
-              Drag your project here
+              Drag your app here
             </h2>
             <p className="mt-3 max-w-md text-sm leading-6 text-muted-foreground">
-              A project folder, one HTML file, or a .zip archive. Folders are
+              A source folder, one HTML file, or a .zip archive. Folders are
               packaged locally before upload.
             </p>
             <div className="mt-7 flex flex-wrap justify-center gap-3">

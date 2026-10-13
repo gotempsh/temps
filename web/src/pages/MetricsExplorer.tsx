@@ -1002,7 +1002,7 @@ function MetricsOverview({
           }
           description={
             totalCount === 0
-              ? 'Point an OpenTelemetry exporter at this project to start seeing metrics here.'
+              ? 'Point an OpenTelemetry exporter at this service to start seeing metrics here.'
               : 'No metrics match your search. Clear the filter to see them all.'
           }
           action={

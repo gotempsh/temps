@@ -166,7 +166,7 @@ function AddMemberDialog({
           <DialogTitle>Add member</DialogTitle>
           <DialogDescription>
             Their role here is capped by the role this team holds on each
-            project — the narrower of the two applies.
+            service — the narrower of the two applies.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
@@ -278,7 +278,7 @@ function EditTeamDialog({
           <DialogTitle>Edit team</DialogTitle>
           <DialogDescription>
             Changing the name doesn&apos;t affect who can reach what —
-            membership and project grants stay as they are.
+            membership and service grants stay as they are.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
@@ -438,7 +438,7 @@ export function TeamDetail() {
   // project isn't in the caller's own visible list.
   const projectFor = (id: number) =>
     projects?.projects?.find((p) => p.id === id)
-  const projectName = (id: number) => projectFor(id)?.name ?? `Project ${id}`
+  const projectName = (id: number) => projectFor(id)?.name ?? `Service ${id}`
 
   const memberList = members ?? []
   const grantList = grants ?? []
@@ -488,7 +488,7 @@ export function TeamDetail() {
               Members
             </CardTitle>
             <CardDescription>
-              Everyone here reaches every project granted to this team.
+              Everyone here reaches every service granted to this team.
             </CardDescription>
           </div>
           <Button size="sm" onClick={() => setAddOpen(true)}>
@@ -503,7 +503,7 @@ export function TeamDetail() {
             <EmptyState
               icon={Users}
               title="No members"
-              description="Add users to this team so they inherit its project access."
+              description="Add users to this team so they inherit its service access."
               action={
                 <Button onClick={() => setAddOpen(true)}>
                   <Plus className="mr-2 h-4 w-4" />
@@ -559,10 +559,10 @@ export function TeamDetail() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <FolderGit2 className="h-4 w-4" />
-            Projects
+            Services
           </CardTitle>
           <CardDescription>
-            Grants are added from each project&apos;s Access tab.
+            Grants are added from each service&apos;s Access tab.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -571,15 +571,15 @@ export function TeamDetail() {
           ) : grantList.length === 0 ? (
             <EmptyState
               icon={FolderGit2}
-              title="No project access"
-              description="This team can't reach any project yet. Open a project's Access tab to grant it."
+              title="No service access"
+              description="This team can't reach any service yet. Open a service's Access tab to grant it."
             />
           ) : (
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Project</TableHead>
+                    <TableHead>Service</TableHead>
                     <TableHead>Team&apos;s role on it</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -640,7 +640,7 @@ export function TeamDetail() {
             <AlertDialogTitle>Remove member?</AlertDialogTitle>
             <AlertDialogDescription>
               {memberToRemove?.user_name ?? 'This user'} loses access to every
-              project they could only reach through this team. This takes effect
+              service they could only reach through this team. This takes effect
               immediately.
             </AlertDialogDescription>
           </AlertDialogHeader>

@@ -264,9 +264,9 @@ export function PlatformServices() {
         <Info className="h-4 w-4" />
         <AlertTitle>Platform Services</AlertTitle>
         <AlertDescription>
-          These services are shared across all projects. Each project’s data is
-          isolated by namespace. Enable a service to make it available for all
-          projects.
+          Platform services are shared by every deployed service. Each service’s
+          data is isolated by namespace. Enable one to make it available
+          everywhere.
         </AlertDescription>
       </Alert>
 

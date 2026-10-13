@@ -205,7 +205,7 @@ function ProjectCollectionArtifact({
 
   return (
     <GeneratedProjectCollection
-      title={artifact.title ?? 'Projects'}
+      title={artifact.title ?? 'Services'}
       presentation={{
         items: projects,
         total: projects.length,

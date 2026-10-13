@@ -178,7 +178,7 @@ export default function GlobalAnalytics() {
   return (
     <GlobalPage
       title="Analytics"
-      description="Traffic, audience, and engagement across your projects."
+      description="Traffic, audience, and engagement across your services."
       view={view}
       fetching={summary.isFetching || traffic.isFetching || pages.isFetching}
       refresh={() => {
@@ -232,7 +232,7 @@ export default function GlobalAnalytics() {
                 size="compact"
                 icon={BarChart3}
                 title="No analytics data yet"
-                description="Open a project to finish analytics setup and start collecting page views, sessions, and visitors."
+                description="Open a service to finish analytics setup and start collecting page views, sessions, and visitors."
                 action={
                   <Button asChild size="sm">
                     <Link to="/projects">Open projects</Link>

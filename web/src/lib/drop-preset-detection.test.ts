@@ -90,7 +90,7 @@ describe('prepareAndInspectDrop', () => {
         undefined,
         async () => ({ suggestedName: 'empty', candidates: [] })
       )
-    ).rejects.toThrow('No deployable project preset was detected')
+    ).rejects.toThrow('No deployable app preset was detected')
   })
 
   test('cancels before uploading when the user clears the selection', async () => {

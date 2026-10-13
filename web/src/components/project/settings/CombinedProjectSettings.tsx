@@ -76,12 +76,12 @@ export function CombinedProjectSettings({
     case 'general':
       sections = [
         {
-          title: 'Project settings',
+          title: 'Service settings',
           icon: Settings2,
           content: <GeneralSettings project={project} refetch={refetch} />,
         },
         {
-          title: 'Project setup',
+          title: 'Service setup',
           icon: ListChecks,
           content: <ProjectSetup project={project} />,
         },
@@ -254,7 +254,7 @@ function ProjectExtensionLinks({ project }: { project: ProjectResponse }) {
     </div>
   ) : (
     <p className="text-sm text-muted-foreground">
-      Installed project extensions will appear here.
+      Installed service extensions will appear here.
     </p>
   )
 }

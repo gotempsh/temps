@@ -1332,7 +1332,7 @@ function AlertFormBody({
                     <FormDescription>
                       Maps to the notification severity. Alerts are delivered
                       through the notification channels configured for this
-                      project.
+                      service.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

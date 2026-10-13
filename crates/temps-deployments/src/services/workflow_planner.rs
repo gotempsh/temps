@@ -466,6 +466,28 @@ impl WorkflowPlanner {
             explicit_project_vars.len()
         );
 
+        // 1b. Variables inherited from the project's group sit beneath the
+        // project's own values (which win) and above linked-service defaults.
+        let inherited = crate::services::group_env::inherited_group_env_vars(
+            self.db.as_ref(),
+            self.encryption_service.as_ref(),
+            project.id,
+            environment,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load variables inherited from the project group of project {} \
+                 (environment {}): {}",
+                project.id,
+                environment.id,
+                e
+            )
+        })?;
+        for (key, value) in inherited {
+            explicit_project_vars.entry(key).or_insert(value);
+        }
+
         // 2. Get runtime environment variables from external services
         // First, get all services linked to this project
         let project_services_list = project_services::Entity::find()
@@ -1190,6 +1212,18 @@ impl WorkflowPlanner {
             ));
         }
         let docker_socket_authorized = caller.may_deploy_granted_project();
+
+        // Every deploy path (API, push webhook, rollback, redeploy) is
+        // planned here, so this is where a project whose app runs elsewhere
+        // is refused.
+        if let Some(reason) = project.hosting.deploy_refusal(&project.name) {
+            warn!(
+                deployment_id,
+                project_id = project.id,
+                "Refused to plan a deployment for a project hosted outside Temps"
+            );
+            return Err(anyhow::anyhow!("{reason}"));
+        }
 
         info!(
             "Planning workflow for deployment {} (project: {}, env: {})",
@@ -4385,6 +4419,27 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// The `deploy_refusal` guard in `plan_deployment_workflow` fires before
+    /// any DB queries. Verify the `Hosting` type's contract: Hosted always
+    /// returns None (allow), External returns Some with the project name.
+    /// The full workflow path is tested through the handler layer; this unit
+    /// test pins the guard's shape so a refactor cannot silence it.
+    #[test]
+    fn external_hosting_produces_a_deploy_refusal() {
+        use temps_entities::types::Hosting;
+        assert!(
+            Hosting::Hosted.deploy_refusal("my-app").is_none(),
+            "Hosted projects must have no refusal"
+        );
+        let reason = Hosting::External
+            .deploy_refusal("my-app")
+            .expect("External projects must have a refusal reason");
+        assert!(
+            reason.contains("my-app"),
+            "refusal reason must name the project; got: {reason}"
+        );
     }
 
     /// ADR 045: the executor recovers the deploy authority from the job row

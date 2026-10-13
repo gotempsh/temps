@@ -52,7 +52,7 @@ export function ProjectSelect({
   onValueChange,
   allowAll = true,
   excludeIds,
-  placeholder = 'Select project…',
+  placeholder = 'Select service…',
   disabled,
   className,
 }: ProjectSelectProps) {
@@ -120,7 +120,7 @@ export function ProjectSelect({
   const triggerLabel =
     value == null
       ? allowAll
-        ? 'All projects'
+        ? 'All services'
         : placeholder
       : (selected?.name ?? placeholder)
 
@@ -166,7 +166,7 @@ export function ProjectSelect({
               className="mr-1 h-7 w-7 shrink-0"
               onClick={handleRefresh}
               disabled={projectsQuery.isFetching}
-              title="Refresh projects"
+              title="Refresh services"
             >
               <RefreshCw
                 className={cn(
@@ -185,7 +185,7 @@ export function ProjectSelect({
               </div>
             ) : projectsQuery.isError ? (
               <div className="flex flex-col items-center gap-2 p-4 text-center text-sm text-muted-foreground">
-                Failed to load projects
+                Failed to load services
                 <Button
                   type="button"
                   variant="outline"
@@ -197,7 +197,7 @@ export function ProjectSelect({
               </div>
             ) : (
               <>
-                <CommandEmpty>No projects found.</CommandEmpty>
+                <CommandEmpty>No services found.</CommandEmpty>
                 {allowAll && (
                   <CommandGroup>
                     <CommandItem
@@ -213,7 +213,7 @@ export function ProjectSelect({
                           value == null ? 'opacity-100' : 'opacity-0'
                         )}
                       />
-                      <span className="truncate">All projects</span>
+                      <span className="truncate">All services</span>
                     </CommandItem>
                   </CommandGroup>
                 )}

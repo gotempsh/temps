@@ -20,7 +20,7 @@ export default function ProjectAiCrawlers({ project }: ProjectAiCrawlersProps) {
         <h2 className="text-2xl font-bold tracking-tight">AI Crawlers</h2>
         <p className="text-sm text-muted-foreground">
           Requests from AI crawlers (ChatGPT, Claude, Perplexity, and more)
-          fetching this project, newest first.
+          fetching this service, newest first.
         </p>
       </div>
       <AiCrawlerActivityFeed projectId={project.id} />

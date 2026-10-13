@@ -126,7 +126,7 @@ export function EnvironmentDashboard({
                 Static site
               </p>
               <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
-                This project does not have running containers to manage.
+                This service does not have running containers to manage.
               </p>
             </div>
           ) : activeView === 'metrics' ? (

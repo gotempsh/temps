@@ -149,7 +149,7 @@ for (const mode of ['project', 'custom'] as const) {
     await page.getByRole('button', { name: 'Link', exact: true }).click()
     await page
       .getByRole('radio', {
-        name: mode === 'custom' ? /Custom database/ : /Database per project/,
+        name: mode === 'custom' ? /Custom database/ : /Database per service/,
       })
       .click()
     if (mode === 'custom') {
@@ -179,7 +179,7 @@ for (const mode of ['project', 'custom'] as const) {
     })
     await expect(
       page
-        .getByText(mode === 'custom' ? /Custom database/ : /Per project/)
+        .getByText(mode === 'custom' ? /Custom database/ : /Per service/)
         .first()
     ).toBeVisible()
   })

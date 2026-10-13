@@ -69,6 +69,7 @@ pub fn project_model(id: i32) -> projects::Model {
         source_type: temps_entities::source_type::SourceType::Git,
         project_type: temps_entities::types::ProjectType::Server,
         allow_alternate_sources: None,
+        hosting: Default::default(),
         template_slug: None,
         service_template: None,
         gitlab_webhook_id: None,

@@ -463,6 +463,39 @@ impl RouteInfo {
     }
 }
 
+/// A path route (ADR 050) resolved for one source environment: requests to
+/// that environment's hostnames under `prefix` are served by `target`.
+#[derive(Clone, Debug)]
+pub struct PathRoute {
+    /// Normalized prefix: leading slash, no trailing slash, e.g. `/api`.
+    pub prefix: String,
+    /// Forward `/api/users` as `/users`.
+    pub strip_prefix: bool,
+    /// Name of the target service, for the error shown when it cannot serve.
+    pub target_service: String,
+    /// The target environment's route at its current deployment. `None` when
+    /// the target has no matching environment or nothing deployed there: the
+    /// proxy answers with an error rather than letting the source service (or
+    /// another environment) answer in its place.
+    pub target: Option<RouteInfo>,
+    /// When the target environment is sleeping (scale-to-zero), this holds
+    /// its ID so the proxy can wake it on demand before resolving the route.
+    /// Mutually exclusive with `target`: if the environment is awake and has
+    /// a deployment, `target` is `Some` and this is `None`.
+    pub sleeping_environment_id: Option<i32>,
+}
+
+impl PathRoute {
+    /// Path and query the target receives for `path_and_query`.
+    pub fn upstream_path(&self, path_and_query: &str) -> String {
+        temps_entities::project_group_routes::rewrite_path(
+            path_and_query,
+            &self.prefix,
+            self.strip_prefix,
+        )
+    }
+}
+
 /// In-memory routing table with O(1) lookup
 ///
 /// Routes are organized into four categories:
@@ -519,6 +552,8 @@ struct RouteTableSnapshot {
     tls_wildcards: WildcardMatcher,
     legacy: LegacyRouteTable,
     ownership: RouteOwnershipSnapshot,
+    /// Path routes by source environment id, longest prefix first.
+    path_routes: HashMap<i32, Arc<[PathRoute]>>,
 }
 
 impl LegacyRouteTable {
@@ -870,6 +905,18 @@ impl CachedPeerTable {
             snapshot.tls_routes.keys(),
             snapshot.legacy.reserved_console_host.clone(),
         );
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Attach path routes to a source environment for cross-crate tests
+    /// without database setup.
+    #[doc(hidden)]
+    pub fn insert_path_routes_for_test(&self, environment_id: i32, mut routes: Vec<PathRoute>) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        routes.sort_by_key(|route| std::cmp::Reverse(route.prefix.len()));
+        snapshot
+            .path_routes
+            .insert(environment_id, Arc::from(routes));
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
@@ -2245,6 +2292,22 @@ impl CachedPeerTable {
             app_settings.console_hostname(),
         );
 
+        // Load path routes (ADR 050). If the table does not yet exist — e.g.
+        // this proxy process started before the console ran the migration —
+        // log the error and carry forward the previous snapshot's path routes
+        // (empty if none) rather than failing the whole reload. A subsequent
+        // reload after the migration will pick them up.
+        let path_routes = match self.load_path_routes(&routes).await {
+            Ok(pr) => pr,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to load path routes; keeping previous snapshot (will retry on next reload)"
+                );
+                self.route_snapshot.load().path_routes.clone()
+            }
+        };
+
         // Atomically replace all route tables
         let route_count = routes.len();
         let http_routes_count = http_routes_map.len();
@@ -2264,6 +2327,7 @@ impl CachedPeerTable {
                 reserved_console_host: app_settings.console_hostname(),
             },
             ownership: route_ownership,
+            path_routes,
         });
 
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -2388,6 +2452,94 @@ impl CachedPeerTable {
         }
 
         Ok(sleeping_environments)
+    }
+
+    /// The path route (ADR 050) serving `path` on `host`, if any. One
+    /// snapshot load, one hash lookup and a scan of that environment's few
+    /// prefixes; no I/O. Platform paths (`/api/_temps`, ACME, …) never match.
+    pub fn match_path_route(&self, host: &str, path: &str) -> Option<PathRoute> {
+        let snapshot = self.route_snapshot.load();
+        if snapshot.path_routes.is_empty()
+            || temps_entities::project_group_routes::is_reserved_path(path)
+        {
+            return None;
+        }
+        // Service hostnames live in the legacy map. Operator `custom_routes`
+        // point at arbitrary addresses, not at a service, so they have no
+        // environment to carry rules and are deliberately not consulted.
+        // A redirecting hostname (e.g. `www` → apex) redirects every path.
+        let host_route = snapshot.legacy.get(host)?;
+        if host_route.redirect_to.is_some() {
+            return None;
+        }
+        let environment_id = host_route.environment.as_ref()?.id;
+        snapshot
+            .path_routes
+            .get(&environment_id)?
+            .iter()
+            .find(|route| {
+                temps_entities::project_group_routes::path_matches_prefix(path, &route.prefix)
+            })
+            .cloned()
+    }
+
+    /// Resolve every path route against the routes just built: each source
+    /// environment gets its rules, each pointing at the target environment's
+    /// route (same slug, or same branch for previews) at its current
+    /// deployment. Runs once per reload, never per request.
+    async fn load_path_routes(
+        &self,
+        routes: &HashMap<String, RouteInfo>,
+    ) -> Result<HashMap<i32, Arc<[PathRoute]>>, sea_orm::DbErr> {
+        use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
+        use temps_entities::project_group_routes;
+
+        let rules = project_group_routes::Entity::find()
+            .all(self.db.as_ref())
+            .await?;
+        if rules.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let project_ids: HashSet<i32> = rules
+            .iter()
+            .flat_map(|r| [r.source_project_id, r.target_project_id])
+            .collect();
+        // Select only id + name: we don't need the full project row, and the
+        // full fetch can be expensive when there are many projects.
+        #[derive(sea_orm::FromQueryResult)]
+        struct ProjectIdName {
+            id: i32,
+            name: String,
+        }
+        let project_names: HashMap<i32, String> = projects::Entity::find()
+            .filter(projects::Column::Id.is_in(project_ids.iter().copied()))
+            .select_only()
+            .column(projects::Column::Id)
+            .column(projects::Column::Name)
+            .into_model::<ProjectIdName>()
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect();
+        let mut environments_by_project: HashMap<i32, Vec<environments::Model>> = HashMap::new();
+        for env in environments::Entity::find()
+            .filter(environments::Column::ProjectId.is_in(project_ids))
+            .filter(environments::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?
+        {
+            environments_by_project
+                .entry(env.project_id)
+                .or_default()
+                .push(env);
+        }
+        Ok(resolve_path_routes(
+            &rules,
+            &environments_by_project,
+            &project_names,
+            routes,
+        ))
     }
 
     /// Get route information for a host (O(1) lookup)
@@ -2653,6 +2805,104 @@ impl Drop for RouteTableListener {
     }
 }
 
+/// Attach path routes to source environments. The target of each rule is
+/// the route of the target environment's *current* deployment: hostnames of
+/// older deployments stay routable on their own, but a path route always
+/// follows what the environment serves now. A target with no backend at all
+/// is left unresolved so the proxy reports it instead of falling back.
+fn resolve_path_routes(
+    rules: &[temps_entities::project_group_routes::Model],
+    environments_by_project: &HashMap<i32, Vec<environments::Model>>,
+    project_names: &HashMap<i32, String>,
+    routes: &HashMap<String, RouteInfo>,
+) -> HashMap<i32, Arc<[PathRoute]>> {
+    use temps_entities::project_group_routes::target_environment;
+
+    // Build a deterministic map from environment_id to the "best" currently
+    // serving route for that environment. Preference (highest wins):
+    //   1. Non-redirect + project set  (the typical service hostname)
+    //   2. Non-redirect + no project
+    //   3. Redirect route (a `www` → apex alias, used as last resort)
+    // Within the same tier the smallest route host string is chosen so the
+    // result is independent of HashMap iteration order.
+    fn route_tier(r: &RouteInfo) -> u8 {
+        match (r.redirect_to.is_none(), r.project.is_some()) {
+            (true, true) => 0,  // non-redirect with project — best
+            (true, false) => 1, // non-redirect without project
+            _ => 2,             // redirect route
+        }
+    }
+    let mut current_by_environment: HashMap<i32, (&RouteInfo, &str, u8)> = HashMap::new();
+    for (host, route) in routes {
+        let (Some(env), Some(deployment)) = (&route.environment, &route.deployment) else {
+            continue;
+        };
+        let serves = match &route.backend {
+            BackendType::Upstream { backends, .. } => !backends.is_empty(),
+            BackendType::StaticDir { .. } => true,
+        };
+        if serves && env.current_deployment_id == Some(deployment.id) {
+            let tier = route_tier(route);
+            let entry =
+                current_by_environment
+                    .entry(env.id)
+                    .or_insert((route, host.as_str(), tier));
+            // Replace if this candidate is better (lower tier) or, at the
+            // same tier, lexicographically smaller host (deterministic).
+            if tier < entry.2 || (tier == entry.2 && host.as_str() < entry.1) {
+                *entry = (route, host.as_str(), tier);
+            }
+        }
+    }
+    let current_by_environment: HashMap<i32, &RouteInfo> = current_by_environment
+        .into_iter()
+        .map(|(env_id, (route, _, _))| (env_id, route))
+        .collect();
+
+    let none = Vec::new();
+    let mut by_source: HashMap<i32, Vec<PathRoute>> = HashMap::new();
+    for rule in rules {
+        let targets = environments_by_project
+            .get(&rule.target_project_id)
+            .unwrap_or(&none);
+        let target_service = project_names
+            .get(&rule.target_project_id)
+            .cloned()
+            .unwrap_or_else(|| format!("project {}", rule.target_project_id));
+        for source in environments_by_project
+            .get(&rule.source_project_id)
+            .unwrap_or(&none)
+        {
+            let target_env = target_environment(source, targets);
+            let target = target_env
+                .and_then(|env| current_by_environment.get(&env.id))
+                .map(|route| (*route).clone());
+            // When target is None, check whether it is specifically because the
+            // matched environment is sleeping (scale-to-zero). The proxy can
+            // then wake it on demand rather than returning 502 immediately.
+            let sleeping_environment_id = if target.is_none() {
+                target_env.filter(|env| env.sleeping).map(|env| env.id)
+            } else {
+                None
+            };
+            by_source.entry(source.id).or_default().push(PathRoute {
+                prefix: rule.path_prefix.clone(),
+                strip_prefix: rule.strip_prefix,
+                target_service: target_service.clone(),
+                target,
+                sleeping_environment_id,
+            });
+        }
+    }
+    by_source
+        .into_iter()
+        .map(|(environment_id, mut rules)| {
+            rules.sort_by_key(|rule| std::cmp::Reverse(rule.prefix.len()));
+            (environment_id, Arc::from(rules))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2705,6 +2955,327 @@ mod tests {
             }
         }
         handle.join().expect("snapshot writer thread panicked");
+    }
+
+    mod path_routes {
+        use super::*;
+        use temps_entities::project_group_routes;
+
+        fn env(id: i32, project_id: i32, slug: &str, current: Option<i32>) -> environments::Model {
+            let mut env: environments::Model = serde_json::from_value(serde_json::json!({
+                "id": id, "name": slug, "slug": slug, "subdomain": slug,
+                "last_deployment": null, "host": "", "upstreams": [],
+                "created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
+                "project_id": project_id, "current_deployment_id": null, "branch": null,
+                "deleted_at": null, "deployment_config": null, "is_preview": false,
+                "protected": false, "sleeping": false, "attack_mode": null,
+                "force_https": null, "last_activity_at": null
+            }))
+            .expect("environment fixture");
+            env.current_deployment_id = current;
+            env
+        }
+
+        fn deployment(id: i32, project_id: i32, environment_id: i32) -> deployments::Model {
+            deployments::Model {
+                id,
+                project_id,
+                environment_id,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                slug: format!("d{id}"),
+                state: "deployed".to_string(),
+                metadata: None,
+                deploying_at: None,
+                ready_at: None,
+                started_at: None,
+                finished_at: None,
+                context_vars: None,
+                branch_ref: None,
+                tag_ref: None,
+                commit_sha: None,
+                commit_message: None,
+                commit_author: None,
+                commit_json: None,
+                cancelled_reason: None,
+                static_dir_location: None,
+                screenshot_location: None,
+                image_name: None,
+                deployment_config: None,
+                promoted_from_deployment_id: None,
+                upload_request_id: None,
+                docker_socket_mounted: false,
+            }
+        }
+
+        fn route(env: &environments::Model, deployment_id: i32, address: &str) -> RouteInfo {
+            RouteInfo {
+                backend: BackendType::Upstream {
+                    backends: vec![BackendEntry {
+                        address: address.to_string(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: Some(Arc::new(env.clone())),
+                deployment: Some(Arc::new(deployment(deployment_id, env.project_id, env.id))),
+                cert_eligible: true,
+            }
+        }
+
+        fn rule(id: i32, source: i32, target: i32, prefix: &str) -> project_group_routes::Model {
+            project_group_routes::Model {
+                id,
+                group_id: 1,
+                source_project_id: source,
+                target_project_id: target,
+                path_prefix: prefix.to_string(),
+                strip_prefix: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }
+        }
+
+        /// frontend (project 1, env 10) and backend (project 2, env 20 at
+        /// deployment 200, which also has an old deployment 199 still up).
+        fn fixture() -> (
+            HashMap<i32, Vec<environments::Model>>,
+            HashMap<String, RouteInfo>,
+        ) {
+            let frontend = env(10, 1, "production", Some(100));
+            let backend = env(20, 2, "production", Some(200));
+            let mut routes = HashMap::new();
+            routes.insert(
+                "web.example.com".to_string(),
+                route(&frontend, 100, "10.0.0.1:3000"),
+            );
+            routes.insert(
+                "api-old.example.com".to_string(),
+                route(&backend, 199, "10.0.0.9:8080"),
+            );
+            routes.insert(
+                "api.example.com".to_string(),
+                route(&backend, 200, "10.0.0.2:8080"),
+            );
+            let mut envs = HashMap::new();
+            envs.insert(1, vec![frontend]);
+            envs.insert(2, vec![backend]);
+            (envs, routes)
+        }
+
+        fn table_with(
+            routes: HashMap<String, RouteInfo>,
+            path_routes: HashMap<i32, Arc<[PathRoute]>>,
+        ) -> CachedPeerTable {
+            let table = CachedPeerTable::new(Arc::new(sea_orm::DatabaseConnection::Disconnected));
+            let mut snapshot = RouteTableSnapshot::default();
+            snapshot.legacy.exact = routes;
+            snapshot.path_routes = path_routes;
+            table.route_snapshot.store(Arc::new(snapshot));
+            table
+        }
+
+        #[test]
+        fn targets_follow_the_current_deployment() {
+            let (envs, routes) = fixture();
+            let names = HashMap::from([(2, "backend".to_string())]);
+            let resolved = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let path_route = &resolved[&10][0];
+            assert_eq!(path_route.target_service, "backend");
+            let target = path_route.target.as_ref().expect("backend is deployed");
+            assert_eq!(target.get_backend_addr(), "10.0.0.2:8080");
+        }
+
+        #[test]
+        fn undeployed_target_stays_unresolved() {
+            // Nothing deployed: the backend environment has no routes at all.
+            let (mut envs, mut routes) = fixture();
+            envs.insert(2, vec![env(20, 2, "production", None)]);
+            routes.retain(|host, _| host == "web.example.com");
+            let resolved =
+                resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &HashMap::new(), &routes);
+            assert!(resolved[&10][0].target.is_none());
+            assert_eq!(resolved[&10][0].target_service, "project 2");
+            // Not deployed is not asleep: nothing for the proxy to wake.
+            assert_eq!(resolved[&10][0].sleeping_environment_id, None);
+        }
+
+        #[test]
+        fn sleeping_target_is_marked_for_wake_up() {
+            // Scale-to-zero: the backend environment is asleep, so it has no
+            // routes, and the proxy must be told which environment to wake.
+            let (mut envs, mut routes) = fixture();
+            let mut backend = env(20, 2, "production", Some(200));
+            backend.sleeping = true;
+            envs.insert(2, vec![backend]);
+            routes.retain(|host, _| host == "web.example.com");
+            let resolved =
+                resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &HashMap::new(), &routes);
+            assert!(resolved[&10][0].target.is_none());
+            assert_eq!(resolved[&10][0].sleeping_environment_id, Some(20));
+        }
+
+        #[test]
+        fn longest_prefix_wins_and_segments_match_whole() {
+            let (envs, routes) = fixture();
+            let rules = [rule(1, 1, 2, "/api"), rule(2, 1, 2, "/api/v2/admin")];
+            let resolved = resolve_path_routes(&rules, &envs, &HashMap::new(), &routes);
+            let table = table_with(routes, resolved);
+
+            let matched = table.match_path_route("web.example.com", "/api/v2/admin/users");
+            assert_eq!(matched.map(|r| r.prefix), Some("/api/v2/admin".to_string()));
+            let matched = table.match_path_route("web.example.com", "/api/users");
+            assert_eq!(matched.map(|r| r.prefix), Some("/api".to_string()));
+            assert!(table
+                .match_path_route("web.example.com", "/apiary")
+                .is_none());
+            assert!(table.match_path_route("web.example.com", "/").is_none());
+            // Rules belong to the source's hostnames only.
+            assert!(table
+                .match_path_route("api.example.com", "/api/users")
+                .is_none());
+            // Platform paths are never handed to a service.
+            assert!(table
+                .match_path_route("web.example.com", "/api/_temps/event")
+                .is_none());
+        }
+
+        #[test]
+        fn stripping_rewrites_only_the_prefix() {
+            let path_route = PathRoute {
+                prefix: "/api".to_string(),
+                strip_prefix: true,
+                target_service: "backend".to_string(),
+                target: None,
+                sleeping_environment_id: None,
+            };
+            assert_eq!(
+                path_route.upstream_path("/api/users?page=2"),
+                "/users?page=2"
+            );
+            assert_eq!(path_route.upstream_path("/api"), "/");
+        }
+
+        /// Build a RouteInfo with the given redirect/address knobs but
+        /// identical deployment/environment for tier comparison testing.
+        fn route_with_redirect(
+            env_model: &environments::Model,
+            deployment_id: i32,
+            address: &str,
+            redirect_to: Option<&str>,
+        ) -> RouteInfo {
+            RouteInfo {
+                backend: BackendType::Upstream {
+                    backends: vec![BackendEntry {
+                        address: address.to_string(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                },
+                redirect_to: redirect_to.map(str::to_string),
+                status_code: None,
+                project: None,
+                environment: Some(Arc::new(env_model.clone())),
+                deployment: Some(Arc::new(deployment(
+                    deployment_id,
+                    env_model.project_id,
+                    env_model.id,
+                ))),
+                cert_eligible: true,
+            }
+        }
+
+        /// When two routes serve the same environment — one a redirect alias
+        /// (tier 2) and one a non-redirect route (tier 1) — `resolve_path_routes`
+        /// must prefer the non-redirect regardless of HashMap iteration order.
+        #[test]
+        fn prefers_non_redirect_over_redirect_route() {
+            let backend = env(20, 2, "production", Some(200));
+            let frontend = env(10, 1, "production", Some(100));
+
+            let mut routes = HashMap::new();
+            routes.insert(
+                "web.example.com".to_string(),
+                route_with_redirect(&frontend, 100, "10.0.0.1:3000", None),
+            );
+            // Two routes for the backend env: one redirect, one direct.
+            routes.insert(
+                "www.example.com".to_string(),
+                route_with_redirect(
+                    &backend,
+                    200,
+                    "10.0.0.2:8080",
+                    Some("https://api.example.com"),
+                ),
+            );
+            routes.insert(
+                "api.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.2:8080", None),
+            );
+
+            let mut envs = HashMap::new();
+            envs.insert(1, vec![frontend]);
+            envs.insert(2, vec![backend]);
+
+            let names = HashMap::from([(2, "backend".to_string())]);
+            let resolved = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let path_route = &resolved[&10][0];
+            // Must resolve — the non-redirect route wins.
+            let target = path_route.target.as_ref().expect("backend is deployed");
+            assert_eq!(target.get_backend_addr(), "10.0.0.2:8080");
+            assert_eq!(path_route.sleeping_environment_id, None);
+        }
+
+        /// When two non-redirect routes for the same environment are present,
+        /// the lexicographically smaller hostname wins, making the result
+        /// stable across HashMap iteration orders.
+        #[test]
+        fn lex_tie_breaking_produces_stable_result() {
+            let backend = env(20, 2, "production", Some(200));
+            let frontend = env(10, 1, "production", Some(100));
+
+            let mut routes = HashMap::new();
+            routes.insert(
+                "web.example.com".to_string(),
+                route_with_redirect(&frontend, 100, "10.0.0.1:3000", None),
+            );
+            // Two equally-ranked (tier 1) routes; "a-api" < "z-api".
+            routes.insert(
+                "z-api.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.2:8080", None),
+            );
+            routes.insert(
+                "a-api.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.9:9090", None),
+            );
+
+            let mut envs = HashMap::new();
+            envs.insert(1, vec![frontend]);
+            envs.insert(2, vec![backend]);
+
+            let names = HashMap::from([(2, "backend".to_string())]);
+            // Run twice; HashMap iteration order is random across runs.
+            let r1 = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let r2 = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let addr1 = r1[&10][0]
+                .target
+                .as_ref()
+                .map(|t| t.get_backend_addr())
+                .unwrap_or_default();
+            let addr2 = r2[&10][0]
+                .target
+                .as_ref()
+                .map(|t| t.get_backend_addr())
+                .unwrap_or_default();
+            assert_eq!(addr1, addr2, "lex tie-breaking must be stable across runs");
+            // "a-api" < "z-api", so "a-api"'s address wins.
+            assert_eq!(addr1, "10.0.0.9:9090");
+        }
     }
 
     /// Create a no-op queue for tests that don't need queue functionality

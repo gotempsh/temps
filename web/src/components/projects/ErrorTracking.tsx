@@ -1085,7 +1085,7 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
                             </div>
                             <p className="text-xs text-muted-foreground">
                               Use this DSN in your {env?.name?.toLowerCase()}{' '}
-                              environment to send errors to this project
+                              environment to send errors to this service
                             </p>
                           </div>
                         </div>
@@ -1271,7 +1271,7 @@ sentry_sdk.init(
           <DialogHeader>
             <DialogTitle>Create DSN</DialogTitle>
             <DialogDescription>
-              Create a new Data Source Name for error tracking in your project.
+              Create a new Data Source Name for error tracking in your service.
             </DialogDescription>
           </DialogHeader>
 

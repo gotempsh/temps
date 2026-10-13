@@ -160,7 +160,7 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
         <div>
           <h1 className="text-xl font-semibold">Revenue</h1>
           <p className="text-sm text-muted-foreground">
-            Track MRR, ARR, churn, and active customers for this project.
+            Track MRR, ARR, churn, and active customers for this service.
           </p>
         </div>
         {hasIntegrations && (

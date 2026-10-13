@@ -299,7 +299,7 @@ export function GlobalSkillDetail() {
               <Badge variant="outline" className="text-xs">
                 {skill.project_id === null
                   ? 'Global'
-                  : `Project ${skill.project_id}`}
+                  : `Service ${skill.project_id}`}
               </Badge>
             </div>
             <div>
@@ -329,7 +329,7 @@ export function GlobalSkillDetail() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete global skill?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete this skill. All projects that
+              This will permanently delete this skill. All services that
               reference it will lose access.
             </AlertDialogDescription>
           </AlertDialogHeader>

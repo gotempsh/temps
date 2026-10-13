@@ -643,7 +643,7 @@ export function ProxyLogsDataTable({
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span>Scoped to:</span>
           {scopedProjectId !== undefined && (
-            <Badge variant="outline">Project {scopedProjectId}</Badge>
+            <Badge variant="outline">Service {scopedProjectId}</Badge>
           )}
           {scopedEnvironmentId !== undefined && (
             <Badge variant="outline">Environment {scopedEnvironmentId}</Badge>
@@ -943,7 +943,7 @@ export function ProxyLogsDataTable({
                     <SelectItem value="routed">Routed</SelectItem>
                     <SelectItem value="failed">Failed</SelectItem>
                     <SelectItem value="not_found">Not Found</SelectItem>
-                    <SelectItem value="no_project">No Project</SelectItem>
+                    <SelectItem value="no_project">No service</SelectItem>
                     <SelectItem value="error">Error</SelectItem>
                   </SelectContent>
                 </Select>
@@ -1780,7 +1780,7 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
         )}
         <DetailField label="Referrer" value={log.referrer} mono />
 
-        <DetailField label="Project ID" value={log.project_id} />
+        <DetailField label="Service ID" value={log.project_id} />
         <DetailField label="Environment ID" value={log.environment_id} />
         <DetailField label="Deployment ID" value={log.deployment_id} />
         <DetailField label="Container" value={log.container_id} mono />

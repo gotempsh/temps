@@ -95,7 +95,7 @@ export function GlobalSkillsSettings() {
         <div>
           <h2 className="text-lg font-semibold">Global Skills</h2>
           <p className="text-sm text-muted-foreground mt-1">
-            Platform-wide skill definitions available to all projects. Skills
+            Platform-wide skill definitions available to all services. Skills
             are injected as{' '}
             <code className="text-xs bg-muted px-1 rounded">
               .claude/skills/
@@ -143,7 +143,7 @@ export function GlobalSkillsSettings() {
             <FileCode className="h-12 w-12 text-muted-foreground/50 mb-4" />
             <h3 className="text-lg font-semibold mb-2">No global skills</h3>
             <p className="text-sm text-muted-foreground text-center mb-4 max-w-md">
-              Global skills are available to all projects. Define common
+              Global skills are available to all services. Define common
               patterns, coding standards, or reusable instructions here.
             </p>
             <Button onClick={openCreate}>
@@ -172,7 +172,7 @@ export function GlobalSkillsSettings() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete global skill?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete this skill. All projects that
+              This will permanently delete this skill. All services that
               reference it will lose access.
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -412,7 +412,7 @@ function GlobalSkillDialog({
           <DialogDescription>
             {isEdit
               ? 'Update this global skill definition.'
-              : 'Define a new global skill available to all projects.'}
+              : 'Define a new global skill available to all services.'}
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">

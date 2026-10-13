@@ -10,6 +10,7 @@ export const metadata = {
 export const sections = [
   { title: 'Check your current version', id: 'check-your-current-version' },
   { title: 'Check for updates', id: 'check-for-updates' },
+  { title: 'Upgrading to Projects and Services', id: 'upgrading-to-projects-and-services' },
   { title: 'Back up before upgrading', id: 'back-up-before-upgrading' },
   { title: 'Run the upgrade', id: 'run-the-upgrade' },
   { title: 'Restart Temps', id: 'restart-temps' },
@@ -55,6 +56,18 @@ If a newer version exists, you will see:
 ```
 WARN Update: v1.1.0 available - run 'temps upgrade' to update
 ```
+
+---
+
+## Upgrading to Projects and Services {{ anchor: true, id: 'upgrading-to-projects-and-services' }}
+
+Read this before upgrading from a release that did not have Projects (groups of services). The upgrade itself is automatic; these are the changes you will notice.
+
+- **Your apps are now called Services.** Every app you had is a service with the same slug, URLs, domains, deployments, variables and linked databases. Nothing moves and nothing is redeployed. See [Projects and Services](/docs/projects).
+- **Projects are optional and start empty.** A Project groups services that ship together so they share a repository, variables and path routes. The upgrade does not create any; create one when you need it. See [Create a project and add services](/docs/create-a-project-and-add-services).
+- **Additional templates with an unsupported preset are skipped.** If a template in a file passed with `temps serve --templates <file>` (or `TEMPS_ADDITIONAL_TEMPLATES`) uses a build preset this release no longer supports, the server logs a warning naming the template, its preset and the supported presets, and loads the rest instead of refusing to start. After restarting, check the logs for those warnings and fix the listed templates. A file that is missing or is not valid YAML still stops the server with an error.
+- **Template kind `service` is now `app`.** Templates that say `kind: service` keep loading, but the API returns them as `app`. With CLI 0.1.36 or older, `templates list --kind service` returns nothing: upgrade the CLI (`bunx @temps-sdk/cli@latest`) and use `--kind app`.
+- **Service template snapshots move to schema 3.** A service created from a service template (Keycloak, Browserless and others) keeps a copy of that template so it can be upgraded later. This release writes that copy in a new format (schema 3) when it creates or upgrades such a service, and still reads the old one. An older Temps binary cannot read schema 3, so **downgrading after this upgrade is not supported**. Take the backup below before you upgrade.
 
 ---
 

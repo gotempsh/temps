@@ -85,7 +85,7 @@ export function useGettingStarted() {
       key: 'database',
       label: 'Add a database',
       description:
-        'Provision a managed Postgres, Redis, or MongoDB to attach to a project.',
+        'Provision a managed Postgres, Redis, or MongoDB to attach to a service.',
       done: signals.hasDatabase,
       href: '/storage/create',
       cta: 'Add database',
@@ -102,7 +102,7 @@ export function useGettingStarted() {
     {
       key: 'team',
       label: 'Invite your team',
-      description: 'Add teammates so they can manage projects and deployments.',
+      description: 'Add teammates so they can manage services and deployments.',
       done: signals.teamInvited,
       href: '/settings/users',
       cta: 'Invite',

@@ -346,7 +346,7 @@ export function EnvironmentConfigurationCard({
           ? parseInt(formData.websocket_idle_timeout_seconds)
           : null,
         // Same semantics as the timeout overrides above: empty string clears
-        // the override (inherit project/global default, itself unlimited by
+        // the override (inherit service/global default, itself unlimited by
         // default), "0" is a valid, distinct override meaning "explicitly
         // unlimited for this environment."
         max_concurrent_connections: formData.max_concurrent_connections
@@ -370,7 +370,7 @@ export function EnvironmentConfigurationCard({
     <form onSubmit={handleSubmit}>
       <div className="space-y-3">
         {/* Git Configuration Section — only for projects that deploy from
-                Git. A static-files, uploaded-source or Docker-image project has
+                Git. A static-files, uploaded-source or Docker-image service has
                 no branch to deploy from and no repository to push to, so both
                 controls here are inapplicable rather than unconfigured. */}
         {hasGitRepo && (
@@ -549,7 +549,7 @@ export function EnvironmentConfigurationCard({
                   />
                   <p className="text-xs text-muted-foreground mt-1">
                     Maximum memory allocation. Leave empty to inherit the
-                    project/default limit, or set <code>0</code> (
+                    service/default limit, or set <code>0</code> (
                     <strong>Uncapped</strong>) to run with no memory limit.
                   </p>
                 </div>
@@ -666,7 +666,7 @@ export function EnvironmentConfigurationCard({
         <SettingsSection title="Request timeouts" icon={Clock}>
           <p className="text-xs text-muted-foreground mb-4">
             Override the global request timeout defaults for this environment.
-            Leave blank to inherit the project/global default (no timeout,
+            Leave blank to inherit the service/global default (no timeout,
             unless an operator configured one). Enter 0 to explicitly force no
             timeout for this environment. Nonzero values are always clamped
             server-side to the operator&apos;s global hard ceiling.
@@ -730,7 +730,7 @@ export function EnvironmentConfigurationCard({
             upstream. Protects the proxy&apos;s own connection budget from a
             stalled or malicious app — mainly relevant when this environment
             shares a node with other tenants. Leave blank to inherit the
-            project/global default (unlimited, unless an operator configured
+            service/global default (unlimited, unless an operator configured
             one). Enter 0 to explicitly force unlimited for this environment.
             Requests over the limit get an immediate 503 instead of queuing.
           </p>
@@ -949,7 +949,7 @@ export function EnvironmentConfigurationCard({
                 <Label className="text-sm font-medium">Attack Mode</Label>
                 <p className="text-xs text-muted-foreground">
                   Require a CAPTCHA challenge for visitors. Inherit uses the
-                  project default (currently{' '}
+                  service default (currently{' '}
                   {project.attack_mode ? 'on' : 'off'}).
                 </p>
               </div>

@@ -424,16 +424,17 @@ export function ServiceLogs() {
           <div className="rounded-md border border-dashed p-8 text-center">
             <Link2 className="mx-auto h-6 w-6 text-muted-foreground" />
             <p className="mt-3 text-sm font-medium">
-              Link this service to a project to view logs
+              Link this database to a service to view logs
             </p>
             <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
-              Service logs inherit project access controls. Link at least one
-              project before searching or retaining this service&apos;s logs.
+              These logs inherit the access controls of the services linked to
+              this database. Link at least one service before searching or
+              retaining its logs.
             </p>
             <Button asChild variant="outline" size="sm" className="mt-4">
               <Link to={`/storage/${id}`} state={{ openLinkedProjects: true }}>
                 <Link2 className="mr-2 h-4 w-4" />
-                Link a project
+                Link a service
               </Link>
             </Button>
           </div>

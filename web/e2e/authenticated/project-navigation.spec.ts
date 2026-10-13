@@ -13,7 +13,7 @@ test('direct project links and direct flat settings navigation', async ({
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.goto(`${root}/settings`)
   await expect(page).toHaveURL(/settings\/general$/)
-  const primary = page.getByRole('list', { name: 'Project navigation' })
+  const primary = page.getByRole('list', { name: 'Service navigation' })
   await expect(primary.getByRole('link')).toHaveCount(12)
   await expect(primary.getByRole('link')).toHaveText([
     'Overview',

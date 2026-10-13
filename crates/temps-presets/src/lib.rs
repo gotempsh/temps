@@ -464,6 +464,26 @@ mod tests {
         assert_eq!(PackageManager::Bun.base_image(), "oven/bun:1.2");
     }
 
+    /// Templates are validated in temps-core, which cannot depend on this
+    /// crate, against its own copy of the preset slugs. A template using a
+    /// slug project creation rejects would install nothing, and one using a
+    /// slug missing there would be refused for no reason, so both lists must
+    /// be the same.
+    #[test]
+    fn template_validation_accepts_exactly_the_catalog_presets() {
+        let mut catalog: Vec<String> = all_presets().iter().map(|p| p.slug()).collect();
+        catalog.sort();
+        let mut templates: Vec<String> = temps_core::templates::VALID_PRESETS
+            .iter()
+            .map(|slug| slug.to_string())
+            .collect();
+        templates.sort();
+        assert_eq!(
+            templates, catalog,
+            "temps_core::templates::VALID_PRESETS must list the slugs of temps_presets::all_presets()"
+        );
+    }
+
     #[test]
     fn test_get_preset_by_slug() {
         assert!(get_preset_by_slug("nextjs").is_some());

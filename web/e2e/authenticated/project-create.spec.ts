@@ -37,7 +37,7 @@ test.describe('project creation', () => {
     await page.goto('/projects/new')
     await expectAppMounted(page)
     await expect(
-      page.getByRole('heading', { name: 'New Project' })
+      page.getByRole('heading', { name: 'New service', exact: true })
     ).toBeVisible()
 
     // Source-type switcher. These are plain buttons rather than ARIA tabs, so
@@ -52,7 +52,7 @@ test.describe('project creation', () => {
 
     // The backend clones and inspects the repo here; give it room. Reaching the
     // config step at all proves the clone and preset detection succeeded.
-    const nameField = page.getByLabel('Project Name')
+    const nameField = page.getByLabel('Service name')
     await expect(
       nameField,
       'the repo should be cloned and inspected'
@@ -80,7 +80,7 @@ test.describe('project creation', () => {
 
     await nameField.fill(name)
     await page
-      .getByRole('button', { name: 'Create Project', exact: true })
+      .getByRole('button', { name: 'Create service', exact: true })
       .click()
 
     try {

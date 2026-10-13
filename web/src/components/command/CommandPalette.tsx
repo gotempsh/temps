@@ -5,8 +5,10 @@ import {
   getProjectsInfiniteOptions,
   listGlobalMcpsOptions,
   listGlobalSkillsOptions,
+  listProjectGroupsOptions,
   listServicesInfiniteOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { GROUP_PAGE_SIZE } from '@/components/project-groups/useProjectGroups'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import {
   Command,
@@ -42,6 +44,7 @@ import {
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
+import { TERMS, groupHref } from '@/lib/terminology'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   mergeSettingsNavigationGroups,
@@ -254,22 +257,46 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['workspace', 'context', 'persistent'],
   },
   {
-    title: 'Create New Project',
+    title: 'New service',
     url: '/projects/new',
     icon: FolderPlus,
-    keywords: ['new', 'create', 'add', 'project', 'app'],
+    keywords: ['new', 'create', 'add', 'service', 'project', 'app', 'deploy'],
   },
   {
-    title: 'Drop Project Files',
+    // A project is a group of services; /projects opens its create dialog
+    // when `new=project` is present.
+    title: 'New project',
+    url: '/projects?new=project',
+    icon: Boxes,
+    keywords: ['new', 'create', 'add', 'group', 'project', 'services'],
+  },
+  {
+    title: 'Drop files to create a service',
     url: '/projects/new?source=drop',
     icon: Upload,
-    keywords: ['drop', 'upload', 'zip', 'folder', 'deploy', 'no git'],
+    keywords: [
+      'drop',
+      'upload',
+      'zip',
+      'folder',
+      'deploy',
+      'no git',
+      'service',
+    ],
   },
   {
-    title: 'Import Project',
+    title: 'Import a service from another platform',
     url: '/projects/import-wizard',
     icon: Upload,
-    keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
+    keywords: [
+      'import',
+      'migrate',
+      'workload',
+      'platform',
+      'external',
+      'service',
+      'project',
+    ],
   },
   {
     title: 'Server',
@@ -737,10 +764,10 @@ const accountNavItems: NavigationItem[] = [
 // Project-specific navigation items (will be prefixed with project slug)
 const projectNavItems: NavigationItem[] = [
   {
-    title: 'Project Overview',
+    title: 'Service overview',
     url: 'project',
     icon: Home,
-    keywords: ['home', 'overview', 'main'],
+    keywords: ['home', 'overview', 'main', 'service'],
   },
   {
     title: 'Deployments',
@@ -877,10 +904,10 @@ const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Project Settings',
+    title: 'Service settings',
     url: 'settings/general',
     icon: Settings,
-    keywords: ['settings', 'configuration', 'general'],
+    keywords: ['settings', 'configuration', 'general', 'service'],
   },
   {
     title: 'Feature Flags',
@@ -949,13 +976,21 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['webhooks', 'hooks', 'events', 'callbacks', 'integrations'],
   },
   {
-    title: 'Project Skills',
+    title: 'Service skills',
     url: 'settings/skills',
     icon: Wand2,
-    keywords: ['skills', 'ai', 'agents', 'claude', 'instructions', 'project'],
+    keywords: [
+      'skills',
+      'ai',
+      'agents',
+      'claude',
+      'instructions',
+      'service',
+      'project',
+    ],
   },
   {
-    title: 'Project MCP Servers',
+    title: 'Service MCP Servers',
     url: 'settings/mcp-servers',
     icon: Server,
     keywords: [
@@ -965,6 +1000,7 @@ const projectNavItems: NavigationItem[] = [
       'protocol',
       'tools',
       'servers',
+      'service',
       'project',
     ],
   },
@@ -1106,6 +1142,15 @@ export function CommandPalette() {
     [projectResponse]
   )
 
+  // Project groups ("Projects" in the console). Same query options as
+  // useProjectGroups so the cache is shared, but only fetched while the
+  // palette is open, like every other list here.
+  const { data: groupsData, refetch: refetchGroups } = useQuery({
+    ...listProjectGroupsOptions({ query: { page_size: GROUP_PAGE_SIZE } }),
+    enabled: open,
+  })
+  const groups = useMemo(() => groupsData?.groups ?? [], [groupsData])
+
   const { data: globalSkillsData, refetch: refetchSkills } = useQuery({
     ...listGlobalSkillsOptions(),
     enabled: open,
@@ -1194,11 +1239,19 @@ export function CommandPalette() {
   useEffect(() => {
     if (open) {
       refetchProjects()
+      refetchGroups()
       refetchSkills()
       refetchMcp()
       refetchServices()
     }
-  }, [open, refetchProjects, refetchSkills, refetchMcp, refetchServices])
+  }, [
+    open,
+    refetchProjects,
+    refetchGroups,
+    refetchSkills,
+    refetchMcp,
+    refetchServices,
+  ])
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -1267,7 +1320,7 @@ export function CommandPalette() {
         title: entry.label,
         url: entry.path,
         icon: resolvePluginIcon(entry.icon),
-        keywords: ['plugin', 'project', entry.label.toLowerCase()],
+        keywords: ['plugin', 'service', 'project', entry.label.toLowerCase()],
       })),
     [projectNavEntries]
   )
@@ -1322,7 +1375,7 @@ export function CommandPalette() {
         ...item,
         // Prepend project slug to URL for absolute navigation
         url: `/projects/${currentProjectSlug}/${item.url}`,
-        category: 'Project',
+        category: TERMS.service.singular,
       }))
       allNavItems.push(...projectSpecificItems)
     }
@@ -1359,6 +1412,19 @@ export function CommandPalette() {
       minMatchCharLength: 1,
     })
   }, [projects])
+
+  const groupsFuse = useMemo(() => {
+    return new Fuse(groups, {
+      keys: [
+        { name: 'name', weight: 2 },
+        { name: 'slug', weight: 1 },
+      ],
+      threshold: 0.3,
+      includeScore: true,
+      shouldSort: true,
+      minMatchCharLength: 1,
+    })
+  }, [groups])
 
   const skillsFuse = useMemo(() => {
     return new Fuse(globalSkills, {
@@ -1442,12 +1508,14 @@ export function CommandPalette() {
       account: accountNavItems,
       plugins: pluginNavItems,
       projectNav: projectNavigation,
+      groups,
       projects,
       skills: globalSkills,
       mcpServers: globalMcpServers,
       actions: commandActions,
     }
   }, [
+    groups,
     projects,
     globalSkills,
     globalMcpServers,
@@ -1501,8 +1569,8 @@ export function CommandPalette() {
     const projectPages = orderedProjects.flatMap((project) => {
       const category =
         project.id === currentProject?.id
-          ? `Current project · ${project.slug}`
-          : `Project · ${project.slug}`
+          ? `Current service · ${project.slug}`
+          : `${TERMS.service.singular} · ${project.slug}`
       const pages = projectNavItems.map((item) => {
         const url = `/projects/${project.slug}/${item.url}`
         return destination(
@@ -1515,18 +1583,19 @@ export function CommandPalette() {
               ...(item.keywords ?? []),
               project.name,
               project.slug,
+              project.id === currentProject?.id ? 'current service' : '',
               project.id === currentProject?.id ? 'current project' : '',
             ].filter(Boolean),
           },
           category,
-          `Open ${item.title} for project ${project.name} (${project.slug})`
+          `Open ${item.title} for service ${project.name} (${project.slug})`
         )
       })
 
       pages.push({
         id: `project:${project.slug}:environment:production`,
         title: `Production environment · ${project.slug}`,
-        description: `Open the production environment for project ${project.name} (${project.slug})`,
+        description: `Open the production environment for service ${project.name} (${project.slug})`,
         url: `/projects/${project.slug}/environments?environment=production`,
         category,
         keywords: [
@@ -1540,12 +1609,23 @@ export function CommandPalette() {
       return pages
     })
 
+    const groupPages: CommandDestination[] = groups.map((group) => ({
+      id: `group:${group.id}`,
+      title: group.name,
+      description: `Open project ${group.name} (${group.slug})`,
+      url: groupHref(group.slug),
+      category: TERMS.group.singular,
+      keywords: ['project', 'group', 'services', group.name, group.slug],
+    }))
+
     const servicePages: CommandDestination[] = services.map((service) => ({
       id: `service:${service.id}`,
       title: `${service.name} · ${service.service_type}`,
-      description: `Open the ${service.service_type} service named ${service.name}`,
+      description: `Open the ${service.service_type} database named ${service.name}`,
       url: `/storage/${service.id}`,
-      category: 'Service',
+      // Not TERMS.service: these are managed databases/storage, listed under
+      // Databases, and must not read like the deployable services above.
+      category: 'Database',
       keywords: [
         'service',
         'database',
@@ -1574,6 +1654,7 @@ export function CommandPalette() {
 
     return dedupeCommandDestinations([
       ...instancePages,
+      ...groupPages,
       ...projectPages,
       ...servicePages,
       ...skillPages,
@@ -1582,6 +1663,7 @@ export function CommandPalette() {
   }, [
     browseResults,
     currentProject,
+    groups,
     projects,
     services,
     globalSkills,
@@ -1629,7 +1711,7 @@ export function CommandPalette() {
         key: item.url,
         title: item.title,
         subtitle:
-          item.category === 'Project' && currentProject
+          item.category === TERMS.service.singular && currentProject
             ? currentProject.name
             : undefined,
         category: item.category,
@@ -1639,12 +1721,25 @@ export function CommandPalette() {
       })
     }
 
+    for (const result of groupsFuse.search(search)) {
+      const group = result.item
+      out.push({
+        key: `group:${group.id}`,
+        title: group.name,
+        subtitle: group.slug,
+        category: TERMS.group.singular,
+        icon: <Boxes className="h-4 w-4" />,
+        score: rank(`group:${group.id}`, group.name, result.score),
+        run: () => navigate(groupHref(group.slug)),
+      })
+    }
+
     for (const result of projectsFuse.search(search)) {
       const project = result.item
       out.push({
         key: `project:${project.id}`,
         title: project.slug,
-        category: 'Project',
+        category: TERMS.service.singular,
         icon: <ProjectAvatar name={project.name} className="size-5" />,
         score: rank(`project:${project.id}`, project.name, result.score),
         run: () => navigate(`/projects/${project.slug}`),
@@ -1661,7 +1756,7 @@ export function CommandPalette() {
           key: item.url,
           title: item.title,
           subtitle: item.projectName,
-          category: 'Project',
+          category: TERMS.service.singular,
           icon: <Icon className="h-4 w-4" />,
           // Damped: a top-level page named X should beat every project's X.
           score: rank(item.url, item.title, result.score, 0.6),
@@ -1728,6 +1823,7 @@ export function CommandPalette() {
   }, [
     search,
     navFuse,
+    groupsFuse,
     projectsFuse,
     crossProjectFuse,
     skillsFuse,
@@ -1841,13 +1937,24 @@ export function CommandPalette() {
       [...allNavItems, ...projectNavigation],
       canViewAuditLogs
     )
+    const groupsById = new Map(groups.map((g) => [String(g.id), g]))
     const projectsById = new Map(projects.map((p) => [String(p.id), p]))
     const skillsBySlug = new Map(globalSkills.map((s) => [s.slug, s]))
     const mcpBySlug = new Map(globalMcpServers.map((m) => [m.slug, m]))
 
     const out: RecentEntry[] = []
     for (const key of recent(7)) {
-      if (key.startsWith('project:')) {
+      if (key.startsWith('group:')) {
+        const group = groupsById.get(key.slice('group:'.length))
+        if (!group) continue
+        out.push({
+          key,
+          title: group.name,
+          subtitle: group.slug,
+          icon: <Boxes className="h-4 w-4" />,
+          run: () => navigate(groupHref(group.slug)),
+        })
+      } else if (key.startsWith('project:')) {
         const project = projectsById.get(key.slice('project:'.length))
         if (!project) continue
         out.push({
@@ -1909,6 +2016,7 @@ export function CommandPalette() {
     projectPluginNavItems,
     currentProjectSlug,
     currentProject,
+    groups,
     projects,
     globalSkills,
     globalMcpServers,
@@ -1918,9 +2026,35 @@ export function CommandPalette() {
     navigate,
   ])
 
+  const groupResultsGroup = browseResults.groups.length > 0 && (
+    <>
+      <CommandGroup heading={TERMS.group.plural}>
+        {browseResults.groups.map((group) => (
+          <CommandItem
+            key={group.id}
+            value={`group-${group.id}`}
+            onSelect={() =>
+              runWithFrecency(`group:${group.id}`, () =>
+                navigate(groupHref(group.slug))
+              )
+            }
+            className="flex items-center gap-2"
+          >
+            <Boxes className="h-4 w-4" />
+            <span className="truncate">{group.name}</span>
+            <span className="truncate font-mono text-xs text-muted-foreground">
+              {group.slug}
+            </span>
+          </CommandItem>
+        ))}
+      </CommandGroup>
+      <CommandSeparator />
+    </>
+  )
+
   const projectResultsGroup = browseResults.projects.length > 0 && (
     <>
-      <CommandGroup heading="Projects">
+      <CommandGroup heading={TERMS.service.plural}>
         {browseResults.projects.map((project) => (
           <CommandItem
             key={project.id}
@@ -2256,6 +2390,7 @@ export function CommandPalette() {
             )}
 
           {/* Preserve the browse order when the palette opens without a query. */}
+          {showFullBrowseCatalog && !search && groupResultsGroup}
           {showFullBrowseCatalog && !search && projectResultsGroup}
 
           {/* Actions */}

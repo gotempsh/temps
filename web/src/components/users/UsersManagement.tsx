@@ -65,12 +65,12 @@ const availableRoles = [
   {
     value: 'admin',
     label: 'Administrator',
-    description: 'Full control of projects, users, settings, and the system.',
+    description: 'Full control of services, users, settings, and the system.',
   },
   {
     value: 'user',
     label: 'User',
-    description: 'Can deploy and operate every existing and future project.',
+    description: 'Can deploy and operate every existing and future service.',
   },
 ]
 

@@ -221,7 +221,7 @@ export function DNSConfigurationHelper() {
                 <div className="flex items-center justify-between">
                   <div>
                     <div className="text-xs text-muted-foreground mb-1">
-                      Wildcard subdomain (for all projects)
+                      Wildcard subdomain (for all services)
                     </div>
                     <code className="text-sm font-mono">
                       A *.yourdomain.com {targetIP}

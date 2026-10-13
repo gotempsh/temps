@@ -18,6 +18,7 @@ Manage projects
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
 - `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+- `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
 
@@ -119,6 +120,7 @@ Create a new project (git-based or manual deployment)
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
+| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
 ### `projects show` (alias: `get`)
@@ -198,6 +200,17 @@ Show or change how a project is deployed (primary source, and whether it also ac
 | `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
 | `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
 | `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects hosting`
+
+Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects config`

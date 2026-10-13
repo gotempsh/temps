@@ -104,7 +104,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       </div>
 
       <p className="text-sm text-muted-foreground mb-6">
-        Configure domains for your project. Each domain can be assigned to a
+        Configure domains for your service. Each domain can be assigned to a
         specific environment and optionally set up with redirects.
       </p>
 
@@ -198,7 +198,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             <AlertDialogTitle>Are you sure?</AlertDialogTitle>
             <AlertDialogDescription>
               This action cannot be undone. This will permanently delete the
-              domain from your project.
+              domain from your service.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

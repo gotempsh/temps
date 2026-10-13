@@ -426,7 +426,7 @@ function VulnerabilityScanningDisabledAlert({
       <Shield className="h-4 w-4 text-amber-600 dark:text-amber-400" />
       <AlertDescription className="text-amber-700 dark:text-amber-400">
         <div className="font-medium">
-          Vulnerability scanning is disabled for this project
+          Vulnerability scanning is disabled for this service
         </div>
         <p className="text-sm text-muted-foreground mt-1">
           Scan your deployed Docker images for known CVEs, categorized by
@@ -499,7 +499,7 @@ function TriggerScanButton({
         </TooltipTrigger>
         <TooltipContent>
           <p>
-            Vulnerability scanning is disabled for this project.{' '}
+            Vulnerability scanning is disabled for this service.{' '}
             <Link to={settingsHref} className="underline">
               Enable it in Settings
             </Link>

@@ -204,7 +204,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         const filters = page.getByRole('region', {
           name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
         })
-        await filters.getByRole('combobox', { name: 'Project scope' }).click()
+        await filters.getByRole('combobox', { name: 'Service scope' }).click()
         await page.getByRole('option', { name: /Storefront/ }).click()
       }
       await expect(page).toHaveURL(/project_id=1/)
@@ -237,7 +237,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
             .getByRole('region', {
               name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
             })
-            .getByRole('combobox', { name: 'Project scope' })
+            .getByRole('combobox', { name: 'Service scope' })
         ).toContainText('Storefront')
       const reloaded = new URL(page.url()).searchParams
       expect(reloaded.get('range')).toBe('6h')
@@ -263,7 +263,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       ).toBe(true)
       if (kind === 'traces')
         await expect(
-          page.getByRole('link', { name: 'Cross-project waterfall' })
+          page.getByRole('link', { name: 'Cross-service waterfall' })
         ).toHaveAttribute(
           'href',
           new RegExp(`^/traces/global/${traceId}\\?start_time=.+&end_time=.+`)
@@ -699,7 +699,7 @@ test('log key:value autocomplete applies, edits and validates filters', async ({
   await page.goto('/logs')
   const input = page.getByRole('combobox', { name: 'Search log messages' })
   await expect(
-    page.getByRole('combobox', { name: 'Project scope' })
+    page.getByRole('combobox', { name: 'Service scope' })
   ).toHaveCount(0)
   await expect(page.getByRole('combobox', { name: 'Log level' })).toHaveCount(0)
   await input.fill('lev')

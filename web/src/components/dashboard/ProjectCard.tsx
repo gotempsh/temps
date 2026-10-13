@@ -56,6 +56,11 @@ interface ProjectCardProps {
   }
   latestDeploymentMediaLoading?: boolean
   latestDeploymentMediaError?: boolean
+  /**
+   * The service's public address, shown under its name in the dense layout.
+   * Text only: the card is itself a link to the service's page.
+   */
+  domain?: string | null
 }
 
 const HEALTH_TONE_STYLES: Record<
@@ -127,17 +132,32 @@ function MetadataCell({
   )
 }
 
+/** The app runs outside Temps; Temps only receives its telemetry. */
+export function ExternalBadge() {
+  return (
+    <Badge
+      variant="outline"
+      className="h-4 shrink-0 px-1.5 text-[10px] font-medium text-muted-foreground"
+      title="Runs outside Temps. Temps receives its analytics, errors and traces but never deploys it."
+    >
+      External
+    </Badge>
+  )
+}
+
 function ProjectIdentitySubtitle({ project }: { project: ProjectResponse }) {
   const isServiceTemplate = project.project_type === 'service'
+  const isExternal = project.hosting === 'external'
   const showSlug = project.slug !== project.name
 
-  if (!showSlug && !isServiceTemplate) return null
+  if (!showSlug && !isServiceTemplate && !isExternal) return null
 
   return (
     <div className="flex min-w-0 items-center gap-2">
       {showSlug && (
         <p className="truncate text-xs text-muted-foreground">{project.slug}</p>
       )}
+      {isExternal && <ExternalBadge />}
       {isServiceTemplate && (
         <Badge
           variant="outline"
@@ -168,9 +188,14 @@ export function ProjectCard({
   latestDeploymentMedia,
   latestDeploymentMediaLoading = false,
   latestDeploymentMediaError = false,
+  domain,
 }: ProjectCardProps) {
   const repository = projectRepository(project)
   const buildSource = projectBuildSource(project)
+  // Temps never deploys an app that runs elsewhere, so "Not deployed" would
+  // read as something to fix.
+  const notDeployed =
+    project.hosting === 'external' ? 'Runs outside Temps' : 'Not deployed'
   const totalVisitors = analytics?.unique_visitors ?? 0
   const apiRequests = health?.total_requests ?? 0
   const healthIndicator = projectHealthIndicator({
@@ -248,7 +273,7 @@ export function ProjectCard({
     return (
       <Link
         to={`/projects/${project.slug}`}
-        className="group flex min-h-44 flex-col rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="group flex min-h-44 flex-col rounded-xl border bg-card p-4 transition-colors hover:border-foreground/20 hover:bg-accent/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex min-w-0 items-start justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-3">
@@ -306,7 +331,9 @@ export function ProjectCard({
                 <TimeAgo date={project.last_deployment} />
               </p>
             ) : (
-              <p className="mt-1 text-xs text-muted-foreground">Not deployed</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {notDeployed}
+              </p>
             )}
           </div>
           {project.last_deployment && deploymentBadge}
@@ -337,6 +364,14 @@ export function ProjectCard({
               <ProjectHealth indicator={healthIndicator} />
             </div>
             <ProjectIdentitySubtitle project={project} />
+            {domain && (
+              <p
+                className="truncate font-mono text-xs text-muted-foreground"
+                title={domain}
+              >
+                {domain}
+              </p>
+            )}
           </div>
         </div>
         <div className="flex min-w-0 items-center gap-2 text-sm">
@@ -359,7 +394,7 @@ export function ProjectCard({
               </span>
             </div>
           ) : (
-            <span className="text-muted-foreground">Not deployed</span>
+            <span className="text-muted-foreground">{notDeployed}</span>
           )}
         </div>
       </Link>
@@ -448,7 +483,7 @@ export function ProjectCard({
             </p>
           </div>
         ) : (
-          <span className="text-sm text-muted-foreground">Not deployed</span>
+          <span className="text-sm text-muted-foreground">{notDeployed}</span>
         )}
       </MetadataCell>
     </Link>

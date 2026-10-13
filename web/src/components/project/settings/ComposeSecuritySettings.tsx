@@ -188,15 +188,15 @@ export function ComposeSecuritySettings({
           role="note"
           className="px-4 pb-4 text-sm text-amber-700 dark:text-amber-400"
         >
-          This project has legacy “Disable sandbox” settings. They no longer
+          This service has legacy “Disable sandbox” settings. They no longer
           apply to new deployments. Review and acknowledge the individual
           exceptions you need here before redeploying.
         </p>
       )}
       <CollapsibleContent className="space-y-4 border-t p-4">
         <p className="text-sm text-muted-foreground">
-          Checks are enabled by default. Exceptions apply to this project on its
-          next deployment and may expose the host or other projects. Docker
+          Checks are enabled by default. Exceptions apply to this service on its
+          next deployment and may expose the host or other services. Docker
           configuration validity and protection of Temps-generated files always
           remain enforced. Ordinary named volumes need no exception. These
           settings replace the former per-service “Disable sandbox” option;
@@ -240,7 +240,7 @@ export function ComposeSecuritySettings({
                     }
                     disabled={mutation.isPending}
                   />
-                  I have reviewed the exceptions this project needs for its next
+                  I have reviewed the exceptions this service needs for its next
                   deployment.
                 </label>
                 <Button
@@ -369,7 +369,7 @@ export function ComposeSecuritySettings({
             <AlertDialogTitle>Disable this security check?</AlertDialogTitle>
             <AlertDialogDescription>
               {pending?.label}: {pending?.consequence} This applies to every
-              service in this project on the next deployment. Other checks
+              Compose service in this stack on the next deployment. Other checks
               remain enforced.
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -382,7 +382,7 @@ export function ComposeSecuritySettings({
             />
             <label htmlFor="acknowledge-compose-security" className="text-sm">
               I trust this stack and understand that this exception can affect
-              the host and other projects.
+              the host and other services.
             </label>
           </div>
           <AlertDialogFooter>

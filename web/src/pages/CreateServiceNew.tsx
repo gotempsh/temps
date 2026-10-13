@@ -594,12 +594,12 @@ export function CreateService() {
             <Link2 className="size-4" />
             <AlertTitle>
               Create and link to{' '}
-              {projectQuery.data?.name ?? `project ${projectId}`}
+              {projectQuery.data?.name ?? `service ${projectId}`}
             </AlertTitle>
             <AlertDescription>
-              Temps will create the service, provision this project&apos;s
-              database and runtime variables, and update its application sandbox
-              network as one operation.
+              Temps will create it, provision this service&apos;s database and
+              runtime variables, and update its application sandbox network as
+              one operation.
             </AlertDescription>
           </Alert>
         )}

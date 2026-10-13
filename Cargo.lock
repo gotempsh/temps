@@ -10740,6 +10740,7 @@ dependencies = [
  "temps-observability",
  "temps-otel",
  "temps-plugin-sdk",
+ "temps-project-groups",
  "temps-projects",
  "temps-providers",
  "temps-proxy",
@@ -12376,6 +12377,34 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "temps-project-groups"
+version = "0.1.0-beta.56"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bollard",
+ "chrono",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-environments",
+ "temps-git",
+ "temps-projects",
+ "temps-providers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]

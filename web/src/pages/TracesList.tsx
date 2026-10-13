@@ -470,7 +470,7 @@ OTEL_SERVICE_NAME=${project.name}`
     <div id="traces-setup">
       <SetupWizardShell
         title="Setup OpenTelemetry"
-        description="Pick your framework — the snippet and endpoint are pre-filled for this project. Apps deployed on Temps get these env vars automatically."
+        description="Pick your framework — the snippet and endpoint are pre-filled for this service. Apps deployed on Temps get these env vars automatically."
         currentStep={wizardStep}
         steps={steps}
         celebrate={celebrate}

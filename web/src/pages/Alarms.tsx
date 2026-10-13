@@ -180,7 +180,7 @@ function scopeLabel(alarm: AlarmResponse): string {
   if (alarm.deployment_id != null) parts.push(`deploy #${alarm.deployment_id}`)
   if (alarm.service_id != null) parts.push(`service #${alarm.service_id}`)
   if (alarm.container_id != null) parts.push(`container #${alarm.container_id}`)
-  return parts.length > 0 ? parts.join(' · ') : 'project-wide'
+  return parts.length > 0 ? parts.join(' · ') : 'service-wide'
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────
@@ -477,7 +477,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           disabled={projectsLoading || projects.length === 0 || bulk.isPending}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
-            <SelectValue placeholder="Select a project…" />
+            <SelectValue placeholder="Select a service…" />
           </SelectTrigger>
           <SelectContent>
             {projects.map((p) => (
@@ -676,8 +676,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     <EmptyState
                       size="compact"
                       icon={AlarmClock}
-                      title="No project selected"
-                      description="Select a project to view its alarm history."
+                      title="No service selected"
+                      description="Select a service to view its alarm history."
                     />
                   </TableCell>
                 </TableRow>
@@ -717,7 +717,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       description={
                         hasFilters
                           ? 'Try adjusting your filters to see more results.'
-                          : 'Nothing has fired for this project yet.'
+                          : 'Nothing has fired for this service yet.'
                       }
                     />
                   </TableCell>
@@ -914,8 +914,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmAction === 'acknowledge'
-                ? 'Every firing alarm in this project that matches the current filters — including ones on other pages — will be marked acknowledged.'
-                : 'Every firing or acknowledged alarm in this project that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
+                ? 'Every firing alarm in this service that matches the current filters — including ones on other pages — will be marked acknowledged.'
+                : 'Every firing or acknowledged alarm in this service that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

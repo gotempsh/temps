@@ -586,7 +586,7 @@ function CrossProjectBar({
               : 'hover:bg-blue-100 dark:hover:bg-blue-900/50'
           )}
         >
-          This project
+          This service
         </button>
         <button
           type="button"
@@ -731,7 +731,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
             projectId={span.project_id}
             name={
               projectById.get(span.project_id)?.project_name ??
-              `Project ${span.project_id}`
+              `Service ${span.project_id}`
             }
           />
         )
@@ -776,7 +776,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     const rootName = tree[0]?.span?.name ?? '(root span)'
     return [
       'The user is viewing a distributed trace (OpenTelemetry) in the Temps console.',
-      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
       `Trace id: ${traceId}.`,
       `Root span: ${rootName}. Duration: ${formatDuration(traceDuration)}. ${spans.length} span(s) across service(s): ${services.join(', ') || 'unknown'}. Status: ${hasError ? 'ERROR' : 'OK'}.`,
       'If they say "this trace"/"this span"/"these logs", they mean this one. You can pull details with the temps CLI: `traces get_trace --trace_id <id>` and `telemetry-logs query_logs --trace_id <id>`.',

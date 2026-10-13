@@ -91,10 +91,16 @@ export function ServiceTemplateRuntimeCard({
     },
   })
 
-  const appliedTemplate = instanceQuery.data?.applied.template
+  // The service of the applied release this project is; snapshots from
+  // before templates had several services name none and have one.
+  const applied = instanceQuery.data?.applied
+  const appliedService = applied
+    ? (applied.template.services.find((s) => s.name === applied.service) ??
+      applied.template.services[0])
+    : undefined
   const runtimeDefaults = useMemo(
-    () => serviceTemplateRuntimeDefaults(project, appliedTemplate ?? {}),
-    [project, appliedTemplate]
+    () => serviceTemplateRuntimeDefaults(project, appliedService ?? {}),
+    [project, appliedService]
   )
   const runtimeDefaultsKey = JSON.stringify(runtimeDefaults)
   const appliedDefaultsKey = useRef<string | null>(null)
@@ -192,7 +198,7 @@ export function ServiceTemplateRuntimeCard({
               Service template details unavailable
             </CardTitle>
             <CardDescription>
-              Temps could not read this project&apos;s saved template release.
+              Temps could not read this service&apos;s saved template release.
               Its current runtime is still editable, but upgrades and resetting
               to template defaults are disabled until this is resolved.
             </CardDescription>
@@ -222,7 +228,7 @@ export function ServiceTemplateRuntimeCard({
                 {template ? (
                   <TemplateImage
                     imageUrl={template.image_url}
-                    preset={template.preset}
+                    preset={appliedService?.preset ?? project.preset ?? ''}
                     alt={template.name}
                     className="size-11 shrink-0 border"
                     imgClassName="size-9"
@@ -245,7 +251,7 @@ export function ServiceTemplateRuntimeCard({
                     )}
                   </CardTitle>
                   <CardDescription>
-                    This project was created from the {templateName} template.
+                    This service was created from the {templateName} template.
                     Changes below become the source of truth for future deploys.
                   </CardDescription>
                 </div>
@@ -257,7 +263,7 @@ export function ServiceTemplateRuntimeCard({
                   size="sm"
                   disabled={isPending}
                   onClick={() =>
-                    form.reset(templateRuntimeDefaults(template), {
+                    form.reset(templateRuntimeDefaults(appliedService ?? {}), {
                       keepDefaultValues: true,
                     })
                   }
@@ -285,7 +291,7 @@ export function ServiceTemplateRuntimeCard({
               {!template && !instanceQuery.isPending && (
                 <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-muted-foreground">
                   The saved template definition is currently unavailable. You
-                  can still edit and save this project&apos;s stored runtime;
+                  can still edit and save this service&apos;s stored runtime;
                   only resetting to template defaults is unavailable.
                 </div>
               )}
@@ -594,7 +600,7 @@ function ServiceTemplateUpgradeCard({
             <div className="flex-1">
               <p className="font-medium">Link the required managed service</p>
               <p className="mt-1 text-muted-foreground">
-                Add {instance.missing_services.join(', ')} to this project
+                Add {instance.missing_services.join(', ')} to this service
                 before applying the update. Existing service links are never
                 removed automatically.
               </p>

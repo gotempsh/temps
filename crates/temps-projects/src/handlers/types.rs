@@ -252,6 +252,11 @@ pub struct CreateProjectRequest {
     /// For `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional.
     #[serde(default)]
     pub source_type: SourceType,
+    /// `external` for an app that runs elsewhere and only sends Temps its
+    /// telemetry. Temps never deploys an external project. Defaults to
+    /// `hosted`.
+    #[serde(default)]
+    pub hosting: temps_entities::types::Hosting,
 }
 
 /// Change a project's source type to a Git-less type (docker_image /
@@ -260,6 +265,15 @@ pub struct CreateProjectRequest {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ChangeProjectSourceRequest {
     pub source_type: SourceType,
+}
+
+/// Whether Temps runs a project's app or only observes an app running
+/// elsewhere.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SetProjectHostingRequest {
+    /// `external` stops Temps from deploying the project (deployments already
+    /// running keep running until stopped); `hosted` lets it deploy again.
+    pub hosting: temps_entities::types::Hosting,
 }
 
 /// Opt a project in or out of accepting deployments from a source other than
@@ -313,6 +327,12 @@ pub struct PaginationParams {
     pub per_page: Option<i64>,
     /// Optional case-insensitive project name or slug filter.
     pub search: Option<String>,
+    /// When `true`, return only services that are not a member of any project
+    /// group. Mutually exclusive with `project_group_id`.
+    pub ungrouped: Option<bool>,
+    /// Return only services that are members of this project group.
+    /// Mutually exclusive with `ungrouped`.
+    pub project_group_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -410,6 +430,10 @@ pub struct ProjectResponse {
     /// every project accepts) may be deployed.
     #[schema(example = false)]
     pub allow_alternate_sources: Option<bool>,
+    /// `hosted`: Temps builds and runs the app. `external`: the app runs
+    /// elsewhere (Vercel, Netlify, a VPS) and only sends Temps its analytics,
+    /// errors and traces; Temps never deploys it.
+    pub hosting: temps_entities::types::Hosting,
     /// GitLab webhook ID installed on the connected repository.
     /// `null` when no GitLab webhook is installed (not connected to GitLab,
     /// or webhook was removed / never created).
@@ -489,6 +513,7 @@ impl ProjectResponse {
             preview_envs_wake_timeout_seconds: project.preview_envs_wake_timeout_seconds,
             source_type: project.source_type,
             allow_alternate_sources: project.allow_alternate_sources,
+            hosting: project.hosting,
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             image_retention_hours: project.image_retention_hours,

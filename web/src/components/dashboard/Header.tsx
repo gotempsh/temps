@@ -1,15 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  getLastDeploymentOptions,
-  getProjectsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { DropButton } from '@/components/dashboard/DropButton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { featureKeyForPath } from '@/lib/feature-maturity'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
@@ -37,41 +34,6 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import { Separator } from '../ui/separator'
 import { SidebarTrigger } from '../ui/sidebar'
-
-function ProjectRowIcon({
-  projectId,
-  name,
-}: {
-  projectId: number
-  name: string
-}) {
-  const { data: lastDeployment } = useQuery({
-    ...getLastDeploymentOptions({ path: { id: projectId } }),
-    enabled: !!projectId,
-  })
-  const screenshot = lastDeployment?.screenshot_location
-  if (screenshot) {
-    const src = `/api/files${
-      screenshot.startsWith('/') ? screenshot : '/' + screenshot
-    }`
-    return (
-      <div className="size-5 shrink-0 overflow-hidden rounded-sm border bg-muted/30">
-        <img
-          src={src}
-          alt={`${name} preview`}
-          className="h-full w-full object-cover object-top"
-        />
-      </div>
-    )
-  }
-  return (
-    <ProjectAvatar
-      name={name}
-      className="size-5 rounded-sm"
-      fallbackClassName="rounded-sm bg-muted text-[10px] text-muted-foreground"
-    />
-  )
-}
 
 function ProjectSwitcher({
   currentSlug,
@@ -101,7 +63,7 @@ function ProjectSwitcher({
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label="Switch project"
+          aria-label="Switch service"
           className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-sm font-normal text-foreground transition-colors hover:bg-accent"
         >
           <span className="max-w-[120px] truncate sm:max-w-[200px] lg:max-w-[280px]">
@@ -117,9 +79,9 @@ function ProjectSwitcher({
         sideOffset={6}
       >
         <Command>
-          <CommandInput placeholder="Find Project…" />
+          <CommandInput placeholder="Find service…" />
           <CommandList>
-            <CommandEmpty>No projects found.</CommandEmpty>
+            <CommandEmpty>No services found.</CommandEmpty>
             <CommandGroup>
               {projects.map((p) => {
                 const isCurrent = p.slug === currentSlug
@@ -134,7 +96,7 @@ function ProjectSwitcher({
                       }
                     }}
                   >
-                    <ProjectRowIcon projectId={p.id} name={p.name} />
+                    <ServiceIcon service={p} size="xs" />
                     <span className="flex-1 truncate">{p.name}</span>
                     {isCurrent && (
                       <Check className="size-4 text-muted-foreground" />
@@ -152,7 +114,7 @@ function ProjectSwitcher({
                 }}
               >
                 <Plus className="size-4" />
-                <span>Create Project</span>
+                <span>New service</span>
               </CommandItem>
             </CommandGroup>
           </CommandList>

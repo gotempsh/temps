@@ -506,7 +506,7 @@ export function CloudSettingsPage() {
                 <p>
                   Disconnecting disables Cloud exports, removes managed backup
                   schedules, and revokes Cloud console access and its sessions.
-                  It removes the saved Cloud credential. Local projects and
+                  It removes the saved Cloud credential. Local services and
                   deployments remain available. After reconnecting, review your
                   Cloud exports and backup schedule.
                 </p>

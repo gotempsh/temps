@@ -158,12 +158,12 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by destination',
     description:
-      'Per-interval request count, split by destination: project routes, console fallback, or handled by the proxy itself',
+      'Per-interval request count, split by destination: service routes, console fallback, or handled by the proxy itself',
     series: [
       {
         metric: 'proxy.requests_project',
         dataKey: 'proxy.requests_project',
-        label: 'Project',
+        label: 'Service',
         color: '#2563eb',
       },
       {
@@ -824,7 +824,7 @@ function NodeSummaryStats({ window }: { window: ResolvedProxyWindow }) {
     hasRequests && destsReady && totalRequests > 0
       ? (() => {
           const pct = (n: number) => Math.round((n / totalRequests) * 100)
-          return `${pct(sumSeries(destProject))}% project · ${pct(sumSeries(destConsole))}% console · ${pct(sumSeries(destOther))}% other`
+          return `${pct(sumSeries(destProject))}% service · ${pct(sumSeries(destConsole))}% console · ${pct(sumSeries(destOther))}% other`
         })()
       : null
 
@@ -1005,7 +1005,7 @@ const TRAFFIC_COLUMNS: {
   numeric: boolean
   secondary: boolean
 }[] = [
-  { key: 'project_name', label: 'Project', numeric: false, secondary: false },
+  { key: 'project_name', label: 'Service', numeric: false, secondary: false },
   { key: 'total_requests', label: 'Requests', numeric: true, secondary: false },
   { key: 'total_errors', label: 'Errors', numeric: true, secondary: true },
   { key: 'error_rate', label: 'Error rate', numeric: true, secondary: false },
@@ -1162,9 +1162,9 @@ function TrafficByProject({
   return (
     <Card ref={containerRef}>
       <CardHeader className="pb-2">
-        <CardTitle className="text-base">Traffic by project</CardTitle>
+        <CardTitle className="text-base">Traffic by service</CardTitle>
         <CardDescription>
-          Requests per project from proxy logs over the selected window
+          Requests per service from proxy logs over the selected window
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -1176,11 +1176,11 @@ function TrafficByProject({
           </div>
         ) : hasError ? (
           <div className="py-8 text-center text-sm text-rose-500">
-            Failed to load project traffic
+            Failed to load service traffic
           </div>
         ) : sorted.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
-            No projects yet
+            No services yet
           </div>
         ) : (
           <>
@@ -1327,7 +1327,7 @@ export default function ProxyMetrics() {
         {tooWide ? (
           <p className="rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
             Custom range exceeds the {maxDays}-day maximum
-            {isFiltered ? ' for a project' : ''}. Narrow the window, or request
+            {isFiltered ? ' for a service' : ''}. Narrow the window, or request
             older data {maxDays} days at a time.
           </p>
         ) : isFiltered ? (

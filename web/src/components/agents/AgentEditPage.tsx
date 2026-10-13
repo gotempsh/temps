@@ -607,7 +607,7 @@ function AgentEditForm({
         <div>
           <h2 className="text-base font-semibold">Skills</h2>
           <p className="text-muted-foreground mt-1 text-sm">
-            Project- and platform-level skills available to this workflow.
+            Service- and platform-level skills available to this workflow.
             Injected as{' '}
             <code className="bg-muted rounded px-1">.claude/skills/</code> files
             in the sandbox.
@@ -649,7 +649,7 @@ function AgentEditForm({
           <div className="rounded-md border border-dashed p-6 text-center">
             <p className="text-muted-foreground text-sm">No skills defined.</p>
             <p className="text-muted-foreground mt-1 text-xs">
-              Create skills in project or platform settings.
+              Create skills in service or platform settings.
             </p>
           </div>
         )}
@@ -705,7 +705,7 @@ function AgentEditForm({
               No MCP servers defined.
             </p>
             <p className="text-muted-foreground mt-1 text-xs">
-              Create MCP servers in project or platform settings.
+              Create MCP servers in service or platform settings.
             </p>
           </div>
         )}

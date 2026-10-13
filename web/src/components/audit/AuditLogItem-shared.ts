@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { AuditLogIpInfo, AuditLogUserInfo } from '@/api/client'
+import { TERMS } from '@/lib/terminology'
 import {
   Bell,
   Box,
+  Boxes,
   ChartLine,
   Database,
   FileCode,
@@ -41,6 +43,7 @@ export type Category =
   | 'auth'
   | 'user'
   | 'mfa'
+  | 'group'
   | 'project'
   | 'deployment'
   | 'container'
@@ -94,6 +97,13 @@ export function categorize(op: string): Category {
     return 'deployment'
   if (op === 'CONTAINER_ACTION') return 'container'
   if (op.startsWith('WORKSPACE_')) return 'workspace'
+  // Project groups are the console's "Projects"; checked before the broader
+  // PROJECT_ prefix, which covers single services.
+  if (
+    op.startsWith('PROJECT_GROUP_') ||
+    op.startsWith('TEMPLATE_INSTANTIATION_')
+  )
+    return 'group'
   if (
     op.startsWith('PROJECT_') ||
     op.startsWith('ENVIRONMENT_') ||
@@ -155,13 +165,18 @@ export const CATEGORY_META: Record<
     icon: Shield,
     tone: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
   },
+  group: {
+    label: TERMS.group.singular,
+    icon: Boxes,
+    tone: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
+  },
   project: {
-    label: 'Project',
+    label: TERMS.service.singular,
     icon: FolderKanban,
     tone: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400',
   },
   service: {
-    label: 'Service',
+    label: 'External service',
     icon: Plug,
     tone: 'bg-cyan-500/10 text-cyan-600 dark:text-cyan-400',
   },

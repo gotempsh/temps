@@ -120,7 +120,7 @@ export function RetainedFailedContainers({
         </div>
         <p className="mb-4 text-xs text-muted-foreground">
           These containers are not receiving public traffic. Inspect their live
-          logs before redeploying; the next successful deployment or project
+          logs before redeploying; the next successful deployment or service
           deletion removes them automatically.
         </p>
 

@@ -62,6 +62,7 @@ import {
   RefreshCw,
   Upload,
   UploadCloud,
+  Globe,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 
@@ -371,7 +372,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           : serviceTemplateDeployOverrides(project)
         const ref = editedImageRef?.trim() || resolveImageRef()
         if (!ref) {
-          toast.error('No image reference found for this project')
+          toast.error('No image reference found for this service')
           return
         }
         await redeployImage.mutateAsync({
@@ -773,6 +774,31 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           ))}
         </div>
       </Card>
+    )
+  }
+
+  if (!deploymentsData?.deployments.length && project.hosting === 'external') {
+    return (
+      <EmptyPlaceholder
+        className="border-2 border-dashed"
+        icon={Globe}
+        title="Runs outside Temps"
+        description="This app is hosted elsewhere, so Temps does not deploy it. Its analytics, errors and traces arrive through an ingest key."
+        action={
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button asChild>
+              <Link to={`/projects/${project.slug}/analytics`}>
+                Set up analytics
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to={`/projects/${project.slug}/settings/delivery`}>
+                Let Temps host it
+              </Link>
+            </Button>
+          </div>
+        }
+      />
     )
   }
 

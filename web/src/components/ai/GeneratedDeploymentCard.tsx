@@ -176,7 +176,7 @@ export function GeneratedDeploymentCard({
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h3 className="truncate text-base font-semibold sm:text-sm">
-              {deployment ? `Deployment #${deployment.id}` : 'Deploy project'}
+              {deployment ? `Deployment #${deployment.id}` : 'Deploy service'}
             </h3>
             {isLive && (
               <span className="ai-activity-shimmer bg-gradient-to-r from-muted-foreground via-foreground to-muted-foreground bg-[length:200%_100%] bg-clip-text text-[11px] font-medium text-transparent">
@@ -259,7 +259,7 @@ export function GeneratedDeploymentCard({
 
       {actionStatus === 'executed' && !reference && (
         <p className="border-t px-3 py-2.5 text-xs text-muted-foreground sm:px-4">
-          The trigger completed, but its response did not include a project id,
+          The trigger completed, but its response did not include a service id,
           so live deployment progress is unavailable.
         </p>
       )}

@@ -587,7 +587,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             </div>
             <div className="space-y-2">
               <p className="text-sm font-medium text-muted-foreground">
-                Project ID
+                Service ID
               </p>
               <p className="text-sm">{monitor.project_id}</p>
             </div>

@@ -61,7 +61,7 @@ function utf8ByteLength(value: string): number {
 }
 
 export const createTemplateRuntimeDefaultsSchema = (
-  kind: 'starter' | 'service'
+  kind: 'starter' | 'app'
 ) =>
   z
     .object({
@@ -75,7 +75,7 @@ export const createTemplateRuntimeDefaultsSchema = (
         )
         .refine(
           (value) =>
-            kind !== 'service' || /^.+@sha256:[0-9a-fA-F]{64}$/.test(value),
+            kind !== 'app' || /^.+@sha256:[0-9a-fA-F]{64}$/.test(value),
           'Image reference must use an immutable SHA-256 digest'
         )
         .refine(
@@ -172,7 +172,7 @@ export const createTemplateRuntimeDefaultsSchema = (
     })
 
 export const templateRuntimeDefaultsSchema =
-  createTemplateRuntimeDefaultsSchema('service')
+  createTemplateRuntimeDefaultsSchema('app')
 
 export type TemplateRuntimeDefaults = z.infer<
   typeof templateRuntimeDefaultsSchema

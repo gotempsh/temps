@@ -13,7 +13,7 @@ import {
 import { withSpinner } from '../../ui/spinner.js'
 import {
   success,
-  error,
+  error as printError,
   newline,
   icons,
   colors,
@@ -25,6 +25,12 @@ import {
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { createProject } from '../../api/sdk.gen.js'
 import type { RepositoryResponse, SourceType } from '../../api/types.gen.js'
+
+/** Print a failure and make the command exit non-zero (scripts rely on it). */
+function error(message: string): void {
+  printError(message)
+  process.exitCode = 1
+}
 
 /**
  * One environment variable to seed a new project with.
@@ -63,6 +69,8 @@ interface CreateOptions {
   sourceType?: string
   image?: string
   port?: string
+  // The app runs elsewhere; Temps only receives its telemetry.
+  external?: boolean
 }
 
 // Manual deployment methods (non-git). Mirrors the web ManualProjectConfigurator.
@@ -104,6 +112,51 @@ export function parseRepoPath(repo: string): { owner: string; name: string } | n
   return { owner: repo.slice(0, lastSlash), name: repo.slice(lastSlash + 1) }
 }
 
+/**
+ * A service for an app that runs outside Temps: never deployed, labelled
+ * External, and fed through an analytics ingest key.
+ */
+async function createExternalProject(options: CreateOptions, skipPrompts: boolean): Promise<void> {
+  let projectName = options.name
+  if (!projectName) {
+    if (skipPrompts) {
+      error('A name is required for an external service. Pass --name <name> when using --yes.')
+      return
+    }
+    projectName = await promptText({
+      message: 'Service name',
+      required: true,
+      validate: (v) => (v.length >= 2 ? true : 'Name must be at least 2 characters'),
+    })
+  }
+  const project = await withSpinner('Creating service...', async () => {
+    const { data, error: apiError } = await createProject({
+      client,
+      body: {
+        name: projectName,
+        hosting: 'external',
+        // Required by the API, unused: Temps never builds this project.
+        preset: 'dockerfile',
+        directory: './',
+        main_branch: 'main',
+        source_type: 'manual',
+        automatic_deploy: false,
+        storage_service_ids: [],
+      },
+    })
+    if (apiError || !data) {
+      throw new Error(getErrorMessage(apiError) || 'Failed to create project')
+    }
+    return data
+  })
+  newline()
+  header(`${icons.check} Service Created`)
+  keyValue('Slug', project.slug)
+  keyValue('Hosting', 'external (runs outside Temps, never deployed)')
+  newline()
+  info(`Send its analytics: bunx @temps-sdk/cli analytics keys create --project ${project.slug}`)
+}
+
 export async function create(options: CreateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -114,6 +167,11 @@ export async function create(options: CreateOptions): Promise<void> {
   console.log(colors.bold(`${icons.sparkles} Create New Project`))
   console.log(colors.muted('─'.repeat(40)))
   newline()
+
+  if (options.external) {
+    await createExternalProject(options, skipPrompts)
+    return
+  }
 
   // Determine deployment method. Manual mode skips git connection/repo/branch/preset.
   const manualRequested =

@@ -6,6 +6,7 @@ import { useSearchParams } from 'react-router'
 import { BuildSettings } from './GitSettings'
 import { DeployDefaultsCard } from './DeployDefaultsCard'
 import { DeploymentSourceCard } from './DeploymentSourceCard'
+import { HostingCard } from './HostingCard'
 import { EnvironmentPortOverrideCard } from './EnvironmentPortOverrideCard'
 import { ImageRetentionCard } from './ImageRetentionCard'
 import { PreviewEnvironmentsCard } from './PreviewEnvironmentsCard'
@@ -64,7 +65,10 @@ export function BuildDeploySettings({
 
       {active === 'source' && (
         <div className="space-y-6">
-          <DeploymentSourceCard project={project} refetch={refetch} />
+          <HostingCard project={project} refetch={refetch} />
+          {project.hosting !== 'external' && (
+            <DeploymentSourceCard project={project} refetch={refetch} />
+          )}
         </div>
       )}
 

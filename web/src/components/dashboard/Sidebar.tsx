@@ -108,7 +108,16 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     label: 'Build & deliver',
     items: [
       { title: 'AI workspace', url: '/ai-first', icon: Sparkles },
-      { title: 'Projects', url: '/projects', icon: Folder },
+      {
+        title: 'Projects',
+        url: '/projects',
+        icon: Folder,
+        // A project (group) overview lives at /p/:slug.
+        activeWhen: (path: string) =>
+          path === '/projects' ||
+          path.startsWith('/projects/') ||
+          path.startsWith('/p/'),
+      },
       { title: 'Git providers', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       // Lives under the /settings/nodes URL for historical reasons, but it is
@@ -1027,7 +1036,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         backLabel="Back to menu"
       />
       <SidebarGroup className="py-2">
-        <SidebarMenu aria-label="Project navigation">
+        <SidebarMenu aria-label="Service navigation">
           {projectPrimaryItems.map((item) => (
             <SidebarMenuItem key={item.section} data-tour={item.section}>
               <SidebarMenuButton

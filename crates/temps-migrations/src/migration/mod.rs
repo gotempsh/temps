@@ -297,6 +297,12 @@ mod m20260920_000001_compose_security_policies;
 mod m20260921_000005_add_docker_socket_mounted_to_deployments;
 mod m20260924_000001_add_sync_error_to_git_provider_connections;
 mod m20260927_000001_add_port_bindings_to_deployment_containers;
+mod m20260928_000001_create_project_groups;
+mod m20260928_000002_create_project_group_env_vars;
+mod m20260928_000003_add_project_group_repository;
+mod m20260928_000004_create_project_group_routes;
+mod m20260929_000001_create_template_instantiations;
+mod m20260929_000002_add_project_hosting;
 
 pub struct Migrator;
 
@@ -656,6 +662,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20260924_000001_add_sync_error_to_git_provider_connections::Migration),
             Box::new(m20260926_000001_stateless_telemetry_anonymous_id::Migration),
             Box::new(m20260927_000001_add_port_bindings_to_deployment_containers::Migration),
+            Box::new(m20260928_000001_create_project_groups::Migration),
+            Box::new(m20260928_000002_create_project_group_env_vars::Migration),
+            Box::new(m20260928_000003_add_project_group_repository::Migration),
+            Box::new(m20260928_000004_create_project_group_routes::Migration),
+            Box::new(m20260929_000001_create_template_instantiations::Migration),
+            Box::new(m20260929_000002_add_project_hosting::Migration),
         ]
     }
 }

@@ -113,6 +113,10 @@ pub struct Model {
     /// (`drop`), so the same project can be shipped from git, a Docker image, or
     /// a local folder. NULL means off.
     pub allow_alternate_sources: Option<bool>,
+    /// `hosted`: Temps builds and runs the app. `external`: the app runs
+    /// elsewhere and only sends Temps its telemetry; it is never deployed.
+    #[sea_orm(default_value = "hosted")]
+    pub hosting: super::types::Hosting,
     /// Bounded template provenance: a reviewed bundled slug or the fixed
     /// `custom` marker. Service projects additionally persist their complete,
     /// immutable template release in `service_template`.

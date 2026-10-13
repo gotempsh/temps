@@ -28,6 +28,7 @@ import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
 import { RepositoryList } from '@/components/repositories/RepositoryList'
 import { TemplateList, TemplateConfigurator } from '@/components/templates'
 import { ManualProjectConfigurator } from '@/components/project/ManualProjectConfigurator'
+import { ExternalProjectConfigurator } from './ExternalProjectConfigurator'
 import type {
   RepositoryResponse,
   TemplateResponse,
@@ -46,6 +47,7 @@ import {
   NewProjectShell,
   type ProjectSource,
 } from '@/components/project/NewProjectShell'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import { Drop } from '@/pages/Drop'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { toast } from 'sonner'
@@ -64,6 +66,7 @@ const SOURCE_VALUES: ProjectSource[] = [
   'git-url',
   'manual',
   'drop',
+  'external',
 ]
 
 function isProjectSource(value: string | null): value is ProjectSource {
@@ -391,15 +394,22 @@ export function GitImportClone({
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
+  // `?group=<id>`: the new service joins that project.
+  const {
+    groupId: targetGroupId,
+    finish,
+    joinGroupDialog,
+  } = useJoinGroupAfterCreate()
+
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
-      errorTitle: 'Failed to create project',
+      errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
-      toast.success('Project created successfully')
+      toast.success('Service created')
       onProjectCreated?.()
-      navigate(`/projects/${data.slug}?new=true`)
+      await finish(data, `/projects/${data.slug}?new=true`)
     },
   })
 
@@ -518,7 +528,11 @@ export function GitImportClone({
         toast.error('Repository is missing an id; cannot import')
         return
       }
-      navigate(`/projects/import/${repo.id}`)
+      navigate(
+        targetGroupId === null
+          ? `/projects/import/${repo.id}`
+          : `/projects/import/${repo.id}?group=${targetGroupId}`
+      )
     } else {
       // Inline mode: show configurator
       setSelectedRepository(repo)
@@ -593,11 +607,12 @@ export function GitImportClone({
         onSelectSource={setSelectedSource}
       >
         {verificationDialog}
+        {joinGroupDialog}
         <div className="space-y-6">
           <div className="flex items-center gap-4">
             <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
               <ChevronLeft className="h-4 w-4 mr-2" />
-              {useGitUrl ? 'Back to Git URL' : 'Back to Create Project'}
+              {useGitUrl ? 'Back to Git URL' : 'Back to New service'}
             </Button>
           </div>
 
@@ -696,7 +711,7 @@ export function GitImportClone({
                   if (handleSensitiveActionError(error, () => void submit())) {
                     return
                   }
-                  console.error('Project creation error:', error)
+                  console.error('Service creation error:', error)
                 }
               }
               await submit()
@@ -762,7 +777,7 @@ export function GitImportClone({
               onTemplateSelect={selectTemplate}
               selectedTemplate={selectedTemplate}
               showFeaturedFirst={true}
-              kind="service"
+              kind="app"
               showTagFilter={false}
             />
           </CardContent>
@@ -945,6 +960,16 @@ export function GitImportClone({
       )}
 
       {selectedSource === 'drop' && <Drop embedded />}
+
+      {selectedSource === 'external' && (
+        <Card>
+          <CardContent className="pt-6">
+            <ExternalProjectConfigurator
+              onCancel={() => setSelectedSource(null)}
+            />
+          </CardContent>
+        </Card>
+      )}
     </>
   )
 
