@@ -952,7 +952,7 @@ jobs:
               package(temps-audit) or package(temps-analytics-performance))
               and kind(=lib)
           - group: unit-b
-            # `not (temps-git and *_real_api)`: those six tests call the live
+            # `not (temps-git and *_real_api)`: those tests call the live
             # github.com / gitlab.com REST APIs unauthenticated, so they share
             # a per-IP rate limit with every other job on the runner fleet.
             # They only tolerate `RateLimitExceeded`, but a throttled provider
