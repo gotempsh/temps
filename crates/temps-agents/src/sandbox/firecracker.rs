@@ -413,20 +413,28 @@ impl FirecrackerSandboxProvider {
                 ),
             )
         })?;
+        // The terminal agent is optional, so nothing about it may fail
+        // sandbox creation. What is keyed is what will actually be injected:
+        // only an agent `ensure_rootfs_locked` accepts counts, and a missing,
+        // unreadable or unusable one is "absent" — the rootfs is converted
+        // without it and terminals report why they are unavailable.
         let pty_agent_path = self.config.pty_agent_bin();
-        let pty_agent = match Self::hash_file(&pty_agent_path) {
-            Ok(hash) => hash,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
-            Err(e) => {
-                return Err(self.err(
-                    "-",
-                    format!(
-                        "PTY agent unreadable at {}: {}",
-                        pty_agent_path.display(),
-                        e
-                    ),
-                ))
+        let terminal = firecracker_terminal_capability_for(&self.config);
+        let pty_agent = if terminal.supported {
+            match Self::hash_file(&pty_agent_path) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    tracing::warn!(
+                        pty_agent = %pty_agent_path.display(),
+                        error = %e,
+                        "terminal agent became unreadable while keying the rootfs cache; \
+                         converting without it"
+                    );
+                    "absent".to_string()
+                }
             }
+        } else {
+            "absent".to_string()
         };
         let digest = Sha256::digest(format!("vm:{vm_agent}\npty:{pty_agent}").as_bytes());
         Ok(hex::encode(&digest[..6]))
@@ -3001,6 +3009,37 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_optional_agent_never_blocks_sandbox_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider_at(dir.path().to_path_buf());
+        let bin = dir.path().join("firecracker/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("temps-vm-agent"), b"vm-1").unwrap();
+        let without_pty = p.guest_agent_fingerprint().unwrap();
+
+        // Unreadable (a root-owned 0600 file staged by sudo, say): the same
+        // key as "not staged", because it is injected in neither case.
+        let staged = bin.join("temps-pty-agent");
+        std::fs::write(&staged, crate::sandbox::test_elf::static_for_host(b"x")).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = p.guest_agent_fingerprint();
+        // Running as root bypasses file modes; there the file is simply read.
+        if std::fs::File::open(&staged).is_err() {
+            assert_eq!(unreadable.unwrap(), without_pty);
+        } else {
+            assert!(unreadable.is_ok());
+        }
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A foreign build (Mach-O) is not injected either, so it must not
+        // churn the cache key or fail creation.
+        std::fs::write(&staged, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        assert_eq!(p.guest_agent_fingerprint().unwrap(), without_pty);
+    }
+
+    #[test]
     fn guest_fingerprint_tracks_both_injected_agents() {
         let dir = tempfile::tempdir().unwrap();
         let p = provider_at(dir.path().to_path_buf());
@@ -3017,11 +3056,19 @@ mod tests {
 
         // Staging the PTY agent must change the cache key, or a rootfs
         // converted before it existed would be reused with no terminals.
-        std::fs::write(bin.join("temps-pty-agent"), b"pty-1").unwrap();
+        std::fs::write(
+            bin.join("temps-pty-agent"),
+            crate::sandbox::test_elf::static_for_host(b"pty-1"),
+        )
+        .unwrap();
         let with_pty = p.guest_agent_fingerprint().unwrap();
         assert_ne!(without_pty, with_pty);
 
-        std::fs::write(bin.join("temps-pty-agent"), b"pty-2").unwrap();
+        std::fs::write(
+            bin.join("temps-pty-agent"),
+            crate::sandbox::test_elf::static_for_host(b"pty-2"),
+        )
+        .unwrap();
         assert_ne!(with_pty, p.guest_agent_fingerprint().unwrap());
 
         std::fs::write(bin.join("temps-vm-agent"), b"vm-2").unwrap();
