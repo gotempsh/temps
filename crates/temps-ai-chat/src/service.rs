@@ -5817,6 +5817,11 @@ impl ConversationService {
                                     error.to_string(),
                                 );
                                 salvage_stream_failed = true;
+                                // Whatever it already sent is a fragment. This
+                                // holds even when the main loop ended cleanly
+                                // (a stop reason, native tools without prose):
+                                // the closing answer was still cut off.
+                                provider_stream_failed = true;
                                 break;
                             }
                             Ok(_) => {}
@@ -9568,6 +9573,9 @@ mod tests {
     /// then sends some text and breaks off as well.
     struct NativeToolThenBrokenSalvageAi {
         calls: std::sync::atomic::AtomicUsize,
+        /// Whether the first stream itself breaks after the tool call. When
+        /// `false` it ends cleanly and only the closing call fails.
+        first_stream_breaks: bool,
     }
 
     #[async_trait]
@@ -9589,6 +9597,7 @@ mod tests {
             _request: ChatTurnRequest,
         ) -> Result<ChatTurnStream, AiError> {
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let first_stream_breaks = self.first_stream_breaks;
             let stream = async_stream::stream! {
                 if call == 0 {
                     yield Ok(ChatStreamDelta::ToolCall(ToolCall {
@@ -9596,10 +9605,12 @@ mod tests {
                         name: "Bash".to_string(),
                         arguments: r#"{"command":"pwd"}"#.to_string(),
                     }));
-                    yield Err(AiError::Provider {
-                        purpose: "chat.application.tools".to_string(),
-                        reason: "first stream dropped".to_string(),
-                    });
+                    if first_stream_breaks {
+                        yield Err(AiError::Provider {
+                            purpose: "chat.application.tools".to_string(),
+                            reason: "first stream dropped".to_string(),
+                        });
+                    }
                 } else {
                     yield Ok(ChatStreamDelta::Text("The directory is".to_string()));
                     yield Err(AiError::Provider {
@@ -10012,13 +10023,12 @@ mod tests {
         assert!(message.contains("terminal chunk"), "{message}");
     }
 
-    /// The closing call can break off after sending some text too. That text
-    /// is a second fragment: the turn must stay failed, not be marked complete
-    /// because "some answer arrived".
-    #[tokio::test]
-    async fn salvage_stream_that_breaks_off_does_not_recover_the_turn() {
+    /// Drive a turn whose closing (salvage) call sends some text and breaks off,
+    /// and return the streamed tokens and the errors the turn reported.
+    async fn run_turn_with_broken_salvage(first_stream_breaks: bool) -> (String, Vec<ChatError>) {
         let ai: Arc<dyn AiService> = Arc::new(NativeToolThenBrokenSalvageAi {
             calls: std::sync::atomic::AtomicUsize::new(0),
+            first_stream_breaks,
         });
         let (svc, tools, auth) = service_with_current_tool_auth(ai);
         let mut conversation = test_conversation();
@@ -10056,6 +10066,15 @@ mod tests {
                 Err(error) => errors.push(error),
             }
         }
+        (tokens, errors)
+    }
+
+    /// The closing call can break off after sending some text too. That text
+    /// is a second fragment: the turn must stay failed, not be marked complete
+    /// because "some answer arrived".
+    #[tokio::test]
+    async fn salvage_stream_that_breaks_off_does_not_recover_the_turn() {
+        let (tokens, errors) = run_turn_with_broken_salvage(true).await;
 
         assert!(tokens.contains("The directory is"), "{tokens}");
         assert_eq!(
@@ -10063,8 +10082,23 @@ mod tests {
             1,
             "the broken salvage must fail the turn: {errors:?}"
         );
-        let message = errors[0].to_string();
-        assert!(message.contains("cut off"), "{message}");
+        assert!(errors[0].to_string().contains("cut off"), "{}", errors[0]);
+    }
+
+    /// The same when the main loop itself ended cleanly (native tools ran and
+    /// produced no prose, so the closing call is made): a closing answer that
+    /// breaks off is still a failed turn, not a completed one.
+    #[tokio::test]
+    async fn salvage_stream_that_breaks_off_fails_a_turn_whose_main_loop_ended_cleanly() {
+        let (tokens, errors) = run_turn_with_broken_salvage(false).await;
+
+        assert!(tokens.contains("The directory is"), "{tokens}");
+        assert_eq!(
+            errors.len(),
+            1,
+            "a cut-off closing answer must fail the turn: {errors:?}"
+        );
+        assert!(errors[0].to_string().contains("cut off"), "{}", errors[0]);
     }
 
     #[tokio::test]
