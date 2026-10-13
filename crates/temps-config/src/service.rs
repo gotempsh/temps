@@ -47,8 +47,7 @@ const GEO_SETTINGS_KEY: &str = "geo";
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
     AgentSandboxSettings, AppSettings, BlobSettings, ClickHouseCompression, GeoLicenseKeyIntent,
-    KvSettings,
-    PreviewGatewaySettings, PublicHostnameStrategy,
+    KvSettings, PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
 /// Whether a settings write explicitly changes outbound private-network trust.
