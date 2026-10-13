@@ -129153,6 +129153,9 @@
           },
           "429": {
             "description": "Too many concurrent terminals for this instance or account"
+          },
+          "504": {
+            "description": "The sandbox's guest did not accept a terminal in time"
           }
         },
         "security": [

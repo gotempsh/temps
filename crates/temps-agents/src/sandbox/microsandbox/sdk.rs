@@ -76,6 +76,25 @@ const PTY_PROBE_INTERVAL: Duration = Duration::from_millis(150);
 /// pushed through the guest filesystem API.
 const MAX_PTY_AGENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Longest a single guest command run for terminal bootstrap may take. These
+/// are `sh -c` one-liners that finish in milliseconds; the bound exists
+/// because the SDK's exec has no timeout of its own and a guest controls
+/// what `sh` does.
+const PTY_GUEST_EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Longest the whole first-use bootstrap (waiting for the per-sandbox lock,
+/// install, start, readiness) may take before the attach fails.
+const PTY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Terminal output the host will hold for one attachment while its client
+/// is not keeping up. The SDK's exec channel is unbounded and the guest does
+/// not slow down for a slow client, so this is drained eagerly into a queue
+/// with this byte budget; past it the attachment is cut and the user
+/// reattaches (the agent keeps the tab, and replays recent output).
+const PTY_OUTPUT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+/// Frame-count bound on the same queue (guards many tiny frames).
+const PTY_OUTPUT_QUEUE_FRAMES: usize = 1024;
+
 /// Buffer between the terminal handler's writes and the guest's stdin. One
 /// per attachment; a stalled guest back-pressures the handler (whose writes
 /// carry their own timeout) rather than growing memory.
@@ -363,9 +382,11 @@ pub struct MicrosandboxSandboxProvider {
     /// evicted on stop/destroy and on any SDK error, so a stale connection
     /// is re-established on the next call.
     live: Mutex<HashMap<String, Sandbox>>,
-    /// Serializes first-use installation of the guest PTY agent, so two
-    /// terminals opened at once don't race on the same temporary file.
-    pty_bootstrap: tokio::sync::Mutex<()>,
+    /// Per-sandbox locks serializing first-use installation of the guest PTY
+    /// agent, so two terminals opened at once on *one* sandbox don't race on
+    /// the same temporary file. Per sandbox, never provider-wide: a wedged
+    /// guest must not be able to stall terminals on every other sandbox.
+    pty_bootstrap: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl MicrosandboxSandboxProvider {
@@ -377,7 +398,7 @@ impl MicrosandboxSandboxProvider {
             config,
             backend: Arc::new(backend),
             live: Mutex::new(HashMap::new()),
-            pty_bootstrap: tokio::sync::Mutex::new(()),
+            pty_bootstrap: Mutex::new(HashMap::new()),
         })
     }
 
@@ -624,8 +645,44 @@ impl MicrosandboxSandboxProvider {
             "temps-pty".to_string(),
         ];
         cmd.extend(args.iter().map(|a| a.to_string()));
-        self.run_exec(handle, cmd, HashMap::new(), user, OutputSink::None)
-            .await
+        let name = handle.sandbox_name.as_str();
+        match tokio::time::timeout(
+            PTY_GUEST_EXEC_TIMEOUT,
+            self.run_exec(handle, cmd, HashMap::new(), user, OutputSink::None),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // The guest never answered; the cached connection may be
+                // wedged with it, so the next call reconnects.
+                self.evict(name);
+                Err(Self::err(
+                    name,
+                    "terminal",
+                    format!(
+                        "guest command did not finish within {:?} (script: {})",
+                        PTY_GUEST_EXEC_TIMEOUT,
+                        script.lines().next().unwrap_or_default()
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// The bootstrap lock for one sandbox. Entries nobody holds or waits on
+    /// are dropped as a side effect, so the map tracks only sandboxes with
+    /// a bootstrap in flight (plus the one being asked for).
+    fn bootstrap_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .pty_bootstrap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|key, lock| key == name || Arc::strong_count(lock) > 1);
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Whether the guest's PTY agent at `guest_bin` is installed and
@@ -655,13 +712,30 @@ impl MicrosandboxSandboxProvider {
     /// not already reach. The binary and its directory are root-owned.
     async fn ensure_pty_agent(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
         let name = handle.sandbox_name.as_str();
+        match tokio::time::timeout(PTY_BOOTSTRAP_TIMEOUT, self.ensure_pty_agent_inner(handle)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Self::err(
+                name,
+                "terminal",
+                format!(
+                    "preparing the guest terminal agent did not finish within {:?}",
+                    PTY_BOOTSTRAP_TIMEOUT
+                ),
+            )),
+        }
+    }
+
+    async fn ensure_pty_agent_inner(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        let name = handle.sandbox_name.as_str();
         let staged = self.config.pty_agent_bin();
         let bytes = read_staged_pty_agent(&staged)
             .await
             .map_err(|reason| Self::err(name, "terminal", reason))?;
         let guest_bin = guest_pty_agent_path(&bytes);
 
-        let _bootstrap = self.pty_bootstrap.lock().await;
+        let bootstrap_lock = self.bootstrap_lock(name);
+        let _bootstrap = bootstrap_lock.lock().await;
         if self.pty_agent_listening(handle, &guest_bin).await? {
             return Ok(guest_bin);
         }
@@ -1171,18 +1245,31 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         let guest_bin = self.ensure_pty_agent(handle).await?;
 
         let sandbox = self.connected(name).await?;
-        let started = sandbox
-            .exec_stream_with(guest_bin.clone(), |opts| {
+        let started = tokio::time::timeout(
+            PTY_GUEST_EXEC_TIMEOUT,
+            sandbox.exec_stream_with(guest_bin.clone(), |opts| {
                 opts.args(["--relay", "--socket", PTY_AGENT_SOCKET])
                     .cwd("/")
                     .stdin_pipe()
-            })
-            .await;
+            }),
+        )
+        .await;
         let mut exec = match started {
-            Ok(exec) => exec,
-            Err(e) => {
+            Ok(Ok(exec)) => exec,
+            Ok(Err(e)) => {
                 self.evict(name);
                 return Err(Self::err(name, "terminal relay exec", e));
+            }
+            Err(_) => {
+                self.evict(name);
+                return Err(Self::err(
+                    name,
+                    "terminal relay exec",
+                    format!(
+                        "starting the relay did not finish within {:?}",
+                        PTY_GUEST_EXEC_TIMEOUT
+                    ),
+                ));
             }
         };
         let stdin = exec.take_stdin().ok_or_else(|| {
@@ -1220,49 +1307,8 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
             let _ = stdin.close().await;
         });
 
-        let sandbox_id = handle.sandbox_id.clone();
-        let output = futures::stream::unfold(Some(exec), move |state| {
-            let sandbox_id = sandbox_id.clone();
-            async move {
-                let mut exec = state?;
-                loop {
-                    match exec.recv().await {
-                        Some(ExecEvent::Stdout(chunk)) => return Some((Ok(chunk), Some(exec))),
-                        // The relay's stderr is its own diagnostics (cannot
-                        // connect, …), never protocol bytes: surface it as an
-                        // error and end the stream.
-                        Some(ExecEvent::Stderr(chunk)) => {
-                            return Some((
-                                Err(AgentError::SandboxExecFailed {
-                                    run_id: 0,
-                                    sandbox_id,
-                                    reason: format!(
-                                        "PTY agent relay error: {}",
-                                        String::from_utf8_lossy(&chunk).trim()
-                                    ),
-                                }),
-                                None,
-                            ));
-                        }
-                        Some(ExecEvent::Failed(failure)) => {
-                            return Some((
-                                Err(AgentError::SandboxExecFailed {
-                                    run_id: 0,
-                                    sandbox_id,
-                                    reason: format!(
-                                        "PTY agent relay failed to start: {:?}",
-                                        failure
-                                    ),
-                                }),
-                                None,
-                            ));
-                        }
-                        Some(ExecEvent::Exited { .. }) | None => return None,
-                        Some(ExecEvent::Started { .. }) | Some(ExecEvent::StdinError(_)) => {}
-                    }
-                }
-            }
-        });
+        let output =
+            bounded_terminal_output(exec, handle.sandbox_id.clone(), PTY_OUTPUT_BUDGET_BYTES);
         Ok(PtyAttachment {
             output: Box::pin(output),
             input: Box::pin(input),
@@ -1564,6 +1610,152 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
 
 /// Build the SDK backend bound to `<data_dir>/microsandbox`. Lazy: the SDK
 /// database and directories are only created on first sandbox operation.
+/// Source of exec events. Abstracts the SDK's `ExecHandle` so the bounded
+/// output pump can be tested without a hypervisor.
+#[async_trait]
+trait ExecEventSource: Send + 'static {
+    async fn next_event(&mut self) -> Option<ExecEvent>;
+    /// Stop the guest process. Best effort.
+    async fn terminate(&mut self);
+}
+
+#[async_trait]
+impl ExecEventSource for ::microsandbox::ExecHandle {
+    async fn next_event(&mut self) -> Option<ExecEvent> {
+        self.recv().await
+    }
+
+    async fn terminate(&mut self) {
+        let _ = self.kill().await;
+    }
+}
+
+/// Terminal output from a relay exec as a stream whose host-side buffering is
+/// bounded.
+///
+/// The SDK queues guest output on an unbounded channel and the guest never
+/// slows down for a slow terminal client, so merely polling lazily would let
+/// that queue grow without limit behind a stalled WebSocket. Instead the
+/// events are drained eagerly by a task into a queue limited to
+/// `budget_bytes` (and [`PTY_OUTPUT_QUEUE_FRAMES`] frames). If the consumer
+/// falls that far behind, the relay process is killed and the stream ends
+/// with an error after delivering what was queued — the same "drop the slow
+/// subscriber" policy the PTY agent applies on its side. Nothing is lost:
+/// the tab keeps running in the guest and a reattach replays its scrollback.
+fn bounded_terminal_output<S: ExecEventSource>(
+    mut source: S,
+    sandbox_id: String,
+    budget_bytes: usize,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, AgentError>> + Send {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::mpsc::error::TrySendError;
+
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, AgentError>>(PTY_OUTPUT_QUEUE_FRAMES);
+    let queued = Arc::new(AtomicUsize::new(0));
+    let overflowed = Arc::new(AtomicBool::new(false));
+
+    let relay_failure = {
+        let sandbox_id = sandbox_id.clone();
+        move |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: sandbox_id.clone(),
+            reason,
+        }
+    };
+
+    {
+        let queued = queued.clone();
+        let overflowed = overflowed.clone();
+        let relay_failure = relay_failure.clone();
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    event = source.next_event() => event,
+                    // The consumer is gone (session ended): stop the relay
+                    // now rather than when the guest next produces output.
+                    _ = tx.closed() => {
+                        source.terminate().await;
+                        return;
+                    }
+                };
+                match event {
+                    Some(ExecEvent::Stdout(chunk)) => {
+                        let len = chunk.len();
+                        let total = queued.fetch_add(len, Ordering::AcqRel) + len;
+                        let sent = if total > budget_bytes {
+                            Err(TrySendError::Closed(Ok(chunk)))
+                        } else {
+                            tx.try_send(Ok(chunk))
+                        };
+                        match sent {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                overflowed.store(true, Ordering::Release);
+                                source.terminate().await;
+                                return;
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                // Over budget, or the consumer went away.
+                                if !tx.is_closed() {
+                                    overflowed.store(true, Ordering::Release);
+                                }
+                                source.terminate().await;
+                                return;
+                            }
+                        }
+                    }
+                    // The relay's stderr is its own diagnostics (cannot
+                    // connect, …), never protocol bytes: surface it as an
+                    // error and end the stream.
+                    Some(ExecEvent::Stderr(chunk)) => {
+                        let _ = tx.try_send(Err(relay_failure(format!(
+                            "PTY agent relay error: {}",
+                            String::from_utf8_lossy(&chunk).trim()
+                        ))));
+                        source.terminate().await;
+                        return;
+                    }
+                    Some(ExecEvent::Failed(failure)) => {
+                        let _ = tx.try_send(Err(relay_failure(format!(
+                            "PTY agent relay failed to start: {:?}",
+                            failure
+                        ))));
+                        return;
+                    }
+                    Some(ExecEvent::Exited { .. }) | None => return,
+                    Some(ExecEvent::Started { .. }) | Some(ExecEvent::StdinError(_)) => {}
+                }
+            }
+        });
+    }
+
+    futures::stream::unfold(Some((rx, queued, overflowed)), move |state| {
+        let relay_failure = relay_failure.clone();
+        async move {
+            let (mut rx, queued, overflowed) = state?;
+            match rx.recv().await {
+                Some(Ok(chunk)) => {
+                    queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+                    Some((Ok(chunk), Some((rx, queued, overflowed))))
+                }
+                // An error is always the last item.
+                Some(Err(e)) => Some((Err(e), None)),
+                None if overflowed.load(Ordering::Acquire) => Some((
+                    Err(relay_failure(format!(
+                        "terminal output backlog exceeded {} bytes: the client is reading \
+                             slower than the sandbox produces output. Reattach to the same tab \
+                             to resume; it keeps running",
+                        budget_bytes
+                    ))),
+                    None,
+                )),
+                None => None,
+            }
+        }
+    })
+}
+
 /// Guest path for a given build of the PTY agent. Content-addressed so a
 /// newer staged binary installs beside the old one instead of replacing a
 /// file a running agent is executing, and so "is it installed?" is a plain
@@ -2691,6 +2883,209 @@ mod tests {
     /// Terminal bridge end to end: stage the guest agent, attach, and drive
     /// the ADR-008 protocol (PING, then OPEN a command and read its output).
     /// Skips when the backend is unavailable or no guest agent is staged.
+    /// Scripted [`ExecEventSource`]: yields the queued events, then waits
+    /// forever (like a live relay that went quiet), and records `terminate`.
+    struct ScriptedSource {
+        events: std::collections::VecDeque<ExecEvent>,
+        terminated: Arc<std::sync::atomic::AtomicBool>,
+        /// Yield `None` once the script is exhausted instead of waiting.
+        end_when_empty: bool,
+    }
+
+    impl ScriptedSource {
+        fn new(events: Vec<ExecEvent>) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+            let terminated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    events: events.into(),
+                    terminated: terminated.clone(),
+                    end_when_empty: false,
+                },
+                terminated,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ExecEventSource for ScriptedSource {
+        async fn next_event(&mut self) -> Option<ExecEvent> {
+            match self.events.pop_front() {
+                Some(event) => Some(event),
+                None if self.end_when_empty => None,
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn terminate(&mut self) {
+            self.terminated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn stdout(bytes: &[u8]) -> ExecEvent {
+        ExecEvent::Stdout(bytes.to_vec().into())
+    }
+
+    async fn wait_for(flag: &Arc<std::sync::atomic::AtomicBool>) {
+        for _ in 0..200 {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("relay was never terminated");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_is_forwarded_in_order_until_the_relay_exits() {
+        use futures::StreamExt;
+        let (source, _) = ScriptedSource::new(vec![
+            stdout(b"one"),
+            stdout(b"two"),
+            ExecEvent::Exited { code: 0 },
+        ]);
+        let output: Vec<_> = bounded_terminal_output(source, "sbx_test".into(), 1024)
+            .collect()
+            .await;
+        let bytes: Vec<_> = output
+            .into_iter()
+            .map(|chunk| chunk.expect("no error expected"))
+            .collect();
+        assert_eq!(
+            bytes,
+            vec![bytes::Bytes::from("one"), bytes::Bytes::from("two")]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stderr_is_an_error_not_terminal_bytes() {
+        use futures::StreamExt;
+        let (source, terminated) = ScriptedSource::new(vec![
+            stdout(b"ok"),
+            ExecEvent::Stderr(b"cannot connect to the PTY agent socket\n".to_vec().into()),
+            // Must never be reached: the stream ended at the error.
+            stdout(b"after"),
+        ]);
+        let mut output = Box::pin(bounded_terminal_output(source, "sbx_test".into(), 1024));
+        assert_eq!(
+            output.next().await.unwrap().unwrap(),
+            bytes::Bytes::from("ok")
+        );
+        let error = output.next().await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("cannot connect"), "{error}");
+        assert!(error.contains("sbx_test"), "{error}");
+        assert!(output.next().await.is_none());
+        wait_for(&terminated).await;
+    }
+
+    #[tokio::test]
+    async fn a_stalled_consumer_cuts_the_attachment_at_the_byte_budget() {
+        use futures::StreamExt;
+        // Budget 10 bytes; five 4-byte chunks. The consumer does not read
+        // while they arrive, so the pump must stop buffering and kill the
+        // relay rather than hold everything the guest keeps producing.
+        let chunks: Vec<_> = (0..5).map(|_| stdout(b"abcd")).collect();
+        let (source, terminated) = ScriptedSource::new(chunks);
+        let mut output = Box::pin(bounded_terminal_output(source, "sbx_test".into(), 10));
+
+        wait_for(&terminated).await;
+
+        // What fit is delivered, in order, then a descriptive error.
+        let mut delivered = 0usize;
+        let error = loop {
+            match output.next().await {
+                Some(Ok(chunk)) => delivered += chunk.len(),
+                Some(Err(e)) => break e.to_string(),
+                None => panic!("stream ended without reporting the overflow"),
+            }
+        };
+        assert!(
+            delivered <= 10,
+            "buffered {delivered} bytes past the budget"
+        );
+        assert!(delivered >= 8, "delivered only {delivered} bytes");
+        assert!(error.contains("backlog exceeded 10 bytes"), "{error}");
+        assert!(error.contains("sbx_test"), "{error}");
+        assert!(output.next().await.is_none());
+    }
+
+    /// Source fed one event at a time by the test, so a consumer can be
+    /// shown keeping pace with the producer deterministically.
+    struct ChannelSource(tokio::sync::mpsc::UnboundedReceiver<ExecEvent>);
+
+    #[async_trait]
+    impl ExecEventSource for ChannelSource {
+        async fn next_event(&mut self) -> Option<ExecEvent> {
+            self.0.recv().await
+        }
+
+        async fn terminate(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn a_consumer_that_keeps_pace_never_hits_the_budget() {
+        use futures::StreamExt;
+        // 100 chunks of 8 bytes through a 16-byte budget: fine while each
+        // chunk is read before the next arrives, because delivered bytes are
+        // credited back to the budget.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut output = Box::pin(bounded_terminal_output(
+            ChannelSource(rx),
+            "sbx_test".into(),
+            16,
+        ));
+        let mut total = 0usize;
+        for _ in 0..100 {
+            tx.send(stdout(b"12345678")).expect("pump alive");
+            total += output
+                .next()
+                .await
+                .expect("stream open")
+                .expect("consumer kept up")
+                .len();
+        }
+        tx.send(ExecEvent::Exited { code: 0 }).expect("pump alive");
+        assert!(output.next().await.is_none());
+        assert_eq!(total, 800);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_output_stops_the_relay_promptly() {
+        let (source, terminated) = ScriptedSource::new(vec![stdout(b"hello")]);
+        let output = bounded_terminal_output(source, "sbx_test".into(), 1024);
+        drop(output);
+        wait_for(&terminated).await;
+    }
+
+    #[test]
+    fn bootstrap_locks_are_per_sandbox_and_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider_at(dir.path().to_path_buf());
+
+        let a1 = provider.bootstrap_lock("sbx-a");
+        let a2 = provider.bootstrap_lock("sbx-a");
+        let b = provider.bootstrap_lock("sbx-b");
+        assert!(Arc::ptr_eq(&a1, &a2), "same sandbox must share a lock");
+        assert!(!Arc::ptr_eq(&a1, &b), "sandboxes must not share a lock");
+
+        // Holding sbx-a's lock does not block sbx-b.
+        {
+            let _held = a1.try_lock().expect("uncontended");
+            assert!(b.try_lock().is_ok());
+        }
+
+        // Once nobody holds an entry it is dropped on the next request, so
+        // the map cannot grow with the number of sandboxes ever seen.
+        drop((a1, a2, b));
+        let _fresh = provider.bootstrap_lock("sbx-c");
+        let tracked = provider
+            .pty_bootstrap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        assert_eq!(tracked, 1, "idle entries must be pruned");
+    }
+
     #[tokio::test]
     async fn e2e_terminal_attach_runs_a_command_and_reattaches() {
         use tokio::io::AsyncWriteExt;

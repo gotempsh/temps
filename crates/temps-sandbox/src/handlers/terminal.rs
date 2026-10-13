@@ -171,6 +171,16 @@ const MISSED_PONGS_BEFORE_CLOSE: u32 = 3;
 /// timeout meaningful.
 const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest `attach_pty` may take before the request is answered with a 504.
+///
+/// Attaching can include first-use work inside the guest (installing and
+/// starting the terminal agent), and a guest that has stopped answering would
+/// otherwise hold this request — and its concurrent-terminal slot — open for
+/// as long as the client cares to wait. The providers bound their own steps
+/// (bootstrap 60 s plus relay start 20 s on microsandbox); this is the
+/// backstop above them, so it is deliberately a little larger.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(100);
+
 /// Hard ceiling on a single attachment.
 ///
 /// Authorization is evaluated once, at upgrade, and never revalidated — so a
@@ -348,6 +358,7 @@ fn wrap_with_sane_termios(cmd: &str) -> String {
         (status = 404, description = "Sandbox not found"),
         (status = 409, description = "Terminal unavailable: the sandbox is not running, or its backend's guest terminal agent is missing (the problem detail names the fix)"),
         (status = 429, description = "Too many concurrent terminals for this instance or account"),
+        (status = 504, description = "The sandbox's guest did not accept a terminal in time"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -413,32 +424,36 @@ pub async fn terminal(
             Problem::from(err)
         })?;
 
-    let attachment = state
-        .sandbox_service
-        .registry()
-        .provider()
-        .attach_pty(&handle)
-        .await
-        .map_err(|e| {
-            // A sandbox on a worker node: terminals are not available there
-            // yet (ADR-048). Say exactly that — the PTY-agent hint below
-            // would send the user hunting for an image problem.
-            if let temps_agents::error::AgentError::SandboxUnsupportedOnNode { .. } = e {
-                return Problem::from(crate::error::from_agent_error(&id, e));
-            }
-            // Say what is actually missing for *this* backend, rather than
-            // leaving the user with a bare 409 or a terminal that never
-            // echoes. The provider's own message already carries the
-            // specific cause; the hint adds where to fix it.
-            problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Terminal Unavailable")
-                .with_detail(format!(
-                    "Could not attach a terminal to sandbox {}: {}. {}",
-                    id,
-                    e,
-                    terminal_unavailable_hint(handle.backend)
-                ))
-        })?;
+    let attachment = bounded_attach(
+        &id,
+        ATTACH_TIMEOUT,
+        state
+            .sandbox_service
+            .registry()
+            .provider()
+            .attach_pty(&handle),
+    )
+    .await?
+    .map_err(|e| {
+        // A sandbox on a worker node: terminals are not available there
+        // yet (ADR-048). Say exactly that — the PTY-agent hint below
+        // would send the user hunting for an image problem.
+        if let temps_agents::error::AgentError::SandboxUnsupportedOnNode { .. } = e {
+            return Problem::from(crate::error::from_agent_error(&id, e));
+        }
+        // Say what is actually missing for *this* backend, rather than
+        // leaving the user with a bare 409 or a terminal that never
+        // echoes. The provider's own message already carries the
+        // specific cause; the hint adds where to fix it.
+        problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Terminal Unavailable")
+            .with_detail(format!(
+                "Could not attach a terminal to sandbox {}: {}. {}",
+                id,
+                e,
+                terminal_unavailable_hint(handle.backend)
+            ))
+    })?;
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
@@ -819,6 +834,32 @@ async fn send_error(ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>, 
     let _ = ws_tx.close().await;
 }
 
+/// Run an `attach_pty` future under `deadline`, answering 504 when the guest
+/// does not respond in time. The inner result is returned untouched so the
+/// caller keeps its backend-specific 409 mapping.
+async fn bounded_attach<T>(
+    sandbox_id: &str,
+    deadline: Duration,
+    attach: impl std::future::Future<Output = Result<T, temps_agents::error::AgentError>>,
+) -> Result<Result<T, temps_agents::error::AgentError>, Problem> {
+    tokio::time::timeout(deadline, attach).await.map_err(|_| {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            deadline_secs = deadline.as_secs(),
+            "terminal attach timed out"
+        );
+        problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+            .with_title("Terminal Attach Timed Out")
+            .with_detail(format!(
+                "Sandbox {} did not accept a terminal within {}s. Its guest may be \
+                 overloaded or unresponsive; retry in a moment, or restart the sandbox \
+                 if this persists.",
+                sandbox_id,
+                deadline.as_secs()
+            ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1071,38 @@ mod tests {
         const _: () = assert!(MAX_CONCURRENT_TERMINALS > 0);
         const _: () = assert!(MAX_CONCURRENT_TERMINALS <= 128);
         assert_eq!(TERMINAL_SLOTS.available_permits(), MAX_CONCURRENT_TERMINALS);
+    }
+
+    #[tokio::test]
+    async fn attach_that_never_completes_is_answered_with_504() {
+        let problem = bounded_attach::<()>(
+            "sbx_test",
+            Duration::from_millis(20),
+            std::future::pending(),
+        )
+        .await
+        .expect_err("a hung attach must time out");
+        let body = format!("{problem:?}");
+        assert!(
+            body.contains("504") || body.contains("GATEWAY_TIMEOUT"),
+            "{body}"
+        );
+        assert!(body.contains("sbx_test"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn attach_result_passes_through_inside_the_deadline() {
+        let ok = bounded_attach("sbx_test", Duration::from_secs(5), async { Ok(7u8) })
+            .await
+            .expect("no timeout");
+        assert_eq!(ok.expect("attach ok"), 7);
+    }
+
+    #[test]
+    fn attach_deadline_covers_the_providers_own_bounds() {
+        // Microsandbox: 60 s bootstrap + 20 s relay start. The backstop must
+        // sit above that or it would pre-empt the provider's better error.
+        assert!(ATTACH_TIMEOUT > Duration::from_secs(80));
     }
 
     #[test]

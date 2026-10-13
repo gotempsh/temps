@@ -70019,6 +70019,10 @@ export type TerminalErrors = {
      * Too many concurrent terminals for this instance or account
      */
     429: unknown;
+    /**
+     * The sandbox's guest did not accept a terminal in time
+     */
+    504: unknown;
 };
 
 export type CmdKillData = {
