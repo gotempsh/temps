@@ -67,6 +67,8 @@ fn remember_provider_error(last_error: &mut Option<String>, candidate: String) {
     }
 }
 
+use crate::thread_kind::{TERMINAL_THREAD_MODEL, TERMINAL_THREAD_PROVIDER, THREAD_KIND_TERMINAL};
+
 const ATTACHMENT_SANDBOX_PREFIX: &str = "/home/temps/workspace/.temps/chat-attachments/";
 const MAX_REPLAYED_ATTACHMENTS: usize = 10;
 
@@ -3232,6 +3234,44 @@ impl ConversationService {
             }
             Err(_) => NativeSessionDiagnostic::Error,
         }
+    }
+
+    /// Create a terminal thread: an interactive shell in the workspace
+    /// sandbox rather than an AI conversation.
+    ///
+    /// No AI runtime is resolved or pinned, and no system message is seeded:
+    /// a terminal has no harness, model or turns. `ai_provider` and `ai_model`
+    /// carry fixed placeholders only because the columns are not nullable;
+    /// nothing may interpret them for a `kind = 'terminal'` row.
+    pub async fn create_terminal_conversation(
+        &self,
+        application_id: Option<i64>,
+        context_type: &str,
+        context_id: &str,
+        user_id: i32,
+        title: &str,
+    ) -> Result<ai_conversations::Model, ChatError> {
+        let now = Utc::now();
+        Ok(ai_conversations::ActiveModel {
+            public_id: Set(uuid::Uuid::new_v4().simple().to_string()),
+            project_id: Set(None),
+            application_id: Set(application_id),
+            context_type: Set(context_type.to_string()),
+            context_id: Set(context_id.to_string()),
+            title: Set(Some(title.to_string())),
+            status: Set("active".to_string()),
+            kind: Set(THREAD_KIND_TERMINAL.to_string()),
+            created_by: Set(user_id),
+            created_at: Set(now),
+            last_activity_at: Set(now),
+            ai_provider: Set(TERMINAL_THREAD_PROVIDER.to_string()),
+            ai_model: Set(TERMINAL_THREAD_MODEL.to_string()),
+            ai_thinking_level: Set(None),
+            ai_permission_mode: Set("default".to_string()),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await?)
     }
 
     /// Find or create the current user's conversation for a context. Context
@@ -8702,6 +8742,7 @@ mod tests {
             context_id: "42".to_string(),
             title: None,
             status: "active".to_string(),
+            kind: "ai".to_string(),
             created_by: 1,
             metadata: None,
             cli_session_id: None,
@@ -11010,6 +11051,7 @@ mod tests {
             context_id: "1".to_string(),
             title: Some("t".to_string()),
             status: "active".to_string(),
+            kind: "ai".to_string(),
             created_by: 5,
             metadata: None,
             cli_session_id: None,

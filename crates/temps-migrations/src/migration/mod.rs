@@ -322,6 +322,7 @@ mod m20261012_000001_ai_provider_keys_self_hosted;
 mod m20261012_000002_create_status_page_domains;
 mod m20261012_000003_managed_daemon_beta_images;
 mod m20261013_000001_webhook_delivery_identity;
+mod m20261013_000002_add_kind_to_ai_conversations;
 
 pub struct Migrator;
 
@@ -715,6 +716,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261012_000002_create_status_page_domains::Migration),
             Box::new(m20261012_000003_managed_daemon_beta_images::Migration),
             Box::new(m20261013_000001_webhook_delivery_identity::Migration),
+            Box::new(m20261013_000002_add_kind_to_ai_conversations::Migration),
         ]
     }
 }
