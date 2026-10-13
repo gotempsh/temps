@@ -502,6 +502,14 @@ info "Extracting temps..."
 tar -xzf "$tarball" -C "$bin_dir" temps ||
     error "Failed to extract temps"
 
+# Linux tarballs also carry the Firecracker guest agent, which
+# `temps firecracker setup` looks for next to the temps binary. macOS tarballs
+# and older Linux ones don't contain it, so a miss is not an error.
+if tar -xzf "$tarball" -C "$bin_dir" temps-vm-agent 2>/dev/null; then
+    chmod +x "$bin_dir/temps-vm-agent" ||
+        warning 'Failed to set permissions on temps-vm-agent'
+fi
+
 rm "$tarball" ||
     warning "Failed to remove temporary tarball"
 
