@@ -4,6 +4,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { SandboxPreviewLinksCard } from './SandboxPreviewLinksCard'
@@ -26,7 +27,9 @@ function renderCard(props: Partial<typeof READY> = {}) {
   })
   return render(
     <QueryClientProvider client={client}>
-      <SandboxPreviewLinksCard {...READY} {...props} />
+      <MemoryRouter>
+        <SandboxPreviewLinksCard {...READY} {...props} />
+      </MemoryRouter>
     </QueryClientProvider>
   )
 }
@@ -79,6 +82,11 @@ test('says when preview URLs are not configured or the sandbox is on a worker', 
   const api = mockApi({})
   const unconfigured = renderCard({ configured: false })
   expect(unconfigured.getByText(/not configured on this install/)).toBeTruthy()
+  // The onboarding state links straight to where the preview domain is set.
+  const fix = unconfigured.getByRole('link', {
+    name: 'Open platform settings',
+  })
+  expect(fix.getAttribute('href')).toBe('/settings')
   cleanup()
   const worker = renderCard({ onWorkerNode: true })
   expect(worker.getByText(/worker nodes/)).toBeTruthy()

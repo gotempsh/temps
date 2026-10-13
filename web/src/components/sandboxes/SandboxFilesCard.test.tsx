@@ -12,11 +12,11 @@ import { encodeText } from './sandbox-files'
 installBrowserWindow()
 afterEach(cleanup)
 
-function renderCard(props: { status?: string; lifecycle?: string } = {}) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  })
-  return render(
+function cardTree(
+  client: QueryClient,
+  props: { status?: string; lifecycle?: string }
+) {
+  return (
     <QueryClientProvider client={client}>
       <SandboxFilesCard
         sandboxId="sbx_1"
@@ -26,6 +26,16 @@ function renderCard(props: { status?: string; lifecycle?: string } = {}) {
       />
     </QueryClientProvider>
   )
+}
+
+function newClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+}
+
+function renderCard(props: { status?: string; lifecycle?: string } = {}) {
+  return render(cardTree(newClient(), props))
 }
 
 const PATH = '/home/user/work/notes.txt'
@@ -361,5 +371,53 @@ test('text typed while a save is in flight is kept and still marked unsaved', as
   expect(after.value).toBe('first, and more')
   expect(view.getByText('unsaved changes')).toBeTruthy()
   expect(written).toEqual([encodeText('first')])
+  api.restore()
+})
+
+test('a sandbox that stops keeps the unsaved edit, read-only, and resumes with it intact', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 5,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () =>
+      jsonResponse({ path: PATH, size: 5, contents_b64: encodeText('saved') }),
+  })
+  const client = newClient()
+  const view = render(cardTree(client, { status: 'running' }))
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const editor = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+  fireEvent.change(editor, { target: { value: 'unsaved work' } })
+
+  // The sandbox stops (ephemeral): file actions are blocked, the text is not.
+  view.rerender(cardTree(client, { status: 'stopped' }))
+  const stopped = view.getByLabelText(
+    `Contents of ${PATH}`
+  ) as HTMLTextAreaElement
+  expect(stopped).toBe(editor)
+  expect(stopped.value).toBe('unsaved work')
+  expect(stopped.readOnly).toBe(true)
+  expect(
+    (view.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled
+  ).toBe(true)
+  expect(view.getByText(/Resume it to read or write files/)).toBeTruthy()
+
+  view.rerender(cardTree(client, { status: 'running' }))
+  const resumed = view.getByLabelText(
+    `Contents of ${PATH}`
+  ) as HTMLTextAreaElement
+  expect(resumed.value).toBe('unsaved work')
+  expect(resumed.readOnly).toBe(false)
+  expect(view.getByText('unsaved changes')).toBeTruthy()
   api.restore()
 })

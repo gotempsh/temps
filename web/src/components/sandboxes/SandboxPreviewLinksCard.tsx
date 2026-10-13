@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
@@ -146,6 +147,17 @@ export function SandboxPreviewLinksCard({
             <AlertTitle>Preview links unavailable</AlertTitle>
             <AlertDescription>
               {blocked}
+              {!configured && !onWorkerNode && !destroyed && (
+                <>
+                  {' '}
+                  <Link
+                    to="/settings"
+                    className="font-medium underline underline-offset-2"
+                  >
+                    Open platform settings
+                  </Link>
+                </>
+              )}
               {configured && !onWorkerNode && !hasPassword && !destroyed && (
                 <>
                   {' '}

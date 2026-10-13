@@ -187,19 +187,21 @@ export function SandboxFilesCard({
           </form>
         </Form>
 
-        {openPath !== null && blocked === null && (
-          <FileSection
-            sandboxId={sandboxId}
-            path={openPath}
-            statError={statQuery.isError ? statQuery.error : null}
-            statLoading={statQuery.isPending}
-            stat={stat}
-            readLoading={readable && readQuery.isPending}
-            readError={readQuery.isError ? readQuery.error : null}
-            contentsB64={readQuery.data?.contents_b64}
-            generation={generation}
-          />
-        )}
+        {/* Always mounted: when the sandbox stops, the editor must keep the
+            operator's unsaved text (read-only) instead of being torn down and
+            rebuilt from the last saved contents on resume. */}
+        <FileSection
+          sandboxId={sandboxId}
+          path={openPath}
+          locked={blocked !== null}
+          statError={statQuery.isError ? statQuery.error : null}
+          statLoading={statQuery.isPending}
+          stat={stat}
+          readLoading={readable && readQuery.isPending}
+          readError={readQuery.isError ? readQuery.error : null}
+          contentsB64={readQuery.data?.contents_b64}
+          generation={generation}
+        />
       </CardContent>
     </Card>
   )
@@ -207,7 +209,10 @@ export function SandboxFilesCard({
 
 interface FileSectionProps {
   sandboxId: string
-  path: string
+  /** The path being edited; `null` before anything has been opened. */
+  path: string | null
+  /** The sandbox cannot serve files right now: show what is loaded, read-only. */
+  locked: boolean
   stat:
     | { exists: boolean; is_file: boolean; is_dir: boolean; size: number }
     | undefined
@@ -222,6 +227,7 @@ interface FileSectionProps {
 function FileSection({
   sandboxId,
   path,
+  locked,
   stat,
   statLoading,
   statError,
@@ -230,8 +236,10 @@ function FileSection({
   contentsB64,
   generation,
 }: FileSectionProps) {
+  if (path === null) return null
   if (statLoading || readLoading) {
-    return <Skeleton className="h-40 w-full" />
+    // Locked and never loaded: the alert above already says why.
+    return locked ? null : <Skeleton className="h-40 w-full" />
   }
   if (statError) {
     return (
@@ -305,6 +313,7 @@ function FileSection({
       path={path}
       exists={stat.exists}
       initial={initial}
+      locked={locked}
     />
   )
 }
@@ -314,11 +323,13 @@ function FileEditor({
   path,
   exists,
   initial,
+  locked,
 }: {
   sandboxId: string
   path: string
   exists: boolean
   initial: string
+  locked: boolean
 }) {
   const queryClient = useQueryClient()
   const [draft, setDraft] = useState(initial)
@@ -362,7 +373,7 @@ function FileEditor({
         </div>
         <Button
           size="sm"
-          disabled={!dirty || save.isPending}
+          disabled={!dirty || save.isPending || locked}
           onClick={() => {
             const sent = draft
             save.mutate(
@@ -386,6 +397,7 @@ function FileEditor({
         aria-label={`Contents of ${path}`}
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
+        readOnly={locked}
         spellCheck={false}
         className="min-h-[240px] font-mono text-xs"
       />
