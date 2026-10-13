@@ -1288,25 +1288,31 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     // the built files, not the build. They must be matched before the generic
     // download, permission and "not found" rules below, which would
     // otherwise misread the Docker archive text.
-    let static_job = matches!(
-        failed_job_id(raw),
-        Some(
+    //
+    // The failed job's id decides when the reason names one. The message
+    // markers are only a fallback for a reason stored without that wrapper:
+    // a build's own output or a Dockerfile excerpt can contain "docker
+    // archive" or "static deployment ", and must keep the code its text earns.
+    let static_job = match failed_job_id(raw) {
+        Some(job) => matches!(
+            job,
             "deploy_static"
                 | "deploy_static_bundle"
                 | "deploy_static_from_source"
                 | "persist_static_assets"
-        )
-    ) || contains_any(
-        r,
-        &[
-            "failed to extract files from container path",
-            "failed to deploy static files",
-            "cannot reach the node that built image",
-            "extracting static files",
-            "static deployment ",
-            "docker archive",
-        ],
-    );
+        ),
+        None => contains_any(
+            r,
+            &[
+                "failed to extract files from container path",
+                "failed to deploy static files",
+                "cannot reach the node that built image",
+                "extracting static files",
+                "static deployment ",
+                "docker archive",
+            ],
+        ),
+    };
     if static_job {
         // The image itself is gone: that is the existing "built image
         // missing" case, not a problem with the output path.
@@ -1320,14 +1326,11 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         ) {
             return make(S::Image, C::ImageMissing);
         }
-        if contains_any(
-            r,
-            &[
-                "could not find the file",
-                "could not find the path",
-                "no such file or directory",
-            ],
-        ) {
+        if contains_any(r, &["could not find the file", "could not find the path"]) {
+            // Docker's own wording for an absent archive path. A bare
+            // "No such file or directory" is not matched: it also comes from
+            // the host (temp directory, publish step), which is not the
+            // build's output.
             return make(S::Build, C::StaticOutputMissing);
         }
         if contains_any(
@@ -2631,6 +2634,45 @@ mod tests {
             "Failed to download package registry.npmjs.org: connection reset",
         );
         assert_class(&install, S::DependencyInstall, C::DependencyDownload);
+    }
+
+    #[test]
+    fn static_markers_do_not_capture_another_jobs_failure() {
+        // Build output and Dockerfile excerpts are free text; a build that
+        // mentions a "docker archive" or a "static deployment" is still a
+        // build, and keeps the code its own text earns.
+        let compile = wrapped(
+            "build_image",
+            "Build failed: step 4/9 `echo static deployment ready` ok; TypeScript error: failed to compile src/index.ts",
+        );
+        assert_class(&compile, S::Build, C::CompileError);
+        let lockfile = wrapped(
+            "build_image",
+            "Docker archive helper installed; ERR_PNPM_OUTDATED_LOCKFILE: frozen lockfile",
+        );
+        assert_class(
+            &lockfile,
+            S::DependencyInstall,
+            C::DependencyLockfileOutOfSync,
+        );
+        let clone = wrapped(
+            "download_repo",
+            "Failed to clone repository; the repo ships a docker archive of fixtures",
+        );
+        assert_class(&clone, S::Source, C::RepositoryClone);
+
+        // Without the job wrapper the static markers still apply.
+        let unwrapped = "Failed to extract files from container path '/app/dist': Other error: Docker archive for image 'i' path '/app/dist': Could not find the file /app/dist in container 1";
+        assert_class(unwrapped, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn host_io_errors_during_static_deploy_are_not_a_missing_output() {
+        let reason = wrapped(
+            "deploy_static",
+            "❌ Failed to deploy static files: IO error: No such file or directory (os error 2)",
+        );
+        assert_class(&reason, S::Deploy, C::StaticDeployFailed);
     }
 
     #[test]
