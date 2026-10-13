@@ -150,7 +150,6 @@
     "js-yaml": "^5.4.3",
     "lodash": "^4.17.24",
     "minimatch": "^10.2.5",
-    "nanoid": "^3.3.17",
     "picomatch": "^2.3.2",
     "postcss": "^8.5.18",
     "source-map-js": "^1.2.2",
