@@ -73,6 +73,23 @@ pub(crate) fn latest_version_command(package: HarnessPackage) -> Vec<String> {
     )
 }
 
+/// Exit status of the install probe when the sandbox user can write the
+/// global package directory.
+const PROBE_WRITABLE: i32 = 0;
+/// Exit status of the install probe when it ran and the directory is not
+/// writable. Deliberately not `1`: a failed `npm`, a `timeout` kill (124/137)
+/// or a missing shell (127) must not read as "owned by root".
+const PROBE_NOT_WRITABLE: i32 = 10;
+
+/// Who may replace a global npm package in the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallOwner {
+    /// The sandbox user owns the prefix: the update runs as that user.
+    SandboxUser,
+    /// An older image installed the CLIs as root: only root can replace them.
+    Root,
+}
+
 /// Whether the sandbox user can replace a global npm package itself.
 ///
 /// Current runtime images install the harness CLIs into a prefix the sandbox
@@ -80,16 +97,31 @@ pub(crate) fn latest_version_command(package: HarnessPackage) -> Vec<String> {
 /// tree the sandbox controls would follow sandbox-planted links and leave
 /// root-owned files that break the CLI's own self-update. Older images
 /// installed them as root, where only a root update can succeed. The probe
-/// runs as the sandbox user and exits 0 only when it can write there.
+/// runs as the sandbox user and reports the answer in its exit status:
+/// [`PROBE_WRITABLE`], [`PROBE_NOT_WRITABLE`], or any other status when it
+/// could not tell (`npm` failed, no prefix, killed by the timeout).
 pub(crate) fn install_writable_probe_command() -> Vec<String> {
     bounded(
         VERSION_COMMAND_TIMEOUT.as_secs().saturating_sub(10).max(1),
         vec![
             "sh".to_string(),
             "-c".to_string(),
-            r#"test -w "$(npm config get prefix)/lib/node_modules""#.to_string(),
+            format!(
+                r#"prefix="$(npm config get prefix)" || exit 3; [ -n "$prefix" ] || exit 3; if test -w "$prefix/lib/node_modules"; then exit {PROBE_WRITABLE}; else exit {PROBE_NOT_WRITABLE}; fi"#
+            ),
         ],
     )
+}
+
+/// Read the probe's exit status. `None` means the probe could not establish
+/// who owns the install, which callers must treat as an error rather than
+/// picking an account.
+pub(crate) fn install_owner_from_probe(exit_code: i32) -> Option<InstallOwner> {
+    match exit_code {
+        PROBE_WRITABLE => Some(InstallOwner::SandboxUser),
+        PROBE_NOT_WRITABLE => Some(InstallOwner::Root),
+        _ => None,
+    }
 }
 
 pub(crate) fn update_command(package: HarnessPackage) -> Vec<String> {
@@ -194,12 +226,22 @@ mod tests {
         let probe = install_writable_probe_command();
         assert_eq!(&probe[..5], ["timeout", "-k", "10", "10", "sh"]);
         assert_eq!(probe[5], "-c");
-        // Nothing request-derived may reach the script.
-        assert_eq!(
-            probe[6],
-            r#"test -w "$(npm config get prefix)/lib/node_modules""#
-        );
+        // Nothing request-derived may reach the script, and a failing `npm`
+        // must end the probe before the writability test can run.
+        assert!(probe[6].starts_with(r#"prefix="$(npm config get prefix)" || exit 3;"#));
+        assert!(probe[6].contains(r#"test -w "$prefix/lib/node_modules""#));
         assert_eq!(probe.len(), 7);
+    }
+
+    #[test]
+    fn only_an_explicit_answer_picks_the_install_owner() {
+        assert_eq!(install_owner_from_probe(0), Some(InstallOwner::SandboxUser));
+        assert_eq!(install_owner_from_probe(10), Some(InstallOwner::Root));
+        // `test -w`'s own failure status, an npm failure, a `timeout` kill
+        // and a missing shell are all "could not tell".
+        for exit_code in [1, 2, 3, 124, 126, 127, 137, -1] {
+            assert_eq!(install_owner_from_probe(exit_code), None, "{exit_code}");
+        }
     }
 
     #[test]

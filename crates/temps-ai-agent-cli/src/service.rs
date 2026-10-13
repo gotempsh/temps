@@ -2169,7 +2169,27 @@ impl AgentCliAiService {
             ),
         })?
         .map_err(|error| map_agent_error(purpose, error))?;
-        let as_root = probe.exit_code != 0;
+        let as_root = match hu::install_owner_from_probe(probe.exit_code) {
+            Some(hu::InstallOwner::SandboxUser) => false,
+            Some(hu::InstallOwner::Root) => true,
+            None => {
+                tracing::warn!(
+                    provider = self.provider.name(),
+                    principal_id,
+                    binary = package.binary,
+                    exit_code = probe.exit_code,
+                    stderr = %scrub_and_bound(&probe.stderr),
+                    "workspace harness install owner could not be determined"
+                );
+                return Err(AiError::Provider {
+                    purpose: purpose.to_string(),
+                    reason: format!(
+                        "could not tell who owns the {} install (probe exited with {}); nothing was changed",
+                        package.binary, probe.exit_code
+                    ),
+                });
+            }
+        };
         // The task hands the slot and the mark back when the install ends so
         // the caller keeps both through the version check below: nothing may
         // run in the workspace, or start another update, until the installed
@@ -8921,13 +8941,29 @@ mod tests {
 
     #[tokio::test]
     async fn harness_update_falls_back_to_root_for_a_root_owned_install() {
-        let (result, as_user, as_root) = run_harness_update(1, false).await;
+        let (result, as_user, as_root) = run_harness_update(10, false).await;
 
         assert!(
             result.is_ok(),
             "older images are still updatable: {result:?}"
         );
         assert_eq!((as_user, as_root), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn harness_update_does_not_pick_root_from_an_inconclusive_probe() {
+        // 124 is `timeout` killing the probe; 127 a missing shell; 1 and 3
+        // are `test` and npm failing. None of them says the install is root's.
+        for exit_code in [1, 3, 124, 127] {
+            let (result, as_user, as_root) = run_harness_update(exit_code, false).await;
+
+            assert!(result.is_err(), "probe exit {exit_code} must not update");
+            assert_eq!(
+                (as_user, as_root),
+                (0, 0),
+                "probe exit {exit_code} must never default to a root install"
+            );
+        }
     }
 
     #[tokio::test]
