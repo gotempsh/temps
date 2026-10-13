@@ -151,6 +151,30 @@ const RELAY_WRITE_SLICE: std::time::Duration = std::time::Duration::from_millis(
 /// a host that stopped draining) must not pin a relay slot for good.
 const RELAY_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Shorter no-progress limit once the *source* has disconnected. Nobody is
+/// left to receive anything the other side would produce, so there is no
+/// reason to wait the full stall limit — but a receiver that is merely slow
+/// (still taking bytes) must be allowed to finish taking what was already
+/// sent, which is why this is a no-progress limit and not an abort on
+/// hang-up.
+const RELAY_CLOSED_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timing limits of one relay; a value type so tests can shrink them.
+#[derive(Clone, Copy)]
+struct RelayLimits {
+    write_slice: std::time::Duration,
+    stall_limit: std::time::Duration,
+    closed_grace: std::time::Duration,
+}
+
+impl RelayLimits {
+    const DEFAULT: RelayLimits = RelayLimits {
+        write_slice: RELAY_WRITE_SLICE,
+        stall_limit: RELAY_STALL_LIMIT,
+        closed_grace: RELAY_CLOSED_GRACE,
+    };
+}
+
 /// Copy bytes both ways between `host` (a vsock connection, wrapped as a
 /// unix stream — the fd type is irrelevant to `read`/`write`) and `agent`
 /// (the PTY agent's unix socket) until either side closes.
@@ -163,22 +187,27 @@ const RELAY_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60
 ///
 /// A *write* can block too — the receiver may have stopped reading — and a
 /// closed source is not noticed by a thread stuck writing. So writes proceed
-/// in short slices, and between slices the relay checks that the source is
-/// still open and that some progress was made within [`RELAY_STALL_LIMIT`];
-/// either failure ends the relay and shuts both sockets down.
+/// in short slices. A write that makes no progress ends the relay (and shuts
+/// both sockets down) after [`RELAY_STALL_LIMIT`], or after the shorter
+/// [`RELAY_CLOSED_GRACE`] once the source has hung up. A receiver that keeps
+/// taking bytes is never cut off, so input already sent still arrives.
 pub fn relay(
     host: std::os::unix::net::UnixStream,
     agent: std::os::unix::net::UnixStream,
 ) -> std::io::Result<()> {
-    relay_with_limits(host, agent, RELAY_WRITE_SLICE, RELAY_STALL_LIMIT)
+    relay_with_limits(host, agent, RelayLimits::DEFAULT)
 }
 
 fn relay_with_limits(
     host: std::os::unix::net::UnixStream,
     agent: std::os::unix::net::UnixStream,
-    write_slice: std::time::Duration,
-    stall_limit: std::time::Duration,
+    limits: RelayLimits,
 ) -> std::io::Result<()> {
+    let RelayLimits {
+        write_slice,
+        stall_limit,
+        closed_grace,
+    } = limits;
     use std::io::Read;
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
@@ -205,13 +234,15 @@ fn relay_with_limits(
         ready > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
     }
 
-    /// `write_all` that gives up when the source closes or no progress is
-    /// made for `stall_limit`. `to` must have a write timeout of one slice.
+    /// `write_all` that gives up when no progress is made for `stall_limit`,
+    /// or for `closed_grace` once the source has hung up. `to` must have a
+    /// write timeout of one slice.
     fn write_watching(
         to: &mut UnixStream,
         source: &UnixStream,
         mut data: &[u8],
         stall_limit: std::time::Duration,
+        closed_grace: std::time::Duration,
     ) -> std::io::Result<()> {
         use std::io::Write;
 
@@ -235,7 +266,7 @@ fn relay_with_limits(
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    if source_closed(source) {
+                    if last_progress.elapsed() >= closed_grace && source_closed(source) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "relay source closed while its peer was not reading",
@@ -268,6 +299,7 @@ fn relay_with_limits(
         from: &mut UnixStream,
         to: &mut UnixStream,
         stall_limit: std::time::Duration,
+        closed_grace: std::time::Duration,
     ) -> std::io::Result<()> {
         let source = from.try_clone()?;
         let mut buf = vec![0u8; RELAY_BUF_BYTES];
@@ -278,7 +310,7 @@ fn relay_with_limits(
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            write_watching(to, &source, &buf[..n], stall_limit)?;
+            write_watching(to, &source, &buf[..n], stall_limit, closed_grace)?;
         }
     }
 
@@ -301,7 +333,7 @@ fn relay_with_limits(
     let upstream = std::thread::Builder::new()
         .name("pty-relay-up".to_string())
         .spawn(move || {
-            let result = pump(&mut host_rx, &mut agent_tx, stall_limit);
+            let result = pump(&mut host_rx, &mut agent_tx, stall_limit, closed_grace);
             let _ = agent_ctl.shutdown(Shutdown::Both);
             let _ = host_ctl.shutdown(Shutdown::Both);
             result
@@ -309,7 +341,7 @@ fn relay_with_limits(
 
     let mut agent_rx = agent;
     let mut host_tx = host;
-    let downstream = pump(&mut agent_rx, &mut host_tx, stall_limit);
+    let downstream = pump(&mut agent_rx, &mut host_tx, stall_limit, closed_grace);
     let _ = host_tx.shutdown(Shutdown::Both);
     let _ = agent_rx.shutdown(Shutdown::Both);
 
@@ -425,13 +457,12 @@ mod tests {
     fn run_relay_to_end(
         host: UnixStream,
         agent: UnixStream,
-        slice: std::time::Duration,
-        stall: std::time::Duration,
+        limits: RelayLimits,
         within: std::time::Duration,
     ) -> std::io::Result<()> {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = done_tx.send(relay_with_limits(host, agent, slice, stall));
+            let _ = done_tx.send(relay_with_limits(host, agent, limits));
         });
         done_rx
             .recv_timeout(within)
@@ -461,8 +492,14 @@ mod tests {
             run_relay_to_end(
                 host,
                 agent,
-                std::time::Duration::from_millis(20),
-                std::time::Duration::from_secs(60),
+                RelayLimits {
+                    write_slice: std::time::Duration::from_millis(20),
+                    stall_limit: std::time::Duration::from_secs(60),
+                    // Short, but far longer than a slice: the point is that
+                    // it is *this* limit, not the 60s stall limit, that
+                    // frees the relay once the host has gone.
+                    closed_grace: std::time::Duration::from_millis(150),
+                },
                 std::time::Duration::from_secs(10),
             )
         });
@@ -489,8 +526,11 @@ mod tests {
         let result = run_relay_to_end(
             host,
             agent,
-            std::time::Duration::from_millis(20),
-            std::time::Duration::from_millis(400),
+            RelayLimits {
+                write_slice: std::time::Duration::from_millis(20),
+                stall_limit: std::time::Duration::from_millis(400),
+                closed_grace: std::time::Duration::from_millis(400),
+            },
             std::time::Duration::from_secs(10),
         );
         let error = result.expect_err("a stalled relay is an error");
@@ -523,8 +563,14 @@ mod tests {
             run_relay_to_end(
                 host,
                 agent,
-                std::time::Duration::from_millis(20),
-                std::time::Duration::from_millis(1500),
+                RelayLimits {
+                    write_slice: std::time::Duration::from_millis(20),
+                    stall_limit: std::time::Duration::from_millis(1500),
+                    // The host closes right after writing, while the reader
+                    // is still draining: a closed source with a receiver that
+                    // keeps taking bytes must be delivered in full.
+                    closed_grace: std::time::Duration::from_millis(300),
+                },
                 std::time::Duration::from_secs(30),
             )
         });
