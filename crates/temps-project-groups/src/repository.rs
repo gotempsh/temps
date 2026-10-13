@@ -352,24 +352,16 @@ async fn validate_public(
 ///
 /// Templates pin their source to a release tag or a commit as often as to a
 /// branch, and a branch-only lookup would reject those and strand the
-/// instantiation. The branch lookup is one cheap request and settles the
-/// common case; anything else falls back to reading the tree at that ref,
-/// which the providers resolve for any of the three kinds. A tree too large
-/// to return still proves the ref exists: the provider answered for it.
+/// instantiation. This uses the same resolution a deployment does
+/// (`resolve_ref`: branch, then tag, then commit), so a ref accepted here is
+/// one the deployment can check out.
 async fn ref_exists(
     client: &dyn PublicRepoProvider,
     owner: &str,
     name: &str,
     reference: &str,
 ) -> Result<bool, PublicRepoError> {
-    if client.get_branch(owner, name, reference).await?.is_some() {
-        return Ok(true);
-    }
-    match client.get_file_tree(owner, name, reference).await {
-        Ok(_) | Err(PublicRepoError::ResponseTooLarge { .. }) => Ok(true),
-        Err(PublicRepoError::NotFound(_)) | Err(PublicRepoError::BranchNotFound(_)) => Ok(false),
-        Err(error) => Err(error),
-    }
+    Ok(client.resolve_ref(owner, name, reference).await?.is_some())
 }
 
 /// A safe, actionable reason for a failed public-repository lookup. Provider
@@ -1145,25 +1137,25 @@ pub(crate) mod tests {
     use temps_git::services::git_provider::FileContent;
     use temps_git::services::public_repo::{PublicBranch, PublicRepoInfo};
 
-    /// A public provider whose branches, and the refs its tree lookup
-    /// resolves, are fixed, counting the tree lookups made.
+    /// A public provider whose branches, and the tags and commits its lookups
+    /// resolve, are fixed, counting the tag lookups made.
     struct FakeProvider {
         branches: Vec<String>,
-        /// Refs `get_file_tree` resolves (tags and commits).
-        trees: Vec<String>,
-        tree_error: Option<fn() -> PublicRepoError>,
+        /// Tag names and commit ids `get_tag_commit` / `get_commit_sha` resolve.
+        refs: Vec<String>,
+        tag_error: Option<fn() -> PublicRepoError>,
         branch_error: Option<fn() -> PublicRepoError>,
-        tree_calls: std::sync::atomic::AtomicUsize,
+        tag_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeProvider {
-        fn new(branches: &[&'static str], trees: &[&'static str]) -> Self {
+        fn new(branches: &[&'static str], refs: &[&'static str]) -> Self {
             Self {
                 branches: branches.iter().map(|b| (*b).to_string()).collect(),
-                trees: trees.iter().map(|t| (*t).to_string()).collect(),
-                tree_error: None,
+                refs: refs.iter().map(|t| (*t).to_string()).collect(),
+                tag_error: None,
                 branch_error: None,
-                tree_calls: Default::default(),
+                tag_calls: Default::default(),
             }
         }
     }
@@ -1210,22 +1202,40 @@ pub(crate) mod tests {
                 }))
         }
 
+        async fn get_tag_commit(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            tag: &str,
+        ) -> Result<Option<String>, PublicRepoError> {
+            self.tag_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.tag_error {
+                return Err(error());
+            }
+            Ok(self
+                .refs
+                .iter()
+                .any(|t| t == tag && !tag.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| "1".repeat(40)))
+        }
+
+        async fn get_commit_sha(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+        ) -> Result<Option<String>, PublicRepoError> {
+            Ok(self.refs.iter().find(|r| r.starts_with(sha)).cloned())
+        }
+
         async fn get_file_tree(
             &self,
             _owner: &str,
             _repo: &str,
-            reference: &str,
+            _reference: &str,
         ) -> Result<Vec<String>, PublicRepoError> {
-            self.tree_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(error) = self.tree_error {
-                return Err(error());
-            }
-            if self.trees.iter().any(|t| *t == reference) {
-                Ok(vec!["README.md".to_string()])
-            } else {
-                Err(PublicRepoError::NotFound(format!("tree at {reference}")))
-            }
+            Err(PublicRepoError::Internal("not used".into()))
         }
 
         async fn get_file_content(
@@ -1240,15 +1250,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_branch_is_confirmed_without_reading_the_tree() {
+    async fn a_branch_is_confirmed_without_looking_up_tags() {
         let provider = FakeProvider::new(&["main", "develop"], &[]);
         assert!(ref_exists(&provider, "acme", "shop", "develop")
             .await
             .expect("lookup"));
         assert_eq!(
-            provider
-                .tree_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+            provider.tag_calls.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
     }
@@ -1257,7 +1265,7 @@ pub(crate) mod tests {
     async fn a_tag_or_commit_pinned_by_a_template_is_accepted() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let provider = FakeProvider::new(&["main"], &["v1.2.3", sha]);
-        for reference in ["v1.2.3", sha] {
+        for reference in ["v1.2.3", sha, &sha[..8]] {
             assert!(
                 ref_exists(&provider, "acme", "shop", reference)
                     .await
@@ -1270,27 +1278,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_ref_that_is_nothing_is_rejected() {
         let provider = FakeProvider::new(&["main"], &["v1.2.3"]);
-        assert!(!ref_exists(&provider, "acme", "shop", "v9.9.9")
-            .await
-            .expect("lookup"));
-    }
-
-    #[tokio::test]
-    async fn an_oversized_tree_still_proves_the_ref_exists() {
-        let mut provider = FakeProvider::new(&["main"], &[]);
-        provider.tree_error = Some(|| PublicRepoError::ResponseTooLarge {
-            context: "repository tree".into(),
-            limit_bytes: 1,
-        });
-        assert!(ref_exists(&provider, "acme", "shop", "v1.2.3")
-            .await
-            .expect("lookup"));
+        for reference in ["v9.9.9", "0123456789abcdef"] {
+            assert!(
+                !ref_exists(&provider, "acme", "shop", reference)
+                    .await
+                    .expect("lookup"),
+                "{reference} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
     async fn provider_failures_are_not_reported_as_a_missing_ref() {
         let mut provider = FakeProvider::new(&["main"], &[]);
-        provider.tree_error = Some(|| PublicRepoError::RateLimitExceeded);
+        provider.tag_error = Some(|| PublicRepoError::RateLimitExceeded);
         assert!(matches!(
             ref_exists(&provider, "acme", "shop", "v1.2.3").await,
             Err(PublicRepoError::RateLimitExceeded)
