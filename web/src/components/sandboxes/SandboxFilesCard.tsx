@@ -169,6 +169,15 @@ export function SandboxFilesCard({
     setGeneration((current) => current + 1)
   }
 
+  // What the file looks like right now, read when Save is pressed. The cached
+  // properties are from when the file was opened; the terminal beside this card
+  // can have replaced it with a symlink or changed its owner since. A probe
+  // that fails reads as "unknown", which asks before saving.
+  const readFreshProperties = async (): Promise<FileProperties | null> => {
+    const result = await propertiesQuery.refetch()
+    return result.isSuccess ? result.data : null
+  }
+
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -242,6 +251,7 @@ export function SandboxFilesCard({
             readable && (readQuery.isPending || propertiesQuery.isPending)
           }
           properties={propertiesQuery.isSuccess ? propertiesQuery.data : null}
+          readFreshProperties={readFreshProperties}
           readError={readQuery.isError ? readQuery.error : null}
           contentsB64={readQuery.data?.contents_b64}
           generation={generation}
@@ -267,6 +277,7 @@ interface FileSectionProps {
   contentsB64: string | undefined
   /** Mode and owner of an existing file; `null` when they could not be read. */
   properties: FileProperties | null
+  readFreshProperties: () => Promise<FileProperties | null>
   generation: number
 }
 
@@ -281,6 +292,7 @@ function FileSection({
   readError,
   contentsB64,
   properties,
+  readFreshProperties,
   generation,
 }: FileSectionProps) {
   if (path === null) return null
@@ -361,6 +373,7 @@ function FileSection({
       exists={stat.exists}
       initial={initial}
       properties={properties}
+      readFreshProperties={readFreshProperties}
       locked={locked}
     />
   )
@@ -372,6 +385,7 @@ function FileEditor({
   exists,
   initial,
   properties,
+  readFreshProperties,
   locked,
 }: {
   sandboxId: string
@@ -380,6 +394,8 @@ function FileEditor({
   initial: string
   /** What an existing file looked like; `null` when it could not be read. */
   properties: FileProperties | null
+  /** Probes the file again, at the moment of saving. */
+  readFreshProperties: () => Promise<FileProperties | null>
   locked: boolean
 }) {
   const queryClient = useQueryClient()
@@ -389,9 +405,12 @@ function FileEditor({
   // flight stays in the editor, still marked unsaved.
   const [saved, setSaved] = useState(initial)
   const dirty = draft !== saved
-  const [confirmRisks, setConfirmRisks] = useState(false)
-  const risks = exists ? saveRisks(path, properties) : []
-  const mode = exists ? writeMode(properties) : DEFAULT_FILE_MODE
+  // What a save would change besides the text, as found by the probe that
+  // runs when Save is pressed; set only when the operator has to confirm.
+  const [review, setReview] = useState<{
+    risks: string[]
+    mode: number
+  } | null>(null)
 
   const save = useMutation({
     ...writeFileMutation(),
@@ -423,7 +442,7 @@ function FileEditor({
     },
   })
 
-  const send = () => {
+  const send = (mode: number) => {
     const sent = draft
     save.mutate(
       {
@@ -438,6 +457,21 @@ function FileEditor({
       { onSuccess: () => setSaved(sent) }
     )
   }
+
+  // Decide from the file as it is now, not as it was when it was opened: if it
+  // has since become a symlink or changed owner, the operator is asked. The
+  // editor text is untouched by the probe. A file that did not exist when it
+  // was opened has nothing to compare against and is written at 0644.
+  const preflight = useMutation({
+    mutationFn: readFreshProperties,
+    meta: { errorTitle: 'Failed to check the file before saving' },
+    onSuccess: (fresh) => {
+      const risks = saveRisks(path, fresh)
+      const mode = writeMode(fresh)
+      if (risks.length > 0) setReview({ risks, mode })
+      else send(mode)
+    },
+  })
 
   return (
     <div className="space-y-2">
@@ -454,15 +488,15 @@ function FileEditor({
         </div>
         <Button
           size="sm"
-          disabled={!dirty || save.isPending || locked}
+          disabled={!dirty || save.isPending || preflight.isPending || locked}
           onClick={() => {
             // Anything a save would change besides the text is said first,
             // not done silently.
-            if (risks.length > 0) setConfirmRisks(true)
-            else send()
+            if (exists) preflight.mutate()
+            else send(DEFAULT_FILE_MODE)
           }}
         >
-          {save.isPending ? (
+          {save.isPending || preflight.isPending ? (
             <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
           ) : (
             <Save className="mr-1.5 h-4 w-4" />
@@ -479,14 +513,16 @@ function FileEditor({
         className="min-h-[240px] font-mono text-xs"
       />
       <ConfirmDialog
-        open={confirmRisks}
-        onOpenChange={setConfirmRisks}
+        open={review !== null}
+        onOpenChange={(open) => {
+          if (!open) setReview(null)
+        }}
         title="Saving will change more than the text"
         description={
           <>
             Saving <span className="font-mono">{path}</span> from here:
             <span className="mt-2 block">
-              {risks.map((risk) => (
+              {(review?.risks ?? []).map((risk) => (
                 <span key={risk} className="mb-1 block">
                   • {risk}
                 </span>
@@ -500,8 +536,8 @@ function FileEditor({
         confirmLabel="Save anyway"
         destructive={false}
         onConfirm={() => {
-          setConfirmRisks(false)
-          send()
+          if (review) send(review.mode)
+          setReview(null)
         }}
       />
     </div>

@@ -135,9 +135,19 @@ export function writeMode(properties: FileProperties | null): number {
   return properties ? properties.mode & 0o777 : DEFAULT_FILE_MODE
 }
 
-/** True when `path` is inside the sandbox user's home. */
+/**
+ * True when the provider hands `path` to the sandbox user. This mirrors
+ * `runtime_user_owns_uploaded_file` (a plain prefix test on `/home/temps`, so
+ * `/home/temps-other/x` counts too): the console warns about what the provider
+ * will really do, not about what a stricter rule would have done.
+ */
 export function isUnderSandboxHome(path: string): boolean {
-  return path === SANDBOX_HOME || path.startsWith(`${SANDBOX_HOME}/`)
+  return path.startsWith(SANDBOX_HOME)
+}
+
+/** The numeric owner `fs/write` gives `path`, whatever owned it before. */
+export function ownerAfterWrite(path: string): number {
+  return isUnderSandboxHome(path) ? SANDBOX_USER_UID : 0
 }
 
 /**
@@ -159,9 +169,15 @@ export function saveRisks(
       'This path is a symbolic link. Saving replaces the link with a regular file holding your text; the file it pointed to is not changed.'
     )
   }
-  if (!isUnderSandboxHome(path) && properties.uid !== 0) {
+  // Every write re-creates the file, so its owner becomes whoever the provider
+  // writes as for this path -- including inside the home, where a file the
+  // sandbox user did not own (a root-owned 0644, say) is handed to uid 1000.
+  const writtenUid = ownerAfterWrite(path)
+  if (properties.uid !== writtenUid) {
     risks.push(
-      `Outside ${SANDBOX_HOME} the sandbox writes files as root, so the sandbox user may lose access to it (this matters most for 0600 files).`
+      writtenUid === 0
+        ? `Outside ${SANDBOX_HOME} the sandbox writes files as root, so the sandbox user may lose access to it (this matters most for 0600 files).`
+        : `Saving makes the sandbox user (uid ${writtenUid}) the owner of this file; it is currently owned by uid ${properties.uid}.`
     )
   }
   if ((properties.mode & ~0o777) !== 0) {
@@ -179,7 +195,7 @@ export function propertiesAfterSave(
 ): FileProperties {
   return {
     mode,
-    uid: isUnderSandboxHome(path) ? SANDBOX_USER_UID : 0,
+    uid: ownerAfterWrite(path),
     symlink: false,
   }
 }

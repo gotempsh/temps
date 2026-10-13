@@ -185,8 +185,23 @@ describe('saveRisks', () => {
     const risks = saveRisks('/srv/app/.env', file({ mode: 0o600 }))
     expect(risks).toHaveLength(1)
     expect(risks[0]).toContain('as root')
-    // /home/temps-other is not inside /home/temps.
-    expect(saveRisks('/home/temps-other/x', file({}))).toHaveLength(1)
+  })
+
+  test('warns when a save would hand a file inside the home to the sandbox user', () => {
+    // A root-owned 0644 under /home/temps is re-created as uid 1000.
+    const risks = saveRisks('/home/temps/workspace/conf', file({ uid: 0 }))
+    expect(risks).toHaveLength(1)
+    expect(risks[0]).toContain('uid 1000')
+    expect(risks[0]).toContain('currently owned by uid 0')
+    // Some other account's file is handed over just the same.
+    expect(saveRisks('/home/temps/x', file({ uid: 33 }))).toHaveLength(1)
+  })
+
+  test('follows the provider rule, a plain prefix test on the home', () => {
+    // Mirrors `runtime_user_owns_uploaded_file`: /home/temps-other/x is
+    // written as uid 1000 too, so a uid 1000 file there is a faithful save.
+    expect(saveRisks('/home/temps-other/x', file({}))).toEqual([])
+    expect(saveRisks('/home/temps-other/x', file({ uid: 0 }))).toHaveLength(1)
   })
 
   test('a root-owned file outside the home is already root, so nothing changes', () => {

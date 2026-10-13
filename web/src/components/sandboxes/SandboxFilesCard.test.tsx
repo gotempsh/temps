@@ -477,7 +477,12 @@ test("saving sends the file's own mode so an executable keeps its bit", async ()
 
   await waitFor(() => expect(body).toBeDefined())
   expect(body?.mode).toBe(0o755)
-  expect(execCalls).toEqual([filePropertiesArgv(PATH)])
+  // One probe when the file is opened and one when Save is pressed, so the
+  // decision is made from the file as it is then.
+  expect(execCalls).toEqual([
+    filePropertiesArgv(PATH),
+    filePropertiesArgv(PATH),
+  ])
   api.restore()
 })
 
@@ -648,5 +653,71 @@ test('setuid is warned about and not written back', async () => {
   fireEvent.click(await view.findByRole('button', { name: 'Save anyway' }))
   await waitFor(() => expect(writes).toHaveLength(1))
   expect(writes[0]!.mode).toBe(0o755)
+  api.restore()
+})
+
+test('a root-owned file inside the home is warned about, because a save gives it to the sandbox user', async () => {
+  const writes: Array<{ mode: number }> = []
+  const api = mockApi(fileRoutes(PATH, '644 0\n', writes))
+  const view = renderCard()
+
+  await openAndSave(view, PATH, 'new')
+
+  await view.findByText(/currently owned by uid 0/)
+  expect(writes).toHaveLength(0)
+  fireEvent.click(await view.findByRole('button', { name: 'Save anyway' }))
+  await waitFor(() => expect(writes).toHaveLength(1))
+  expect(writes[0]!.mode).toBe(0o644)
+  api.restore()
+})
+
+test('a file replaced by a symlink after it was opened is caught when Save is pressed', async () => {
+  const writes: Array<{ mode: number }> = []
+  // The probe at open time sees a regular file; the one at save time sees the
+  // link that the terminal put there in between.
+  const probes = ['644 1000\n', '644 1000\nsymlink\n']
+  let probeCount = 0
+  const api = mockApi({
+    ...fileRoutes(PATH, '644 1000\n', writes),
+    'POST /v1/sandboxes/sbx_1/exec': () =>
+      jsonResponse({
+        exit_code: 0,
+        stdout: probes[Math.min(probeCount++, probes.length - 1)],
+        stderr: '',
+      }),
+  })
+  const view = renderCard()
+
+  await openAndSave(view, PATH, 'typed by the operator')
+
+  await view.findByText(/replaces the link with a regular file/)
+  expect(probeCount).toBe(2)
+  expect(writes).toHaveLength(0)
+  // The probe never touches what the operator typed.
+  expect(
+    (view.getByLabelText(`Contents of ${PATH}`) as HTMLTextAreaElement).value
+  ).toBe('typed by the operator')
+
+  fireEvent.click(await view.findByRole('button', { name: 'Save anyway' }))
+  await waitFor(() => expect(writes).toHaveLength(1))
+  api.restore()
+})
+
+test('declining the warning writes nothing and keeps the text', async () => {
+  const writes: Array<{ mode: number }> = []
+  const api = mockApi(fileRoutes(PATH, '644 0\n', writes))
+  const view = renderCard()
+
+  await openAndSave(view, PATH, 'kept')
+  await view.findByText(/currently owned by uid 0/)
+  fireEvent.click(view.getByRole('button', { name: 'Cancel' }))
+
+  await waitFor(() =>
+    expect(view.queryByText(/currently owned by uid 0/)).toBeNull()
+  )
+  expect(writes).toHaveLength(0)
+  expect(
+    (view.getByLabelText(`Contents of ${PATH}`) as HTMLTextAreaElement).value
+  ).toBe('kept')
   api.restore()
 })
