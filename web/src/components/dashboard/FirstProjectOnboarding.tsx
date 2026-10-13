@@ -88,6 +88,7 @@ export function FirstProjectOnboarding() {
               Moving from another platform?
             </h2>
             <div
+              role="group"
               className="mt-3 flex flex-wrap gap-2"
               aria-label="Migration platforms"
             >

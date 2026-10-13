@@ -415,13 +415,19 @@ export function EnvironmentConfigurationCard({
             {/* Deploy on push toggle */}
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg mt-4">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Deploy on push</Label>
+                <Label
+                  htmlFor="env-automatic-deploy"
+                  className="text-sm font-medium"
+                >
+                  Deploy on push
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically deploy when a commit is pushed to this branch.
                   Disable to deploy on demand only.
                 </p>
               </div>
               <Switch
+                id="env-automatic-deploy"
                 checked={formData.automatic_deploy}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -609,13 +615,16 @@ export function EnvironmentConfigurationCard({
           <div className="space-y-4">
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Enable On-Demand</Label>
+                <Label htmlFor="env-on-demand" className="text-sm font-medium">
+                  Enable On-Demand
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically stop containers after idle timeout and restart
                   on the next request.
                 </p>
               </div>
               <Switch
+                id="env-on-demand"
                 checked={formData.on_demand}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -669,7 +678,7 @@ export function EnvironmentConfigurationCard({
                   </p>
                 </div>
                 {environment.sleeping && (
-                  <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-600 dark:text-yellow-400 text-xs">
+                  <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-700 dark:text-yellow-400 text-xs">
                     <Moon className="h-3.5 w-3.5" />
                     This environment is currently sleeping. It will wake on the
                     next request.
@@ -844,7 +853,10 @@ export function EnvironmentConfigurationCard({
               {/* Protected environment toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                 <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                  <Label
+                    htmlFor="env-protected"
+                    className="text-sm font-medium flex items-center gap-1.5"
+                  >
                     <Shield className="h-4 w-4 shrink-0" />
                     Protected
                   </Label>
@@ -854,6 +866,7 @@ export function EnvironmentConfigurationCard({
                   </p>
                 </div>
                 <Switch
+                  id="env-protected"
                   checked={formData.protected}
                   onCheckedChange={(checked) =>
                     setFormData((prev) => ({
@@ -867,12 +880,18 @@ export function EnvironmentConfigurationCard({
               {/* Anti-affinity toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                 <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium">Anti-affinity</Label>
+                  <Label
+                    htmlFor="env-anti-affinity"
+                    className="text-sm font-medium"
+                  >
+                    Anti-affinity
+                  </Label>
                   <p className="text-xs text-muted-foreground">
                     Spread replicas across different nodes (best-effort).
                   </p>
                 </div>
                 <Switch
+                  id="env-anti-affinity"
                   checked={formData.anti_affinity}
                   onCheckedChange={(checked) =>
                     setFormData((prev) => ({
@@ -1109,12 +1128,18 @@ export function EnvironmentConfigurationCard({
 
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Security Headers</Label>
+                <Label
+                  htmlFor="env-security-headers"
+                  className="text-sm font-medium"
+                >
+                  Security Headers
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Enable security headers
                 </p>
               </div>
               <Switch
+                id="env-security-headers"
                 checked={formData.security?.enabled ?? false}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -1166,7 +1191,10 @@ export function EnvironmentConfigurationCard({
             {/* Password Protection */}
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium flex items-center gap-1.5">
+                <Label
+                  htmlFor="env-password-protection"
+                  className="text-sm font-medium flex items-center gap-1.5"
+                >
                   <KeyRound className="h-4 w-4 shrink-0" />
                   Password Protection
                 </Label>
@@ -1175,6 +1203,7 @@ export function EnvironmentConfigurationCard({
                 </p>
               </div>
               <Switch
+                id="env-password-protection"
                 checked={formData.password_enabled}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({

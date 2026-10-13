@@ -109,9 +109,35 @@ pub struct TlsExtensionData {
     pub sni_hostname: String,
 }
 
+/// How the TLS callback treats an SNI hostname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SniCertPolicy {
+    /// Any other hostname: load its certificate; on a miss, ask on-demand TLS.
+    Default,
+    /// A status page's custom hostname (#1412) whose ownership is proven and
+    /// whose page is published: serve its own certificate, never ask
+    /// on-demand TLS to mint one.
+    StatusPageServing,
+    /// A status page's custom hostname that is not verified, or whose page is
+    /// unpublished: no certificate at all — no exact match, no wildcard
+    /// fallback, no on-demand issuance.
+    StatusPageRefused,
+}
+
+fn sni_cert_policy(route_table: &CachedPeerTable, sni: &str) -> SniCertPolicy {
+    match route_table.status_page_host(sni) {
+        None => SniCertPolicy::Default,
+        Some(route) if route.slug.is_some() => SniCertPolicy::StatusPageServing,
+        Some(_) => SniCertPolicy::StatusPageRefused,
+    }
+}
+
 /// Dynamic certificate callback for TLS
 struct DynamicCertLoader {
     cert_loader: Arc<CertificateLoader>,
+    /// Consulted for status-page custom hostnames (#1412) before any
+    /// certificate is chosen. Lock-free snapshot read.
+    route_table: Arc<CachedPeerTable>,
     /// On-demand HTTP-01 TLS manager (ADR-018). When present and the SNI has no
     /// active cert, the callback asks it to provision one in the background and
     /// still returns `Ok(None)` immediately (Option B: fail-fast, do not block
@@ -136,6 +162,15 @@ impl TlsAccept for DynamicCertLoader {
             .to_string();
 
         debug!("TLS callback for SNI: {}", sni);
+
+        let policy = sni_cert_policy(&self.route_table, &sni);
+        if policy == SniCertPolicy::StatusPageRefused {
+            debug!(
+                "No certificate for unverified or unpublished status-page hostname {}",
+                sni
+            );
+            return;
+        }
 
         match self.cert_loader.load_certificate(&sni).await {
             Ok(Some((certs, key))) => {
@@ -196,8 +231,10 @@ impl TlsAccept for DynamicCertLoader {
                 // Peer IP isn't readily available in the OpenSSL TLS callback, so
                 // the per-IP novelty limiter is passed `None`; the zone, route,
                 // dedup, backoff, and global hourly-cap checks remain in force.
-                if let Some(ref manager) = self.on_demand_cert_manager {
-                    let _ = manager.try_enqueue(&sni, None);
+                if policy == SniCertPolicy::Default {
+                    if let Some(ref manager) = self.on_demand_cert_manager {
+                        let _ = manager.try_enqueue(&sni, None);
+                    }
                 }
             }
             Err(e) => {
@@ -454,6 +491,11 @@ pub fn setup_proxy_server(
         retention_resolver.clone(),
     );
 
+    // One counter set shared by the batch writer (log write retries/drops) and
+    // the load balancer (request counters), so the metrics sampler persists
+    // both from a single snapshot.
+    let proxy_metrics = Arc::new(crate::metrics::ProxyMetrics::default());
+
     // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
     let (proxy_log_handle, tracking_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
@@ -461,6 +503,8 @@ pub fn setup_proxy_server(
             ip_service.clone(),
             proxy_log_storage,
         );
+    let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
+    let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -557,6 +601,7 @@ pub fn setup_proxy_server(
         proxy_config.disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate);
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
@@ -692,6 +737,7 @@ pub fn setup_proxy_server(
         // only in DynamicCertLoader, never in the loader (ADR §7).
         let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
             cert_loader,
+            route_table: route_table.clone(),
             on_demand_cert_manager: proxy_config.on_demand_cert_manager.clone(),
         });
 
@@ -850,6 +896,11 @@ pub fn create_proxy_service(
         retention_resolver.clone(),
     );
 
+    // One counter set shared by the batch writer (log write retries/drops) and
+    // the load balancer (request counters), so the metrics sampler persists
+    // both from a single snapshot.
+    let proxy_metrics = Arc::new(crate::metrics::ProxyMetrics::default());
+
     // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
     let (proxy_log_handle, tracking_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
@@ -857,6 +908,8 @@ pub fn create_proxy_service(
             ip_service.clone(),
             proxy_log_storage,
         );
+    let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
+    let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -905,7 +958,8 @@ pub fn create_proxy_service(
         cert_host_cache,
         proxy_config.disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip);
+    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_proxy_metrics(proxy_metrics);
 
     Ok(lb)
 }
@@ -1144,6 +1198,34 @@ mod preflight_bind_tests {
         assert!(
             message.contains(&addr),
             "error should name the conflicting address: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sni_cert_policy_tests {
+    use super::*;
+
+    fn table() -> CachedPeerTable {
+        CachedPeerTable::new(Arc::new(sea_orm::DatabaseConnection::Disconnected))
+    }
+
+    #[test]
+    fn status_page_hosts_never_get_on_demand_or_unverified_certificates() {
+        let table = table();
+        table.insert_status_page_host_for_test("status.example.com", Some("abc"));
+        table.insert_status_page_host_for_test("pending.example.com", None);
+        assert_eq!(
+            sni_cert_policy(&table, "status.example.com"),
+            SniCertPolicy::StatusPageServing
+        );
+        assert_eq!(
+            sni_cert_policy(&table, "PENDING.example.com."),
+            SniCertPolicy::StatusPageRefused
+        );
+        assert_eq!(
+            sni_cert_policy(&table, "app.example.com"),
+            SniCertPolicy::Default
         );
     }
 }

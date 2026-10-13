@@ -133,6 +133,7 @@ function StatusDot({
           : 'Unknown'
   return (
     <span
+      role="img"
       className={cn(
         'inline-block size-2 rounded-full ring-2 ring-background',
         tone,
@@ -230,7 +231,7 @@ function DnsRecordStatusBadge({
   switch (status) {
     case 'verified':
       return (
-        <div className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-500">
+        <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-500">
           <CheckCircle2 className="size-4" />
           <span className="text-xs font-medium">Verified</span>
         </div>
@@ -313,7 +314,7 @@ export function DnsVerificationSummary({
   if (allVerified) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/30">
-        <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-500" />
+        <CheckCircle2 className="size-5 text-emerald-700 dark:text-emerald-500" />
         <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
           All {totalCount} required DNS records verified successfully
         </span>
@@ -325,7 +326,7 @@ export function DnsVerificationSummary({
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border bg-muted/40 p-3">
       <span className="text-sm font-medium">DNS status</span>
       {verifiedCount > 0 && (
-        <div className="flex items-center gap-1 text-sm text-emerald-600 dark:text-emerald-500">
+        <div className="flex items-center gap-1 text-sm text-emerald-700 dark:text-emerald-500">
           <CheckCircle2 className="size-4" />
           <span>{verifiedCount} verified</span>
         </div>

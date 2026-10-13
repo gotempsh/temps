@@ -309,7 +309,10 @@ function PlanApprovalVariant({
   return (
     <div className="space-y-3">
       {plan ? (
-        <div className={cn(proseClasses, 'max-h-72 overflow-auto')}>
+        <div
+          tabIndex={0}
+          className={cn(proseClasses, 'max-h-72 overflow-auto')}
+        >
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={markdownComponents}

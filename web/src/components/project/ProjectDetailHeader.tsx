@@ -227,6 +227,7 @@ export function ProjectDetailHeader({
               // an operator needs. It degrades to an icon plus a short label
               // instead of disappearing.
               <Badge
+                role="img"
                 variant="outline"
                 className="inline-flex shrink-0 gap-1"
                 title={dockerSocket.detail}
@@ -303,7 +304,7 @@ export function ProjectDetailHeader({
           )}
           <Button size="sm" onClick={onDeploy}>
             <Rocket className="size-4" />
-            <span className="hidden sm:inline">Deploy</span>
+            <span className="max-sm:sr-only">Deploy</span>
           </Button>
         </div>
       </div>

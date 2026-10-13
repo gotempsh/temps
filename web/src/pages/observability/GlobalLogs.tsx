@@ -349,15 +349,8 @@ export default function GlobalLogs() {
                       env: undefined,
                       node_id: undefined,
                       deploy_id: undefined,
+                      attr: undefined,
                     })
-                    setSearchParams(
-                      (current) => {
-                        const next = new URLSearchParams(current)
-                        next.delete('attr')
-                        return next
-                      },
-                      { replace: true }
-                    )
                   }}
                 >
                   Clear filters

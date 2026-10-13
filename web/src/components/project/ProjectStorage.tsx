@@ -216,7 +216,7 @@ function ServiceRow({
             }}
           >
             <Database className="size-3.5" />
-            <span className="hidden sm:inline">Browse</span>
+            <span className="max-sm:sr-only">Browse</span>
           </Button>
         ) : (
           <Button

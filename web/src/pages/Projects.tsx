@@ -24,7 +24,8 @@ import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import { ArrowRight, RefreshCw } from 'lucide-react'
-import { Link, useSearchParams } from 'react-router'
+import { Link } from 'react-router'
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
@@ -42,13 +43,11 @@ const SEARCH_CATALOG_LIMIT = 50
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
   const { page, pageSize } = readProjectPagination(searchParams)
   const projectSearch = searchParams.get('q') ?? ''
   const setProjectSearch = (value: string) => {
-    setSearchParams((current) => withProjectSearch(current, value), {
-      replace: true,
-    })
+    updateSearchParams((current) => withProjectSearch(current, value))
   }
   const normalizedProjectSearch = projectSearch.trim().toLowerCase()
 
@@ -82,7 +81,7 @@ export function Projects() {
 
   const setPagination = useCallback(
     (nextPage: number, nextPageSize = pageSize, replace = false) => {
-      setSearchParams(
+      updateSearchParams(
         (current) =>
           withProjectPagination(current, {
             page: nextPage,
@@ -91,7 +90,7 @@ export function Projects() {
         { replace }
       )
     },
-    [pageSize, setSearchParams]
+    [pageSize, updateSearchParams]
   )
 
   useEffect(() => {
@@ -242,6 +241,7 @@ export function Projects() {
 
       {isLoading || isPageOutOfRange ? (
         <div
+          role="status"
           className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
           aria-label="Loading projects"
           aria-busy="true"

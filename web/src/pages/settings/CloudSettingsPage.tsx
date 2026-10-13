@@ -360,7 +360,7 @@ export function CloudSettingsPage() {
                   Connection state
                 </p>
                 <div className="flex items-center gap-3">
-                  <span className="grid size-9 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-500">
+                  <span className="grid size-9 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500">
                     <Check className="size-4" />
                   </span>
                   <div>

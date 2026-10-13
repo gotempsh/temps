@@ -816,7 +816,7 @@ export function ProxyLogsDataTable({
               setPage(1)
             }}
           >
-            <SelectTrigger className="w-[100px]">
+            <SelectTrigger aria-label="Rows per page" className="w-[100px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>

@@ -58,7 +58,7 @@ import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Link, useNavigate } from 'react-router'
-import { DataTable, type DataTableColumn } from '@temps-sdk/ds'
+import { DataTable, useUrlBoundText, type DataTableColumn } from '@temps-sdk/ds'
 import type { DomainSort } from './domain-sort'
 import { hasUrgentCertificate } from './domain-expiry'
 
@@ -99,6 +99,12 @@ export function DomainsManagement({
 }: DomainsManagementProps) {
   const [domainToDelete, setDomainToDelete] = useState<DomainResponse | null>(
     null
+  )
+  // The query lives in the URL; typing is mirrored locally so a router
+  // transition cannot reset the box and drop keystrokes.
+  const [searchText, setSearchText] = useUrlBoundText(
+    searchQuery,
+    onSearchChange
   )
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
@@ -301,8 +307,8 @@ export function DomainsManagement({
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <Input
-          value={searchQuery}
-          onChange={(e) => onSearchChange(e.target.value)}
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
           aria-label="Search domains"
           placeholder="Search domains..."
           className="pl-9 pr-10"

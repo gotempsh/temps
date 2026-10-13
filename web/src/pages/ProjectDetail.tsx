@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import {
   getLastDeploymentOptions,
   getEnvironmentVariablesOptions,
@@ -63,6 +64,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import { projectLoadState } from '@/lib/project-load-state'
 import {
@@ -160,16 +162,19 @@ export function ProjectDetail() {
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
 
-  const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
+  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } = useQuery(
     {
       ...getLastDeploymentOptions({
         path: {
           id: project?.id || 0,
         },
       }),
+      select: selectLastDeployment,
       enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
-        const data = query.state.data
+        // `state.data` is the raw response; the deployment is `null` until the
+        // first deploy.
+        const data = query.state.data?.deployment
         // Poll more frequently for active deployments
         if (
           data &&
@@ -186,6 +191,9 @@ export function ProjectDetail() {
       refetchOnWindowFocus: true,
     }
   )
+  // The API answers 200 with `deployment: null` for a project that has never
+  // deployed; consumers take `undefined` for "nothing yet".
+  const lastDeployment = lastDeploymentOrNull ?? undefined
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({
@@ -464,7 +472,7 @@ export function ProjectDetail() {
         <div className="min-w-0 flex-1 overflow-y-auto p-4">
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
               {['project', 'integrations', 'setup'].map((path) => (
                 <Route
                   key={path}
@@ -659,10 +667,10 @@ export function ProjectDetail() {
           <ProjectTour />
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
               <Route
                 path="hosting"
-                element={<Navigate to="../settings/delivery" replace />}
+                element={<RedirectWithQuery to="../settings/delivery" />}
               />
               <Route
                 path="integrations"
@@ -679,7 +687,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="tools"
-                element={<Navigate to="../settings/general" replace />}
+                element={<RedirectWithQuery to="../settings/general" />}
               />
               <Route
                 path="setup"
@@ -851,7 +859,7 @@ export function ProjectDetail() {
                   any lingering /dashboards links. */}
               <Route
                 path="dashboards/*"
-                element={<Navigate to="../metrics/dashboards" replace />}
+                element={<RedirectWithQuery to="../metrics/dashboards" />}
               />
               <Route
                 path="ai-gateway"

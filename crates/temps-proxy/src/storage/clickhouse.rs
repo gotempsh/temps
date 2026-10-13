@@ -969,7 +969,7 @@ impl ClickHouseProxyLogStore {
 impl ProxyLogStorage for ClickHouseProxyLogStore {
     async fn write_batch(
         &self,
-        entries: Vec<CreateProxyLogRequest>,
+        entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError> {
         if entries.is_empty() {
             return Ok(());
@@ -2504,7 +2504,7 @@ mod tests {
         entry.is_bot = Some(true);
         entry.bot_name = Some("GPTBot".to_string());
         store
-            .write_batch(vec![entry])
+            .write_batch(&[entry])
             .await
             .expect("insert proxy-log fixture");
 
@@ -2554,7 +2554,7 @@ mod tests {
         failed.project_id = Some(7);
         failed.status_code = 503;
         store
-            .write_batch(vec![ok, failed])
+            .write_batch(&[ok, failed])
             .await
             .expect("insert proxy-log fixtures");
 
@@ -2612,7 +2612,7 @@ mod tests {
         served.status_code = 200;
 
         store
-            .write_batch(vec![upgrade, served])
+            .write_batch(&[upgrade, served])
             .await
             .expect("insert proxy-log fixtures");
 
@@ -2666,7 +2666,7 @@ mod tests {
         crawler.bot_name = Some("ExampleBot".to_string());
 
         store
-            .write_batch(vec![fast, slow_error, monitor, crawler])
+            .write_batch(&[fast, slow_error, monitor, crawler])
             .await
             .expect("insert traffic aggregation fixtures");
 
@@ -2814,7 +2814,7 @@ mod tests {
         no_latency.path = "/api/no-latency".to_string();
         no_latency.response_time_ms = None;
         store
-            .write_batch(vec![no_latency])
+            .write_batch(&[no_latency])
             .await
             .expect("insert traffic fixture without latency");
 
@@ -3183,7 +3183,7 @@ mod tests {
             ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
             Arc::new(temps_core::FixedRetentionResolver),
         );
-        assert!(store.write_batch(vec![]).await.is_ok());
+        assert!(store.write_batch(&[]).await.is_ok());
     }
 
     #[tokio::test]

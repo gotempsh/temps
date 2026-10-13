@@ -131,7 +131,7 @@ function FailedDeploymentNotice({
             {failure.remediation}
           </p>
         ) : reason ? (
-          <p className="whitespace-pre-wrap break-words text-sm text-destructive/80">
+          <p className="whitespace-pre-wrap break-words text-sm text-destructive">
             {reason}
           </p>
         ) : null}

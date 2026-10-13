@@ -358,7 +358,10 @@ export function GlobalMcpServerDetail() {
                     Raw config
                   </div>
                   <div className="rounded-md border bg-muted/50 p-3">
-                    <pre className="text-xs whitespace-pre-wrap font-mono overflow-x-auto">
+                    <pre
+                      tabIndex={0}
+                      className="text-xs whitespace-pre-wrap font-mono overflow-x-auto"
+                    >
                       <HighlightedCode
                         code={JSON.stringify(mcp.config, null, 2)}
                         language="json"

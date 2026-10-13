@@ -611,6 +611,105 @@ pub type OnCertEligibleCallback = Arc<
         + Sync,
 >;
 
+/// A custom hostname attached to a public status page (#1412).
+///
+/// Every attached hostname is reserved for the status page, whatever its
+/// state: no project route, sleeping wildcard or console fall-through may
+/// ever answer it. `slug` is `Some` only while the page is published and the
+/// hostname's ownership has been proven (its `domains` row holds a valid
+/// certificate); otherwise the proxy answers 404 and no certificate is
+/// served for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusPageHostRoute {
+    pub slug: Option<Arc<str>>,
+}
+
+/// Lowercase `host`, dropping a `:port` suffix and a trailing dot, the same
+/// way the status-page hostname column is stored. Borrows when already
+/// normalized, which is the common case for proxy lookups.
+pub fn normalize_route_hostname(host: &str) -> std::borrow::Cow<'_, str> {
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    let host = host.trim_end_matches('.');
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct StatusPageHostRow {
+    hostname: String,
+    slug: Option<String>,
+    attached: bool,
+    serving: bool,
+}
+
+/// Status-page hostname bindings, split into hostnames attached to a page and
+/// tombstones (removed hostnames, or ones whose page or project was deleted).
+#[derive(Debug, Default)]
+struct StatusPageHostBindings {
+    attached: HashMap<String, StatusPageHostRoute>,
+    tombstones: HashSet<String>,
+}
+
+/// Load every status-page hostname binding (#1412).
+async fn load_status_page_hosts(
+    db: &DatabaseConnection,
+) -> Result<StatusPageHostBindings, sea_orm::DbErr> {
+    use sea_orm::{FromQueryResult, Statement};
+    let rows = StatusPageHostRow::find_by_statement(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT spd.hostname,
+               sp.slug,
+               (sp.id IS NOT NULL) AS attached,
+               -- Ownership is proven once the binding's own `domains` row
+               -- holds a certificate: the row is created empty for the
+               -- binding and only ACME issuance fills it. Its `status` is not
+               -- consulted, because a renewal order moves it to
+               -- `challenge_requested` while the current certificate is
+               -- still valid and must keep being served.
+               COALESCE(
+                   sp.is_published
+                   AND NOT p.is_deleted
+                   AND d.certificate IS NOT NULL
+                   AND d.private_key IS NOT NULL
+                   AND (d.expiration_time IS NULL OR d.expiration_time > now())
+                   AND lower(d.domain) = spd.hostname,
+                   FALSE
+               ) AS serving
+        FROM status_page_domains spd
+        LEFT JOIN status_pages sp ON sp.id = spd.status_page_id
+        LEFT JOIN projects p ON p.id = sp.project_id
+        LEFT JOIN domains d ON d.id = spd.domain_id
+        "#,
+    ))
+    .all(db)
+    .await?;
+    let mut bindings = StatusPageHostBindings::default();
+    for row in rows {
+        let host = normalize_route_hostname(&row.hostname).into_owned();
+        if host.is_empty() {
+            continue;
+        }
+        if !row.attached {
+            bindings.tombstones.insert(host);
+            continue;
+        }
+        let slug = row
+            .serving
+            .then_some(row.slug)
+            .flatten()
+            .map(Arc::<str>::from);
+        bindings.attached.insert(host, StatusPageHostRoute { slug });
+    }
+    Ok(bindings)
+}
+
 #[derive(Clone, Debug, Default)]
 struct LegacyRouteTable {
     exact: HashMap<String, RouteInfo>,
@@ -620,6 +719,11 @@ struct LegacyRouteTable {
     /// hostname (ADR-051). Reserved exactly like the console hostname, and
     /// additionally pinned by the proxy to the public-only console surface.
     reserved_ingress_host: Option<String>,
+    /// Custom hostnames of status pages (#1412), reserved like the console
+    /// and ingress hosts. Never part of `exact`, so they are not exported to
+    /// worker nodes, not cert-eligible for on-demand TLS, and never resolve
+    /// to a project.
+    status_page_hosts: HashMap<String, StatusPageHostRoute>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -654,6 +758,7 @@ impl LegacyRouteTable {
     fn is_reserved(&self, host: &str) -> bool {
         self.reserved_console_host.as_deref() == Some(host)
             || self.reserved_ingress_host.as_deref() == Some(host)
+            || self.status_page_hosts.contains_key(host)
     }
 
     fn get(&self, host: &str) -> Option<&RouteInfo> {
@@ -2784,6 +2889,65 @@ impl CachedPeerTable {
             );
         }
 
+        // 7. Custom hostnames of public status pages (#1412). A hostname
+        // attached to a page is reserved for it: any project route on it is
+        // dropped, and it serves only while the page is published, its project
+        // is not being deleted, and its own `domains` row holds a valid
+        // certificate (ownership proven through ACME). A tombstone (removed
+        // hostname, or deleted page/project) answers 404 too, but only while
+        // nothing else claims the name: any application route wins over it.
+        // The console and public ingress hostnames win over both.
+        let status_bindings = load_status_page_hosts(self.db.as_ref()).await?;
+        let console_host_for_status = app_settings.console_hostname();
+        let ingress_host_for_status = app_settings.dedicated_public_ingress_hostname();
+        let is_platform_host = |host: &str| {
+            console_host_for_status.as_deref() == Some(host)
+                || ingress_host_for_status.as_deref() == Some(host)
+        };
+        let mut status_page_hosts: HashMap<String, StatusPageHostRoute> = HashMap::new();
+        for (host, route) in status_bindings.attached {
+            if is_platform_host(&host) {
+                continue;
+            }
+            let removed = routes.remove(&host).is_some()
+                | http_routes_map.remove(&host).is_some()
+                | tls_routes_map.remove(&host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for status-page hostname '{}' — it is attached to a status page",
+                    host
+                );
+            }
+            unavailable.exact.remove(&host);
+            status_page_hosts.insert(host, route);
+        }
+        for host in status_bindings.tombstones {
+            let claimed = is_platform_host(&host)
+                || status_page_hosts.contains_key(&host)
+                || routes.contains_key(&host)
+                || http_routes_map.contains_key(&host)
+                || tls_routes_map.contains_key(&host)
+                || unavailable.exact.contains_key(&host)
+                || http_wildcards_matcher.match_domain(&host).is_some()
+                || tls_wildcards_matcher.match_domain(&host).is_some()
+                || host
+                    .split_once('.')
+                    .is_some_and(|(_, parent)| routes.contains_key(&format!("*.{parent}")));
+            if !claimed {
+                status_page_hosts.insert(host, StatusPageHostRoute { slug: None });
+            }
+        }
+        if !status_page_hosts.is_empty() {
+            debug!(
+                "Section 7: Loaded {} status-page hostnames ({} serving)",
+                status_page_hosts.len(),
+                status_page_hosts
+                    .values()
+                    .filter(|r| r.slug.is_some())
+                    .count()
+            );
+        }
+
         // The console hostname is owned by the control plane, never by a
         // project. A route pointing it at a deployment locks the operator out
         // of the console entirely (issue #478) — the create/update API now
@@ -2862,7 +3026,8 @@ impl CachedPeerTable {
             app_settings
                 .console_hostname()
                 .into_iter()
-                .chain(ingress_host.clone()),
+                .chain(ingress_host.clone())
+                .chain(status_page_hosts.keys().cloned()),
         );
 
         // Atomically replace all route tables
@@ -2884,6 +3049,7 @@ impl CachedPeerTable {
                 wildcards: legacy_wildcards_matcher,
                 reserved_console_host: app_settings.console_hostname(),
                 reserved_ingress_host: ingress_host,
+                status_page_hosts,
             },
             ownership: route_ownership,
             unavailable,
@@ -3050,6 +3216,20 @@ impl CachedPeerTable {
         Some(route.clone())
     }
 
+    /// Record a status-page hostname for cross-crate tests without database
+    /// setup. Not used on the production load path.
+    #[doc(hidden)]
+    pub fn insert_status_page_host_for_test(&self, host: &str, slug: Option<&str>) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.legacy.status_page_hosts.insert(
+            normalize_route_hostname(host).into_owned(),
+            StatusPageHostRoute {
+                slug: slug.map(Arc::from),
+            },
+        );
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
     /// Record an unavailable hostname for cross-crate tests without database
     /// setup. Not used on the production load path.
     #[doc(hidden)]
@@ -3086,6 +3266,23 @@ impl CachedPeerTable {
             _ => host,
         };
         reserved.eq_ignore_ascii_case(host.trim_end_matches('.'))
+    }
+
+    /// The status-page binding for `host`, if it is a status page's custom
+    /// hostname (#1412). One lock-free snapshot load and one hash lookup; no
+    /// allocation unless `host` carries uppercase letters. `host` may be a raw
+    /// `Host` header: a `:port` suffix, a trailing dot and letter case are
+    /// ignored.
+    pub fn status_page_host(&self, host: &str) -> Option<StatusPageHostRoute> {
+        let snapshot = self.route_snapshot.load();
+        if snapshot.legacy.status_page_hosts.is_empty() {
+            return None;
+        }
+        snapshot
+            .legacy
+            .status_page_hosts
+            .get(normalize_route_hostname(host).as_ref())
+            .cloned()
     }
 
     /// Return whether an active route or reserved control-plane hostname owns

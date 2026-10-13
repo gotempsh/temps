@@ -6,6 +6,7 @@ import { aiHarnessName } from '@/components/ui/ai-harness-brand'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -137,14 +138,16 @@ function AgentEditForm({
   const [aiProvider, setAiProvider] = useState(agent.ai_provider ?? '')
   const [aiModel, setAiModel] = useState<string>(agent.ai_model ?? '')
   const [prompt, setPrompt] = useState(agent.prompt ?? '')
-  const [maxTurns, setMaxTurns] = useState(agent.max_turns ?? 25)
-  const [timeoutSeconds, setTimeoutSeconds] = useState(
+  const [maxTurns, setMaxTurns] = useState<number | undefined>(
+    agent.max_turns ?? 25
+  )
+  const [timeoutSeconds, setTimeoutSeconds] = useState<number | undefined>(
     agent.timeout_seconds ?? 600
   )
-  const [dailyBudgetCents, setDailyBudgetCents] = useState(
+  const [dailyBudgetCents, setDailyBudgetCents] = useState<number | undefined>(
     agent.daily_budget_cents ?? 500
   )
-  const [cooldownMinutes, setCooldownMinutes] = useState(
+  const [cooldownMinutes, setCooldownMinutes] = useState<number | undefined>(
     agent.cooldown_minutes ?? 30
   )
   const [branchPrefix, setBranchPrefix] = useState(
@@ -247,6 +250,22 @@ function AgentEditForm({
     if (triggerManual) triggerConfig.manual = true
     if (triggerCron.trim())
       triggerConfig.schedule = { cron: triggerCron.trim() }
+
+    // The limit boxes may be empty while editing; an empty or invalid one is
+    // an error on submit rather than silently becoming a default.
+    const isValidLimit = (value: number | undefined): value is number =>
+      value !== undefined && Number.isInteger(value) && value >= 0
+    if (
+      !isValidLimit(maxTurns) ||
+      !isValidLimit(timeoutSeconds) ||
+      !isValidLimit(dailyBudgetCents) ||
+      !isValidLimit(cooldownMinutes)
+    ) {
+      toast.error(
+        'Max turns, timeout, daily budget and cooldown must each be a whole number of 0 or more'
+      )
+      return
+    }
 
     const body: UpsertAgentRequest = {
       slug: agent.slug,
@@ -727,54 +746,50 @@ function AgentEditForm({
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
             <Label htmlFor="max-turns">Max turns</Label>
-            <Input
+            <NumberInput
               id="max-turns"
               name="max-turns"
-              type="number"
               min={0}
+              step={1}
               className="tabular-nums"
               value={maxTurns}
-              onChange={(e) => setMaxTurns(parseInt(e.target.value) || 0)}
+              onValueChange={setMaxTurns}
             />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="timeout">Timeout (sec)</Label>
-            <Input
+            <NumberInput
               id="timeout"
               name="timeout"
-              type="number"
               min={0}
+              step={1}
               className="tabular-nums"
               value={timeoutSeconds}
-              onChange={(e) => setTimeoutSeconds(parseInt(e.target.value) || 0)}
+              onValueChange={setTimeoutSeconds}
             />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="budget">Daily budget (cents)</Label>
-            <Input
+            <NumberInput
               id="budget"
               name="budget"
-              type="number"
               min={0}
+              step={1}
               className="tabular-nums"
               value={dailyBudgetCents}
-              onChange={(e) =>
-                setDailyBudgetCents(parseInt(e.target.value) || 0)
-              }
+              onValueChange={setDailyBudgetCents}
             />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="cooldown">Cooldown (min)</Label>
-            <Input
+            <NumberInput
               id="cooldown"
               name="cooldown"
-              type="number"
               min={0}
+              step={1}
               className="tabular-nums"
               value={cooldownMinutes}
-              onChange={(e) =>
-                setCooldownMinutes(parseInt(e.target.value) || 0)
-              }
+              onValueChange={setCooldownMinutes}
             />
           </div>
         </div>

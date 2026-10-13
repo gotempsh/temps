@@ -1628,7 +1628,7 @@ function QueryErrorState({ label, error }: { label: string; error?: unknown }) {
         {problem?.title ?? `Could not load ${label}.`}
       </p>
       {detail ? <p className="text-destructive/90">{detail}</p> : null}
-      <p className="text-destructive/80">
+      <p className="text-destructive">
         {isClientError
           ? 'Adjust the time range or filters above — retrying the same request will fail again.'
           : `Could not load ${label}. Refresh to try again.`}

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ProjectResponse } from '@/api/client'
+import type { ProjectResponse, ProjectSecretResponse } from '@/api/client'
 import {
   createProjectSecretMutation,
   deleteProjectSecretMutation,
@@ -36,7 +36,7 @@ import { Label } from '@/components/ui/label'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FileLock2, Plus, Trash2 } from 'lucide-react'
+import { FileLock2, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { detailReturnState } from '@/lib/detail-return-path'
@@ -49,6 +49,8 @@ import {
   type EnvironmentVariableCheck,
 } from './EnvironmentVariableChecks'
 import { indicatorsBySubject, useHttpChecks } from './http-checks'
+import { SecretEditDialog } from './SecretEditDialog'
+import { composeServiceNamesFor } from './secret-form'
 
 interface SecretsSettingsProps {
   project: ProjectResponse
@@ -86,6 +88,9 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   })
 
   const [isCreateOpen, setIsCreateOpen] = useState(false)
+  // The id outlives the dialog so its content stays put while it fades out.
+  const [editingSecretId, setEditingSecretId] = useState<number | null>(null)
+  const [isEditOpen, setIsEditOpen] = useState(false)
 
   useKeyboardShortcut({
     key: 'n',
@@ -102,6 +107,8 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   }
 
   const secrets = secretsQuery.data ?? []
+  const editingSecret: ProjectSecretResponse | null =
+    secrets.find((s) => s.id === editingSecretId) ?? null
   const environments = environmentsQuery.data ?? []
   const composeServiceNames = composeServiceNamesFor(project)
   const isComposeProject = project.preset === 'docker-compose'
@@ -162,6 +169,10 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               projectId={project.id}
               detailPath={secretPath(s.id)}
               checks={checksBySecret.get(s.id) ?? []}
+              onEdit={() => {
+                setEditingSecretId(s.id)
+                setIsEditOpen(true)
+              }}
               onManageChecks={() =>
                 navigate(secretPath(s.id), {
                   state: detailReturnState(location),
@@ -178,6 +189,13 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
           ))}
         </div>
       )}
+
+      <SecretEditDialog
+        open={isEditOpen && editingSecret !== null}
+        onOpenChange={setIsEditOpen}
+        project={project}
+        secret={editingSecret}
+      />
 
       <CreateSecretDialog
         open={isCreateOpen}
@@ -205,27 +223,6 @@ function secretScope(environments: Array<{ id: number }>): VariableChangeScope {
     : environments.map((environment) => environment.id)
 }
 
-/** Compose service names the project last synced from its compose file.
- *  Empty for non-Compose presets, which deploy a single container. */
-function composeServiceNamesFor(project: {
-  preset?: string | null
-  preset_config?: unknown
-}): string[] {
-  const cfg = (project.preset_config ?? {}) as Record<string, unknown>
-  const services = (cfg.composeServices ??
-    cfg.compose_services ??
-    []) as Array<{
-    name?: string
-  }>
-  return Array.from(
-    new Set(
-      services
-        .map((service) => service?.name)
-        .filter((name): name is string => typeof name === 'string' && !!name)
-    )
-  ).sort()
-}
-
 interface SecretRowProps {
   secret: {
     id: number
@@ -239,6 +236,7 @@ interface SecretRowProps {
   projectId: number
   detailPath: string
   checks: EnvironmentVariableCheck[]
+  onEdit: () => void
   onManageChecks: () => void
   onDeleted: () => void
 }
@@ -248,6 +246,7 @@ function SecretRow({
   projectId,
   detailPath,
   checks,
+  onEdit,
   onManageChecks,
   onDeleted,
 }: SecretRowProps) {
@@ -289,6 +288,15 @@ function SecretRow({
         ••••••••
       </span>
       <EnvironmentVariableChecks checks={checks} onManage={onManageChecks} />
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground"
+        aria-label={`Edit secret ${secret.key}`}
+        onClick={onEdit}
+      >
+        <Pencil className="h-4 w-4" />
+      </Button>
       <AlertDialog>
         <AlertDialogTrigger asChild>
           <Button

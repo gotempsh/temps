@@ -123,10 +123,10 @@ function formatDuration(ms: number): string {
 }
 
 function durationColor(ms: number): string {
-  if (ms < 100) return 'text-green-600 dark:text-green-400'
-  if (ms < 500) return 'text-yellow-600 dark:text-yellow-400'
-  if (ms < 2000) return 'text-orange-600 dark:text-orange-400'
-  return 'text-red-600 dark:text-red-400'
+  if (ms < 100) return 'text-green-700 dark:text-green-400'
+  if (ms < 500) return 'text-yellow-700 dark:text-yellow-400'
+  if (ms < 2000) return 'text-orange-700 dark:text-orange-400'
+  return 'text-red-700 dark:text-red-400'
 }
 
 const PAGE_SIZE = 10
@@ -1023,7 +1023,7 @@ export default function TracesList({ project }: TracesListProps) {
               }
             >
               <Gauge className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Operations</span>
+              <span className="max-sm:sr-only">Operations</span>
             </Button>
             <Button
               variant="outline"
@@ -1034,7 +1034,7 @@ export default function TracesList({ project }: TracesListProps) {
               }
             >
               <Bot className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">AI Traces</span>
+              <span className="max-sm:sr-only">AI Traces</span>
             </Button>
             <Button
               variant="outline"
@@ -1050,7 +1050,7 @@ export default function TracesList({ project }: TracesListProps) {
               }}
             >
               <Settings2 className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Setup</span>
+              <span className="max-sm:sr-only">Setup</span>
             </Button>
             {totalCount > 0 && (
               <span className="text-sm text-muted-foreground">

@@ -823,6 +823,39 @@ impl PostgresUpgradeOrchestrator {
         let source_volume = format!("{}_data", container_name);
         let rollback_volume = format!("{}_data_rollback_{}", container_name, row.id);
 
+        // The snapshot copies `{container}_data` and the dump reads PGDATA
+        // at `<from major>/docker` inside it. A container keeping its cluster
+        // anywhere else (an older layout, an imported container, a bind
+        // mount) would be dumped as an empty cluster and its live volume
+        // deleted, so refuse before stopping anything (#1415).
+        let from_pgdata = pgdata_path_for(&row.from_image).map_err(|reason| {
+            PostgresUpgradeError::SnapshotFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason,
+            }
+        })?;
+        super::recreate_guard::preflight(
+            &self.docker,
+            super::recreate_guard::ManagedEngine::Postgres,
+            &format!("service {}", row.service_id),
+            &container_name,
+            &super::recreate_guard::ReplacementStorage {
+                data_dir: from_pgdata,
+                mounts: vec![super::recreate_guard::PlannedMount {
+                    volume: source_volume.clone(),
+                    target: "/var/lib/postgresql".to_string(),
+                }],
+            },
+            "a major-version upgrade",
+        )
+        .await
+        .map_err(|e| PostgresUpgradeError::SnapshotFailed {
+            upgrade_id: row.id,
+            service_id: row.service_id,
+            reason: e.to_string(),
+        })?;
+
         self.ensure_busybox_pulled(row).await?;
         self.create_volume_if_missing(row, &rollback_volume).await?;
 

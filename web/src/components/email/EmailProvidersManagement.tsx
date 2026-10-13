@@ -41,6 +41,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -255,17 +256,8 @@ function ProviderCard({
   onTestClick: (id: number) => void
   onEditClick: (provider: EmailProvider) => void
 }) {
-  const [isDeleting, setIsDeleting] = useState(false)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const navigate = useNavigate()
-
-  const handleDelete = () => {
-    setIsDeleting(true)
-    try {
-      onDelete(provider.id)
-    } finally {
-      setIsDeleting(false)
-    }
-  }
 
   return (
     <Card
@@ -313,13 +305,21 @@ function ProviderCard({
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-destructive"
-                onClick={handleDelete}
-                disabled={isDeleting}
+                onClick={() => setConfirmingDelete(true)}
               >
-                {isDeleting ? 'Deleting...' : 'Delete'}
+                Delete
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          {/* Inside the stopPropagation wrapper so clicks in the dialog (a
+              React portal child of this card) don't navigate to the detail. */}
+          <ConfirmDialog
+            open={confirmingDelete}
+            onOpenChange={setConfirmingDelete}
+            title={`Delete ${provider.name}?`}
+            description="This permanently deletes the email provider. Domains and sending that rely on it will stop working. This cannot be undone."
+            onConfirm={() => onDelete(provider.id)}
+          />
         </div>
       </CardHeader>
       <CardContent>

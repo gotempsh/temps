@@ -45,7 +45,7 @@ async function mockApi(page: Page) {
       return
     }
     if (path.endsWith('/last-deployment')) {
-      await route.fulfill({ status: 404, json: { detail: 'No deployments' } })
+      await route.fulfill({ json: { deployment: null } })
       return
     }
     const json =

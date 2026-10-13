@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -155,16 +156,23 @@ export function AlertRulesManagement({
     },
   })
 
-  const handleDelete = async (rule: AlertRuleResponse) => {
-    if (!projectId) return
-    await deleteMutation.mutateAsync({
-      path: { project_id: projectId, rule_id: rule.id },
+  const [ruleToDelete, setRuleToDelete] = useState<AlertRuleResponse | null>(
+    null
+  )
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!projectId || !ruleToDelete) return
+    deleteMutation.mutate({
+      path: { project_id: projectId, rule_id: ruleToDelete.id },
     })
+    setRuleToDelete(null)
   }
 
-  const handleToggleEnabled = async (rule: AlertRuleResponse) => {
+  const handleToggleEnabled = (rule: AlertRuleResponse) => {
     if (!projectId) return
-    await updateMutation.mutateAsync({
+    updateMutation.mutate({
       path: { project_id: projectId, rule_id: rule.id },
       body: { enabled: !rule.enabled },
     })
@@ -303,7 +311,7 @@ export function AlertRulesManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(rule)}
+                        onClick={() => setRuleToDelete(rule)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -332,6 +340,13 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
+      <ConfirmDialog
+        open={ruleToDelete !== null}
+        onOpenChange={(open) => !open && setRuleToDelete(null)}
+        title={`Delete ${ruleToDelete?.name ?? 'alert rule'}?`}
+        description="This permanently deletes the alert rule. It will stop sending notifications immediately. This cannot be undone."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

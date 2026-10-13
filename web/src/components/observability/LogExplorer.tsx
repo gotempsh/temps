@@ -665,7 +665,10 @@ export function LogExplorer({
             >
               {new Date(line.timestamp).toLocaleString()}
             </time>
-            <pre className="my-3 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs">
+            <pre
+              tabIndex={0}
+              className="my-3 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs"
+            >
               <AnsiLogMessage message={line.message} />
             </pre>
             <CopyButton
@@ -699,7 +702,10 @@ export function LogExplorer({
                 <h3 className="mb-2 text-xs font-semibold">
                   Structured fields
                 </h3>
-                <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs">
+                <pre
+                  tabIndex={0}
+                  className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs"
+                >
                   <HighlightedCode
                     code={JSON.stringify(line.fields, null, 2)}
                     language={'json'}
@@ -911,7 +917,10 @@ function SurroundingLines({ line }: { line: GlobalLogLine }) {
               </Button>
             </div>
           ) : (
-            <pre className="max-h-72 overflow-auto rounded bg-muted p-2 font-mono text-[11px]">
+            <pre
+              tabIndex={0}
+              className="max-h-72 overflow-auto rounded bg-muted p-2 font-mono text-[11px]"
+            >
               {query.data.lines.map((context, index) => (
                 <div
                   key={context.line_id}

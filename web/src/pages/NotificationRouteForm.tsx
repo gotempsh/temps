@@ -180,7 +180,7 @@ export function NotificationRouteForm() {
     }))
   }
 
-  const save = async (event: FormEvent<HTMLFormElement>) => {
+  const save = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!draft.name.trim()) {
       toast.error('Route name is required')
@@ -192,12 +192,12 @@ export function NotificationRouteForm() {
     }
 
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { id: routeId },
         body: draft,
       })
     } else {
-      await createMutation.mutateAsync({ body: draft })
+      createMutation.mutate({ body: draft })
     }
   }
 

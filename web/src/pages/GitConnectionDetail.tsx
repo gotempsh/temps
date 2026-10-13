@@ -764,7 +764,7 @@ function HealthValue({ connection }: { connection: ConnectionResponse }) {
         connection.health_status === 'unhealthy'
           ? 'text-destructive'
           : connection.health_status === 'healthy'
-            ? 'text-emerald-600 dark:text-emerald-400'
+            ? 'text-emerald-700 dark:text-emerald-400'
             : undefined
       }
     >

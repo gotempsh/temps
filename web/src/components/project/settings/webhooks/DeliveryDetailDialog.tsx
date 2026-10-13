@@ -87,7 +87,7 @@ export function DeliveryDetailDialog({
             {delivery.success ? (
               <Badge
                 variant="outline"
-                className="gap-1 border-green-500/50 text-green-600 bg-green-50 dark:bg-green-950"
+                className="gap-1 border-green-500/50 text-green-700 dark:text-green-600 bg-green-50 dark:bg-green-950"
               >
                 <CheckCircle2 className="h-3 w-3" />
                 Success
@@ -95,7 +95,7 @@ export function DeliveryDetailDialog({
             ) : (
               <Badge
                 variant="outline"
-                className="gap-1 border-red-500/50 text-red-600 bg-red-50 dark:bg-red-950"
+                className="gap-1 border-red-500/50 text-red-700 dark:text-red-600 bg-red-50 dark:bg-red-950"
               >
                 <XCircle className="h-3 w-3" />
                 Failed

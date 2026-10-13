@@ -12,7 +12,7 @@ describe('shouldRetryQuery', () => {
   })
 
   test('retries a missing last deployment zero times', () => {
-    // GET /projects/{id}/last-deployment answers 404 before a first deploy.
+    // GET /projects/{id}/last-deployment answers 404 only for an unknown project.
     expect(
       shouldRetryQuery(0, {
         title: 'Not Found',

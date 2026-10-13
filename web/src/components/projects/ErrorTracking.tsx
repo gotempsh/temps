@@ -392,13 +392,13 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       case 'typeerror':
       case 'syntaxerror':
       case 'rangeerror':
-        return 'text-red-400 bg-red-500/15 border border-red-500/20'
+        return 'text-red-700 dark:text-red-400 bg-red-500/15 border border-red-500/20'
       case 'warning':
-        return 'text-yellow-400 bg-yellow-500/15 border border-yellow-500/20'
+        return 'text-yellow-700 dark:text-yellow-400 bg-yellow-500/15 border border-yellow-500/20'
       case 'info':
-        return 'text-blue-400 bg-blue-500/15 border border-blue-500/20'
+        return 'text-blue-600 dark:text-blue-400 bg-blue-500/15 border border-blue-500/20'
       default:
-        return 'text-red-400 bg-red-500/15 border border-red-500/20'
+        return 'text-red-700 dark:text-red-400 bg-red-500/15 border border-red-500/20'
     }
   }
   const handleCreateOrRegenerateDsn = () => {
@@ -636,12 +636,12 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
               {group.title}
             </p>
             {group.status === 'resolved' && (
-              <span className="flex items-center gap-1 text-xs text-green-500 shrink-0">
+              <span className="flex items-center gap-1 text-xs text-green-700 dark:text-green-500 shrink-0">
                 <CheckCircle2 className="h-3 w-3" /> Resolved
               </span>
             )}
             {group.status === 'ignored' && (
-              <span className="flex items-center gap-1 text-xs text-yellow-500 shrink-0">
+              <span className="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-500 shrink-0">
                 <EyeOff className="h-3 w-3" /> Ignored
               </span>
             )}
@@ -784,7 +784,9 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
               <span
                 className={cn(
                   'ml-2 inline-flex items-center gap-0.5 text-xs font-medium tabular-nums',
-                  trendUp ? 'text-red-500' : 'text-green-500'
+                  trendUp
+                    ? 'text-red-700 dark:text-red-500'
+                    : 'text-green-700 dark:text-green-500'
                 )}
               >
                 {trendUp ? (
@@ -902,7 +904,10 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           <TabsTrigger value="setup">
             DSN & Setup
             {!hasDsn && (
-              <Badge variant="outline" className="ml-2 text-yellow-600">
+              <Badge
+                variant="outline"
+                className="ml-2 text-yellow-700 dark:text-yellow-600"
+              >
                 !
               </Badge>
             )}
@@ -1082,6 +1087,7 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
                           <div className="space-y-2">
                             <div className="flex gap-2">
                               <Input
+                                aria-label="DSN"
                                 value={dsn.dsn || ''}
                                 readOnly
                                 className="font-mono text-sm"

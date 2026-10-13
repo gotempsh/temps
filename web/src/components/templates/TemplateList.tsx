@@ -103,7 +103,11 @@ export function TemplateList({
 
   if (isLoadingTemplates) {
     return (
-      <div className="grid gap-4 md:grid-cols-2" aria-label="Loading templates">
+      <div
+        role="status"
+        className="grid gap-4 md:grid-cols-2"
+        aria-label="Loading templates"
+      >
         {[0, 1, 2, 3].map((item) => (
           <Skeleton key={item} className="h-52 rounded-xl" />
         ))}

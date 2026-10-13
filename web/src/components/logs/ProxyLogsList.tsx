@@ -811,7 +811,7 @@ export default function ProxyLogsList({
                 className="h-8 px-2 sm:h-9 sm:px-3"
               >
                 <ChevronLeft className="h-4 w-4" />
-                <span className="hidden sm:inline ml-1">Previous</span>
+                <span className="max-sm:sr-only ml-1">Previous</span>
               </Button>
               {/* Desktop only: Show numbered page buttons */}
               <div className="hidden sm:flex items-center gap-1">
@@ -838,7 +838,7 @@ export default function ProxyLogsList({
                 disabled={page === totalPages}
                 className="h-8 px-2 sm:h-9 sm:px-3"
               >
-                <span className="hidden sm:inline mr-1">Next</span>
+                <span className="max-sm:sr-only mr-1">Next</span>
                 <ChevronRight className="h-4 w-4" />
               </Button>
             </div>

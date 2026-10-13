@@ -514,7 +514,7 @@ export function S3SourcesManagement() {
                           {isManagedByCloud && (
                             <Badge
                               variant="outline"
-                              className="gap-1 border-sky-400/40 text-sky-600 dark:text-sky-300"
+                              className="gap-1 border-sky-400/40 text-sky-700 dark:text-sky-300"
                             >
                               <Cloud className="size-3 fill-current" />
                               Managed by Temps Cloud

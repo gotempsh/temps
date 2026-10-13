@@ -437,7 +437,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
           <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/20">
             <Check className="size-7" />
           </div>
-          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-600 dark:text-emerald-400">
+          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-700 dark:text-emerald-400">
             Drop accepted
           </p>
           <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">

@@ -225,12 +225,9 @@ fn render_incident(html: &mut String, incident: &PublicIncident) {
 }
 
 /// The body served for any slug that is not a published page. Identical for
-/// unknown, malformed, unpublished and deleted slugs.
-pub const NOT_FOUND_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"robots\" content=\"noindex,nofollow\"><title>Status page not found</title></head>\
-<body style=\"font-family:system-ui,sans-serif;max-width:640px;margin:80px auto;padding:0 20px\">\
-<h1>Status page not found</h1><p>This status page does not exist or is no longer published.</p>\
-</body></html>";
+/// unknown, malformed, unpublished and deleted slugs, and shared with the
+/// proxy's answers on custom hostnames.
+pub use temps_core::public_status_page::NOT_FOUND_HTML;
 
 #[cfg(test)]
 mod tests {

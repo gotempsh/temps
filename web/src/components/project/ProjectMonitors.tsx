@@ -61,6 +61,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -91,7 +92,7 @@ const createMonitorSchema = z.object({
     error: 'Environment is required',
   }),
   check_interval_seconds: z
-    .number()
+    .number({ message: 'Check interval is required' })
     .min(30, 'Check interval must be at least 30 seconds'),
 })
 
@@ -218,12 +219,12 @@ function MonitorCard({
                   <div
                     className={`text-xs flex items-center gap-1 ${
                       currentMonitorStatus?.current_status === 'operational'
-                        ? 'text-green-500'
+                        ? 'text-green-700 dark:text-green-500'
                         : currentMonitorStatus?.current_status === 'degraded'
-                          ? 'text-yellow-500'
+                          ? 'text-yellow-700 dark:text-yellow-500'
                           : currentMonitorStatus?.current_status ===
                               'major_outage'
-                            ? 'text-red-500'
+                            ? 'text-red-700 dark:text-red-500'
                             : 'text-muted-foreground'
                     }`}
                   >
@@ -424,7 +425,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
           <Button variant="outline" asChild>
             <Link to={`/projects/${project.slug}/status-pages`}>
               <Globe className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">Status pages</span>
+              <span className="max-sm:sr-only">Status pages</span>
             </Link>
           </Button>
           {monitors && monitors.length > 0 && (
@@ -532,12 +533,14 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                     <FormItem>
                       <FormLabel>Check Interval (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
-                          min="30"
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(parseInt(e.target.value) || 60)
+                        <NumberInput
+                          min={30}
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>

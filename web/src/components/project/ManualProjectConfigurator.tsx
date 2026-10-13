@@ -638,6 +638,7 @@ export function ManualProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >

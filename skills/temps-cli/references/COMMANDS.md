@@ -1715,6 +1715,7 @@ Run a backup for an external service
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
+| `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |
 
 ## `runtime-logs` (alias: `rlogs`)
 
@@ -6068,6 +6069,7 @@ Publish public status pages for selected monitors
 - `unpublish` - Unpublish; the public URL returns 404 immediately
 - `rotate-url` - Replace the public URL; the old one stops working
 - `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
+- `domains` (`domain`) - Serve a status page on your own hostname
 
 ### `status-pages list` (alias: `ls`)
 
@@ -6162,6 +6164,78 @@ Delete a status page; its public URL returns 404 immediately
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Status page ID | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages domains` (alias: `domain`)
+
+Serve a status page on your own hostname
+
+**Subcommands:**
+
+- `list` (`ls`) - List a status page's custom domains and the DNS records they need
+- `add` - Attach a hostname; it serves only after ownership is verified
+- `verify` - Prove ownership and issue the certificate
+- `renew` - Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+- `remove` (`rm`) - Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+#### `status-pages domains list` (alias: `ls`)
+
+List a status page's custom domains and the DNS records they need
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains add`
+
+Attach a hostname; it serves only after ownership is verified
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--hostname <hostname>` | Hostname, e.g. status.example.com | - | Yes |
+| `--dns` | Verify with a DNS TXT record instead of HTTP | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains verify`
+
+Prove ownership and issue the certificate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains renew`
+
+Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains remove` (alias: `rm`)
+
+Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
 
 ## `alarms` (alias: `alarm`)

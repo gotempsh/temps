@@ -388,6 +388,18 @@ export type AddProviderModelRequest = {
     model_id: string;
 };
 
+export type AddStatusPageDomainRequest = {
+    /**
+     * Hostname to serve the page on, e.g. `status.example.com`. Unicode names
+     * are converted to punycode; wildcards and IP addresses are refused.
+     */
+    hostname: string;
+    /**
+     * Defaults to `http-01`.
+     */
+    verification_method?: VerificationMethod;
+};
+
 export type AdminGateResponse = {
     /**
      * `Host` header values allowed. Empty = any host.
@@ -1648,6 +1660,12 @@ export type AppSettings = {
      */
     anonymous_telemetry_enabled?: boolean | null;
     /**
+     * Managed Blob service (RustFS container) settings. Owned by
+     * `PATCH /blob/settings`; the generic settings update preserves the
+     * stored value.
+     */
+    blob?: BlobSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -1754,6 +1772,12 @@ export type AppSettings = {
      * `external_url`, which is the public-facing address.
      */
     internal_url?: string | null;
+    /**
+     * Managed KV service (Redis container) settings. Owned by
+     * `PATCH /kv/settings`; the generic settings update preserves the stored
+     * value.
+     */
+    kv?: KvSettings;
     letsencrypt?: LetsEncryptSettings;
     /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
@@ -2825,6 +2849,20 @@ export type BlobResponse = {
      * URL path to access the blob
      */
     url: string;
+};
+
+/**
+ * Settings of the managed Blob service (the RustFS container behind `/blob`).
+ *
+ * Same reasoning as [`KvSettings`]: the container is named
+ * `rustfs-<service name>`.
+ */
+export type BlobSettings = {
+    /**
+     * Docker container name of the Blob RustFS container. Empty means the
+     * per-instance default. A custom value must start with `rustfs-`.
+     */
+    container_name?: string;
 };
 
 /**
@@ -6621,6 +6659,18 @@ export type CurrentStatusResponse = {
     uptime_percentage: number;
 };
 
+/**
+ * Result of looking a hostname up among the custom domains the caller can see.
+ *
+ * "Not assigned to any project" is a normal state for a certificate that has
+ * not been attached yet, so it is expressed as `custom_domain: null` with a
+ * 200 rather than a 404. A hostname that belongs to a project the caller
+ * cannot see is deliberately reported the same way.
+ */
+export type CustomDomainLookupResponse = {
+    custom_domain?: CustomDomainResponse | null;
+};
+
 export type CustomDomainRequest = {
     branch?: string | null;
     domain: string;
@@ -7529,7 +7579,7 @@ export type DeploymentEnvironmentResponse = {
  * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
  * variants rather than renaming existing ones.
  */
-export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'unknown';
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'static_output_rejected' | 'build_node_unreachable' | 'static_deploy_failed' | 'unknown';
 
 /**
  * API view of a failed deployment's classification.
@@ -8448,6 +8498,28 @@ export type DnsRecordContent = {
     };
 };
 
+/**
+ * A DNS record the operator must create.
+ */
+export type DnsRecordInstruction = {
+    /**
+     * Fully qualified record name.
+     */
+    name: string;
+    /**
+     * Why the record is needed.
+     */
+    purpose: string;
+    /**
+     * `CNAME`, `A` or `TXT`.
+     */
+    record_type: string;
+    /**
+     * Record value.
+     */
+    value: string;
+};
+
 export type DnsRecordResponse = {
     /**
      * DNS record name (host)
@@ -8799,6 +8871,21 @@ export type DomainError = {
     code: string;
     details?: string | null;
     message: string;
+};
+
+/**
+ * Result of looking up the ACME order of a domain.
+ *
+ * Having no order is a normal state (the certificate is already issued, or no
+ * order has been started yet), so it is reported as `order: null` with a
+ * `reason` and a 200 instead of a 404. Only an unknown domain is a 404.
+ */
+export type DomainOrderResponse = {
+    order?: AcmeOrderResponse | null;
+    /**
+     * Why there is no order. Present only when `order` is `null`.
+     */
+    reason?: string | null;
 };
 
 /**
@@ -10614,6 +10701,27 @@ export type ExternalServiceBackupCapabilityResponse = {
 };
 
 /**
+ * What running a backup of this service now would do, so a client can warn
+ * before starting it.
+ */
+export type ExternalServiceBackupPreflightResponse = {
+    /**
+     * Engine that would run the backup (e.g. "postgres_walg").
+     */
+    engine: string;
+    /**
+     * Why, when `restarts_database` is true.
+     */
+    reason?: string | null;
+    /**
+     * The backup restarts the database (PostgreSQL with WAL archiving off).
+     * Send `confirm_restart: true` to run it.
+     */
+    restarts_database: boolean;
+    service_id: number;
+};
+
+/**
  * Response type for external service backup
  */
 export type ExternalServiceBackupResponse = {
@@ -10627,6 +10735,11 @@ export type ExternalServiceBackupResponse = {
     finished_at?: string | null;
     id: number;
     metadata: unknown;
+    /**
+     * Set on the response to a manual run: this backup restarts the
+     * database to turn WAL archiving on before backing it up.
+     */
+    restarts_database?: boolean | null;
     s3_location: string;
     service_id: number;
     /**
@@ -13790,6 +13903,23 @@ export type KnownAiAgentsResponse = {
 };
 
 /**
+ * Settings of the managed KV service (the Redis container behind `/kv`).
+ *
+ * The Docker container is named `redis-<service name>`, so two Temps
+ * instances sharing one Docker daemon collide unless each has its own name.
+ * An unset value follows the per-instance default (the pre-existing
+ * `redis-temps-kv` for an install that already enabled KV, a name derived
+ * from this instance otherwise).
+ */
+export type KvSettings = {
+    /**
+     * Docker container name of the KV Redis container. Empty means the
+     * per-instance default. A custom value must start with `redis-`.
+     */
+    container_name?: string;
+};
+
+/**
  * Response for KV service status
  */
 export type KvStatusResponse = {
@@ -13809,6 +13939,16 @@ export type KvStatusResponse = {
      * Service version
      */
     version?: string | null;
+};
+
+/**
+ * Most recent deployment of a project.
+ *
+ * A project that has never been deployed is a normal state, so it is
+ * reported as `deployment: null` with a 200 instead of a 404.
+ */
+export type LastDeploymentResponse = {
+    deployment?: DeploymentResponse | null;
 };
 
 export type LatestDeploymentMediaResponse = {
@@ -14483,6 +14623,35 @@ export type ManagedBackupSetup = {
 export type ManagedBackupSetupAction = 'none' | 'retry' | 'renew_subscription';
 
 export type ManagedBackupSetupStatus = 'disabled' | 'ready' | 'needs_setup' | 'subscription_required' | 'unavailable';
+
+/**
+ * Response of the container-name settings endpoints.
+ */
+export type ManagedContainerNameSettings = {
+    /**
+     * Docker container the service runs in on this instance.
+     */
+    container_name: string;
+    /**
+     * Whether an operator-chosen name is saved.
+     */
+    custom: boolean;
+    /**
+     * The container an empty setting resolves to: the pre-existing fixed
+     * name when this install already enabled the service, otherwise a name
+     * derived from this instance.
+     */
+    default_container_name: string;
+    /**
+     * Whether the service already exists. The name cannot change then:
+     * delete the service first.
+     */
+    in_use: boolean;
+    /**
+     * Every container name for this service must start with this.
+     */
+    required_prefix: string;
+};
 
 /**
  * Managed domain response
@@ -19633,6 +19802,30 @@ export type PublicUptimeDay = {
     uptime_percentage?: number | null;
 };
 
+/**
+ * Whether published status pages have an address people can open.
+ *
+ * Follows the capability-endpoint pattern: an unconfigured install answers
+ * with `configured: false`, a reason and the console path that fixes it,
+ * rather than a made-up URL.
+ */
+export type PublicUrlStatus = {
+    /**
+     * `true` when `public_url` is present on the page.
+     */
+    configured: boolean;
+    /**
+     * Why there is no public URL, or why the one there will not open from
+     * outside this network (for example a loopback address). `None` when
+     * nothing is known to be wrong.
+     */
+    reason?: string | null;
+    /**
+     * Console path where the operator sets it. Present whenever `reason` is.
+     */
+    setup_path?: string | null;
+};
+
 export type PurgeLogsRequest = {
     /**
      * Delete all logs before this timestamp (ISO 8601)
@@ -20703,6 +20896,12 @@ export type ResourceLimitsUpdateResponse = {
      * The limits that were persisted to the encrypted config.
      */
     limits: ServiceResourceLimits;
+    /**
+     * Set when a new `/dev/shm` size was saved but could not be applied,
+     * because that needs a new container and replacing it was refused or
+     * failed (the reason says which, and that no data was changed).
+     */
+    shm_not_applied?: string | null;
 };
 
 /**
@@ -21213,6 +21412,13 @@ export type RunExternalServiceBackupRequest = {
      * Type of backup to perform (e.g., "full", "incremental")
      */
     backup_type?: string | null;
+    /**
+     * Acknowledge that this backup restarts the database. Required (`true`)
+     * when `GET /backups/external-services/{id}/run-preflight` reports
+     * `restarts_database`; otherwise the request is refused with a 409 and
+     * nothing is started.
+     */
+    confirm_restart?: boolean | null;
     /**
      * ID of the S3 source to store the backup. If omitted, the current default S3 source is used.
      */
@@ -24287,6 +24493,30 @@ export type StatusCodesQuery = {
     start_date: string;
 };
 
+export type StatusPageDomainResponse = {
+    certificate_expires_at?: string | null;
+    created_at: string;
+    dns_records: Array<DnsRecordInstruction>;
+    hostname: string;
+    id: number;
+    /**
+     * Reason the last verification failed, if it did.
+     */
+    last_error?: string | null;
+    /**
+     * True when visitors can open the page on this hostname right now: the
+     * hostname is verified and the page is published.
+     */
+    serving: boolean;
+    status: StatusPageDomainStatus;
+    verification_method: VerificationMethod;
+};
+
+/**
+ * Lifecycle of a custom hostname.
+ */
+export type StatusPageDomainStatus = 'pending' | 'active' | 'failed' | 'unverified' | 'renewal_pending' | 'renewal_failed';
+
 export type StatusPageListResponse = {
     items: Array<StatusPageResponse>;
     page: number;
@@ -24333,13 +24563,22 @@ export type StatusPageResponse = {
     monitors: Array<StatusPageMonitorResponse>;
     project_id: number;
     /**
-     * Machine-readable form of the public page.
+     * Machine-readable form of the public page. `None` exactly when
+     * `public_url` is.
      */
-    public_json_url: string;
+    public_json_url?: string | null;
     /**
-     * Public HTML page. Serves 404 while the page is unpublished.
+     * Public HTML page. Serves 404 while the page is unpublished. `None`
+     * when this install has no public address to build it from; see
+     * `public_url_status` for why and where to fix it. Temps never invents a
+     * host for it.
      */
-    public_url: string;
+    public_url?: string | null;
+    /**
+     * Whether `public_url` exists, and if not (or if it will not open from
+     * outside this network) what to do about it.
+     */
+    public_url_status: PublicUrlStatus;
     published_at?: string | null;
     /**
      * Unguessable token in the public URL.
@@ -26600,6 +26839,17 @@ export type UpdateKvResponse = {
 };
 
 /**
+ * Request body of the container-name settings endpoints.
+ */
+export type UpdateManagedContainerName = {
+    /**
+     * New container name. Empty resets to the per-instance default. Must
+     * start with the service's prefix (`redis-` for KV, `rustfs-` for Blob).
+     */
+    container_name: string;
+};
+
+/**
  * Request to update a managed domain's settings.
  */
 export type UpdateManagedDomainApiRequest = {
@@ -27612,6 +27862,11 @@ export type VariableHistoryList = {
     total: number;
 };
 
+/**
+ * How ownership of a hostname is proven.
+ */
+export type VerificationMethod = 'http-01' | 'dns-01';
+
 export type VerificationResult = {
     checked_at: string;
     findings: Array<Finding>;
@@ -28053,12 +28308,23 @@ export type WebhookConfig = {
 };
 
 export type WebhookDeliveryResponse = {
+    /**
+     * 1-based attempt number within the delivery (sent as `X-Webhook-Attempt`).
+     */
     attempt_number: number;
     created_at: string;
     delivered_at?: string | null;
+    /**
+     * Stable identity of the delivery, identical for every attempt of it and
+     * sent as the `X-Webhook-Delivery` header. Dedupe on this value.
+     */
+    delivery_id: number;
     error_message?: string | null;
     event_id: string;
     event_type: string;
+    /**
+     * Id of this history row, i.e. of this single attempt.
+     */
     id: number;
     /**
      * JSON payload that was sent to the webhook endpoint
@@ -34418,6 +34684,10 @@ export type RunExternalServiceBackupErrors = {
      */
     404: ProblemDetails;
     /**
+     * The backup would restart the database and `confirm_restart` was not true (error_code RESTART_CONFIRMATION_REQUIRED); nothing was started
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -34433,6 +34703,48 @@ export type RunExternalServiceBackupResponses = {
 };
 
 export type RunExternalServiceBackupResponse = RunExternalServiceBackupResponses[keyof RunExternalServiceBackupResponses];
+
+export type ExternalServiceBackupPreflightData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/run-preflight';
+};
+
+export type ExternalServiceBackupPreflightErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * External service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ExternalServiceBackupPreflightError = ExternalServiceBackupPreflightErrors[keyof ExternalServiceBackupPreflightErrors];
+
+export type ExternalServiceBackupPreflightResponses = {
+    /**
+     * What a backup run would do
+     */
+    200: ExternalServiceBackupPreflightResponse;
+};
+
+export type ExternalServiceBackupPreflightResponse2 = ExternalServiceBackupPreflightResponses[keyof ExternalServiceBackupPreflightResponses];
 
 export type ListExternalServiceBackupsData = {
     body?: never;
@@ -35892,10 +36204,16 @@ export type BlobEnableErrors = {
      */
     401: unknown;
     /**
+     * The Blob container name is already taken on this Docker host by something that is not this instance's Blob service. Set a unique blob.container_name via PATCH /blob/settings
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: unknown;
 };
+
+export type BlobEnableError = BlobEnableErrors[keyof BlobEnableErrors];
 
 export type BlobEnableResponses = {
     /**
@@ -35905,6 +36223,78 @@ export type BlobEnableResponses = {
 };
 
 export type BlobEnableResponse = BlobEnableResponses[keyof BlobEnableResponses];
+
+export type BlobGetSettingsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/blob/settings';
+};
+
+export type BlobGetSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobGetSettingsResponses = {
+    /**
+     * Blob container-name settings
+     */
+    200: ManagedContainerNameSettings;
+};
+
+export type BlobGetSettingsResponse = BlobGetSettingsResponses[keyof BlobGetSettingsResponses];
+
+export type BlobUpdateSettingsData = {
+    body: UpdateManagedContainerName;
+    path?: never;
+    query?: never;
+    url: '/blob/settings';
+};
+
+export type BlobUpdateSettingsErrors = {
+    /**
+     * The container name is not one Docker and Temps accept
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The Blob service already exists, so its container cannot be renamed
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobUpdateSettingsError = BlobUpdateSettingsErrors[keyof BlobUpdateSettingsErrors];
+
+export type BlobUpdateSettingsResponses = {
+    /**
+     * Container name saved
+     */
+    200: ManagedContainerNameSettings;
+};
+
+export type BlobUpdateSettingsResponse = BlobUpdateSettingsResponses[keyof BlobUpdateSettingsResponses];
 
 export type BlobStatusData = {
     body?: never;
@@ -37727,7 +38117,7 @@ export type GetDomainOrderErrors = {
      */
     401: unknown;
     /**
-     * Order not found
+     * Domain not found
      */
     404: unknown;
     /**
@@ -37738,9 +38128,9 @@ export type GetDomainOrderErrors = {
 
 export type GetDomainOrderResponses = {
     /**
-     * Order retrieved successfully
+     * Order lookup result; `order` is null when the domain has no ACME order
      */
-    200: AcmeOrderResponse;
+    200: DomainOrderResponse;
 };
 
 export type GetDomainOrderResponse = GetDomainOrderResponses[keyof GetDomainOrderResponses];
@@ -37811,7 +38201,7 @@ export type FinalizeOrderErrors = {
      */
     404: unknown;
     /**
-     * Certificate issued but DNS cleanup requires operator action
+     * The ACME challenge was invalidated and cannot be retried (start a new order with POST /domains/{domain_id}/order), or the certificate was issued but DNS cleanup requires operator action
      */
     409: unknown;
     /**
@@ -42149,6 +42539,10 @@ export type ListContainersAtPathData = {
 
 export type ListContainersAtPathErrors = {
     /**
+     * Path is deeper than this data source's container hierarchy (the container has no child containers; list its entities instead)
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -42196,6 +42590,10 @@ export type ListEntitiesData = {
 
 export type ListEntitiesErrors = {
     /**
+     * Path is not a valid container for this data source
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -42234,6 +42632,10 @@ export type GetEntityInfoData = {
 };
 
 export type GetEntityInfoErrors = {
+    /**
+     * Path is not a valid container for this data source
+     */
+    400: unknown;
     /**
      * Unauthorized
      */
@@ -42427,6 +42829,10 @@ export type GetQueryContainerInfoData = {
 };
 
 export type GetQueryContainerInfoErrors = {
+    /**
+     * Path is not a valid container for this data source
+     */
+    400: unknown;
     /**
      * Unauthorized
      */
@@ -45763,10 +46169,16 @@ export type KvEnableErrors = {
      */
     401: unknown;
     /**
+     * The KV container name is already taken on this Docker host by something that is not this instance's KV service. Set a unique kv.container_name via PATCH /kv/settings
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: unknown;
 };
+
+export type KvEnableError = KvEnableErrors[keyof KvEnableErrors];
 
 export type KvEnableResponses = {
     /**
@@ -45911,6 +46323,78 @@ export type KvSetResponses = {
 };
 
 export type KvSetResponse = KvSetResponses[keyof KvSetResponses];
+
+export type KvGetSettingsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/kv/settings';
+};
+
+export type KvGetSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvGetSettingsResponses = {
+    /**
+     * KV container-name settings
+     */
+    200: ManagedContainerNameSettings;
+};
+
+export type KvGetSettingsResponse = KvGetSettingsResponses[keyof KvGetSettingsResponses];
+
+export type KvUpdateSettingsData = {
+    body: UpdateManagedContainerName;
+    path?: never;
+    query?: never;
+    url: '/kv/settings';
+};
+
+export type KvUpdateSettingsErrors = {
+    /**
+     * The container name is not one Docker and Temps accept
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The KV service already exists, so its container cannot be renamed
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvUpdateSettingsError = KvUpdateSettingsErrors[keyof KvUpdateSettingsErrors];
+
+export type KvUpdateSettingsResponses = {
+    /**
+     * Container name saved
+     */
+    200: ManagedContainerNameSettings;
+};
+
+export type KvUpdateSettingsResponse = KvUpdateSettingsResponses[keyof KvUpdateSettingsResponses];
 
 export type KvStatusData = {
     body?: never;
@@ -51918,6 +52402,10 @@ export type GetVisibleCustomDomainByHostnameData = {
 
 export type GetVisibleCustomDomainByHostnameErrors = {
     /**
+     * Hostname is not a valid domain name
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -51925,17 +52413,13 @@ export type GetVisibleCustomDomainByHostnameErrors = {
      * Project access denied
      */
     403: unknown;
-    /**
-     * Domain is not assigned to a project
-     */
-    404: unknown;
 };
 
 export type GetVisibleCustomDomainByHostnameResponses = {
     /**
-     * Custom domain assignment retrieved
+     * Lookup result; `custom_domain` is null when the hostname is not assigned to a visible project
      */
-    200: CustomDomainResponse;
+    200: CustomDomainLookupResponse;
 };
 
 export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
@@ -52283,7 +52767,7 @@ export type GetLastDeploymentData = {
 
 export type GetLastDeploymentErrors = {
     /**
-     * Project not found or no deployments
+     * Project not found
      */
     404: unknown;
     /**
@@ -52294,9 +52778,9 @@ export type GetLastDeploymentErrors = {
 
 export type GetLastDeploymentResponses = {
     /**
-     * Last deployment details
+     * Last deployment, or `deployment: null` when the project has no deployments yet
      */
-    200: DeploymentResponse;
+    200: LastDeploymentResponse;
 };
 
 export type GetLastDeploymentResponse = GetLastDeploymentResponses[keyof GetLastDeploymentResponses];
@@ -53920,6 +54404,48 @@ export type ResolveAlarmErrors = {
 export type ResolveAlarmResponses = {
     /**
      * Alarm resolved
+     */
+    200: unknown;
+};
+
+export type UnsilenceAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/{alarm_id}/silence';
+};
+
+export type UnsilenceAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UnsilenceAlarmResponses = {
+    /**
+     * Alarm unsilenced (or it was not silenced)
      */
     200: unknown;
 };
@@ -63530,6 +64056,10 @@ export type RetryDeliveryErrors = {
      */
     404: unknown;
     /**
+     * A concurrent retry already holds this attempt; nothing was sent
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -67039,6 +67569,246 @@ export type UpdateStatusPageResponses = {
 
 export type UpdateStatusPageResponse = UpdateStatusPageResponses[keyof UpdateStatusPageResponses];
 
+export type ListStatusPageDomainsData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains';
+};
+
+export type ListStatusPageDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPageDomainsResponses = {
+    /**
+     * Custom domains with their DNS records and state
+     */
+    200: Array<StatusPageDomainResponse>;
+};
+
+export type ListStatusPageDomainsResponse = ListStatusPageDomainsResponses[keyof ListStatusPageDomainsResponses];
+
+export type AddStatusPageDomainData = {
+    body: AddStatusPageDomainRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains';
+};
+
+export type AddStatusPageDomainErrors = {
+    /**
+     * Invalid hostname
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Hostname already in use, or domain limit reached
+     */
+    409: unknown;
+    /**
+     * Certificate order could not be started
+     */
+    502: unknown;
+    /**
+     * Hostname availability could not be checked
+     */
+    503: unknown;
+};
+
+export type AddStatusPageDomainResponses = {
+    /**
+     * Domain attached; create the DNS records, then verify
+     */
+    201: StatusPageDomainResponse;
+};
+
+export type AddStatusPageDomainResponse = AddStatusPageDomainResponses[keyof AddStatusPageDomainResponses];
+
+export type RemoveStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}';
+};
+
+export type RemoveStatusPageDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+};
+
+export type RemoveStatusPageDomainResponses = {
+    /**
+     * Domain removed; its certificate is deleted
+     */
+    204: void;
+};
+
+export type RemoveStatusPageDomainResponse = RemoveStatusPageDomainResponses[keyof RemoveStatusPageDomainResponses];
+
+export type RenewStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}/renew';
+};
+
+export type RenewStatusPageDomainErrors = {
+    /**
+     * The new order could not be validated
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+    /**
+     * The page is unpublished, the domain has no certificate yet, or another verify or renew of this hostname is in progress
+     */
+    409: unknown;
+    /**
+     * Too many domain operations for this project
+     */
+    429: unknown;
+};
+
+export type RenewStatusPageDomainResponses = {
+    /**
+     * Renewal started (DNS-01) or completed (HTTP-01)
+     */
+    200: StatusPageDomainResponse;
+};
+
+export type RenewStatusPageDomainResponse = RenewStatusPageDomainResponses[keyof RenewStatusPageDomainResponses];
+
+export type VerifyStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}/verify';
+};
+
+export type VerifyStatusPageDomainErrors = {
+    /**
+     * Ownership could not be verified yet
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+    /**
+     * The page is unpublished, or another verify or renew of this hostname is in progress
+     */
+    409: unknown;
+    /**
+     * Too many domain operations for this project
+     */
+    429: unknown;
+    /**
+     * Certificate order could not be started
+     */
+    502: unknown;
+};
+
+export type VerifyStatusPageDomainResponses = {
+    /**
+     * Verification result; `status` is `active` once the certificate is issued
+     */
+    200: StatusPageDomainResponse;
+};
+
+export type VerifyStatusPageDomainResponse = VerifyStatusPageDomainResponses[keyof VerifyStatusPageDomainResponses];
+
 export type PublishStatusPageData = {
     body?: never;
     path: {
@@ -67431,6 +68201,44 @@ export type ResolveSystemAlarmErrors = {
 export type ResolveSystemAlarmResponses = {
     /**
      * Alarm resolved
+     */
+    200: unknown;
+};
+
+export type UnsilenceSystemAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/silence';
+};
+
+export type UnsilenceSystemAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UnsilenceSystemAlarmResponses = {
+    /**
+     * Alarm unsilenced (or it was not silenced)
      */
     200: unknown;
 };
@@ -68288,6 +69096,10 @@ export type DisableMfaErrors = {
      */
     401: unknown;
     /**
+     * Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -68318,6 +69130,10 @@ export type SetupMfaErrors = {
      * Unauthorized or current password is incorrect
      */
     401: unknown;
+    /**
+     * Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)
+     */
+    403: unknown;
     /**
      * MFA is already enabled; verify and disable it before re-enrollment
      */
@@ -68353,6 +69169,10 @@ export type VerifyAndEnableMfaErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)
+     */
+    403: unknown;
     /**
      * Internal server error
      */

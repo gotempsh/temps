@@ -1714,8 +1714,9 @@ function PersistentAiFirstWorkspace() {
               title="Harnesses"
             >
               <Terminal className="size-4 sm:mr-1.5" />
-              <span className="hidden sm:inline">Harnesses</span>
+              <span className="max-sm:sr-only">Harnesses</span>
               <span
+                role="img"
                 aria-label={
                   harnessesLoading
                     ? 'Harness readiness is being checked'
@@ -1743,7 +1744,7 @@ function PersistentAiFirstWorkspace() {
           >
             <a href="/projects" title="Classic console">
               <X className="size-4 sm:mr-1.5" />
-              <span className="hidden sm:inline">Classic console</span>
+              <span className="max-sm:sr-only">Classic console</span>
             </a>
           </Button>
         </div>
@@ -2473,6 +2474,7 @@ export function ThreadStatusIndicator({
 
   return (
     <span
+      role="img"
       className={cn(
         'inline-flex shrink-0 items-center gap-1 text-[9px] font-medium',
         presentation.text

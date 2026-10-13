@@ -15,7 +15,6 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
-  getComposeSecurityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -24,6 +23,7 @@ import {
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
+import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
@@ -524,8 +524,9 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
-  const composeSecurityQuery = useQuery(
-    getComposeSecurityOptions({ path: { id: project.id } })
+  const composeSecurityQuery = useComposeSecurityPolicy(
+    project.id,
+    isComposePreset
   )
   const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
     null
@@ -1663,6 +1664,7 @@ function GitSettingsInline({
           <CardContent className="p-0 divide-y">
             <div className="flex items-center gap-4 p-6">
               <Switch
+                aria-label="Automatic deployments"
                 checked={autoDeployOn}
                 onCheckedChange={handleAutoDeployToggle}
               />

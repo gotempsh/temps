@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Error, ErrorType, Result as PingoraResult};
 use std::sync::Arc;
 use temps_routes::CachedPeerTable;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
 const ROUTE_PREFIX_OTEL: &str = "/api/otel";
@@ -121,6 +121,24 @@ impl UpstreamResolver for UpstreamResolverImpl {
                 );
                 return Ok(console_peer(ingress_address));
             }
+        }
+
+        // A status page's custom hostname (#1412) is answered by the proxy's
+        // status-host branch in `request_filter`, which pins it to the
+        // public-only listener before peer resolution. Reaching this point
+        // with one means that branch was bypassed: refuse rather than let any
+        // path prefix below send the host to the console or a project.
+        if self.route_table.status_page_host(host).is_some()
+            || sni_hostname.is_some_and(|sni| self.route_table.status_page_host(sni).is_some())
+        {
+            warn!(
+                host,
+                "status-page hostname reached generic peer resolution; refusing"
+            );
+            return Err(Error::explain(
+                ErrorType::ConnectNoRoute,
+                format!("status-page hostname '{host}' is only served by the status-page branch"),
+            ));
         }
 
         // Route API and OTLP paths directly to the console (API server),
@@ -335,6 +353,10 @@ impl UpstreamResolver for UpstreamResolverImpl {
 
     fn is_public_ingress_host(&self, host: &str) -> bool {
         self.route_table.is_public_ingress_hostname(host)
+    }
+
+    fn status_page_host(&self, host: &str) -> Option<temps_routes::StatusPageHostRoute> {
+        self.route_table.status_page_host(host)
     }
 }
 

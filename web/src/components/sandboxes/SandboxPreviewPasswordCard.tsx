@@ -13,6 +13,8 @@ import { Input } from '@/components/ui/input'
 
 import {
   clearPreviewPasswordMutation,
+  getSandboxQueryKey,
+  listSandboxesQueryKey,
   setPreviewPasswordMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 
@@ -76,8 +78,12 @@ export function SandboxPreviewPasswordCard({
   const [show, setShow] = useState(false)
 
   const invalidate = () => {
-    queryClient.invalidateQueries({ queryKey: ['sandbox', sandboxId] })
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+    // The generated keys, not ad-hoc ones: the detail page and the preview
+    // links card read the password hint from this query.
+    queryClient.invalidateQueries({
+      queryKey: getSandboxQueryKey({ path: { id: sandboxId } }),
+    })
+    queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
   }
 
   const setMutation = useMutation({

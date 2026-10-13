@@ -242,6 +242,7 @@ export default function RequestLogDetail({
                         href={logDetail.referrer}
                         target="_blank"
                         rel="noopener noreferrer"
+                        aria-label="Open referrer in a new tab"
                       >
                         <ExternalLink className="h-3 w-3" />
                       </a>
