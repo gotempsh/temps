@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { domainNextStep, domainStateLabel, parseMonitorSpec, parseMonitorSpecs } from './index.js'
+import {
+  domainNextStep,
+  domainStateLabel,
+  parseMonitorSpec,
+  parseMonitorSpecs,
+  resolveLink,
+} from './index.js'
 
 describe('parseMonitorSpec', () => {
   test('parses <id>=<public name>', () => {
@@ -59,5 +65,34 @@ describe('domainNextStep', () => {
     expect(domainNextStep({ status: 'renewal_pending', verification_method: 'dns-01' })).toContain('domains verify')
     expect(domainNextStep({ status: 'renewal_failed', verification_method: 'http-01' })).toContain('domains renew')
     expect(domainNextStep({ status: 'pending', verification_method: 'http-01' })).toContain('domains verify')
+  })
+})
+
+describe('resolveLink', () => {
+  test('resolves a console-relative link against the instance URL', () => {
+    expect(resolveLink('/api/status/abc123', 'https://temps.example.test')).toBe(
+      'https://temps.example.test/api/status/abc123',
+    )
+  })
+
+  test('keeps the port of the instance URL', () => {
+    expect(resolveLink('/api/status/abc123/summary.json', 'http://localhost:3000')).toBe(
+      'http://localhost:3000/api/status/abc123/summary.json',
+    )
+  })
+
+  test('an instance URL that already carries /api does not double the prefix', () => {
+    expect(resolveLink('/api/status/abc123', 'https://temps.example.test/api')).toBe(
+      'https://temps.example.test/api/status/abc123',
+    )
+  })
+
+  test('leaves an absolute public URL untouched', () => {
+    const url = 'https://status.example.test/api/status/abc123'
+    expect(resolveLink(url, 'https://temps.example.test')).toBe(url)
+  })
+
+  test('returns the relative link when the instance URL cannot be a base', () => {
+    expect(resolveLink('/api/status/abc123', 'not a url')).toBe('/api/status/abc123')
   })
 })

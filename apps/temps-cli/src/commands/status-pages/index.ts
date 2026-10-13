@@ -107,14 +107,15 @@ function parseId(value: string, what: string): number | null {
 /**
  * Until a public or external URL is configured the API returns links relative
  * to the console (`/api/status/<slug>`). Resolve them against the instance this
- * CLI talks to, so they can be opened.
+ * CLI talks to, so they can be opened. An absolute URL is returned unchanged,
+ * and so is a relative one when `apiUrl` cannot be used as a base.
  */
-function resolveLink(url: string): string {
+export function resolveLink(url: string, apiUrl: string): string {
   if (!url.startsWith('/')) {
     return url
   }
   try {
-    return new URL(url, config.get('apiUrl')).toString()
+    return new URL(url, apiUrl).toString()
   } catch {
     return url
   }
@@ -125,8 +126,8 @@ function printPage(page: StatusPageResponse): void {
   header(`${icons.info} ${page.title}`)
   keyValue('ID', page.id)
   keyValue('State', page.is_published ? colors.success('published') : colors.muted('draft'))
-  keyValue('Public URL', resolveLink(page.public_url))
-  keyValue('JSON', resolveLink(page.public_json_url))
+  keyValue('Public URL', resolveLink(page.public_url, config.get('apiUrl')))
+  keyValue('JSON', resolveLink(page.public_json_url, config.get('apiUrl')))
   if (!page.public_url_configured) {
     warning(
       'No public URL is configured, so these links use the console address and only work '
@@ -426,7 +427,7 @@ export function registerStatusPagesCommands(program: Command): void {
         { header: 'Title', key: 'title', color: (v) => colors.bold(v) },
         { header: 'State', accessor: (p) => (p.is_published ? 'published' : 'draft') },
         { header: 'Monitors', accessor: (p) => String(p.monitors.length) },
-        { header: 'Public URL', accessor: (p) => (p.is_published ? resolveLink(p.public_url) : '-') },
+        { header: 'Public URL', accessor: (p) => (p.is_published ? resolveLink(p.public_url, config.get('apiUrl')) : '-') },
       ]
       printTable(result.items, columns, { style: 'minimal' })
       newline()
