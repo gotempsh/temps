@@ -243,13 +243,15 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-gnu
+          # The musl target is for the Firecracker guest agent (temps-vm-agent),
+          # which must be fully static; the temps binary itself stays on gnu.
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -283,9 +285,27 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps
 
+      # Guest-side agent for Firecracker sandboxes. It runs as PID 1 inside the
+      # microVM, so it has to be a fully static binary that works on any guest
+      # image. `temps firecracker setup` installs it from next to the `temps`
+      # executable, so it ships in the same tarball and always matches the
+      # host's wire protocol.
+      - name: Build Firecracker guest agent (static musl)
+        run: cargo build --release -p temps-vm-agent --bin temps-vm-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package Firecracker guest agent
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/temps-vm-agent
+          cp target/x86_64-unknown-linux-musl/release/temps-vm-agent temps-vm-agent
+          file temps-vm-agent
+          file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-amd64.tar.gz temps temps-vm-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
@@ -320,13 +340,14 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-          targets: aarch64-unknown-linux-gnu
+          # See build-linux-amd64: the musl target is for the static guest agent.
+          targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -363,9 +384,23 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps
 
+      # See build-linux-amd64: the static guest agent ships next to `temps`.
+      - name: Build Firecracker guest agent (static musl)
+        run: cargo build --release -p temps-vm-agent --bin temps-vm-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package Firecracker guest agent
+        run: |
+          strip target/aarch64-unknown-linux-musl/release/temps-vm-agent
+          cp target/aarch64-unknown-linux-musl/release/temps-vm-agent temps-vm-agent
+          file temps-vm-agent
+          file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-arm64.tar.gz temps temps-vm-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-arm64.tar.gz
 
       - name: Generate checksum
@@ -880,6 +915,10 @@ jobs:
           # Move to PATH
           sudo mv temps /usr/local/bin/temps
 
+          # Firecracker sandboxes only: `temps firecracker setup` looks for the
+          # guest agent next to the temps binary
+          sudo mv temps-vm-agent /usr/local/bin/temps-vm-agent
+
           # Verify
           temps --version
           ```
@@ -894,6 +933,10 @@ jobs:
 
           # Move to PATH
           sudo mv temps /usr/local/bin/temps
+
+          # Firecracker sandboxes only: `temps firecracker setup` looks for the
+          # guest agent next to the temps binary
+          sudo mv temps-vm-agent /usr/local/bin/temps-vm-agent
 
           # Verify
           temps --version
