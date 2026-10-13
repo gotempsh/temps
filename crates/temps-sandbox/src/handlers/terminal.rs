@@ -832,12 +832,17 @@ fn attach_timeout_problem(sandbox_id: &str, what: &str) -> Problem {
 
 /// Map a provider's `attach_pty` failure to the response a client should see.
 ///
-/// Three different situations, three different answers:
+/// Four different situations, four different answers:
 /// - the sandbox lives on a worker node, where terminals are not available
 ///   yet (ADR-048): the node-specific 422, not a hunt for an image problem;
 /// - the guest stalled past a provider deadline: a 504 to retry or restart;
-/// - anything else is a missing capability for *this* backend: a 409 whose
-///   detail carries the provider's own cause plus where to fix it.
+/// - the provider could not offer a terminal on this sandbox: a 409 whose
+///   detail carries the provider's own cause plus where to fix it;
+/// - an agent-run, definition or secret error, which a sandbox provider never
+///   produces: a 500 with no setup advice, since there is nothing to set up.
+///
+/// Every `AgentError` variant is named so that a new one has to be placed in
+/// one of these groups instead of silently becoming setup advice.
 fn attach_failure_problem(
     sandbox_id: &str,
     backend: temps_agents::sandbox::SandboxBackend,
@@ -857,14 +862,55 @@ fn attach_failure_problem(
             );
             attach_timeout_problem(sandbox_id, &timeout.to_string())
         }
-        other => problemdetails::new(StatusCode::CONFLICT)
+        unavailable @ (AgentError::SandboxExecFailed { .. }
+        | AgentError::SandboxCreationFailed { .. }
+        | AgentError::SandboxNotFound { .. }
+        | AgentError::SandboxProviderUnavailable { .. }
+        | AgentError::SandboxNodeUnavailable { .. }
+        | AgentError::SandboxConflictOnNode { .. }
+        | AgentError::Validation { .. }
+        | AgentError::ImmutableSandboxImageRebuild { .. }
+        | AgentError::SnapshotSizeLimitExceeded { .. }
+        | AgentError::Io(_)
+        | AgentError::Database(_)) => problemdetails::new(StatusCode::CONFLICT)
             .with_title("Terminal Unavailable")
             .with_detail(format!(
                 "Could not attach a terminal to sandbox {}: {}. {}",
                 sandbox_id,
-                other,
+                unavailable,
                 terminal_unavailable_hint(backend)
             )),
+        unexpected @ (AgentError::ConfigNotFound { .. }
+        | AgentError::AgentNotFound { .. }
+        | AgentError::RunNotFound { .. }
+        | AgentError::ProjectNotFound { .. }
+        | AgentError::BudgetExceeded { .. }
+        | AgentError::CooldownActive { .. }
+        | AgentError::AiCliNotInstalled { .. }
+        | AgentError::AiCliFailed { .. }
+        | AgentError::AiCliReportedError { .. }
+        | AgentError::AiCliTimeout { .. }
+        | AgentError::GitError { .. }
+        | AgentError::EncryptionError { .. }
+        | AgentError::SecretNotFound { .. }
+        | AgentError::SkillDefinitionNotFound { .. }
+        | AgentError::McpDefinitionNotFound { .. }
+        | AgentError::McpConfigFieldNotFound { .. }
+        | AgentError::SkillDefinitionAlreadyExists { .. }
+        | AgentError::McpDefinitionAlreadyExists { .. }
+        | AgentError::DockerSocketWriteRequiresAdmin { .. }) => {
+            tracing::error!(
+                sandbox_id = %sandbox_id,
+                error = %unexpected,
+                "sandbox provider returned an error it never produces for a terminal attach"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Terminal Attach Failed")
+                .with_detail(format!(
+                    "Could not attach a terminal to sandbox {}: {}",
+                    sandbox_id, unexpected
+                ))
+        }
     }
 }
 
@@ -1168,6 +1214,25 @@ mod tests {
         assert!(body.contains("no terminal listener"), "{body}");
         assert!(
             body.contains(terminal_unavailable_hint(SandboxBackend::Firecracker)),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn errors_a_provider_never_produces_are_500_without_setup_advice() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        let problem = attach_failure_problem(
+            "sbx_test",
+            SandboxBackend::Microsandbox,
+            AgentError::RunNotFound { run_id: 7 },
+        );
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = format!("{problem:?}");
+        assert!(body.contains("sbx_test"), "{body}");
+        assert!(
+            !body.contains(terminal_unavailable_hint(SandboxBackend::Microsandbox)),
             "{body}"
         );
     }
