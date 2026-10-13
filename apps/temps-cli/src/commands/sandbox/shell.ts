@@ -23,6 +23,7 @@
  * leave it idle past the timeout.
  */
 import type { IncomingMessage } from 'node:http'
+import type { Readable } from 'node:stream'
 import WebSocket from 'ws'
 
 import { requireAuth, credentials, config } from '../../config/store.js'
@@ -57,6 +58,21 @@ export function terminalWsUrl(
 
 /** Most of a rejected upgrade's response body we will buffer. */
 const MAX_REJECTION_BODY_BYTES = 16 * 1024
+
+/**
+ * Longest we wait for a rejected upgrade's body. The status line already told
+ * us it failed; the body only adds the explanation, so a peer that sends
+ * headers and then stalls must not be able to hold the command open.
+ */
+const REJECTION_BODY_TIMEOUT_MS = 3_000
+
+/**
+ * Longest the opening handshake may take. Deliberately above the server's own
+ * attach ceiling (100 s): a first terminal can include installing the
+ * in-guest agent, and the server's 504 explains a stall far better than a
+ * client-side abort would.
+ */
+const HANDSHAKE_TIMEOUT_MS = 120_000
 
 /**
  * Turn a rejected WebSocket upgrade into the sentence the user should see.
@@ -99,21 +115,86 @@ export function describeUpgradeRejection(
   )
 }
 
-/** Read a response body, bounded, for error reporting. */
-function readRejectionBody(res: IncomingMessage): Promise<string> {
+/**
+ * Undo HTTP/1.1 chunked transfer framing (`<hex size>[;ext]\r\n<data>\r\n …
+ * 0\r\n`) when `raw` carries it, otherwise return `raw` unchanged.
+ *
+ * Node's HTTP client strips the framing before the body reaches us; Bun's
+ * `ws` compatibility layer hands it through verbatim, which made a perfectly
+ * valid chunked problem document unparseable. Working on bytes, not text,
+ * because chunk sizes count bytes and a multi-byte character would otherwise
+ * shift every later boundary.
+ *
+ * Tolerant of truncation (the read is capped): it returns whatever whole
+ * data was seen rather than failing.
+ */
+export function decodeChunkedBody(raw: Buffer): Buffer {
+  const header = /^([0-9a-fA-F]{1,8})(?:;[^\r\n]*)?\r\n/
+  const looksFramed = (at: number): RegExpExecArray | null => {
+    // Only a few bytes: no need to stringify the whole body.
+    return header.exec(raw.subarray(at, at + 64).toString('latin1'))
+  }
+  if (!looksFramed(0)) return raw
+
+  const out: Buffer[] = []
+  let at = 0
+  for (;;) {
+    const match = looksFramed(at)
+    if (!match) break
+    const size = Number.parseInt(match[1]!, 16)
+    at += match[0].length
+    if (size === 0) break
+    // A partial final chunk (cap or cut connection) still contributes.
+    out.push(raw.subarray(at, Math.min(at + size, raw.length)))
+    at += size + 2 // data, then the CRLF that ends the chunk
+    if (at >= raw.length) break
+  }
+  return Buffer.concat(out)
+}
+
+/**
+ * Read at most `maxBytes` of `stream` within `timeoutMs`, then stop.
+ *
+ * Always settles: on end, error, close, the byte cap, or the deadline — and in
+ * the last two cases the stream is destroyed, so a peer that sends a rejection
+ * and then leaves the response open can neither hold the command nor keep a
+ * socket. Whatever arrived is returned; this is for error reporting, so a
+ * short read is a degraded message, not a failure.
+ */
+export function readBoundedBody(
+  stream: Readable,
+  maxBytes = MAX_REJECTION_BODY_BYTES,
+  timeoutMs = REJECTION_BODY_TIMEOUT_MS,
+): Promise<Buffer> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = []
     let size = 0
-    const done = () => resolve(Buffer.concat(chunks).toString('utf8'))
-    res.on('data', (chunk: Buffer) => {
-      if (size >= MAX_REJECTION_BODY_BYTES) return
-      chunks.push(chunk)
-      size += chunk.length
+    let settled = false
+    const done = (destroy: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (destroy) stream.destroy()
+      resolve(Buffer.concat(chunks).subarray(0, maxBytes))
+    }
+    const timer = setTimeout(() => done(true), timeoutMs)
+    stream.on('data', (chunk: Buffer | string) => {
+      if (settled) return
+      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+      chunks.push(buf)
+      size += buf.length
+      if (size >= maxBytes) done(true)
     })
-    res.on('end', done)
-    res.on('error', done)
-    res.on('close', done)
+    stream.on('end', () => done(false))
+    stream.on('error', () => done(false))
+    stream.on('close', () => done(false))
   })
+}
+
+/** Read a rejected upgrade's response body for error reporting. */
+async function readRejectionBody(res: IncomingMessage): Promise<string> {
+  const raw = await readBoundedBody(res)
+  return decodeChunkedBody(raw).toString('utf8')
 }
 
 /** Current terminal size, falling back to a sane default when not a TTY. */
@@ -155,6 +236,7 @@ export async function shellAction(
   // proxy logs and shell history, and this one is a live credential.
   const socket = new WebSocket(url, {
     headers: { Authorization: `Bearer ${apiKey}` },
+    handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
   })
 
   await runSession(socket, id, options)
