@@ -63,7 +63,7 @@ impl DiscoveredLocalCredential {
 
 #[derive(Debug, Error)]
 pub enum LocalCredentialError {
-    #[error("Claude Code local-login import is disabled. Save a token from `claude setup-token` or an Anthropic API key manually.")]
+    #[error("Claude Code local-login import is disabled because a copied login would share one rotating refresh token. Use \"Sign in with Claude\" in Settings > AI Agents, or save a token from `claude setup-token` or an Anthropic API key.")]
     ClaudeLocalImportDisabled,
     #[error("provider '{provider_id}' is not supported for local credential discovery")]
     UnsupportedProvider { provider_id: String },

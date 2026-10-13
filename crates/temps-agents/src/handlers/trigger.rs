@@ -802,8 +802,31 @@ pub async fn smoke_test_agent(
                         test_env.insert(auth_flavor.env_var.to_string(), plain);
                     }
                     CredentialFormat::OauthToken if target_provider_id == "claude_cli" => {
-                        // Legacy env var still recognized by the Claude CLI.
-                        test_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), plain);
+                        // Legacy env var still recognized by the Claude CLI. A
+                        // console sign-in is stored as a snapshot, so resolve
+                        // it to the bearer rather than exporting the JSON.
+                        match crate::ai_cli::credential_snapshot::resolve_claude_oauth(
+                            &plain,
+                            std::time::Duration::from_secs(300),
+                        )
+                        .await
+                        {
+                            Ok(resolved) => {
+                                test_env.insert(
+                                    "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                                    resolved.access_token,
+                                );
+                            }
+                            Err(error) => {
+                                // Leave the variable unset so the check reports
+                                // "not authenticated" instead of exporting JSON.
+                                tracing::warn!(
+                                    provider_id = %target_provider_id,
+                                    %error,
+                                    "saved Claude sign-in could not be resolved for the smoke test"
+                                );
+                            }
+                        }
                     }
                     _ => {
                         // ConfigFile flavors (opencode, codex subscription): the

@@ -223,6 +223,41 @@ fn build_bridge_router(path: &str, state: McpBridgeState) -> axum::Router {
 }
 
 const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cached harness version status for one principal's workspace.
+#[derive(Default)]
+struct HarnessUpdateState {
+    status: Option<temps_ai::HarnessUpdateStatus>,
+    checked_at: Option<Instant>,
+    updating: bool,
+}
+
+type HarnessUpdates = Arc<std::sync::Mutex<HashMap<i32, HarnessUpdateState>>>;
+
+/// Marks a workspace's harness as "updating" and clears the mark when dropped.
+///
+/// The update runs in a detached task that owns this guard, so a client that
+/// disconnects mid-update can neither strand the flag nor cancel the install.
+/// Dropping also discards the cached check: whatever finished (or failed)
+/// changed what is installed, so the next read looks inside the workspace again.
+struct HarnessUpdateGuard {
+    states: HarnessUpdates,
+    principal_id: i32,
+}
+
+impl Drop for HarnessUpdateGuard {
+    fn drop(&mut self) {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = states.get_mut(&self.principal_id) {
+            state.updating = false;
+            state.status = None;
+            state.checked_at = None;
+        }
+    }
+}
+
 const WORKSPACE_MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const WORKSPACE_MODEL_REFRESH_COOLDOWN: Duration = Duration::from_secs(15);
 const WORKSPACE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1116,6 +1151,9 @@ pub struct AgentCliAiService {
     /// `workspace_models` so one slow workspace never blocks another user's
     /// model refresh.
     workspace_model_refreshes: Arc<tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Last known harness version status per principal's workspace, and
+    /// whether an update is running (see `harness_update`).
+    harness_updates: HarnessUpdates,
     /// Credential replacement takes the write side; discoveries hold the read
     /// side. This keeps invalidation a hard freshness boundary while allowing
     /// different principals to refresh concurrently.
@@ -1519,6 +1557,7 @@ impl AgentCliAiService {
             sandbox_timeout: None,
             workspace_models: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_model_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            harness_updates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workspace_model_refresh_barrier: Arc::new(tokio::sync::RwLock::new(())),
             host_model_refresh: Arc::new(tokio::sync::Mutex::new(HostModelRefreshState::default())),
         }
@@ -2009,6 +2048,231 @@ impl AgentCliAiService {
         }
     }
 
+    /// Resolve the principal's persistent workspace and run `command` in it,
+    /// bounded by `timeout`. `as_root` is for the update only: the harness is
+    /// installed globally by the managed image.
+    async fn run_in_workspace(
+        &self,
+        principal_id: i32,
+        command: Vec<String>,
+        timeout: Duration,
+        as_root: bool,
+    ) -> Result<(i32, String, String), AiError> {
+        let purpose = "provider.harness.update";
+        let sandbox_provider = self
+            .sandbox_provider
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: "Temps sandbox execution is not configured".to_string(),
+            })?;
+        let resolved = self
+            .sandbox_workspace_resolver
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: "the persistent global workspace resolver is not configured".to_string(),
+            })?
+            .resolve(principal_id)
+            .await?;
+        self.validate_sandbox_workspace(&resolved.workspace)?;
+        let execution = async {
+            if as_root {
+                sandbox_provider
+                    .exec_as_root(&resolved.handle, command, HashMap::new(), None)
+                    .await
+            } else {
+                sandbox_provider
+                    .exec(&resolved.handle, command, HashMap::new(), None)
+                    .await
+            }
+        };
+        let output = tokio::time::timeout(timeout, execution)
+            .await
+            .map_err(|_| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "the workspace command timed out after {}s",
+                    timeout.as_secs()
+                ),
+            })?
+            .map_err(|error| map_agent_error(purpose, error))?;
+        Ok((output.exit_code, output.stdout, output.stderr))
+    }
+
+    /// Install the latest release of the harness in the workspace and
+    /// re-read its version. Refuses while a harness operation (a turn, a model
+    /// refresh) holds the workspace, because the binary is replaced in place.
+    async fn run_workspace_harness_update(
+        &self,
+        principal_id: i32,
+        package: crate::harness_update::HarnessPackage,
+        guard: HarnessUpdateGuard,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let purpose = "provider.harness.update";
+        let sandbox_provider =
+            self.sandbox_provider
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: purpose.to_string(),
+                    reason: "Temps sandbox execution is not configured".to_string(),
+                })?;
+        let resolved = self
+            .sandbox_workspace_resolver
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: "the persistent global workspace resolver is not configured".to_string(),
+            })?
+            .resolve(principal_id)
+            .await?;
+        self.validate_sandbox_workspace(&resolved.workspace)?;
+        let slot = self
+            .sandbox_slot(&resolved.workspace.sandbox_label)
+            .try_acquire_owned()
+            .map_err(|_| AiError::Provider {
+                purpose: "provider.harness.update.busy".to_string(),
+                reason: "the persistent workspace is busy with a turn; retry when it finishes"
+                    .to_string(),
+            })?;
+
+        // The install runs in its own task that owns the workspace slot and
+        // the updating mark. If the caller goes away (client disconnect) the
+        // install is not cancelled halfway and nothing else may touch the
+        // workspace until it has really ended: the command also bounds itself
+        // inside the sandbox (`timeout`), so it cannot outlive its slot.
+        let handle = resolved.handle.clone();
+        let command = hu::update_command(package);
+        // The task hands the slot and the mark back when the install ends so
+        // the caller keeps both through the version check below: nothing may
+        // run in the workspace, or start another update, until the installed
+        // version has been read.
+        let task = tokio::spawn(async move {
+            let outcome = tokio::time::timeout(
+                hu::UPDATE_COMMAND_TIMEOUT,
+                sandbox_provider.exec_as_root(&handle, command, HashMap::new(), None),
+            )
+            .await;
+            (outcome, slot, guard)
+        });
+        let (outcome, _slot, _guard) = task.await.map_err(|error| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!("the update task ended unexpectedly: {error}"),
+        })?;
+        let output = outcome
+            .map_err(|_| AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "the update did not finish within {}s",
+                    hu::UPDATE_COMMAND_TIMEOUT.as_secs()
+                ),
+            })?
+            .map_err(|error| map_agent_error(purpose, error))?;
+        if output.exit_code != 0 {
+            tracing::warn!(
+                provider = self.provider.name(),
+                principal_id,
+                exit_code = output.exit_code,
+                stderr = %scrub_and_bound(&output.stderr),
+                "workspace harness update failed"
+            );
+            return Err(AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "the update command exited with status {}: {}",
+                    output.exit_code,
+                    scrub_and_bound(&output.stderr)
+                ),
+            });
+        }
+        // New models only appear after the next discovery, so drop the cached
+        // catalog; the caller refreshes models right after this returns.
+        self.workspace_models.lock().await.remove(&principal_id);
+        self.check_workspace_harness(principal_id, package).await
+    }
+
+    /// Read the installed and latest versions inside the workspace and cache
+    /// the result. A failed lookup is reported in `detail`, never as a guess.
+    async fn check_workspace_harness(
+        &self,
+        principal_id: i32,
+        package: crate::harness_update::HarnessPackage,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let installed = self
+            .run_in_workspace(
+                principal_id,
+                hu::version_command(package),
+                hu::VERSION_COMMAND_TIMEOUT,
+                false,
+            )
+            .await?;
+        let installed_version = (installed.0 == 0)
+            .then(|| hu::parse_version(&installed.1))
+            .flatten();
+        let latest = self
+            .run_in_workspace(
+                principal_id,
+                hu::latest_version_command(package),
+                hu::LATEST_COMMAND_TIMEOUT,
+                false,
+            )
+            .await;
+        let (latest_version, latest_detail) = match latest {
+            Ok((0, stdout, _)) => (hu::parse_version(&stdout), None),
+            Ok((code, _, stderr)) => (
+                None,
+                Some(format!(
+                    "the latest version could not be looked up (exit {code}): {}",
+                    scrub_and_bound(&stderr)
+                )),
+            ),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "the latest version could not be looked up: {error}"
+                )),
+            ),
+        };
+        let detail = match (&installed_version, &latest_version) {
+            (None, _) => {
+                Some("the installed version could not be read from the workspace".to_string())
+            }
+            (_, None) => latest_detail,
+            _ => None,
+        };
+        let update_available = match (&installed_version, &latest_version) {
+            (Some(installed), Some(latest)) => hu::is_newer(latest, installed),
+            _ => false,
+        };
+        let status = temps_ai::HarnessUpdateStatus {
+            provider_id: self.provider.name().to_string(),
+            installed_version,
+            latest_version,
+            update_available,
+            updating: false,
+            checked_at: Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ),
+            detail,
+        };
+        let mut states = self
+            .harness_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = states.entry(principal_id).or_default();
+        state.status = Some(status.clone());
+        state.checked_at = Some(Instant::now());
+        Ok(temps_ai::HarnessUpdateStatus {
+            updating: state.updating,
+            ..status
+        })
+    }
+
     async fn discover_workspace_capabilities(
         &self,
         principal_id: i32,
@@ -2081,6 +2345,16 @@ impl AgentCliAiService {
                 })
             }
             Err(error) => {
+                // A failed live discovery that is hidden behind a stale
+                // catalog would otherwise leave no trace of why the model
+                // list stopped refreshing.
+                tracing::warn!(
+                    provider = self.provider.name(),
+                    principal_id,
+                    serving_stale_catalog = state.snapshot.is_some(),
+                    reason = %temps_agents::ai_cli::scrub_and_bound(&error.to_string()),
+                    "workspace model discovery failed"
+                );
                 if let Some(snapshot) = state.snapshot.as_ref() {
                     Ok(temps_ai::ProviderCapabilitiesSnapshot {
                         capabilities: snapshot.capabilities.clone(),
@@ -5917,6 +6191,94 @@ impl AiService for AgentCliAiService {
             return self.discover_workspace_capabilities(principal_id).await;
         }
         self.host_capabilities_snapshot(refresh).await
+    }
+
+    async fn workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+        refresh: bool,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let unavailable = || AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        };
+        if provider != self.provider.name() {
+            return Err(unavailable());
+        }
+        let package = hu::harness_package(provider).ok_or_else(unavailable)?;
+        if !refresh {
+            let states = self
+                .harness_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(state) = states.get(&principal_id) {
+                let fresh = state
+                    .checked_at
+                    .is_some_and(|at| at.elapsed() < hu::CHECK_INTERVAL);
+                if let (true, Some(status)) = (fresh, state.status.as_ref()) {
+                    return Ok(temps_ai::HarnessUpdateStatus {
+                        updating: state.updating,
+                        ..status.clone()
+                    });
+                }
+                if state.updating {
+                    return Ok(temps_ai::HarnessUpdateStatus {
+                        provider_id: provider.to_string(),
+                        installed_version: None,
+                        latest_version: None,
+                        update_available: false,
+                        updating: true,
+                        checked_at: None,
+                        detail: None,
+                    });
+                }
+            }
+        }
+        self.check_workspace_harness(principal_id, package).await
+    }
+
+    async fn update_workspace_harness(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        use crate::harness_update as hu;
+
+        let unavailable = || AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        };
+        if provider != self.provider.name() {
+            return Err(unavailable());
+        }
+        let package = hu::harness_package(provider).ok_or_else(unavailable)?;
+        let guard = {
+            let mut states = self
+                .harness_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = states.entry(principal_id).or_default();
+            if state.updating {
+                return Err(AiError::Provider {
+                    purpose: "provider.harness.update.busy".into(),
+                    reason: format!("{provider} is already being updated in this workspace"),
+                });
+            }
+            state.updating = true;
+            HarnessUpdateGuard {
+                states: self.harness_updates.clone(),
+                principal_id,
+            }
+        };
+        self.run_workspace_harness_update(principal_id, package, guard)
+            .await
+            .map(|status| temps_ai::HarnessUpdateStatus {
+                updating: false,
+                ..status
+            })
     }
 
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {
@@ -10981,5 +11343,40 @@ mod tests {
             deltas.as_slice(),
             [ChatStreamDelta::ToolResult { result, .. }] if result == "failed with [REDACTED]"
         ));
+    }
+
+    #[test]
+    fn dropping_the_update_guard_clears_the_flag_and_the_stale_check() {
+        let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        states.lock().expect("lock").insert(
+            7,
+            HarnessUpdateState {
+                status: Some(temps_ai::HarnessUpdateStatus {
+                    provider_id: "claude_cli".to_string(),
+                    installed_version: Some("2.1.263".to_string()),
+                    latest_version: Some("2.1.296".to_string()),
+                    update_available: true,
+                    updating: true,
+                    checked_at: None,
+                    detail: None,
+                }),
+                checked_at: Some(Instant::now()),
+                updating: true,
+            },
+        );
+
+        // A request that is cancelled mid-update drops its guard like this.
+        drop(HarnessUpdateGuard {
+            states: states.clone(),
+            principal_id: 7,
+        });
+
+        let states = states.lock().expect("lock");
+        let state = states.get(&7).expect("state kept");
+        assert!(!state.updating, "the flag must not be stranded");
+        assert!(
+            state.status.is_none() && state.checked_at.is_none(),
+            "what is installed changed, so the cached check is discarded"
+        );
     }
 }

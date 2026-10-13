@@ -29,6 +29,7 @@ test('OpenCode imports unverified once and verifies a chosen model without re-en
     host_authenticated: true,
     model_source: 'bootstrap',
     supports_max_turns: false,
+    login_supported: false,
     workspace_ready: false,
     local_credential: {
       auth_type: 'config_file',
@@ -218,6 +219,7 @@ test('rejects invalid credentials and enables Continue after verification withou
     host_authenticated: false,
     model_source: 'bootstrap',
     supports_max_turns: true,
+    login_supported: false,
     workspace_ready: false,
   }
   // Keep GET deliberately stale: the successful save response must update the
