@@ -125,10 +125,21 @@ Deferred (required before this backend could be recommended for untrusted multi-
 - **Snapshots / fork (ADR-037).** The SDK has snapshot, fork and CoW-memory restore, but ADR-037's surface is a content-addressed, credential-scrubbed artifact file with a digest and a cross-backend 422. Mapping SDK snapshots onto that (export archive → digest → scrub → restore) is not a straight translation, so `take_snapshot` / `create_from_snapshot` keep the trait default ("not supported").
 - **Worker nodes (ADR-048).** `"microsandbox"` on a worker-placed sandbox is rejected with a validation error, the same as Firecracker today.
 - **Preview URLs / port publishing.** No ports are published. The preview gateway resolves Docker container names only.
-- **Interactive terminals (`attach_pty`)** and the retained agent runtime transport: trait default (unsupported). The SDK has TTY exec; wiring it to the ADR-008 frame protocol is follow-up work.
+- **Retained agent runtime transport** (`connect_agent_runtime`): trait default (unsupported).
 - **Operator-configurable egress allowlists** (domains on top of `restricted`) and host-side secret substitution: see §6.
 - **Disk resize:** trait default (unsupported).
 - **Windows hosts.** The SDK supports them in preview; Temps' sandbox code is Unix-only.
+
+### 8. Interactive terminals (`attach_pty`) — shipped
+
+Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends (ADR-008), so tabs, scrollback replay and detach/reattach are identical. Nothing in the image is assumed: the default `alpine:3.20` has no `bash`, `socat` or `dtach`.
+
+- **Guest agent.** `temps microsandbox setup` stages a static Linux `temps-pty-agent` at `<data_dir>/microsandbox/guest/` (`--pty-agent-bin`, or a file next to the `temps` executable; it must match the guest architecture — the host's on Linux, aarch64 on Apple Silicon — and is built with `cargo build --release --target <arch>-unknown-linux-musl -p temps-pty-agent`; the release workflow does not publish it yet). On the first terminal for a sandbox the provider writes it into the guest through the SDK file API at `/usr/local/lib/temps/pty-agent-<sha256 prefix>`, root-owned `0755` in a root-owned directory (content-addressed, so a new build installs beside the old one). A VM that is recreated or restarted keeps it on its root disk.
+- **Start.** The agent is started detached (`setsid`, `nohup` fallback) as the sandbox's **default exec user** — the same identity every `exec` runs as — with `/run/temps-pty` created `0700` for that uid. Every step is idempotent: a probe (`temps-pty-agent --probe`, which connects rather than testing for the socket file, since a crashed agent leaves a stale one) gates both installation and start, and the agent itself refuses to bind over a live socket, so concurrent first attaches cannot orphan each other's tabs.
+- **Attach.** `attach_pty` is an SDK streaming exec of `temps-pty-agent --relay` with stdin piped (`exec_stream_with(.., stdin_pipe())`). Exec stdout is the `output` stream; `input` is a bounded 64 KiB pipe pumped into the SDK's stdin sink and closed on drop, which ends the relay but not the agent. Relay stderr is surfaced as the attach error, never mixed into the frame stream.
+- **Shell.** The default tab command uses `bash -l` when the guest has bash and `sh -l` otherwise.
+- **Requirements and limits.** The guest needs `/bin/sh` (the agent spawns tabs with `sh -c`); shell-less images (distroless) cannot open terminals. The status API reports `microsandbox.terminal` (`supported`, `reason`, `setup_command`) independently of `configured`, so the console shows "terminals unavailable" with the fix instead of a bare 409. The staged binary must be a Linux ELF; a macOS build is rejected at staging and at attach.
+- **Verification status.** The relay, the bootstrap scripts, the argument/ELF validation and the stream plumbing are unit-tested without a hypervisor; `sandbox::microsandbox::tests::e2e_terminal_attach_runs_a_command_and_reattaches` boots a real VM and skips at runtime when the backend or a staged agent is absent.
 
 ## Consequences
 
@@ -156,6 +167,7 @@ Landed with this ADR:
 4. `temps-config`: settings validation accepts `"microsandbox"`.
 5. Status API `microsandbox` capability; console backend option with onboarding state.
 6. `temps microsandbox setup [--check] [--skip-smoke]`.
+7. Interactive terminals (§8): `attach_pty`, guest agent staging (`--pty-agent-bin`), `microsandbox.terminal` capability.
 
 ### Measured (macOS 27, Apple Silicon, runtime v0.7.7, `alpine:3.20`, 1 vCPU / 256 MiB)
 
