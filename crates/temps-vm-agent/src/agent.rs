@@ -29,6 +29,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use serde_json::{json, Value};
+use temps_vm_agent::logging::{self, Level};
+use temps_vm_agent::mounts::{MountArgs, MountError};
 use temps_vm_agent::{
     read_frame, relay, write_frame, Request, Response, AGENT_PORT, MAX_PTY_RELAYS, PTY_AGENT_BIN,
     PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
@@ -38,6 +41,10 @@ use temps_vm_agent::{
 /// and guest images vary, so every child gets the same sane default.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Pause between PTY agent restarts, so a binary that dies at once cannot
+/// turn PID 1 into a hot loop.
+const PTY_RESTART_DELAY: Duration = Duration::from_secs(1);
+
 /// Relays currently being served; bounded by [`MAX_PTY_RELAYS`].
 static ACTIVE_PTY_RELAYS: AtomicUsize = AtomicUsize::new(0);
 
@@ -46,12 +53,14 @@ pub fn run() {
     if is_init {
         setup_system();
     }
-    log(&format!(
-        "temps-vm-agent starting (pid {}, vsock port {}, pty port {})",
-        std::process::id(),
-        AGENT_PORT,
-        PTY_PORT
-    ));
+    info(
+        "starting",
+        &[
+            ("pid", json!(std::process::id())),
+            ("vsock_port", json!(AGENT_PORT)),
+            ("pty_port", json!(PTY_PORT)),
+        ],
+    );
     start_terminal_support();
     serve();
 }
@@ -93,7 +102,16 @@ fn setup_system() {
     for (src, target, fstype, data) in BOOT_MOUNTS {
         // `/dev/pts` only exists once devtmpfs is mounted over `/dev`.
         let _ = std::fs::create_dir_all(target);
-        mount(src, target, fstype, *data);
+        if let Err(e) = mount(src, target, fstype, *data) {
+            warn(
+                "mount_failed",
+                &[
+                    ("target", json!(target)),
+                    ("fstype", json!(fstype)),
+                    ("error", json!(e.to_string())),
+                ],
+            );
+        }
     }
     unsafe {
         let name = b"sandbox";
@@ -133,40 +151,60 @@ fn interface_up(name: &str) {
     }
 }
 
-fn mount(src: &str, target: &str, fstype: &str, data: Option<&str>) {
-    let src = std::ffi::CString::new(src).unwrap();
-    let target_c = std::ffi::CString::new(target).unwrap();
-    let fstype = std::ffi::CString::new(fstype).unwrap();
-    let data = data.map(|d| std::ffi::CString::new(d).unwrap());
+/// Mount one pseudo-filesystem. `EBUSY` (already mounted, e.g. a kernel that
+/// automounted devtmpfs) is success.
+fn mount(src: &str, target: &str, fstype: &str, data: Option<&str>) -> Result<(), MountError> {
+    let args = MountArgs::new(src, target, fstype, data)?;
     let rc = unsafe {
         libc::mount(
-            src.as_ptr(),
-            target_c.as_ptr(),
-            fstype.as_ptr(),
+            args.source.as_ptr(),
+            args.target.as_ptr(),
+            args.fstype.as_ptr(),
             0,
-            data.as_ref()
+            args.data
+                .as_ref()
                 .map_or(std::ptr::null(), |d| d.as_ptr() as *const libc::c_void),
         )
     };
-    if rc != 0 {
-        // EBUSY = already mounted (e.g. kernel automounted devtmpfs) — fine.
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EBUSY) {
-            log(&format!("mount {} failed: {}", target, err));
-        }
+    if rc == 0 {
+        return Ok(());
     }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EBUSY) {
+        return Ok(());
+    }
+    Err(MountError::Syscall {
+        target: target.to_string(),
+        fstype: fstype.to_string(),
+        source: err,
+    })
 }
 
-/// Serial console is our only log sink; failures to write are ignorable.
-fn log(msg: &str) {
-    println!("[temps-vm-agent] {}", msg);
+/// Structured JSONL record on the serial console, our only log sink.
+fn log_event(level: Level, event: &str, fields: &[(&str, Value)]) {
+    logging::emit(level, event, fields);
+}
+
+fn info(event: &str, fields: &[(&str, Value)]) {
+    log_event(Level::Info, event, fields);
+}
+
+fn warn(event: &str, fields: &[(&str, Value)]) {
+    log_event(Level::Warn, event, fields);
+}
+
+fn error(event: &str, fields: &[(&str, Value)]) {
+    log_event(Level::Error, event, fields);
 }
 
 // ── Vsock server ────────────────────────────────────────────────────────
 
 /// Bind and listen on a vsock `port`, accepting connections from any CID.
 fn listen_vsock(port: u32) -> Result<RawFd, String> {
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    // CLOEXEC: this agent starts every sandbox command and restarts the PTY
+    // agent. Without it each child would inherit the listener, and could
+    // hold or reuse it independently of the agent that owns it.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(format!("vsock socket: {}", std::io::Error::last_os_error()));
     }
@@ -194,21 +232,56 @@ fn listen_vsock(port: u32) -> Result<RawFd, String> {
     Ok(fd)
 }
 
+/// Accept one connection with `SOCK_CLOEXEC` set atomically, so the stream is
+/// never inherited by a command started on another thread (a plain `accept`
+/// followed by `fcntl` would leave a window).
+///
+/// `None` means no connection was produced. Anything other than `EINTR`
+/// pauses briefly first: an `EMFILE`/`ENOMEM` failure would otherwise spin
+/// this PID 1 thread at full speed.
+fn accept_cloexec(listener: RawFd) -> Option<RawFd> {
+    let conn = unsafe {
+        libc::accept4(
+            listener,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    if conn >= 0 {
+        return Some(conn);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EINTR) {
+        warn(
+            "accept_failed",
+            &[
+                ("listener_fd", json!(listener)),
+                ("error", json!(err.to_string())),
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
 fn serve() {
     let fd = match listen_vsock(AGENT_PORT) {
         Ok(fd) => fd,
         Err(e) => {
-            log(&format!("fatal: {}", e));
+            error(
+                "listen_failed",
+                &[("port", json!(AGENT_PORT)), ("error", json!(e))],
+            );
             halt_forever();
         }
     };
-    log("ready");
+    info("ready", &[("port", json!(AGENT_PORT))]);
 
     loop {
-        let conn: RawFd = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if conn < 0 {
+        let Some(conn) = accept_cloexec(fd) else {
             continue;
-        }
+        };
         // A vsock stream fd behaves like any stream socket; UnixStream is
         // just an fd wrapper and gives us Read/Write + Drop-closes.
         let stream = unsafe { UnixStream::from_raw_fd(conn) };
@@ -224,17 +297,23 @@ fn serve() {
 /// has no terminals.
 fn start_terminal_support() {
     if !Path::new(PTY_AGENT_BIN).exists() {
-        log(&format!(
-            "{} not present; interactive terminals are disabled in this guest",
-            PTY_AGENT_BIN
-        ));
+        warn(
+            "terminals_disabled",
+            &[
+                ("path", json!(PTY_AGENT_BIN)),
+                ("reason", json!("PTY agent binary not present")),
+            ],
+        );
         return;
     }
     if let Err(e) = std::thread::Builder::new()
         .name("pty-supervisor".to_string())
         .spawn(supervise_pty_agent)
     {
-        log(&format!("could not start the PTY agent supervisor: {}", e));
+        error(
+            "pty_supervisor_spawn_failed",
+            &[("error", json!(e.to_string()))],
+        );
         return;
     }
     match listen_vsock(PTY_PORT) {
@@ -243,10 +322,16 @@ fn start_terminal_support() {
                 .name("pty-listener".to_string())
                 .spawn(move || serve_pty(fd));
             if let Err(e) = spawned {
-                log(&format!("could not start the PTY relay listener: {}", e));
+                error(
+                    "pty_listener_spawn_failed",
+                    &[("port", json!(PTY_PORT)), ("error", json!(e.to_string()))],
+                );
             }
         }
-        Err(e) => log(&format!("terminal relay unavailable: {}", e)),
+        Err(e) => error(
+            "pty_listen_failed",
+            &[("port", json!(PTY_PORT)), ("error", json!(e))],
+        ),
     }
 }
 
@@ -276,19 +361,33 @@ fn supervise_pty_agent() {
             .spawn();
         match spawned {
             Ok(mut child) => {
-                log(&format!("temps-pty-agent started (pid {})", child.id()));
+                let pid = child.id();
+                info("pty_agent_started", &[("pid", json!(pid))]);
                 match child.wait() {
-                    Ok(status) => log(&format!(
-                        "temps-pty-agent exited ({}) after {:?}; restarting",
-                        status,
-                        started.elapsed()
-                    )),
-                    Err(e) => log(&format!("waiting on temps-pty-agent failed: {}", e)),
+                    Ok(status) => warn(
+                        "pty_agent_exited",
+                        &[
+                            ("pid", json!(pid)),
+                            ("status", json!(status.to_string())),
+                            ("uptime_ms", json!(started.elapsed().as_millis() as u64)),
+                            ("restart_in_ms", json!(PTY_RESTART_DELAY.as_millis() as u64)),
+                        ],
+                    ),
+                    Err(e) => error(
+                        "pty_agent_wait_failed",
+                        &[("pid", json!(pid)), ("error", json!(e.to_string()))],
+                    ),
                 }
             }
-            Err(e) => log(&format!("could not start {}: {}", PTY_AGENT_BIN, e)),
+            Err(e) => error(
+                "pty_agent_spawn_failed",
+                &[
+                    ("path", json!(PTY_AGENT_BIN)),
+                    ("error", json!(e.to_string())),
+                ],
+            ),
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(PTY_RESTART_DELAY);
     }
 }
 
@@ -303,28 +402,42 @@ fn secure_pty_agent_binary() {
     let bin = Path::new(PTY_AGENT_BIN);
     for path in [Some(bin), bin.parent()].into_iter().flatten() {
         if let Err(e) = std::os::unix::fs::chown(path, Some(0), Some(0)) {
-            log(&format!("chown {}: {}", path.display(), e));
+            warn(
+                "pty_agent_chown_failed",
+                &[
+                    ("path", json!(path.display().to_string())),
+                    ("error", json!(e.to_string())),
+                ],
+            );
         }
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
-            log(&format!("chmod {}: {}", path.display(), e));
+            warn(
+                "pty_agent_chmod_failed",
+                &[
+                    ("path", json!(path.display().to_string())),
+                    ("error", json!(e.to_string())),
+                ],
+            );
         }
     }
 }
 
 /// Accept terminal connections and relay each to the PTY agent's socket.
 fn serve_pty(fd: RawFd) {
-    log(&format!("terminal relay ready on vsock port {}", PTY_PORT));
+    info("pty_relay_ready", &[("port", json!(PTY_PORT))]);
     loop {
-        let conn: RawFd = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if conn < 0 {
+        let Some(conn) = accept_cloexec(fd) else {
             continue;
-        }
+        };
         let stream = unsafe { UnixStream::from_raw_fd(conn) };
         let Some(slot) = RelaySlot::acquire() else {
-            log(&format!(
-                "terminal relay refused: {} relays already active",
-                MAX_PTY_RELAYS
-            ));
+            warn(
+                "pty_relay_refused",
+                &[
+                    ("port", json!(PTY_PORT)),
+                    ("max_relays", json!(MAX_PTY_RELAYS)),
+                ],
+            );
             continue;
         };
         let spawned = std::thread::Builder::new()
@@ -334,7 +447,10 @@ fn serve_pty(fd: RawFd) {
                 relay_to_pty_agent(stream);
             });
         if let Err(e) = spawned {
-            log(&format!("could not start a terminal relay thread: {}", e));
+            error(
+                "pty_relay_spawn_failed",
+                &[("port", json!(PTY_PORT)), ("error", json!(e.to_string()))],
+            );
         }
     }
 }
@@ -382,16 +498,26 @@ fn relay_to_pty_agent(host: UnixStream) {
             Err(e) => {
                 // Closing the vsock connection is the only signal the host
                 // gets; the cause belongs on the serial console.
-                log(&format!(
-                    "terminal relay: cannot connect to {}: {}",
-                    PTY_AGENT_SOCKET, e
-                ));
+                warn(
+                    "pty_relay_connect_failed",
+                    &[
+                        ("socket", json!(PTY_AGENT_SOCKET)),
+                        ("attempts", json!(attempts + 1)),
+                        ("error", json!(e.to_string())),
+                    ],
+                );
                 return;
             }
         }
     };
     if let Err(e) = relay(host, agent) {
-        log(&format!("terminal relay ended with an error: {}", e));
+        warn(
+            "pty_relay_ended_with_error",
+            &[
+                ("socket", json!(PTY_AGENT_SOCKET)),
+                ("error", json!(e.to_string())),
+            ],
+        );
     }
 }
 
@@ -640,6 +766,38 @@ mod tests {
         let (_, target, _, data) = BOOT_MOUNTS[position("devpts")];
         assert_eq!(target, "/dev/pts");
         assert!(data.is_some_and(|d| d.contains("ptmxmode=")), "{data:?}");
+    }
+
+    fn is_cloexec(fd: RawFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fcntl(F_GETFD) failed on fd {fd}");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    #[test]
+    fn accepted_connections_are_close_on_exec() {
+        // A plain `accept` would hand every sandbox command started by this
+        // PID 1 a copy of the stream; accept4(SOCK_CLOEXEC) must not.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("temps-vm-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("accept.sock");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let _client = UnixStream::connect(&path).expect("connect test socket");
+
+        let conn = accept_cloexec(listener.as_raw_fd()).expect("a pending connection is accepted");
+        let cloexec = is_cloexec(conn);
+        unsafe { libc::close(conn) };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(cloexec, "accepted fd {conn} must carry FD_CLOEXEC");
+    }
+
+    #[test]
+    fn mount_rejects_an_argument_with_a_nul_byte_without_panicking() {
+        let err = mount("tmpfs", "/run\0x", "tmpfs", None).unwrap_err();
+        assert!(matches!(err, MountError::InvalidArgument { .. }), "{err}");
     }
 
     #[test]

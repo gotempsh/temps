@@ -16,6 +16,9 @@
 //! throughput makes this a non-issue at sandbox file sizes. Exec output is
 //! lossy UTF-8 by design — it feeds `SandboxExecResult { stdout: String }`.
 
+pub mod logging;
+pub mod mounts;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
