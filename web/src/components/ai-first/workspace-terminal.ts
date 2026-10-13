@@ -15,22 +15,31 @@
 import type { ApplicationWorkspaceResponse } from '@/api/client'
 import type { TerminalStatus } from '@/components/sandboxes/sandbox-terminal'
 
-/** Longest `tab` the endpoint accepts (see `validate_tab` in the handler). */
-const MAX_TAB_LENGTH = 64
-
 /**
- * The tab the workspace view attaches to.
+ * Socket URL of a terminal thread.
  *
- * Deliberately not the `main` tab the sandbox page and the CLI use: a PTY has
- * one size, so two clients of different widths sharing a tab would resize it
- * back and forth. Derived from the sandbox id so it is stable across reloads
- * and devices; the endpoint scopes tabs to one sandbox, so this never needs
- * to be unique across workspaces, only valid and constant.
+ * Not `/v1/sandboxes/{id}/terminal`: managed workspaces are hidden from the
+ * generic sandbox API on purpose (every access must re-check the linked
+ * projects), so the terminal is served under the workspace's own routes. The
+ * thread names the shell; the server derives its PTY tab from the thread, so
+ * the client never picks one. Same origin as the console, so the session
+ * cookie authenticates it and nothing secret goes in the URL.
  */
-export function workspaceTerminalTab(sandboxPublicId: string): string {
-  const safe = sandboxPublicId.replace(/[^A-Za-z0-9_-]/g, '')
-  const tab = safe ? `ws-${safe}` : 'workspace'
-  return tab.slice(0, MAX_TAB_LENGTH)
+export function workspaceTerminalSocketUrl(
+  location: Pick<Location, 'protocol' | 'host'>,
+  applicationPublicId: string | null,
+  options: { thread: string; cols: number; rows: number }
+): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const params = new URLSearchParams({
+    thread: options.thread,
+    cols: String(options.cols),
+    rows: String(options.rows),
+  })
+  const path = applicationPublicId
+    ? `/api/ai/applications/${encodeURIComponent(applicationPublicId)}/workspace/terminal`
+    : '/api/ai/workspace/terminal'
+  return `${protocol}//${location.host}${path}?${params.toString()}`
 }
 
 /** Reconnect attempts allowed after a connection drops before giving up. */
@@ -319,6 +328,37 @@ export function terminalKeySequence(
       return `\x1b${applicationCursorKeys ? 'O' : '['}${ARROWS[key]}`
   }
 }
+
+export type TerminalFailureCause = 'helper-missing' | 'unknown'
+
+/**
+ * Failures that mean the sandbox's PTY helper (`socat` relaying to the
+ * in-sandbox agent socket) did not start. The relay's own launch error is
+ * read back as the first protocol frame, so the symptom is usually an absurd
+ * "frame too large" rather than a message naming the helper.
+ */
+const HELPER_MISSING_SIGNATURES = [
+  /frame too large/i,
+  /socat/i,
+  /agent\.sock/i,
+  /pty agent/i,
+  /executable file not found/i,
+  /oci runtime exec failed/i,
+]
+
+/**
+ * Names the likely cause of a refused or lost terminal from the server's
+ * message. A pure string match: the message is the only thing a browser
+ * WebSocket can see of the failure.
+ */
+export function classifyTerminalFailure(reason: string): TerminalFailureCause {
+  return HELPER_MISSING_SIGNATURES.some((signature) => signature.test(reason))
+    ? 'helper-missing'
+    : 'unknown'
+}
+
+export const TERMINAL_HELPER_MISSING_HINT =
+  "This sandbox's runtime image does not include the terminal helper (the PTY agent and socat), so no shell can be attached to it. It needs a runtime image that ships them: update the Temps sandbox images, then use Update runtime in Workspace settings. Workspace files are preserved."
 
 export type TerminalBadgeTone = 'success' | 'warning' | 'neutral' | 'danger'
 

@@ -13,7 +13,6 @@ import {
 import type { WorkspaceTerminalAvailability } from './workspace-terminal'
 
 const SANDBOX_ID = 'sbx_0123456789abcdef'
-const CLI = `bunx @temps-sdk/cli sandbox shell ${SANDBOX_ID}`
 
 function workspace(
   overrides: Partial<ApplicationWorkspaceResponse> = {}
@@ -41,7 +40,8 @@ function renderPanel(overrides: Partial<WorkspaceTerminalPanelProps> = {}) {
   return renderToStaticMarkup(
     <MemoryRouter>
       <WorkspaceTerminalPanel
-        hasApplication
+        applicationPublicId="app_123"
+        threadPublicId="0123456789abcdef0123456789abcdef"
         loading={false}
         onOpenWorkspaceSettings={() => {}}
         onWake={() => {}}
@@ -68,30 +68,31 @@ function renderOnboarding(availability: WorkspaceTerminalAvailability) {
 }
 
 describe('WorkspaceTerminalPanel', () => {
-  test('a running workspace shows the terminal surface and the CLI alternative', () => {
+  test('a running workspace shows the terminal surface', () => {
     const html = renderPanel()
-    expect(html).toContain('Workspace terminal')
+    expect(html).toContain('Shell in the workspace sandbox')
     expect(html).toContain('aria-label="Workspace terminal"')
     expect(html).toContain('Connecting…')
     expect(html).toContain('Extra keys')
     expect(html).toContain('Paste into terminal')
-    expect(html).toContain(CLI)
     // The terminal host is visible, not the onboarding card.
     expect(html).not.toContain('class="hidden"')
     expect(html).not.toContain('is sleeping')
+    // The terminal is the way in; there is no CLI route for managed
+    // workspaces, so none is advertised.
+    expect(html).not.toContain('sandbox shell')
   })
 
-  test('a sleeping workspace onboards with a wake action and keeps the CLI command', () => {
+  test('a sleeping workspace onboards with a wake action', () => {
     const html = renderPanel({ workspace: workspace({ state: 'sleeping' }) })
     expect(html).toContain('The workspace sandbox is sleeping')
     expect(html).toContain('Wake workspace')
-    expect(html).toContain(CLI)
     expect(html).not.toContain('Connecting…')
   })
 
   test('the global workspace is woken by connecting', () => {
     const html = renderPanel({
-      hasApplication: false,
+      applicationPublicId: null,
       workspace: workspace({ state: 'sleeping' }),
     })
     expect(html).toContain('Wake and connect')
@@ -103,8 +104,6 @@ describe('WorkspaceTerminalPanel', () => {
     expect(html).toContain('sandboxes:exec')
     expect(html).toContain('platform_admin')
     expect(html).toContain('href="/users"')
-    // Never silently disappears: the manual route is still offered.
-    expect(html).toContain(CLI)
   })
 
   test('an incompatible runtime points at Workspace settings', () => {
@@ -117,7 +116,6 @@ describe('WorkspaceTerminalPanel', () => {
     expect(html).toContain('The sandbox runtime needs an update')
     expect(html).toContain('The image predates the terminal agent.')
     expect(html).toContain('Open Workspace settings')
-    expect(html).toContain(CLI)
   })
 
   test('a backend without terminal support says why and links the fix', () => {
@@ -135,13 +133,18 @@ describe('WorkspaceTerminalPanel', () => {
     expect(html).toContain('the guest terminal agent is not staged')
     expect(html).toContain('temps firecracker setup --pty-agent-bin')
     expect(html).toContain('href="/agent-sandbox/sandbox"')
-    expect(html).toContain(CLI)
+  })
+
+  test('an archived terminal thread explains it must be restored', () => {
+    const html = renderPanel({ archived: true })
+    expect(html).toContain('This terminal thread is archived')
+    expect(html).toContain('Restore this thread')
+    expect(html).not.toContain('Connecting…')
   })
 
   test('loading the workspace shows a placeholder, not a blank panel', () => {
     const html = renderPanel({ workspace: null, loading: true })
     expect(html).toContain('Checking the workspace sandbox')
-    expect(html).not.toContain(CLI)
   })
 
   test('a waking workspace says it is starting', () => {

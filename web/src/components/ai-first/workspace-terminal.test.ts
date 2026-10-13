@@ -7,6 +7,7 @@ import {
   INITIAL_TERMINAL_VIEW_STATE,
   TERMINAL_RECONNECT_MAX_ATTEMPTS,
   TERMINAL_STABLE_CONNECTION_MS,
+  classifyTerminalFailure,
   reconnectDelayMs,
   roleLacksSandboxExec,
   terminalConnectTimeoutMs,
@@ -14,7 +15,7 @@ import {
   terminalViewBadge,
   terminalViewReducer,
   workspaceTerminalAvailability,
-  workspaceTerminalTab,
+  workspaceTerminalSocketUrl,
   type TerminalViewEvent,
   type TerminalViewState,
 } from './workspace-terminal'
@@ -56,25 +57,50 @@ const status = (
   detail?: string
 ): TerminalViewEvent => ({ type: 'status', status: value, detail, at })
 
-describe('workspaceTerminalTab', () => {
-  test('is stable for a sandbox and valid for the endpoint', () => {
-    const tab = workspaceTerminalTab('sbx_0123456789abcdef')
-    expect(tab).toBe('ws-sbx_0123456789abcdef')
-    expect(workspaceTerminalTab('sbx_0123456789abcdef')).toBe(tab)
-    expect(tab).toMatch(/^[A-Za-z0-9_-]{1,64}$/)
+describe('workspaceTerminalSocketUrl', () => {
+  const options = { thread: 'abc123', cols: 120, rows: 40 }
+
+  test('uses the application workspace route, same origin', () => {
+    expect(
+      workspaceTerminalSocketUrl(
+        { protocol: 'https:', host: 'temps.test' },
+        'app_123',
+        options
+      )
+    ).toBe(
+      'wss://temps.test/api/ai/applications/app_123/workspace/terminal?thread=abc123&cols=120&rows=40'
+    )
   })
 
-  test('never differs from the sandbox page tab', () => {
-    expect(workspaceTerminalTab('sbx_0123456789abcdef')).not.toBe('main')
+  test('uses the global workspace route without an application', () => {
+    expect(
+      workspaceTerminalSocketUrl(
+        { protocol: 'http:', host: 'localhost:3000' },
+        null,
+        options
+      )
+    ).toBe(
+      'ws://localhost:3000/api/ai/workspace/terminal?thread=abc123&cols=120&rows=40'
+    )
   })
 
-  test('strips characters the endpoint rejects and bounds the length', () => {
-    expect(workspaceTerminalTab('sbx a/b;c\n')).toBe('ws-sbxabc')
-    const long = workspaceTerminalTab('x'.repeat(200))
-    expect(long.length).toBe(64)
-    expect(long).toMatch(/^[A-Za-z0-9_-]+$/)
-    expect(workspaceTerminalTab('')).toBe('workspace')
-    expect(workspaceTerminalTab('///')).toBe('workspace')
+  test('never puts a credential or a command in the URL', () => {
+    const url = workspaceTerminalSocketUrl(
+      { protocol: 'https:', host: 'temps.test' },
+      'app_123',
+      options
+    )
+    expect(url).not.toMatch(/token|key|secret|cmd|tab=/i)
+  })
+
+  test('encodes an application id that is not path safe', () => {
+    expect(
+      workspaceTerminalSocketUrl(
+        { protocol: 'https:', host: 'temps.test' },
+        'a/b?c',
+        options
+      )
+    ).toContain('/applications/a%2Fb%3Fc/workspace/terminal')
   })
 })
 
@@ -473,5 +499,38 @@ describe('terminalViewBadge', () => {
         attempt: 0,
       })
     ).toEqual({ label: 'Connected · session resumed', tone: 'success' })
+  })
+})
+
+describe('classifyTerminalFailure', () => {
+  test('recognises a sandbox whose terminal helper did not start', () => {
+    // The relay's launch error is read as a binary frame header: the first
+    // four bytes of "OCI runtime exec failed" decode to this length.
+    expect(
+      classifyTerminalFailure(
+        'terminal stream failed: frame too large: 1329809696 bytes'
+      )
+    ).toBe('helper-missing')
+    expect(
+      classifyTerminalFailure('PTY agent relay error: socat: command not found')
+    ).toBe('helper-missing')
+    expect(
+      classifyTerminalFailure(
+        'exec: "socat": executable file not found in $PATH'
+      )
+    ).toBe('helper-missing')
+    expect(
+      classifyTerminalFailure('connect to /run/temps-pty/agent.sock failed')
+    ).toBe('helper-missing')
+  })
+
+  test('leaves unrelated failures unclassified', () => {
+    expect(classifyTerminalFailure('')).toBe('unknown')
+    expect(classifyTerminalFailure('The connection was closed.')).toBe(
+      'unknown'
+    )
+    expect(
+      classifyTerminalFailure('Forbidden: sandboxes:exec is required')
+    ).toBe('unknown')
   })
 })

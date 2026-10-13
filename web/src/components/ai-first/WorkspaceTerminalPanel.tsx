@@ -32,20 +32,20 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { fitTerminalToHost } from '@/components/sandboxes/sandbox-terminal-dom'
 import {
   openTerminalSession,
-  terminalSocketUrl,
   TERMINAL_REFUSED_HINT,
   type TerminalSession,
 } from '@/components/sandboxes/sandbox-terminal'
 import { cn } from '@/lib/utils'
-import { sandboxShellCommand } from './harness-upgrade-commands'
 import {
+  classifyTerminalFailure,
   INITIAL_TERMINAL_VIEW_STATE,
+  TERMINAL_HELPER_MISSING_HINT,
   terminalConnectTimeoutMs,
   terminalKeySequence,
   terminalViewBadge,
   terminalViewReducer,
   workspaceTerminalAvailability,
-  workspaceTerminalTab,
+  workspaceTerminalSocketUrl,
   type BackendTerminalSupport,
   type TerminalKey,
   type TerminalViewState,
@@ -69,23 +69,21 @@ const EXTRA_KEYS: Array<{
   { key: 'right', label: 'Right arrow', icon: ArrowRight },
 ]
 
-/** The CLI equivalent, or `null` when the id is not one we can quote safely. */
-function cliShellCommand(sandboxPublicId: string | null): string | null {
-  if (!sandboxPublicId) return null
-  try {
-    return sandboxShellCommand(sandboxPublicId)
-  } catch {
-    return null
-  }
-}
-
 export interface WorkspaceTerminalPanelProps {
   workspace: ApplicationWorkspaceResponse | null
   loading: boolean
   /** A wake is in flight (from the automatic wake or the Wake button). */
   waking: boolean
-  /** An application workspace has a control action; the global one does not. */
-  hasApplication: boolean
+  /**
+   * The application whose workspace this is, or `null` for the user's global
+   * workspace. Application workspaces have a control action to wake them; the
+   * global one is woken by the attach itself.
+   */
+  applicationPublicId: string | null
+  /** The terminal thread this shell belongs to; the server derives its tab. */
+  threadPublicId: string
+  /** An archived thread is read-only until restored: no shell is attached. */
+  archived?: boolean
   /** The signed-in user's role, to explain a missing `sandboxes:exec`. */
   role: string | null | undefined
   /** Per-backend terminal support, when the backend reports it. */
@@ -98,15 +96,17 @@ export interface WorkspaceTerminalPanelProps {
  * Interactive shell inside the persistent AI workspace sandbox.
  *
  * Attaches over `GET /v1/sandboxes/{id}/terminal` (the sandbox provider's
- * `attach_pty`, so it is backend-agnostic) to a tab derived from the sandbox,
- * so leaving the view, reloading or losing the connection detaches without
- * stopping what is running and the next attach picks it up again.
+ * `attach_pty`, so it is backend-agnostic) to the shell a terminal thread
+ * owns, so leaving the thread, reloading or losing the connection detaches
+ * without stopping what is running and the next attach picks it up again.
  */
 export function WorkspaceTerminalPanel({
   workspace,
   loading,
   waking,
-  hasApplication,
+  applicationPublicId,
+  threadPublicId,
+  archived = false,
   role,
   backendTerminal,
   onWake,
@@ -116,7 +116,7 @@ export function WorkspaceTerminalPanel({
     workspace,
     loading,
     waking,
-    hasApplication,
+    hasApplication: applicationPublicId !== null,
     role,
     backendTerminal,
   })
@@ -141,7 +141,8 @@ export function WorkspaceTerminalPanel({
   const wakesOnConnect =
     availability.kind === 'sleeping' && availability.wake === 'on-connect'
   const canConnect =
-    availability.kind === 'ready' || (wakesOnConnect && connectRequested)
+    !archived &&
+    (availability.kind === 'ready' || (wakesOnConnect && connectRequested))
   const candidate =
     availability.kind === 'ready'
       ? availability.sandboxPublicId
@@ -154,8 +155,6 @@ export function WorkspaceTerminalPanel({
   if (canConnect && candidate && target !== candidate) {
     setTarget(candidate)
   }
-
-  const tab = target ? workspaceTerminalTab(target) : null
 
   // The xterm instance lives as long as there is a sandbox to show, across
   // reconnects, so scrollback and the viewport survive a dropped socket.
@@ -224,14 +223,14 @@ export function WorkspaceTerminalPanel({
 
   // One socket per attempt. The terminal outlives it.
   useEffect(() => {
-    if (!terminal || !target || !tab) return undefined
+    if (!terminal || !target) return undefined
     // The server replays recent scrollback on attach; clear first so a
     // reconnect does not stack the replay on top of what is already shown.
     terminal.reset()
     let closed = false
     const session = openTerminalSession({
-      url: terminalSocketUrl(window.location, target, {
-        tab,
+      url: workspaceTerminalSocketUrl(window.location, applicationPublicId, {
+        thread: threadPublicId,
         cols: terminal.cols,
         rows: terminal.rows,
       }),
@@ -265,7 +264,14 @@ export function WorkspaceTerminalPanel({
       resized.dispose()
       session.close()
     }
-  }, [terminal, target, tab, generation, connectTimeoutMs])
+  }, [
+    terminal,
+    target,
+    threadPublicId,
+    generation,
+    connectTimeoutMs,
+    applicationPublicId,
+  ])
 
   useEffect(() => {
     if (view.phase !== 'reconnecting') return undefined
@@ -304,7 +310,6 @@ export function WorkspaceTerminalPanel({
 
   const showTerminal = target !== null
   const badge = terminalViewBadge(view)
-  const shellCommand = cliShellCommand(target ?? candidate)
   const lostConnection =
     view.phase === 'disconnected' ||
     view.phase === 'exited' ||
@@ -315,7 +320,7 @@ export function WorkspaceTerminalPanel({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2 text-xs font-medium">
           <TerminalIcon className="size-4 shrink-0 stroke-success" />
-          <span className="truncate">Workspace terminal</span>
+          <span className="truncate">Shell in the workspace sandbox</span>
         </div>
         {showTerminal && (
           <Badge variant={badgeVariant(badge.tone)} role="status">
@@ -324,7 +329,14 @@ export function WorkspaceTerminalPanel({
         )}
       </div>
 
-      {!showTerminal && (
+      {!showTerminal && archived && (
+        <OnboardingCard
+          detail="Restore this thread from the thread list to attach to its shell again. Whatever was running in it is still there."
+          title="This terminal thread is archived"
+        />
+      )}
+
+      {!showTerminal && !archived && (
         <WorkspaceTerminalOnboarding
           availability={availability}
           onOpenWorkspaceSettings={onOpenWorkspaceSettings}
@@ -405,10 +417,12 @@ export function WorkspaceTerminalPanel({
       />
 
       {showTerminal && lostConnection && (
-        <ConnectionLostNotice onRetry={retry} view={view} />
+        <ConnectionLostNotice
+          onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+          onRetry={retry}
+          view={view}
+        />
       )}
-
-      {shellCommand && <CliAlternative command={shellCommand} />}
     </div>
   )
 }
@@ -429,9 +443,11 @@ function badgeVariant(tone: ReturnType<typeof terminalViewBadge>['tone']) {
 function ConnectionLostNotice({
   view,
   onRetry,
+  onOpenWorkspaceSettings,
 }: {
   view: TerminalViewState
   onRetry: () => void
+  onOpenWorkspaceSettings: () => void
 }) {
   const reason =
     view.phase === 'disconnected' ||
@@ -441,6 +457,8 @@ function ConnectionLostNotice({
       : ''
   const exited = view.phase === 'exited'
   const refused = view.phase === 'refused'
+  const helperMissing =
+    !exited && classifyTerminalFailure(reason) === 'helper-missing'
   return (
     <div
       className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs"
@@ -454,7 +472,12 @@ function ConnectionLostNotice({
             : 'Disconnected from the workspace terminal'}
       </p>
       <p className="leading-5 text-muted-foreground">{reason}</p>
-      {refused && (
+      {helperMissing && (
+        <p className="leading-5 text-muted-foreground">
+          {TERMINAL_HELPER_MISSING_HINT}
+        </p>
+      )}
+      {refused && !helperMissing && (
         <p className="leading-5 text-muted-foreground">
           {TERMINAL_REFUSED_HINT}
         </p>
@@ -465,29 +488,22 @@ function ConnectionLostNotice({
           the same session back up.
         </p>
       )}
-      <Button onClick={onRetry} size="sm" type="button" variant="outline">
-        <RefreshCw className="mr-1.5 size-3.5" />
-        {exited ? 'Start a new session' : 'Reconnect'}
-      </Button>
-    </div>
-  )
-}
-
-function CliAlternative({ command }: { command: string }) {
-  return (
-    <div className="shrink-0 rounded-lg border border-border bg-muted/30 p-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] font-medium">Prefer your own terminal?</p>
-        <CopyButton
-          className="size-7 rounded-md"
-          label="Copy sandbox shell command"
-          minimal
-          value={command}
-        />
+      <div className="flex flex-wrap gap-2">
+        <Button onClick={onRetry} size="sm" type="button" variant="outline">
+          <RefreshCw className="mr-1.5 size-3.5" />
+          {exited ? 'Start a new session' : 'Reconnect'}
+        </Button>
+        {helperMissing && (
+          <Button
+            onClick={onOpenWorkspaceSettings}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            Open Workspace settings
+          </Button>
+        )}
       </div>
-      <code className="mt-1.5 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 font-mono text-[10px] text-muted-foreground">
-        {command}
-      </code>
     </div>
   )
 }
