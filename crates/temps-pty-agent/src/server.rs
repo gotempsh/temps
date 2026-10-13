@@ -588,11 +588,23 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
         assert!(path.exists());
 
-        let probe = probe_socket(
-            async { UnixStream::connect(&path).await.map(drop) },
-            LIVE_AGENT_PROBE_TIMEOUT,
-        )
-        .await;
+        // Other tests in this process spawn children, and a child forked
+        // just before `exec` still holds a copy of the closed listener's fd
+        // (CLOEXEC only takes effect at exec), so the socket keeps answering
+        // until that window closes. Wait it out rather than assume the close
+        // is instantaneous.
+        let mut probe = SocketProbe::Live;
+        for _ in 0..100 {
+            probe = probe_socket(
+                async { UnixStream::connect(&path).await.map(drop) },
+                LIVE_AGENT_PROBE_TIMEOUT,
+            )
+            .await;
+            if probe == SocketProbe::Stale {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(probe, SocketProbe::Stale);
     }
 
