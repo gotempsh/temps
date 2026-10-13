@@ -512,9 +512,9 @@ impl DeploymentEnvResolver {
             environment,
         )
         .await?;
-        for (key, value) in inherited {
-            explicit_project_vars.entry(key).or_insert(value);
-        }
+        // Promotion and rollback run no build, so which values are public
+        // is of no use here.
+        crate::services::group_env::merge_inherited_beneath(&mut explicit_project_vars, inherited);
 
         // 2. Get runtime environment variables from external services
         // First, get all services linked to this project

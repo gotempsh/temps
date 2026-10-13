@@ -45,15 +45,37 @@ pub enum GroupEnvError {
     },
 }
 
-/// The decrypted variables `project_id` inherits in `environment`. Empty when
-/// the service is in no project, so every deploy path can call it
+/// One decrypted variable a project inherits from its group, with the
+/// sensitivity the group's admin gave it. Carrying `is_secret` beside the
+/// value is what lets the planner keep a secret on the control plane while a
+/// public one (`VITE_API_URL`) still reaches a worker build.
+///
+/// Deliberately not `Debug`-derived: the value must never reach a log line or
+/// a panic message.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InheritedGroupVariable {
+    pub value: String,
+    pub is_secret: bool,
+}
+
+impl std::fmt::Debug for InheritedGroupVariable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InheritedGroupVariable")
+            .field("value", &"<redacted>")
+            .field("is_secret", &self.is_secret)
+            .finish()
+    }
+}
+
+/// The decrypted variables `project_id` inherits in `environment`, by key.
+/// Empty when the service is in no project, so every deploy path can call it
 /// unconditionally and a container never boots without them.
 pub async fn inherited_group_env_vars(
     db: &DatabaseConnection,
     encryption: &EncryptionService,
     project_id: i32,
     environment: &environments::Model,
-) -> Result<HashMap<String, String>, GroupEnvError> {
+) -> Result<HashMap<String, InheritedGroupVariable>, GroupEnvError> {
     let Some((group_id, selected)) =
         project_group_env_vars::inherited_for_project(db, project_id, environment)
             .await
@@ -70,7 +92,15 @@ pub async fn inherited_group_env_vars(
         .map(|(key, variable)| {
             encryption
                 .decrypt_string(&variable.value)
-                .map(|value| (key.clone(), value))
+                .map(|value| {
+                    (
+                        key.clone(),
+                        InheritedGroupVariable {
+                            value,
+                            is_secret: variable.is_secret,
+                        },
+                    )
+                })
                 .map_err(|e| GroupEnvError::Decrypt {
                     project_id,
                     environment_id: environment.id,
@@ -80,6 +110,31 @@ pub async fn inherited_group_env_vars(
                 })
         })
         .collect()
+}
+
+/// Lay `inherited` beneath the project's own variables: a key the project
+/// already defines (secret or not, for this environment) keeps the project's
+/// value, and every other key is added.
+///
+/// Returns the `(key, value)` pairs that were added **and** are not secret.
+/// Those are the only inherited values a remote worker build may receive;
+/// an inherited value the project overrode is never among them, so the
+/// planner's public record can only ever hold the value the build carries.
+pub fn merge_inherited_beneath(
+    explicit_vars: &mut HashMap<String, String>,
+    inherited: HashMap<String, InheritedGroupVariable>,
+) -> Vec<(String, String)> {
+    let mut public = Vec::new();
+    for (key, variable) in inherited {
+        if explicit_vars.contains_key(&key) {
+            continue;
+        }
+        if !variable.is_secret {
+            public.push((key.clone(), variable.value.clone()));
+        }
+        explicit_vars.insert(key, variable.value);
+    }
+    public
 }
 
 #[cfg(test)]
@@ -167,7 +222,140 @@ mod tests {
         let vars = inherited_group_env_vars(&db, &encryption, 11, &environment(3, "production"))
             .await
             .expect("decrypts");
-        assert_eq!(vars.get("API_TOKEN").map(String::as_str), Some(PLAINTEXT));
+        let token = vars.get("API_TOKEN").expect("API_TOKEN is inherited");
+        assert_eq!(token.value, PLAINTEXT);
+        assert!(token.is_secret, "the stored sensitivity travels with it");
+    }
+
+    #[tokio::test]
+    async fn sensitivity_is_carried_per_variable() {
+        let encryption = encryption();
+        let public_stored = encryption
+            .encrypt_string("https://api.example.test")
+            .expect("encrypt");
+        let secret_stored = encryption.encrypt_string(PLAINTEXT).expect("encrypt");
+        let mut public = variable(1, 5, "VITE_API_URL", &public_stored);
+        public.is_secret = false;
+        let secret = variable(2, 5, "API_TOKEN", &secret_stored);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![membership(11, 5)]])
+            .append_query_results([vec![public, secret]])
+            .into_connection();
+        let vars = inherited_group_env_vars(&db, &encryption, 11, &environment(3, "production"))
+            .await
+            .expect("decrypts");
+        assert_eq!(
+            vars.get("VITE_API_URL"),
+            Some(&InheritedGroupVariable {
+                value: "https://api.example.test".to_string(),
+                is_secret: false,
+            })
+        );
+        assert_eq!(
+            vars.get("API_TOKEN"),
+            Some(&InheritedGroupVariable {
+                value: PLAINTEXT.to_string(),
+                is_secret: true,
+            })
+        );
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_value() {
+        let variable = InheritedGroupVariable {
+            value: PLAINTEXT.to_string(),
+            is_secret: true,
+        };
+        let rendered = format!("{variable:?}");
+        assert!(!rendered.contains(PLAINTEXT), "got {rendered}");
+        assert!(rendered.contains("is_secret: true"), "got {rendered}");
+    }
+
+    fn inherited(entries: &[(&str, &str, bool)]) -> HashMap<String, InheritedGroupVariable> {
+        entries
+            .iter()
+            .map(|(key, value, is_secret)| {
+                (
+                    key.to_string(),
+                    InheritedGroupVariable {
+                        value: value.to_string(),
+                        is_secret: *is_secret,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_reports_only_added_non_secret_values_as_public() {
+        let mut explicit = HashMap::new();
+        let mut public = merge_inherited_beneath(
+            &mut explicit,
+            inherited(&[
+                ("VITE_API_URL", "https://api.example.test", false),
+                ("API_TOKEN", PLAINTEXT, true),
+            ]),
+        );
+        public.sort();
+        assert_eq!(
+            public,
+            vec![(
+                "VITE_API_URL".to_string(),
+                "https://api.example.test".to_string()
+            )]
+        );
+        // Both are still part of the resolved variables.
+        assert_eq!(explicit.len(), 2);
+        assert_eq!(
+            explicit.get("API_TOKEN").map(String::as_str),
+            Some(PLAINTEXT)
+        );
+    }
+
+    #[test]
+    fn merge_keeps_the_project_value_and_does_not_report_the_overridden_one() {
+        let mut explicit: HashMap<String, String> = [
+            ("VITE_API_URL", "https://project.example.test"),
+            ("SHARED_TOKEN", "project-secret"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let public = merge_inherited_beneath(
+            &mut explicit,
+            inherited(&[
+                ("VITE_API_URL", "https://group.example.test", false),
+                // A public group value under a name the project holds as a
+                // secret must not become public either.
+                ("SHARED_TOKEN", "group-public", false),
+            ]),
+        );
+        assert!(public.is_empty(), "nothing was added");
+        assert_eq!(
+            explicit.get("VITE_API_URL").map(String::as_str),
+            Some("https://project.example.test")
+        );
+        assert_eq!(
+            explicit.get("SHARED_TOKEN").map(String::as_str),
+            Some("project-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn another_environments_variable_is_not_inherited() {
+        let encryption = encryption();
+        let stored = encryption.encrypt_string("staging-only").expect("encrypt");
+        let mut scoped = variable(1, 5, "VITE_API_URL", &stored);
+        scoped.is_secret = false;
+        scoped.environment_slug = Some("staging".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![membership(11, 5)]])
+            .append_query_results([vec![scoped]])
+            .into_connection();
+        let vars = inherited_group_env_vars(&db, &encryption, 11, &environment(3, "production"))
+            .await
+            .expect("decrypts");
+        assert!(vars.is_empty(), "got keys {:?}", vars.keys());
     }
 
     #[tokio::test]

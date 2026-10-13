@@ -542,8 +542,16 @@ impl WorkflowPlanner {
             environment,
         )
         .await?;
-        for (key, value) in inherited {
-            explicit_project_vars.entry(key).or_insert(value);
+        // The winning non-secret inherited values are public build values,
+        // exactly as the project's own non-secret variables are above: a
+        // remote builder may receive them. A value the project overrode, a
+        // secret, and a variable scoped to another environment (never
+        // selected) are not recorded.
+        for (key, value) in crate::services::group_env::merge_inherited_beneath(
+            &mut explicit_project_vars,
+            inherited,
+        ) {
+            public_values.record(key, value);
         }
 
         // 2. Get runtime environment variables from external services
@@ -4768,6 +4776,269 @@ mod tests {
         assert_eq!(
             public.worker_build_arg_keys(&build_args),
             vec!["HOST".to_string(), "VITE_API_URL".to_string()]
+        );
+    }
+
+    /// A non-secret variable inherited from the project's group is a public
+    /// build value, exactly as the same variable set on the project is, so a
+    /// remote builder receives it. A group secret, a group value the project
+    /// overrode, and a group variable scoped to another environment never
+    /// leave the control plane as the group's value.
+    #[tokio::test]
+    async fn inherited_group_variables_reach_worker_builds_only_when_public(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{
+            env_var_environments, env_vars, project_group_env_vars, project_group_members,
+            project_groups,
+        };
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping group worker variables test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let catalog_preset = temps_presets::all_presets()
+            .into_iter()
+            .find(|preset| preset.slug() == "vite")
+            .ok_or("the vite preset is in the catalog")?;
+        let stored = catalog_preset.resolve_storage(None)?;
+        let project = projects::ActiveModel {
+            name: Set("Group worker vars".to_string()),
+            slug: Set("group-worker-vars".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            main_branch: Set("main".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(stored.preset),
+            preset_config: Set(stored.config.clone()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("group-worker-vars.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("group-worker-vars.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("group-worker-vars-deployment".to_string()),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // The project's own variables: one public value that overrides the
+        // group's, and one secret under a name the group sets publicly.
+        for (key, value, is_secret) in [
+            ("VITE_OVERRIDDEN", "project-public", false),
+            ("VITE_SECRET_OVERRIDE", "project-secret", true),
+        ] {
+            let variable = env_vars::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                key: Set(key.to_string()),
+                value: Set(value.to_string()),
+                is_secret: Set(is_secret),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            env_var_environments::ActiveModel {
+                env_var_id: Set(variable.id),
+                environment_id: Set(environment.id),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let group = project_groups::ActiveModel {
+            name: Set("Worker vars group".to_string()),
+            slug: Set("worker-vars-group".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        project_group_members::ActiveModel {
+            project_id: Set(project.id),
+            group_id: Set(group.id),
+            position: Set(0),
+            inherits_repository: Set(false),
+            added_at: Set(Utc::now()),
+        }
+        .insert(db.as_ref())
+        .await?;
+        for (key, value, is_secret, environment_slug) in [
+            ("VITE_API_URL", "https://api.example.test", false, None),
+            ("VITE_GROUP_TOKEN", "group-secret-value", true, None),
+            ("VITE_OVERRIDDEN", "group-public", false, None),
+            ("VITE_SECRET_OVERRIDE", "group-public", false, None),
+            (
+                "VITE_STAGING_ONLY",
+                "staging-value",
+                false,
+                Some("staging".to_string()),
+            ),
+        ] {
+            project_group_env_vars::ActiveModel {
+                group_id: Set(group.id),
+                key: Set(key.to_string()),
+                value: Set(encryption_service.encrypt_string(value)?),
+                is_secret: Set(is_secret),
+                environment_slug: Set(environment_slug),
+                include_in_preview: Set(true),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+        let build_job = jobs
+            .iter()
+            .find(|job| job.job_id == "build_image")
+            .ok_or("a vite project has a build job")?;
+        let config = build_job
+            .job_config
+            .as_ref()
+            .ok_or("a build job has configuration")?;
+        let build_args = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        let keys: std::collections::BTreeSet<String> = config
+            .get(WORKER_BUILD_ARG_KEYS_FIELD)
+            .and_then(|value| value.as_array())
+            .ok_or("the build job lists its worker build arguments")?
+            .iter()
+            .filter_map(|key| key.as_str().map(str::to_owned))
+            .collect();
+
+        // The public group value is built in and may go to a worker.
+        assert_eq!(
+            build_args.get("VITE_API_URL").map(String::as_str),
+            Some("https://api.example.test")
+        );
+        assert!(keys.contains("VITE_API_URL"), "keys: {keys:?}");
+
+        // The project's own public value wins and is the one a worker gets.
+        assert_eq!(
+            build_args.get("VITE_OVERRIDDEN").map(String::as_str),
+            Some("project-public")
+        );
+        assert!(keys.contains("VITE_OVERRIDDEN"), "keys: {keys:?}");
+
+        // A group secret is built in but stays on the control plane.
+        assert_eq!(
+            build_args.get("VITE_GROUP_TOKEN").map(String::as_str),
+            Some("group-secret-value")
+        );
+        assert!(!keys.contains("VITE_GROUP_TOKEN"), "keys: {keys:?}");
+
+        // The project's secret wins, and the group's public value under the
+        // same name is not recorded, so the name is withheld.
+        assert_eq!(
+            build_args.get("VITE_SECRET_OVERRIDE").map(String::as_str),
+            Some("project-secret")
+        );
+        assert!(!keys.contains("VITE_SECRET_OVERRIDE"), "keys: {keys:?}");
+
+        // Another environment's variable is not inherited at all.
+        assert!(!build_args.contains_key("VITE_STAGING_ONLY"));
+        assert!(!keys.contains("VITE_STAGING_ONLY"), "keys: {keys:?}");
+        Ok(())
+    }
+
+    /// Inherited group variables go through the same record as the project's:
+    /// the winning non-secret value is sendable, a secret or an overridden
+    /// value is not.
+    #[test]
+    fn inherited_non_secret_values_are_recorded_as_public() {
+        use crate::services::group_env::{merge_inherited_beneath, InheritedGroupVariable};
+
+        let inherited = |value: &str, is_secret: bool| InheritedGroupVariable {
+            value: value.to_string(),
+            is_secret,
+        };
+        let mut explicit: std::collections::HashMap<String, String> = [
+            ("VITE_OVERRIDDEN", "project-public"),
+            ("VITE_SECRET_OVERRIDE", "project-secret"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let mut public = PublicBuildValues::default();
+        public.record("VITE_OVERRIDDEN", "project-public");
+        for (name, value) in merge_inherited_beneath(
+            &mut explicit,
+            [
+                ("VITE_API_URL", inherited("https://api.example.test", false)),
+                ("VITE_GROUP_TOKEN", inherited("group-secret", true)),
+                ("VITE_OVERRIDDEN", inherited("group-public", false)),
+                ("VITE_SECRET_OVERRIDE", inherited("group-public", false)),
+            ]
+            .into_iter()
+            .map(|(name, variable)| (name.to_string(), variable))
+            .collect(),
+        ) {
+            public.record(name, value);
+        }
+
+        assert_eq!(
+            public.worker_build_arg_keys(&explicit),
+            vec!["VITE_API_URL".to_string(), "VITE_OVERRIDDEN".to_string()]
+        );
+        assert_eq!(
+            explicit.get("VITE_OVERRIDDEN").map(String::as_str),
+            Some("project-public")
         );
     }
 
