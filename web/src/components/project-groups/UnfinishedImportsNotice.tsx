@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { AlertTriangle, Loader2, RefreshCw } from 'lucide-react'
-import { listInstantiationsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { retryInstantiation } from '@/api/client/sdk.gen'
+import {
+  listInstantiationsOptions,
+  retryInstantiationMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import type { InstantiationResponse, ProjectGroupResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -50,7 +52,17 @@ export function UnfinishedImportsNotice({
         ? POLL_INTERVAL_MS
         : false,
   })
-  const [retrying, setRetrying] = useState<number | null>(null)
+  const retryImport = useMutation({
+    ...retryInstantiationMutation(),
+    onError: (err) => {
+      toast.error(getErrorMessage(err, 'Could not retry it'))
+    },
+    onSettled: () => invalidate(),
+  })
+  // The import being retried, while its retry request is in flight.
+  const retrying = retryImport.isPending
+    ? (retryImport.variables?.path.id ?? null)
+    : null
   const [dismissed, setDismissed] = useState(loadDismissed)
   const dismiss = (id: number) => {
     const next = new Set(dismissed).add(id)
@@ -85,18 +97,11 @@ export function UnfinishedImportsNotice({
   }
   if (items.length === 0) return null
 
-  const retry = async (item: InstantiationResponse) => {
-    setRetrying(item.id)
-    try {
-      await retryInstantiation({ path: { id: item.id }, throwOnError: true })
-      await query.refetch()
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'Could not retry it'))
-    } finally {
-      setRetrying(null)
-      await invalidate()
-    }
-  }
+  const retry = (item: InstantiationResponse) =>
+    retryImport.mutate(
+      { path: { id: item.id } },
+      { onSuccess: () => query.refetch() }
+    )
 
   return (
     <div className="space-y-2">
@@ -142,7 +147,7 @@ export function UnfinishedImportsNotice({
                     size="sm"
                     variant="outline"
                     disabled={retrying !== null}
-                    onClick={() => void retry(item)}
+                    onClick={() => retry(item)}
                   >
                     {retrying === item.id ? (
                       <Loader2 className="size-4 animate-spin" />

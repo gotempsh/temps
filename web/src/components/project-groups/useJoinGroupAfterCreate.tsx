@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Loader2, RefreshCw } from 'lucide-react'
 import { getProjectGroupOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -46,7 +46,17 @@ export interface CreatedService {
 interface JoinFailure {
   service: CreatedService
   message: string
+  /**
+   * Set when a deployment is waiting on the join (see `joinBeforeDeploy`):
+   * Retry joins and then runs it, so the first deployment still starts after
+   * the service belongs to the project.
+   */
+  resume: (() => Promise<void>) | null
 }
+
+type JoinOutcome =
+  | { status: 'joined'; group: ProjectGroupResponse }
+  | { status: 'failed'; message: string }
 
 /**
  * The project (group) a new service should join, from `?group=<id>`. Shared
@@ -68,46 +78,72 @@ export function useTargetGroup() {
  * project and opens the project; otherwise goes where the flow always went.
  * A failed add never passes silently: `joinGroupDialog` (render it in the
  * flow) says so, with Retry and a link to the service that was created.
+ *
+ * Ordering matters when the flow also deploys the service: the server
+ * resolves the project's shared variables while it plans a deployment, so a
+ * deployment started before the service joined runs without them. Flows that
+ * start the deployment themselves use `joinBeforeDeploy` and `continueTo`.
  */
 export function useJoinGroupAfterCreate() {
   const navigate = useNavigate()
   const invalidate = useInvalidateGroups()
   const { groupId, group } = useTargetGroup()
   const [failure, setFailure] = useState<JoinFailure | null>(null)
-  const [retrying, setRetrying] = useState(false)
+  // Where `continueTo` lands once the service has joined. Only ever read from
+  // event handlers, never during render.
+  const joinedGroupRef = useRef<ProjectGroupResponse | null>(null)
 
-  const join = useCallback(
-    async (service: CreatedService): Promise<boolean> => {
-      if (groupId === null) return true
+  /**
+   * Add `service` to the target project and report how it went. Silent: no
+   * toast, dialog or navigation, for a flow that owns its own failure UI.
+   */
+  const addToGroup = useCallback(
+    async (service: CreatedService): Promise<JoinOutcome> => {
+      if (groupId === null) {
+        return { status: 'failed', message: 'No project was selected.' }
+      }
       try {
         const { data } = await addProjectToGroup({
           path: { group_id: groupId, project_id: service.id },
           throwOnError: true,
         })
+        joinedGroupRef.current = data
         await invalidate()
-        toast.success(`${service.name} added to ${data.name}`)
-        setFailure(null)
-        navigate(groupHref(data.slug))
-        return true
+        return { status: 'joined', group: data }
       } catch (err) {
         await invalidate()
-        setFailure({
-          service,
+        return {
+          status: 'failed',
           message: getErrorMessage(
             err,
             'The service could not be added to the project.'
           ),
-        })
-        return false
+        }
       }
     },
-    [groupId, invalidate, navigate]
+    [groupId, invalidate]
+  )
+
+  const reportFailure = useCallback(
+    (
+      service: CreatedService,
+      message: string,
+      resume: (() => Promise<void>) | null
+    ) => {
+      toast.error(
+        `${service.name} was created, but not added to ${group?.name ?? 'the project'}`,
+        { description: message }
+      )
+      setFailure({ service, message, resume })
+    },
+    [group]
   )
 
   /**
-   * Finish a creation: join the target project when there is one, otherwise
-   * navigate to `fallbackHref`. Resolves false when joining failed and the
-   * dialog is showing; the caller stays where it is.
+   * Finish a creation that deploys nothing itself: join the target project
+   * when there is one, otherwise navigate to `fallbackHref`. Resolves false
+   * when joining failed and the dialog is showing; the caller stays where
+   * it is.
    */
   const finish = useCallback(
     async (service: CreatedService, fallbackHref: string): Promise<boolean> => {
@@ -115,32 +151,96 @@ export function useJoinGroupAfterCreate() {
         navigate(fallbackHref)
         return true
       }
-      return join(service)
+      const outcome = await addToGroup(service)
+      if (outcome.status === 'failed') {
+        reportFailure(service, outcome.message, null)
+        return false
+      }
+      setFailure(null)
+      toast.success(`${service.name} added to ${outcome.group.name}`)
+      navigate(groupHref(outcome.group.slug))
+      return true
     },
-    [groupId, join, navigate]
+    [groupId, addToGroup, navigate, reportFailure]
   )
 
-  const retry = async () => {
-    if (!failure) return
-    setRetrying(true)
-    try {
-      await join(failure.service)
-    } finally {
-      setRetrying(false)
-    }
-  }
+  /**
+   * Add a just-created service to the target project BEFORE the caller
+   * starts its first deployment, so that deployment is planned with the
+   * project's shared variables. Resolves true when the caller should go on
+   * to deploy (joined, or there is no target project).
+   *
+   * Resolves false when joining failed: nothing must be deployed. The dialog
+   * is showing; its Retry joins again and, once that works, calls `resume`,
+   * which must do the deployment and finish with `continueTo`. `resume` is
+   * responsible for reporting its own failures.
+   */
+  const joinBeforeDeploy = useCallback(
+    async (
+      service: CreatedService,
+      resume: () => Promise<void>
+    ): Promise<boolean> => {
+      if (groupId === null) return true
+      const outcome = await addToGroup(service)
+      if (outcome.status === 'failed') {
+        reportFailure(service, outcome.message, resume)
+        return false
+      }
+      setFailure(null)
+      toast.success(`${service.name} added to ${outcome.group.name}`)
+      return true
+    },
+    [groupId, addToGroup, reportFailure]
+  )
+
+  /**
+   * Where a flow lands after it deployed: the project the service joined,
+   * or `fallbackHref` when there was no target project.
+   */
+  const continueTo = useCallback(
+    (fallbackHref: string) => {
+      const joined = groupId === null ? null : joinedGroupRef.current
+      navigate(joined ? groupHref(joined.slug) : fallbackHref)
+    },
+    [groupId, navigate]
+  )
+
+  const retryJoin = useMutation({
+    mutationFn: async (pending: JoinFailure) => {
+      const outcome = await addToGroup(pending.service)
+      if (outcome.status === 'failed') {
+        setFailure({ ...pending, message: outcome.message })
+        return
+      }
+      setFailure(null)
+      toast.success(`${pending.service.name} added to ${outcome.group.name}`)
+      if (pending.resume) {
+        await pending.resume()
+      } else {
+        navigate(groupHref(outcome.group.slug))
+      }
+    },
+  })
 
   const joinGroupDialog = (
     <JoinGroupFailedDialog
       failure={failure}
       group={group}
-      retrying={retrying}
-      onRetry={() => void retry()}
+      retrying={retryJoin.isPending}
+      onRetry={() => failure && retryJoin.mutate(failure)}
       onClose={() => setFailure(null)}
     />
   )
 
-  return { groupId, group, finish, joinGroupDialog }
+  return {
+    groupId,
+    group,
+    finish,
+    joinBeforeDeploy,
+    continueTo,
+    addToGroup,
+    joinGroupDialog,
+  }
 }
 
 function JoinGroupFailedDialog({
@@ -166,8 +266,9 @@ function JoinGroupFailedDialog({
             to {groupName}
           </DialogTitle>
           <DialogDescription>
-            The service exists and works on its own. Retry adding it, or add it
-            later from the project&apos;s Add services menu.
+            {failure?.resume
+              ? 'Nothing was deployed: the first deployment waits until the service is in the project, so it starts with the shared variables of the project. Retry to add it and deploy, or open the service and deploy it from there.'
+              : 'The service exists and works on its own. Retry adding it, or add it later from the Add services menu of the project.'}
           </DialogDescription>
         </DialogHeader>
         {failure && (

@@ -11,6 +11,7 @@ import {
   uploadStaticBundle,
   type DropInspectionResponse,
   type EnvironmentResponse,
+  type ProjectGroupResponse,
   type ProjectResponse,
 } from '@/api/client'
 import { DropDeliveryRow } from '@/components/drop/DropDeliveryRow'
@@ -64,6 +65,7 @@ import {
 import type { DropDeliveryChoice } from '@/lib/drop-delivery'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
+import { toast } from 'sonner'
 import {
   ArrowRight,
   Check,
@@ -154,11 +156,14 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [handedOffFiles] = useState(() => consumeDropFilesHandoff())
   const detectionRunRef = useRef(0)
   const detectionAbortRef = useRef<AbortController | null>(null)
-  // `/projects/new?group=<id>`: the new service joins that project.
+  // `/projects/new?group=<id>`: the new service joins that project, before
+  // anything is uploaded or deployed (the server resolves the project's
+  // shared variables while it plans a deployment).
   const {
     groupId: targetGroupId,
-    finish,
-    joinGroupDialog,
+    group: targetGroup,
+    addToGroup,
+    continueTo,
   } = useJoinGroupAfterCreate()
 
   usePageTitle(embedded ? 'New service' : 'Drop')
@@ -377,6 +382,20 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       if (!targetEnvironment)
         throw new Error('The service has no deployment environment')
 
+      // Into the target project before any deployment is planned. A failure
+      // lands in the catch below: nothing was deployed, the incomplete
+      // service is removed and Deploy can simply be pressed again.
+      let joinedGroup: ProjectGroupResponse | null = null
+      if (targetGroupId !== null) {
+        const joined = await addToGroup(createdProject)
+        if (joined.status === 'failed') {
+          throw new Error(
+            `The service could not be added to ${targetGroup?.name ?? 'the project'}, so nothing was deployed. ${joined.message}`
+          )
+        }
+        joinedGroup = joined.group
+      }
+
       setStage('uploading')
       if (!candidate.isStatic) {
         const sourceResponse = await deployFromUploadedSource({
@@ -391,17 +410,12 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
         if (!sourceDeployment)
           throw new Error('Source deployment returned no result')
         deploymentAccepted = true
-        const joined = await finish(
-          createdProject,
+        if (joinedGroup) {
+          toast.success(`${createdProject.name} added to ${joinedGroup.name}`)
+        }
+        continueTo(
           `/projects/${createdProject.slug}/deployments/${sourceDeployment.id}`
         )
-        if (!joined) {
-          // Deployed, but not added to the project: the dialog says so over
-          // the completion screen.
-          setProject(createdProject)
-          setEnvironment(targetEnvironment)
-          setStage('done')
-        }
         return
       }
       const uploadResponse = await uploadStaticBundle({
@@ -422,9 +436,12 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
         body: { static_bundle_id: bundle.id },
       })
       deploymentAccepted = true
-      // Into a project: land on it (or, if adding fails, the dialog says so
-      // over the completion screen below).
-      if (targetGroupId !== null && (await finish(createdProject, ''))) return
+      // Into a project: land on it.
+      if (joinedGroup) {
+        toast.success(`${createdProject.name} added to ${joinedGroup.name}`)
+        continueTo('')
+        return
+      }
       setProject(createdProject)
       setEnvironment(targetEnvironment)
       setStage('done')
@@ -483,19 +500,11 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       </div>
     )
 
-    if (embedded) {
-      return (
-        <>
-          {completedContent}
-          {joinGroupDialog}
-        </>
-      )
-    }
+    if (embedded) return completedContent
 
     return (
       <PageContainer innerClassName="min-h-[calc(100vh-8rem)] flex items-center">
         {completedContent}
-        {joinGroupDialog}
       </PageContainer>
     )
   }

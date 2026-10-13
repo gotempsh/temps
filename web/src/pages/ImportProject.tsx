@@ -90,11 +90,16 @@ export function ImportProject() {
       errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
+      // The server queues a Git service's first deployment as part of
+      // creating it and the create request has no project field, so join
+      // before anything else (cache refreshes included) to keep the window in
+      // which that deployment is planned without the project's shared
+      // variables as short as possible.
+      toast.success('Service created')
+      await finish(data, `/projects/${data.slug}?new=true`)
       // Invalidate services queries to refresh the command palette
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
-      toast.success('Service created')
-      await finish(data, `/projects/${data.slug}?new=true`)
     },
   })
 

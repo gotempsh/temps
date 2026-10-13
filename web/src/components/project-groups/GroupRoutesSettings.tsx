@@ -4,6 +4,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import * as z from 'zod/v4'
 import { toast } from 'sonner'
 import { AlertTriangle, ArrowRight, Loader2, Trash2 } from 'lucide-react'
 import {
@@ -28,8 +31,15 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -42,6 +52,19 @@ import { Switch } from '@/components/ui/switch'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { RouteAddresses } from './GroupRoutesSummary'
 import { useServiceEnvironments } from './service-urls'
+
+const DEFAULT_PREFIX = '/api'
+
+const routeSchema = z.object({
+  source: z
+    .string()
+    .min(1, 'Choose the service whose domains hand the path over.'),
+  target: z.string().min(1, 'Choose the service that serves the path.'),
+  prefix: z.string().trim().min(1, 'Enter the path to route, such as /api.'),
+  strip: z.boolean(),
+})
+
+type RouteValues = z.infer<typeof routeSchema>
 
 /**
  * Path routes (ADR 050): a service's domains hand a path such as `/api` to
@@ -61,11 +84,19 @@ export function GroupRoutesSettings({
 
   const services = group.projects
   const environments = useServiceEnvironments(services.map((p) => p.id))
-  const [source, setSource] = useState('')
-  const [target, setTarget] = useState('')
-  const [prefix, setPrefix] = useState('/api')
-  const [strip, setStrip] = useState(false)
-  const [formError, setFormError] = useState<string | null>(null)
+  const form = useForm<RouteValues>({
+    resolver: zodResolver(routeSchema),
+    defaultValues: {
+      source: '',
+      target: '',
+      prefix: DEFAULT_PREFIX,
+      strip: false,
+    },
+  })
+  const [source, target, prefix] = useWatch({
+    control: form.control,
+    name: ['source', 'target', 'prefix'],
+  })
   // Removing a route changes live traffic, so it is confirmed first.
   const [confirming, setConfirming] = useState<GroupRouteResponse | null>(null)
 
@@ -74,27 +105,29 @@ export function GroupRoutesSettings({
       queryKey: listGroupRoutesQueryKey({ path }),
     })
 
-  const add = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setFormError(null)
+  const add = async (values: RouteValues) => {
     try {
       const created = await create.mutateAsync({
         path,
         body: {
-          source_project_id: Number(source),
-          target_project_id: Number(target),
-          path_prefix: prefix,
-          strip_prefix: strip,
+          source_project_id: Number(values.source),
+          target_project_id: Number(values.target),
+          path_prefix: values.prefix,
+          strip_prefix: values.strip,
         },
       })
       await refresh()
       toast.success(
         `${created.source_project_name} now sends ${created.path_prefix} to ${created.target_project_name}`
       )
-      setPrefix('/api')
-      setStrip(false)
+      // The services stay chosen: routes are often added in a row.
+      form.setValue('prefix', DEFAULT_PREFIX)
+      form.setValue('strip', false)
     } catch (err) {
-      setFormError(getErrorMessage(err, 'The route could not be added.'))
+      form.setError('root', {
+        type: 'server',
+        message: getErrorMessage(err, 'The route could not be added.'),
+      })
     }
   }
 
@@ -211,81 +244,119 @@ export function GroupRoutesSettings({
           (say, an API next to a frontend) to route a path between them.
         </p>
       ) : (
-        <form
-          onSubmit={add}
-          className="space-y-3 rounded-lg border border-dashed px-4 py-4"
-        >
-          <div className="grid gap-3 sm:grid-cols-[1fr_8rem_1fr]">
-            <div className="space-y-1.5">
-              <Label htmlFor="route-source">On the domains of</Label>
-              <Select value={source} onValueChange={setSource}>
-                <SelectTrigger id="route-source">
-                  <SelectValue placeholder="Service" />
-                </SelectTrigger>
-                <SelectContent>
-                  {services.map((p) => (
-                    <SelectItem key={p.id} value={String(p.id)}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="route-prefix">Path</Label>
-              <Input
-                id="route-prefix"
-                className="font-mono"
-                value={prefix}
-                onChange={(e) => setPrefix(e.target.value)}
-                placeholder="/api"
+        <Form {...form}>
+          <form
+            onSubmit={(event) => void form.handleSubmit(add)(event)}
+            className="space-y-3 rounded-lg border border-dashed px-4 py-4"
+          >
+            <div className="grid gap-3 sm:grid-cols-[1fr_8rem_1fr]">
+              <FormField
+                control={form.control}
+                name="source"
+                render={({ field }) => (
+                  <FormItem className="space-y-1.5">
+                    <FormLabel htmlFor="route-source">
+                      On the domains of
+                    </FormLabel>
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <FormControl>
+                        <SelectTrigger id="route-source">
+                          <SelectValue placeholder="Service" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {services.map((p) => (
+                          <SelectItem key={p.id} value={String(p.id)}>
+                            {p.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="prefix"
+                render={({ field }) => (
+                  <FormItem className="space-y-1.5">
+                    <FormLabel htmlFor="route-prefix">Path</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        id="route-prefix"
+                        className="font-mono"
+                        placeholder="/api"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="target"
+                render={({ field }) => (
+                  <FormItem className="space-y-1.5">
+                    <FormLabel htmlFor="route-target">Is served by</FormLabel>
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <FormControl>
+                        <SelectTrigger id="route-target">
+                          <SelectValue placeholder="Service" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {services
+                          .filter((p) => String(p.id) !== source)
+                          .map((p) => (
+                            <SelectItem key={p.id} value={String(p.id)}>
+                              {p.name}
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
               />
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="route-target">Is served by</Label>
-              <Select value={target} onValueChange={setTarget}>
-                <SelectTrigger id="route-target">
-                  <SelectValue placeholder="Service" />
-                </SelectTrigger>
-                <SelectContent>
-                  {services
-                    .filter((p) => String(p.id) !== source)
-                    .map((p) => (
-                      <SelectItem key={p.id} value={String(p.id)}>
-                        {p.name}
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Switch
-              id="route-strip"
-              checked={strip}
-              onCheckedChange={setStrip}
+            <FormField
+              control={form.control}
+              name="strip"
+              render={({ field }) => (
+                <FormItem className="flex items-center gap-2 space-y-0">
+                  <FormControl>
+                    <Switch
+                      id="route-strip"
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                    />
+                  </FormControl>
+                  <FormLabel htmlFor="route-strip" className="font-normal">
+                    Remove the path before forwarding (
+                    <code>{prefix || DEFAULT_PREFIX}/users</code> arrives as{' '}
+                    <code>/users</code>)
+                  </FormLabel>
+                </FormItem>
+              )}
             />
-            <Label htmlFor="route-strip" className="font-normal">
-              Remove the path before forwarding (
-              <code>{prefix || '/api'}/users</code> arrives as{' '}
-              <code>/users</code>)
-            </Label>
-          </div>
-          {formError && (
-            <p role="alert" className="text-sm font-medium text-destructive">
-              {formError}
-            </p>
-          )}
-          <Button
-            type="submit"
-            size="sm"
-            disabled={
-              !source || !target || source === target || create.isPending
-            }
-          >
-            {create.isPending ? 'Adding…' : 'Add route'}
-          </Button>
-        </form>
+            {form.formState.errors.root && (
+              <p role="alert" className="text-sm font-medium text-destructive">
+                {form.formState.errors.root.message}
+              </p>
+            )}
+            <Button
+              type="submit"
+              size="sm"
+              disabled={
+                !source || !target || source === target || create.isPending
+              }
+            >
+              {create.isPending ? 'Adding…' : 'Add route'}
+            </Button>
+          </form>
+        </Form>
       )}
     </div>
   )

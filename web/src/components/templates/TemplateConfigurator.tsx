@@ -574,8 +574,6 @@ function SingleServiceTemplateConfigurator({
   const createFromTemplateMutation = useMutation({
     ...createProjectFromTemplateMutation(),
     onSuccess: async (data) => {
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
       if (data.deployment_queued === false) {
         toast.warning(
           data.deployment_error ??
@@ -585,6 +583,11 @@ function SingleServiceTemplateConfigurator({
         toast.success(`Service "${data.project_name}" created successfully!`)
       }
       onSuccess?.()
+      // The server queues a Git service's first deployment as part of
+      // creating it and the create request has no project field, so join
+      // before anything else (cache refreshes included) to keep the window in
+      // which that deployment is planned without the project's shared
+      // variables as short as possible.
       await finish(
         {
           id: data.project_id,
@@ -593,6 +596,8 @@ function SingleServiceTemplateConfigurator({
         },
         `/projects/${data.project_slug}?new=true`
       )
+      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
+      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
     },
     onError: (error, variables) => {
       // ADR 045: a slug this host grants the Docker socket to is admin-only

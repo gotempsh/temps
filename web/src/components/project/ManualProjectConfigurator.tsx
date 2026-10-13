@@ -209,8 +209,64 @@ export function ManualProjectConfigurator({
     return Array.from(servicesById.values())
   }, [existingServices, newlyCreatedServices])
 
-  // `?group=<id>`: the new service joins that project.
-  const { finish, joinGroupDialog } = useJoinGroupAfterCreate()
+  // `?group=<id>`: the new service joins that project. The server resolves
+  // the project's shared variables while it plans a deployment, so the join
+  // happens before the image deployment is started, never after.
+  const { finish, joinBeforeDeploy, continueTo, joinGroupDialog } =
+    useJoinGroupAfterCreate()
+
+  /**
+   * Deploy the image entered on this form to a service that was just created
+   * and then leave the page. Without it the image was dropped and the
+   * service had nothing to deploy. Every failure is reported here, so it is
+   * safe to run again from the join dialog's Retry.
+   */
+  const deployImageAndLeave = async (
+    service: { id: number; slug: string },
+    imageRef: string
+  ) => {
+    try {
+      const firstDeploy = await startFirstImageDeploy(service.id, imageRef, {
+        listEnvironments: async (projectId) => {
+          const { data: environments } = await getEnvironments({
+            path: { project_id: projectId },
+            throwOnError: true,
+          })
+          return environments
+        },
+        deployImage: ({ projectId, environmentId, imageRef }) =>
+          deployFromImage({
+            path: {
+              project_id: projectId,
+              environment_id: environmentId,
+            },
+            body: { image_ref: imageRef },
+            throwOnError: true,
+          }),
+      })
+      if (firstDeploy.status === 'started') {
+        toast.success(`Deploying to ${firstDeploy.environmentName}`)
+        continueTo(deploymentsAfterStartPath(service.slug))
+        return
+      }
+      if (firstDeploy.status === 'no_environment') {
+        toast.error(
+          'The service has no environment to deploy the image to. Create one, then deploy from the Deployments tab.'
+        )
+      }
+      continueTo(`/projects/${service.slug}?new=true&source=${sourceType}`)
+    } catch (error) {
+      toast.error(
+        `Service created, but the image deployment did not start: ${problemDetail(
+          error,
+          'unknown error'
+        )}`
+      )
+      // Service creation does not store the image, so hand it to the
+      // deploy dialog rather than making the user retype it.
+      continueTo(imageDeployRetryPath(service.slug, imageRef))
+    }
+  }
 
   // Service creation mutation
   const projectMutation = useMutation({
@@ -223,54 +279,21 @@ export function ManualProjectConfigurator({
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
       toast.success('Service created')
 
-      // Deploy the image entered on this form. Without this the image was
-      // dropped and the service had nothing to deploy.
       const imageRef = form.getValues('imageUrl')?.trim()
-      if (sourceType !== 'static_files' && imageRef) {
-        try {
-          const firstDeploy = await startFirstImageDeploy(data.id, imageRef, {
-            listEnvironments: async (projectId) => {
-              const { data: environments } = await getEnvironments({
-                path: { project_id: projectId },
-                throwOnError: true,
-              })
-              return environments
-            },
-            deployImage: ({ projectId, environmentId, imageRef }) =>
-              deployFromImage({
-                path: {
-                  project_id: projectId,
-                  environment_id: environmentId,
-                },
-                body: { image_ref: imageRef },
-                throwOnError: true,
-              }),
-          })
-          if (firstDeploy.status === 'started') {
-            toast.success(`Deploying to ${firstDeploy.environmentName}`)
-            await finish(data, deploymentsAfterStartPath(data.slug))
-            return
-          }
-          if (firstDeploy.status === 'no_environment') {
-            toast.error(
-              'The service has no environment to deploy the image to. Create one, then deploy from the Deployments tab.'
-            )
-          }
-        } catch (error) {
-          toast.error(
-            `Service created, but the image deployment did not start: ${problemDetail(
-              error,
-              'unknown error'
-            )}`
-          )
-          // Service creation does not store the image, so hand it to the
-          // deploy dialog rather than making the user retype it.
-          await finish(data, imageDeployRetryPath(data.slug, imageRef))
-          return
-        }
+      if (sourceType === 'static_files' || !imageRef) {
+        // Nothing to deploy from here: no ordering to protect.
+        await finish(
+          data,
+          `/projects/${data.slug}?new=true&source=${sourceType}`
+        )
+        return
       }
 
-      await finish(data, `/projects/${data.slug}?new=true&source=${sourceType}`)
+      const deploy = () => deployImageAndLeave(data, imageRef)
+      // Join first. When that fails nothing is deployed; the dialog offers
+      // Retry, which joins again and then runs `deploy`.
+      if (!(await joinBeforeDeploy(data, deploy))) return
+      await deploy()
     },
   })
 

@@ -3,6 +3,9 @@
 
 import { useMemo, useState } from 'react'
 import { useMutation, useQueries, useQuery } from '@tanstack/react-query'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import * as z from 'zod/v4'
 import { toast } from 'sonner'
 import { KeyRound, Lock, MoreHorizontal, Plus, RefreshCw } from 'lucide-react'
 import {
@@ -41,8 +44,16 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
@@ -370,6 +381,16 @@ function VariableDialog({
   )
 }
 
+const variableSchema = z.object({
+  key: z.string().trim().min(1, 'Give the variable a name.'),
+  value: z.string(),
+  scope: z.string(),
+  isSecret: z.boolean(),
+  includeInPreview: z.boolean(),
+})
+
+type VariableValues = z.infer<typeof variableSchema>
+
 function VariableForm({
   groupId,
   variable,
@@ -381,41 +402,43 @@ function VariableForm({
   const existing = variable && variable !== 'new' ? variable : null
   // A secret's value cannot be read back: empty means "keep it".
   const keepsSecret = Boolean(existing?.is_secret)
-  const [key, setKey] = useState(existing?.key ?? '')
-  const [value, setValue] = useState(
-    existing && !existing.is_secret ? (existing.value ?? '') : ''
-  )
-  const [scope, setScope] = useState(
-    existing?.environment_slug ?? ALL_ENVIRONMENTS
-  )
-  const [isSecret, setIsSecret] = useState(existing?.is_secret ?? false)
-  // Previews are opt-in, as for a service's own variables.
-  const [includeInPreview, setIncludeInPreview] = useState(
-    existing?.include_in_preview ?? false
-  )
-  const [error, setError] = useState<string | null>(null)
+
+  const form = useForm<VariableValues>({
+    resolver: zodResolver(variableSchema),
+    defaultValues: {
+      key: existing?.key ?? '',
+      value: existing && !existing.is_secret ? (existing.value ?? '') : '',
+      scope: existing?.environment_slug ?? ALL_ENVIRONMENTS,
+      isSecret: existing?.is_secret ?? false,
+      // Previews are opt-in, as for a service's own variables.
+      includeInPreview: existing?.include_in_preview ?? false,
+    },
+  })
+  const [key, value, scope] = useWatch({
+    control: form.control,
+    name: ['key', 'value', 'scope'],
+  })
 
   const create = useMutation({ ...createGroupEnvVarMutation() })
   const update = useMutation({ ...updateGroupEnvVarMutation() })
   const pending = create.isPending || update.isPending
 
-  const submit = async (e: { preventDefault: () => void }) => {
-    e.preventDefault()
-    setError(null)
+  const submit = async (values: VariableValues) => {
     try {
       if (isNew) {
         await create.mutateAsync({
           path: { group_id: groupId },
           body: {
-            key: key.trim(),
-            value,
-            is_secret: isSecret,
-            environment_slug: scope === ALL_ENVIRONMENTS ? null : scope,
-            include_in_preview: includeInPreview,
+            key: values.key,
+            value: values.value,
+            is_secret: values.isSecret,
+            environment_slug:
+              values.scope === ALL_ENVIRONMENTS ? null : values.scope,
+            include_in_preview: values.includeInPreview,
           },
         })
         toast.success(
-          `${key.trim()} added; services pick it up on their next deployment`
+          `${values.key} added; services pick it up on their next deployment`
         )
       } else if (existing) {
         await update.mutateAsync({
@@ -423,9 +446,9 @@ function VariableForm({
           body: {
             // A plain value is sent as shown, empty included; an empty secret
             // field keeps the stored secret.
-            value: keepsSecret && value === '' ? null : value,
-            is_secret: isSecret,
-            include_in_preview: includeInPreview,
+            value: keepsSecret && values.value === '' ? null : values.value,
+            is_secret: values.isSecret,
+            include_in_preview: values.includeInPreview,
           },
         })
         toast.success(
@@ -435,120 +458,178 @@ function VariableForm({
       await invalidate()
       onClose()
     } catch (err) {
-      setError(getErrorMessage(err, 'The variable could not be saved.'))
+      form.setError('root', {
+        type: 'server',
+        message: getErrorMessage(err, 'The variable could not be saved.'),
+      })
     }
   }
 
   return (
-    <form onSubmit={submit} className="space-y-4">
-      <DialogHeader>
-        <DialogTitle>
-          {isNew ? 'Add shared variable' : `Change ${existing?.key}`}
-        </DialogTitle>
-        <DialogDescription>
-          Applies to each service&apos;s next deployment. A service that sets
-          the same name itself keeps its own value.
-        </DialogDescription>
-      </DialogHeader>
+    <Form {...form}>
+      <form
+        onSubmit={(event) => void form.handleSubmit(submit)(event)}
+        className="space-y-4"
+      >
+        <DialogHeader>
+          <DialogTitle>
+            {isNew ? 'Add shared variable' : `Change ${existing?.key}`}
+          </DialogTitle>
+          <DialogDescription>
+            Applies to each service&apos;s next deployment. A service that sets
+            the same name itself keeps its own value.
+          </DialogDescription>
+        </DialogHeader>
 
-      <div className="space-y-2">
-        <Label htmlFor="group-var-key">Name</Label>
-        <Input
-          id="group-var-key"
-          className="font-mono"
-          placeholder="API_BASE_URL"
-          value={key}
-          disabled={!isNew}
-          onChange={(e) => setKey(e.target.value.toUpperCase())}
-          autoFocus={isNew}
+        <FormField
+          control={form.control}
+          name="key"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel htmlFor="group-var-key">Name</FormLabel>
+              <FormControl>
+                <Input
+                  {...field}
+                  id="group-var-key"
+                  className="font-mono"
+                  placeholder="API_BASE_URL"
+                  disabled={!isNew}
+                  onChange={(e) => field.onChange(e.target.value.toUpperCase())}
+                  autoFocus={isNew}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
         />
-      </div>
 
-      <div className="space-y-2">
-        <Label htmlFor="group-var-value">Value</Label>
-        <Textarea
-          id="group-var-value"
-          className="font-mono"
-          rows={2}
-          placeholder={
-            keepsSecret
-              ? 'Leave empty to keep the current secret'
-              : 'https://api.example.com'
-          }
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          autoFocus={!isNew}
+        <FormField
+          control={form.control}
+          name="value"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel htmlFor="group-var-value">Value</FormLabel>
+              <FormControl>
+                <Textarea
+                  {...field}
+                  id="group-var-value"
+                  className="font-mono"
+                  rows={2}
+                  placeholder={
+                    keepsSecret
+                      ? 'Leave empty to keep the current secret'
+                      : 'https://api.example.com'
+                  }
+                  autoFocus={!isNew}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
         />
-      </div>
 
-      <div className="space-y-2">
-        <Label>Environments</Label>
-        <Select value={scope} onValueChange={setScope} disabled={!isNew}>
-          <SelectTrigger>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL_ENVIRONMENTS}>All environments</SelectItem>
-            {environmentSlugs.map((slug) => (
-              <SelectItem key={slug} value={slug}>
-                Only {slug}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        {!isNew && (
-          <p className="text-xs text-muted-foreground">
-            To change where it applies, remove it and add it again.
+        <FormField
+          control={form.control}
+          name="scope"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Environments</FormLabel>
+              <Select
+                value={field.value}
+                onValueChange={field.onChange}
+                disabled={!isNew}
+              >
+                <FormControl>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent>
+                  <SelectItem value={ALL_ENVIRONMENTS}>
+                    All environments
+                  </SelectItem>
+                  {environmentSlugs.map((slug) => (
+                    <SelectItem key={slug} value={slug}>
+                      Only {slug}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {!isNew && (
+                <FormDescription className="text-xs">
+                  To change where it applies, remove it and add it again.
+                </FormDescription>
+              )}
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        {scope === ALL_ENVIRONMENTS && (
+          <FormField
+            control={form.control}
+            name="includeInPreview"
+            render={({ field }) => (
+              <FormItem className="flex items-center justify-between gap-4 space-y-0 rounded-md border px-3 py-2">
+                <div>
+                  <FormLabel htmlFor="group-var-preview">
+                    Include in previews
+                  </FormLabel>
+                  <FormDescription className="text-xs">
+                    Preview deployments of pull requests also receive it.
+                  </FormDescription>
+                </div>
+                <FormControl>
+                  <Switch
+                    id="group-var-preview"
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+        )}
+
+        <FormField
+          control={form.control}
+          name="isSecret"
+          render={({ field }) => (
+            <FormItem className="flex items-center justify-between gap-4 space-y-0 rounded-md border px-3 py-2">
+              <div>
+                <FormLabel htmlFor="group-var-secret">Secret</FormLabel>
+                <FormDescription className="text-xs">
+                  Write-only: nobody can read the value back, including you.
+                </FormDescription>
+              </div>
+              <FormControl>
+                <Switch
+                  id="group-var-secret"
+                  checked={field.value}
+                  onCheckedChange={field.onChange}
+                  disabled={keepsSecret && value === ''}
+                />
+              </FormControl>
+            </FormItem>
+          )}
+        />
+
+        {form.formState.errors.root && (
+          <p role="alert" className="text-sm font-medium text-destructive">
+            {form.formState.errors.root.message}
           </p>
         )}
-      </div>
 
-      {scope === ALL_ENVIRONMENTS && (
-        <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
-          <div>
-            <Label htmlFor="group-var-preview">Include in previews</Label>
-            <p className="text-xs text-muted-foreground">
-              Preview deployments of pull requests also receive it.
-            </p>
-          </div>
-          <Switch
-            id="group-var-preview"
-            checked={includeInPreview}
-            onCheckedChange={setIncludeInPreview}
-          />
-        </div>
-      )}
-
-      <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
-        <div>
-          <Label htmlFor="group-var-secret">Secret</Label>
-          <p className="text-xs text-muted-foreground">
-            Write-only: nobody can read the value back, including you.
-          </p>
-        </div>
-        <Switch
-          id="group-var-secret"
-          checked={isSecret}
-          onCheckedChange={setIsSecret}
-          disabled={keepsSecret && value === ''}
-        />
-      </div>
-
-      {error && (
-        <p role="alert" className="text-sm font-medium text-destructive">
-          {error}
-        </p>
-      )}
-
-      <DialogFooter>
-        <Button type="button" variant="outline" onClick={onClose}>
-          Cancel
-        </Button>
-        <Button type="submit" disabled={pending || (isNew && !key.trim())}>
-          {pending ? 'Saving…' : isNew ? 'Add variable' : 'Save'}
-        </Button>
-      </DialogFooter>
-    </form>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={pending || (isNew && !key.trim())}>
+            {pending ? 'Saving…' : isNew ? 'Add variable' : 'Save'}
+          </Button>
+        </DialogFooter>
+      </form>
+    </Form>
   )
 }
 

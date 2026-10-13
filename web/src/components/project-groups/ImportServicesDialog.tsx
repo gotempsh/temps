@@ -3,6 +3,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import * as z from 'zod/v4'
 import { toast } from 'sonner'
 import { Check, FolderGit2, Loader2, RefreshCw } from 'lucide-react'
 import {
@@ -26,6 +29,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { ServicePresetIcon } from './ServicePresetIcon'
@@ -67,6 +77,31 @@ interface ActiveImport {
 
 const keyOf = (app: ProjectPresetResponse) =>
   `${app.preset}::${normalizeDirectory(app.path)}`
+
+/** One scanned app: whether to add it and what to call the service. */
+const importFormSchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        key: z.string(),
+        name: z.string(),
+        selected: z.boolean(),
+      })
+    )
+    .superRefine((rows, ctx) => {
+      rows.forEach((row, index) => {
+        if (row.selected && !row.name.trim()) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [index, 'name'],
+            message: 'Give the service a name.',
+          })
+        }
+      })
+    }),
+})
+
+type ImportFormValues = z.infer<typeof importFormSchema>
 
 /** The names, checked rows and row states a freshly scanned list starts with. */
 function seedRows({
@@ -179,8 +214,9 @@ export function ImportServicesDialog({
     return used
   }, [repo, services])
 
-  const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [names, setNames] = useState<Record<string, string>>({})
+  // What the form starts from; replaced (and the form with it) whenever a
+  // freshly scanned list is seeded below. Edits live in the form.
+  const [seed, setSeed] = useState<ImportFormValues>({ rows: [] })
   const [status, setStatus] = useState<Record<string, ImportRowState>>({})
   const [running, setRunning] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
@@ -217,19 +253,49 @@ export function ImportServicesDialog({
         usedDirectories,
         unfinished: active,
       })
-      setNames(seeded.names)
-      setSelected(seeded.selected)
+      setSeed({
+        rows: apps.map((app) => ({
+          key: keyOf(app),
+          name: seeded.names[keyOf(app)] ?? '',
+          selected: seeded.selected.has(keyOf(app)),
+        })),
+      })
       setStatus(seeded.status)
     }
   }
 
-  const toggle = (key: string) =>
-    setSelected((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
+  const form = useForm<ImportFormValues>({
+    resolver: zodResolver(importFormSchema),
+    values: seed,
+  })
+  const watchedRows = useWatch({ control: form.control, name: 'rows' })
+  // The form takes a new seed one commit after it is set; until it has, the
+  // seed itself stands in, so a row is never looked up in the previous scan.
+  const rows =
+    watchedRows?.length === seed.rows.length &&
+    watchedRows.every((row, i) => row.key === seed.rows[i].key)
+      ? watchedRows
+      : seed.rows
+  const rowIndexOf = (key: string) => rows.findIndex((r) => r.key === key)
+  const isSelected = (key: string) =>
+    rows.find((r) => r.key === key)?.selected ?? false
+  const selectedCount = rows.filter((r) => r.selected).length
+
+  const toggle = (key: string) => {
+    const index = rowIndexOf(key)
+    if (index >= 0) {
+      form.setValue(`rows.${index}.selected`, !rows[index].selected, {
+        shouldDirty: true,
+      })
+    }
+  }
+
+  const selectOnly = (keys: Set<string>) =>
+    rows.forEach((row, index) =>
+      form.setValue(`rows.${index}.selected`, keys.has(row.key), {
+        shouldDirty: true,
+      })
+    )
 
   /**
    * Poll the import, updating its rows, until the server finishes it, the
@@ -274,7 +340,7 @@ export function ImportServicesDialog({
     )
   }
 
-  const importSelected = async () => {
+  const importSelected = async (values: ImportFormValues) => {
     if (!repo) return
     setRunning(true)
     setImportError(null)
@@ -287,30 +353,18 @@ export function ImportServicesDialog({
           throwOnError: true,
         })
       } else {
+        // Names are already checked by the form's schema.
+        const nameOf = (key: string) =>
+          values.rows.find((row) => row.key === key)?.name ?? ''
         const chosen = apps.filter(
           (app) =>
-            selected.has(keyOf(app)) && status[keyOf(app)]?.state !== 'done'
+            values.rows.find((row) => row.key === keyOf(app))?.selected ===
+              true && status[keyOf(app)]?.state !== 'done'
         )
-        const unnamed = chosen.filter(
-          (app) => !(names[keyOf(app)] ?? '').trim()
-        )
-        if (unnamed.length > 0) {
-          setStatus((prev) => {
-            const next = { ...prev }
-            for (const app of unnamed) {
-              next[keyOf(app)] = {
-                state: 'failed',
-                message: 'Give the service a name.',
-              }
-            }
-            return next
-          })
-          return
-        }
         const { data } = await importProjectServices({
           path: { group_id: group.id },
           body: {
-            apps: chosen.map((app) => importedApp(app, names[keyOf(app)])),
+            apps: chosen.map((app) => importedApp(app, nameOf(keyOf(app)))),
             idempotency_key: crypto.randomUUID(),
           },
           throwOnError: true,
@@ -318,7 +372,7 @@ export function ImportServicesDialog({
         current = {
           id: data.id,
           keys: chosen.map(keyOf),
-          names: chosen.map((app) => names[keyOf(app)].trim()),
+          names: chosen.map((app) => nameOf(keyOf(app)).trim()),
           states: importRowStates(data),
         }
         setActive(current)
@@ -365,7 +419,7 @@ export function ImportServicesDialog({
   const canClose = !running || active !== null
 
   const pending = apps.filter(
-    (app) => selected.has(keyOf(app)) && status[keyOf(app)]?.state !== 'done'
+    (app) => isSelected(keyOf(app)) && status[keyOf(app)]?.state !== 'done'
   ).length
   const failed =
     importError !== null ||
@@ -430,21 +484,21 @@ export function ImportServicesDialog({
   } else {
     const selectable = apps.filter((a) => status[keyOf(a)]?.state !== 'done')
     const allChecked =
-      selectable.length > 0 && selectable.every((a) => selected.has(keyOf(a)))
+      selectable.length > 0 && selectable.every((a) => isSelected(keyOf(a)))
     body = (
       <div className="space-y-2">
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <span>
             {apps.length} {apps.length === 1 ? 'app' : 'apps'} found ·{' '}
-            {selected.size} selected
-            {selected.size === 0 && ' — check the ones to deploy'}
+            {selectedCount} selected
+            {selectedCount === 0 && ' — check the ones to deploy'}
           </span>
           <button
             type="button"
             className="font-medium text-foreground hover:underline disabled:opacity-50"
             disabled={running}
             onClick={() =>
-              setSelected(
+              selectOnly(
                 allChecked
                   ? new Set()
                   : new Set(selectable.map((a) => keyOf(a)))
@@ -462,54 +516,72 @@ export function ImportServicesDialog({
             const rowStatus = status[key]
             const done = rowStatus?.state === 'done'
             const created = active?.keys.includes(key) ?? false
+            const index = rowIndexOf(key)
             return (
-              <li key={key} className="space-y-1 px-3 py-2">
-                <div className="flex items-center gap-3">
-                  <Checkbox
-                    checked={selected.has(key)}
-                    disabled={running || done || created}
-                    onCheckedChange={() => toggle(key)}
-                    aria-label={`Add ${dir}`}
-                  />
-                  <ServicePresetIcon preset={app.preset} className="size-6" />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate font-mono text-sm">
-                      {dir === '.' ? '(repository root)' : dir}
-                    </p>
-                    <p className="truncate text-xs text-muted-foreground">
-                      {app.presetLabel}
-                      {isNestedApp(dir, allDirs) && ' · inside another app'}
-                      {existing &&
-                        !done &&
-                        !created &&
-                        ` · already deployed as ${existing}`}
-                    </p>
-                  </div>
-                  {done ? (
-                    <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <Check className="size-3.5" /> Added
-                    </span>
-                  ) : rowStatus?.state === 'running' ? (
-                    <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <Loader2 className="size-3.5 animate-spin" /> Adding…
-                    </span>
-                  ) : (
-                    <Input
-                      value={names[key] ?? ''}
-                      onChange={(e) =>
-                        setNames((prev) => ({ ...prev, [key]: e.target.value }))
-                      }
-                      disabled={running || created || !selected.has(key)}
-                      className="h-8 w-40"
-                      aria-label={`Service name for ${dir}`}
-                    />
+              <li key={key} className="px-3 py-2">
+                <FormField
+                  control={form.control}
+                  name={`rows.${index}.name`}
+                  render={({ field }) => (
+                    <FormItem className="space-y-1">
+                      <div className="flex items-center gap-3">
+                        <Checkbox
+                          checked={isSelected(key)}
+                          disabled={running || done || created}
+                          onCheckedChange={() => toggle(key)}
+                          aria-label={`Add ${dir}`}
+                        />
+                        <ServicePresetIcon
+                          preset={app.preset}
+                          className="size-6"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate font-mono text-sm">
+                            {dir === '.' ? '(repository root)' : dir}
+                          </p>
+                          <p className="truncate text-xs text-muted-foreground">
+                            {app.presetLabel}
+                            {isNestedApp(dir, allDirs) &&
+                              ' · inside another app'}
+                            {existing &&
+                              !done &&
+                              !created &&
+                              ` · already deployed as ${existing}`}
+                          </p>
+                        </div>
+                        {done ? (
+                          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                            <Check className="size-3.5" /> Added
+                          </span>
+                        ) : rowStatus?.state === 'running' ? (
+                          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                            <Loader2 className="size-3.5 animate-spin" />{' '}
+                            Adding…
+                          </span>
+                        ) : (
+                          <FormControl>
+                            <Input
+                              {...field}
+                              value={field.value ?? ''}
+                              disabled={running || created || !isSelected(key)}
+                              className="h-8 w-40"
+                              aria-label={`Service name for ${dir}`}
+                            />
+                          </FormControl>
+                        )}
+                      </div>
+                      <FormMessage className="pl-7 text-xs font-normal" />
+                      {rowStatus?.state === 'failed' && (
+                        <p
+                          role="alert"
+                          className="pl-7 text-xs text-destructive"
+                        >
+                          {rowStatus.message}
+                        </p>
+                      )}
+                    </FormItem>
                   )}
-                </div>
-                {rowStatus?.state === 'failed' && (
-                  <p role="alert" className="pl-7 text-xs text-destructive">
-                    {rowStatus.message}
-                  </p>
-                )}
+                />
               </li>
             )
           })}
@@ -547,56 +619,77 @@ export function ImportServicesDialog({
             )}
           </DialogDescription>
         </DialogHeader>
-        {body}
-        {importError && (
-          <p role="alert" className="text-sm text-destructive">
-            {importError}
-          </p>
-        )}
-        <DialogFooter>
-          {scannable && scan.isSuccess && (
-            <Button
-              variant="ghost"
-              className="mr-auto"
-              onClick={() => void scan.refetch()}
-              disabled={running || scan.isFetching}
-            >
-              <RefreshCw
-                className={scan.isFetching ? 'size-4 animate-spin' : 'size-4'}
-              />
-              Scan again
-            </Button>
-          )}
-          {running && active ? (
-            <Button variant="outline" onClick={keepInBackground}>
-              Keep running in background
-            </Button>
-          ) : (
-            <Button
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              disabled={!canClose}
-            >
-              {allDone ? 'Done' : 'Cancel'}
-            </Button>
-          )}
-          {!allDone && (
-            <Button
-              onClick={() => void importSelected()}
-              disabled={running || (pending === 0 && !active)}
-            >
-              {running ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" /> Adding…
-                </>
-              ) : active ? (
-                'Retry'
-              ) : (
-                `Add ${pending} ${pending === 1 ? 'service' : 'services'}`
+        <Form {...form}>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              if (running || (pending === 0 && !active)) return
+              // Retrying a started import sends nothing from the form.
+              if (active) void importSelected(form.getValues())
+              else void form.handleSubmit(importSelected)(event)
+            }}
+            className="grid gap-4"
+          >
+            {body}
+            {importError && (
+              <p role="alert" className="text-sm text-destructive">
+                {importError}
+              </p>
+            )}
+            <DialogFooter>
+              {scannable && scan.isSuccess && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="mr-auto"
+                  onClick={() => void scan.refetch()}
+                  disabled={running || scan.isFetching}
+                >
+                  <RefreshCw
+                    className={
+                      scan.isFetching ? 'size-4 animate-spin' : 'size-4'
+                    }
+                  />
+                  Scan again
+                </Button>
               )}
-            </Button>
-          )}
-        </DialogFooter>
+              {running && active ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={keepInBackground}
+                >
+                  Keep running in background
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => onOpenChange(false)}
+                  disabled={!canClose}
+                >
+                  {allDone ? 'Done' : 'Cancel'}
+                </Button>
+              )}
+              {!allDone && (
+                <Button
+                  type="submit"
+                  disabled={running || (pending === 0 && !active)}
+                >
+                  {running ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" /> Adding…
+                    </>
+                  ) : active ? (
+                    'Retry'
+                  ) : (
+                    `Add ${pending} ${pending === 1 ? 'service' : 'services'}`
+                  )}
+                </Button>
+              )}
+            </DialogFooter>
+          </form>
+        </Form>
       </DialogContent>
     </Dialog>
   )
@@ -622,7 +715,7 @@ function Problem({
   return (
     <div role="alert" className="flex items-center gap-3 text-sm">
       <p className="flex-1 text-destructive">{message}</p>
-      <Button variant="outline" size="sm" onClick={onRetry}>
+      <Button type="button" variant="outline" size="sm" onClick={onRetry}>
         <RefreshCw className="size-4" /> Retry
       </Button>
     </div>

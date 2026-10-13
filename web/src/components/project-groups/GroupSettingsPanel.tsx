@@ -4,6 +4,9 @@
 import { useState, type ReactNode } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { useMutation, useQuery } from '@tanstack/react-query'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import * as z from 'zod/v4'
 import { toast } from 'sonner'
 import {
   AlertTriangle,
@@ -36,8 +39,16 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { SectionNavLayout } from '@/components/layout/SectionNavLayout'
@@ -78,30 +89,10 @@ export function GroupSettingsPanel({
   const page: SettingsPage =
     SETTINGS_PAGES.find((p) => p.key === requested)?.key ?? 'general'
   const invalidate = useInvalidateGroups()
-  const [name, setName] = useState(group.name)
-  const [slug, setSlug] = useState(group.slug)
-  const [description, setDescription] = useState(group.description ?? '')
-  const [formError, setFormError] = useState<string | null>(null)
   const [removing, setRemoving] = useState<{ id: number; name: string } | null>(
     null
   )
   const [confirmDelete, setConfirmDelete] = useState(false)
-
-  // Follow the server's values (a save, another tab, a refetch), discarding
-  // unsaved edits as soon as they change. Adjusted while rendering, so the
-  // form never paints the stale values.
-  const serverValues = [
-    group.name,
-    group.slug,
-    group.description ?? '',
-  ] as const
-  const [syncedValues, setSyncedValues] = useState(serverValues)
-  if (syncedValues.some((value, i) => value !== serverValues[i])) {
-    setSyncedValues(serverValues)
-    setName(group.name)
-    setSlug(group.slug)
-    setDescription(group.description ?? '')
-  }
 
   const vars = useQuery({
     ...listGroupEnvVarsOptions({ path: { group_id: group.id } }),
@@ -109,38 +100,8 @@ export function GroupSettingsPanel({
   })
   const varCount = vars.data?.length ?? 0
 
-  const update = useMutation({ ...updateProjectGroupMutation() })
   const remove = useMutation({ ...removeProjectFromGroupMutation() })
   const destroy = useMutation({ ...deleteProjectGroupMutation() })
-
-  const dirty =
-    name.trim() !== group.name ||
-    slug.trim() !== group.slug ||
-    description.trim() !== (group.description ?? '')
-
-  const save = async (e: { preventDefault: () => void }) => {
-    e.preventDefault()
-    setFormError(null)
-    try {
-      const updated = await update.mutateAsync({
-        path: { group_id: group.id },
-        body: {
-          name: name.trim(),
-          slug: slug.trim(),
-          description: description.trim(),
-        },
-      })
-      await invalidate()
-      toast.success('Project updated')
-      if (updated.slug !== group.slug) {
-        navigate(`${groupHref(updated.slug)}?tab=settings&section=general`, {
-          replace: true,
-        })
-      }
-    } catch (err) {
-      setFormError(getErrorMessage(err, 'The project could not be updated.'))
-    }
-  }
 
   const removeService = async () => {
     if (!removing) return
@@ -171,50 +132,13 @@ export function GroupSettingsPanel({
     }
   }
 
+  // Follows the server's values (a save, another tab, a refetch): a new set
+  // of them remounts the form, discarding unsaved edits.
   const identity = (
-    <form onSubmit={save} className="max-w-2xl space-y-4">
-      <p className="text-sm text-muted-foreground">
-        Renaming changes this project&apos;s address; its services keep their
-        own names and URLs.
-      </p>
-      <div className="space-y-2">
-        <Label htmlFor="group-settings-name">Name</Label>
-        <Input
-          id="group-settings-name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-      </div>
-      <div className="space-y-2">
-        <Label htmlFor="group-settings-slug">Slug</Label>
-        <Input
-          id="group-settings-slug"
-          className="font-mono"
-          value={slug}
-          onChange={(e) => setSlug(e.target.value.toLowerCase())}
-        />
-        <p className="text-xs text-muted-foreground">
-          Used in the console address: {groupHref(slug.trim() || group.slug)}
-        </p>
-      </div>
-      <div className="space-y-2">
-        <Label htmlFor="group-settings-description">Description</Label>
-        <Textarea
-          id="group-settings-description"
-          rows={2}
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
-      </div>
-      {formError && (
-        <p role="alert" className="text-sm font-medium text-destructive">
-          {formError}
-        </p>
-      )}
-      <Button type="submit" disabled={!dirty || update.isPending}>
-        {update.isPending ? 'Saving…' : 'Save changes'}
-      </Button>
-    </form>
+    <GroupIdentityForm
+      key={[group.name, group.slug, group.description ?? ''].join('\u0000')}
+      group={group}
+    />
   )
 
   const deletion = (
@@ -376,6 +300,135 @@ export function GroupSettingsPanel({
         </AlertDialogContent>
       </AlertDialog>
     </SectionNavLayout>
+  )
+}
+
+const identitySchema = z.object({
+  name: z.string().trim().min(1, 'Give the project a name.'),
+  slug: z.string().trim().min(1, 'Give the project an address.'),
+  description: z.string().trim(),
+})
+
+type IdentityValues = z.infer<typeof identitySchema>
+
+/** Name, address and description of the project. */
+function GroupIdentityForm({ group }: { group: ProjectGroupResponse }) {
+  const navigate = useNavigate()
+  const invalidate = useInvalidateGroups()
+  const update = useMutation({ ...updateProjectGroupMutation() })
+
+  const form = useForm<IdentityValues>({
+    resolver: zodResolver(identitySchema),
+    defaultValues: {
+      name: group.name,
+      slug: group.slug,
+      description: group.description ?? '',
+    },
+  })
+  const [name, slug, description] = useWatch({
+    control: form.control,
+    name: ['name', 'slug', 'description'],
+  })
+  const dirty =
+    name.trim() !== group.name ||
+    slug.trim() !== group.slug ||
+    description.trim() !== (group.description ?? '')
+
+  const save = async (values: IdentityValues) => {
+    try {
+      const updated = await update.mutateAsync({
+        path: { group_id: group.id },
+        body: {
+          name: values.name,
+          slug: values.slug,
+          description: values.description,
+        },
+      })
+      await invalidate()
+      toast.success('Project updated')
+      if (updated.slug !== group.slug) {
+        navigate(`${groupHref(updated.slug)}?tab=settings&section=general`, {
+          replace: true,
+        })
+      }
+    } catch (err) {
+      form.setError('root', {
+        type: 'server',
+        message: getErrorMessage(err, 'The project could not be updated.'),
+      })
+    }
+  }
+
+  return (
+    <Form {...form}>
+      <form
+        onSubmit={(event) => void form.handleSubmit(save)(event)}
+        className="max-w-2xl space-y-4"
+      >
+        <p className="text-sm text-muted-foreground">
+          Renaming changes this project&apos;s address; its services keep their
+          own names and URLs.
+        </p>
+        <FormField
+          control={form.control}
+          name="name"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel htmlFor="group-settings-name">Name</FormLabel>
+              <FormControl>
+                <Input {...field} id="group-settings-name" />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={form.control}
+          name="slug"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel htmlFor="group-settings-slug">Slug</FormLabel>
+              <FormControl>
+                <Input
+                  {...field}
+                  id="group-settings-slug"
+                  className="font-mono"
+                  onChange={(e) => field.onChange(e.target.value.toLowerCase())}
+                />
+              </FormControl>
+              <FormDescription className="text-xs">
+                Used in the console address:{' '}
+                {groupHref(slug.trim() || group.slug)}
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={form.control}
+          name="description"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel htmlFor="group-settings-description">
+                Description
+              </FormLabel>
+              <FormControl>
+                <Textarea {...field} id="group-settings-description" rows={2} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        {form.formState.errors.root && (
+          <p role="alert" className="text-sm font-medium text-destructive">
+            {form.formState.errors.root.message}
+          </p>
+        )}
+        <Button type="submit" disabled={!dirty || update.isPending}>
+          {update.isPending ? 'Saving…' : 'Save changes'}
+        </Button>
+      </form>
+    </Form>
   )
 }
 

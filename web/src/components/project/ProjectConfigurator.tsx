@@ -993,10 +993,15 @@ export function ProjectConfigurator({
       errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
+      // The server queues a Git service's first deployment as part of
+      // creating it and the create request has no project field, so join
+      // before anything else (cache refreshes included) to keep the window in
+      // which that deployment is planned without the project's shared
+      // variables as short as possible.
       toast.success('Service created')
       await finish(data, `/projects/${data.slug}?new=true`)
+      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
+      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
     },
   })
 
