@@ -124,7 +124,12 @@ pub struct Model {
     pub template_slug: Option<String>,
     /// Immutable resolved service-template release. Stored as JSONB so an
     /// existing service remains deployable and editable without consulting the
-    /// mutable catalog. Only `project_type = service` may populate it.
+    /// mutable catalog. A `service` project always has one. A `server` or
+    /// `static` project has one only when it is a source-built service of an
+    /// app template (it then also has a non-blank `template_slug`, enforced
+    /// by `projects_service_template_identity`): the release holds its
+    /// managed-database bindings, but it is built and deployed like any
+    /// other project and is not upgradeable.
     #[serde(skip_serializing)]
     pub service_template: Option<Json>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install

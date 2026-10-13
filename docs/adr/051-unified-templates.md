@@ -199,6 +199,17 @@ One-service instances created with **no project** keep today's per-service
 snapshot columns (`template_slug`, `service_template_version`). They move to the
 project table the first time the service joins a project.
 
+A service of an `app` that is built from source keeps the lifecycle its preset
+gives it (`server`, or `static` for a frontend) so the normal build pipeline
+runs, and only image services are `service` projects. Both carry the release
+snapshot, because it holds the service's database bindings, which every
+deployment applies. The `projects_service_template_identity` constraint
+therefore allows a `server` or `static` row to carry `service_template` when it
+also names its template (`template_slug` present and not blank); a row with a
+release and no provenance is still rejected. Only `service` projects can be
+upgraded: the upgrade endpoints refuse a source-built service, whose code moves
+with its repository.
+
 ### 5. References between services
 
 Variable values may reference other parts of the same instance:

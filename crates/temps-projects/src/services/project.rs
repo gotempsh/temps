@@ -21,7 +21,9 @@ use temps_entities::{
     project_delivery_settings, project_group_members, project_services, projects, settings,
     types::ProjectType,
 };
-use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
+use temps_git::services::public_repo::{
+    PublicRefKind, PublicRepoError, PublicRepoProviderFactory, ResolvedPublicRef,
+};
 
 use serde::Serialize;
 
@@ -1536,7 +1538,9 @@ impl ProjectService {
         // An app's image services are service projects: their runtime is the
         // pinned release. Services an app builds from source keep the type
         // their preset gives them (a static frontend stays static); their
-        // snapshot still records the release and its database bindings.
+        // snapshot still records the release and its database bindings, which
+        // `projects_service_template_identity` allows on a server/static row
+        // that names its template (checked by `check_service_release`).
         let project_type = if service_template
             .as_ref()
             .and_then(|release| release.spec())
@@ -6793,32 +6797,40 @@ impl ProjectService {
         // Use provided branch/commit or fall back to project defaults
         let branch_to_use = branch.unwrap_or(project.main_branch.clone());
 
+        // An empty tag is no tag. A tag names the commit to deploy: it is
+        // resolved to that commit below, never ignored in favour of the
+        // branch tip.
+        let mut tag = tag.filter(|tag| !tag.trim().is_empty());
+
         // Fetch the latest commit from the branch if no commit was provided
         let commit_to_use = if let Some(commit) = commit {
             commit
         } else if let Some(connection_id) = project.git_provider_connection_id {
-            // Fetch latest commit from the branch using authenticated git provider
+            // The ref to resolve: the tag when one was asked for, otherwise
+            // the branch. Providers resolve a branch, tag or commit id here.
+            let lookup_ref = tag.as_deref().unwrap_or(&branch_to_use);
+            // Fetch latest commit from the ref using authenticated git provider
             match self
                 .git_provider_manager
                 .get_branch_latest_commit(
                     connection_id,
                     &project.repo_owner,
                     &project.repo_name,
-                    &branch_to_use,
+                    lookup_ref,
                 )
                 .await
             {
                 Ok(commit_info) => {
                     info!(
-                        "Fetched latest commit from branch {}: {} ({})",
-                        branch_to_use, commit_info.sha, commit_info.message
+                        "Fetched latest commit from ref {}: {} ({})",
+                        lookup_ref, commit_info.sha, commit_info.message
                     );
                     commit_info.sha
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to fetch latest commit from branch {}: {}, using placeholder",
-                        branch_to_use, e
+                        "Failed to fetch latest commit from ref {}: {}, using placeholder",
+                        lookup_ref, e
                     );
                     format!("manual-trigger-{}", chrono::Utc::now().timestamp())
                 }
@@ -6881,34 +6893,50 @@ impl ProjectService {
                     )),
                 })?;
 
-            // One lookup by name: listing every branch stops at a safety cap
-            // and reports existing branches of large repositories as missing.
-            let branch_info = provider
-                .get_branch(&project.repo_owner, &project.repo_name, &branch_to_use)
-                .await
-                .map_err(|e| match e {
-                    PublicRepoError::RateLimitExceeded => ProjectError::PublicRepoRateLimited {
+            // The tag when one was asked for, otherwise the branch field,
+            // which may hold a tag or a commit id (group repositories and
+            // templates pin either). One lookup per kind by name: listing
+            // every branch stops at a safety cap and reports existing
+            // branches of large repositories as missing.
+            let resolved = resolve_public_trigger_ref(
+                provider.as_ref(),
+                &project.repo_owner,
+                &project.repo_name,
+                &branch_to_use,
+                tag.as_deref(),
+            )
+            .await
+            .map_err(|e| match e {
+                PublicTriggerRefError::Provider(PublicRepoError::RateLimitExceeded) => {
+                    ProjectError::PublicRepoRateLimited {
                         project_id,
                         project_slug: project.slug.clone(),
                         provider: provider_name.to_string(),
-                    },
-                    e => ProjectError::Other(format!(
-                        "Failed to fetch branch '{}' from public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
-                        branch_to_use, project.repo_owner, project.repo_name, e
-                    )),
-                })?
-                .ok_or_else(|| {
-                    ProjectError::NotFound(format!(
-                        "Branch '{}' not found in public repo {}/{}",
-                        branch_to_use, project.repo_owner, project.repo_name
-                    ))
-                })?;
+                    }
+                }
+                PublicTriggerRefError::Provider(e) => ProjectError::Other(format!(
+                    "Failed to resolve '{}' in public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
+                    tag.as_deref().unwrap_or(&branch_to_use),
+                    project.repo_owner,
+                    project.repo_name,
+                    e
+                )),
+                PublicTriggerRefError::Missing(message) => ProjectError::NotFound(message),
+            })?;
 
             info!(
-                "Fetched latest commit from public repo {}/{} branch {}: {}",
-                project.repo_owner, project.repo_name, branch_to_use, branch_info.commit_sha
+                "Resolved {} '{}' of public repo {}/{} to commit {}",
+                resolved.kind.as_str(),
+                resolved.name,
+                project.repo_owner,
+                project.repo_name,
+                resolved.commit_sha
             );
-            branch_info.commit_sha.clone()
+            // Keep the tag on the deployment when the ref turned out to be one.
+            if resolved.kind == PublicRefKind::Tag && tag.is_none() {
+                tag = Some(resolved.name.clone());
+            }
+            resolved.commit_sha
         } else {
             warn!("No git provider connection found for project, using placeholder commit");
             format!("manual-trigger-{}", chrono::Utc::now().timestamp())
@@ -6958,6 +6986,48 @@ impl ProjectService {
     }
 }
 
+/// Why a manual trigger could not resolve its ref in a public repository.
+enum PublicTriggerRefError {
+    /// The repository has no such branch, tag or commit; carries the
+    /// user-facing explanation.
+    Missing(String),
+    /// The provider could not answer (rate limit, outage, not supported).
+    Provider(PublicRepoError),
+}
+
+/// Resolve what a manual trigger deploys in a public repository to the commit
+/// it points at.
+///
+/// An explicit `tag` is looked up as a tag only, so a branch of the same name
+/// can never answer for it, and the deployment gets that tag's commit rather
+/// than the branch tip. Without a tag, `reference` (the branch field) is
+/// resolved as a branch, then a tag, then a full or abbreviated commit id,
+/// because group repositories and templates pin a release tag or a commit in
+/// the same field.
+async fn resolve_public_trigger_ref(
+    provider: &dyn temps_git::services::public_repo::PublicRepoProvider,
+    owner: &str,
+    repo: &str,
+    reference: &str,
+    tag: Option<&str>,
+) -> Result<ResolvedPublicRef, PublicTriggerRefError> {
+    let (lookup, missing) = match tag {
+        Some(tag) => (
+            format!("refs/tags/{tag}"),
+            format!("Tag '{tag}' not found in public repo {owner}/{repo}"),
+        ),
+        None => (
+            reference.to_string(),
+            format!("'{reference}' is not a branch, tag or commit of public repo {owner}/{repo}"),
+        ),
+    };
+    provider
+        .resolve_ref(owner, repo, &lookup)
+        .await
+        .map_err(PublicTriggerRefError::Provider)?
+        .ok_or(PublicTriggerRefError::Missing(missing))
+}
+
 fn base_project_slug(name: &str) -> String {
     let mut slug = slugify(name);
     // Leave room for the production environment and service namespace within
@@ -6981,6 +7051,221 @@ fn git_webhook_base_url(settings: Option<&temps_core::AppSettings>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Manual triggers resolve branches, tags and commits of public repos
+    // ------------------------------------------------------------------
+
+    mod public_trigger_ref {
+        use super::*;
+        use temps_core::async_trait::async_trait;
+        use temps_git::services::git_provider::FileContent;
+        use temps_git::services::public_repo::{PublicBranch, PublicRepoInfo, PublicRepoProvider};
+
+        const BRANCH_TIP: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const TAG_COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const OLD_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        struct FakePublicRepo {
+            rate_limited: bool,
+        }
+
+        #[async_trait]
+        impl PublicRepoProvider for FakePublicRepo {
+            fn provider_name(&self) -> &'static str {
+                "fake"
+            }
+
+            async fn get_repository(
+                &self,
+                _owner: &str,
+                _repo: &str,
+            ) -> Result<PublicRepoInfo, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+
+            async fn list_branches(
+                &self,
+                _owner: &str,
+                _repo: &str,
+            ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+                Ok(Vec::new())
+            }
+
+            async fn get_branch(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                branch: &str,
+            ) -> Result<Option<PublicBranch>, PublicRepoError> {
+                if self.rate_limited {
+                    return Err(PublicRepoError::RateLimitExceeded);
+                }
+                // `v2` is both a branch and a tag in this repository.
+                Ok(["master", "v2"].contains(&branch).then(|| PublicBranch {
+                    name: branch.to_string(),
+                    commit_sha: BRANCH_TIP.to_string(),
+                    protected: false,
+                }))
+            }
+
+            async fn get_tag_commit(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                tag: &str,
+            ) -> Result<Option<String>, PublicRepoError> {
+                Ok(["v1.2.3", "v2"]
+                    .contains(&tag)
+                    .then(|| TAG_COMMIT.to_string()))
+            }
+
+            async fn get_commit_sha(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                sha: &str,
+            ) -> Result<Option<String>, PublicRepoError> {
+                Ok(OLD_COMMIT.starts_with(sha).then(|| OLD_COMMIT.to_string()))
+            }
+
+            async fn get_file_tree(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                _reference: &str,
+            ) -> Result<Vec<String>, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+
+            async fn get_file_content(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                _path: &str,
+                _reference: &str,
+            ) -> Result<FileContent, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+        }
+
+        async fn resolve(
+            reference: &str,
+            tag: Option<&str>,
+        ) -> Result<ResolvedPublicRef, PublicTriggerRefError> {
+            resolve_public_trigger_ref(
+                &FakePublicRepo {
+                    rate_limited: false,
+                },
+                "acme",
+                "shop",
+                reference,
+                tag,
+            )
+            .await
+        }
+
+        fn expect_ok(
+            result: Result<ResolvedPublicRef, PublicTriggerRefError>,
+        ) -> ResolvedPublicRef {
+            match result {
+                Ok(resolved) => resolved,
+                Err(PublicTriggerRefError::Missing(message)) => {
+                    panic!("expected a resolved ref, got missing: {message}")
+                }
+                Err(PublicTriggerRefError::Provider(error)) => {
+                    panic!("expected a resolved ref, got provider error: {error}")
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_branch_resolves_to_its_tip() {
+            let resolved = expect_ok(resolve("master", None).await);
+            assert_eq!(resolved.kind, PublicRefKind::Branch);
+            assert_eq!(resolved.commit_sha, BRANCH_TIP);
+        }
+
+        #[tokio::test]
+        async fn a_tag_in_the_branch_field_resolves_to_the_tag_commit() {
+            let resolved = expect_ok(resolve("v1.2.3", None).await);
+            assert_eq!(resolved.kind, PublicRefKind::Tag);
+            assert_eq!(resolved.name, "v1.2.3");
+            assert_eq!(resolved.commit_sha, TAG_COMMIT);
+        }
+
+        #[tokio::test]
+        async fn a_commit_in_the_branch_field_resolves_full_or_abbreviated() {
+            for reference in [OLD_COMMIT, &OLD_COMMIT[..7], &OLD_COMMIT[..12]] {
+                let resolved = expect_ok(resolve(reference, None).await);
+                assert_eq!(resolved.kind, PublicRefKind::Commit, "{reference}");
+                assert_eq!(resolved.commit_sha, OLD_COMMIT, "{reference}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_tag_parameter_deploys_the_tags_commit_not_the_branch_tip() {
+            // `{"branch":"master","tag":"v1.2.3"}` used to deploy master's tip.
+            let resolved = expect_ok(resolve("master", Some("v1.2.3")).await);
+            assert_eq!(resolved.kind, PublicRefKind::Tag);
+            assert_eq!(resolved.commit_sha, TAG_COMMIT);
+            assert_ne!(resolved.commit_sha, BRANCH_TIP);
+        }
+
+        #[tokio::test]
+        async fn the_tag_parameter_is_never_answered_by_a_branch_of_the_same_name() {
+            // `v2` is a branch and a tag; the explicit tag must win.
+            let resolved = expect_ok(resolve("master", Some("v2")).await);
+            assert_eq!(resolved.kind, PublicRefKind::Tag);
+            assert_eq!(resolved.commit_sha, TAG_COMMIT);
+            // Without the tag parameter the branch field prefers the branch.
+            let resolved = expect_ok(resolve("v2", None).await);
+            assert_eq!(resolved.kind, PublicRefKind::Branch);
+            assert_eq!(resolved.commit_sha, BRANCH_TIP);
+        }
+
+        #[tokio::test]
+        async fn a_missing_ref_names_the_repository_and_the_ref() {
+            let Err(PublicTriggerRefError::Missing(message)) = resolve("nope", None).await else {
+                panic!("an unknown ref must be reported missing");
+            };
+            assert_eq!(
+                message,
+                "'nope' is not a branch, tag or commit of public repo acme/shop"
+            );
+
+            let Err(PublicTriggerRefError::Missing(message)) =
+                resolve("master", Some("v9.9.9")).await
+            else {
+                panic!("an unknown tag must be reported missing");
+            };
+            assert_eq!(message, "Tag 'v9.9.9' not found in public repo acme/shop");
+
+            // A branch name is not a tag.
+            assert!(matches!(
+                resolve("master", Some("master")).await,
+                Err(PublicTriggerRefError::Missing(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_provider_failure_is_not_a_missing_ref() {
+            let result = resolve_public_trigger_ref(
+                &FakePublicRepo { rate_limited: true },
+                "acme",
+                "shop",
+                "v1.2.3",
+                None,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(PublicTriggerRefError::Provider(
+                    PublicRepoError::RateLimitExceeded
+                ))
+            ));
+        }
+    }
 
     // ADR-051 D2: provider webhooks are delivered to the public ingress URL.
     #[test]
@@ -9461,6 +9746,294 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect()
+        );
+    }
+
+    /// An app template with two source-built services and one pinned image.
+    /// The git host is not GitHub, so creating its services never asks a
+    /// public API whether `api/` or `web/` exists.
+    const STACK_APP_TEMPLATE: &str = r#"
+version: "3"
+templates:
+  - slug: stack-app
+    name: Stack app
+    version: 1.0.0
+    kind: app
+    git:
+      url: https://git.example.test/example/stack-app.git
+      ref: v1.0.0
+    databases: [postgres]
+    services:
+      - name: api
+        directory: api
+        preset: dockerfile
+        exposed_port: 8080
+        database_bindings:
+          postgres:
+            DATABASE_URL: POSTGRES_URL
+      - name: web
+        directory: web
+        preset: vite
+      - name: cache
+        preset: dockerfile
+        image: registry.example.test/cache@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        exposed_port: 6379
+"#;
+
+    struct DiscardingAudit;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for DiscardingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stack_app_template() -> temps_core::templates::ProjectTemplate {
+        temps_core::templates::TemplatesConfig::from_yaml(STACK_APP_TEMPLATE)
+            .expect("the test template parses")
+            .templates
+            .into_iter()
+            .next()
+            .expect("the test template is listed")
+    }
+
+    fn stack_app_service_request(
+        template: &temps_core::templates::ProjectTemplate,
+        service_name: &str,
+        instantiation_id: i32,
+    ) -> crate::template_creation::TemplateServiceRequest {
+        let service = template
+            .service(service_name)
+            .cloned()
+            .expect("the template declares the service");
+        let release = temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            template.clone(),
+        )
+        .for_service(service_name);
+        let repository = (!service.is_image()).then(|| {
+            let source = service.source(&template.git);
+            crate::template_creation::RepositoryTarget {
+                repo_owner: "example".to_string(),
+                repo_name: "stack-app".to_string(),
+                branch: source.r#ref.clone(),
+                git_url: Some(template.git.url.clone()),
+                git_provider_connection_id: None,
+                is_public: true,
+                directory: service.directory.clone().unwrap_or_else(|| ".".to_string()),
+                automatic_deploy: false,
+            }
+        });
+        crate::template_creation::TemplateServiceRequest {
+            template: template.clone(),
+            service,
+            release: Some(release),
+            project_name: format!("Stack {service_name}"),
+            project_slug: format!("stack-{service_name}"),
+            provenance: Some(template.slug.clone()),
+            variables: Vec::new(),
+            variable_templates: Vec::new(),
+            storage_service_ids: Vec::new(),
+            storage_service_claim_ids: Vec::new(),
+            repository,
+            runtime_overrides: Default::default(),
+            defer_initial_deployment: true,
+            instantiation_token: Some(temps_entities::projects::instantiation_token(
+                instantiation_id,
+                service_name,
+            )),
+            deploy_mode: "public_repo",
+            cloudflare_enabled: None,
+            delivery_provider: None,
+        }
+    }
+
+    /// `projects_service_template_identity` only exists in a real database,
+    /// and the mock-database tests cannot see it: it once rejected every
+    /// source-built service of an app, which none of them noticed. This
+    /// creates all three kinds of service an app can have through the
+    /// creator the instantiation engine uses.
+    #[tokio::test]
+    async fn app_template_services_satisfy_the_service_identity_constraint() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service =
+            Arc::new(create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await);
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let creator = crate::template_creation::TemplateServiceCreator {
+            project_service: project_service.clone(),
+            config_service: Arc::new(temps_config::ConfigService::new(server_config, db.clone())),
+            public_hostname_resolver: Arc::new(temps_core::StandardHostnameResolver),
+            audit_service: Arc::new(DiscardingAudit),
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+        };
+        let session = SlugClaimSession::admin(&db).await;
+        let slug_claim = session.caller();
+        let caller = crate::template_creation::TemplateCreationCaller {
+            auth: &session.auth,
+            slug_claim: &slug_claim,
+            ip_address: None,
+            user_agent: "test".to_string(),
+        };
+        let template = stack_app_template();
+
+        let mut stored = std::collections::BTreeMap::new();
+        for service_name in ["api", "web", "cache"] {
+            let created = creator
+                .create(
+                    stack_app_service_request(&template, service_name, 41),
+                    &caller,
+                )
+                .await
+                .unwrap_or_else(|problem| {
+                    panic!("service '{service_name}' must be created: {problem:?}")
+                });
+            let row = projects::Entity::find_by_id(created.project.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("the created service is stored");
+            stored.insert(service_name, (created, row));
+        }
+
+        // Source-built: the lifecycle the preset gives them, so the normal
+        // build pipeline runs, plus the release and the template it is from.
+        let (api, api_row) = &stored["api"];
+        assert_eq!(api_row.project_type, ProjectType::Server);
+        assert_eq!(
+            api_row.source_type,
+            temps_entities::source_type::SourceType::Git
+        );
+        let (_, web_row) = &stored["web"];
+        assert_eq!(web_row.project_type, ProjectType::Static);
+
+        // An image-only service is a service project, as before.
+        let (_, cache_row) = &stored["cache"];
+        assert_eq!(cache_row.project_type, ProjectType::Service);
+        assert_eq!(
+            cache_row.source_type,
+            temps_entities::source_type::SourceType::DockerImage
+        );
+
+        for (service_name, (created, row)) in &stored {
+            assert_eq!(row.template_slug.as_deref(), Some("stack-app"));
+            assert_eq!(
+                row.instantiation_token.as_deref(),
+                Some(temps_entities::projects::instantiation_token(41, service_name).as_str()),
+                "'{service_name}' is sealed with the final token"
+            );
+            let snapshot =
+                serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+                    row.service_template
+                        .clone()
+                        .unwrap_or_else(|| panic!("'{service_name}' keeps its release")),
+                )
+                .expect("the stored release decodes");
+            snapshot.validate().expect("the stored release is valid");
+            assert_eq!(snapshot.service.as_deref(), Some(*service_name));
+            assert_eq!(
+                snapshot.spec().map(|spec| spec.name.as_str()),
+                Some(*service_name)
+            );
+            assert_eq!(
+                created.project.service_template_version.as_deref(),
+                Some("1.0.0")
+            );
+            let environments = environments::Entity::find()
+                .filter(environments::Column::ProjectId.eq(row.id))
+                .count(db.as_ref())
+                .await
+                .unwrap();
+            assert!(environments > 0, "'{service_name}' has its environment");
+        }
+
+        // What the deployment environment reads back: the source-built
+        // backend still carries its managed-database bindings.
+        let api_release = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+            api_row.service_template.clone().expect("api release"),
+        )
+        .unwrap();
+        assert_eq!(
+            api_release
+                .spec()
+                .and_then(|spec| spec.database_bindings.get("postgres"))
+                .and_then(|bindings| bindings.get("DATABASE_URL"))
+                .map(String::as_str),
+            Some("POSTGRES_URL")
+        );
+        assert_eq!(api.project.project_type, "server");
+
+        // Upgrades are for image releases only: a source-built service
+        // reports that plainly instead of failing a constraint.
+        let error = project_service
+            .get_applied_service_template(api_row.id)
+            .await
+            .expect_err("a source-built service has no upgradeable release");
+        assert!(
+            matches!(&error, ProjectError::InvalidInput(message)
+                if message.contains(&api_row.id.to_string())),
+            "{error:?}"
+        );
+        assert!(project_service
+            .get_applied_service_template(cache_row.id)
+            .await
+            .is_ok());
+    }
+
+    /// Provenance is what lets a project carry a release without being a
+    /// service project, so a release with none must never reach the table.
+    #[tokio::test]
+    async fn a_release_without_template_provenance_is_refused_before_it_is_stored() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let template = stack_app_template();
+        let release = temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            template,
+        )
+        .for_service("api");
+        let mut request = create_request("Provenance missing");
+        request.preset = "dockerfile".to_string();
+        request.template_slug = None;
+
+        let result = project_service
+            .create_template_service_as(
+                request,
+                Some(release),
+                &SlugClaimCaller::project_writer(),
+                true,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ProjectError::InvalidInput(_))),
+            "a release needs its template slug"
+        );
+        assert_eq!(
+            projects::Entity::find().count(db.as_ref()).await.unwrap(),
+            0,
+            "nothing was inserted"
         );
     }
 

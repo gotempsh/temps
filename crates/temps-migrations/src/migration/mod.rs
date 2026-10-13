@@ -329,6 +329,7 @@ mod m20261012_000001_ai_provider_keys_self_hosted;
 mod m20261012_000002_create_status_page_domains;
 mod m20261012_000003_managed_daemon_beta_images;
 mod m20261013_000001_webhook_delivery_identity;
+mod m20261013_000002_allow_source_built_service_release;
 
 pub struct Migrator;
 
@@ -733,6 +734,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260929_000001_create_template_instantiations::Migration),
             Box::new(m20260929_000002_add_project_hosting::Migration),
             Box::new(m20260930_000001_add_project_instantiation_token::Migration),
+            // Source-built services of an app template keep their release.
+            Box::new(m20261013_000002_allow_source_built_service_release::Migration),
         ]
     }
 }
@@ -787,6 +790,10 @@ mod registry_tests {
             (
                 "m20260903_000001_add_service_project_identity",
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",
+            ),
+            (
+                "m20260903_000001_add_service_project_identity",
+                "m20261013_000002_allow_source_built_service_release",
             ),
             (
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",

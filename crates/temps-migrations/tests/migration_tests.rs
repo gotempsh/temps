@@ -378,6 +378,184 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
+async fn test_source_built_service_release_migration_relaxes_identity_constraint(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping source-built service release migration test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping source-built service release migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261013_000002_allow_source_built_service_release";
+    let migrations = Migrator::migrations();
+    let target_position = migrations
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    assert_eq!(
+        target_position,
+        migrations.len() - 1,
+        "this test reverts the target with `down(1)`, so it must be the last migration"
+    );
+    Migrator::up(&db, None).await?;
+
+    let insert = |slug: &str, project_type: &str, release: &str, template_slug: &str| {
+        format!(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, \
+              slug, project_type, service_template, template_slug) \
+             VALUES ('{slug}', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                     '{slug}', '{project_type}', {release}, {template_slug})"
+        )
+    };
+
+    // A source-built service of an app keeps its lifecycle and its release,
+    // with the template it came from.
+    for (slug, project_type) in [("built-server", "server"), ("built-static", "static")] {
+        db.execute_unprepared(&insert(slug, project_type, "'{}'::jsonb", "'infra-app'"))
+            .await?;
+    }
+    // Image-only services are unchanged.
+    db.execute_unprepared(&insert(
+        "image-service",
+        "service",
+        "'{}'::jsonb",
+        "'infra-app'",
+    ))
+    .await?;
+    // Plain projects need no provenance.
+    db.execute_unprepared(&insert("plain-server", "server", "NULL", "NULL"))
+        .await?;
+
+    // A release without provenance is still not a regular project's to carry.
+    for (case, template_slug) in [("null", "NULL"), ("blank", "'   '")] {
+        for project_type in ["server", "static"] {
+            let slug = format!("orphan-{project_type}-{case}");
+            assert!(
+                db.execute_unprepared(&insert(&slug, project_type, "'{}'::jsonb", template_slug))
+                    .await
+                    .is_err(),
+                "a {project_type} project with a release and a {case} template slug must be rejected"
+            );
+        }
+    }
+    // The service lifecycle keeps its stricter rule.
+    assert!(
+        db.execute_unprepared(&insert(
+            "service-no-release",
+            "service",
+            "NULL",
+            "'infra-app'"
+        ))
+        .await
+        .is_err(),
+        "a service project must persist its exact template release"
+    );
+    assert!(
+        db.execute_unprepared(&insert("service-no-slug", "service", "'{}'::jsonb", "NULL"))
+            .await
+            .is_err(),
+        "a service project must name its template"
+    );
+    // The type vocabulary is closed.
+    assert!(
+        db.execute_unprepared(&insert("bogus-type", "worker", "NULL", "NULL"))
+            .await
+            .is_err(),
+        "an unknown project type must be rejected"
+    );
+
+    // Down restores the original rule and clears the snapshots it forbids,
+    // keeping the services themselves and their provenance.
+    Migrator::down(&db, Some(1)).await?;
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT slug, service_template IS NOT NULL AS has_release, template_slug \
+             FROM projects WHERE slug IN ('built-server', 'built-static', 'image-service') \
+             ORDER BY slug"
+                .to_string(),
+        ))
+        .await?;
+    let state = rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String>("", "slug")?,
+                row.try_get::<bool>("", "has_release")?,
+                row.try_get::<Option<String>>("", "template_slug")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    assert_eq!(
+        state,
+        vec![
+            (
+                "built-server".to_string(),
+                false,
+                Some("infra-app".to_string())
+            ),
+            (
+                "built-static".to_string(),
+                false,
+                Some("infra-app".to_string())
+            ),
+            (
+                "image-service".to_string(),
+                true,
+                Some("infra-app".to_string())
+            ),
+        ]
+    );
+    assert!(
+        db.execute_unprepared(&insert(
+            "late-built",
+            "server",
+            "'{}'::jsonb",
+            "'infra-app'"
+        ))
+        .await
+        .is_err(),
+        "after down, a server project cannot carry a release again"
+    );
+
+    // And it can be applied again on the reverted schema.
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared(&insert("rebuilt", "server", "'{}'::jsonb", "'infra-app'"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");

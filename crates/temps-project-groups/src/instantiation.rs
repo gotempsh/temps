@@ -3519,6 +3519,238 @@ routes:
         );
     }
 
+    /// Two source-built services and one pinned image. The git host is not
+    /// GitHub, so creating the services never asks a public API for the
+    /// repository's directories.
+    const STACK_APP: &str = r#"
+slug: stack-app
+name: Stack app
+version: 1.0.0
+kind: app
+git:
+  url: https://git.example.test/example/stack-app.git
+  ref: v1.0.0
+databases: [postgres]
+services:
+  - name: api
+    directory: api
+    preset: dockerfile
+    exposed_port: 8080
+    database_bindings:
+      postgres:
+        DATABASE_URL: POSTGRES_URL
+  - name: web
+    directory: web
+    preset: vite
+  - name: cache
+    preset: dockerfile
+    image: registry.example.test/cache@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    exposed_port: 6379
+"#;
+
+    struct DiscardingAudit;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for DiscardingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn project_ids_and_types(
+        db: &DatabaseConnection,
+        plan: &InstantiationPlan,
+    ) -> Vec<(String, i32, temps_entities::types::ProjectType)> {
+        let mut found = Vec::new();
+        for service in &plan.services {
+            let id = service
+                .project_id
+                .unwrap_or_else(|| panic!("service '{}' was created", service.template_service));
+            let row = projects::Entity::find_by_id(id)
+                .one(db)
+                .await
+                .expect("lookup")
+                .expect("the created service is stored");
+            let token =
+                temps_entities::projects::instantiation_token(21, &service.template_service);
+            assert_eq!(
+                row.instantiation_token.as_deref(),
+                Some(token.as_str()),
+                "'{}' is complete and sealed",
+                service.template_service
+            );
+            assert_eq!(row.template_slug.as_deref(), Some("stack-app"));
+            assert!(
+                row.service_template.is_some(),
+                "'{}' keeps its release",
+                service.template_service
+            );
+            found.push((service.template_service.clone(), id, row.project_type));
+        }
+        found
+    }
+
+    /// An app whose services are built from source can be instantiated
+    /// against a real schema -- the `projects` check constraint ties a
+    /// release to the service lifecycle, and this is the path that failed on
+    /// it -- and a resumed run adopts what it created instead of making a
+    /// second set.
+    #[tokio::test]
+    async fn an_app_with_source_built_services_is_created_and_resumed() {
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::types::ProjectType;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some((project_service, git)) =
+            crate::repository::tests::project_service(conn.clone()).await
+        else {
+            eprintln!("Docker client unavailable, skipping instantiation test");
+            return;
+        };
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            eprintln!("Docker client unavailable, skipping instantiation test");
+            return;
+        };
+        let encryption = Arc::new(EncryptionService::new(&"0".repeat(64)).expect("test key"));
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                None,
+            )
+            .expect("server config"),
+        );
+        let config = Arc::new(temps_config::ConfigService::new(
+            server_config,
+            conn.clone(),
+        ));
+        let audit: Arc<dyn temps_core::AuditLogger> = Arc::new(DiscardingAudit);
+        let engine = InstantiationEngine::new(
+            conn.clone(),
+            encryption.clone(),
+            Arc::new(ProjectGroupService::new(conn.clone())),
+            Arc::new(GroupEnvVarService::new(conn.clone(), encryption.clone())),
+            Arc::new(GroupRepositoryService::new(
+                conn.clone(),
+                project_service.clone(),
+                git.clone(),
+            )),
+            Arc::new(GroupRouteService::new(conn.clone())),
+            TemplateServiceCreator {
+                project_service: project_service.clone(),
+                config_service: config,
+                public_hostname_resolver: Arc::new(temps_core::StandardHostnameResolver),
+                audit_service: audit.clone(),
+                telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            },
+            Arc::new(temps_providers::ExternalServiceManager::new(
+                conn.clone(),
+                encryption,
+                Arc::new(docker),
+                Arc::new(temps_providers::DnsRegistry::new(conn.clone())),
+            )),
+            git,
+            Arc::new(temps_auth::DefaultSensitiveActionAuthorizer::new(
+                conn.clone(),
+            )),
+            audit,
+        );
+
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Instantiation Owner".to_string()),
+            email: Set("instantiation-owner@example.com".to_string()),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("the acting user is inserted");
+        let auth = AuthContext::new_session(user.clone(), temps_auth::Role::Admin);
+        let template: ProjectTemplate = yaml_serde::from_str(STACK_APP).expect("template");
+        let services = planned(&template);
+        let mut plan = InstantiationPlan {
+            template,
+            carries_release: true,
+            provenance: Some("stack-app".to_string()),
+            target: PlannedTarget::NewProject {
+                name: "Stack".to_string(),
+                slug: "stack".to_string(),
+            },
+            fork: None,
+            repository: None,
+            follow_repository: false,
+            databases: Vec::new(),
+            services,
+            storage_claim_ids: Vec::new(),
+            group_id: None,
+            steps: Vec::new(),
+        };
+        let now = Utc::now();
+        let model = template_instantiations::ActiveModel {
+            id: Set(21),
+            user_id: Set(user.id),
+            idempotency_key: Set("stack-run".to_string()),
+            kind: Set("template".to_string()),
+            template_slug: Set(Some("stack-app".to_string())),
+            name: Set("Stack".to_string()),
+            status: Set("running".to_string()),
+            plan: Set(serde_json::to_value(&plan).expect("plan")),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("the instantiation is stored");
+        let secrets = PlanSecrets::default();
+        let origin = RequestOrigin::default();
+
+        for service in ["api", "web", "cache"] {
+            engine
+                .step_service(&mut plan, service, &secrets, &model, &auth, &origin)
+                .await
+                .unwrap_or_else(|error| panic!("service '{service}' must be created: {error}"));
+        }
+        let created = project_ids_and_types(conn.as_ref(), &plan).await;
+        assert_eq!(
+            created
+                .iter()
+                .map(|(name, _, project_type)| (name.as_str(), project_type.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("api", ProjectType::Server),
+                ("web", ProjectType::Static),
+                ("cache", ProjectType::Service),
+            ]
+        );
+
+        // A restart before the ids were recorded: the next run finds the
+        // projects by their token, adopts them, and creates nothing.
+        for service in &mut plan.services {
+            service.project_id = None;
+            service.creation_started = false;
+        }
+        for service in ["api", "web", "cache"] {
+            engine
+                .step_service(&mut plan, service, &secrets, &model, &auth, &origin)
+                .await
+                .unwrap_or_else(|error| panic!("service '{service}' must be adopted: {error}"));
+        }
+        assert_eq!(project_ids_and_types(conn.as_ref(), &plan).await, created);
+        let stored = projects::Entity::find()
+            .filter(projects::Column::TemplateSlug.eq("stack-app"))
+            .all(conn.as_ref())
+            .await
+            .expect("lookup");
+        assert_eq!(stored.len(), 3, "the retry did not create a second set");
+    }
+
     fn group_repository(
         connection_id: Option<i32>,
         public_provider: Option<&str>,
