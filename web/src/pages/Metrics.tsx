@@ -213,7 +213,7 @@ function HealthDotInline({
       </Link>
     )
   return (
-    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
       <span className="size-2 rounded-full bg-emerald-500" />
       Healthy
     </span>

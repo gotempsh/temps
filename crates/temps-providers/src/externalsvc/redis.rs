@@ -399,7 +399,14 @@ impl RedisService {
                     *config = attempt_config;
                     return Ok(());
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                // A failed guarded recreate has already put the original
+                // back under this name; never remove it as "the failed attempt".
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                            .is_none()
+                        && is_port_conflict_error(&e.to_string()) =>
+                {
                     warn!(
                         "Port {} for Redis container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
                         attempt_config.port, attempt, MAX_ATTEMPTS, e
@@ -456,8 +463,12 @@ impl RedisService {
 
         if let Some(existing_container) = super::exact_named_container(&containers, &container_name)
         {
-            // Check if we need to recreate with a new image
-            let existing_image = existing_container.image.as_deref().unwrap_or("");
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| existing_container.image.clone())
+                .unwrap_or_default();
 
             if existing_image == config.docker_image {
                 info!(
@@ -468,34 +479,67 @@ impl RedisService {
             }
 
             info!(
-                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
+                "Container {} already exists with different image (current: {}, requested: {}), recreating it",
                 container_name, existing_image, config.docker_image
             );
-
-            // Stop the container first
-            let _ = docker
-                .stop_container(
-                    &container_name,
-                    None::<bollard::query_parameters::StopContainerOptions>,
-                )
-                .await;
-
-            // Remove the container
-            docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to remove existing container: {}", e))?;
-
-            info!("Removed existing container {}", container_name);
+            self.recreate_container_guarded(docker, config, password, resource_limits)
+                .await?;
+            return Ok(());
         }
 
+        self.create_fresh_container(docker, config, password, resource_limits)
+            .await
+    }
+
+    /// Replace this service's container with one built from `config`,
+    /// through the shared guard (same data volume or refuse; original kept
+    /// until the new one shows the same keyspaces; restored otherwise).
+    async fn recreate_container_guarded(
+        &self,
+        docker: &Docker,
+        config: &RedisConfig,
+        password: &str,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let service_name = self.instance_name();
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker,
+                engine: super::recreate_guard::ManagedEngine::Redis,
+                service_name: &service_name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation: "changing its image",
+            },
+            || self.create_fresh_container(docker, config, password, resource_limits),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/data".to_string(),
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: format!("redis_data_{}", self.instance_name()),
+                target: "/data".to_string(),
+            }],
+        }
+    }
+
+    /// Create, start and wait for a new container. The caller has made sure
+    /// no container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &RedisConfig,
+        password: &str,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
         let instance_name = self.instance_name();
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
@@ -2253,6 +2297,19 @@ pub(crate) fn redis_volume_names(name: &str) -> [String; 1] {
 
 #[async_trait]
 impl ExternalService for RedisService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::Redis,
+            self.replacement_storage(),
+        ))
+    }
+
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
             containers: vec![redis_container_name(&self.instance_name())],
@@ -3253,6 +3310,9 @@ impl ExternalService for RedisService {
         info!("Starting Redis upgrade");
 
         let _old_redis_config = self.get_redis_config(old_config)?;
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let mut new_redis_config = self.get_redis_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
@@ -3264,16 +3324,43 @@ impl ExternalService for RedisService {
             .await?;
         info!("New Docker image verified and is available");
 
-        // Stop the old container
-        info!("Stopping old Redis container");
-        self.stop().await?;
+        // No stop here: replacing the container goes through the recreate
+        // guard, which stops the original itself once it has checked the new
+        // container will see its data, and fingerprints it while it runs.
 
-        // Create container with new image (keeping the same volume for data persistence)
-        info!("Starting Redis container with new image");
-        let limits = self.resource_limits.read().await.clone();
+        // Compare with the build the tag resolves to now, not only the
+        // reference string: asking again for a re-published tag must
+        // replace the container with its new digest.
+        let limits = upgrade_limits;
         let password = new_redis_config.password.clone();
-        self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
-            .await?;
+        match super::recreate_guard::runs_current_image(
+            &self.docker,
+            &self.get_container_name(),
+            &new_redis_config.docker_image,
+        )
+        .await
+        {
+            Some(true) => info!(
+                "Redis container {} already runs the current {} build",
+                self.get_container_name(),
+                new_redis_config.docker_image
+            ),
+            Some(false) => {
+                info!("Replacing Redis container with the new image");
+                self.recreate_container_guarded(
+                    &self.docker,
+                    &new_redis_config,
+                    &password,
+                    &limits,
+                )
+                .await?;
+            }
+            None => {
+                info!("Starting Redis container with new image");
+                self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
+                    .await?;
+            }
+        }
         *self.config.write().await = Some(new_redis_config);
 
         info!("Redis upgrade completed successfully");

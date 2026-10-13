@@ -1648,6 +1648,28 @@ pub struct BackupService {
 }
 
 impl BackupService {
+    /// Why running a backup of external service `service_id` with
+    /// `engine_key` would restart its database now, or `None`. Only the
+    /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
+    pub async fn backup_restart_reason(
+        &self,
+        service_id: i32,
+        engine_key: &str,
+    ) -> Result<Option<String>, BackupError> {
+        if engine_key != "postgres_walg" {
+            return Ok(None);
+        }
+        self.external_service_manager
+            .backup_restart_reason(service_id)
+            .await
+            .map_err(|e| {
+                BackupError::ExternalService(format!(
+                    "Failed to check whether backing up service {} restarts it: {}",
+                    service_id, e
+                ))
+            })
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         external_service_manager: Arc<ExternalServiceManager>,

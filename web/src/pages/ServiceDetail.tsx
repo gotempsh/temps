@@ -664,7 +664,7 @@ export function ServiceDetail() {
 
   const backAction = (
     <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage">
+      <Link to="/storage" aria-label="Back to storage">
         <ArrowLeft className="h-4 w-4" />
       </Link>
     </Button>

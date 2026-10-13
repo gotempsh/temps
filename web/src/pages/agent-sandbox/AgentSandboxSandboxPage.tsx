@@ -362,7 +362,7 @@ export function AgentSandboxSandboxPage() {
                     </div>
                   )}
                   {sandboxStatus.error && (
-                    <p className="text-xs text-red-400 mt-1">
+                    <p className="text-xs text-red-700 dark:text-red-400 mt-1">
                       {sandboxStatus.error}
                     </p>
                   )}
@@ -382,7 +382,10 @@ export function AgentSandboxSandboxPage() {
                         {rebuilding ? 'Rebuilding...' : 'Rebuild Image'}
                       </Button>
                       {buildLog.length > 0 && (
-                        <div className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5">
+                        <div
+                          tabIndex={0}
+                          className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5"
+                        >
                           {buildLog.map((line, i) => (
                             <div key={i}>{line}</div>
                           ))}

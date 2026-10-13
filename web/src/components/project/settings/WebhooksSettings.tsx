@@ -170,7 +170,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                         {webhook.enabled ? (
                           <Badge
                             variant="outline"
-                            className="border-green-500/50 text-green-600 bg-green-50 dark:bg-green-950 dark:text-green-400"
+                            className="border-green-500/50 text-green-700 bg-green-50 dark:bg-green-950 dark:text-green-400"
                           >
                             <CheckCircle2 className="h-3 w-3 mr-1" />
                             Enabled

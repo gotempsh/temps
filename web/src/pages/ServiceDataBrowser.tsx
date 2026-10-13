@@ -135,6 +135,7 @@ import {
   ResizablePanelGroup,
 } from '@/components/ui/resizable'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   containerPathLevel,
   findTreeNode,
@@ -2012,7 +2013,7 @@ export function ServiceDataBrowser() {
                   </Button>
                 </div>
               )}
-              <div className="h-full overflow-auto px-4 pb-4 pt-2">
+              <div tabIndex={0} className="h-full overflow-auto px-4 pb-4 pt-2">
                 {getProcessedNodes().length > 0 ? (
                   <TreeView
                     nodes={getProcessedNodes()}
@@ -4183,7 +4184,10 @@ function EntityDataView({
           <div>
             {queryResult && queryResult.rows && queryResult.rows.length > 0 ? (
               <>
-                <div className="rounded-md border overflow-x-auto">
+                <ScrollRegion
+                  className="rounded-md border"
+                  regionLabel="Query results, scrollable"
+                >
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-muted/50">
@@ -4239,7 +4243,7 @@ function EntityDataView({
                       ))}
                     </tbody>
                   </table>
-                </div>
+                </ScrollRegion>
 
                 {/* Row detail. Opening a JSON cell previously showed that
                     value alone, stripped of the row it came from. This shows
@@ -4297,7 +4301,10 @@ function EntityDataView({
                                   null
                                 </span>
                               ) : isStructured ? (
-                                <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
+                                <pre
+                                  tabIndex={0}
+                                  className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all"
+                                >
                                   <HighlightedCode
                                     code={text}
                                     language="json"

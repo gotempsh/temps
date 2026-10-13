@@ -215,7 +215,7 @@ export function CodeBlock({
             variant="ghost"
             className={cn(
               'size-7 rounded-md',
-              'text-muted-foreground/70 hover:text-foreground',
+              'text-muted-foreground hover:text-foreground',
               'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
             )}
             onClick={() => setShowLineNumbers(!showLineNumbers)}
@@ -237,7 +237,7 @@ export function CodeBlock({
               variant="ghost"
               className={cn(
                 'size-7 rounded-md',
-                'text-muted-foreground/70 hover:text-foreground',
+                'text-muted-foreground hover:text-foreground',
                 'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
               )}
               onClick={() => setWrapLines(!wrapLines)}
@@ -258,7 +258,7 @@ export function CodeBlock({
               variant="ghost"
               className={cn(
                 'size-7 rounded-md',
-                'text-muted-foreground/70 hover:text-foreground',
+                'text-muted-foreground hover:text-foreground',
                 'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
               )}
               onClick={handleCopy}

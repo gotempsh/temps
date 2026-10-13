@@ -1405,7 +1405,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                 <Button
                   variant="link"
                   size="sm"
-                  className="text-yellow-600 dark:text-yellow-400"
+                  className="text-yellow-700 dark:text-yellow-400"
                   onClick={() =>
                     navigate(`/projects/${project.slug}/analytics/setup`)
                   }
@@ -1935,6 +1935,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             <div className="space-y-1.5">
               <div className="flex gap-2">
                 <Input
+                  aria-label="Public key"
                   value={primaryKey.public_key}
                   readOnly
                   className="font-mono text-sm"

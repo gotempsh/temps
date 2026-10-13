@@ -937,7 +937,7 @@ export function GitImportClone({
                   <Gitlab className="h-3 w-3" />
                   <span>GitLab</span>
                 </div>
-                <span className="text-muted-foreground/60">supported</span>
+                <span className="text-muted-foreground">supported</span>
               </div>
             </div>
             <Button

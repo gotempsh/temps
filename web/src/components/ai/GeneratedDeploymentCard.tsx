@@ -31,7 +31,7 @@ function statusPresentation(status: string) {
   if (status === 'completed') {
     return {
       label: 'Ready',
-      className: 'text-green-600 dark:text-green-400',
+      className: 'text-green-700 dark:text-green-400',
     }
   }
   if (isFailedDeploymentStatus(status)) {

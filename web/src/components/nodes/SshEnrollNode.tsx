@@ -455,7 +455,7 @@ function EnrollmentProgress({ id }: { id: number }) {
         </Alert>
       )}
       {data.log && (
-        <pre className="max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug">
+        <pre tabIndex={0} className="max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug">
           {data.log}
         </pre>
       )}

@@ -10701,6 +10701,27 @@ export type ExternalServiceBackupCapabilityResponse = {
 };
 
 /**
+ * What running a backup of this service now would do, so a client can warn
+ * before starting it.
+ */
+export type ExternalServiceBackupPreflightResponse = {
+    /**
+     * Engine that would run the backup (e.g. "postgres_walg").
+     */
+    engine: string;
+    /**
+     * Why, when `restarts_database` is true.
+     */
+    reason?: string | null;
+    /**
+     * The backup restarts the database (PostgreSQL with WAL archiving off).
+     * Send `confirm_restart: true` to run it.
+     */
+    restarts_database: boolean;
+    service_id: number;
+};
+
+/**
  * Response type for external service backup
  */
 export type ExternalServiceBackupResponse = {
@@ -10714,6 +10735,11 @@ export type ExternalServiceBackupResponse = {
     finished_at?: string | null;
     id: number;
     metadata: unknown;
+    /**
+     * Set on the response to a manual run: this backup restarts the
+     * database to turn WAL archiving on before backing it up.
+     */
+    restarts_database?: boolean | null;
     s3_location: string;
     service_id: number;
     /**
@@ -21206,6 +21232,12 @@ export type ResourceLimitsUpdateResponse = {
      * The limits that were persisted to the encrypted config.
      */
     limits: ServiceResourceLimits;
+    /**
+     * Set when a new `/dev/shm` size was saved but could not be applied,
+     * because that needs a new container and replacing it was refused or
+     * failed (the reason says which, and that no data was changed).
+     */
+    shm_not_applied?: string | null;
 };
 
 /**
@@ -21716,6 +21748,13 @@ export type RunExternalServiceBackupRequest = {
      * Type of backup to perform (e.g., "full", "incremental")
      */
     backup_type?: string | null;
+    /**
+     * Acknowledge that this backup restarts the database. Required (`true`)
+     * when `GET /backups/external-services/{id}/run-preflight` reports
+     * `restarts_database`; otherwise the request is refused with a 409 and
+     * nothing is started.
+     */
+    confirm_restart?: boolean | null;
     /**
      * ID of the S3 source to store the backup. If omitted, the current default S3 source is used.
      */
@@ -34994,6 +35033,10 @@ export type RunExternalServiceBackupErrors = {
      */
     404: ProblemDetails;
     /**
+     * The backup would restart the database and `confirm_restart` was not true (error_code RESTART_CONFIRMATION_REQUIRED); nothing was started
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -35009,6 +35052,48 @@ export type RunExternalServiceBackupResponses = {
 };
 
 export type RunExternalServiceBackupResponse = RunExternalServiceBackupResponses[keyof RunExternalServiceBackupResponses];
+
+export type ExternalServiceBackupPreflightData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/run-preflight';
+};
+
+export type ExternalServiceBackupPreflightErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * External service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ExternalServiceBackupPreflightError = ExternalServiceBackupPreflightErrors[keyof ExternalServiceBackupPreflightErrors];
+
+export type ExternalServiceBackupPreflightResponses = {
+    /**
+     * What a backup run would do
+     */
+    200: ExternalServiceBackupPreflightResponse;
+};
+
+export type ExternalServiceBackupPreflightResponse2 = ExternalServiceBackupPreflightResponses[keyof ExternalServiceBackupPreflightResponses];
 
 export type ListExternalServiceBackupsData = {
     body?: never;

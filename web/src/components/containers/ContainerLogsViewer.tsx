@@ -55,7 +55,7 @@ const LEVEL_COLORS: Record<LiveLogLevel, string> = {
   WARN: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
   INFO: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/20',
   DEBUG: 'bg-zinc-500/15 text-zinc-700 dark:text-zinc-400 border-zinc-500/20',
-  TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
+  TRACE: 'bg-zinc-400/15 text-zinc-600 dark:text-zinc-500 border-zinc-400/20',
 }
 
 interface ColumnVisibility {
@@ -259,12 +259,12 @@ export function ContainerLogsViewer({
             className={cn(
               'flex items-center gap-1.5 text-xs',
               connectionStatus === 'connected'
-                ? 'text-emerald-600 dark:text-emerald-400'
+                ? 'text-emerald-700 dark:text-emerald-400'
                 : connectionStatus === 'complete'
                   ? 'text-muted-foreground'
                   : connectionStatus === 'connecting'
-                    ? 'text-yellow-600 dark:text-yellow-400'
-                    : 'text-red-600 dark:text-red-400'
+                    ? 'text-yellow-700 dark:text-yellow-400'
+                    : 'text-red-700 dark:text-red-400'
             )}
           >
             <span

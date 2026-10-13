@@ -243,25 +243,25 @@ const KIND_META: Record<
   request: {
     label: 'Requests',
     icon: Network,
-    accent: 'text-sky-500',
+    accent: 'text-sky-700 dark:text-sky-500',
     gutter: 'border-l-sky-500',
   },
   span: {
     label: 'Traces',
     icon: Workflow,
-    accent: 'text-violet-500',
+    accent: 'text-violet-600 dark:text-violet-500',
     gutter: 'border-l-violet-500',
   },
   error: {
     label: 'Errors',
     icon: AlertOctagon,
-    accent: 'text-rose-500',
+    accent: 'text-rose-700 dark:text-rose-500',
     gutter: 'border-l-rose-500',
   },
   revenue: {
     label: 'Revenue',
     icon: CircleDollarSign,
-    accent: 'text-emerald-500',
+    accent: 'text-emerald-700 dark:text-emerald-500',
     gutter: 'border-l-emerald-500',
   },
 }
@@ -563,7 +563,9 @@ function EmptyState() {
 function ErrorState({ message }: { message: string }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 p-12 text-center">
-      <p className="text-sm font-medium text-rose-500">Failed to load events</p>
+      <p className="text-sm font-medium text-rose-700 dark:text-rose-500">
+        Failed to load events
+      </p>
       <p className="text-xs text-muted-foreground">{message}</p>
     </div>
   )

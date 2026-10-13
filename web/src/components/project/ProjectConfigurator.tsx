@@ -1778,6 +1778,7 @@ export function ProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -1962,6 +1963,7 @@ export function ProjectConfigurator({
                   <div key={v.key} className="flex items-start gap-2">
                     <Checkbox
                       className="mt-2.5"
+                      aria-label={`Import ${v.key}`}
                       checked={selectedEnvExampleKeys.has(v.key)}
                       onCheckedChange={(checked) => {
                         setSelectedEnvExampleKeys((prev) => {

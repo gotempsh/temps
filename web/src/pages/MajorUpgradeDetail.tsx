@@ -230,7 +230,7 @@ export function MajorUpgradeDetail() {
 
   const backAction = (
     <Button variant="ghost" size="icon" asChild>
-      <Link to={`/storage/${id}`}>
+      <Link to={`/storage/${id}`} aria-label="Back to storage service">
         <ArrowLeft className="h-4 w-4" />
       </Link>
     </Button>
@@ -423,7 +423,10 @@ export function MajorUpgradeDetail() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <pre className="text-xs bg-muted rounded-md p-3 max-h-[480px] overflow-auto whitespace-pre-wrap break-all">
+                <pre
+                  tabIndex={0}
+                  className="text-xs bg-muted rounded-md p-3 max-h-[480px] overflow-auto whitespace-pre-wrap break-all"
+                >
                   {logsQuery.data?.content?.trim() || '(no log output yet)'}
                 </pre>
               </CardContent>

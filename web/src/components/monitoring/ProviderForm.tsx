@@ -720,7 +720,10 @@ export function ProviderForm({
               <h4 className="text-sm font-medium mb-2">
                 Webhook Payload Format
               </h4>
-              <pre className="text-xs text-muted-foreground overflow-x-auto">
+              <pre
+                tabIndex={0}
+                className="text-xs text-muted-foreground overflow-x-auto"
+              >
                 <HighlightedCode
                   code={`{
   "id": "notification-uuid",

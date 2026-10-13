@@ -543,7 +543,7 @@ export function S3SourceDetail() {
                                     className={cn(
                                       'truncate text-base sm:text-sm',
                                       !schedule.enabled
-                                        ? 'text-muted-foreground/60'
+                                        ? 'text-muted-foreground'
                                         : 'text-muted-foreground'
                                     )}
                                     title={schedule.description}

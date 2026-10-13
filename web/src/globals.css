@@ -44,8 +44,11 @@
   --destructive-foreground: oklch(0.985 0 0);
   /* Status semantics — success (green) + warning (amber), matching the chart
      tones. Used by AlertStateBadge (ok/warn) and the metrics health surfaces. */
+  /* #0f813d. White text on the previous, brighter green (#0da34d) measured
+     3.16:1, below the 4.5:1 WCAG 1.4.3 floor for badges and buttons; this
+     reaches 4.74:1 and, used as text on white, 4.95:1. */
   --success: oklch(
-    0.627 0.1684 150.31
+    0.53 0.14 150.31
   ); /* green — solid fill paired with white text */
   --success-foreground: oklch(0.985 0 0);
   /* Green *text* on light surfaces. --success is a fill colour: as text it
@@ -133,15 +136,20 @@
   /* gray-300 (#3a3a3a) — accent hover */
   --accent: oklch(0.322 0 0);
   --accent-foreground: oklch(0.985 0 0);
-  /* Vercel red (#e5484d / error) */
-  --destructive: oklch(0.627 0.2193 23.03);
-  --destructive-foreground: oklch(0.985 0 0);
+  /* #f45055. As text it is 5.2:1 on the card colour and 4.7:1 on a
+     destructive/10 tint (the previous #f03744 managed 4.2:1 there). White
+     text on a red this light is only 3.3:1, so the foreground is the same
+     near-black as --warning-foreground (5.8:1). */
+  --destructive: oklch(0.66 0.2 23);
+  --destructive-foreground: oklch(0.145 0 0);
   /* Status semantics — same green/amber as light (chart tones are mode-stable);
      dark foreground reads well on both. */
+  /* Bright green fill: white text on it is 3.16:1, so the foreground is the
+     near-black used by --warning-foreground (6.0:1). */
   --success: oklch(
     0.627 0.1684 150.31
-  ); /* green — solid fill paired with white text */
-  --success-foreground: oklch(0.985 0 0);
+  ); /* green — solid fill paired with dark text */
+  --success-foreground: oklch(0.145 0 0);
   /* Green text on dark surfaces: ~9.9:1 on the card colour. */
   --success-strong: oklch(0.79 0.17 150);
   --warning: oklch(0.773 0.1776 69.61); /* amber */

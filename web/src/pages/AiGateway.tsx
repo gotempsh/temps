@@ -182,11 +182,15 @@ import {
   settingsSaveKeyId,
 } from '@/components/ai/self-hosted-provider'
 import {
+  canSubmitProviderKeyForm,
   EMPTY_PROVIDER_KEY_FORM,
+  providerKeyFormForProvider,
   providerKeyFormSchema,
   providerKeyFormToRequest,
+  selectProviderKeyFormProvider,
   type ProviderKeyFormValues,
 } from '@/components/ai/provider-key-form'
+import { ProviderKeyProviderPicker } from '@/components/ai/ProviderKeyProviderPicker'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
@@ -1406,7 +1410,7 @@ export function UsageAnalytics() {
                         <span>{formatTokenCount(m.request_count)} req</span>
                         <span>{formatTokenCount(m.total_tokens)} tok</span>
                         {cost > 0 && (
-                          <span className="text-orange-500 font-medium">
+                          <span className="text-orange-700 dark:text-orange-500 font-medium">
                             {formatCost(cost)}
                           </span>
                         )}
@@ -1613,7 +1617,7 @@ export function UsageAnalytics() {
                             }
                             className={
                               log.status < 400
-                                ? 'bg-green-500/15 text-green-500 hover:bg-green-500/25'
+                                ? 'bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25'
                                 : ''
                             }
                           >
@@ -1872,7 +1876,7 @@ function SpanTreeRow({
                 <TooltipTrigger asChild>
                   <Badge
                     variant="outline"
-                    className="text-[9px] px-1 py-0 h-4 text-blue-500 border-blue-500/30 shrink-0"
+                    className="text-[9px] px-1 py-0 h-4 text-blue-600 dark:text-blue-500 border-blue-500/30 shrink-0"
                   >
                     cached
                   </Badge>
@@ -2009,7 +2013,7 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
         <div key={`thinking-${i}`} className="flex justify-start">
           <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-violet-500/10 border border-violet-500/20">
             <div className="flex items-center gap-1.5 mb-1">
-              <span className="text-[10px] font-semibold uppercase text-violet-500">
+              <span className="text-[10px] font-semibold uppercase text-violet-600 dark:text-violet-500">
                 thinking
               </span>
             </div>
@@ -2076,7 +2080,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
                   key={j}
                   className="bg-background/50 rounded p-1.5 font-mono text-[10px]"
                 >
-                  <span className="text-amber-500">{tc.function?.name}</span>
+                  <span className="text-amber-700 dark:text-amber-500">
+                    {tc.function?.name}
+                  </span>
                   {tc.function?.arguments && (
                     <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
                       <HighlightedCode
@@ -2095,7 +2101,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
               key={`tool-use-${j}`}
               className="bg-background/50 rounded p-1.5 font-mono text-[10px] mt-1"
             >
-              <span className="text-amber-500">{block.name}</span>
+              <span className="text-amber-700 dark:text-amber-500">
+                {block.name}
+              </span>
               {block.id && (
                 <span className="text-muted-foreground ml-1">({block.id})</span>
               )}
@@ -2196,11 +2204,11 @@ function FullConversationView({
             <div key={i} className="flex justify-start">
               <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-emerald-500/10 border border-emerald-500/20">
                 <div className="flex items-center gap-1.5 mb-1">
-                  <span className="text-[10px] font-semibold uppercase text-emerald-600">
+                  <span className="text-[10px] font-semibold uppercase text-emerald-700 dark:text-emerald-600">
                     tool execution
                   </span>
                   {block?.name && (
-                    <span className="font-mono text-[10px] text-emerald-500">
+                    <span className="font-mono text-[10px] text-emerald-700 dark:text-emerald-500">
                       {block.name}
                     </span>
                   )}
@@ -2252,7 +2260,10 @@ function JsonBlock({ label, value }: { label: string; value: string | null }) {
         {label}
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <pre className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto">
+        <pre
+          tabIndex={0}
+          className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto"
+        >
           <HighlightedCode code={formatted} language="json" />
         </pre>
       </CollapsibleContent>
@@ -2319,7 +2330,11 @@ function SpanDetailSheet({
             )}
             <Badge
               variant={isError ? 'destructive' : 'default'}
-              className={!isError ? 'bg-green-500/15 text-green-500' : ''}
+              className={
+                !isError
+                  ? 'bg-green-500/15 text-green-700 dark:text-green-500'
+                  : ''
+              }
             >
               {span.status_code}
             </Badge>
@@ -2344,13 +2359,13 @@ function SpanDetailSheet({
                 </div>
                 {span.cache_read_input_tokens != null &&
                   span.cache_read_input_tokens > 0 && (
-                    <div className="text-[10px] text-blue-500">
+                    <div className="text-[10px] text-blue-600 dark:text-blue-500">
                       {formatTokenCount(span.cache_read_input_tokens)} cached
                     </div>
                   )}
                 {span.cache_creation_input_tokens != null &&
                   span.cache_creation_input_tokens > 0 && (
-                    <div className="text-[10px] text-amber-500">
+                    <div className="text-[10px] text-amber-700 dark:text-amber-500">
                       {formatTokenCount(span.cache_creation_input_tokens)} cache
                       write
                     </div>
@@ -2846,7 +2861,7 @@ function InvocationCard({
                     </span>
                   )}
                   {cacheRead > 0 && (
-                    <span className="text-blue-500">
+                    <span className="text-blue-600 dark:text-blue-500">
                       {formatTokenCount(cacheRead)} cached
                     </span>
                   )}
@@ -3111,7 +3126,7 @@ function TraceDetailView({
                   {formatTokenCount(stats.totalInput)}
                 </div>
                 {stats.totalCacheRead > 0 && (
-                  <div className="text-[10px] text-blue-500">
+                  <div className="text-[10px] text-blue-600 dark:text-blue-500">
                     {formatTokenCount(stats.totalCacheRead)} cached
                   </div>
                 )}
@@ -3140,7 +3155,7 @@ function TraceDetailView({
                   <div className="text-xl font-bold text-destructive">
                     {stats.errors.length}
                   </div>
-                  <div className="text-[10px] text-destructive/70">
+                  <div className="text-[10px] text-destructive">
                     {stats.errors[0].error_type ?? 'Unknown'}
                   </div>
                 </Card>
@@ -3507,7 +3522,7 @@ export function AgentActivity() {
                                 <TooltipTrigger>
                                   <Badge
                                     variant="outline"
-                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                    className="text-[10px] text-blue-600 dark:text-blue-500 border-blue-500/30"
                                   >
                                     {cachePct}% hit
                                   </Badge>
@@ -3545,7 +3560,7 @@ export function AgentActivity() {
                           ) : (
                             <Badge
                               variant="default"
-                              className="bg-green-500/15 text-green-500 hover:bg-green-500/25"
+                              className="bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25"
                             >
                               OK
                             </Badge>
@@ -3800,7 +3815,7 @@ export function ProjectAgentActivity({
                                 <TooltipTrigger>
                                   <Badge
                                     variant="outline"
-                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                    className="text-[10px] text-blue-600 dark:text-blue-500 border-blue-500/30"
                                   >
                                     {cachePct}% hit
                                   </Badge>
@@ -3838,7 +3853,7 @@ export function ProjectAgentActivity({
                           ) : (
                             <Badge
                               variant="default"
-                              className="bg-green-500/15 text-green-500 hover:bg-green-500/25"
+                              className="bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25"
                             >
                               OK
                             </Badge>
@@ -3914,6 +3929,10 @@ export function AiGatewayPage() {
   usePageTitle('AI Gateway')
 
   const [dialogOpen, setDialogOpen] = useState(false)
+  // True when the add-key dialog was opened from a provider's own row, so the
+  // provider is fixed. Opened from the header or the onboarding prompt, the
+  // dialog shows a provider choice instead.
+  const [providerPreselected, setProviderPreselected] = useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
     null
@@ -4069,7 +4088,35 @@ export function AiGatewayPage() {
   // backend now verifies on create (see handlers/providers.rs) — a failed
   // test surfaces as a 400 on the create call itself.
 
-  const resetForm = () => providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+  const resetForm = () => {
+    providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+    setProviderPreselected(false)
+  }
+
+  // Header and onboarding entry points: no provider yet, the user picks one
+  // in the dialog.
+  const openAddKeyDialog = () => {
+    providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+    setProviderPreselected(false)
+    createMutation.reset()
+    setDialogOpen(true)
+  }
+
+  const handleProviderChosen = (providerId: string) => {
+    const provider = SUPPORTED_PROVIDERS.find((p) => p.id === providerId)
+    if (!provider) return
+    const existingKeyCount = keys.filter(
+      (k) => k.provider === provider.id
+    ).length
+    providerKeyForm.reset(
+      selectProviderKeyFormProvider(
+        providerKeyForm.getValues(),
+        provider,
+        existingKeyCount,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
 
   const handleCreate = providerKeyForm.handleSubmit((values) => {
     if (createMutation.isPending) return
@@ -4201,10 +4248,7 @@ console.log(response.choices[0].message.content);`,
             Unified API for multiple AI providers with a single endpoint
           </p>
         </div>
-        <Button
-          onClick={() => setDialogOpen(true)}
-          className="w-full sm:w-auto"
-        >
+        <Button onClick={openAddKeyDialog} className="w-full sm:w-auto">
           <Plus className="mr-2 h-4 w-4" />
           Add Provider Key
         </Button>
@@ -4243,7 +4287,7 @@ console.log(response.choices[0].message.content);`,
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => setDialogOpen(true)}
+                    onClick={openAddKeyDialog}
                   >
                     <Plus className="mr-2 h-4 w-4" />
                     Add a provider key
@@ -4433,7 +4477,7 @@ console.log(response.choices[0].message.content);`,
                               Unknown
                             </Badge>
                           ) : status === 'active' ? (
-                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
+                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-700 dark:text-green-400 hover:bg-green-500/25">
                               Active
                             </Badge>
                           ) : status === 'disabled' ? (
@@ -4464,13 +4508,13 @@ console.log(response.choices[0].message.content);`,
                             }
                             size="sm"
                             onClick={() => {
-                              providerKeyForm.reset({
-                                ...EMPTY_PROVIDER_KEY_FORM,
-                                provider: provider.id,
-                                display_name: hasAnyKey
-                                  ? `${provider.name} (key ${providerKeys.length + 1})`
-                                  : provider.name,
-                              })
+                              providerKeyForm.reset(
+                                providerKeyFormForProvider(
+                                  provider,
+                                  providerKeys.length
+                                )
+                              )
+                              setProviderPreselected(true)
                               setDialogOpen(true)
                             }}
                           >
@@ -4620,7 +4664,24 @@ console.log(response.choices[0].message.content);`,
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
-              {newProvider && (
+              {providerPreselected ? null : (
+                <div className="grid gap-2">
+                  <Label>Provider</Label>
+                  <ProviderKeyProviderPicker
+                    providers={SUPPORTED_PROVIDERS}
+                    value={newProvider}
+                    onChange={handleProviderChosen}
+                    disabled={createMutation.isPending}
+                    invalid={!!formErrors.provider}
+                  />
+                  {formErrors.provider && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.provider.message}
+                    </p>
+                  )}
+                </div>
+              )}
+              {newProvider && providerPreselected && (
                 <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
                   <AiProviderIcon provider={newProvider} size={36} />
                   <div className="min-w-0 flex-1">
@@ -4643,109 +4704,114 @@ console.log(response.choices[0].message.content);`,
                   )}
                 </div>
               )}
-              <div className="grid gap-2">
-                <Label htmlFor="displayName">Display Name</Label>
-                <Input
-                  id="displayName"
-                  placeholder="Production API Key"
-                  disabled={createMutation.isPending}
-                  aria-invalid={!!formErrors.display_name}
-                  {...providerKeyForm.register('display_name')}
-                />
-                {formErrors.display_name && (
-                  <p className="text-xs text-destructive">
-                    {formErrors.display_name.message}
-                  </p>
-                )}
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="apiKey">
-                  API Key
-                  {newProviderIsSelfHosted && (
-                    <>
-                      {' '}
-                      <span className="text-muted-foreground font-normal">
-                        (optional)
-                      </span>
-                    </>
+              {/* Hidden (not unmounted) until a provider is chosen: the fields
+                  depend on the provider, and SelfHostedProviderFields keeps
+                  its discovery state mounted. */}
+              <div className={newProvider ? 'grid gap-4' : 'hidden'}>
+                <div className="grid gap-2">
+                  <Label htmlFor="displayName">Display Name</Label>
+                  <Input
+                    id="displayName"
+                    placeholder="Production API Key"
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.display_name}
+                    {...providerKeyForm.register('display_name')}
+                  />
+                  {formErrors.display_name && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.display_name.message}
+                    </p>
                   )}
-                </Label>
-                <Input
-                  id="apiKey"
-                  type="password"
-                  placeholder={
-                    newProviderIsSelfHosted
-                      ? 'Leave empty if your server has no authentication'
-                      : 'sk-...'
-                  }
-                  disabled={createMutation.isPending}
-                  aria-invalid={!!formErrors.api_key}
-                  {...providerKeyForm.register('api_key')}
-                />
-                {formErrors.api_key ? (
-                  <p className="text-xs text-destructive">
-                    {formErrors.api_key.message}
-                  </p>
-                ) : (
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="apiKey">
+                    API Key
+                    {newProviderIsSelfHosted && (
+                      <>
+                        {' '}
+                        <span className="text-muted-foreground font-normal">
+                          (optional)
+                        </span>
+                      </>
+                    )}
+                  </Label>
+                  <Input
+                    id="apiKey"
+                    type="password"
+                    placeholder={
+                      newProviderIsSelfHosted
+                        ? 'Leave empty if your server has no authentication'
+                        : 'sk-...'
+                    }
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.api_key}
+                    {...providerKeyForm.register('api_key')}
+                  />
+                  {formErrors.api_key ? (
+                    <p className="text-xs text-destructive">
+                      {formErrors.api_key.message}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      Your key is encrypted at rest and never exposed in the
+                      dashboard.
+                    </p>
+                  )}
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="baseUrl">
+                    {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
+                    <span className="text-muted-foreground font-normal">
+                      {newProviderIsSelfHosted ? '(required)' : '(optional)'}
+                    </span>
+                  </Label>
+                  <Input
+                    id="baseUrl"
+                    placeholder={
+                      newProviderIsSelfHosted
+                        ? 'http://10.0.0.5:8000/v1'
+                        : 'https://api.openai.com/v1'
+                    }
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.base_url}
+                    {...providerKeyForm.register('base_url')}
+                  />
+                  {formErrors.base_url && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.base_url.message}
+                    </p>
+                  )}
                   <p className="text-xs text-muted-foreground">
-                    Your key is encrypted at rest and never exposed in the
-                    dashboard.
+                    {newProviderIsSelfHosted
+                      ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
+                      : 'Override the default API endpoint for this provider.'}
                   </p>
-                )}
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="baseUrl">
-                  {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
-                  <span className="text-muted-foreground font-normal">
-                    {newProviderIsSelfHosted ? '(required)' : '(optional)'}
-                  </span>
-                </Label>
-                <Input
-                  id="baseUrl"
-                  placeholder={
-                    newProviderIsSelfHosted
-                      ? 'http://10.0.0.5:8000/v1'
-                      : 'https://api.openai.com/v1'
+                </div>
+                <SelfHostedProviderFields
+                  open={newProviderIsSelfHosted}
+                  baseUrl={formValues.base_url}
+                  apiKey={formValues.api_key}
+                  trustPrivateAddress={formValues.trust_private_address}
+                  onTrustPrivateAddressChange={(trusted) =>
+                    setFormValue('trust_private_address', trusted)
                   }
+                  canTrustPrivateAddress={canTrustPrivateAddress}
+                  discovery={formValues.discovery}
+                  onDiscovered={(discovery) =>
+                    setFormValue('discovery', discovery)
+                  }
+                  defaultModel={formValues.default_model}
+                  onDefaultModelChange={(model) =>
+                    setFormValue('default_model', model)
+                  }
+                  capabilities={formValues.capabilities}
+                  onCapabilitiesChange={(capabilities) =>
+                    setFormValue('capabilities', capabilities)
+                  }
+                  error={formErrors.default_model?.message}
                   disabled={createMutation.isPending}
-                  aria-invalid={!!formErrors.base_url}
-                  {...providerKeyForm.register('base_url')}
                 />
-                {formErrors.base_url && (
-                  <p className="text-xs text-destructive">
-                    {formErrors.base_url.message}
-                  </p>
-                )}
-                <p className="text-xs text-muted-foreground">
-                  {newProviderIsSelfHosted
-                    ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
-                    : 'Override the default API endpoint for this provider.'}
-                </p>
               </div>
-              <SelfHostedProviderFields
-                open={newProviderIsSelfHosted}
-                baseUrl={formValues.base_url}
-                apiKey={formValues.api_key}
-                trustPrivateAddress={formValues.trust_private_address}
-                onTrustPrivateAddressChange={(trusted) =>
-                  setFormValue('trust_private_address', trusted)
-                }
-                canTrustPrivateAddress={canTrustPrivateAddress}
-                discovery={formValues.discovery}
-                onDiscovered={(discovery) =>
-                  setFormValue('discovery', discovery)
-                }
-                defaultModel={formValues.default_model}
-                onDefaultModelChange={(model) =>
-                  setFormValue('default_model', model)
-                }
-                capabilities={formValues.capabilities}
-                onCapabilitiesChange={(capabilities) =>
-                  setFormValue('capabilities', capabilities)
-                }
-                error={formErrors.default_model?.message}
-                disabled={createMutation.isPending}
-              />
             </div>
             <p className="text-xs text-muted-foreground">
               {newProviderIsSelfHosted
@@ -4763,7 +4829,10 @@ console.log(response.choices[0].message.content);`,
             <DialogFooter>
               <Button
                 onClick={handleCreate}
-                disabled={createMutation.isPending}
+                disabled={
+                  createMutation.isPending ||
+                  !canSubmitProviderKeyForm({ provider: newProvider })
+                }
                 className="w-full sm:w-auto"
               >
                 {createMutation.isPending ? (

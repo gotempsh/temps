@@ -70,6 +70,22 @@ jobs:
       channel: ${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
+  database-images:
+    # Managed-database images (Postgres, Redis, MongoDB, ...) the binary
+    # references by tag. Publishes only tags missing from GHCR -- a release
+    # must not move a tag under running databases -- then fails unless every
+    # required tag is anonymously pullable. Freshness is owned by the weekly
+    # schedule in database-images.yml, not by the release cadence.
+    needs: [validate-release-ref, require-tests]
+    uses: ./.github/workflows/database-images.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      ensure: true
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
   validate-release-ref:
     name: Validate Release Ref
     runs-on: ubuntu-latest
@@ -604,9 +620,10 @@ jobs:
 
   create-release:
     name: Create Release
-    # All image sets, embedded manifests and binaries must succeed before
-    # publication, and the commit must have passed rust-tests.yml.
-    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
+    # All image sets (including the managed-database images), embedded
+    # manifests and binaries must succeed before publication, and the commit
+    # must have passed rust-tests.yml.
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images, database-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write

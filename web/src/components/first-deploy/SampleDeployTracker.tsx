@@ -512,6 +512,7 @@ function LiveDeployment({
 function TrackerSkeleton() {
   return (
     <div
+      role="status"
       className="space-y-4 rounded-lg border bg-card p-5"
       aria-label="Loading deployment"
       aria-busy="true"

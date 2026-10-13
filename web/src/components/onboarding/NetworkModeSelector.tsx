@@ -170,7 +170,7 @@ export function NetworkModeSelector({
                 {/* Pros and Cons */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
                   <div className="space-y-1">
-                    <p className="text-xs font-medium text-green-600 dark:text-green-400">
+                    <p className="text-xs font-medium text-green-700 dark:text-green-400">
                       Pros:
                     </p>
                     <ul className="space-y-0.5">
@@ -186,7 +186,7 @@ export function NetworkModeSelector({
                     </ul>
                   </div>
                   <div className="space-y-1">
-                    <p className="text-xs font-medium text-orange-600 dark:text-orange-400">
+                    <p className="text-xs font-medium text-orange-700 dark:text-orange-400">
                       Cons:
                     </p>
                     <ul className="space-y-0.5">

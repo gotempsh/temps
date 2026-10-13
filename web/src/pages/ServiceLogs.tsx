@@ -38,11 +38,11 @@ import { Link, useParams } from 'react-router'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
 const LEVEL_CLASS: Record<LogLevel, string> = {
-  ERROR: 'text-red-500',
-  WARN: 'text-amber-500',
+  ERROR: 'text-red-700 dark:text-red-500',
+  WARN: 'text-amber-700 dark:text-amber-500',
   INFO: 'text-foreground',
   DEBUG: 'text-muted-foreground',
-  TRACE: 'text-muted-foreground/70',
+  TRACE: 'text-muted-foreground',
 }
 
 const LEVELS: LogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
@@ -465,6 +465,7 @@ export function ServiceLogs() {
         ) : (
           <div className="rounded-md border bg-muted/30">
             <div
+              tabIndex={0}
               ref={scrollRef}
               onScroll={handleScroll}
               className="max-h-[calc(100vh-19rem)] overflow-auto [overflow-anchor:none]"
@@ -476,11 +477,11 @@ export function ServiceLogs() {
                   Loading older logs…
                 </div>
               ) : hasNextPage ? (
-                <div className="py-1.5 text-center text-xs text-muted-foreground/70">
+                <div className="py-1.5 text-center text-xs text-muted-foreground">
                   Scroll up to load older logs
                 </div>
               ) : (
-                <div className="py-1.5 text-center text-xs text-muted-foreground/50">
+                <div className="py-1.5 text-center text-xs text-muted-foreground">
                   Beginning of {rangeLabel.toLowerCase()}
                 </div>
               )}
@@ -490,7 +491,7 @@ export function ServiceLogs() {
                     key={`${line.container_id ?? ''}-${line.line_id}-${i}`}
                     className="flex gap-3 border-b border-border/40 py-0.5 last:border-0"
                   >
-                    <span className="shrink-0 text-muted-foreground/70">
+                    <span className="shrink-0 text-muted-foreground">
                       {formatTs(line.timestamp)}
                     </span>
                     <span

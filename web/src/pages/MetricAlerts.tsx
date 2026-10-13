@@ -282,7 +282,7 @@ function AlertRow({
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={onDelete}
-            className="text-rose-500 focus:text-rose-500"
+            className="text-rose-700 dark:text-rose-500 focus:text-rose-500"
           >
             <Trash2 className="size-4" />
             Delete

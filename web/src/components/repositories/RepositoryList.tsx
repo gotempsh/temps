@@ -660,7 +660,7 @@ export function RepositoryList({
                       </span>
                     )}
                     {repo.language && repo.pushed_at && (
-                      <span className="text-muted-foreground/40">•</span>
+                      <span className="text-muted-foreground">•</span>
                     )}
                     {repo.language && (
                       <span className="inline-flex items-center gap-1.5">

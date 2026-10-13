@@ -540,7 +540,7 @@ function EventEntriesCard({
                           <button
                             type="button"
                             aria-label={`Remove ${col} column`}
-                            className="text-muted-foreground/50 transition-colors hover:text-foreground"
+                            className="text-muted-foreground transition-colors hover:text-foreground"
                             onClick={() =>
                               setPropColumns(
                                 propColumns.filter((c) => c !== col)

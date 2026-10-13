@@ -1664,6 +1664,7 @@ function GitSettingsInline({
           <CardContent className="p-0 divide-y">
             <div className="flex items-center gap-4 p-6">
               <Switch
+                aria-label="Automatic deployments"
                 checked={autoDeployOn}
                 onCheckedChange={handleAutoDeployToggle}
               />

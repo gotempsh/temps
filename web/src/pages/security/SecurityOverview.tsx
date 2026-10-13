@@ -51,7 +51,7 @@ function getScanStatusBadge(scan: ScanResponse | undefined) {
     return (
       <Badge
         variant="outline"
-        className="bg-blue-500/10 text-blue-500 border-blue-500/20"
+        className="bg-blue-500/10 text-blue-600 dark:text-blue-500 border-blue-500/20"
       >
         <Loader2 className="h-3 w-3 mr-1 animate-spin" />
         Scanning...
@@ -63,7 +63,7 @@ function getScanStatusBadge(scan: ScanResponse | undefined) {
     return (
       <Badge
         variant="outline"
-        className="bg-red-500/10 text-red-500 border-red-500/20"
+        className="bg-red-500/10 text-red-700 dark:text-red-500 border-red-500/20"
       >
         <AlertTriangle className="h-3 w-3 mr-1" />
         Failed
@@ -84,7 +84,7 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
     return (
       <Badge
         variant="outline"
-        className="bg-green-500/10 text-green-500 border-green-500/20"
+        className="bg-green-500/10 text-green-700 dark:text-green-500 border-green-500/20"
       >
         <CheckCircle2 className="h-3 w-3 mr-1" />
         Clean
@@ -96,7 +96,7 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
     return (
       <Badge
         variant="outline"
-        className="bg-red-500/10 text-red-500 border-red-500/20"
+        className="bg-red-500/10 text-red-700 dark:text-red-500 border-red-500/20"
       >
         <AlertTriangle className="h-3 w-3 mr-1" />
         {scan.critical_count} Critical
@@ -108,7 +108,7 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
     return (
       <Badge
         variant="outline"
-        className="bg-orange-500/10 text-orange-500 border-orange-500/20"
+        className="bg-orange-500/10 text-orange-700 dark:text-orange-500 border-orange-500/20"
       >
         <AlertTriangle className="h-3 w-3 mr-1" />
         {scan.high_count} High
@@ -119,7 +119,7 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
   return (
     <Badge
       variant="outline"
-      className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20"
+      className="bg-yellow-500/10 text-yellow-700 dark:text-yellow-500 border-yellow-500/20"
     >
       {total} Vulnerabilities
     </Badge>

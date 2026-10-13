@@ -512,6 +512,7 @@ export function DomainDetail() {
     return (
       <div className="flex-1 overflow-auto">
         <div
+          role="status"
           className="space-y-4 p-6"
           aria-label="Loading domain"
           aria-busy="true"
@@ -1032,7 +1033,7 @@ export function DomainDetail() {
                 <KeyFact
                   label="Certificate"
                   value={
-                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                    <span className="text-emerald-700 dark:text-emerald-400 font-medium">
                       Present
                     </span>
                   }
@@ -1543,6 +1544,7 @@ function DnsAutoProvision({
       </div>
       {loading && providers.length === 0 ? (
         <Skeleton
+          role="status"
           className="h-8 w-full sm:w-48"
           aria-label="Loading DNS providers"
         />
@@ -1857,7 +1859,7 @@ function InlineStepStrip({ steps }: { steps: InlineStep[] }) {
             ? 'text-foreground'
             : step.state === 'complete'
               ? 'text-muted-foreground'
-              : 'text-muted-foreground/70'
+              : 'text-muted-foreground'
         const indicatorClasses =
           step.state === 'current'
             ? 'bg-foreground text-background'
@@ -1979,7 +1981,10 @@ function ActiveCertificateInner({
             />
           </div>
           <CollapsibleContent>
-            <pre className="mt-2 p-4 bg-muted rounded-lg text-xs font-mono overflow-x-auto max-h-64 overflow-y-auto">
+            <pre
+              tabIndex={0}
+              className="mt-2 p-4 bg-muted rounded-lg text-xs font-mono overflow-x-auto max-h-64 overflow-y-auto"
+            >
               {domain.certificate}
             </pre>
           </CollapsibleContent>

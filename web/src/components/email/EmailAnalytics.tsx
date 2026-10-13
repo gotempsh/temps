@@ -213,35 +213,35 @@ export function EmailAnalytics() {
             count={stats.delivered}
             rate={null}
             icon={Send}
-            color="text-emerald-500"
+            color="text-emerald-700 dark:text-emerald-500"
           />
           <RateCard
             title="Opened"
             count={stats.opened}
             rate={stats.open_rate}
             icon={Eye}
-            color="text-blue-500"
+            color="text-blue-600 dark:text-blue-500"
           />
           <RateCard
             title="Clicked"
             count={stats.clicked}
             rate={stats.click_rate}
             icon={MousePointerClick}
-            color="text-green-500"
+            color="text-green-700 dark:text-green-500"
           />
           <RateCard
             title="Bounced"
             count={stats.bounced}
             rate={stats.bounce_rate}
             icon={MailWarning}
-            color="text-red-500"
+            color="text-red-700 dark:text-red-500"
           />
           <RateCard
             title="Complained"
             count={stats.complained}
             rate={null}
             icon={AlertTriangle}
-            color="text-orange-500"
+            color="text-orange-700 dark:text-orange-500"
           />
         </div>
       )}

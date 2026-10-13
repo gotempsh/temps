@@ -163,7 +163,7 @@ function TlsStatusCell({
     return (
       <Badge
         variant="outline"
-        className="w-fit border-green-500 text-xs text-green-600 dark:text-green-400"
+        className="w-fit border-green-500 text-xs text-green-700 dark:text-green-400"
       >
         Authorized
       </Badge>
@@ -278,7 +278,7 @@ function SetupInstructions({
           console hostname.
         </p>
         <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
-          <pre className="overflow-x-auto text-xs leading-relaxed">
+          <pre tabIndex={0} className="overflow-x-auto text-xs leading-relaxed">
             <HighlightedCode code={EXAMPLE_LABELS} language="bash" />
           </pre>
           <CopyButton
@@ -334,7 +334,7 @@ function SetupInstructions({
         </dl>
 
         <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
-          <pre className="overflow-x-auto text-xs leading-relaxed">
+          <pre tabIndex={0} className="overflow-x-auto text-xs leading-relaxed">
             <HighlightedCode code={status.setup.example} language="bash" />
           </pre>
           <CopyButton
@@ -762,7 +762,10 @@ export function TraefikDiscoveryPage() {
                   container and it appears here on the next reconciliation.
                 </p>
                 <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
-                  <pre className="overflow-x-auto text-xs leading-relaxed">
+                  <pre
+                    tabIndex={0}
+                    className="overflow-x-auto text-xs leading-relaxed"
+                  >
                     <HighlightedCode code={EXAMPLE_LABELS} language="bash" />
                   </pre>
                   <CopyButton
