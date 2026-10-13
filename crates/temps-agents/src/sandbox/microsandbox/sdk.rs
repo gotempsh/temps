@@ -21,13 +21,13 @@ use ::microsandbox::{
 
 use super::{
     host_virtualization, MicrosandboxSandboxConfig, MicrosandboxUnavailable, MICROSANDBOX_VERSION,
-    MSB_SANDBOX_NAME_PREFIX, PROVIDER_NAME, WORK_DIR,
+    MSB_SANDBOX_NAME_PREFIX, PROVIDER_NAME, SETUP_COMMAND, WORK_DIR,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
 use crate::sandbox::{
-    ExecStream, KillSignal, OnStreamEventCallback, SandboxBackend, SandboxCreateConfig,
-    SandboxExecResult, SandboxHandle, SandboxProvider,
+    is_linux_elf, ExecStream, KillSignal, OnStreamEventCallback, PtyAttachment, SandboxBackend,
+    SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
 };
 
 /// Image used when a sandbox doesn't specify one. Same default as the
@@ -55,6 +55,67 @@ const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
 /// How long `connect` waits for the in-guest agent handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Guest directory that holds the injected PTY agent. Created root-owned
+/// 0755 on first use, so a workload running as an unprivileged user can
+/// neither replace the binary nor plant a look-alike next to it.
+const GUEST_PTY_DIR: &str = "/usr/local/lib/temps";
+
+/// Guest directory of the agent's control socket. Owned by the sandbox's
+/// default exec user, mode 0700 (the ADR-008 trust boundary: the agent's
+/// socket is reachable by exactly the user the sandbox runs commands as).
+const GUEST_PTY_SOCKET_DIR: &str = "/run/temps-pty";
+
+/// How long a freshly started PTY agent has to begin accepting connections.
+const PTY_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause between probes while waiting for the PTY agent to come up.
+const PTY_PROBE_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Largest guest agent accepted from the host. The static build is a few
+/// MiB; the bound only keeps a wrong file from being read into memory and
+/// pushed through the guest filesystem API.
+const MAX_PTY_AGENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Buffer between the terminal handler's writes and the guest's stdin. One
+/// per attachment; a stalled guest back-pressures the handler (whose writes
+/// carry their own timeout) rather than growing memory.
+const PTY_INPUT_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Succeeds only when the agent binary is installed *and* answering on its
+/// socket. `$1` = binary, `$2` = socket. A stale socket file left by a
+/// crashed agent fails the probe, which is why this connects rather than
+/// testing for the file.
+const PTY_PROBE_SCRIPT: &str = r#"test -x "$1" && "$1" --probe --socket "$2" >/dev/null 2>&1"#;
+
+/// Installs a staged agent: root-owned directory, then an atomic rename so a
+/// concurrent attach never executes a half-written file.
+/// `$1` = directory, `$2` = temporary file, `$3` = final path.
+const PTY_INSTALL_SCRIPT: &str = r#"set -e
+mkdir -p "$1"
+chown 0:0 "$1"
+chmod 0755 "$1"
+chown 0:0 "$2"
+chmod 0755 "$2"
+mv -f "$2" "$3""#;
+
+/// Prepares the socket directory for the sandbox user.
+/// `$1` = directory, `$2` = uid, `$3` = gid.
+const PTY_SOCKET_DIR_SCRIPT: &str = r#"set -e
+mkdir -p "$1"
+chown "$2:$3" "$1"
+chmod 0700 "$1""#;
+
+/// Starts the agent detached from the exec session that launches it, so it
+/// outlives that session and keeps every terminal tab alive between
+/// attachments. `setsid` puts it in its own session where available;
+/// `nohup` is the fallback for images without util-linux/busybox `setsid`.
+/// Its output goes to a log in the 0700 socket directory, which is read back
+/// if it fails to come up. `$1` = binary, `$2` = socket, `$3` = log.
+const PTY_START_SCRIPT: &str = r#"if command -v setsid >/dev/null 2>&1; then
+  setsid "$1" --socket "$2" </dev/null >"$3" 2>&1 &
+else
+  nohup "$1" --socket "$2" </dev/null >"$3" 2>&1 &
+fi"#;
 
 /// Network policy a sandbox gets for a given `network_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +363,9 @@ pub struct MicrosandboxSandboxProvider {
     /// evicted on stop/destroy and on any SDK error, so a stale connection
     /// is re-established on the next call.
     live: Mutex<HashMap<String, Sandbox>>,
+    /// Serializes first-use installation of the guest PTY agent, so two
+    /// terminals opened at once don't race on the same temporary file.
+    pty_bootstrap: tokio::sync::Mutex<()>,
 }
 
 impl MicrosandboxSandboxProvider {
@@ -313,6 +377,7 @@ impl MicrosandboxSandboxProvider {
             config,
             backend: Arc::new(backend),
             live: Mutex::new(HashMap::new()),
+            pty_bootstrap: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -540,6 +605,180 @@ impl MicrosandboxSandboxProvider {
             stdout: stdout.into_text(),
             stderr: stderr.into_text(),
         })
+    }
+
+    /// Run `script` under `sh -c` in the guest with positional `args`
+    /// (`$1`…). Arguments travel as argv, never interpolated into the
+    /// script text, so paths and ids need no quoting.
+    async fn guest_sh(
+        &self,
+        handle: &SandboxHandle,
+        user: Option<&str>,
+        script: &str,
+        args: &[&str],
+    ) -> Result<SandboxExecResult, AgentError> {
+        let mut cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "temps-pty".to_string(),
+        ];
+        cmd.extend(args.iter().map(|a| a.to_string()));
+        self.run_exec(handle, cmd, HashMap::new(), user, OutputSink::None)
+            .await
+    }
+
+    /// Whether the guest's PTY agent at `guest_bin` is installed and
+    /// accepting connections.
+    async fn pty_agent_listening(
+        &self,
+        handle: &SandboxHandle,
+        guest_bin: &str,
+    ) -> Result<bool, AgentError> {
+        let result = self
+            .guest_sh(
+                handle,
+                None,
+                PTY_PROBE_SCRIPT,
+                &[guest_bin, PTY_AGENT_SOCKET],
+            )
+            .await?;
+        Ok(result.exit_code == 0)
+    }
+
+    /// Make sure the guest has a running `temps-pty-agent` and return the
+    /// path of its binary. Idempotent: every step checks before acting, so
+    /// the common case (agent already up) is one probe exec.
+    ///
+    /// The agent runs as the sandbox's default exec user — the same identity
+    /// every `exec` runs as — so terminals expose nothing a command could
+    /// not already reach. The binary and its directory are root-owned.
+    async fn ensure_pty_agent(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let staged = self.config.pty_agent_bin();
+        let bytes = read_staged_pty_agent(&staged)
+            .await
+            .map_err(|reason| Self::err(name, "terminal", reason))?;
+        let guest_bin = guest_pty_agent_path(&bytes);
+
+        let _bootstrap = self.pty_bootstrap.lock().await;
+        if self.pty_agent_listening(handle, &guest_bin).await? {
+            return Ok(guest_bin);
+        }
+
+        // Install the binary when this build of it is not in the guest yet.
+        let installed = self
+            .guest_sh(handle, None, r#"test -x "$1""#, &[&guest_bin])
+            .await?;
+        if installed.exit_code != 0 {
+            let tmp = format!("{}.tmp", guest_bin);
+            self.write_file(handle, &tmp, &bytes, 0o755).await?;
+            let result = self
+                .guest_sh(
+                    handle,
+                    Some("root"),
+                    PTY_INSTALL_SCRIPT,
+                    &[GUEST_PTY_DIR, &tmp, &guest_bin],
+                )
+                .await?;
+            if result.exit_code != 0 {
+                return Err(Self::err(
+                    name,
+                    "terminal",
+                    format!(
+                        "installing the PTY agent at {} failed (exit {}): {}",
+                        guest_bin,
+                        result.exit_code,
+                        result.stderr.trim()
+                    ),
+                ));
+            }
+            tracing::info!(
+                sandbox = %name,
+                guest_path = %guest_bin,
+                bytes = bytes.len(),
+                "installed temps-pty-agent in microsandbox guest"
+            );
+        }
+
+        // Start it, with its socket directory owned by the sandbox user.
+        let ids = self.guest_sh(handle, None, "id -u; id -g", &[]).await?;
+        let (uid, gid) = parse_uid_gid(&ids.stdout).ok_or_else(|| {
+            Self::err(
+                name,
+                "terminal",
+                format!(
+                    "could not determine the sandbox user (id exited {}): {}",
+                    ids.exit_code,
+                    ids.stderr.trim()
+                ),
+            )
+        })?;
+        let uid_arg = uid.to_string();
+        let gid_arg = gid.to_string();
+        let dir = self
+            .guest_sh(
+                handle,
+                Some("root"),
+                PTY_SOCKET_DIR_SCRIPT,
+                &[GUEST_PTY_SOCKET_DIR, &uid_arg, &gid_arg],
+            )
+            .await?;
+        if dir.exit_code != 0 {
+            return Err(Self::err(
+                name,
+                "terminal",
+                format!(
+                    "preparing {} for uid {} failed (exit {}): {}",
+                    GUEST_PTY_SOCKET_DIR,
+                    uid,
+                    dir.exit_code,
+                    dir.stderr.trim()
+                ),
+            ));
+        }
+        let log_path = format!("{}/agent.log", GUEST_PTY_SOCKET_DIR);
+        self.guest_sh(
+            handle,
+            None,
+            PTY_START_SCRIPT,
+            &[&guest_bin, PTY_AGENT_SOCKET, &log_path],
+        )
+        .await?;
+
+        let deadline = Instant::now() + PTY_START_TIMEOUT;
+        loop {
+            if self.pty_agent_listening(handle, &guest_bin).await? {
+                tracing::info!(
+                    sandbox = %name,
+                    uid,
+                    "started temps-pty-agent in microsandbox guest"
+                );
+                return Ok(guest_bin);
+            }
+            if Instant::now() >= deadline {
+                let log = self
+                    .guest_sh(handle, None, r#"tail -n 5 "$1" 2>&1"#, &[&log_path])
+                    .await
+                    .map(|r| r.stdout.trim().to_string())
+                    .unwrap_or_default();
+                return Err(Self::err(
+                    name,
+                    "terminal",
+                    format!(
+                        "temps-pty-agent did not start listening on {} within {:?}{}",
+                        PTY_AGENT_SOCKET,
+                        PTY_START_TIMEOUT,
+                        if log.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; agent log: {}", log)
+                        }
+                    ),
+                ));
+            }
+            tokio::time::sleep(PTY_PROBE_INTERVAL).await;
+        }
     }
 
     async fn create_inner(
@@ -922,6 +1161,114 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         self.run_exec(handle, cmd, env, None, sink).await
     }
 
+    /// Bridge to the guest's `temps-pty-agent`: an SDK exec running
+    /// `temps-pty-agent --relay` with stdin piped, so the SDK's exec channel
+    /// carries the ADR-008 frames. The agent itself is installed and started
+    /// on first use (see [`Self::ensure_pty_agent`]) and keeps every tab
+    /// alive; ending this exec only detaches.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let guest_bin = self.ensure_pty_agent(handle).await?;
+
+        let sandbox = self.connected(name).await?;
+        let started = sandbox
+            .exec_stream_with(guest_bin.clone(), |opts| {
+                opts.args(["--relay", "--socket", PTY_AGENT_SOCKET])
+                    .cwd("/")
+                    .stdin_pipe()
+            })
+            .await;
+        let mut exec = match started {
+            Ok(exec) => exec,
+            Err(e) => {
+                self.evict(name);
+                return Err(Self::err(name, "terminal relay exec", e));
+            }
+        };
+        let stdin = exec.take_stdin().ok_or_else(|| {
+            Self::err(
+                name,
+                "terminal relay exec",
+                "the SDK did not provide a stdin sink for the piped exec",
+            )
+        })?;
+
+        // `AsyncWrite` over the SDK's async `write`: a bounded duplex pipe
+        // whose far end is pumped into the sink by a task. Dropping the
+        // returned writer ends the pump, which closes the guest's stdin, so
+        // the relay exits and the attachment ends — the agent stays up.
+        let (input, mut pump) = tokio::io::duplex(PTY_INPUT_BUFFER_BYTES);
+        let pump_name = name.to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match pump.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Err(e) = stdin.write(&buf[..n]).await {
+                            tracing::debug!(
+                                sandbox = %pump_name,
+                                "terminal stdin pump stopped: {}",
+                                e
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = stdin.close().await;
+        });
+
+        let sandbox_id = handle.sandbox_id.clone();
+        let output = futures::stream::unfold(Some(exec), move |state| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let mut exec = state?;
+                loop {
+                    match exec.recv().await {
+                        Some(ExecEvent::Stdout(chunk)) => return Some((Ok(chunk), Some(exec))),
+                        // The relay's stderr is its own diagnostics (cannot
+                        // connect, …), never protocol bytes: surface it as an
+                        // error and end the stream.
+                        Some(ExecEvent::Stderr(chunk)) => {
+                            return Some((
+                                Err(AgentError::SandboxExecFailed {
+                                    run_id: 0,
+                                    sandbox_id,
+                                    reason: format!(
+                                        "PTY agent relay error: {}",
+                                        String::from_utf8_lossy(&chunk).trim()
+                                    ),
+                                }),
+                                None,
+                            ));
+                        }
+                        Some(ExecEvent::Failed(failure)) => {
+                            return Some((
+                                Err(AgentError::SandboxExecFailed {
+                                    run_id: 0,
+                                    sandbox_id,
+                                    reason: format!(
+                                        "PTY agent relay failed to start: {:?}",
+                                        failure
+                                    ),
+                                }),
+                                None,
+                            ));
+                        }
+                        Some(ExecEvent::Exited { .. }) | None => return None,
+                        Some(ExecEvent::Started { .. }) | Some(ExecEvent::StdinError(_)) => {}
+                    }
+                }
+            }
+        });
+        Ok(PtyAttachment {
+            output: Box::pin(output),
+            input: Box::pin(input),
+        })
+    }
+
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
         Ok(self
             .lookup(&handle.sandbox_name)
@@ -1217,6 +1564,69 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
 
 /// Build the SDK backend bound to `<data_dir>/microsandbox`. Lazy: the SDK
 /// database and directories are only created on first sandbox operation.
+/// Guest path for a given build of the PTY agent. Content-addressed so a
+/// newer staged binary installs beside the old one instead of replacing a
+/// file a running agent is executing, and so "is it installed?" is a plain
+/// existence check.
+fn guest_pty_agent_path(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    format!("{}/pty-agent-{}", GUEST_PTY_DIR, hex::encode(&digest[..8]))
+}
+
+/// Read the host-staged guest agent, bounded and validated. The error is a
+/// complete, actionable sentence.
+async fn read_staged_pty_agent(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "the guest terminal agent (temps-pty-agent) is not staged at {} — \
+                 run `{} --pty-agent-bin <path>`",
+                path.display(),
+                SETUP_COMMAND
+            )
+        } else {
+            format!(
+                "cannot read the guest terminal agent at {}: {}",
+                path.display(),
+                e
+            )
+        }
+    })?;
+    if metadata.len() > MAX_PTY_AGENT_BYTES {
+        return Err(format!(
+            "{} is {} bytes, over the {}-byte limit for a guest terminal agent",
+            path.display(),
+            metadata.len(),
+            MAX_PTY_AGENT_BYTES
+        ));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|e| {
+        format!(
+            "cannot read the guest terminal agent at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if !is_linux_elf(&bytes) {
+        return Err(format!(
+            "{} is not a Linux executable; stage the static Linux build with \
+             `{} --pty-agent-bin <path>`",
+            path.display(),
+            SETUP_COMMAND
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Parse the output of `id -u; id -g`.
+fn parse_uid_gid(stdout: &str) -> Option<(u32, u32)> {
+    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let uid = lines.next()?.parse().ok()?;
+    let gid = lines.next()?.parse().ok()?;
+    lines.next().is_none().then_some((uid, gid))
+}
+
 fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBackend, AgentError> {
     let home = config.home();
     LocalBackend::builder()
@@ -1730,6 +2140,73 @@ mod tests {
             .unwrap_or_else(|e| panic!("exec `{script}`: {e}"))
     }
 
+    #[test]
+    fn guest_agent_path_is_content_addressed_under_a_root_owned_dir() {
+        let a = guest_pty_agent_path(b"\x7fELF-build-a");
+        let b = guest_pty_agent_path(b"\x7fELF-build-b");
+        assert_ne!(a, b, "a new build must not overwrite the running one");
+        assert_eq!(a, guest_pty_agent_path(b"\x7fELF-build-a"));
+        assert!(a.starts_with("/usr/local/lib/temps/pty-agent-"), "{a}");
+        // The socket directory is the agent's, not the binary's.
+        assert!(!a.starts_with(GUEST_PTY_SOCKET_DIR));
+    }
+
+    #[test]
+    fn id_output_parses_to_a_single_uid_gid_pair() {
+        assert_eq!(parse_uid_gid("1000\n1000\n"), Some((1000, 1000)));
+        assert_eq!(parse_uid_gid("0\n0"), Some((0, 0)));
+        assert_eq!(parse_uid_gid(""), None);
+        assert_eq!(parse_uid_gid("1000\n"), None);
+        assert_eq!(parse_uid_gid("root\n0\n"), None);
+        // Extra output means `id` printed something unexpected; refuse to
+        // guess which lines are the ids.
+        assert_eq!(parse_uid_gid("1\n2\n3\n"), None);
+    }
+
+    #[test]
+    fn bootstrap_scripts_take_paths_as_arguments_not_text() {
+        // Paths and ids must reach the guest shell as `$n`, never spliced
+        // into the script — the staged path comes from configuration.
+        for script in [
+            PTY_PROBE_SCRIPT,
+            PTY_INSTALL_SCRIPT,
+            PTY_SOCKET_DIR_SCRIPT,
+            PTY_START_SCRIPT,
+        ] {
+            assert!(!script.contains("/usr/local"), "{script}");
+            assert!(!script.contains("/run/"), "{script}");
+            assert!(script.contains("\"$1\""), "{script}");
+        }
+        // The installer makes the directory and file root-owned before the
+        // rename publishes the binary under its final name.
+        let chown = PTY_INSTALL_SCRIPT
+            .find("chown 0:0 \"$2\"")
+            .expect("chown file");
+        let mv = PTY_INSTALL_SCRIPT.find("mv -f").expect("mv");
+        assert!(chown < mv, "ownership must be fixed before publishing");
+        assert!(PTY_INSTALL_SCRIPT.contains("chown 0:0 \"$1\""));
+        // The socket directory is private to the sandbox user.
+        assert!(PTY_SOCKET_DIR_SCRIPT.contains("chmod 0700"));
+    }
+
+    #[tokio::test]
+    async fn staged_agent_errors_name_the_path_and_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("temps-pty-agent");
+
+        let missing = read_staged_pty_agent(&staged).await.unwrap_err();
+        assert!(missing.contains(&staged.display().to_string()), "{missing}");
+        assert!(missing.contains("temps microsandbox setup"), "{missing}");
+
+        std::fs::write(&staged, b"MZ not an elf").unwrap();
+        let foreign = read_staged_pty_agent(&staged).await.unwrap_err();
+        assert!(foreign.contains("not a Linux executable"), "{foreign}");
+
+        std::fs::write(&staged, b"\x7fELF\x02\x01\x01\x00rest").unwrap();
+        let bytes = read_staged_pty_agent(&staged).await.unwrap();
+        assert_eq!(bytes, b"\x7fELF\x02\x01\x01\x00rest");
+    }
+
     const EGRESS_PROBE: &str = "wget -q -T 5 -O - http://1.1.1.1/cdn-cgi/trace";
     /// Number of IPv4 routes in the guest (header line excluded).
     const ROUTE_COUNT: &str = "tail -n +2 /proc/net/route | wc -l";
@@ -2206,6 +2683,137 @@ mod tests {
                 let egress = sh(provider, &handle, EGRESS_PROBE).await;
                 assert_eq!(egress.exit_code, 0, "stderr: {}", egress.stderr);
                 assert!(egress.stdout.contains("ip="), "{}", egress.stdout);
+            }
+        })
+        .await;
+    }
+
+    /// Terminal bridge end to end: stage the guest agent, attach, and drive
+    /// the ADR-008 protocol (PING, then OPEN a command and read its output).
+    /// Skips when the backend is unavailable or no guest agent is staged.
+    #[tokio::test]
+    async fn e2e_terminal_attach_runs_a_command_and_reattaches() {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        let staged = provider.config.pty_agent_bin();
+        if !staged.exists() {
+            println!(
+                "no guest terminal agent staged at {}, skipping",
+                staged.display()
+            );
+            return;
+        }
+
+        fn frame(op: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(5 + payload.len());
+            out.extend_from_slice(&((payload.len() as u32) + 1).to_be_bytes());
+            out.push(op);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        async fn read_until(
+            output: &mut (impl futures::Stream<Item = Result<bytes::Bytes, AgentError>> + Unpin),
+            needle: &[u8],
+        ) -> Vec<u8> {
+            use futures::StreamExt;
+            let mut seen = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !seen.windows(needle.len()).any(|w| w == needle) {
+                let next = tokio::time::timeout_at(deadline, output.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out waiting for {:?}; saw {} bytes",
+                            needle,
+                            seen.len()
+                        )
+                    });
+                match next {
+                    Some(Ok(chunk)) => seen.extend_from_slice(&chunk),
+                    Some(Err(e)) => panic!("terminal stream error: {e}"),
+                    None => panic!("terminal stream ended before {:?}", needle),
+                }
+            }
+            seen
+        }
+
+        with_sandbox(&provider, e2e_config("term", "none"), |handle| {
+            let provider = &provider;
+            async move {
+                let open = |tab: &str, cmd: &str| {
+                    let body = serde_json::json!({
+                        "tab_id": tab, "kind": "shell", "cmd": cmd,
+                        "cols": 80, "rows": 24, "replay_bytes": 4096,
+                        "label": tab, "cwd": "/", "env": null,
+                    });
+                    frame(0x01, body.to_string().as_bytes())
+                };
+
+                // First attach: bootstrap installs and starts the agent.
+                let mut first = provider.attach_pty(&handle).await.expect("attach");
+                first.input.write_all(&frame(0x07, &[])).await.unwrap();
+                first
+                    .input
+                    .write_all(&open("e2e", "echo terminal-e2e-marker; sleep 300"))
+                    .await
+                    .unwrap();
+                read_until(&mut first.output, b"terminal-e2e-marker").await;
+                // The trust boundary: root-owned binary in a root-owned
+                // directory, a private socket directory and a 0600 socket.
+                let stat = sh(
+                    provider,
+                    &handle,
+                    "stat -c '%u %a %n' /usr/local/lib/temps \
+                     /usr/local/lib/temps/pty-agent-* /run/temps-pty \
+                     /run/temps-pty/agent.sock",
+                )
+                .await;
+                assert_eq!(stat.exit_code, 0, "stat failed: {}", stat.stderr);
+                let modes: Vec<(String, String)> = stat
+                    .stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(3, ' ');
+                        let owner = parts.next()?;
+                        let mode = parts.next()?;
+                        let path = parts.next()?;
+                        Some((path.to_string(), format!("{owner}:{mode}")))
+                    })
+                    .collect();
+                let mode_of = |needle: &str| {
+                    modes
+                        .iter()
+                        .find(|(path, _)| path.contains(needle))
+                        .map(|(_, m)| m.as_str())
+                        .unwrap_or_else(|| panic!("no stat line for {needle}: {modes:?}"))
+                };
+                assert_eq!(mode_of("pty-agent-"), "0:755");
+                assert_eq!(mode_of("lib/temps"), "0:755");
+                assert_eq!(mode_of("run/temps-pty/agent.sock"), "0:600");
+
+                // Detach: closing input ends the relay, not the tab.
+                first.input.shutdown().await.unwrap();
+                drop(first);
+
+                // Second attach to the same tab replays the scrollback.
+                let mut second = provider.attach_pty(&handle).await.expect("reattach");
+                second
+                    .input
+                    .write_all(&open("e2e", "echo should-not-run"))
+                    .await
+                    .unwrap();
+                let replay = read_until(&mut second.output, b"terminal-e2e-marker").await;
+                assert!(
+                    !replay
+                        .windows(b"should-not-run".len())
+                        .any(|w| w == b"should-not-run"),
+                    "reattach must not start a second program"
+                );
+                second.input.shutdown().await.unwrap();
             }
         })
         .await;

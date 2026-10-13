@@ -6,11 +6,14 @@
 //! Each sandbox is a KVM microVM: pinned guest kernel, an ext4 rootfs
 //! derived from the sandbox's Docker image (Docker is the image toolchain —
 //! pull/export happen through bollard, ADR-029 §4), and `temps-vm-agent`
-//! injected as PID 1 serving exec/fs RPCs over vsock (§5).
+//! injected as PID 1 serving exec/fs RPCs over vsock (§5). Interactive
+//! terminals reuse the Docker backend's `temps-pty-agent`: it is injected next
+//! to `temps-vm-agent`, supervised by it, and reached through a second vsock
+//! listener that relays bytes to the agent's unix socket (§5).
 //!
 //! On-disk layout under `<data_dir>/firecracker/` (provisioned by
 //! `temps firecracker setup`):
-//!   bin/{firecracker,jailer,temps-vm-agent}   pinned binaries
+//!   bin/{firecracker,jailer,temps-vm-agent,temps-pty-agent}   pinned binaries
 //!   kernel/vmlinux-<ver>                      pinned guest kernel
 //!   state.json                               setup outcome (smoke_ok gate)
 //!   rootfs-cache/<image-digest>.ext4          converted images, digest-keyed
@@ -33,12 +36,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use temps_vm_agent::{Request, Response, AGENT_PORT, MAX_FRAME_BYTES, WORK_DIR};
+use temps_vm_agent::{Request, Response, AGENT_PORT, MAX_FRAME_BYTES, PTY_PORT, WORK_DIR};
 
-use super::{KillSignal, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider};
+use super::{
+    KillSignal, PtyAttachment, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
+    SandboxProvider,
+};
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
 
@@ -57,6 +63,12 @@ const DEFAULT_DISK_MB: u64 = 1024;
 const CACHE_SLACK_MB: u64 = 64;
 
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long opening a terminal stream may take (socket connect plus the
+/// hybrid-vsock handshake). The guest answers in milliseconds; this only
+/// bounds a wedged VMM.
+const PTY_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bytes read per chunk from a terminal stream. One buffer per attachment.
+const PTY_READ_CHUNK_BYTES: usize = 16 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const SNAPSHOT_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -190,6 +202,12 @@ impl FirecrackerSandboxConfig {
     }
     fn agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-vm-agent")
+    }
+    /// Static musl `temps-pty-agent`, injected next to the VM agent so the
+    /// guest can serve interactive terminals. Optional: a host without it
+    /// still creates sandboxes, just without terminals.
+    fn pty_agent_bin(&self) -> PathBuf {
+        self.fc_root().join("bin/temps-pty-agent")
     }
     fn kernel_glob_dir(&self) -> PathBuf {
         self.fc_root().join("kernel")
@@ -374,6 +392,46 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// Fingerprint of the guest binaries injected into every rootfs.
+    ///
+    /// Part of the rootfs cache key: the agents are baked into the cached
+    /// ext4, so a cache entry converted before `temps firecracker setup`
+    /// staged a newer (or the first) `temps-pty-agent` must not be reused —
+    /// it would boot VMs that have no terminal support no matter what the
+    /// host has staged now.
+    fn guest_agent_fingerprint(&self) -> Result<String, AgentError> {
+        use sha2::{Digest, Sha256};
+
+        let vm_agent_path = self.config.agent_bin();
+        let vm_agent = Self::hash_file(&vm_agent_path).map_err(|e| {
+            self.err(
+                "-",
+                format!(
+                    "guest agent missing or unreadable at {} ({}) — run `temps firecracker setup`",
+                    vm_agent_path.display(),
+                    e
+                ),
+            )
+        })?;
+        let pty_agent_path = self.config.pty_agent_bin();
+        let pty_agent = match Self::hash_file(&pty_agent_path) {
+            Ok(hash) => hash,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+            Err(e) => {
+                return Err(self.err(
+                    "-",
+                    format!(
+                        "PTY agent unreadable at {}: {}",
+                        pty_agent_path.display(),
+                        e
+                    ),
+                ))
+            }
+        };
+        let digest = Sha256::digest(format!("vm:{vm_agent}\npty:{pty_agent}").as_bytes());
+        Ok(hex::encode(&digest[..6]))
+    }
+
     // ── Rootfs conversion (ADR-029 §4, digest-keyed cache) ──────────
 
     /// Docker image → ext4 rootfs with the agent injected. Returns the
@@ -398,7 +456,11 @@ impl FirecrackerSandboxProvider {
         let image_id = inspect
             .id
             .ok_or_else(|| self.err("-", format!("image {} has no id", image)))?;
-        let cache_key = image_id.replace(':', "-");
+        let cache_key = format!(
+            "{}-g{}",
+            image_id.replace(':', "-"),
+            self.guest_agent_fingerprint()?
+        );
         let cached = self.config.cache_dir().join(format!("{}.ext4", cache_key));
         if cached.exists() {
             return Ok(cached);
@@ -455,15 +517,16 @@ impl FirecrackerSandboxProvider {
             .await;
 
         let rootfs_dir = staging.join("rootfs");
+        // `guest_agent_fingerprint` above already proved the VM agent is
+        // readable; the PTY agent is optional.
         let agent_src = self.config.agent_bin();
-        if !agent_src.exists() {
-            return Err(self.err(
-                "-",
-                format!(
-                    "guest agent missing at {} — run `temps firecracker setup`",
-                    agent_src.display()
-                ),
-            ));
+        let pty_agent_src = Some(self.config.pty_agent_bin()).filter(|p| p.exists());
+        if pty_agent_src.is_none() {
+            tracing::warn!(
+                "temps-pty-agent is not staged at {}; sandboxes converted now will not \
+                 support interactive terminals — run `temps firecracker setup`",
+                self.config.pty_agent_bin().display()
+            );
         }
         let workdir_rel = WORK_DIR.trim_start_matches('/').to_string();
 
@@ -499,6 +562,14 @@ impl FirecrackerSandboxProvider {
             let sbin = rootfs_for_task.join("sbin");
             std::fs::create_dir_all(&sbin).map_err(|e| e.to_string())?;
             std::fs::copy(&agent_src, sbin.join("temps-vm-agent")).map_err(|e| e.to_string())?;
+            if let Some(pty_src) = &pty_agent_src {
+                // Same directory as the VM agent; `copy` keeps the staged
+                // file's executable bit. The guest's PID 1 re-asserts root
+                // ownership of it at every boot (the rootfs is built
+                // unprivileged, so the file carries the host user's uid)
+                // before supervising it.
+                std::fs::copy(pty_src, sbin.join("temps-pty-agent")).map_err(|e| e.to_string())?;
+            }
             std::fs::create_dir_all(rootfs_for_task.join(&workdir_rel))
                 .map_err(|e| e.to_string())?;
             Ok(dir_size(&rootfs_for_task))
@@ -643,39 +714,12 @@ impl FirecrackerSandboxProvider {
     ) -> Result<Response, AgentError> {
         let sock = self.config.vm_dir(name).join("v.sock");
         let fut = async {
-            let stream = UnixStream::connect(&sock).await?;
-            let mut stream = BufReader::new(stream);
-            stream
-                .get_mut()
-                .write_all(format!("CONNECT {}\n", AGENT_PORT).as_bytes())
-                .await?;
-            // Handshake ack: "OK <hostport>\n"
-            let mut ack = Vec::new();
-            loop {
-                let b = stream.read_u8().await?;
-                if b == b'\n' {
-                    break;
-                }
-                ack.push(b);
-                if ack.len() > 64 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "vsock handshake overflow",
-                    ));
-                }
-            }
-            if !ack.starts_with(b"OK") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!("vsock handshake: {}", String::from_utf8_lossy(&ack)),
-                ));
-            }
+            let mut stream = vsock_connect(&sock, AGENT_PORT).await?;
             let payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
             stream
-                .get_mut()
                 .write_all(&(payload.len() as u32).to_be_bytes())
                 .await?;
-            stream.get_mut().write_all(&payload).await?;
+            stream.write_all(&payload).await?;
             let len = stream.read_u32().await?;
             if len == 0 || len > MAX_FRAME_BYTES {
                 return Err(std::io::Error::new(
@@ -2102,6 +2146,102 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         self.finish_create(config, name, image, vm_rootfs).await
     }
 
+    /// Bridge to the guest's `temps-pty-agent` over vsock port
+    /// [`PTY_PORT`] (ADR-029 §5).
+    ///
+    /// `temps-vm-agent` runs the PTY agent and relays this connection to its
+    /// unix socket, so no process is started per attach and the VM needs no
+    /// `socat`. Dropping the returned `input` closes the vsock connection;
+    /// the agent — and every tab — keeps running in the guest.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let sock = self.config.vm_dir(name).join("v.sock");
+        if !sock.exists() {
+            return Err(self.err(
+                name,
+                format!(
+                    "cannot attach a terminal: sandbox is not running (no vsock socket at {})",
+                    sock.display()
+                ),
+            ));
+        }
+
+        let stream =
+            match tokio::time::timeout(PTY_ATTACH_TIMEOUT, vsock_connect(&sock, PTY_PORT)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    // The VMM drops the connection when the guest has nothing
+                    // listening on the port, so a handshake failure here almost
+                    // always means this guest was built without the PTY agent.
+                    let staged = self.config.pty_agent_bin();
+                    let remedy = if staged.exists() {
+                        "this sandbox was created before terminal support, or from a \
+                     snapshot taken before it; recreate the sandbox to get it"
+                            .to_string()
+                    } else {
+                        format!(
+                            "temps-pty-agent is not staged at {} — run `temps firecracker setup \
+                         --pty-agent-bin <path>`, then recreate the sandbox",
+                            staged.display()
+                        )
+                    };
+                    tracing::warn!(
+                        sandbox = %name,
+                        vsock_port = PTY_PORT,
+                        error = %e,
+                        "firecracker terminal attach failed"
+                    );
+                    return Err(self.err(
+                        name,
+                        format!(
+                            "no terminal listener answered on vsock port {} ({}): {}",
+                            PTY_PORT, e, remedy
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    return Err(self.err(
+                        name,
+                        format!(
+                            "terminal attach timed out after {:?} on vsock port {}",
+                            PTY_ATTACH_TIMEOUT, PTY_PORT
+                        ),
+                    ));
+                }
+            };
+
+        let (reader, writer) = stream.into_split();
+        let sandbox_id = handle.sandbox_id.clone();
+        // `None` after an error so a failed read ends the stream instead of
+        // being retried in a loop.
+        let output = futures::stream::unfold(Some(reader), move |state| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let mut reader = state?;
+                let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
+                match reader.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok(bytes::Bytes::from(buf)), Some(reader)))
+                    }
+                    Err(e) => Some((
+                        Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id,
+                            reason: format!("terminal stream read failed: {}", e),
+                        }),
+                        None,
+                    )),
+                }
+            }
+        });
+        Ok(PtyAttachment {
+            output: Box::pin(output),
+            input: Box::pin(writer),
+        })
+    }
+
     fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
         matches!(backend, super::SandboxBackend::Firecracker)
     }
@@ -2232,6 +2372,42 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     }
 }
 
+/// Open a stream to a guest vsock `port` through Firecracker's hybrid-vsock
+/// unix socket (`CONNECT <port>\n` → `OK <hostport>\n`).
+///
+/// The ack is read **one byte at a time from the unbuffered stream**. A
+/// buffered reader could pull bytes that follow the ack into its own buffer
+/// and lose them when the stream is handed on — harmless for the RPC (the
+/// guest only speaks after the request), fatal for a terminal, where the
+/// agent's first frame can arrive immediately behind the ack.
+async fn vsock_connect(sock: &Path, port: u32) -> std::io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(sock).await?;
+    stream
+        .write_all(format!("CONNECT {}\n", port).as_bytes())
+        .await?;
+    let mut ack = Vec::with_capacity(32);
+    loop {
+        let b = stream.read_u8().await?;
+        if b == b'\n' {
+            break;
+        }
+        ack.push(b);
+        if ack.len() > 64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vsock handshake overflow",
+            ));
+        }
+    }
+    if !ack.starts_with(b"OK") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("vsock handshake: {}", String::from_utf8_lossy(&ack)),
+        ));
+    }
+    Ok(stream)
+}
+
 /// Restrict a directory to the owner (0700). Best-effort — a failure is
 /// logged, not fatal, since it only weakens local isolation.
 fn set_dir_private(path: &Path) {
@@ -2299,6 +2475,18 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
         && firecracker_snapshot_host_available()
 }
 
+/// Whether Firecracker sandboxes created on this host can open interactive
+/// terminals: the static `temps-pty-agent` must be staged for injection.
+/// Reported next to [`is_firecracker_available`] so the console can onboard
+/// ("stage the terminal agent") instead of surfacing a bare 409 later.
+pub fn firecracker_terminal_capability(data_dir: &Path) -> super::TerminalCapability {
+    let config = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    super::TerminalCapability::from_staged_binary(
+        &config.pty_agent_bin(),
+        "temps firecracker setup --pty-agent-bin <path>",
+    )
+}
+
 fn host_tool_available(tool: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
@@ -2359,6 +2547,204 @@ mod tests {
         assert_eq!(p.resolve_name(&config), "temps-fcsandbox-abc123");
         config.container_name_override = None;
         assert_eq!(p.resolve_name(&config), "temps-fcsandbox-7");
+    }
+
+    // ── Terminal attach (ADR-029 §5) ─────────────────────────────────
+    //
+    // These speak to a stand-in for Firecracker's hybrid-vsock socket, so
+    // they run anywhere — no KVM, no guest.
+
+    /// Provider whose VM `name` has a `v.sock` served by `serve`, which gets
+    /// each accepted connection. Returns the provider, its handle, and the
+    /// temp dir (kept alive by the caller).
+    fn provider_with_vsock<F, Fut>(
+        name: &str,
+        serve: F,
+    ) -> (FirecrackerSandboxProvider, SandboxHandle, tempfile::TempDir)
+    where
+        F: FnOnce(UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let vm_dir = provider.config.vm_dir(name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(vm_dir.join("v.sock")).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                serve(stream).await;
+            }
+        });
+        let handle = provider.handle_for(name);
+        (provider, handle, dir)
+    }
+
+    /// Read the `CONNECT <port>\n` line a client sends first.
+    async fn read_connect_line(stream: &mut UnixStream) -> String {
+        let mut line = Vec::new();
+        loop {
+            let b = stream.read_u8().await.unwrap();
+            if b == b'\n' {
+                break;
+            }
+            line.push(b);
+        }
+        String::from_utf8(line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn attach_pty_connects_to_the_pty_port_and_relays_bytes() {
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            assert_eq!(
+                read_connect_line(&mut stream).await,
+                format!("CONNECT {}", PTY_PORT)
+            );
+            // The agent's first bytes land immediately behind the ack, in
+            // the same write — the case a buffered handshake reader loses.
+            stream.write_all(b"OK 1073741824\nhello").await.unwrap();
+            let mut got = [0u8; 4];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let mut attachment = provider.attach_pty(&handle).await.expect("attach");
+        attachment.input.write_all(b"ping").await.unwrap();
+        attachment.input.flush().await.unwrap();
+
+        let mut received = Vec::new();
+        while received.len() < "hellopong".len() {
+            let chunk = attachment
+                .output
+                .next()
+                .await
+                .expect("stream ended early")
+                .expect("stream error");
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, b"hellopong");
+        // Server closed: the stream ends cleanly rather than erroring.
+        assert!(attachment.output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_pty_without_a_running_vm_names_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let handle = provider.handle_for("sbx_test");
+
+        let err = provider.attach_pty(&handle).await.err().expect("must fail");
+        let message = err.to_string();
+        assert!(message.contains("sbx_test"), "{message}");
+        assert!(message.contains("not running"), "{message}");
+        assert!(message.contains("v.sock"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn attach_pty_explains_a_guest_that_has_no_terminal_listener() {
+        // The VMM drops a connection to a vsock port nobody listens on.
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            drop(stream);
+        });
+
+        let err = provider.attach_pty(&handle).await.err().expect("must fail");
+        let message = err.to_string();
+        assert!(message.contains("sbx_test"), "{message}");
+        assert!(message.contains(&PTY_PORT.to_string()), "{message}");
+        // No agent staged on this host: the remedy is the setup command.
+        assert!(message.contains("temps firecracker setup"), "{message}");
+        assert!(message.contains("--pty-agent-bin"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn attach_pty_on_an_older_guest_says_to_recreate_it() {
+        let (provider, handle, dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            drop(stream);
+        });
+        // The host has the agent staged now; this VM predates it.
+        let staged = provider.config.pty_agent_bin();
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"\x7fELF").unwrap();
+        let _keep = dir;
+
+        let message = provider
+            .attach_pty(&handle)
+            .await
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(message.contains("recreate the sandbox"), "{message}");
+        assert!(!message.contains("--pty-agent-bin"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn attach_pty_rejects_a_refused_handshake() {
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            stream.write_all(b"ERR connection refused\n").await.unwrap();
+        });
+        let err = provider.attach_pty(&handle).await.err().expect("must fail");
+        assert!(err.to_string().contains("handshake"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rpc_still_round_trips_through_the_shared_handshake() {
+        // `rpc` and `attach_pty` share `vsock_connect`; the refactor must
+        // leave the RPC path byte-identical on the wire.
+        let (provider, _handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            assert_eq!(
+                read_connect_line(&mut stream).await,
+                format!("CONNECT {}", AGENT_PORT)
+            );
+            stream.write_all(b"OK 1073741824\n").await.unwrap();
+            let len = stream.read_u32().await.unwrap() as usize;
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Request = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, Request::Ping));
+            let reply = serde_json::to_vec(&Response::Pong).unwrap();
+            stream
+                .write_all(&(reply.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&reply).await.unwrap();
+        });
+
+        let response = provider
+            .rpc("sbx_test", &Request::Ping, Duration::from_secs(5))
+            .await
+            .expect("rpc");
+        assert!(matches!(response, Response::Pong));
+    }
+
+    #[test]
+    fn guest_fingerprint_tracks_both_injected_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider_at(dir.path().to_path_buf());
+        let bin = dir.path().join("firecracker/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // The VM agent is mandatory.
+        let err = p.guest_agent_fingerprint().unwrap_err().to_string();
+        assert!(err.contains("temps firecracker setup"), "{err}");
+
+        std::fs::write(bin.join("temps-vm-agent"), b"vm-1").unwrap();
+        let without_pty = p.guest_agent_fingerprint().unwrap();
+        assert_eq!(without_pty.len(), 12);
+
+        // Staging the PTY agent must change the cache key, or a rootfs
+        // converted before it existed would be reused with no terminals.
+        std::fs::write(bin.join("temps-pty-agent"), b"pty-1").unwrap();
+        let with_pty = p.guest_agent_fingerprint().unwrap();
+        assert_ne!(without_pty, with_pty);
+
+        std::fs::write(bin.join("temps-pty-agent"), b"pty-2").unwrap();
+        assert_ne!(with_pty, p.guest_agent_fingerprint().unwrap());
+
+        std::fs::write(bin.join("temps-vm-agent"), b"vm-2").unwrap();
+        assert_ne!(with_pty, p.guest_agent_fingerprint().unwrap());
     }
 
     #[tokio::test]

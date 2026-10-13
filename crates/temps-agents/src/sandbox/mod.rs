@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -383,6 +383,157 @@ pub struct PtyAttachment {
 /// Fixed by the sandbox Dockerfile (`RUN mkdir -p /run/temps-pty …`), so it
 /// is a property of the image rather than something a caller chooses.
 pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
+
+/// File name of the static Linux `temps-pty-agent` build that the microVM
+/// backends inject into guests. `temps firecracker setup` and
+/// `temps microsandbox setup` look for it next to the running executable
+/// (release archives ship it there) unless told otherwise.
+pub const PTY_AGENT_BINARY_NAME: &str = "temps-pty-agent";
+
+/// Whether interactive terminals (`SandboxProvider::attach_pty`) can be
+/// opened on a backend right now, and if not, what to do about it.
+///
+/// Reported next to each backend's availability so the console and CLI can
+/// say "terminals need X" up front instead of discovering it as a bare 409
+/// when someone opens one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct TerminalCapability {
+    /// Whether a terminal can be attached to a sandbox on this backend.
+    pub supported: bool,
+    /// Why not, when `supported` is false.
+    pub reason: Option<String>,
+    /// Shell command that fixes it, when running one is the fix.
+    pub setup_command: Option<String>,
+}
+
+impl TerminalCapability {
+    pub fn supported() -> Self {
+        Self {
+            supported: true,
+            reason: None,
+            setup_command: None,
+        }
+    }
+
+    pub fn unsupported(reason: impl Into<String>, setup_command: Option<&str>) -> Self {
+        Self {
+            supported: false,
+            reason: Some(reason.into()),
+            setup_command: setup_command.map(str::to_string),
+        }
+    }
+
+    /// Capability for a microVM backend whose guests get `temps-pty-agent`
+    /// injected from a binary staged on the host at `staged`.
+    ///
+    /// A binary that is not a Linux ELF (for instance the macOS build of
+    /// `temps-pty-agent` copied next to a development `temps`) is reported
+    /// as unusable rather than discovered when a guest fails to exec it.
+    pub fn from_staged_binary(staged: &Path, setup_command: &str) -> Self {
+        use std::io::Read;
+
+        let mut header = [0u8; 4];
+        let read = std::fs::File::open(staged).and_then(|mut f| f.read_exact(&mut header));
+        match read {
+            Ok(()) if is_linux_elf(&header) => Self::supported(),
+            Ok(()) => Self::unsupported(
+                format!(
+                    "{} is not a Linux executable; the guest needs the static Linux \
+                     build of temps-pty-agent",
+                    staged.display()
+                ),
+                Some(setup_command),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::unsupported(
+                format!(
+                    "the guest terminal agent (temps-pty-agent) is not staged at {}",
+                    staged.display()
+                ),
+                Some(setup_command),
+            ),
+            Err(e) => Self::unsupported(
+                format!(
+                    "the guest terminal agent at {} is unreadable: {}",
+                    staged.display(),
+                    e
+                ),
+                Some(setup_command),
+            ),
+        }
+    }
+}
+
+/// Why a guest terminal agent could not be staged on the host.
+#[derive(Debug, thiserror::Error)]
+pub enum PtyAgentStagingError {
+    #[error("guest terminal agent {path} does not exist")]
+    Missing { path: PathBuf },
+
+    #[error(
+        "{path} is not a Linux executable; the guest needs the static Linux (musl) \
+         build of temps-pty-agent"
+    )]
+    NotLinuxElf { path: PathBuf },
+
+    #[error("cannot stage guest terminal agent {source_path} at {dest}: {reason}")]
+    Io {
+        source_path: PathBuf,
+        dest: PathBuf,
+        reason: String,
+    },
+}
+
+/// Copy a guest terminal agent from `source` to `dest` (mode 0755),
+/// refusing anything that is not a Linux ELF so a wrong-platform build fails
+/// at setup instead of at the first terminal.
+///
+/// Both microVM backends' setup commands stage through this, so they agree on
+/// what a valid agent is.
+pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgentStagingError> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    let io_err = |e: std::io::Error| PtyAgentStagingError::Io {
+        source_path: source.to_path_buf(),
+        dest: dest.to_path_buf(),
+        reason: e.to_string(),
+    };
+    let mut file = match std::fs::File::open(source) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PtyAgentStagingError::Missing {
+                path: source.to_path_buf(),
+            })
+        }
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut header = [0u8; 4];
+    // A file shorter than a header cannot be an ELF; treat it as one that
+    // is not rather than as an I/O failure.
+    let is_elf = file.read_exact(&mut header).is_ok() && is_linux_elf(&header);
+    if !is_elf {
+        return Err(PtyAgentStagingError::NotLinuxElf {
+            path: source.to_path_buf(),
+        });
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    // Write beside the destination and rename, so a running server never
+    // reads a half-copied agent.
+    let tmp = dest.with_extension("staging");
+    std::fs::copy(source, &tmp).map_err(io_err)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(io_err)?;
+    std::fs::rename(&tmp, dest).map_err(io_err)?;
+    Ok(())
+}
+
+/// Whether `header` (a file's leading bytes) starts an ELF image. The guests
+/// are Linux, so an ELF header is the cheapest check that a staged agent is
+/// not, say, a Mach-O build for the developer's laptop.
+pub fn is_linux_elf(header: &[u8]) -> bool {
+    header.starts_with(b"\x7fELF")
+}
 
 /// Pluggable sandbox backend. Implementations provide container/VM isolation
 /// for agent runs. The executor and autofixer interact only with this trait,
@@ -1119,6 +1270,87 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
+
+    #[test]
+    fn staged_agent_capability_distinguishes_missing_foreign_and_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(PTY_AGENT_BINARY_NAME);
+        let cmd = "temps example setup";
+
+        let missing = TerminalCapability::from_staged_binary(&staged, cmd);
+        assert!(!missing.supported);
+        let reason = missing.reason.unwrap();
+        assert!(reason.contains("not staged"), "{reason}");
+        assert!(reason.contains(&staged.display().to_string()), "{reason}");
+        assert_eq!(missing.setup_command.as_deref(), Some(cmd));
+
+        // A Mach-O header (macOS build) must not be mistaken for a guest binary.
+        std::fs::write(&staged, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        let foreign = TerminalCapability::from_staged_binary(&staged, cmd);
+        assert!(!foreign.supported);
+        assert!(foreign.reason.unwrap().contains("not a Linux executable"));
+
+        std::fs::write(&staged, b"\x7fELF\x02\x01\x01\x00").unwrap();
+        assert_eq!(
+            TerminalCapability::from_staged_binary(&staged, cmd),
+            TerminalCapability::supported()
+        );
+
+        // Too short to hold a header: unreadable, not "ready".
+        std::fs::write(&staged, b"\x7f").unwrap();
+        assert!(!TerminalCapability::from_staged_binary(&staged, cmd).supported);
+    }
+
+    #[test]
+    fn staging_installs_an_elf_and_rejects_everything_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("guest").join(PTY_AGENT_BINARY_NAME);
+
+        let missing = stage_pty_agent_binary(&dir.path().join("absent"), &dest).unwrap_err();
+        assert!(matches!(missing, PtyAgentStagingError::Missing { .. }));
+        assert!(missing.to_string().contains("absent"));
+        assert!(!dest.exists(), "a failed stage must not leave a file");
+
+        let foreign = dir.path().join("macho");
+        std::fs::write(&foreign, [0xcf, 0xfa, 0xed, 0xfe, 1, 2, 3, 4]).unwrap();
+        let err = stage_pty_agent_binary(&foreign, &dest).unwrap_err();
+        assert!(matches!(err, PtyAgentStagingError::NotLinuxElf { .. }));
+        assert!(!dest.exists());
+
+        let tiny = dir.path().join("tiny");
+        std::fs::write(&tiny, b"\x7f").unwrap();
+        assert!(matches!(
+            stage_pty_agent_binary(&tiny, &dest).unwrap_err(),
+            PtyAgentStagingError::NotLinuxElf { .. }
+        ));
+
+        let elf = dir.path().join("agent");
+        std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00payload").unwrap();
+        std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        stage_pty_agent_binary(&elf, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"\x7fELF\x02\x01\x01\x00payload"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the staged agent must be executable whatever the source mode"
+        );
+        // No temporary left behind, and re-staging over an existing file works.
+        assert!(!dest.with_extension("staging").exists());
+        stage_pty_agent_binary(&elf, &dest).unwrap();
+    }
+
+    #[test]
+    fn vm_agent_and_docker_agree_on_the_pty_socket_path() {
+        // The microVM guests run the same agent as the Docker sandboxes and
+        // the host handler dials one fixed path; a drift would silently
+        // break terminals on one backend only.
+        assert_eq!(temps_vm_agent::PTY_AGENT_SOCKET, PTY_AGENT_SOCKET);
+    }
 
     #[test]
     fn sandbox_backend_round_trips_through_its_string_form() {
