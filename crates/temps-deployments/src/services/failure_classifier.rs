@@ -805,8 +805,14 @@ fn elapsed_seconds(lower: &str) -> Option<u64> {
 }
 
 /// The quoted path of a BuildKit `failed to compute cache key` /
-/// `failed to calculate checksum` error: the `"<path>"` right before
-/// `: not found`. `None` when the text is not that error.
+/// `failed to calculate checksum` error: the `"<path>"` right before the
+/// `not found`. `None` when the text is not that error.
+///
+/// Two daemon generations word it differently, and self-hosted workers still
+/// run both:
+/// - current: `... of ref abc: "/node_modules": not found`
+/// - older (Docker 20.10 era): `failed to compute cache key: "/app/dist" not
+///   found: not found`
 fn buildkit_missing_path(lower: &str) -> Option<String> {
     // The failure text is often a Debug-quoted string, which escapes the quotes
     // around the path (`\"/node_modules\": not found`).
@@ -819,8 +825,13 @@ fn buildkit_missing_path(lower: &str) -> Option<String> {
     .filter_map(|phrase| text.find(phrase))
     .min()?;
     let after_phrase = &text[phrase_at..];
-    let not_found_at = after_phrase.find("\": not found")?;
-    let before = &after_phrase[..not_found_at];
+    // The closing quote of the path is followed by `: not found` (current) or
+    // ` not found` (older); take whichever comes first.
+    let closing_quote_at = ["\": not found", "\" not found"]
+        .iter()
+        .filter_map(|marker| after_phrase.find(marker))
+        .min()?;
+    let before = &after_phrase[..closing_quote_at];
     let opening_quote = before.rfind('"')?;
     Some(before[opening_quote + 1..].to_string())
 }
@@ -1715,6 +1726,20 @@ mod tests {
             S::Build,
             C::BuildContextPathMissing,
         );
+
+        // Older BuildKit daemons word the same failure as `"<path>" not
+        // found: not found`; both the output and the context-file cases must
+        // still be classified, not fall through to the generic image rule.
+        let old_format_output = wrapped(
+            "build_image",
+            "Failed to build image: failed to solve: failed to compute cache key: \"/app/dist\" not found: not found",
+        );
+        assert_class(&old_format_output, S::Build, C::StaticOutputMissing);
+        let old_format_context = wrapped(
+            "build_image",
+            "Failed to build image: failed to solve: failed to compute cache key: \"/node_modules\" not found: not found",
+        );
+        assert_class(&old_format_context, S::Build, C::BuildContextPathMissing);
 
         // A `/app/` anywhere in the excerpt (WORKDIR, a COPY destination) must
         // not turn a missing context file into "build output not found".
