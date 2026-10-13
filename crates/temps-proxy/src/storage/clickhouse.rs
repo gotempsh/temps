@@ -87,6 +87,9 @@ pub struct ClickHouseProxyLogConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression, resolved from the stored `clickhouse.compression`
+    /// setting. [`ClickHouseProxyLogConfig::new`] starts at the default (LZ4).
+    pub compression: temps_clickhouse::ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs.
@@ -97,6 +100,7 @@ impl std::fmt::Debug for ClickHouseProxyLogConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -113,7 +117,17 @@ impl ClickHouseProxyLogConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: temps_clickhouse::ClickHouseCompression::default(),
         }
+    }
+
+    /// Use `compression` for the client built from this config.
+    pub fn with_compression(
+        mut self,
+        compression: temps_clickhouse::ClickHouseCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
     }
 }
 
@@ -632,11 +646,13 @@ impl ClickHouseProxyLogStore {
         config: ClickHouseProxyLogConfig,
         resolver: Arc<dyn temps_core::RetentionResolver>,
     ) -> Self {
-        let client = ::clickhouse::Client::default()
-            .with_url(&config.url)
-            .with_database(&config.database)
-            .with_user(&config.user)
-            .with_password(&config.password);
+        let client = temps_clickhouse::build_client(
+            &config.url,
+            &config.database,
+            &config.user,
+            &config.password,
+            config.compression,
+        );
         Self { client, resolver }
     }
 

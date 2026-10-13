@@ -223,11 +223,14 @@ pub trait ProxyLogStorage: Send + Sync {
 /// TimescaleDB store — preserving the prior behaviour byte-for-byte when CH is
 /// not configured.
 ///
+/// `compression` is the wire-compression mode every ClickHouse client of this
+/// process uses (`ConfigService::clickhouse_compression`).
+///
 /// When ClickHouse is selected, the proxy-log migrations are applied in a
-/// background task (`tokio::spawn`) so server startup is never blocked. If the
-/// migrations fail, a warning is logged and the first read/write surfaces the
-/// error per-call (the table/columns may already exist from a prior run). This
-/// mirrors the metrics/otel ClickHouse wiring exactly.
+/// background task so server startup is never blocked, and retried until they
+/// apply: a server that is still starting heals by waiting, one whose
+/// responses cannot be decoded is re-checked at a slow cadence and recovers
+/// once the operator fixes it, without a restart. Every attempt is logged.
 ///
 /// Both the HTTP handler path (via `ProxyLogService::with_storage`) and the
 /// background batch-writer path call this so they share one backend selection
@@ -237,6 +240,7 @@ pub fn build_proxy_log_storage(
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
     resolver: Arc<dyn temps_core::RetentionResolver>,
+    compression: temps_clickhouse::ClickHouseCompression,
 ) -> Arc<dyn ProxyLogStorage> {
     if config.is_clickhouse_enabled() {
         // is_clickhouse_enabled() guarantees all four fields are Some.
@@ -245,50 +249,32 @@ pub fn build_proxy_log_storage(
             config.clickhouse_database.clone().unwrap_or_default(),
             config.clickhouse_user.clone().unwrap_or_default(),
             config.clickhouse_password.clone().unwrap_or_default(),
-        );
+        )
+        .with_compression(compression);
         let store = ClickHouseProxyLogStore::new(cfg, resolver);
 
         // Apply migrations off the startup path. Cloning the client is cheap
-        // (Arc-backed internally).
-        //
-        // `build_proxy_log_storage` is called during plugin registration, which
-        // is a SYNCHRONOUS context with no Tokio reactor — a bare `tokio::spawn`
-        // here panics ("there is no reactor running"). Guard on the runtime
-        // handle: spawn when one exists, otherwise run the migrations to
-        // completion on a short-lived current-thread runtime (proxy crates may
-        // be initialized outside the async runtime, per the Pingora note).
+        // (Arc-backed internally). `spawn_retrying` works with or without a
+        // Tokio runtime on this thread: the standalone proxy calls this from a
+        // synchronous setup function.
         let client = store.client().clone();
         let database = config.clickhouse_database.clone().unwrap_or_default();
-        let run_migrations = async move {
-            match clickhouse_migrations::apply_migrations(&client, &database).await {
-                Ok(report) => tracing::debug!(
+        temps_clickhouse::spawn_retrying(
+            "proxy-log",
+            temps_clickhouse::MigrationRetryPolicy::default(),
+            move || {
+                let client = client.clone();
+                let database = database.clone();
+                async move { clickhouse_migrations::apply_migrations(&client, &database).await }
+            },
+            |report| {
+                tracing::debug!(
                     applied = ?report.applied,
                     skipped = report.skipped.len(),
                     "ClickHouse proxy-log migrations applied"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "ClickHouse proxy-log migrations failed; proxy-log \
-                     writes/queries will surface the error per-call"
-                ),
-            }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(run_migrations);
-            }
-            Err(_) => match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt.block_on(run_migrations),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "Could not build a runtime to apply ClickHouse proxy-log \
-                     migrations; they will be attempted on first read/write"
-                ),
+                )
             },
-        }
+        );
 
         tracing::info!(
             "Proxy/request logs: ClickHouse backend enabled (TEMPS_CLICKHOUSE_* configured)"

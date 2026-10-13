@@ -489,6 +489,7 @@ pub fn setup_proxy_server(
         db.clone(),
         ip_service.clone(),
         retention_resolver.clone(),
+        config_service.clickhouse_compression(),
     );
 
     // One counter set shared by the batch writer (log write retries/drops) and
@@ -894,6 +895,7 @@ pub fn create_proxy_service(
         db.clone(),
         ip_service.clone(),
         retention_resolver.clone(),
+        config_service.clickhouse_compression(),
     );
 
     // One counter set shared by the batch writer (log write retries/drops) and

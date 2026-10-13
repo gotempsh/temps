@@ -13,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 # Internal crates
 temps-core = { path = "../temps-core" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
