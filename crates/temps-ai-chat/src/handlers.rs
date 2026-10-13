@@ -4863,6 +4863,16 @@ async fn ensure_workspace_terminal_permissions(
     Ok(())
 }
 
+/// Where an authorized workspace terminal request attaches.
+struct WorkspaceTerminalTarget {
+    /// `application` or `global`, recorded in the audit event.
+    scope: &'static str,
+    workspace_id: String,
+    sandbox_public_id: String,
+    /// The PTY tab the terminal thread owns.
+    tab: String,
+}
+
 /// Hand an authorized workspace terminal request to the sandbox terminal.
 ///
 /// The generic `/v1/sandboxes/{id}/terminal` route cannot be used directly:
@@ -4874,13 +4884,16 @@ async fn attach_workspace_terminal(
     state: &AppState,
     auth: AuthContext,
     metadata: RequestMetadata,
-    scope: &'static str,
-    workspace_id: String,
-    sandbox_public_id: String,
+    target: WorkspaceTerminalTarget,
     query: WorkspaceTerminalQuery,
-    tab: String,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
+    let WorkspaceTerminalTarget {
+        scope,
+        workspace_id,
+        sandbox_public_id,
+        tab,
+    } = target;
     let terminal_state = state.application_terminal.clone().ok_or_else(|| {
         problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
             .with_title("Workspace Terminal Unavailable")
@@ -4961,11 +4974,13 @@ pub async fn attach_application_workspace_terminal(
         &state,
         auth,
         metadata,
-        "application",
-        application_public_id,
-        sandbox_public_id,
+        WorkspaceTerminalTarget {
+            scope: "application",
+            workspace_id: application_public_id,
+            sandbox_public_id,
+            tab,
+        },
         query,
-        tab,
         ws,
     )
     .await
@@ -5006,11 +5021,13 @@ pub async fn attach_global_workspace_terminal(
         &state,
         auth,
         metadata,
-        "global",
-        workspace_id,
-        sandbox_public_id,
+        WorkspaceTerminalTarget {
+            scope: "global",
+            workspace_id,
+            sandbox_public_id,
+            tab,
+        },
         query,
-        tab,
         ws,
     )
     .await
