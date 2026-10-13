@@ -35,6 +35,10 @@ import {
   TERMINAL_REFUSED_HINT,
   type TerminalSession,
 } from '@/components/sandboxes/sandbox-terminal'
+import {
+  appendOutputTail,
+  resyncReplay,
+} from '@/components/sandboxes/terminal-replay'
 import { cn } from '@/lib/utils'
 import {
   classifyTerminalFailure,
@@ -127,6 +131,9 @@ export function WorkspaceTerminalPanel({
     INITIAL_TERMINAL_VIEW_STATE
   )
   const sessionRef = useRef<TerminalSession | null>(null)
+  // The end of the output the terminal has been shown, used to continue its
+  // history across a reconnect.
+  const outputTailRef = useRef<Uint8Array>(new Uint8Array(0))
   const [generation, setGeneration] = useState(0)
   const [connectRequested, setConnectRequested] = useState(false)
   // Waking by attaching is a container start, so it needs a longer wait than
@@ -216,6 +223,7 @@ export function WorkspaceTerminalPanel({
       observer?.disconnect()
       selectionListener?.dispose()
       created?.dispose()
+      outputTailRef.current = new Uint8Array(0)
       setTerminal(null)
       setSelection('')
     }
@@ -224,10 +232,11 @@ export function WorkspaceTerminalPanel({
   // One socket per attempt. The terminal outlives it.
   useEffect(() => {
     if (!terminal || !target) return undefined
-    // The server replays recent scrollback on attach; clear first so a
-    // reconnect does not stack the replay on top of what is already shown.
-    terminal.reset()
     let closed = false
+    // The server replays recent output as the first message of an attach. The
+    // terminal keeps its own, longer history across reconnects, so the replay
+    // is trimmed to what it has not shown yet rather than clearing it.
+    let firstOutput = true
     const session = openTerminalSession({
       url: workspaceTerminalSocketUrl(window.location, applicationPublicId, {
         thread: threadPublicId,
@@ -235,7 +244,20 @@ export function WorkspaceTerminalPanel({
         rows: terminal.rows,
       }),
       connectTimeoutMs,
-      onOutput: (bytes) => terminal.write(bytes),
+      onOutput: (received) => {
+        let bytes = received
+        if (firstOutput) {
+          firstOutput = false
+          const resync = resyncReplay(outputTailRef.current, received)
+          if (resync.reset) {
+            terminal.reset()
+            outputTailRef.current = new Uint8Array(0)
+          }
+          bytes = resync.bytes
+        }
+        outputTailRef.current = appendOutputTail(outputTailRef.current, bytes)
+        terminal.write(bytes)
+      },
       onStatus: (status, detail) => {
         if (closed) return
         dispatch({
