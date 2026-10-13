@@ -598,6 +598,10 @@ pub async fn blob_enable(
         request.root_password.is_some()
     );
 
+    // A container-name change must not land between resolving the name below
+    // and creating the service under it.
+    let _naming = state.managed_names.lock_naming().await;
+
     // What this instance calls its Blob service. The plugin built its engine
     // at startup; point it at the name resolved now (the operator may have
     // chosen another container name since) before anything creates or starts

@@ -71,6 +71,25 @@ impl ManagedServiceKind {
         }
     }
 
+    /// `external_services.service_type` values a row of this kind can carry.
+    /// A name resolves only to a row of the right type, so the KV store's
+    /// Redis row is never mistaken for the Blob store's service (or the
+    /// reverse) when both were given the same service name.
+    pub fn service_types(self) -> &'static [&'static str] {
+        match self {
+            Self::Kv => &["redis", "kv"],
+            Self::Blob => &["blob", "s3", "rustfs"],
+        }
+    }
+
+    /// The other managed kind.
+    fn other(self) -> Self {
+        match self {
+            Self::Kv => Self::Blob,
+            Self::Blob => Self::Kv,
+        }
+    }
+
     /// The setting that holds the operator's chosen container name.
     pub fn setting_key(self) -> &'static str {
         match self {
@@ -387,6 +406,10 @@ pub struct ManagedServiceNames {
     db: Arc<DatabaseConnection>,
     config_service: Arc<ConfigService>,
     encryption_service: Arc<EncryptionService>,
+    /// Held while a name is saved and while the service is enabled, so a
+    /// rename can never interleave with a service being created under the
+    /// name it just resolved.
+    naming_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ManagedServiceNames {
@@ -399,7 +422,15 @@ impl ManagedServiceNames {
             db,
             config_service,
             encryption_service,
+            naming_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Serialize with name changes. Hold the guard across resolving the name
+    /// and creating the service in an enable request; saving a new name waits
+    /// for it and then sees the service as existing.
+    pub async fn lock_naming(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.naming_lock.clone().lock_owned().await
     }
 
     fn derived_service_name(&self, kind: ManagedServiceKind) -> String {
@@ -441,6 +472,7 @@ impl ManagedServiceNames {
         candidates.extend(configured.clone());
         let existing = external_services::Entity::find()
             .filter(external_services::Column::Name.is_in(candidates))
+            .filter(external_services::Column::ServiceType.is_in(kind.service_types().to_vec()))
             .all(self.db.as_ref())
             .await
             .map_err(|source| ManagedNameError::Database { kind, source })?
@@ -467,18 +499,25 @@ impl ManagedServiceNames {
         submitted: &str,
     ) -> Result<ResolvedManagedName, ManagedNameError> {
         let requested = parse_container_name(kind, submitted)?;
+        let _naming = self.lock_naming().await;
         let current = self.resolve(kind).await?;
 
         let Some(saved) = check_rename(kind, &current, requested.as_deref())? else {
             return Ok(current);
         };
+        // Taken by any service row (a user's own service, or the other managed
+        // kind's), or by the name the other managed kind already resolves to:
+        // two kinds sharing one service name would adopt each other's row.
         let row_exists = match requested.as_deref() {
-            Some(service) => external_services::Entity::find()
-                .filter(external_services::Column::Name.eq(service))
-                .one(self.db.as_ref())
-                .await
-                .map_err(|source| ManagedNameError::Database { kind, source })?
-                .is_some(),
+            Some(service) => {
+                let held_by_row = external_services::Entity::find()
+                    .filter(external_services::Column::Name.eq(service))
+                    .one(self.db.as_ref())
+                    .await
+                    .map_err(|source| ManagedNameError::Database { kind, source })?
+                    .is_some();
+                held_by_row || self.resolve(kind.other()).await?.service_name == service
+            }
             None => false,
         };
         check_name_free(kind, &current, requested.as_deref(), row_exists)?;
@@ -846,6 +885,25 @@ mod tests {
         assert_eq!(check_rename(KV, &current, Some("temps-kv")).unwrap(), None);
         // The empty submission resolves to the same legacy container.
         assert_eq!(check_rename(KV, &current, None).unwrap(), None);
+    }
+
+    #[test]
+    fn each_kind_only_adopts_rows_of_its_own_service_type() {
+        // KV and Blob can be saved with the same service name; each must
+        // only ever resolve to a row of its own type, so disabling Blob
+        // can never stop the KV store's Redis row.
+        assert!(KV.service_types().contains(&"redis"));
+        assert!(!KV.service_types().contains(&"blob"));
+        assert!(BLOB.service_types().contains(&"blob"));
+        assert!(!BLOB.service_types().contains(&"redis"));
+        for kind_type in KV.service_types() {
+            assert!(
+                !BLOB.service_types().contains(kind_type),
+                "{kind_type} is claimed by both kinds"
+            );
+        }
+        assert_eq!(KV.other(), BLOB);
+        assert_eq!(BLOB.other(), KV);
     }
 
     #[test]

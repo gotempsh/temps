@@ -199,16 +199,14 @@ export function ContainerNameField({
           ? 'It cannot change while the service exists; delete the service first to pick another name.'
           : `If another Temps instance on this Docker host already uses it, enabling ${serviceName} fails with a conflict. Pick a unique name first.`}
       </p>
-      {canEdit && (
-        <ContainerNameForm
-          key={settings.container_name}
-          settings={settings}
-          open={editing}
-          isSaving={isSaving}
-          onSave={(name) => onSave(name, () => setEditing(false))}
-          onCancel={() => setEditing(false)}
-        />
-      )}
+      <ContainerNameForm
+        key={settings.container_name}
+        settings={settings}
+        open={canEdit && editing}
+        isSaving={isSaving}
+        onSave={(name) => onSave(name, () => setEditing(false))}
+        onCancel={() => setEditing(false)}
+      />
     </div>
   )
 }

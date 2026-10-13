@@ -73,6 +73,11 @@ pub struct WebhookDeliveryResult {
     pub delivered_at: DateTime<Utc>,
     /// The history row for this attempt as persisted (`None` when recording failed).
     pub record: Option<temps_entities::webhook_deliveries::Model>,
+    /// Why the attempt is not (fully) recorded. `Some` with `attempt_id == 0`
+    /// means the history row could not be inserted and nothing was sent;
+    /// `Some` with a non-zero `attempt_id` means the request *was* sent but
+    /// its outcome could not be saved, so history still shows it as pending.
+    pub recording_error: Option<String>,
 }
 
 /// Where an attempt sits in its delivery: which delivery it belongs to
@@ -462,6 +467,7 @@ impl WebhookService {
                     attempt_number: slot.attempt_number,
                     delivered_at: Utc::now(),
                     record: None,
+                    recording_error: Some(e.to_string()),
                 };
             }
         };
@@ -520,20 +526,17 @@ impl WebhookService {
         delivery_update.success = Set(success);
         delivery_update.delivered_at = Set(Some(delivered_at));
 
-        let record = match delivery_update.update(self.db.as_ref()).await {
-            Ok(updated) => updated,
+        // The request has been sent either way. If its outcome cannot be
+        // saved, say so rather than presenting an in-memory copy as history
+        // that a reload would not show.
+        let (record, recording_error) = match delivery_update.update(self.db.as_ref()).await {
+            Ok(updated) => (Some(updated), None),
             Err(e) => {
                 error!(
                     "Failed to update delivery record {} (delivery {}, attempt {}): {}",
                     delivery_record.id, stable_delivery_id, slot.attempt_number, e
                 );
-                let mut fallback = delivery_record.clone();
-                fallback.delivery_id = Some(stable_delivery_id);
-                fallback.status_code = status_code.map(|s| s as i32);
-                fallback.error_message = error_message.clone();
-                fallback.success = success;
-                fallback.delivered_at = Some(delivered_at);
-                fallback
+                (None, Some(e.to_string()))
             }
         };
 
@@ -558,7 +561,8 @@ impl WebhookService {
             error_message,
             attempt_number: slot.attempt_number,
             delivered_at,
-            record: Some(record),
+            record,
+            recording_error,
         }
     }
 
@@ -750,7 +754,7 @@ impl WebhookService {
         // not recorded because a concurrent retry already holds this attempt
         // number, nothing went out and the caller must be told that, not that
         // the retry failed.
-        if result.record.is_none() && self.attempt_exists(webhook.id, stable_id, slot).await? {
+        if result.attempt_id == 0 && self.attempt_exists(webhook.id, stable_id, slot).await? {
             return Err(WebhookError::RetryInProgress {
                 webhook_id: webhook.id,
                 delivery_id: stable_id,
@@ -1128,6 +1132,85 @@ mod tests {
             insert_values.contains("Int(Some(2))") && insert_values.contains("Int(Some(20))"),
             "insert carries attempt 2 and delivery 20: {insert_values}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sent_attempt_whose_result_cannot_be_saved_is_not_reported_as_recorded() {
+        let (addr, received) = spawn_receiver(vec![200]).await;
+        let payload = r#"{"id":"event-1"}"#;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // the attempt row is inserted before sending...
+                .append_query_results(vec![vec![attempt_row(5, 10, None, 1, payload, false)]])
+                // ...and saving the outcome fails afterwards
+                .append_query_errors(vec![DbErr::Custom("database went away".to_string())])
+                .into_connection(),
+        );
+        let service = service_with_db(db);
+
+        let result = service
+            .send_attempt(
+                &webhook_at(addr),
+                "deployment.succeeded",
+                "event-1",
+                payload.to_string(),
+                AttemptSlot::first(),
+            )
+            .await;
+
+        // The request went out and succeeded...
+        assert!(result.success);
+        assert_eq!(received.await.unwrap().len(), 1);
+        // ...but there is no persisted row to present as history, and the
+        // failure to save is reported instead of being hidden.
+        assert!(
+            result.record.is_none(),
+            "an unsaved copy must not be returned"
+        );
+        assert_ne!(
+            result.attempt_id, 0,
+            "the attempt row exists, so it was sent"
+        );
+        let reason = result.recording_error.expect("recording failure reported");
+        assert!(reason.contains("database went away"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_loses_the_attempt_number_race_is_a_conflict_and_sends_nothing() {
+        let (addr, received) = spawn_receiver(vec![]).await;
+        let payload = r#"{"id":"event-1"}"#;
+        let first = attempt_row(20, 10, Some(20), 1, payload, false);
+        let rival = attempt_row(21, 10, Some(20), 2, payload, false);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![webhook_at(addr)]])
+                .append_query_results(vec![vec![first.clone()]])
+                .append_query_results(vec![vec![first]])
+                // another request already claimed attempt 2: the insert hits
+                // the unique (webhook_id, delivery_id, attempt_number) index
+                .append_query_errors(vec![DbErr::Custom(
+                    "duplicate key value violates unique constraint".to_string(),
+                )])
+                // the follow-up lookup finds the rival's row
+                .append_query_results(vec![vec![rival]])
+                .into_connection(),
+        );
+        let service = service_with_db(db);
+
+        let error = service.retry_delivery(1, 10, 20).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WebhookError::RetryInProgress {
+                    webhook_id: 10,
+                    delivery_id: 20,
+                    attempt_number: 2
+                }
+            ),
+            "{error:?}"
+        );
+        drop(received);
     }
 
     #[tokio::test]

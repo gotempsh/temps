@@ -1003,6 +1003,20 @@ where
             match byte_stream.next().await {
                 Some(Ok(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
                 Some(Err(e)) => {
+                    if finished {
+                        // The provider already said the reply is complete; a
+                        // reset while it sends the usage chunk or `[DONE]`
+                        // loses nothing, so keep the answer (and its tool
+                        // calls) instead of failing a finished turn.
+                        tracing::warn!(
+                            purpose = %purpose,
+                            "chat_stream_turn: connection failed after the final chunk: {e}"
+                        );
+                        for tc in assemble_tool_calls(&mut pending) {
+                            yield Ok(ChatStreamDelta::ToolCall(tc));
+                        }
+                        return;
+                    }
                     yield Err(AiError::StreamInterrupted {
                         purpose: purpose.clone(),
                         reason: format!("the connection failed mid-reply: {e}"),
@@ -1832,6 +1846,26 @@ mod tests {
             other => panic!("expected StreamInterrupted, got {other:?}"),
         }
         assert_eq!(items.len(), 2, "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_after_the_final_chunk_keeps_the_finished_reply() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(
+                serde_json::json!({"content": "All done."}),
+                Some("stop"),
+            )),
+            // The connection resets while the provider sends the trailing
+            // usage chunk / `[DONE]`.
+            Err(crate::error::AiGatewayError::StreamError {
+                model: "test-model".into(),
+                reason: "connection reset by peer".into(),
+            }),
+        ])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert_eq!(texts(&items), vec!["All done."]);
     }
 
     #[tokio::test]

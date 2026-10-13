@@ -76,9 +76,10 @@ export function SampleDeployTracker({
           ? POLL_INTERVAL_MS
           : false
       }
-      // `deployment: null` means "nothing deployed yet"; each such answer counts
-      // as one poll of the bounded wait.
-      return query.state.dataUpdateCount < MAX_POLLS_WITHOUT_DEPLOYMENT
+      // `deployment: null` means "nothing deployed yet"; each such answer, and
+      // each failed read, counts as one poll of the bounded wait.
+      return query.state.dataUpdateCount + query.state.errorUpdateCount <
+        MAX_POLLS_WITHOUT_DEPLOYMENT
         ? POLL_INTERVAL_MS
         : false
     },
@@ -95,6 +96,8 @@ export function SampleDeployTracker({
           getLastDeploymentQueryKey({ path: { id: project?.id ?? 0 } })
         )?.dataUpdateCount ?? 0)
       : 0
+  // The latest read failed and there is nothing cached to show instead.
+  const readFailed = deploymentQuery.isError && deployment == null
   const phase = deployment ? firstDeployPhase(deployment.status) : undefined
 
   // The setup checklist reads "has anything gone live" from the project list;
@@ -157,7 +160,10 @@ export function SampleDeployTracker({
     // A deployment started a moment ago may not be visible on the first
     // read; keep waiting through the bounded polls before calling it absent.
     const stillWaiting =
-      !startError && emptyAnswers < MAX_POLLS_WITHOUT_DEPLOYMENT
+      !startError &&
+      !readFailed &&
+      emptyAnswers + deploymentQuery.errorUpdateCount <
+        MAX_POLLS_WITHOUT_DEPLOYMENT
     if (deploymentQuery.isPending || stillWaiting) {
       return <TrackerSkeleton />
     }
@@ -168,14 +174,25 @@ export function SampleDeployTracker({
         status={<Status tone="warn" label="Not deployed" />}
       >
         <Callout
-          tone={startError ? 'error' : 'warning'}
-          title={startError ? hint.title : 'No deployment has started yet'}
+          tone={startError || readFailed ? 'error' : 'warning'}
+          title={
+            startError
+              ? hint.title
+              : readFailed
+                ? 'Could not read the deployment status'
+                : 'No deployment has started yet'
+          }
         >
           {startError ? (
             <>
               <p className="whitespace-pre-wrap break-words">{startError}</p>
               <p className="mt-2">{hint.remedy}</p>
             </>
+          ) : readFailed ? (
+            <p>
+              Temps could not read this project&apos;s latest deployment. Check
+              again, or start the sample deployment.
+            </p>
           ) : (
             <p>
               The project exists but nothing has been deployed to it. Start the
@@ -184,6 +201,14 @@ export function SampleDeployTracker({
           )}
         </Callout>
         <div className="flex flex-wrap gap-2">
+          {readFailed && (
+            <LinkButton
+              variant="outline"
+              onClick={() => void deploymentQuery.refetch()}
+            >
+              Check again
+            </LinkButton>
+          )}
           {deployButton(
             startError ? 'Retry deployment' : 'Deploy the sample image'
           )}

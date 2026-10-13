@@ -772,8 +772,9 @@ async fn retry_delivery(
                 delivery_id, result.success
             );
 
-            // Only an attempt that was recorded (and so sent) is audited as a retry.
-            if result.record.is_some() {
+            // An attempt with a history row was sent, whether or not its
+            // outcome could be saved; one without was never sent.
+            if result.attempt_id != 0 {
                 let audit = WebhookAudit {
                     context: AuditContext {
                         user_id: auth.user_id(),
@@ -793,18 +794,27 @@ async fn retry_delivery(
             // `attempt_number`.
             match result.record {
                 Some(record) => Ok(Json(WebhookDeliveryResponse::from(record))),
-                None => Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .title("Failed to retry delivery")
-                    .detail(format!(
-                        "Attempt {} of delivery {} for webhook {} could not be recorded: {}",
-                        result.attempt_number,
-                        delivery_id,
-                        webhook_id,
-                        result
-                            .error_message
-                            .unwrap_or_else(|| "unknown error".to_string())
-                    ))
-                    .build()),
+                None => {
+                    let cause = result
+                        .recording_error
+                        .or(result.error_message)
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    let detail = if result.attempt_id != 0 {
+                        format!(
+                            "Attempt {} of delivery {} for webhook {} was sent (success: {}) but its result could not be saved, so delivery history still shows it as pending: {}",
+                            result.attempt_number, delivery_id, webhook_id, result.success, cause
+                        )
+                    } else {
+                        format!(
+                            "Attempt {} of delivery {} for webhook {} could not be recorded and was not sent: {}",
+                            result.attempt_number, delivery_id, webhook_id, cause
+                        )
+                    };
+                    Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to retry delivery")
+                        .detail(detail)
+                        .build())
+                }
             }
         }
         Err(e @ crate::service::WebhookError::DeliveryNotInScope { .. }) => {

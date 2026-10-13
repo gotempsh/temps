@@ -2955,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn image_unavailable_problem_names_the_image_cause_and_remediation() {
+    fn image_unavailable_problem_names_the_image_and_remediation_without_the_registry_error() {
         let problem = Problem::from(SandboxError::ImageUnavailable {
             sandbox_id: "sbx_1".into(),
             image: "registry.example.test/team/img:1.0.0".into(),
@@ -2965,8 +2965,10 @@ mod tests {
         assert_eq!(problem.body["title"], "Sandbox Image Unavailable");
         let detail = problem.body["detail"].as_str().unwrap_or_default();
         assert!(detail.contains("registry.example.test/team/img:1.0.0"));
-        assert!(detail.contains("manifest unknown"));
+        assert!(detail.contains("sbx_1"));
         assert!(detail.contains("docker pull"));
+        // The registry's own text stays in the server log, not the response.
+        assert!(!detail.contains("manifest unknown"));
     }
 
     #[test]

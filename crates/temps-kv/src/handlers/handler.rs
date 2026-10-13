@@ -509,6 +509,10 @@ pub async fn kv_enable(
 
     info!("Enabling KV service with config: {:?}", request);
 
+    // A container-name change must not land between resolving the name below
+    // and creating the service under it.
+    let _naming = state.managed_names.lock_naming().await;
+
     // What this instance calls its KV service. The plugin built its engine at
     // startup; point it at the name resolved now (the operator may have chosen
     // another container name since) before anything creates or starts a

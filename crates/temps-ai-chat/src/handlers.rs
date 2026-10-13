@@ -4699,6 +4699,10 @@ fn global_workspace_failure_problem(error: &temps_sandbox::error::SandboxError) 
                      that the image tag is published, then try again."
                 ))
         }
+        // `SandboxError` is `#[non_exhaustive]` and lives in another crate, so
+        // the compiler requires this wildcard. Every other variant is the same
+        // server-side failure from the caller's point of view; the detail is
+        // deliberately generic so no sandbox internals reach the response.
         _ => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("Global Workspace Failed")
             .with_detail("Temps could not prepare the persistent global workspace."),
