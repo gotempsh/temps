@@ -4836,6 +4836,16 @@ fn terminal_thread_attach_tab(
     Ok(terminal_thread_tab(&thread.public_id))
 }
 
+/// What opening a global workspace terminal needs. Creating a terminal thread
+/// is held to the same bar, so no role is handed a thread it can never attach
+/// to (an attach needs `projects:write` as well as the sandbox permissions).
+fn require_global_terminal_permissions(auth: &AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    permission_guard!(auth, SandboxesExec);
+    Ok(())
+}
+
 /// Require the permissions a shell inside the workspace needs, at both the
 /// instance and the linked-project level.
 ///
@@ -4989,9 +4999,7 @@ pub async fn attach_global_workspace_terminal(
     Query(query): Query<WorkspaceTerminalQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
-    permission_guard!(auth, SandboxesWrite);
-    permission_guard!(auth, SandboxesExec);
+    require_global_terminal_permissions(&auth)?;
     deny_deployment_token!(auth);
     let thread = state
         .service
@@ -6140,7 +6148,7 @@ pub async fn create_global_conversation(
     deny_deployment_token!(auth);
     let context_id = format!("global_{}", uuid::Uuid::new_v4().simple());
     if requested_thread_kind(request.kind.as_deref())? == ThreadKind::Terminal {
-        permission_guard!(auth, SandboxesExec);
+        require_global_terminal_permissions(&auth)?;
         let conversation = state
             .service
             .create_terminal_conversation(
@@ -11710,6 +11718,37 @@ mod tests {
             detail.contains("sandboxes:exec"),
             "the problem must name the missing permission: {detail}"
         );
+    }
+
+    #[test]
+    fn global_terminal_needs_everything_an_attach_needs() {
+        // Creating a thread must not succeed for a role whose attach would be
+        // refused, so create and attach share one permission check.
+        for missing in [
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ] {
+            let held = [
+                Permission::ProjectsRead,
+                Permission::ProjectsWrite,
+                Permission::SandboxesWrite,
+                Permission::SandboxesExec,
+            ]
+            .into_iter()
+            .filter(|permission| *permission != missing)
+            .collect::<Vec<_>>();
+            let error = require_global_terminal_permissions(&custom_auth(held))
+                .expect_err("a role missing one terminal permission must be refused");
+            assert_eq!(error.status_code, StatusCode::FORBIDDEN, "{missing}");
+        }
+
+        require_global_terminal_permissions(&custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]))
+        .expect("project write, sandbox write and sandbox exec open a global terminal");
     }
 
     fn terminal_thread(application_id: Option<i64>, context_type: &str) -> ai_conversations::Model {
