@@ -420,7 +420,7 @@ function SecondaryActions({
     <>
       <Button variant="outline" onClick={actions.onRedeploy} title="Redeploy">
         <RotateCw className="h-4 w-4" />
-        <span className="hidden sm:inline">Redeploy</span>
+        <span className="max-sm:sr-only">Redeploy</span>
       </Button>
       {showMenu && (
         <DropdownMenu>
@@ -526,7 +526,9 @@ function CancelledReason({
             </Badge>
           )}
           {failure && failure.code !== 'unknown' && (
-            <code className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive">
+            // Opaque surface, not another destructive/10 tint: the banner it sits
+            // in is already tinted, and stacked tints measured 4.35:1.
+            <code className="rounded border border-destructive/30 bg-background px-1.5 py-0.5 text-xs text-destructive">
               {failure.code}
             </code>
           )}

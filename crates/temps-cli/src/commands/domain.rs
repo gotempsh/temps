@@ -460,6 +460,13 @@ struct AcmeOrderResponse {
     challenge_validation: Option<ChallengeValidationStatus>,
 }
 
+/// `GET /domains/{id}/order`: `order` is `null` when the domain has none.
+#[derive(Debug, Deserialize, Serialize)]
+struct DomainOrderResponse {
+    order: Option<AcmeOrderResponse>,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ChallengeValidationStatus {
     #[serde(rename = "type")]
@@ -1505,16 +1512,30 @@ async fn execute_order_show(cmd: OrderShowCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let order_resp: AcmeOrderResponse = parse_api_response(response, "GET", &url).await?;
+    let lookup: DomainOrderResponse = parse_api_response(response, "GET", &url).await?;
 
     if cmd.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&order_resp)
+            serde_json::to_string_pretty(&lookup)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))?
         );
         return Ok(());
     }
+
+    let Some(order_resp) = lookup.order else {
+        println!();
+        println!(
+            "  {} {}",
+            "No ACME order:".bright_white(),
+            lookup
+                .reason
+                .unwrap_or_else(|| format!("domain ID {} has no ACME order", cmd.domain_id))
+                .bright_yellow()
+        );
+        println!();
+        return Ok(());
+    };
 
     println!();
     println!(

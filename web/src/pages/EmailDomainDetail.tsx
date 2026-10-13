@@ -942,6 +942,7 @@ export function EmailDomainDetail() {
               {canManageAuthorizations && !authorizationsError && (
                 <div className="flex items-center gap-2">
                   <ProjectSelect
+                    ariaLabel="Project to authorize"
                     open={projectPickerOpen}
                     onOpenChange={setProjectPickerOpen}
                     value={null}

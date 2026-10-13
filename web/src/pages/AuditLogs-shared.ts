@@ -71,6 +71,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
   {
     label: 'MFA',
     operations: [
+      { value: 'MFA_SETUP_STARTED', label: 'MFA Setup Started' },
       { value: 'MFA_ENABLED', label: 'MFA Enabled' },
       { value: 'MFA_DISABLED', label: 'MFA Disabled' },
       { value: 'MFA_VERIFIED', label: 'MFA Verified' },

@@ -346,7 +346,7 @@ export function ScheduleRunDetail() {
                 ) : (
                   <Ban className="h-4 w-4" />
                 )}
-                <span className="hidden sm:inline">Cancel run</span>
+                <span className="max-sm:sr-only">Cancel run</span>
               </Button>
             )}
 

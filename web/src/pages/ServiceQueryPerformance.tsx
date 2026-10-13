@@ -375,7 +375,7 @@ function SlowQueriesContent({
             ) : (
               <Trash2 className="size-3.5" />
             )}
-            <span className="hidden sm:inline">Reset statistics</span>
+            <span className="max-sm:sr-only">Reset statistics</span>
           </Button>
           <Button
             variant="outline"
@@ -387,7 +387,7 @@ function SlowQueriesContent({
             <RefreshCw
               className={cn('size-3.5', isFetching && 'animate-spin')}
             />
-            <span className="hidden sm:inline">Refresh</span>
+            <span className="max-sm:sr-only">Refresh</span>
           </Button>
         </div>
       </div>
@@ -812,7 +812,7 @@ export function ServiceQueryPerformance() {
             onClick={() => navigate(`/storage/${serviceId}`)}
           >
             <ArrowLeft className="size-4" />
-            <span className="hidden sm:inline">{serviceName}</span>
+            <span className="max-sm:sr-only">{serviceName}</span>
           </Button>
           <span className="text-muted-foreground">/</span>
           <span className="text-sm font-medium">Query Performance</span>

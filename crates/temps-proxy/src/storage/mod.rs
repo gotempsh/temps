@@ -70,9 +70,17 @@ pub trait ProxyLogStorage: Send + Sync {
     /// geo resolved) — implementations must not re-enrich, only persist. Must
     /// fail open: returning `Err` causes the caller to log-and-drop the batch;
     /// it never blocks live traffic and never panics.
+    ///
+    /// Takes the batch by reference so the caller keeps ownership and can
+    /// retry a transient failure (a Postgres deadlock or serialization
+    /// failure) without cloning every batch up front. The caller only retries
+    /// errors that Postgres reports for a rolled-back statement
+    /// ([`ProxyLogServiceError::is_transient_write_conflict`]), so a backend
+    /// that cannot make a batch atomic (ClickHouse writes in chunks) is never
+    /// retried and cannot produce duplicate rows.
     async fn write_batch(
         &self,
-        entries: Vec<CreateProxyLogRequest>,
+        entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError>;
 
     /// Generic, client-shaped traffic aggregation. Implementations must keep

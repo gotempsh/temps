@@ -24,7 +24,7 @@ use tracing::{error, info, warn};
 
 use super::snapshot::StatusSnapshotCache;
 use super::types::{
-    CreateStatusPageRequest, StatusPageListResponse, StatusPageMonitorInput,
+    CreateStatusPageRequest, PublicUrlStatus, StatusPageListResponse, StatusPageMonitorInput,
     StatusPageMonitorResponse, StatusPageResponse, UpdateStatusPageRequest, MAX_DESCRIPTION_CHARS,
     MAX_DISPLAY_NAME_CHARS, MAX_MONITORS_PER_STATUS_PAGE, MAX_STATUS_PAGES_PER_PROJECT,
     MAX_TITLE_CHARS,
@@ -580,15 +580,21 @@ impl PublicStatusPageService {
         Ok(())
     }
 
-    async fn public_base_url(&self) -> String {
-        match self.config_service.get_public_ingress_url().await {
-            Ok(url) => url.trim_end_matches('/').to_string(),
+    /// Where public pages are addressed on this install, read from the
+    /// current settings. A settings read failure is reported as "not
+    /// configured" with the failure as the reason, so listing pages still
+    /// works and the console shows what went wrong instead of a broken link.
+    async fn public_url_base(&self) -> PublicUrlBase {
+        match self.config_service.get_settings().await {
+            Ok(settings) => PublicUrlBase::from_settings(&settings),
             Err(e) => {
                 warn!(
                     error = %e,
-                    "could not read the public ingress URL; status page URLs are shown relative"
+                    "could not read the settings holding the public URL; status page URLs are withheld"
                 );
-                String::new()
+                PublicUrlBase::unavailable(format!(
+                    "The settings that hold the public URL could not be read: {e}."
+                ))
             }
         }
     }
@@ -639,12 +645,13 @@ impl PublicStatusPageService {
                 });
         }
 
-        let base = self.public_base_url().await;
+        let base = self.public_url_base().await;
         Ok(models
             .into_iter()
             .map(|model| StatusPageResponse {
-                public_url: format!("{base}/api/status/{}", model.slug),
-                public_json_url: format!("{base}/api/status/{}/summary.json", model.slug),
+                public_url: base.page_url(&model.slug),
+                public_json_url: base.json_url(&model.slug),
+                public_url_status: base.status.clone(),
                 monitors: by_page.remove(&model.id).unwrap_or_default(),
                 id: model.id,
                 project_id: model.project_id,
@@ -657,6 +664,79 @@ impl PublicStatusPageService {
                 updated_at: model.updated_at,
             })
             .collect())
+    }
+}
+
+/// The base every public status page address is built from, and whether it is
+/// usable.
+///
+/// The base is the install's configured public ingress URL
+/// (`public_ingress_url`, else `external_url`). When neither is set there is
+/// no base: Temps does not guess a host, because the placeholder it uses
+/// elsewhere (`http://localho.st`) is a loopback name that is wrong for anyone
+/// but the machine itself and carries no port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicUrlBase {
+    /// Configured base without a trailing slash, `None` when unconfigured.
+    base: Option<String>,
+    status: PublicUrlStatus,
+}
+
+impl PublicUrlBase {
+    fn from_settings(settings: &temps_core::AppSettings) -> Self {
+        let Some(base) = settings.configured_public_ingress_url() else {
+            return Self::unavailable(
+                "Public URL is not configured. Set the external URL or the public ingress \
+                 URL so published status pages get an address that people outside your \
+                 network can open."
+                    .to_string(),
+            );
+        };
+        // Judged on the base itself: a configured loopback or private host
+        // still produces a link, but it will not open for the public.
+        let reason = settings
+            .resolve_public_ingress()
+            .unreachable_reason
+            .map(|why| {
+                format!(
+                    "Status pages are addressed at {base}, which people outside this machine \
+                     or network cannot open: {why}. Set a publicly reachable external URL or \
+                     public ingress URL."
+                )
+            });
+        Self {
+            status: PublicUrlStatus {
+                configured: true,
+                setup_path: reason
+                    .is_some()
+                    .then(|| temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+                reason,
+            },
+            base: Some(base),
+        }
+    }
+
+    fn unavailable(reason: String) -> Self {
+        Self {
+            base: None,
+            status: PublicUrlStatus {
+                configured: false,
+                reason: Some(reason),
+                setup_path: Some(temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+            },
+        }
+    }
+
+    fn page_url(&self, slug: &str) -> Option<String> {
+        self.base
+            .as_ref()
+            .map(|base| format!("{base}/api/status/{slug}"))
+    }
+
+    fn json_url(&self, slug: &str) -> Option<String> {
+        self.base
+            .as_ref()
+            .map(|base| format!("{base}/api/status/{slug}/summary.json"))
     }
 }
 
@@ -686,6 +766,124 @@ impl temps_core::ProjectDeletionHook for PublicStatusPageService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settings(external: Option<&str>, ingress: Option<&str>) -> temps_core::AppSettings {
+        temps_core::AppSettings {
+            external_url: external.map(str::to_string),
+            public_ingress_url: ingress.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    const SLUG: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn unconfigured_install_has_no_public_url_and_no_invented_host() {
+        let base = PublicUrlBase::from_settings(&settings(None, None));
+
+        assert_eq!(base.page_url(SLUG), None);
+        assert_eq!(base.json_url(SLUG), None);
+        assert!(!base.status.configured);
+        assert_eq!(
+            base.status.setup_path.as_deref(),
+            Some("/settings#public-ingress")
+        );
+        let reason = base
+            .status
+            .reason
+            .expect("an unconfigured install explains itself");
+        assert!(reason.contains("not configured"), "{reason}");
+        assert!(!reason.contains("localho.st"), "{reason}");
+    }
+
+    #[test]
+    fn blank_settings_count_as_unconfigured() {
+        let base = PublicUrlBase::from_settings(&settings(Some("  "), Some("")));
+        assert_eq!(base.page_url(SLUG), None);
+        assert!(!base.status.configured);
+    }
+
+    #[test]
+    fn external_url_is_used_when_no_ingress_url_is_set() {
+        let base = PublicUrlBase::from_settings(&settings(Some("https://temps.example.com"), None));
+
+        assert_eq!(
+            base.page_url(SLUG).as_deref(),
+            Some("https://temps.example.com/api/status/0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            base.json_url(SLUG).as_deref(),
+            Some(
+                "https://temps.example.com/api/status/0123456789abcdef0123456789abcdef/summary.json"
+            )
+        );
+        assert_eq!(
+            base.status,
+            PublicUrlStatus {
+                configured: true,
+                reason: None,
+                setup_path: None
+            }
+        );
+    }
+
+    #[test]
+    fn ingress_url_takes_precedence_over_external_url() {
+        let base = PublicUrlBase::from_settings(&settings(
+            Some("https://console.example.com"),
+            Some("https://hooks.example.com"),
+        ));
+
+        assert_eq!(
+            base.page_url(SLUG).as_deref(),
+            Some("https://hooks.example.com/api/status/0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_never_double_up() {
+        let external =
+            PublicUrlBase::from_settings(&settings(Some("https://temps.example.com//"), None));
+        let ingress = PublicUrlBase::from_settings(&settings(
+            Some("https://temps.example.com"),
+            Some("https://hooks.example.com:8443/"),
+        ));
+
+        assert_eq!(
+            external.page_url(SLUG).as_deref(),
+            Some("https://temps.example.com/api/status/0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            ingress.page_url(SLUG).as_deref(),
+            Some("https://hooks.example.com:8443/api/status/0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn configured_loopback_host_keeps_its_link_but_warns() {
+        let base = PublicUrlBase::from_settings(&settings(Some("http://localhost:3000"), None));
+
+        assert_eq!(
+            base.page_url(SLUG).as_deref(),
+            Some("http://localhost:3000/api/status/0123456789abcdef0123456789abcdef")
+        );
+        assert!(base.status.configured);
+        let reason = base.status.reason.expect("loopback host is flagged");
+        assert!(reason.contains("localhost"), "{reason}");
+        assert_eq!(
+            base.status.setup_path.as_deref(),
+            Some("/settings#public-ingress")
+        );
+    }
+
+    #[test]
+    fn unreadable_settings_withhold_the_link_with_the_cause() {
+        let base = PublicUrlBase::unavailable("The settings could not be read: boom.".into());
+        assert_eq!(base.page_url(SLUG), None);
+        assert!(!base.status.configured);
+        assert!(base.status.reason.unwrap().contains("boom"));
+        assert!(base.status.setup_path.is_some());
+    }
 
     #[test]
     fn generated_slugs_are_128_bit_hex_and_distinct() {

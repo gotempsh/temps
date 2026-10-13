@@ -582,7 +582,7 @@ impl NativeApiService {
             credentials
                 .require_capability(&request.model, "the Responses API", |c| c.responses_api)?;
         } else {
-            Self::require_openai(&credentials, "/ai/v1/responses", &request.model)?;
+            Self::require_openai(&credentials, "/api/ai/v1/responses", &request.model)?;
         }
         if credentials.credential_type == CredentialType::System {
             reject_stateful_request(request)?;
@@ -670,7 +670,7 @@ impl NativeApiService {
             .gateway_service
             .resolve_credentials(&summary.model, byok)
             .await?;
-        Self::require_openai(&credentials, "/ai/v1/files", &summary.model)?;
+        Self::require_openai(&credentials, "/api/ai/v1/files", &summary.model)?;
         let base_url = self.base_url(&credentials)?;
 
         let file = tokio::fs::File::open(spooled.file.path())

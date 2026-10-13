@@ -18101,6 +18101,19 @@ mod tests {
                 .exec(manager.db.as_ref())
                 .await
                 .unwrap();
+            // Its data volume cannot follow a rename, so a service that
+            // already owns Docker resources is refused before its container
+            // is stopped, whatever the destination (#1455). The destination
+            // checks below are only reachable from a service that owns none.
+            let free_name = format!("rename-free-{}", uuid::Uuid::new_v4());
+            let refused = manager
+                .update_service(original.id, rename(free_name))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, ExternalServiceError::DataSafetyRefusal { service_id, .. } if service_id == original.id),
+                "renaming a service that owns Docker resources must be refused: {refused:?}"
+            );
             let occupied_name = format!("rename-occupied-{}", uuid::Uuid::new_v4());
             let occupied_container = postgres_container_name(&occupied_name);
             let docker = manager.require_docker().unwrap();
@@ -18148,14 +18161,34 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            // A stopped service with no Docker resources of its own passes the
+            // data-safety guard, so the occupied destination is what refuses.
+            let renamable_name = format!("rename-source-{}", uuid::Uuid::new_v4());
+            let mut renamable: external_services::ActiveModel =
+                manager.get_service(original.id).await.unwrap().into();
+            renamable.id = sea_orm::ActiveValue::NotSet;
+            renamable.name = Set(renamable_name.clone());
+            renamable.status = Set("stopped".to_string());
+            let renamable = renamable.insert(manager.db.as_ref()).await.unwrap();
             let conflict = manager
-                .update_service(original.id, rename(occupied_name))
+                .update_service(renamable.id, rename(occupied_name))
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                conflict,
-                ExternalServiceError::ServiceResourceConflict { .. }
-            ));
+            assert!(
+                matches!(
+                    conflict,
+                    ExternalServiceError::ServiceResourceConflict { .. }
+                ),
+                "an occupied rename destination must be refused: {conflict:?}"
+            );
+            assert_eq!(
+                manager.get_service(renamable.id).await.unwrap().name,
+                renamable_name
+            );
+            external_services::Entity::delete_by_id(renamable.id)
+                .exec(manager.db.as_ref())
+                .await
+                .unwrap();
             let after = docker
                 .inspect_container(
                     &container_name,

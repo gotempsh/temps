@@ -263,7 +263,7 @@ function DomainRow({
                 rel="noreferrer"
               >
                 <ExternalLink className="size-4 sm:mr-2" />
-                <span className="hidden sm:inline">Open</span>
+                <span className="max-sm:sr-only">Open</span>
               </a>
             </Button>
           )}
@@ -274,7 +274,7 @@ function DomainRow({
               onClick={() => verify.mutate(path)}
             >
               <ShieldCheck className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">
+              <span className="max-sm:sr-only">
                 {verify.isPending ? 'Verifying...' : 'Verify'}
               </span>
             </Button>
@@ -289,7 +289,7 @@ function DomainRow({
               onClick={() => renew.mutate(path)}
             >
               <RefreshCw className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">
+              <span className="max-sm:sr-only">
                 {renew.isPending ? 'Renewing...' : 'Renew'}
               </span>
             </Button>

@@ -615,7 +615,7 @@ export function DeploymentStages({
                     title="Debug this failure with AI"
                   >
                     <Sparkles className="h-4 w-4" />
-                    <span className="hidden sm:inline">Debug with AI</span>
+                    <span className="max-sm:sr-only">Debug with AI</span>
                   </Button>
                 )}
                 <ElapsedTime
@@ -635,13 +635,22 @@ export function DeploymentStages({
                   <Settings className="h-4 w-4" />
                 </Button>
                 <button
+                  type="button"
                   onClick={() => toggleStage(stage.id)}
-                  className="cursor-pointer"
+                  aria-expanded={expandedStageIds.has(stage.id)}
+                  aria-label={`${expandedStageIds.has(stage.id) ? 'Hide' : 'Show'} logs for ${stage.name}`}
+                  className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 >
                   {expandedStageIds.has(stage.id) ? (
-                    <ChevronUpIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronUpIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <ChevronDownIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronDownIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   )}
                 </button>
               </div>

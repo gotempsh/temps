@@ -28,7 +28,6 @@ import {
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -52,7 +51,6 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  ExternalLink,
   Eye,
   EyeOff,
   MoreVertical,
@@ -65,6 +63,7 @@ import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { StatusPageStateBadge } from './ProjectStatusPages'
 import { StatusPageDomains } from './StatusPageDomains'
+import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageIncidents } from './StatusPageIncidents'
 import {
   formDefaults,
@@ -81,39 +80,6 @@ function DetailSkeleton() {
       <Skeleton className="h-20 w-full" />
       <Skeleton className="h-64 w-full" />
     </div>
-  )
-}
-
-function PublicLinkSection({ page }: { page: StatusPageResponse }) {
-  return (
-    <section className="space-y-2">
-      <h3 className="text-lg font-semibold">Public link</h3>
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
-        <code className="min-w-0 truncate rounded-md border bg-muted px-3 py-2 text-sm">
-          {page.public_url}
-        </code>
-        <div className="flex gap-2">
-          <CopyButton value={page.public_url} variant="outline" size="sm">
-            Copy
-          </CopyButton>
-          {page.is_published && (
-            <Button variant="outline" size="sm" asChild>
-              <a href={page.public_url} target="_blank" rel="noreferrer">
-                <ExternalLink className="size-4 sm:mr-2" />
-                <span className="hidden sm:inline">Open</span>
-              </a>
-            </Button>
-          )}
-        </div>
-      </div>
-      <p className="text-sm text-muted-foreground">
-        {page.is_published
-          ? 'Anyone with this link can see the page. Unpublish or rotate the link to revoke access immediately. Search engines are asked not to index it.'
-          : 'This link returns “not found” until you publish the page.'}{' '}
-        A machine-readable version is at{' '}
-        <code className="text-xs">…/summary.json</code>.
-      </p>
-    </section>
   )
 }
 
@@ -438,7 +404,7 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
               onClick={() => unpublish.mutate(path)}
             >
               <EyeOff className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">
+              <span className="max-sm:sr-only">
                 {unpublish.isPending ? 'Unpublishing...' : 'Unpublish'}
               </span>
             </Button>
@@ -448,7 +414,7 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
               onClick={() => publish.mutate(path)}
             >
               <Eye className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">
+              <span className="max-sm:sr-only">
                 {publish.isPending ? 'Publishing...' : 'Publish'}
               </span>
             </Button>

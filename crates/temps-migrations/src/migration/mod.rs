@@ -320,6 +320,8 @@ mod m20261009_000001_unconfirm_legacy_worker_container_removals;
 mod m20261011_000001_create_public_status_pages;
 mod m20261012_000001_ai_provider_keys_self_hosted;
 mod m20261012_000002_create_status_page_domains;
+mod m20261012_000003_managed_daemon_beta_images;
+mod m20261013_000001_webhook_delivery_identity;
 
 pub struct Migrator;
 
@@ -711,6 +713,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261011_000001_create_public_status_pages::Migration),
             Box::new(m20261012_000001_ai_provider_keys_self_hosted::Migration),
             Box::new(m20261012_000002_create_status_page_domains::Migration),
+            Box::new(m20261012_000003_managed_daemon_beta_images::Migration),
+            Box::new(m20261013_000001_webhook_delivery_identity::Migration),
         ]
     }
 }

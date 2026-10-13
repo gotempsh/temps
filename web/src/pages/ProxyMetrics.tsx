@@ -940,6 +940,7 @@ function FilterBar({
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
       <ProjectSelect
+        ariaLabel="Filter by project"
         value={filter.projectId}
         onValueChange={(projectId) =>
           onChange({ projectId, environmentId: null })

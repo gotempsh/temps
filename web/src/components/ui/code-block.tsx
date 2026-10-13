@@ -5,7 +5,9 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Check, Copy, Hash, WrapText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 import type { HighlighterCore } from 'shiki/core'
+import { withReadableDarkComments } from './code-block-theme'
 
 /**
  * Languages this block can highlight.
@@ -97,7 +99,9 @@ async function getHighlighter(): Promise<HighlighterCore> {
       return createHighlighterCore({
         themes: [
           import('shiki/themes/github-light.mjs'),
-          import('shiki/themes/github-dark.mjs'),
+          import('shiki/themes/github-dark.mjs').then((module) =>
+            withReadableDarkComments(module.default)
+          ),
         ],
         langs: [],
         engine: createJavaScriptRegexEngine({ forgiving: true }),
@@ -156,6 +160,11 @@ export function CodeBlock({
   const visibleButtonCount =
     1 + (disableWrapToggle ? 0 : 1) + (showCopy ? 1 : 0)
 
+  // Long unwrapped lines scroll horizontally; make that scroller a tab stop
+  // (only while it overflows) so keyboard users can reach the rest of the line.
+  const { ref: scrollerRef, scrollable } = useScrollableRegion<HTMLDivElement>()
+  const scrollerProps = scrollableRegionProps(scrollable)
+
   const handleCopy = async () => {
     await navigator.clipboard.writeText(code)
     setCopied(true)
@@ -185,7 +194,10 @@ export function CodeBlock({
           flat hole in the page. */}
       <div className="relative min-w-0 dark:bg-white/[0.025]">
         <div
+          ref={scrollerRef}
+          {...scrollerProps}
           className={cn(
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
             // w-0 min-w-full max-w-full is the trick: forces this element to
             // parent width while letting its children overflow horizontally.
             'w-0 min-w-full max-w-full py-4 pl-4',
