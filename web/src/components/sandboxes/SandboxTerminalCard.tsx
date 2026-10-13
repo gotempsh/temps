@@ -18,30 +18,18 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { fitTerminalToHost } from './sandbox-terminal-dom'
 import {
-  computeTerminalSize,
   openTerminalSession,
   terminalSocketUrl,
   type TerminalSession,
   type TerminalStatus,
 } from './sandbox-terminal'
 
-const FALLBACK_CELL = { width: 9, height: 17 }
-
 interface SandboxTerminalCardProps {
   sandboxId: string
   /** Why a terminal cannot be attached right now; `null` when it can. */
   unavailableReason: string | null
-}
-
-/** Cell size xterm measured for the current font, with a sane fallback. */
-function measureCell(host: HTMLElement) {
-  const probe = host.querySelector<HTMLElement>('.xterm-char-measure-element')
-  const length = probe?.textContent?.length ?? 0
-  if (!probe || length === 0) return FALLBACK_CELL
-  const rect = probe.getBoundingClientRect()
-  if (rect.width === 0 || rect.height === 0) return FALLBACK_CELL
-  return { width: rect.width / length, height: rect.height }
 }
 
 const STATUS_LABEL: Record<TerminalStatus, string> = {
@@ -95,14 +83,7 @@ export function SandboxTerminalCard({
       })
       term.open(host)
       const fit = () => {
-        const cell = measureCell(host)
-        const { cols, rows } = computeTerminalSize(
-          host.clientWidth,
-          host.clientHeight,
-          cell.width,
-          cell.height
-        )
-        if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows)
+        fitTerminalToHost(term, host)
       }
       fit()
 
