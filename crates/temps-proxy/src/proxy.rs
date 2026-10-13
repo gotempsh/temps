@@ -45,8 +45,9 @@ use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
     bounded_cas_etag, bounded_log_value, canonical_redirect_location, cap_static_chunk,
     if_none_match_matches, metadata_etag, object_etag, open_static_file, opened_cas_size_matches,
-    read_static_chunk, resolve_static_object_request, static_not_found_contract, static_object_key,
-    unavailable_outcome, StaticFileMatch, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
+    read_static_chunk, resolve_static_object_request, static_mount_prefix,
+    static_not_found_contract, static_object_key, unavailable_outcome, StaticFileMatch,
+    StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -2967,6 +2968,36 @@ impl LoadBalancer {
         builder.build().to_string()
     }
 
+    /// Serve the static target the request resolved to, honouring a path
+    /// route.
+    ///
+    /// A stripping path route looks the file up without its prefix, so
+    /// `ctx.path` holds the route-relative path while the file is served and
+    /// the requested path again afterwards (the request log keeps it). Every
+    /// absolute path the static layer writes back to the client is built from
+    /// the route-relative `ctx.path` and must be re-mounted under the route
+    /// prefix by the writer (see [`static_mount_prefix`]).
+    async fn serve_static_target(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        static_dir: &str,
+    ) -> Result<StaticFileServeOutcome> {
+        let requested_path = ctx
+            .path_route
+            .as_ref()
+            .filter(|route| route.strip_prefix)
+            .map(|route| {
+                let target_path = route.upstream_path(&ctx.path);
+                std::mem::replace(&mut ctx.path, target_path)
+            });
+        let served = self.serve_static_file(session, ctx, static_dir).await;
+        if let Some(requested_path) = requested_path {
+            ctx.path = requested_path;
+        }
+        served
+    }
+
     /// Serve a static file from the filesystem using fixed-size response chunks.
     ///
     /// Filesystem/path failures are deliberately returned as a uniform not-found
@@ -3173,7 +3204,11 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         page_content_type: &str,
     ) -> Result<StaticFileServeOutcome> {
-        let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
+        // `ctx.path` is the route-relative path while a stripping path route
+        // is being served; the client must be sent back under the mount.
+        let mount_prefix = static_mount_prefix(ctx.path_route.as_ref());
+        let Some(location) =
+            canonical_redirect_location(mount_prefix, &ctx.path, ctx.query_string.as_deref())
         else {
             warn!(
                 request_path = %bounded_log_value(&ctx.path),
@@ -7068,20 +7103,7 @@ impl ProxyHttp for LoadBalancer {
             // IMPORTANT: Skip static file serving for /api/_temps/* paths
             // These must ALWAYS be proxied to the console address (admin API)
             if !ctx.path.starts_with("/api/_temps/") {
-                // Serve static file. A stripping path route looks the file
-                // up without its prefix; the log keeps the requested path.
-                let requested_path = ctx
-                    .path_route
-                    .as_ref()
-                    .filter(|route| route.strip_prefix)
-                    .map(|route| {
-                        let target_path = route.upstream_path(&ctx.path);
-                        std::mem::replace(&mut ctx.path, target_path)
-                    });
-                let served = self.serve_static_file(session, ctx, &static_dir).await;
-                if let Some(requested_path) = requested_path {
-                    ctx.path = requested_path;
-                }
+                let served = self.serve_static_target(session, ctx, &static_dir).await;
                 match served {
                     Ok(StaticFileServeOutcome::Served) => {
                         debug!("Served static file: {}", ctx.path);
@@ -11396,6 +11418,225 @@ mod status_page_host_tests {
             }
             Outcome::Answered { head, .. } => panic!("{head}"),
         }
+        Ok(())
+    }
+}
+
+/// A path route mounts a static target under a prefix (ADR 050). The static
+/// layer resolves files against the route-relative path, so the redirects it
+/// writes must be re-mounted under the prefix or the client leaves the route.
+#[cfg(test)]
+mod static_path_route_redirect_tests {
+    use super::{LoadBalancer, StaticFileServeOutcome};
+    use crate::config::ProxyConfig;
+    use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
+    use crate::traits::{ProjectContextResolver, UpstreamResolver};
+    use anyhow::Result;
+    use pingora_proxy::{ProxyHttp, Session};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::Arc;
+    use temp_dir::TempDir;
+    use temps_routes::{CachedPeerTable, PathRoute};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const STORED_DIR: &str = "projects/site/production/deploy-1";
+
+    /// Load balancer over an in-memory database: serving a redirect never
+    /// queries it, so these tests need no Docker.
+    fn load_balancer(data_dir: &std::path::Path) -> Result<LoadBalancer> {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let mut config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test@localhost/test".to_string(),
+            None,
+            None,
+        )?;
+        config.data_dir = data_dir.to_path_buf();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ));
+
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let geoip_service = Arc::new(temps_geo::GeoIpService::new()?);
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip_service));
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
+        );
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
+            crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            );
+
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig::default()),
+            Arc::new(crate::service::lb_service::LbService::new(db.clone())),
+            route_table.clone(),
+        )) as Arc<dyn UpstreamResolver>;
+        let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table))
+            as Arc<dyn ProjectContextResolver>;
+
+        Ok(LoadBalancer::new(
+            upstream_resolver,
+            proxy_log_handle,
+            tracking_handle,
+            project_context_resolver,
+            Arc::new(temps_core::CookieCrypto::new(
+                "default-32-byte-key-for-testing!",
+            )?),
+            db.clone(),
+            config_service,
+            Arc::new(
+                crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+            ),
+            Arc::new(temps_core::OpenIpGate),
+            Arc::new(crate::service::challenge_service::ChallengeService::new(
+                db.clone(),
+            )),
+            Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+                db.clone(),
+            )),
+            false,
+        ))
+    }
+
+    /// `<data_dir>/static/<STORED_DIR>` holding a root page, `guide.html` and
+    /// `docs/other.html` (a deployment that itself ships a `docs/` folder).
+    fn write_deployment(data_dir: &std::path::Path) -> Result<()> {
+        let deployment = data_dir.join("static").join(STORED_DIR);
+        std::fs::create_dir_all(deployment.join("docs"))?;
+        std::fs::write(deployment.join("index.html"), b"root")?;
+        std::fs::write(deployment.join("guide.html"), b"guide")?;
+        std::fs::write(deployment.join("docs/other.html"), b"other")?;
+        Ok(())
+    }
+
+    fn route(prefix: &str, strip_prefix: bool) -> PathRoute {
+        PathRoute {
+            prefix: prefix.to_string(),
+            strip_prefix,
+            target_service: "docs".to_string(),
+            target: None,
+            sleeping_environment_id: None,
+        }
+    }
+
+    /// Serve `path_and_query` through the same entry point `request_filter`
+    /// uses for a static target and return the raw response head.
+    async fn serve(
+        lb: &LoadBalancer,
+        path_route: Option<PathRoute>,
+        path_and_query: &str,
+    ) -> Result<(StaticFileServeOutcome, String, String)> {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(
+                format!("GET {path_and_query} HTTP/1.1\r\nHost: site.example.com\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await?, "request must parse");
+
+        let mut ctx = lb.new_ctx();
+        let (path, query) = match path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query.to_string())),
+            None => (path_and_query, None),
+        };
+        ctx.method = "GET".to_string();
+        ctx.host = "site.example.com".to_string();
+        ctx.path = path.to_string();
+        ctx.query_string = query;
+        ctx.path_route = path_route;
+
+        let outcome = lb
+            .serve_static_target(&mut session, &mut ctx, STORED_DIR)
+            .await?;
+        assert_eq!(
+            ctx.path, path,
+            "the requested path is restored after serving"
+        );
+        drop(session);
+
+        let mut raw = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut raw),
+        )
+        .await??;
+        let response = String::from_utf8_lossy(&raw).to_string();
+        let head = response
+            .split_once("\r\n\r\n")
+            .map(|(head, _)| head.to_string())
+            .unwrap_or(response.clone());
+        let location = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("location")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_default();
+        Ok((outcome, head, location))
+    }
+
+    #[tokio::test]
+    async fn stripped_route_redirect_keeps_the_mount_prefix_and_query() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        let (outcome, head, location) =
+            serve(&lb, Some(route("/docs", true)), "/docs/guide/?ref=home&x=1").await?;
+        assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
+        assert!(head.starts_with("HTTP/1.1 308"), "{head}");
+        assert_eq!(location, "/docs/guide?ref=home&x=1");
+
+        let (_, head, location) = serve(&lb, Some(route("/docs", true)), "/docs/guide/").await?;
+        assert!(head.starts_with("HTTP/1.1 308"), "{head}");
+        assert_eq!(location, "/docs/guide");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stripped_route_root_is_served_not_redirected() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        for requested in ["/docs", "/docs/"] {
+            let (outcome, head, location) =
+                serve(&lb, Some(route("/docs", true)), requested).await?;
+            assert_eq!(
+                outcome,
+                StaticFileServeOutcome::Served,
+                "{requested}: {head}"
+            );
+            assert!(head.starts_with("HTTP/1.1 200"), "{requested}: {head}");
+            assert_eq!(location, "", "{requested}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirect_is_unchanged_without_a_stripping_route() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        // Not path-routed.
+        let (outcome, head, location) = serve(&lb, None, "/guide/?ref=home").await?;
+        assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
+        assert_eq!(location, "/guide?ref=home");
+
+        // A route that keeps its prefix: the lookup path already carries it.
+        let (outcome, head, location) =
+            serve(&lb, Some(route("/docs", false)), "/docs/other/").await?;
+        assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
+        assert_eq!(location, "/docs/other");
         Ok(())
     }
 }
