@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+/**
+ * Presentation helpers for the console sign-in ("Sign in with Claude").
+ * The server owns the state machine; these only turn its phases into words.
+ */
+
+export type LoginPhase =
+  'starting' | 'waiting' | 'verifying' | 'succeeded' | 'failed' | 'cancelled'
+
+const TERMINAL_PHASES: ReadonlySet<string> = new Set([
+  'succeeded',
+  'failed',
+  'cancelled',
+])
+
+/** True once the sign-in can no longer change state. */
+export function isLoginTerminal(phase: string | undefined | null): boolean {
+  return phase != null && TERMINAL_PHASES.has(phase)
+}
+
+/** True while a CLI process is running on the server for this sign-in. */
+export function isLoginActive(phase: string | undefined | null): boolean {
+  return phase != null && !TERMINAL_PHASES.has(phase)
+}
+
+/** `m:ss`, clamped at zero. */
+export function formatElapsed(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds))
+  const minutes = Math.floor(whole / 60)
+  const rest = whole % 60
+  return `${minutes}:${rest.toString().padStart(2, '0')}`
+}
+
+/** Short heading for each phase. */
+export function loginPhaseTitle(phase: string, providerName: string): string {
+  switch (phase) {
+    case 'starting':
+      return `Starting ${providerName}…`
+    case 'waiting':
+      return 'Waiting for you'
+    case 'verifying':
+      return 'Verifying the sign-in…'
+    case 'succeeded':
+      return 'Signed in'
+    case 'failed':
+      return 'Sign-in failed'
+    case 'cancelled':
+      return 'Sign-in cancelled'
+    default:
+      return 'Signing in…'
+  }
+}
+
+/** Label of the sign-in button, e.g. "Sign in with Claude". */
+export function loginButtonLabel(providerName: string): string {
+  const short = providerName.split(/[\s(]/)[0] || providerName
+  return `Sign in with ${short}`
+}

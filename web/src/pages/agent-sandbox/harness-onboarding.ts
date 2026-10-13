@@ -5,6 +5,8 @@ import type { AuthFlavorDto, ProviderCatalogDto } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 
 export const LOCAL_LOGIN_METHOD = 'local'
+/** One-click subscription sign-in run by the server's own CLI. */
+export const CONSOLE_LOGIN_METHOD = 'console-login'
 
 /** Credential format of an OpenAI-compatible endpoint (OpenCode only). */
 export const OPENAI_COMPATIBLE_FORMAT = 'openai_compatible'
@@ -30,6 +32,7 @@ export function openAiCompatibleUpstreamModel(selection?: string | null) {
 
 /** One way to connect a harness: paste a credential, or import a host login. */
 export type HarnessConnectionMethod =
+  | { kind: 'login'; id: typeof CONSOLE_LOGIN_METHOD; label: string }
   | { kind: 'local'; id: typeof LOCAL_LOGIN_METHOD; label: string }
   | { kind: 'credential'; id: string; label: string; flavor: AuthFlavorDto }
 
@@ -40,13 +43,22 @@ export type HarnessConnectionMethod =
  * offers it: the server does not accept a local Claude login.
  */
 export function harnessConnectionMethods(
-  provider: Pick<ProviderCatalogDto, 'id' | 'auth_flavors' | 'local_credential'>
+  provider: Pick<
+    ProviderCatalogDto,
+    'id' | 'auth_flavors' | 'local_credential'
+  > &
+    Partial<Pick<ProviderCatalogDto, 'name' | 'login_supported'>>
 ): HarnessConnectionMethod[] {
+  const displayName = provider.name ?? provider.id
   const methods: HarnessConnectionMethod[] = provider.auth_flavors.map(
     (flavor) => ({
       kind: 'credential',
       id: flavor.id,
-      label: flavor.label,
+      // Pasting stays available as the advanced route, and for API keys.
+      label:
+        provider.login_supported && flavor.format !== 'api_key'
+          ? 'Paste token (advanced)'
+          : flavor.label,
       flavor,
     })
   )
@@ -55,6 +67,15 @@ export function harnessConnectionMethods(
       kind: 'local',
       id: LOCAL_LOGIN_METHOD,
       label: 'Login on this server',
+    })
+  }
+  if (provider.login_supported) {
+    // Always first and never conditional on the CLI being installed: when it
+    // is not, the panel explains what is missing instead of vanishing.
+    methods.unshift({
+      kind: 'login',
+      id: CONSOLE_LOGIN_METHOD,
+      label: `Sign in with ${displayName.split(/[\s(]/)[0] || displayName}`,
     })
   }
   return methods
@@ -68,6 +89,12 @@ export function initialConnectionMethodId(
   const saved = provider.credential_saved
     ? methods.find((method) => method.id === provider.current_auth_type)
     : undefined
+  // A saved subscription credential is replaced most simply by signing in
+  // again; the pasted-token tab stays one click away.
+  if (saved?.kind === 'credential' && saved.flavor.format !== 'api_key') {
+    const login = methods.find((method) => method.kind === 'login')
+    if (login) return login.id
+  }
   return (saved ?? methods[0])?.id ?? ''
 }
 

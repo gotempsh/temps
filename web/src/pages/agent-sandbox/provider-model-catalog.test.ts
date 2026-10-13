@@ -85,6 +85,7 @@ function provider(id: string): ProviderCatalogDto {
     max_turns_fix: null,
     max_turns_feedback: null,
     supports_max_turns: id === 'claude_cli',
+    login_supported: false,
     host_authenticated: false,
     host_auth_method: null,
     host_version: null,

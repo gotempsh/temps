@@ -18,6 +18,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { problemDetail } from '@/lib/api-problem'
+import { HarnessLoginPanel } from './HarnessLoginPanel'
 import {
   aiProviderCatalogQueryOptions,
   publishVerifiedProvider,
@@ -315,7 +316,9 @@ export function HarnessConnectionForm({
       <p>
         {busy
           ? 'Checking the harness in a temporary sandbox…'
-          : 'Temps verifies it with one small test request, which may use your provider allowance.'}
+          : activeMethod?.kind === 'login'
+            ? 'The sign-in itself stays with the CLI on this server; Temps saves only a short-lived access token.'
+            : 'Temps verifies it with one small test request, which may use your provider allowance.'}
       </p>
     </div>
   )
@@ -451,7 +454,16 @@ export function HarnessConnectionForm({
         )}
         {methods.map((method) => (
           <TabsContent key={method.id} value={method.id} className="mt-4">
-            {method.kind === 'local' ? (
+            {method.kind === 'login' ? (
+              <HarnessLoginPanel
+                provider={provider}
+                disabled={busy}
+                onSucceeded={async () => {
+                  await publish(null)
+                  stopReplacing()
+                }}
+              />
+            ) : method.kind === 'local' ? (
               <div className="space-y-3">
                 <p className="text-sm text-muted-foreground">
                   Temps found a {provider.name} login on this server (
