@@ -458,6 +458,10 @@ pub struct SandboxStatusResponse {
     /// Experimental microsandbox microVM backend (ADR-050). Always present:
     /// when not configured it carries the reason and where to set it up.
     pub microsandbox: crate::sandbox::microsandbox::MicrosandboxCapability,
+    /// Whether Firecracker sandboxes can open interactive terminals (the
+    /// guest terminal agent must be staged). Always present, with the reason
+    /// and fix when not, so clients never have to infer it from a 409.
+    pub firecracker_terminal: crate::sandbox::TerminalCapability,
 }
 
 #[utoipa::path(
@@ -511,6 +515,9 @@ pub async fn get_sandbox_status(
         microsandbox: crate::sandbox::microsandbox::microsandbox_capability(
             &crate::sandbox::microsandbox::host_data_dir(),
         ),
+        firecracker_terminal: crate::sandbox::firecracker::firecracker_terminal_capability(
+            &crate::sandbox::microsandbox::host_data_dir(),
+        ),
     }))
 }
 
@@ -556,6 +563,8 @@ pub async fn get_global_sandbox_status(
     let firecracker_available =
         crate::sandbox::firecracker::is_firecracker_available(&data_dir).await;
     let microsandbox = crate::sandbox::microsandbox::microsandbox_capability(&data_dir);
+    let firecracker_terminal =
+        crate::sandbox::firecracker::firecracker_terminal_capability(&data_dir);
 
     Ok(Json(SandboxStatusResponse {
         docker_available,
@@ -564,6 +573,7 @@ pub async fn get_global_sandbox_status(
         error,
         firecracker_available,
         microsandbox,
+        firecracker_terminal,
     }))
 }
 

@@ -33,6 +33,10 @@ import {
   MicrosandboxBackendOption,
   type MicrosandboxCapability,
 } from '@/components/sandboxes/MicrosandboxBackendOption'
+import {
+  TerminalSupportNote,
+  type TerminalCapability,
+} from '@/components/sandboxes/TerminalSupportNote'
 
 interface SandboxStatus {
   docker_available: boolean
@@ -40,6 +44,7 @@ interface SandboxStatus {
   image_name: string
   error: string | null
   firecracker_available: boolean
+  firecracker_terminal: TerminalCapability
   microsandbox: MicrosandboxCapability
 }
 
@@ -508,6 +513,13 @@ export function AgentSandboxSandboxPage() {
                       : 'KVM microVM isolation — stronger security boundary.'}
                   </p>
                 </button>
+                {sandboxStatus?.firecracker_available && (
+                  <div className="mt-2">
+                    <TerminalSupportNote
+                      capability={sandboxStatus.firecracker_terminal}
+                    />
+                  </div>
+                )}
               </div>
               <MicrosandboxBackendOption
                 capability={sandboxStatus?.microsandbox}
