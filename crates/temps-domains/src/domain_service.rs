@@ -1869,10 +1869,6 @@ pub struct OnDemandCertStatus {
     pub latest_attempt: Option<on_demand_cert_attempts::Model>,
 }
 
-/// Render the full `Display` chain of an error — the top-level message plus every
-/// `source()` level joined by `: ` — for the `on_demand_cert_attempts.error_chain`
-/// audit column (ADR-018 §5). This is the operator's first-line diagnostic, so it
-/// must preserve every nested cause rather than the top-level message alone.
 /// The DNS cleanup receipt (the plan of TXT records Temps published) stored on
 /// an ACME order, if it has one.
 fn cleanup_receipt_of(order: &crate::tls::models::AcmeOrder) -> Option<serde_json::Value> {
@@ -1883,6 +1879,10 @@ fn cleanup_receipt_of(order: &crate::tls::models::AcmeOrder) -> Option<serde_jso
         .cloned()
 }
 
+/// Render the full `Display` chain of an error — the top-level message plus every
+/// `source()` level joined by `: ` — for the `on_demand_cert_attempts.error_chain`
+/// audit column (ADR-018 §5). This is the operator's first-line diagnostic, so it
+/// must preserve every nested cause rather than the top-level message alone.
 fn has_pending_dns_cleanup(authorizations: Option<&serde_json::Value>) -> bool {
     authorizations.is_some_and(|metadata| {
         metadata
