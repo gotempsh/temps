@@ -143,24 +143,24 @@ export function WorkspaceTerminalPanel({
   )
   const [selection, setSelection] = useState('')
 
-  // A suspended global workspace has no control action: the attach itself
-  // wakes it, so connecting only starts once the user asks.
+  // A suspended global workspace has no control action, and a workspace that
+  // was never created has nothing to resume: the attach itself wakes or
+  // creates the sandbox, so connecting only starts once the user asks.
   const wakesOnConnect =
-    availability.kind === 'sleeping' && availability.wake === 'on-connect'
+    availability.kind === 'not-created' ||
+    (availability.kind === 'sleeping' && availability.wake === 'on-connect')
   const canConnect =
     !archived &&
     (availability.kind === 'ready' || (wakesOnConnect && connectRequested))
-  const candidate =
-    availability.kind === 'ready'
-      ? availability.sandboxPublicId
-      : (workspace?.sandbox_public_id ?? null)
-
-  // Latch the sandbox once it may be attached. Later status polls (a stale
+  // Latch the thread once it may be attached. Later status polls (a stale
   // `sleeping` while a live terminal is open, a slow refresh) must not tear
-  // down a working session; only a different sandbox does.
+  // down a working session. The sandbox's id cannot key the session: it may
+  // not exist until the attach creates it, and keying on it would remount the
+  // terminal the moment it appears. A terminal thread owns its shell, so the
+  // thread does.
   const [target, setTarget] = useState<string | null>(null)
-  if (canConnect && candidate && target !== candidate) {
-    setTarget(candidate)
+  if (canConnect && target !== threadPublicId) {
+    setTarget(threadPublicId)
   }
 
   // The xterm instance lives as long as there is a sandbox to show, across
@@ -641,21 +641,17 @@ export function WorkspaceTerminalOnboarding({
           )}
         </OnboardingCard>
       )
-    case 'no-sandbox':
+    case 'not-created':
       return (
         <OnboardingCard
           action={
-            <Button
-              onClick={onOpenWorkspaceSettings}
-              size="sm"
-              type="button"
-              variant="outline"
-            >
-              Open Workspace
+            <Button onClick={onWakeOnConnect} size="sm" type="button">
+              <Power className="mr-1.5 size-3.5" />
+              Create and connect
             </Button>
           }
-          detail="The sandbox is created the first time the workspace is used. Send a message in a thread, then come back to open a terminal."
-          title="No sandbox has been created yet"
+          detail="The workspace sandbox is created the first time it is used. Creating it starts a container and then opens the terminal; your files will persist across sleeps."
+          title="The workspace sandbox hasn't been created yet"
         />
       )
     case 'failed':

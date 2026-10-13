@@ -214,7 +214,11 @@ export type WorkspaceTerminalAvailability =
   | { kind: 'no-permission'; role: string }
   | { kind: 'runtime-update-required'; detail: string }
   | { kind: 'backend-unsupported'; reason: string; setupCommand: string | null }
-  | { kind: 'no-sandbox' }
+  /**
+   * No sandbox exists yet. Attaching creates it, so connecting is the action;
+   * it is the user's to take because it starts a container.
+   */
+  | { kind: 'not-created' }
   | { kind: 'failed'; detail: string }
   /** A wake is in flight, or the sandbox is coming up on its own. */
   | { kind: 'starting' }
@@ -263,11 +267,11 @@ export function workspaceTerminalAvailability(input: {
   }
   const sandboxPublicId = workspace.sandbox_public_id
   if (!sandboxPublicId) {
-    // Nothing has been created yet. A global workspace is created on first
-    // use; there is no sandbox to attach to until then.
+    // Nothing has been created yet. The attach route creates the sandbox on
+    // first use, so there is no id to wait for before connecting.
     return workspace.state === 'recovering'
       ? { kind: 'starting' }
-      : { kind: 'no-sandbox' }
+      : { kind: 'not-created' }
   }
   const backend = input.backendTerminal
   if (backend && !backend.supported) {

@@ -384,7 +384,7 @@ describe('workspaceTerminalAvailability', () => {
         ...base,
         workspace: workspace({ sandbox_public_id: null, state: 'sleeping' }),
       }).kind
-    ).toBe('no-sandbox')
+    ).toBe('not-created')
   })
 
   test('a backend that reports no terminal support explains why', () => {

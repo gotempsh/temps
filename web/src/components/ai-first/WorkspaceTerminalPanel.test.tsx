@@ -98,6 +98,17 @@ describe('WorkspaceTerminalPanel', () => {
     expect(html).toContain('Wake and connect')
   })
 
+  test('a workspace with no sandbox yet is created by connecting', () => {
+    for (const applicationPublicId of [null, 'app_demo']) {
+      const html = renderPanel({
+        applicationPublicId,
+        workspace: workspace({ sandbox_public_id: null, state: 'sleeping' }),
+      })
+      expect(html).toContain('Create and connect')
+      expect(html).toContain('hasn&#x27;t been created yet')
+    }
+  })
+
   test('a role without sandboxes:exec is told exactly what is missing', () => {
     const html = renderPanel({ role: 'platform_admin' })
     expect(html).toContain('Your account can&#x27;t open a terminal')
@@ -164,7 +175,7 @@ describe('WorkspaceTerminalOnboarding', () => {
       { kind: 'no-permission', role: 'reader' },
       { kind: 'runtime-update-required', detail: 'update' },
       { kind: 'backend-unsupported', reason: 'no', setupCommand: null },
-      { kind: 'no-sandbox' },
+      { kind: 'not-created' },
       { kind: 'failed', detail: 'disk full' },
     ]
     for (const state of states) {
