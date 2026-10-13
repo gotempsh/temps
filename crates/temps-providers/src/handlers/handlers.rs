@@ -117,7 +117,8 @@ pub(crate) fn worker_node_required(
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -197,7 +198,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -254,7 +256,8 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -276,6 +279,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterMemberProvisioning { .. } => "Cluster Member Still Provisioning",
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
+        E::LockTimeout { .. } => "Service Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(

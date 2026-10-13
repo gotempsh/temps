@@ -479,6 +479,66 @@ async fn reserve_service_name(
         .map_err(ExternalServiceError::from)
 }
 
+/// Longest a service-config transaction waits for a row or advisory lock
+/// held by another transaction. Every holder of these locks is a short
+/// database transaction, so a wait this long means the holder is stuck;
+/// failing with [`ExternalServiceError::LockTimeout`] names the service and
+/// the operation where an unbounded wait would hang the request (and, in a
+/// test, the whole CI job) with nothing in the log.
+const SERVICE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open a transaction whose lock waits are capped at `timeout`.
+///
+/// `SET LOCAL` scopes the cap to this transaction, so it cannot leak onto
+/// the pooled connection's next user.
+async fn begin_bounded_transaction(
+    db: &DatabaseConnection,
+    service_id: i32,
+    operation: &'static str,
+    timeout: std::time::Duration,
+) -> Result<sea_orm::DatabaseTransaction, ExternalServiceError> {
+    use sea_orm::ConnectionTrait;
+    let txn = db.begin().await?;
+    // The value is an integer we format ourselves; `SET` cannot bind a
+    // parameter.
+    let statement = format!(
+        "SET LOCAL lock_timeout = '{}ms'",
+        timeout.as_millis().max(1)
+    );
+    if let Err(error) = txn.execute_unprepared(&statement).await {
+        let error = lock_timeout_or_database_error(service_id, operation, timeout, error.into());
+        return Err(rollback_before_error(txn, error).await);
+    }
+    Ok(txn)
+}
+
+/// Whether a database error message is Postgres's "lock_not_available"
+/// (SQLSTATE 55P03), which `lock_timeout` raises as "canceling statement
+/// due to lock timeout".
+fn is_lock_timeout_message(message: &str) -> bool {
+    message.contains("55P03") || message.contains("due to lock timeout")
+}
+
+/// Turn a lock-wait failure into [`ExternalServiceError::LockTimeout`];
+/// every other error passes through unchanged.
+fn lock_timeout_or_database_error(
+    service_id: i32,
+    operation: &'static str,
+    timeout: std::time::Duration,
+    error: ExternalServiceError,
+) -> ExternalServiceError {
+    match error {
+        ExternalServiceError::DatabaseError { reason } if is_lock_timeout_message(&reason) => {
+            ExternalServiceError::LockTimeout {
+                service_id,
+                operation,
+                timeout_secs: timeout.as_secs().max(1),
+            }
+        }
+        other => other,
+    }
+}
+
 /// `pg_advisory_xact_lock` key serializing cluster port-block reservation
 /// ("TEMPSPRT"), so two concurrent creations cannot pick the same block.
 const CLUSTER_PORT_LOCK_KEY: i64 = 0x5445_4D50_5350_5254;
@@ -743,6 +803,21 @@ pub enum ExternalServiceError {
     ClusterBusy {
         service_id: i32,
         action: &'static str,
+    },
+
+    /// A database lock this operation needs was still held by another
+    /// transaction after `timeout_secs`. The wait is bounded so a stuck
+    /// holder surfaces as this error naming the service and the operation,
+    /// not as a request that never returns. Nothing was changed.
+    #[error(
+        "Timed out after {timeout_secs}s waiting for a database lock while {operation} \
+         service {service_id}: another operation is holding it. Nothing was changed; \
+         retry once it finishes"
+    )]
+    LockTimeout {
+        service_id: i32,
+        operation: &'static str,
+        timeout_secs: u64,
     },
 
     #[error("Failed to delete service {id}: {reason}")]
@@ -4499,19 +4574,23 @@ impl ExternalServiceManager {
                 reason: format!("Failed to encrypt config: {}", e),
             })?;
 
-        let name_transaction = if let Some(new_name) = request.name.as_deref() {
-            let txn = self.db.begin().await?;
-            reserve_service_name(&txn, new_name, Some(service_id)).await?;
-            Some(txn)
-        } else {
-            None
-        };
+        // Fail fast on a taken name, before anything is stopped. This is a
+        // short transaction that is rolled back before any Docker work: the
+        // name lock is never held across a container call. The save below
+        // reserves the name again, atomically with the write.
+        if let Some(new_name) = request.name.as_deref() {
+            self.ensure_service_name_available(service_id, new_name)
+                .await?;
+        }
 
         // Update service config (and optionally name/slug) in database.
         // `name` was previously accepted by the request but silently dropped;
         // applying it here keeps the API contract honest.
         let mut service_update: external_services::ActiveModel = service.clone().into();
         service_update.config = Set(Some(encrypted_config));
+        // Set when the rename moves the service off a running container that
+        // is identified by its pre-rename name.
+        let mut pre_rename_instance: Option<Box<dyn ExternalService>> = None;
         if let Some(new_name) = request.name {
             if new_name != service.name {
                 // Reserving a database name does not grant ownership of an
@@ -4529,11 +4608,13 @@ impl ExternalServiceManager {
                 // current (pre-rename) name (see create_service_instance).
                 // initialize_service() below rebuilds its stop-then-recreate
                 // instance from whatever name is in the DB at that point --
-                // if we persist the rename first, it looks for a container
-                // under the *new* name, finds nothing, and the still-running
-                // old container is left holding the host port, so the new
+                // once the rename is saved, it looks for a container under
+                // the *new* name, finds nothing, and the still-running old
+                // container is left holding the host port, so the new
                 // container's start fails with "port is already allocated".
-                // Stop the old container by its pre-rename identity first.
+                // Build the instance for the pre-rename identity now (so a
+                // failure to build it stops nothing), and stop it after the
+                // rename is saved and before initialize_service().
                 let service_type_enum =
                     ServiceType::from_str(&service.service_type).map_err(|_| {
                         ExternalServiceError::InvalidServiceType {
@@ -4541,27 +4622,27 @@ impl ExternalServiceManager {
                             service_type: service.service_type.clone(),
                         }
                     })?;
-                let old_instance =
-                    self.create_service_instance(service.name.clone(), service_type_enum)?;
-                if let Err(e) = old_instance.stop().await {
-                    info!(
-                        "Could not stop pre-rename container for service {} (may not exist): {}",
-                        service_id, e
-                    );
-                }
+                pre_rename_instance =
+                    Some(self.create_service_instance(service.name.clone(), service_type_enum)?);
             }
             let new_slug = Self::generate_slug(&new_name);
             service_update.name = Set(new_name);
             service_update.slug = Set(Some(new_slug));
         }
         service_update.updated_at = Set(Utc::now());
-        if let Some(txn) = name_transaction {
-            self.persist_service_config_in_transaction(service_id, service_update, &txn)
-                .await?;
-            txn.commit().await?;
-        } else {
-            self.persist_service_config(service_id, service_update)
-                .await?;
+        // The save reserves the name and writes the row in one short
+        // transaction, so a name taken since the check above is refused
+        // before the original container is stopped.
+        self.persist_service_config(service_id, service_update)
+            .await?;
+
+        if let Some(old_instance) = pre_rename_instance {
+            if let Err(e) = old_instance.stop().await {
+                info!(
+                    "Could not stop pre-rename container for service {} (may not exist): {}",
+                    service_id, e
+                );
+            }
         }
 
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
@@ -7575,12 +7656,60 @@ echo "[restore] Pre-seed complete"
         service_id: i32,
         active: external_services::ActiveModel,
     ) -> Result<external_services::Model, ExternalServiceError> {
-        let txn = self.db.begin().await?;
-        let updated = self
+        let txn = begin_bounded_transaction(
+            &self.db,
+            service_id,
+            "saving the configuration of",
+            SERVICE_LOCK_TIMEOUT,
+        )
+        .await?;
+        let updated = match self
             .persist_service_config_in_transaction(service_id, active, &txn)
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                // Roll back now: leaving it to Drop keeps the row lock and
+                // the name's advisory lock until the connection is recycled.
+                let error = lock_timeout_or_database_error(
+                    service_id,
+                    "saving the configuration of",
+                    SERVICE_LOCK_TIMEOUT,
+                    error,
+                );
+                return Err(rollback_before_error(txn, error).await);
+            }
+        };
         txn.commit().await?;
         Ok(updated)
+    }
+
+    /// Refuse a service name that is already taken or reserved, without
+    /// keeping any lock: the check runs in a short transaction that is rolled
+    /// back before this returns, so callers can go on to Docker work.
+    async fn ensure_service_name_available(
+        &self,
+        service_id: i32,
+        name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        let txn = begin_bounded_transaction(
+            &self.db,
+            service_id,
+            "checking the new name of",
+            SERVICE_LOCK_TIMEOUT,
+        )
+        .await?;
+        if let Err(error) = reserve_service_name(&txn, name, Some(service_id)).await {
+            let error = lock_timeout_or_database_error(
+                service_id,
+                "checking the new name of",
+                SERVICE_LOCK_TIMEOUT,
+                error,
+            );
+            return Err(rollback_before_error(txn, error).await);
+        }
+        txn.rollback().await?;
+        Ok(())
     }
 
     async fn persist_service_config_in_transaction(
@@ -18922,22 +19051,11 @@ mod tests {
     }
 
     #[cfg(feature = "docker-tests")]
-    #[tokio::test]
-    async fn test_update_service_parameters() {
-        let (manager, _test_db) = setup_test_manager_or_skip!();
-
-        // Create a service first. Use an explicit unused port and unique names
-        // so the Postgres container (and its post-rename recreate) does not
-        // collide with the default port (5449) or another test's container name
-        // on the shared CI runner.
-        let random_unused_port = get_unused_port();
-        let ts = chrono::Utc::now().timestamp_millis();
-        let service_name = format!("test-update-{}", ts);
-        let renamed_name = format!("test-update-renamed-{}", ts);
+    fn postgres_create_request(name: &str, database: &str) -> CreateExternalServiceRequest {
         let mut params = HashMap::new();
         params.insert(
             "database".to_string(),
-            JsonValue::String("original_db".to_string()),
+            JsonValue::String(database.to_string()),
         );
         params.insert(
             "username".to_string(),
@@ -18947,31 +19065,81 @@ mod tests {
             "password".to_string(),
             JsonValue::String("original_pass".to_string()),
         );
+        // An explicit unused port keeps the container from colliding with the
+        // default port (5449) or another test's container on a shared runner.
         params.insert(
             "port".to_string(),
-            JsonValue::String(random_unused_port.to_string()),
+            JsonValue::String(get_unused_port().to_string()),
         );
-
-        let request = CreateExternalServiceRequest {
-            name: service_name,
+        CreateExternalServiceRequest {
+            name: name.to_string(),
             service_type: ServiceType::Postgres,
             version: None,
             parameters: params,
             node_id: None,
             topology: "standalone".to_string(),
             members: Vec::new(),
-        };
+        }
+    }
 
-        let service = manager.create_service(request).await.unwrap();
+    /// Whether another connection can take the advisory lock that serializes
+    /// writers of `name`. Runs on its own thread and runtime and is joined,
+    /// so the calling test's runtime is blocked meanwhile: a transaction the
+    /// service dropped without rolling back stays open here, exactly as it
+    /// does under a test database's synchronous cleanup (sea-orm only queues
+    /// the ROLLBACK, and a task on the blocked runtime would send it).
+    #[cfg(feature = "docker-tests")]
+    fn service_name_lock_is_free(database_url: &str, name: &str) -> Result<bool, String> {
+        let database_url = database_url.to_string();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start probe runtime: {e}"))?;
+            runtime.block_on(async {
+                use sea_orm::ConnectionTrait;
+                let conn = sea_orm::Database::connect(&database_url)
+                    .await
+                    .map_err(|e| format!("probe connection failed: {e}"))?;
+                let row = conn
+                    .query_one(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT pg_try_advisory_lock(hashtextextended('external-service-name:' || $1, 0)) AS free",
+                        [name.into()],
+                    ))
+                    .await
+                    .map_err(|e| format!("probe query failed: {e}"))?
+                    .ok_or_else(|| "probe query returned no row".to_string())?;
+                row.try_get::<bool>("", "free")
+                    .map_err(|e| format!("probe result unreadable: {e}"))
+            })
+        })
+        .join()
+        .map_err(|_| "probe thread panicked".to_string())?
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_update_service_parameters() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+
+        let service_name = format!("test-update-{}", chrono::Utc::now().timestamp_millis());
+        let service = manager
+            .create_service(postgres_create_request(&service_name, "original_db"))
+            .await
+            .unwrap();
         let service_id = service.id;
 
-        // Update only updateable fields — Postgres marks `database`,
+        // Update only updateable fields -- Postgres marks `database`,
         // `username`, `password`, and `host` as readonly (see
         // parameter_strategies.rs), so the request must not touch them or
         // the strategy rejects the whole update with a validation error.
-        // The test asserts the rename + docker_image path works.
+        // A rename is not part of this case: it is refused for a service that
+        // owns Docker resources (#1455), covered by
+        // `test_update_service_rename_refusal_leaves_no_lock_held`.
         let update_request = UpdateExternalServiceRequest {
-            name: Some(renamed_name.clone()),
+            name: None,
             parameters: HashMap::new(),
             docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         };
@@ -18982,8 +19150,7 @@ mod tests {
             "update_service failed: {:?}",
             updated_service.err()
         );
-        let updated = updated_service.unwrap();
-        assert_eq!(updated.name, renamed_name);
+        assert_eq!(updated_service.unwrap().name, service_name);
 
         // Sensitive readonly fields must NOT have been mutated.
         let params_after = manager.get_service_parameters(service_id).await.unwrap();
@@ -18995,6 +19162,200 @@ mod tests {
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
+    }
+
+    /// A refused rename is an early return from the middle of
+    /// `update_service`. It must not leave the destination name's lock held:
+    /// a transaction left to sea-orm's lazy Drop-time ROLLBACK keeps that
+    /// lock, and on a blocked current-thread runtime -- as in a test
+    /// database's synchronous cleanup -- is never rolled back at all, which
+    /// hung CI until the job's own timeout.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_update_service_rename_refusal_leaves_no_lock_held() {
+        let (manager, test_db) = setup_test_manager_or_skip!();
+
+        let ts = chrono::Utc::now().timestamp_millis();
+        let service_name = format!("test-refuse-{ts}");
+        let renamed_name = format!("test-refuse-renamed-{ts}");
+        let service = manager
+            .create_service(postgres_create_request(&service_name, "original_db"))
+            .await
+            .unwrap();
+
+        let refused = manager
+            .update_service(
+                service.id,
+                UpdateExternalServiceRequest {
+                    name: Some(renamed_name.clone()),
+                    parameters: HashMap::new(),
+                    docker_image: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                ExternalServiceError::DataSafetyRefusal { service_id, .. } if service_id == service.id
+            ),
+            "renaming a service that owns Docker resources must be refused: {refused:?}"
+        );
+
+        // Probed without yielding to this runtime, so a rollback that was
+        // only queued has not been sent yet.
+        let free = service_name_lock_is_free(&test_db.database_url, &renamed_name).unwrap();
+        assert!(
+            free,
+            "the refused rename left a transaction open holding the lock on '{renamed_name}'"
+        );
+        assert_eq!(
+            manager.get_service(service.id).await.unwrap().name,
+            service_name,
+            "a refused rename must not change the service's name"
+        );
+
+        // Cleanup
+        let _ = manager.delete_service(service.id).await;
+    }
+
+    /// A lock another transaction holds forever must surface as a typed
+    /// error naming the service and operation, not as a wait that never ends.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_bounded_transaction_gives_up_on_a_held_lock() {
+        use sea_orm::ConnectionTrait;
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                let error = format!("test database is unavailable: {error}");
+                if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                    eprintln!("Skipping Docker-dependent test: {error}");
+                    return;
+                }
+                panic!("Failed to set up test database: {error}");
+            }
+        };
+        let db = test_db.db.clone();
+        let advisory = "SELECT pg_advisory_xact_lock(7243)";
+
+        let holder = db.begin().await.unwrap();
+        holder.execute_unprepared(advisory).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let waiter = begin_bounded_transaction(
+            &db,
+            42,
+            "saving the configuration of",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        let waited = waiter.execute_unprepared(advisory).await;
+        let error = lock_timeout_or_database_error(
+            42,
+            "saving the configuration of",
+            std::time::Duration::from_millis(300),
+            waited.unwrap_err().into(),
+        );
+        assert!(
+            matches!(
+                error,
+                ExternalServiceError::LockTimeout {
+                    service_id: 42,
+                    operation: "saving the configuration of",
+                    ..
+                }
+            ),
+            "a held lock must surface as LockTimeout: {error:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the wait must be bounded by the lock timeout, took {:?}",
+            started.elapsed()
+        );
+
+        // The timeout aborts the waiter's transaction only; once the holder
+        // lets go, the same lock is available again.
+        let error = rollback_before_error(waiter, error).await;
+        assert!(matches!(error, ExternalServiceError::LockTimeout { .. }));
+        holder.rollback().await.unwrap();
+        let retry = begin_bounded_transaction(
+            &db,
+            42,
+            "saving the configuration of",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        retry.execute_unprepared(advisory).await.unwrap();
+        retry.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn lock_timeout_message_is_recognised() {
+        assert!(is_lock_timeout_message(
+            "Query Error: error returned from database: canceling statement due to lock timeout"
+        ));
+        assert!(is_lock_timeout_message("error with SQLSTATE 55P03"));
+        assert!(!is_lock_timeout_message(
+            "duplicate key value violates unique constraint"
+        ));
+    }
+
+    #[test]
+    fn only_lock_timeouts_are_reclassified() {
+        let timeout = std::time::Duration::from_secs(30);
+        let classified = lock_timeout_or_database_error(
+            9,
+            "saving the configuration of",
+            timeout,
+            ExternalServiceError::DatabaseError {
+                reason: "canceling statement due to lock timeout".to_string(),
+            },
+        );
+        match &classified {
+            ExternalServiceError::LockTimeout {
+                service_id,
+                operation,
+                timeout_secs,
+            } => {
+                assert_eq!(*service_id, 9);
+                assert_eq!(*operation, "saving the configuration of");
+                assert_eq!(*timeout_secs, 30);
+            }
+            other => panic!("expected LockTimeout, got {other:?}"),
+        }
+        let message = classified.to_string();
+        assert!(message.contains("service 9"), "{message}");
+        assert!(message.contains("saving the configuration of"), "{message}");
+        assert!(message.contains("30s"), "{message}");
+
+        let unrelated = lock_timeout_or_database_error(
+            9,
+            "saving the configuration of",
+            timeout,
+            ExternalServiceError::DatabaseError {
+                reason: "connection reset by peer".to_string(),
+            },
+        );
+        assert!(
+            matches!(unrelated, ExternalServiceError::DatabaseError { .. }),
+            "{unrelated:?}"
+        );
+        let other_variant = lock_timeout_or_database_error(
+            9,
+            "saving the configuration of",
+            timeout,
+            ExternalServiceError::ServiceNotFound { id: 9 },
+        );
+        assert!(
+            matches!(
+                other_variant,
+                ExternalServiceError::ServiceNotFound { id: 9 }
+            ),
+            "{other_variant:?}"
+        );
     }
 
     #[cfg(feature = "docker-tests")]
