@@ -31,7 +31,14 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { harnessSetupHref } from '@/pages/agent-sandbox/harness-onboarding'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
@@ -41,6 +48,9 @@ import {
   type ChatRuntimeSelection,
 } from '@/components/ai/chat-runtime-options'
 import { WorkspaceHarnessSetup } from './WorkspaceHarnessSetup'
+import { WorkspaceTerminalPanel } from './WorkspaceTerminalPanel'
+import { useWorkspaceWideLayout } from './use-workspace-wide-layout'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
 import { workspaceFirstTask } from './workspace-first-task'
 import { Textarea } from '@/components/ui/textarea'
@@ -159,6 +169,7 @@ import {
   threadTitleFromLiveEvent,
   workspacePageTitle,
 } from './thread-title-event'
+import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
@@ -338,6 +349,10 @@ function PersistentAiFirstWorkspace() {
   const [threadDialogOpen, setThreadDialogOpen] = useState(false)
   const [globalStartOpen, setGlobalStartOpen] = useState(false)
   const [rightView, setRightView] = useState<RightView>('generated')
+  const wideLayout = useWorkspaceWideLayout()
+  // Read the context directly: this screen is also rendered without an auth
+  // provider in tests, and a missing role only means "let the server decide".
+  const userRole = useContext(AuthContext)?.user?.role
   const [rightPanelOpen, setRightPanelOpen] = useState(false)
   const [leftPanelOpen, setLeftPanelOpen] = useState(false)
   const leftNavigationRef = useRef<HTMLElement | null>(null)
@@ -1042,6 +1057,49 @@ function PersistentAiFirstWorkspace() {
     refetchGlobalWorkspace,
   ])
 
+  // The Terminal view's Wake button. Same `resume` action the automatic wake
+  // uses, but user-initiated, so a failure is reported rather than retried.
+  const handleWakeWorkspace = useCallback(async () => {
+    if (
+      !activeApplicationId ||
+      workspaceWakeInFlight.current === activeApplicationId
+    ) {
+      return
+    }
+    workspaceWakeAttempted.current = activeApplicationId
+    workspaceWakeInFlight.current = activeApplicationId
+    setActiveWorkspaceWaking(true)
+    try {
+      const { data: resumed } = await controlApplicationWorkspace({
+        path: { application_public_id: activeApplicationId },
+        body: { action: 'resume' },
+        throwOnError: true,
+      })
+      queryClient.setQueryData<ApplicationWorkspaceResponse>(
+        applicationWorkspaceOptions.queryKey,
+        resumed
+      )
+    } catch (cause) {
+      toast.error('Could not wake the workspace', {
+        description: problemDetail(
+          cause,
+          'The workspace sandbox did not start. Open Workspace settings for details.'
+        ),
+      })
+      await refetchApplicationWorkspace()
+    } finally {
+      if (workspaceWakeInFlight.current === activeApplicationId) {
+        workspaceWakeInFlight.current = null
+        setActiveWorkspaceWaking(false)
+      }
+    }
+  }, [
+    activeApplicationId,
+    applicationWorkspaceOptions.queryKey,
+    queryClient,
+    refetchApplicationWorkspace,
+  ])
+
   const queriedWorkspace = activeApplicationId
     ? applicationWorkspaceQuery.data
     : globalWorkspaceQuery.data
@@ -1663,6 +1721,21 @@ function PersistentAiFirstWorkspace() {
       setThreadActionPending(null)
     }
   }
+
+  // The Terminal view holds a socket and a PTY size, so exactly one instance
+  // may exist: the docked aside and the mobile sheet are both in the tree.
+  const terminalPanel = (
+    <WorkspaceTerminalPanel
+      hasApplication={Boolean(activeApplication)}
+      key={activeApplication?.public_id ?? 'global-workspace'}
+      loading={activeWorkspaceStatusLoading}
+      onOpenWorkspaceSettings={() => setRightView('workspace')}
+      onWake={() => void handleWakeWorkspace()}
+      role={userRole}
+      waking={activeWorkspaceWaking}
+      workspace={activeWorkspaceStatus}
+    />
+  )
 
   return (
     <div className="fixed inset-0 z-40 overflow-hidden bg-background text-foreground antialiased">
@@ -2303,6 +2376,10 @@ function PersistentAiFirstWorkspace() {
                 uploadRoot={primaryWorkspaceUploadRoot}
                 importLimits={workspaceImportLimits}
               />
+            ) : rightView === 'terminal' ? (
+              wideLayout ? (
+                terminalPanel
+              ) : null
             ) : rightView === 'projects' && activeApplication ? (
               <ApplicationProjectsPanel
                 application={activeApplication}
@@ -2357,8 +2434,8 @@ function PersistentAiFirstWorkspace() {
           <SheetHeader className="sr-only">
             <SheetTitle>Application workspace</SheetTitle>
             <SheetDescription>
-              Inspect the application workspace, preview, projects, files, and
-              generated output.
+              Inspect the application workspace, preview, projects, files,
+              terminal, and generated output.
             </SheetDescription>
           </SheetHeader>
           <WorkspaceViewTabs
@@ -2389,6 +2466,10 @@ function PersistentAiFirstWorkspace() {
                 uploadRoot={primaryWorkspaceUploadRoot}
                 importLimits={workspaceImportLimits}
               />
+            ) : rightView === 'terminal' ? (
+              wideLayout ? null : (
+                terminalPanel
+              )
             ) : rightView === 'projects' && activeApplication ? (
               <ApplicationProjectsPanel
                 application={activeApplication}
@@ -2578,13 +2659,14 @@ export function WorkspaceViewTabs({
       icon: FolderTree,
       count: changedFileCount,
     },
+    { view: 'terminal', label: 'Terminal', icon: TerminalSquare },
     { view: 'workspace', label: 'Workspace', icon: Server },
   ]
 
   return (
     <div
       aria-label="Application workspace views"
-      className="grid h-14 shrink-0 grid-cols-4 border-b border-border bg-card px-1"
+      className="grid h-14 shrink-0 grid-cols-5 border-b border-border bg-card px-1"
       role="tablist"
     >
       {tabs.map((tab) => {

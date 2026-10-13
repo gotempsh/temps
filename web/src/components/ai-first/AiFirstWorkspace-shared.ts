@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 export type RightView =
-  'generated' | 'files' | 'preview' | 'projects' | 'workspace'
+  'generated' | 'files' | 'preview' | 'projects' | 'workspace' | 'terminal'
 
 export type ThreadListMode = 'active' | 'archived'
 

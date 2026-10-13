@@ -280,11 +280,12 @@ describe('WorkspaceViewTabs', () => {
       />
     )
 
-    expect(html).toContain('grid-cols-4')
+    expect(html).toContain('grid-cols-5')
     expect(html).not.toContain('overflow-x-auto')
     expect(html).toContain('Output')
     expect(html).toContain('Preview')
     expect(html).toContain('Files')
+    expect(html).toContain('Terminal')
     expect(html).toContain('Workspace')
     expect(html).not.toContain('Projects')
     expect(html).not.toContain('Settings')
@@ -301,8 +302,9 @@ describe('WorkspaceViewTabs', () => {
       />
     )
 
-    expect(html).toContain('grid-cols-4')
+    expect(html).toContain('grid-cols-5')
     expect(html).toContain('Output')
+    expect(html).toContain('Terminal')
     expect(html).toContain('Workspace')
     expect(html).toContain('Preview')
     expect(html).toContain('Files')
