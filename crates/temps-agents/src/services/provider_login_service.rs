@@ -391,7 +391,9 @@ impl ProviderLoginService {
         if session.is_terminal() {
             return Ok(session.view());
         }
-        let _ = session.commands.send(SessionCommand::Cancel).await;
+        // try_send: once the final save has begun nothing reads commands, and
+        // a full queue must not hang the caller.
+        let _ = session.commands.try_send(SessionCommand::Cancel);
         let mut phase = session.phase_tx.subscribe();
         let _ = tokio::time::timeout(
             Duration::from_secs(10),
@@ -486,14 +488,21 @@ impl Driver {
 
         let scratch = self.scratch_location()?;
         // The shared parents stay owned by the server (traversable, not
-        // writable, by the run user); only the per-sign-in leaf is handed over.
-        for dir in [self.state_root.clone(), self.state_root.join(&provider_id)] {
-            host_cli::ensure_shared_dir(&dir, &self.identity)
-                .map_err(|error| io_error("preparing the CLI state directory", error))?;
-        }
+        // writable, by the run user); only the per-sign-in leaf is handed
+        // over. The directory shared by every provider stays traversable on a
+        // root server: Codex runs as the server user, but Claude's run user
+        // must still reach its own provider directory below it.
+        host_cli::ensure_shared_dir(&self.state_root, host_cli::server_is_root())
+            .map_err(|error| io_error("preparing the CLI state directory", error))?;
+        host_cli::ensure_shared_dir(
+            &self.state_root.join(&provider_id),
+            self.identity.run_user.is_some(),
+        )
+        .map_err(|error| io_error("preparing the CLI state directory", error))?;
 
         // Start the CLI, staying responsive to cancellation while it spins up.
-        let begin = self.provider.begin_login(&scratch.config_dir);
+        let config_dir = scratch.config_dir.clone();
+        let begin = self.provider.begin_login(&config_dir);
         tokio::pin!(begin);
         let handle = loop {
             tokio::select! {
@@ -569,15 +578,70 @@ impl Driver {
             LoginPhase::Verifying,
             "The CLI finished. Confirming the sign-in.",
         );
-        let finish = self.finalize(&scratch);
-        match tokio::time::timeout_at(deadline, finish).await {
-            Ok(result) => result,
-            Err(_) => Err(timed_out()),
-        }
+        // Confirming the sign-in only reads; it can be cancelled or time out
+        // without changing anything.
+        let confirmed = {
+            let prepare = self.confirm_and_snapshot(&scratch);
+            tokio::pin!(prepare);
+            loop {
+                tokio::select! {
+                result = &mut prepare => break result?,
+                command = commands.recv() => match command {
+                    Some(SessionCommand::SubmitCode { reply, .. }) => {
+                        let _ = reply.send(Err(LoginError::NotWaitingForCode {
+                            provider_id: provider_id.clone(),
+                            phase: LoginPhase::Verifying.as_str().to_string(),
+                        }));
+                    }
+                    Some(SessionCommand::Cancel) | None => {
+                        return Err(LoginError::Cancelled { provider_id: provider_id.clone() });
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => return Err(timed_out()),
+                }
+            }
+        };
+
+        // From here the live home and the saved credential change together or
+        // not at all, so this step is not subject to cancellation or the
+        // deadline: it runs to completion in its own task and rolls the home
+        // back itself if saving fails.
+        self.session.set_phase(
+            LoginPhase::Verifying,
+            "Saving the sign-in. This last step can no longer be cancelled.",
+        );
+        let activation = tokio::spawn(activate_and_save(
+            self.sink.clone(),
+            self.actor.clone(),
+            provider_id.clone(),
+            scratch,
+            ProviderLocation::below_home(
+                &provider_id,
+                &host_cli::managed_home(&self.state_root, &provider_id),
+            )
+            .ok_or_else(|| LoginError::NotSupported {
+                provider_id: provider_id.clone(),
+            })?,
+            confirmed.credential,
+        ));
+        activation.await.map_err(|error| LoginError::Io {
+            provider_id: provider_id.clone(),
+            operation: "activating the new sign-in".to_string(),
+            reason: format!("the activation task ended unexpectedly: {error}"),
+        })??;
+
+        Ok(match confirmed.subscription_type.as_deref() {
+            Some(plan) if !plan.is_empty() => format!("Signed in ({plan} plan)."),
+            _ => "Signed in.".to_string(),
+        })
     }
 
-    /// Verify, snapshot, save and promote a finished sign-in.
-    async fn finalize(&self, scratch: &ProviderLocation) -> Result<String, LoginError> {
+    /// Confirm the sign-in with the CLI and take the access-token snapshot.
+    /// Read-only: nothing is activated or saved here.
+    async fn confirm_and_snapshot(
+        &self,
+        scratch: &ProviderLocation,
+    ) -> Result<ConfirmedSignIn, LoginError> {
         let provider_id = self.session.provider_id.as_str();
 
         let status = self.provider.verify_login(&scratch.config_dir).await?;
@@ -587,52 +651,64 @@ impl Driver {
                 installed: status.installed,
             });
         }
-
         let credential = read_snapshot(provider_id, scratch).await?;
-        let canonical = ProviderLocation::below_home(
-            provider_id,
-            &host_cli::managed_home(&self.state_root, provider_id),
-        )
-        .ok_or_else(|| LoginError::NotSupported {
-            provider_id: provider_id.to_string(),
-        })?;
-
-        // Activate the new home first and keep the previous one aside, then
-        // save the credential. If saving fails the previous home is restored,
-        // so the live CLI sign-in and the saved credential never describe
-        // different accounts and a failed sign-in changes nothing.
-        let promotion = promote(scratch, &canonical).map_err(|error| LoginError::Io {
-            provider_id: provider_id.to_string(),
-            operation: "activating the new sign-in".to_string(),
-            reason: error.to_string(),
-        })?;
-        let stored = self
-            .sink
-            .store(StoreLoginCredential {
-                provider_id,
-                auth_type: "subscription",
-                credential: &credential,
-                actor: &self.actor,
-            })
-            .await;
-        match stored {
-            Ok(()) => promotion.commit(),
-            Err(error) => {
-                if let Err(rollback) = promotion.rollback() {
-                    tracing::error!(
-                        provider_id,
-                        error = %rollback,
-                        "could not restore the previous CLI sign-in after the credential save failed"
-                    );
-                }
-                return Err(error);
-            }
-        }
-
-        Ok(match status.subscription_type.as_deref() {
-            Some(plan) if !plan.is_empty() => format!("Signed in ({plan} plan)."),
-            _ => "Signed in.".to_string(),
+        Ok(ConfirmedSignIn {
+            credential,
+            subscription_type: status.subscription_type,
         })
+    }
+}
+
+/// A sign-in the CLI confirmed, ready to be activated.
+struct ConfirmedSignIn {
+    /// Access-token-only snapshot JSON.
+    credential: String,
+    subscription_type: Option<String>,
+}
+
+/// Activate the new home and save its credential as one unit.
+///
+/// The new home replaces the live one with the previous home kept aside, then
+/// the credential is saved; a failed save restores the previous home. The
+/// [`Promotion`] also restores it if this future is dropped before the save
+/// completes, so the live CLI sign-in and the saved credential never describe
+/// different accounts.
+async fn activate_and_save(
+    sink: Arc<dyn LoginCredentialSink>,
+    actor: LoginActor,
+    provider_id: String,
+    scratch: ProviderLocation,
+    canonical: ProviderLocation,
+    credential: String,
+) -> Result<(), LoginError> {
+    let promotion = promote(&scratch, &canonical).map_err(|error| LoginError::Io {
+        provider_id: provider_id.clone(),
+        operation: "activating the new sign-in".to_string(),
+        reason: error.to_string(),
+    })?;
+    let stored = sink
+        .store(StoreLoginCredential {
+            provider_id: &provider_id,
+            auth_type: "subscription",
+            credential: &credential,
+            actor: &actor,
+        })
+        .await;
+    match stored {
+        Ok(()) => {
+            promotion.commit();
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback) = promotion.rollback() {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %rollback,
+                    "could not restore the previous CLI sign-in after the credential save failed"
+                );
+            }
+            Err(error)
+        }
     }
 }
 
@@ -667,28 +743,53 @@ async fn read_snapshot(
 
 /// A scratch home that has replaced the live one but is not yet final: the
 /// previous home is kept aside until the caller commits or rolls back.
+///
+/// Dropping a promotion that was neither committed nor rolled back restores
+/// the previous home, so an interrupted activation cannot leave the new
+/// account live.
 struct Promotion {
     scratch_home: PathBuf,
     live_home: PathBuf,
     previous: Option<PathBuf>,
+    finished: bool,
 }
 
 impl Promotion {
     /// Keep the new home and discard the previous one.
-    fn commit(self) {
-        if let Some(previous) = self.previous {
+    fn commit(mut self) {
+        self.finished = true;
+        if let Some(previous) = self.previous.take() {
             let _ = std::fs::remove_dir_all(previous);
         }
     }
 
     /// Put the previous home back and return the new one to its scratch path
     /// (where it is cleaned up with the rest of the failed attempt).
-    fn rollback(self) -> std::io::Result<()> {
+    fn rollback(mut self) -> std::io::Result<()> {
+        self.finished = true;
+        self.restore()
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
         std::fs::rename(&self.live_home, &self.scratch_home)?;
-        if let Some(previous) = self.previous {
+        if let Some(previous) = self.previous.take() {
             std::fs::rename(previous, &self.live_home)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Promotion {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Err(error) = self.restore() {
+            tracing::error!(
+                error = %error,
+                "could not restore the previous CLI sign-in after an interrupted activation"
+            );
+        }
     }
 }
 
@@ -723,6 +824,7 @@ fn promote(scratch: &ProviderLocation, canonical: &ProviderLocation) -> std::io:
         scratch_home: scratch.home.clone(),
         live_home: canonical.home.clone(),
         previous,
+        finished: false,
     })
 }
 
@@ -1474,6 +1576,65 @@ done
         assert!(canonical.config_dir.join("old").is_file());
         assert!(!canonical.config_dir.join("new").exists());
         assert!(scratch.config_dir.join("new").is_file());
+    }
+
+    #[test]
+    fn dropping_an_unfinished_promotion_restores_the_previous_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/home"))
+                .expect("canonical");
+        let scratch =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/login-1"))
+                .expect("scratch");
+        std::fs::create_dir_all(&canonical.config_dir).expect("old");
+        std::fs::write(canonical.config_dir.join("old"), "old").expect("old file");
+        std::fs::create_dir_all(&scratch.config_dir).expect("new");
+        std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
+
+        // An interrupted activation: the promotion goes away without a commit.
+        drop(promote(&scratch, &canonical).expect("promote"));
+
+        assert!(canonical.config_dir.join("old").is_file());
+        assert!(!canonical.config_dir.join("new").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_restores_the_previous_sign_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/home"))
+                .expect("canonical");
+        let scratch =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/login-1"))
+                .expect("scratch");
+        std::fs::create_dir_all(&canonical.config_dir).expect("old");
+        std::fs::write(canonical.config_dir.join("old"), "old").expect("old file");
+        std::fs::create_dir_all(&scratch.config_dir).expect("new");
+        std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
+
+        let sink = Arc::new(RecordingSink {
+            fail: true,
+            ..RecordingSink::default()
+        });
+        let error = activate_and_save(
+            sink,
+            LoginActor {
+                user_id: 1,
+                ip_address: None,
+                user_agent: "test".to_string(),
+            },
+            "claude_cli".to_string(),
+            scratch,
+            canonical.clone(),
+            "{}".to_string(),
+        )
+        .await
+        .expect_err("the sink refused the credential");
+
+        assert!(matches!(error, LoginError::CredentialImport { .. }));
+        assert!(canonical.config_dir.join("old").is_file());
+        assert!(!canonical.config_dir.join("new").exists());
     }
 
     #[tokio::test]

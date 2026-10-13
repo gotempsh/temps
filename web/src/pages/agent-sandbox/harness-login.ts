@@ -1,10 +1,38 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { z } from 'zod'
+
 /**
  * Presentation helpers for the console sign-in ("Sign in with Claude").
  * The server owns the state machine; these only turn its phases into words.
  */
+
+/** The server refuses codes longer than this (bytes; the alphabet is ASCII). */
+export const MAX_LOGIN_CODE_LENGTH = 2048
+
+/**
+ * The pasted authorization code. Mirrors the server's rules so an invalid
+ * paste is explained in the form rather than after a round trip: non-empty,
+ * at most 2 KiB, visible ASCII only (a space or line break could become a
+ * second answer to the CLI's prompt).
+ */
+export const loginCodeSchema = z.object({
+  code: z
+    .string()
+    .trim()
+    .min(1, 'Paste the code shown after approving access.')
+    .max(
+      MAX_LOGIN_CODE_LENGTH,
+      `The code is longer than ${MAX_LOGIN_CODE_LENGTH} characters. Copy only the code shown on the page.`
+    )
+    .regex(
+      /^[\x21-\x7e]+$/,
+      'The code may only contain visible ASCII characters, without spaces or line breaks.'
+    ),
+})
+
+export type LoginCodeFormValues = z.infer<typeof loginCodeSchema>
 
 export type LoginPhase =
   'starting' | 'waiting' | 'verifying' | 'succeeded' | 'failed' | 'cancelled'

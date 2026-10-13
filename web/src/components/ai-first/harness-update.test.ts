@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  harnessUpdateCheckProblem,
   harnessUpdateDetail,
   harnessUpdateHeadline,
   harnessUpdateRefetchInterval,
@@ -53,5 +54,39 @@ describe('harness update bar', () => {
     expect(harnessUpdateRefetchInterval(running)).toBe(3_000)
     expect(harnessUpdateRefetchInterval(available)).toBeGreaterThan(60_000)
     expect(harnessUpdateRefetchInterval(undefined)).toBeGreaterThan(60_000)
+  })
+
+  test('explains an unanswered check instead of hiding it', () => {
+    expect(harnessUpdateCheckProblem(undefined, 'Claude Code')).toBeNull()
+    expect(harnessUpdateCheckProblem(available, 'Claude Code')).toBeNull()
+    expect(
+      harnessUpdateCheckProblem(
+        { ...available, update_available: false },
+        'Claude Code'
+      )
+    ).toBeNull()
+    expect(
+      harnessUpdateCheckProblem(
+        {
+          installed_version: null,
+          latest_version: null,
+          update_available: false,
+          updating: false,
+          detail: 'The workspace is not running.',
+        },
+        'Claude Code'
+      )
+    ).toBe('The workspace is not running.')
+    expect(
+      harnessUpdateCheckProblem(
+        {
+          installed_version: '2.1.263',
+          latest_version: null,
+          update_available: false,
+          updating: false,
+        },
+        'Claude Code'
+      )
+    ).toContain('Claude Code')
   })
 })

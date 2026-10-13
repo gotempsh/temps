@@ -30,6 +30,19 @@ export interface LoginSession {
   timeout_seconds: number
 }
 
+/**
+ * Thrown by {@link ProviderLoginApi.start} when the server already has a
+ * sign-in running for the provider (HTTP 409). The flow resumes that sign-in
+ * instead of failing, which is what the recovery advice in
+ * {@link cancelAndExplain} tells the user to rely on.
+ */
+export class SignInAlreadyRunningError extends Error {
+  constructor(readonly providerId: string) {
+    super(`A sign-in is already running for ${providerId}`)
+    this.name = 'SignInAlreadyRunningError'
+  }
+}
+
 /** The four server operations the flow needs. */
 export interface ProviderLoginApi {
   start(providerId: string): Promise<LoginSession>
@@ -131,7 +144,14 @@ export async function runProviderLogin(
   options: LoginFlowOptions = {}
 ): Promise<LoginSession> {
   const pollIntervalMs = options.pollIntervalMs ?? 1000
-  let session = await api.start(providerId)
+  let session: LoginSession
+  try {
+    session = await api.start(providerId)
+  } catch (error) {
+    if (!(error instanceof SignInAlreadyRunningError)) throw error
+    io.log('A sign-in is already running for this provider; resuming it.')
+    session = await api.status(providerId)
+  }
   options.onCancelable?.(async () => {
     await api.cancel(providerId)
   })

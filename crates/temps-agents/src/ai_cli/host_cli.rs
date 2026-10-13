@@ -224,7 +224,7 @@ pub fn host_command(
 /// because they are verified to be real directories owned by the server
 /// before any permission change, a symlink planted earlier is refused rather
 /// than followed.
-pub fn ensure_shared_dir(path: &Path, identity: &HostIdentity) -> std::io::Result<()> {
+pub fn ensure_shared_dir(path: &Path, traversable_by_others: bool) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     std::fs::create_dir_all(path)?;
@@ -251,31 +251,50 @@ pub fn ensure_shared_dir(path: &Path, identity: &HostIdentity) -> std::io::Resul
             ),
         ));
     }
-    let mode = if identity.run_user.is_some() {
-        0o711
-    } else {
-        0o700
-    };
+    let mode = if traversable_by_others { 0o711 } else { 0o700 };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// True when the server runs as root and may therefore drop privileges for
+/// some providers' CLIs. The directory shared by every provider must then stay
+/// traversable: closing it for one provider (Codex runs as the server user)
+/// would lock out another's run user.
+pub fn server_is_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Create a brand-new directory owned by the server and locked to `0700`.
+///
+/// `path` must not exist and its parent must not be writable by the run user.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Give a directory the server just created to the run user, without
+/// following a symlink at `path`. A no-op when privileges are not dropped.
+pub fn hand_over_to_run_user(path: &Path, identity: &HostIdentity) -> std::io::Result<()> {
+    let Some(user) = identity.run_user.as_deref() else {
+        return Ok(());
+    };
+    let uid = lookup_id(user, "-u")?;
+    let gid = lookup_id(user, "-g")?;
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
 }
 
 /// Create a brand-new private directory and hand it to the run user.
 ///
-/// `path` must not exist: the leaf is made by the server inside a shared
-/// parent the run user cannot write to, locked to `0700`, and only then given
-/// to the run user with `lchown`, so there is no window in which the run user
-/// can substitute it.
+/// The leaf is made by the server inside a shared parent the run user cannot
+/// write to, locked to `0700`, and only then given to the run user with
+/// `lchown`, so there is no window in which the run user can substitute it.
+/// When the leaf must contain further directories, create those first with
+/// [`create_private_dir`] and hand everything over from the inside out.
 pub fn create_private_leaf(path: &Path, identity: &HostIdentity) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    if let Some(user) = identity.run_user.as_deref() {
-        let uid = lookup_id(user, "-u")?;
-        let gid = lookup_id(user, "-g")?;
-        std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
-    }
-    Ok(())
+    create_private_dir(path)?;
+    hand_over_to_run_user(path, identity)
 }
 
 /// Read a regular file at `relative` below `home` without following a symlink
@@ -342,7 +361,9 @@ pub fn read_regular_file_below(
         libc::openat(
             current.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            // O_NONBLOCK: opening a FIFO the run user planted must not wait
+            // for a writer; the file type is checked right after opening.
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -403,10 +424,17 @@ pub async fn prepare_login_location(
         operation: operation.to_string(),
         reason: error.to_string(),
     };
-    create_private_leaf(&location.home, identity)
+    // Create and lock both directories while the server still owns them, then
+    // hand them over from the inside out: once the home belongs to the run
+    // user it could swap a child for a symlink between a create and a chmod.
+    create_private_dir(&location.home)
         .map_err(|error| io_error("preparing the sign-in home directory", error))?;
-    create_private_leaf(&location.config_dir, identity)
+    create_private_dir(&location.config_dir)
         .map_err(|error| io_error("preparing the sign-in config directory", error))?;
+    hand_over_to_run_user(&location.config_dir, identity)
+        .map_err(|error| io_error("handing over the sign-in config directory", error))?;
+    hand_over_to_run_user(&location.home, identity)
+        .map_err(|error| io_error("handing over the sign-in home directory", error))?;
     if !run_user_can_write(identity, &location.config_dir).await {
         return Err(LoginError::StateDirectoryInaccessible {
             provider_id: provider_id.to_string(),
@@ -550,8 +578,7 @@ mod tests {
         let link = temp.path().join("shared");
         symlink(&target, &link).expect("symlink");
 
-        let error = ensure_shared_dir(&link, &HostIdentity::current())
-            .expect_err("a symlink must be refused");
+        let error = ensure_shared_dir(&link, false).expect_err("a symlink must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         // The symlink target was left exactly as it was.
         let mode = std::fs::metadata(&target)
@@ -567,17 +594,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().join("a").join("b");
-        let dropped = HostIdentity {
-            run_user: Some("temps".to_string()),
-        };
-        ensure_shared_dir(&dir, &dropped).expect("ensure");
+        ensure_shared_dir(&dir, true).expect("ensure");
         let mode = std::fs::metadata(&dir)
             .expect("metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o711);
-        ensure_shared_dir(&dir, &HostIdentity::current()).expect("idempotent");
+        ensure_shared_dir(&dir, false).expect("idempotent");
         let mode = std::fs::metadata(&dir)
             .expect("metadata")
             .permissions()
@@ -617,6 +641,29 @@ mod tests {
         std::fs::write(other.join(".credentials.json"), b"{\"stolen\":true}").expect("w");
         symlink(&other, &config).expect("symlink dir");
         assert!(read_regular_file_below(&home, &relative, 1024).is_err());
+    }
+
+    #[test]
+    fn credential_reads_do_not_block_on_a_planted_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).expect("config");
+        let fifo = home.join(".claude/.credentials.json");
+        let path = CString::new(fifo.as_os_str().as_bytes()).expect("path");
+        // SAFETY: `path` is a valid NUL-terminated string.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let relative = vec![".claude".to_string(), ".credentials.json".to_string()];
+        let started = std::time::Instant::now();
+        let result = read_regular_file_below(&home, &relative, 1024);
+        assert!(result.is_err(), "a FIFO is not a credential file");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "opening a FIFO must not wait for a writer"
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
 import { AlertTriangle, ExternalLink, Loader2 } from 'lucide-react'
 
@@ -23,8 +25,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
 import {
   formatElapsed,
@@ -32,7 +43,9 @@ import {
   isLoginTerminal,
   isSignInConflict,
   loginButtonLabel,
+  loginCodeSchema,
   loginPhaseTitle,
+  type LoginCodeFormValues,
 } from './harness-login'
 
 /** Render `code` spans from server hints such as "Install it with `…`". */
@@ -80,9 +93,17 @@ export function HarnessLoginPanel({
   const providerId = provider.id
   const queryKey = ['ai-provider-login', providerId] as const
   const [open, setOpen] = useState(false)
-  const [code, setCode] = useState('')
   const [startError, setStartError] = useState<string | null>(null)
   const announcedSession = useRef<string | null>(null)
+  // The first session this panel sees may be an old, finished one (the server
+  // keeps it, and so does the query cache). Only a sign-in that finishes while
+  // the panel is mounted is announced, otherwise reopening this panel to
+  // replace a credential would report the previous success again.
+  const baselineTaken = useRef(false)
+  const codeForm = useForm<LoginCodeFormValues>({
+    resolver: zodResolver(loginCodeSchema),
+    defaultValues: { code: '' },
+  })
 
   const sessionQuery = useQuery({
     queryKey,
@@ -115,7 +136,7 @@ export function HarnessLoginPanel({
     onMutate: () => setStartError(null),
     onSuccess: (data) => {
       queryClient.setQueryData(queryKey, data)
-      setCode('')
+      codeForm.reset({ code: '' })
       setOpen(true)
     },
     onError: (error) => {
@@ -148,7 +169,7 @@ export function HarnessLoginPanel({
     },
     onSuccess: (data) => {
       queryClient.setQueryData(queryKey, data)
-      setCode('')
+      codeForm.reset({ code: '' })
     },
     onError: (error) => {
       toast.error('Could not submit the code', {
@@ -180,7 +201,15 @@ export function HarnessLoginPanel({
   const phase = session?.phase
   const sessionId = session?.session_id
   useEffect(() => {
-    if (phase !== 'succeeded' || !sessionId) return
+    if (!phase || !sessionId) return
+    if (!baselineTaken.current) {
+      baselineTaken.current = true
+      if (isLoginTerminal(phase)) {
+        announcedSession.current = sessionId
+        return
+      }
+    }
+    if (phase !== 'succeeded') return
     if (announcedSession.current === sessionId) return
     announcedSession.current = sessionId
     toast.success(`${provider.name} signed in`)
@@ -265,10 +294,11 @@ export function HarnessLoginPanel({
 
           <div className="space-y-4" aria-live="polite">
             {!session && sessionQuery.isPending && (
-              <p className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" />
-                Loading sign-in…
-              </p>
+              <div className="space-y-3" aria-busy="true">
+                <Skeleton className="h-4 w-40" />
+                <Skeleton className="h-8 w-56" />
+                <Skeleton className="h-4 w-3/4" />
+              </div>
             )}
 
             {session?.phase === 'starting' && (
@@ -322,39 +352,49 @@ export function HarnessLoginPanel({
                 )}
 
                 {requiresCode && session.phase === 'waiting' && (
-                  <form
-                    className="space-y-1.5"
-                    onSubmit={(event) => {
-                      event.preventDefault()
-                      if (code.trim()) submitMutation.mutate(code.trim())
-                    }}
-                  >
-                    <Label htmlFor={`login-code-${providerId}`}>
-                      2. Paste the code shown after approving
-                    </Label>
-                    <div className="flex gap-2">
-                      <Input
-                        id={`login-code-${providerId}`}
-                        type="password"
-                        autoComplete="off"
-                        spellCheck={false}
-                        placeholder="Paste code"
-                        value={code}
-                        disabled={submitted}
-                        onChange={(event) => setCode(event.target.value)}
-                      />
-                      <Button
-                        type="submit"
-                        size="sm"
-                        disabled={submitted || !code.trim()}
-                      >
-                        {submitted && (
-                          <Loader2 className="mr-1.5 size-4 animate-spin" />
+                  <Form {...codeForm}>
+                    <form
+                      className="space-y-1.5"
+                      onSubmit={codeForm.handleSubmit((values) =>
+                        submitMutation.mutate(values.code)
+                      )}
+                    >
+                      <FormField
+                        control={codeForm.control}
+                        name="code"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>
+                              2. Paste the code shown after approving
+                            </FormLabel>
+                            <div className="flex gap-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="password"
+                                  autoComplete="off"
+                                  spellCheck={false}
+                                  placeholder="Paste code"
+                                  disabled={submitted}
+                                />
+                              </FormControl>
+                              <Button
+                                type="submit"
+                                size="sm"
+                                disabled={submitted}
+                              >
+                                {submitted && (
+                                  <Loader2 className="mr-1.5 size-4 animate-spin" />
+                                )}
+                                Submit
+                              </Button>
+                            </div>
+                            <FormMessage />
+                          </FormItem>
                         )}
-                        Submit
-                      </Button>
-                    </div>
-                  </form>
+                      />
+                    </form>
+                  </Form>
                 )}
 
                 {!requiresCode && session.phase === 'waiting' && (

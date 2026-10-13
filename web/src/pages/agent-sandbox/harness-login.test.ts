@@ -7,7 +7,9 @@ import {
   isLoginActive,
   isLoginTerminal,
   loginButtonLabel,
+  loginCodeSchema,
   loginPhaseTitle,
+  MAX_LOGIN_CODE_LENGTH,
 } from './harness-login'
 
 describe('harness login helpers', () => {
@@ -41,5 +43,19 @@ describe('harness login helpers', () => {
     expect(loginPhaseTitle('waiting', 'Claude Code')).toBe('Waiting for you')
     expect(loginPhaseTitle('failed', 'Claude Code')).toBe('Sign-in failed')
     expect(loginPhaseTitle('starting', 'Claude Code')).toContain('Claude Code')
+  })
+
+  test('the pasted code is validated like the server does', () => {
+    const parse = (code: string) => loginCodeSchema.safeParse({ code })
+    expect(parse('abc123#state').success).toBe(true)
+    // Surrounding whitespace from a copy is trimmed, not rejected.
+    const trimmed = parse('  abc123  ')
+    expect(trimmed.success && trimmed.data.code).toBe('abc123')
+    expect(parse('   ').success).toBe(false)
+    expect(parse('two words').success).toBe(false)
+    expect(parse('line\nbreak').success).toBe(false)
+    expect(parse('caf\u00e9').success).toBe(false)
+    expect(parse('a'.repeat(MAX_LOGIN_CODE_LENGTH)).success).toBe(true)
+    expect(parse('a'.repeat(MAX_LOGIN_CODE_LENGTH + 1)).success).toBe(false)
   })
 })

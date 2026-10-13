@@ -6,6 +6,7 @@ import {
   LoginFlowError,
   progressLogger,
   runProviderLogin,
+  SignInAlreadyRunningError,
   type LoginIo,
   type LoginPhase,
   type LoginSession,
@@ -205,6 +206,42 @@ describe('runProviderLogin', () => {
     expect(message).toContain('may keep running')
     // One retry before giving up.
     expect(calls.filter((call) => call === 'cancel')).toHaveLength(2)
+  })
+
+  test('resumes the sign-in that is already running instead of failing', async () => {
+    const { api, calls, submitted } = fakeApi([
+      session('waiting', { verification_url: LINK }),
+      session('verifying'),
+      session('succeeded', { detail: 'Signed in.' }),
+    ])
+    api.start = async () => {
+      calls.push('start')
+      throw new SignInAlreadyRunningError('claude_cli')
+    }
+    const { io, lines } = fakeIo()
+
+    const result = await runProviderLogin(api, io, 'claude_cli', {
+      pollIntervalMs: 0,
+    })
+
+    expect(result.phase).toBe('succeeded')
+    expect(calls[0]).toBe('start')
+    expect(calls[1]).toBe('status')
+    expect(submitted).toEqual(['good-code'])
+    expect(lines.some((line) => line.includes('resuming'))).toBe(true)
+    expect(lines.some((line) => line.includes(LINK))).toBe(true)
+  })
+
+  test('other start failures still propagate', async () => {
+    const { api } = fakeApi([session('succeeded')])
+    api.start = async () => {
+      throw new Error('429 too many sign-ins')
+    }
+    const { io } = fakeIo()
+
+    await expect(
+      runProviderLogin(api, io, 'claude_cli', { pollIntervalMs: 0 })
+    ).rejects.toThrow('429')
   })
 
   test('an empty code reports a failed cancel too', async () => {

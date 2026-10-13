@@ -693,14 +693,22 @@ rewrite any path inside it. The server therefore never `chown`s, `chmod`s or
 reads through a path inside `home/` with a symlink-following call:
 
 - `<data dir>/ai-cli` and `<data dir>/ai-cli/<provider>` stay owned by the
-  server (`0711`: traversable, not writable, by the run user) and are refused
-  if they are not real directories owned by the server;
-- each sign-in's scratch home is created by the server, locked to `0700` and
-  handed over with `lchown`; promotion renames the whole scratch home over the
-  live one, two renames of entries the run user cannot substitute;
-- credential files are read component by component with `O_NOFOLLOW`, so a
-  planted `.claude` or `.credentials.json` symlink cannot make the server
-  import another account's token;
+  server and are refused if they are not real directories owned by the server.
+  On a root server `<data dir>/ai-cli` is always `0711` (traversable, not
+  writable, by a run user) because it is shared by every provider: Codex runs
+  as the server user, but signing in to it must not close the directory to
+  Claude's run user. Only a provider directory whose CLI drops privileges is
+  `0711`; the others are `0700`;
+- each sign-in's scratch home and its config directory are created by the
+  server and locked to `0700` *before* anything is handed to the run user, then
+  handed over with `lchown` from the inside out, so the run user never owns a
+  parent in which the server still creates or `chmod`s a child. Promotion
+  renames the whole scratch home over the live one, two renames of entries the
+  run user cannot substitute;
+- credential files are read component by component with `O_NOFOLLOW` and the
+  leaf is opened `O_NONBLOCK`, so a planted `.claude` or `.credentials.json`
+  symlink cannot make the server import another account's token and a planted
+  FIFO cannot hang a blocking read;
 - Codex, which runs as the server user, keeps its directories owned by the
   server user instead of being handed to an unprivileged user that a root
   process would then execute configuration from.
@@ -738,7 +746,12 @@ Design: **one holder of the refresh token, access-token-only fan-out.**
    the live one, with the previous home kept aside; the access-token snapshot is
    then saved and, if saving fails, the previous home is restored. A failed or
    cancelled attempt therefore never changes the live sign-in, and the saved
-   credential and the live CLI home never describe different accounts.
+   credential and the live CLI home never describe different accounts. Cancel
+   and the deadline are honoured while the CLI runs and while the sign-in is
+   being confirmed; once the home swap starts, the swap and the save run to
+   completion in their own task (a swap that is interrupted regardless restores
+   the previous home when its guard is dropped), and the dialog says that
+   last step can no longer be cancelled.
 
 Known limits: a workspace turn holds its access token for the whole turn (a
 turn that outlives the remaining validity fails and must be retried); the
@@ -759,6 +772,16 @@ completion and the credential file it writes; that Anthropic and OpenAI refresh
 tokens rotate (assumed, which is the safe direction); that a one-token request
 makes each CLI refresh an expiring token; and that `CLAUDE_CODE_OAUTH_TOKEN`
 accepts a sign-in access token.
+
+### Scope of the CLI update action
+
+The update bar acts on the persistent workspace that model discovery uses,
+because that is the CLI whose version decides which models the picker offers. It
+is shown where that workspace is configured, not above an application's first
+task: an application's turns run in a separate workspace that does not exist yet
+at that point, so updating the discovery workspace there would report an update
+that the application's CLI never receives. Updating an application workspace's
+CLI is not covered and is a follow-up.
 
 ## Alternatives considered
 

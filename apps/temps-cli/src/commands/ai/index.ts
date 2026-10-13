@@ -19,6 +19,7 @@ import {
   LoginFlowError,
   progressLogger,
   runProviderLogin,
+  SignInAlreadyRunningError,
   type LoginSession,
   type ProviderLoginApi,
 } from './provider-login.js'
@@ -123,13 +124,17 @@ function providerLoginApi(): ProviderLoginApi {
     return result.data
   }
   return {
-    start: async (providerId) =>
-      unwrap(
-        await startAiProviderLogin({
-          client,
-          path: { provider_id: providerId },
-        })
-      ),
+    start: async (providerId) => {
+      const result = await startAiProviderLogin({
+        client,
+        path: { provider_id: providerId },
+      })
+      // 409: a sign-in is already running; the flow resumes it.
+      if (result.response?.status === 409) {
+        throw new SignInAlreadyRunningError(providerId)
+      }
+      return unwrap(result)
+    },
     status: async (providerId) =>
       unwrap(
         await getAiProviderLogin({ client, path: { provider_id: providerId } })

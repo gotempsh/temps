@@ -8,6 +8,8 @@ export interface HarnessUpdateView {
   latest_version?: string | null
   update_available: boolean
   updating: boolean
+  /** Why the versions could not be determined, when they could not. */
+  detail?: string | null
 }
 
 /** How long a cached check stays fresh in the console before a re-check. */
@@ -25,6 +27,24 @@ export function shouldShowHarnessUpdate(
   status: HarnessUpdateView | undefined
 ): boolean {
   return Boolean(status && (status.update_available || status.updating))
+}
+
+/**
+ * Why the version check came back without an answer, or null when it did
+ * answer (an update is available, running, or both versions are known).
+ * An unanswered check is shown rather than hidden, so a failed check is not
+ * mistaken for a current CLI.
+ */
+export function harnessUpdateCheckProblem(
+  status: HarnessUpdateView | undefined,
+  providerName: string
+): string | null {
+  if (!status || status.update_available || status.updating) return null
+  if (status.installed_version && status.latest_version) return null
+  return (
+    status.detail ||
+    `Could not determine the installed and latest ${providerName} versions.`
+  )
 }
 
 /** "2.1.263 → 2.1.296", or the available version alone when unknown. */
