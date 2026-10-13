@@ -73,6 +73,25 @@ pub(crate) fn latest_version_command(package: HarnessPackage) -> Vec<String> {
     )
 }
 
+/// Whether the sandbox user can replace a global npm package itself.
+///
+/// Current runtime images install the harness CLIs into a prefix the sandbox
+/// user owns, so the update must run as that user: root running npm inside a
+/// tree the sandbox controls would follow sandbox-planted links and leave
+/// root-owned files that break the CLI's own self-update. Older images
+/// installed them as root, where only a root update can succeed. The probe
+/// runs as the sandbox user and exits 0 only when it can write there.
+pub(crate) fn install_writable_probe_command() -> Vec<String> {
+    bounded(
+        VERSION_COMMAND_TIMEOUT.as_secs().saturating_sub(10).max(1),
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"test -w "$(npm config get prefix)/lib/node_modules""#.to_string(),
+        ],
+    )
+}
+
 pub(crate) fn update_command(package: HarnessPackage) -> Vec<String> {
     bounded(
         UPDATE_COMMAND_TIMEOUT.as_secs().saturating_sub(30),
@@ -168,6 +187,19 @@ mod tests {
             &update[5..8],
             ["install", "-g", "@anthropic-ai/claude-code@latest"]
         );
+    }
+
+    #[test]
+    fn the_writable_probe_is_a_fixed_bounded_command() {
+        let probe = install_writable_probe_command();
+        assert_eq!(&probe[..5], ["timeout", "-k", "10", "10", "sh"]);
+        assert_eq!(probe[5], "-c");
+        // Nothing request-derived may reach the script.
+        assert_eq!(
+            probe[6],
+            r#"test -w "$(npm config get prefix)/lib/node_modules""#
+        );
+        assert_eq!(probe.len(), 7);
     }
 
     #[test]

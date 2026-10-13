@@ -2049,8 +2049,8 @@ impl AgentCliAiService {
     }
 
     /// Resolve the principal's persistent workspace and run `command` in it,
-    /// bounded by `timeout`. `as_root` is for the update only: the harness is
-    /// installed globally by the managed image.
+    /// bounded by `timeout`. `as_root` is for the update only, and only for
+    /// images that installed the harness as root.
     async fn run_in_workspace(
         &self,
         principal_id: i32,
@@ -2146,16 +2146,48 @@ impl AgentCliAiService {
         // inside the sandbox (`timeout`), so it cannot outlive its slot.
         let handle = resolved.handle.clone();
         let command = hu::update_command(package);
+        // Pick the account the install runs as. A prefix the sandbox user
+        // owns is updated by that user; only an older root-owned install is
+        // updated as root. A probe that cannot run is an error, never a
+        // reason to fall back to root.
+        let probe = tokio::time::timeout(
+            hu::VERSION_COMMAND_TIMEOUT,
+            sandbox_provider.exec(
+                &handle,
+                hu::install_writable_probe_command(),
+                HashMap::new(),
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!(
+                "checking whether the {} install is writable timed out after {}s",
+                package.binary,
+                hu::VERSION_COMMAND_TIMEOUT.as_secs()
+            ),
+        })?
+        .map_err(|error| map_agent_error(purpose, error))?;
+        let as_root = probe.exit_code != 0;
         // The task hands the slot and the mark back when the install ends so
         // the caller keeps both through the version check below: nothing may
         // run in the workspace, or start another update, until the installed
         // version has been read.
         let task = tokio::spawn(async move {
-            let outcome = tokio::time::timeout(
-                hu::UPDATE_COMMAND_TIMEOUT,
-                sandbox_provider.exec_as_root(&handle, command, HashMap::new(), None),
-            )
-            .await;
+            let outcome = if as_root {
+                tokio::time::timeout(
+                    hu::UPDATE_COMMAND_TIMEOUT,
+                    sandbox_provider.exec_as_root(&handle, command, HashMap::new(), None),
+                )
+                .await
+            } else {
+                tokio::time::timeout(
+                    hu::UPDATE_COMMAND_TIMEOUT,
+                    sandbox_provider.exec(&handle, command, HashMap::new(), None),
+                )
+                .await
+            };
             (outcome, slot, guard)
         });
         let (outcome, _slot, _guard) = task.await.map_err(|error| AiError::Provider {
@@ -8656,6 +8688,261 @@ mod tests {
         assert_eq!(destroys.load(Ordering::SeqCst), 1);
         assert_eq!(execs.load(Ordering::SeqCst), 1);
         assert!(!provider_called.load(Ordering::SeqCst));
+    }
+
+    /// Records which account ran the harness install, so the update tests can
+    /// prove the sandbox user is preferred and root is only the fallback.
+    struct HarnessUpdateSandbox {
+        /// Exit status of the "can the sandbox user write the install" probe.
+        probe_exit_code: i32,
+        probe_fails_to_run: bool,
+        user_updates: Arc<AtomicUsize>,
+        root_updates: Arc<AtomicUsize>,
+    }
+
+    impl HarnessUpdateSandbox {
+        fn answer(&self, command: &[String]) -> temps_agents::sandbox::SandboxExecResult {
+            let joined = command.join(" ");
+            let (exit_code, stdout) = if joined.contains("test -w") {
+                (self.probe_exit_code, String::new())
+            } else if joined.contains("npm view") {
+                (0, "2.1.296\n".to_string())
+            } else if joined.contains("--version") {
+                (0, "2.1.296 (Claude Code)\n".to_string())
+            } else {
+                (0, String::new())
+            };
+            temps_agents::sandbox::SandboxExecResult {
+                exit_code,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+
+        fn is_update(command: &[String]) -> bool {
+            command.windows(2).any(|pair| pair == ["npm", "install"])
+        }
+    }
+
+    #[async_trait]
+    impl SandboxProvider for HarnessUpdateSandbox {
+        async fn create(
+            &self,
+            _config: SandboxCreateConfig,
+        ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
+            Err(AgentError::SandboxCreationFailed {
+                run_id: 0,
+                provider: "test".into(),
+                reason: "a harness update must adopt the managed handle".into(),
+            })
+        }
+
+        async fn exec(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            command: Vec<String>,
+            _environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+            if self.probe_fails_to_run && command.join(" ").contains("test -w") {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: "harness-update-test".into(),
+                    reason: "synthetic probe failure".into(),
+                });
+            }
+            if Self::is_update(&command) {
+                self.user_updates.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(self.answer(&command))
+        }
+
+        async fn exec_as_root(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            command: Vec<String>,
+            _environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+            if Self::is_update(&command) {
+                self.root_updates.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(self.answer(&command))
+        }
+
+        async fn is_alive(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+        ) -> Result<bool, AgentError> {
+            Ok(true)
+        }
+
+        async fn write_file(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn read_file(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _local_dir: &Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn kill_processes(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _pattern: &str,
+            _signal: temps_agents::sandbox::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn destroy(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _purge_volumes: bool,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn recover(
+            &self,
+            _run_id: i32,
+        ) -> Result<Option<temps_agents::sandbox::SandboxHandle>, AgentError> {
+            Ok(None)
+        }
+
+        fn name(&self) -> &str {
+            "harness-update-test"
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "test-image".into()))
+        }
+
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            Ok("test-image".into())
+        }
+    }
+
+    /// Runs `update_workspace_harness` against a sandbox whose install probe
+    /// and failure mode are configured; returns the result plus the number of
+    /// installs run as the sandbox user and as root.
+    async fn run_harness_update(
+        probe_exit_code: i32,
+        probe_fails_to_run: bool,
+    ) -> (Result<temps_ai::HarnessUpdateStatus, AiError>, usize, usize) {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let workspace_root = scratch.path().join("ai-applications");
+        let workspace_path = workspace_root.join("global-user-42");
+        std::fs::create_dir_all(&workspace_path).expect("managed workspace path");
+        let handle = test_sandbox_handle();
+        let resolver = SandboxWorkspaceResolverSlot::new();
+        assert!(resolver.set(Arc::new(move |principal_id| {
+            let handle = handle.clone();
+            let workspace_path = workspace_path.clone();
+            Box::pin(async move {
+                assert_eq!(principal_id, 42);
+                Ok(ResolvedSandboxWorkspace {
+                    workspace: temps_ai::HarnessWorkspace {
+                        sandbox_label: handle.sandbox_name.clone(),
+                        host_work_dir: workspace_path,
+                    },
+                    handle,
+                    stop: Arc::new(|| Box::pin(async { Ok(()) })),
+                })
+            })
+        })));
+        let user_updates = Arc::new(AtomicUsize::new(0));
+        let root_updates = Arc::new(AtomicUsize::new(0));
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(HarnessUpdateSandbox {
+            probe_exit_code,
+            probe_fails_to_run,
+            user_updates: user_updates.clone(),
+            root_updates: root_updates.clone(),
+        });
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().join("cli-scratch"),
+            Duration::from_secs(30),
+            1,
+        )
+        .with_temps_sandbox(
+            sandbox,
+            workspace_root,
+            Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(SandboxModelRelayService::new().expect("model relay")),
+            resolver,
+        );
+        let result = service.update_workspace_harness("claude_cli", 42).await;
+        (
+            result,
+            user_updates.load(Ordering::SeqCst),
+            root_updates.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn harness_update_runs_as_the_sandbox_user_when_it_owns_the_install() {
+        let (result, as_user, as_root) = run_harness_update(0, false).await;
+
+        let status = result.expect("update succeeds");
+        assert_eq!(status.installed_version.as_deref(), Some("2.1.296"));
+        assert_eq!(
+            (as_user, as_root),
+            (1, 0),
+            "root must never run npm inside a tree the sandbox user owns"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_update_falls_back_to_root_for_a_root_owned_install() {
+        let (result, as_user, as_root) = run_harness_update(1, false).await;
+
+        assert!(
+            result.is_ok(),
+            "older images are still updatable: {result:?}"
+        );
+        assert_eq!((as_user, as_root), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn harness_update_does_not_guess_when_the_probe_cannot_run() {
+        let (result, as_user, as_root) = run_harness_update(0, true).await;
+
+        assert!(
+            result.is_err(),
+            "an unreadable install state must not update"
+        );
+        assert_eq!(
+            (as_user, as_root),
+            (0, 0),
+            "an unknown install owner must never default to a root install"
+        );
     }
 
     #[test]
