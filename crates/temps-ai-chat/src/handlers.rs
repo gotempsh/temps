@@ -3472,13 +3472,8 @@ pub async fn create_application_conversation(
         // opening one needs, so a role that could never attach is refused here
         // instead of being handed a thread that cannot connect.
         permission_guard!(auth, SandboxesExec);
-        ensure_application_project_permission(
-            &auth,
-            &state.project_access_checker,
-            &project_ids,
-            &Permission::SandboxesExec,
-        )
-        .await?;
+        ensure_workspace_terminal_permissions(&auth, &state.project_access_checker, &project_ids)
+            .await?;
         let conversation = state
             .service
             .create_terminal_conversation(
@@ -11676,6 +11671,33 @@ mod tests {
         ensure_workspace_terminal_permissions(&auth, &allowed, &[7])
             .await
             .expect("project write, sandbox write and sandbox exec allow a shell");
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_requires_project_sandbox_write_like_attach_does() {
+        // Create and attach share this check, so a project role that holds
+        // exec but not sandbox write cannot be handed a thread it can never
+        // open.
+        let auth = custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]);
+        let without_sandbox_write: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsWrite.to_string(),
+                    Permission::SandboxesExec.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+
+        let error = ensure_workspace_terminal_permissions(&auth, &without_sandbox_write, &[7])
+            .await
+            .expect_err("a project role without sandbox write must not get a terminal");
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
