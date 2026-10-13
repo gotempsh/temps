@@ -12898,11 +12898,17 @@ dependencies = [
 name = "temps-clickhouse"
 version = "0.1.0-beta.57"
 dependencies = [
+ "chrono",
  "clickhouse",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
  "serde",
+ "temps-core",
+ "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
