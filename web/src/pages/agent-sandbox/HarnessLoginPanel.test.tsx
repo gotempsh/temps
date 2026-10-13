@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ProviderCatalogDto } from '@/api/client'
 import { HarnessLoginPanel } from './HarnessLoginPanel'
+import { isSignInConflict } from './harness-login'
 
 const provider: ProviderCatalogDto = {
   id: 'claude_cli',
@@ -57,5 +58,18 @@ describe('HarnessLoginPanel', () => {
   test('never renders a code field before a sign-in has started', () => {
     const html = render()
     expect(html).not.toContain('Paste code')
+  })
+
+  test('recognizes the already-in-progress conflict so it can resume', () => {
+    expect(
+      isSignInConflict({
+        title: 'Sign-in Already In Progress',
+        detail: "A sign-in for 'claude_cli' is already in progress",
+      })
+    ).toBe(true)
+    expect(isSignInConflict({ status: 409 })).toBe(true)
+    expect(isSignInConflict({ title: 'Sign-in Failed' })).toBe(false)
+    expect(isSignInConflict(null)).toBe(false)
+    expect(isSignInConflict('boom')).toBe(false)
   })
 })

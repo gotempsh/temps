@@ -30,6 +30,7 @@ import {
   formatElapsed,
   isLoginActive,
   isLoginTerminal,
+  isSignInConflict,
   loginButtonLabel,
   loginPhaseTitle,
 } from './harness-login'
@@ -92,9 +93,12 @@ export function HarnessLoginPanel({
       })
       return data
     },
-    // Only poll while the dialog is open; a 404 simply means no sign-in yet.
-    enabled: open,
+    // Always look for an existing sign-in on mount: a reload or tab switch
+    // while one is running must offer to resume it rather than start a second
+    // one (the server refuses with 409). A 404 simply means none yet. Polling
+    // continues only while the sign-in is active.
     retry: false,
+    refetchOnWindowFocus: false,
     refetchInterval: (query) =>
       isLoginActive(query.state.data?.phase) ? POLL_INTERVAL_MS : false,
   })
@@ -115,6 +119,13 @@ export function HarnessLoginPanel({
       setOpen(true)
     },
     onError: (error) => {
+      // The server already has a sign-in for this provider (started from
+      // another tab or before a reload): show it instead of failing.
+      if (isSignInConflict(error)) {
+        void queryClient.invalidateQueries({ queryKey })
+        setOpen(true)
+        return
+      }
       const detail = problemDetail(
         error,
         'Could not start the sign-in. Check that the CLI is installed on this server.'

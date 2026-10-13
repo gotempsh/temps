@@ -58,3 +58,16 @@ export function loginButtonLabel(providerName: string): string {
   const short = providerName.split(/[\s(]/)[0] || providerName
   return `Sign in with ${short}`
 }
+
+/** Title of the server's 409 problem when a sign-in is already running. */
+const ALREADY_IN_PROGRESS_TITLE = 'Sign-in Already In Progress'
+
+/**
+ * True when an API error is the server's "already in progress" conflict. The
+ * problem body carries a title but not always a status, so match the title.
+ */
+export function isSignInConflict(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const problem = error as { status?: unknown; title?: unknown }
+  return problem.title === ALREADY_IN_PROGRESS_TITLE || problem.status === 409
+}
