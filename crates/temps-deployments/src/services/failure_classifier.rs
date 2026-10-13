@@ -1353,6 +1353,11 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "per-entry limit",
                 "component depth limit",
                 "download limit",
+                // Bundle and direct-source jobs state their size limits in
+                // their own words.
+                "exceeds maximum allowed decompressed size",
+                "byte per-file limit",
+                "byte aggregate limit",
                 "disallowed type",
                 "symbolic link",
                 "non-regular filesystem entry",
@@ -2597,6 +2602,22 @@ mod tests {
             "❌ Failed to deploy static files: Static deployment source contains a symbolic link: /tmp/x/dist/link",
         );
         assert_class(&publish, S::Deploy, C::StaticOutputRejected);
+    }
+
+    #[test]
+    fn bundle_and_source_size_limits_are_rejected_output() {
+        let bundle = wrapped(
+            "deploy_static_bundle",
+            "Archive exceeds maximum allowed decompressed size of 2147483648 bytes",
+        );
+        assert_class(&bundle, S::Deploy, C::StaticOutputRejected);
+        for inner in [
+            "❌ Failed to deploy static files: file 'assets/video.mp4' exceeds the 524288000 byte per-file limit",
+            "❌ Failed to deploy static files: deployment exceeds the 2147483648 byte aggregate limit",
+        ] {
+            let reason = wrapped("deploy_static", inner);
+            assert_class(&reason, S::Deploy, C::StaticOutputRejected);
+        }
     }
 
     #[test]
