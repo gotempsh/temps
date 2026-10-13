@@ -446,9 +446,17 @@ async fn send_error(
 /// Top-level: bind the Unix socket and accept forever. Returns only on bind
 /// error or explicit shutdown (SIGTERM from docker-init).
 pub async fn run(socket_path: &str) -> io::Result<()> {
-    // Clean stale socket from a previous run. Safe because the agent is
-    // the only process that binds here; if another instance is actually
-    // running, `bind` below will fail with EADDRINUSE which we surface.
+    // Refuse to displace a live agent. Removing the socket file and binding
+    // a new one would succeed even with another instance running, silently
+    // orphaning every tab it owns — a second `temps-pty-agent` started by a
+    // careless bootstrap must be a no-op, not an outage. Only a socket that
+    // nothing answers on is stale and safe to clear.
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("a temps-pty-agent is already listening on {socket_path}"),
+        ));
+    }
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     // 0600 — only the `temps` user should be able to connect. docker exec
@@ -477,6 +485,20 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_refuses_to_displace_a_live_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let _live = tokio::net::UnixListener::bind(&path).expect("bind");
+
+        let err = run(&path.to_string_lossy())
+            .await
+            .expect_err("a second agent must not start");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        // The live listener's socket file must be untouched.
+        assert!(path.exists());
+    }
 
     #[test]
     fn ring_push_and_tail_under_capacity() {
