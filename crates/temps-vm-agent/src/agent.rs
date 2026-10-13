@@ -56,16 +56,45 @@ pub fn run() {
     serve();
 }
 
+/// One pseudo-filesystem mounted at boot: `(source, target, fstype, data)`.
+type MountSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+);
+
+/// Pseudo-filesystems mounted when running as PID 1, in order.
+///
+/// `devpts` must follow `devtmpfs`: the guest boots straight into this
+/// binary (no distro init), and without a devpts instance `openpty(3)` — and
+/// therefore every terminal tab — fails. `/dev/ptmx` comes from devtmpfs and
+/// resolves its slaves through the sibling `/dev/pts`; `ptmxmode=0666` lets
+/// non-root users open it.
+const BOOT_MOUNTS: &[MountSpec] = &[
+    ("proc", "/proc", "proc", None),
+    ("sysfs", "/sys", "sysfs", None),
+    ("devtmpfs", "/dev", "devtmpfs", None),
+    (
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        Some("mode=0620,ptmxmode=0666"),
+    ),
+    ("tmpfs", "/tmp", "tmpfs", None),
+    ("tmpfs", "/run", "tmpfs", None),
+];
+
 /// Minimal boot-time setup when running as PID 1.
 fn setup_system() {
     for dir in ["/proc", "/sys", "/dev", "/tmp", "/run", WORK_DIR] {
         let _ = std::fs::create_dir_all(dir);
     }
-    mount("proc", "/proc", "proc");
-    mount("sysfs", "/sys", "sysfs");
-    mount("devtmpfs", "/dev", "devtmpfs");
-    mount("tmpfs", "/tmp", "tmpfs");
-    mount("tmpfs", "/run", "tmpfs");
+    for (src, target, fstype, data) in BOOT_MOUNTS {
+        // `/dev/pts` only exists once devtmpfs is mounted over `/dev`.
+        let _ = std::fs::create_dir_all(target);
+        mount(src, target, fstype, *data);
+    }
     unsafe {
         let name = b"sandbox";
         libc::sethostname(name.as_ptr() as *const libc::c_char, name.len());
@@ -104,17 +133,19 @@ fn interface_up(name: &str) {
     }
 }
 
-fn mount(src: &str, target: &str, fstype: &str) {
+fn mount(src: &str, target: &str, fstype: &str, data: Option<&str>) {
     let src = std::ffi::CString::new(src).unwrap();
     let target_c = std::ffi::CString::new(target).unwrap();
     let fstype = std::ffi::CString::new(fstype).unwrap();
+    let data = data.map(|d| std::ffi::CString::new(d).unwrap());
     let rc = unsafe {
         libc::mount(
             src.as_ptr(),
             target_c.as_ptr(),
             fstype.as_ptr(),
             0,
-            std::ptr::null(),
+            data.as_ref()
+                .map_or(std::ptr::null(), |d| d.as_ptr() as *const libc::c_void),
         )
     };
     if rc != 0 {
@@ -594,6 +625,22 @@ fn kill_matching(pattern: &str, signal: i32) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_mounts_provide_devpts_after_devtmpfs() {
+        // Without devpts every `openpty` — and so every terminal tab — fails
+        // in a guest that boots straight into this binary.
+        let position = |fstype: &str| {
+            BOOT_MOUNTS
+                .iter()
+                .position(|(_, _, t, _)| *t == fstype)
+                .unwrap_or_else(|| panic!("{fstype} is not mounted at boot"))
+        };
+        assert!(position("devpts") > position("devtmpfs"));
+        let (_, target, _, data) = BOOT_MOUNTS[position("devpts")];
+        assert_eq!(target, "/dev/pts");
+        assert!(data.is_some_and(|d| d.contains("ptmxmode=")), "{data:?}");
+    }
 
     #[test]
     fn relay_slots_are_bounded_and_returned_on_drop() {
