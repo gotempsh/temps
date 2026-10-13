@@ -41,6 +41,16 @@ pub struct MigrationRetryPolicy {
     /// Each delay is stretched by up to this many percent so several
     /// subsystems that failed together do not retry in lockstep.
     pub jitter_percent: u32,
+    /// Deadline for one migration attempt. An attempt that exceeds it is
+    /// dropped and counted as a retryable failure, so a stalled connection
+    /// (a half-open socket, a server that accepted the request and went
+    /// quiet) cannot wedge the loop on one attempt forever. Generous, because
+    /// a legitimate migration can rewrite a large table: it only has to be
+    /// finite.
+    pub attempt_timeout: Duration,
+    /// How long a caller without a Tokio runtime waits for the *first*
+    /// attempt before startup continues without the migrations.
+    pub startup_wait: Duration,
 }
 
 impl Default for MigrationRetryPolicy {
@@ -51,6 +61,8 @@ impl Default for MigrationRetryPolicy {
                 .with_max_delay(Duration::from_secs(60)),
             decode_interval: Duration::from_secs(120),
             jitter_percent: 20,
+            attempt_timeout: Duration::from_secs(600),
+            startup_wait: Duration::from_secs(30),
         }
     }
 }
@@ -84,14 +96,41 @@ impl MigrationRetryPolicy {
 /// whatever its outcome, so a caller can wait for one attempt without waiting
 /// out the backoff.
 ///
+/// Each attempt runs under `policy.attempt_timeout`; expiry is a retryable
+/// failure like any other, so the loop always reaches its next attempt.
 /// Every attempt is logged with its attempt count. Failures are classified
 /// from the error's message with [`classify_message`], which is what the
 /// per-crate error types preserve of a ClickHouse failure.
 pub async fn retry_until_applied<T, E, F, Fut>(
     subsystem: &str,
     policy: &MigrationRetryPolicy,
-    mut apply: F,
+    apply: F,
     first_attempt_done: Option<tokio::sync::oneshot::Sender<()>>,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    retry_loop(
+        subsystem,
+        policy,
+        apply,
+        first_attempt_done.map(|done| {
+            Box::new(move || {
+                // The receiver is gone once startup stopped waiting.
+                let _ = done.send(());
+            }) as Box<dyn FnOnce() + Send>
+        }),
+    )
+    .await
+}
+
+async fn retry_loop<T, E, F, Fut>(
+    subsystem: &str,
+    policy: &MigrationRetryPolicy,
+    mut apply: F,
+    first_attempt_done: Option<Box<dyn FnOnce() + Send>>,
 ) -> T
 where
     F: FnMut() -> Fut,
@@ -101,10 +140,15 @@ where
     let mut first_attempt_done = first_attempt_done;
     let mut attempt: u32 = 1;
     loop {
-        let result = apply().await;
+        let result = match tokio::time::timeout(policy.attempt_timeout, apply()).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err(format!(
+                "ClickHouse migration attempt timed out after {}s",
+                policy.attempt_timeout.as_secs()
+            )),
+        };
         if let Some(done) = first_attempt_done.take() {
-            // The receiver is gone once startup stopped waiting; nothing to do.
-            let _ = done.send(());
+            done();
         }
         match result {
             Ok(applied) => {
@@ -117,8 +161,7 @@ where
                 }
                 return applied;
             }
-            Err(error) => {
-                let message = error.to_string();
+            Err(message) => {
                 let kind = classify_message(&message);
                 let delay = policy.jittered(policy.base_delay(attempt, kind));
                 if kind.persists_until_config_changes() {
@@ -160,8 +203,9 @@ where
 /// the thread, where a bare `tokio::spawn` panics; there the retry loop runs
 /// on its own named thread with a private current-thread runtime, and this
 /// call waits for the *first* attempt only (as the one-shot code it replaces
-/// did), so a healthy server is migrated before first use while an unhealthy
-/// one never blocks startup beyond that attempt.
+/// did), so a healthy server is migrated before first use, but never longer
+/// than `policy.startup_wait`, so an unhealthy or stalled one cannot hold
+/// startup.
 pub fn spawn_retrying<T, E, F, Fut, D>(
     subsystem: &'static str,
     policy: MigrationRetryPolicy,
@@ -182,7 +226,8 @@ pub fn spawn_retrying<T, E, F, Fut, D>(
             });
         }
         Err(_) => {
-            let (first_attempt_done, first_attempt) = tokio::sync::oneshot::channel();
+            let startup_wait = policy.startup_wait;
+            let (first_attempt_done, first_attempt) = std::sync::mpsc::channel::<()>();
             let spawned = std::thread::Builder::new()
                 .name(format!("temps-ch-migrate-{subsystem}"))
                 .spawn(move || {
@@ -191,11 +236,14 @@ pub fn spawn_retrying<T, E, F, Fut, D>(
                         .build()
                     {
                         Ok(runtime) => runtime.block_on(async move {
-                            let applied = retry_until_applied(
+                            let applied = retry_loop(
                                 subsystem,
                                 &policy,
                                 apply,
-                                Some(first_attempt_done),
+                                Some(Box::new(move || {
+                                    // The receiver is gone once startup stopped waiting.
+                                    let _ = first_attempt_done.send(());
+                                })),
                             )
                             .await;
                             on_applied(applied);
@@ -209,11 +257,18 @@ pub fn spawn_retrying<T, E, F, Fut, D>(
                     }
                 });
             match spawned {
-                // Returns as soon as the first attempt has finished, or at
-                // once if the thread could not build its runtime.
-                Ok(_) => {
-                    let _ = first_attempt.blocking_recv();
-                }
+                // Returns once the first attempt has finished, at once if the
+                // thread could not build its runtime (the sender is dropped),
+                // and never later than `startup_wait`: past that, startup
+                // continues and the loop keeps going in the background.
+                Ok(_) => match first_attempt.recv_timeout(startup_wait) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => warn!(
+                        subsystem,
+                        wait_secs = startup_wait.as_secs(),
+                        "ClickHouse migrations are still running; starting without them"
+                    ),
+                },
                 Err(error) => warn!(
                     subsystem,
                     %error,
@@ -432,5 +487,72 @@ mod tests {
         // Returned after one failed attempt, long before the 5 s backoff.
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(attempts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_attempt_is_cut_off_and_retried() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let started = tokio::time::Instant::now();
+        let policy = MigrationRetryPolicy {
+            attempt_timeout: Duration::from_secs(10),
+            ..MigrationRetryPolicy::default()
+        };
+
+        let applied = retry_until_applied(
+            "test",
+            &policy,
+            || {
+                let attempts = attempts.clone();
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        // A server that accepted the request and went quiet.
+                        std::future::pending::<Result<u32, String>>().await
+                    } else {
+                        Ok(n)
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            applied, 2,
+            "the second attempt ran after the first timed out"
+        );
+        // 10 s deadline, then the 5 s backoff (plus up to 20% jitter).
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_secs(15), "{waited:?}");
+        assert!(waited <= Duration::from_secs(16), "{waited:?}");
+    }
+
+    #[test]
+    fn a_timed_out_attempt_is_classified_as_transient() {
+        let message = format!(
+            "ClickHouse migration attempt timed out after {}s",
+            MigrationRetryPolicy::default().attempt_timeout.as_secs()
+        );
+        assert_eq!(classify_message(&message), FailureKind::Unreachable);
+    }
+
+    #[test]
+    fn without_a_runtime_a_stalled_first_attempt_does_not_hold_startup_past_the_wait() {
+        let policy = MigrationRetryPolicy {
+            startup_wait: Duration::from_millis(200),
+            ..MigrationRetryPolicy::default()
+        };
+        let started = std::time::Instant::now();
+
+        spawn_retrying(
+            "test",
+            policy,
+            || std::future::pending::<Result<(), String>>(),
+            |()| {},
+        );
+
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(waited < Duration::from_secs(3), "{waited:?}");
     }
 }

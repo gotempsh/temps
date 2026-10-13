@@ -99,12 +99,52 @@ impl CompressionMethod {
         }
     }
 
-    /// The method byte of the first block of `body` (the 17th byte), if the
-    /// body is long enough to hold one.
+    /// The codec of the first compressed block in `body`, or `None` when
+    /// `body` does not start with one.
+    ///
+    /// A block is `[16-byte checksum][1-byte method][u32 LE compressed size]
+    /// [u32 LE uncompressed size][payload]`, where the compressed size counts
+    /// the 9 header bytes and the payload. A body is accepted only when the
+    /// method byte is one ClickHouse defines *and* the declared sizes are
+    /// consistent with the bytes actually present, so a long plain-text or
+    /// HTML body (a proxy's error page, say) is not mistaken for a block whose
+    /// 17th byte happens to be some character.
     pub fn from_body(body: &[u8]) -> Option<Self> {
-        body.get(CHECKSUM_LEN).copied().map(Self::from_byte)
+        let header = body.get(CHECKSUM_LEN..CHECKSUM_LEN + BLOCK_HEADER_LEN)?;
+        let method = header[0];
+        let compressed_size = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+        let uncompressed_size = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
+
+        if !is_known_method_byte(method) {
+            return None;
+        }
+        if (compressed_size as usize) < BLOCK_HEADER_LEN
+            || compressed_size > MAX_BLOCK_SIZE
+            || uncompressed_size > MAX_BLOCK_SIZE
+        {
+            return None;
+        }
+        // The first block must be fully present in the body.
+        if CHECKSUM_LEN + compressed_size as usize > body.len() {
+            return None;
+        }
+        Some(Self::from_byte(method))
     }
 }
+
+/// Method bytes ClickHouse defines: NONE `0x02`, LZ4 `0x82`, ZSTD `0x90`,
+/// and the multi-codec / specialised codecs in `0x91..=0x9f`.
+fn is_known_method_byte(byte: u8) -> bool {
+    matches!(byte, 0x02 | 0x82 | 0x90..=0x9f)
+}
+
+/// Bytes of block header after the checksum: method, compressed size,
+/// uncompressed size.
+const BLOCK_HEADER_LEN: usize = 9;
+
+/// Largest compressed or uncompressed block size accepted; the `clickhouse`
+/// client's decoder uses the same 1 GiB bound.
+const MAX_BLOCK_SIZE: u32 = 1024 * 1024 * 1024;
 
 /// Size of the checksum that precedes every compressed block.
 const CHECKSUM_LEN: usize = 16;
@@ -174,7 +214,10 @@ pub fn classify_message(message: &str) -> FailureKind {
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("decompression error") {
         FailureKind::Decode
-    } else if lowered.contains("network error") || lowered.contains("timeout expired") {
+    } else if lowered.contains("network error")
+        || lowered.contains("timeout expired")
+        || lowered.contains("timed out")
+    {
         FailureKind::Unreachable
     } else if lowered.contains("code: ") || lowered.contains("bad response") {
         FailureKind::Server
@@ -305,18 +348,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn method_byte_is_read_after_the_checksum() {
+    /// A well-formed block: checksum, method byte, compressed and
+    /// uncompressed sizes (the compressed size counts the 9 header bytes and
+    /// the payload, not the checksum), then the payload.
+    fn block(method: u8, payload: &[u8]) -> Vec<u8> {
         let mut body = vec![0xAA; CHECKSUM_LEN];
-        body.push(0x90);
-        body.extend_from_slice(&[0, 0, 0, 0]);
+        body.push(method);
+        body.extend_from_slice(&((BLOCK_HEADER_LEN + payload.len()) as u32).to_le_bytes());
+        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(payload);
+        body
+    }
+
+    #[test]
+    fn method_byte_is_read_from_a_well_formed_block() {
+        for (method, expected) in [
+            (0x82, CompressionMethod::Lz4),
+            (0x90, CompressionMethod::Zstd),
+            (0x02, CompressionMethod::None),
+            (0x91, CompressionMethod::Other(0x91)),
+        ] {
+            assert_eq!(
+                CompressionMethod::from_body(&block(method, b"0123456789")),
+                Some(expected),
+                "method byte {method:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_plain_text_body_is_not_mistaken_for_a_block() {
+        // A proxy's error page: far longer than a block header, every byte a
+        // printable character, so byte 17 is "something" but not a codec.
+        let html = b"<html><head><title>502 Bad Gateway</title></head><body>\
+                     <h1>502 Bad Gateway</h1><p>upstream unavailable</p></body></html>";
+        assert!(html.len() > 64);
+        assert_eq!(CompressionMethod::from_body(html), None);
+
+        // Even where the 17th byte happens to be a method byte that ClickHouse
+        // defines, text does not declare consistent sizes.
+        let mut text = b"0123456789abcdef".to_vec();
+        text.push(0x90);
+        text.extend_from_slice(b" plain text that keeps going for a good while longer");
+        assert_eq!(CompressionMethod::from_body(&text), None);
+    }
+
+    #[test]
+    fn an_inconsistent_or_unknown_block_header_is_rejected() {
+        // Declares more payload than the body holds (a truncated response).
+        let mut truncated = block(0x82, b"0123456789");
+        truncated.truncate(truncated.len() - 4);
+        assert_eq!(CompressionMethod::from_body(&truncated), None);
+
+        // A method byte ClickHouse does not define.
         assert_eq!(
-            CompressionMethod::from_body(&body),
-            Some(CompressionMethod::Zstd)
+            CompressionMethod::from_body(&block(0x41, b"0123456789")),
+            None
         );
-        // Too short to hold a block header: a plain-text error body, say.
+
+        // Compressed size smaller than its own header.
+        let mut tiny = block(0x82, b"0123456789");
+        tiny[CHECKSUM_LEN + 1..CHECKSUM_LEN + 5].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(CompressionMethod::from_body(&tiny), None);
+
+        // Sizes beyond the 1 GiB bound.
+        let mut huge = block(0x82, b"0123456789");
+        huge[CHECKSUM_LEN + 5..CHECKSUM_LEN + 9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(CompressionMethod::from_body(&huge), None);
+    }
+
+    #[test]
+    fn a_body_too_short_to_hold_a_header_has_no_method() {
         assert_eq!(CompressionMethod::from_body(b"Code: 60"), None);
         assert_eq!(CompressionMethod::from_body(&[]), None);
+        // Exactly a checksum and a method byte, but no sizes.
+        let mut short = vec![0xAA; CHECKSUM_LEN];
+        short.push(0x90);
+        assert_eq!(CompressionMethod::from_body(&short), None);
     }
 
     #[test]
