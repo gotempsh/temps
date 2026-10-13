@@ -556,22 +556,34 @@ impl FirecrackerSandboxProvider {
                 }
             }
             let _ = std::fs::remove_file(&tar_path);
+            // Everything below touches paths *the image controls*: a custom
+            // image may make `etc`, `sbin` or the agent files themselves
+            // symlinks (absolute ones included) to host paths. Plain
+            // `join` + `remove_file`/`copy` would follow them out of the
+            // rootfs and delete or overwrite host files, so every path is
+            // resolved the way a chroot would and files are created
+            // exclusively (see `rootfs_resolve`).
             for artifact in [".dockerenv", "etc/resolv.conf", "etc/hostname", "etc/hosts"] {
-                let _ = std::fs::remove_file(rootfs_for_task.join(artifact));
+                let _ = rootfs_remove(&rootfs_for_task, Path::new(artifact));
             }
-            let sbin = rootfs_for_task.join("sbin");
-            std::fs::create_dir_all(&sbin).map_err(|e| e.to_string())?;
-            std::fs::copy(&agent_src, sbin.join("temps-vm-agent")).map_err(|e| e.to_string())?;
+            rootfs_inject(
+                &rootfs_for_task,
+                Path::new("sbin/temps-vm-agent"),
+                &agent_src,
+            )
+            .map_err(|e| e.to_string())?;
             if let Some(pty_src) = &pty_agent_src {
-                // Same directory as the VM agent; `copy` keeps the staged
-                // file's executable bit. The guest's PID 1 re-asserts root
+                // Same directory as the VM agent; the staged file's
+                // executable bit is kept. The guest's PID 1 re-asserts root
                 // ownership of it at every boot (the rootfs is built
                 // unprivileged, so the file carries the host user's uid)
                 // before supervising it.
-                std::fs::copy(pty_src, sbin.join("temps-pty-agent")).map_err(|e| e.to_string())?;
+                rootfs_inject(&rootfs_for_task, Path::new("sbin/temps-pty-agent"), pty_src)
+                    .map_err(|e| e.to_string())?;
             }
-            std::fs::create_dir_all(rootfs_for_task.join(&workdir_rel))
+            let workdir = rootfs_resolve(&rootfs_for_task, Path::new(&workdir_rel))
                 .map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
             Ok(dir_size(&rootfs_for_task))
         })
         .await
@@ -2408,6 +2420,131 @@ async fn vsock_connect(sock: &Path, port: u32) -> std::io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Resolve `rel` inside `root` the way a chroot at `root` would, without
+/// ever leaving it, and return the real path under `root`.
+///
+/// Image contents are untrusted: any component may be a symlink, absolute
+/// targets included (`etc -> /etc`), and `..` may try to climb out. A plain
+/// `root.join(rel)` followed by a filesystem call follows those links onto
+/// the *host*. Here an absolute target restarts at `root`, `..` stops at
+/// `root`, and the walk is bounded so a link cycle fails instead of looping.
+/// Components that do not exist yet are kept as plain names.
+///
+/// The result is only symlink-free for the components that existed when it
+/// was computed, which is sufficient because extraction has finished and the
+/// tree is private to this process.
+fn rootfs_resolve(root: &Path, rel: &Path) -> std::io::Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    #[derive(Debug)]
+    enum Part {
+        Parent,
+        Name(OsString),
+    }
+
+    fn parts_of(path: &Path) -> Vec<Part> {
+        path.components()
+            .filter_map(|c| match c {
+                Component::ParentDir => Some(Part::Parent),
+                Component::Normal(name) => Some(Part::Name(name.to_os_string())),
+                // `/`, prefixes and `.` carry no name to resolve.
+                Component::RootDir | Component::Prefix(_) | Component::CurDir => None,
+            })
+            .collect()
+    }
+
+    let mut pending: VecDeque<Part> = parts_of(rel).into();
+    let mut resolved = PathBuf::new();
+    let mut hops = 0usize;
+    while let Some(part) = pending.pop_front() {
+        match part {
+            Part::Parent => {
+                // At the root `..` is the root, as in a real chroot.
+                resolved.pop();
+            }
+            Part::Name(name) => {
+                let candidate = root.join(&resolved).join(&name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "too many symbolic links resolving {} inside the image rootfs",
+                                    rel.display()
+                                ),
+                            ));
+                        }
+                        let target = std::fs::read_link(&candidate)?;
+                        if target.is_absolute() {
+                            resolved.clear();
+                        }
+                        for part in parts_of(&target).into_iter().rev() {
+                            pending.push_front(part);
+                        }
+                    }
+                    _ => resolved.push(name),
+                }
+            }
+        }
+    }
+    Ok(root.join(resolved))
+}
+
+/// Remove `rel` from the image rootfs without following symlinks out of it.
+/// A missing entry is not an error; a symlink at the final component is
+/// removed itself, never its target.
+fn rootfs_remove(root: &Path, rel: &Path) -> std::io::Result<()> {
+    let Some(name) = rel.file_name() else {
+        return Ok(());
+    };
+    let dir = rootfs_resolve(root, rel.parent().unwrap_or_else(|| Path::new("")))?;
+    let path = dir.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the host file `source` to `rel` inside the image rootfs, keeping its
+/// mode. Whatever the image had at that path (a file, a directory, a symlink
+/// to a host file) is replaced, never written through, and the new file is
+/// created exclusively so a racing link cannot redirect the write.
+fn rootfs_inject(root: &Path, rel: &Path, source: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let name = rel.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("injection path {} has no file name", rel.display()),
+        )
+    })?;
+    let dir = rootfs_resolve(root, rel.parent().unwrap_or_else(|| Path::new("")))?;
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(name);
+    rootfs_remove(root, rel)?;
+
+    let mut input = std::fs::File::open(source)?;
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        input.metadata()?.permissions().mode() & 0o777
+    };
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&dest)?;
+    std::io::copy(&mut input, &mut output)?;
+    Ok(())
+}
+
 /// Restrict a directory to the owner (0700). Best-effort — a failure is
 /// logged, not fatal, since it only weakens local isolation.
 fn set_dir_private(path: &Path) {
@@ -2547,6 +2684,133 @@ mod tests {
         assert_eq!(p.resolve_name(&config), "temps-fcsandbox-abc123");
         config.container_name_override = None;
         assert_eq!(p.resolve_name(&config), "temps-fcsandbox-7");
+    }
+
+    // ── Rootfs injection must stay inside the image (untrusted symlinks) ──
+
+    /// A scratch rootfs next to a "host" directory holding a file the image
+    /// must never be able to touch.
+    fn rootfs_with_host_file() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        let host_file = host.join("config");
+        std::fs::write(&host_file, b"host configuration").unwrap();
+        (dir, root, host, host_file)
+    }
+
+    fn staged_agent(dir: &Path, bytes: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let src = dir.join("agent-src");
+        std::fs::write(&src, bytes).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        src
+    }
+
+    #[test]
+    fn injection_replaces_a_symlinked_agent_path_instead_of_writing_through_it() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (dir, root, _host, host_file) = rootfs_with_host_file();
+        std::fs::create_dir_all(root.join("sbin")).unwrap();
+        // The attack: the image ships the agent path as a link to a host file.
+        symlink(&host_file, root.join("sbin/temps-pty-agent")).unwrap();
+        let src = staged_agent(dir.path(), b"\x7fELF-agent");
+
+        rootfs_inject(&root, Path::new("sbin/temps-pty-agent"), &src).unwrap();
+
+        assert_eq!(std::fs::read(&host_file).unwrap(), b"host configuration");
+        let injected = root.join("sbin/temps-pty-agent");
+        assert!(!std::fs::symlink_metadata(&injected)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&injected).unwrap(), b"\x7fELF-agent");
+        assert_eq!(
+            std::fs::metadata(&injected).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn injection_follows_directory_symlinks_only_inside_the_rootfs() {
+        use std::os::unix::fs::symlink;
+        let (dir, root, host, host_file) = rootfs_with_host_file();
+        // `sbin -> <absolute host dir>`: a real chroot would see it as
+        // `<root><host dir>`, so the file must land there, not on the host.
+        symlink(&host, root.join("sbin")).unwrap();
+        let src = staged_agent(dir.path(), b"\x7fELF-agent");
+
+        rootfs_inject(&root, Path::new("sbin/temps-vm-agent"), &src).unwrap();
+
+        assert!(!host.join("temps-vm-agent").exists(), "escaped to the host");
+        let contained = root
+            .join(host.strip_prefix("/").unwrap())
+            .join("temps-vm-agent");
+        assert_eq!(std::fs::read(contained).unwrap(), b"\x7fELF-agent");
+        assert_eq!(std::fs::read(&host_file).unwrap(), b"host configuration");
+    }
+
+    #[test]
+    fn dotdot_and_relative_links_cannot_climb_out_of_the_rootfs() {
+        use std::os::unix::fs::symlink;
+        let (dir, root, host, _host_file) = rootfs_with_host_file();
+        std::fs::create_dir_all(root.join("usr")).unwrap();
+        symlink("../../../../../../host", root.join("usr/escape")).unwrap();
+        symlink("usr/escape", root.join("sbin")).unwrap();
+        let src = staged_agent(dir.path(), b"agent");
+
+        let resolved = rootfs_resolve(&root, Path::new("sbin/temps-vm-agent")).unwrap();
+        assert!(resolved.starts_with(&root), "{}", resolved.display());
+
+        rootfs_inject(&root, Path::new("sbin/temps-vm-agent"), &src).unwrap();
+        assert!(!host.join("temps-vm-agent").exists());
+    }
+
+    #[test]
+    fn symlink_cycles_fail_instead_of_looping() {
+        use std::os::unix::fs::symlink;
+        let (dir, root, _host, _file) = rootfs_with_host_file();
+        symlink("b", root.join("a")).unwrap();
+        symlink("a", root.join("b")).unwrap();
+        let src = staged_agent(dir.path(), b"agent");
+        let err = rootfs_inject(&root, Path::new("a/temps-vm-agent"), &src).unwrap_err();
+        assert!(err.to_string().contains("too many symbolic links"), "{err}");
+    }
+
+    #[test]
+    fn scrubbing_artifacts_never_deletes_host_files() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root, host, host_file) = rootfs_with_host_file();
+        // `etc -> <host dir>` would make `remove_file(root/etc/config)`
+        // delete the host's file if followed.
+        symlink(&host, root.join("etc")).unwrap();
+        rootfs_remove(&root, Path::new("etc/config")).unwrap();
+        assert!(host_file.exists(), "a host file was deleted through a link");
+
+        // A symlink at the final component is removed itself, not followed.
+        let target = host.join("keep");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::create_dir_all(root.join("etc2")).unwrap();
+        symlink(&target, root.join("etc2/resolv.conf")).unwrap();
+        rootfs_remove(&root, Path::new("etc2/resolv.conf")).unwrap();
+        assert!(target.exists());
+        assert!(!root.join("etc2/resolv.conf").exists());
+        // Missing entries are fine.
+        rootfs_remove(&root, Path::new("etc2/hosts")).unwrap();
+    }
+
+    #[test]
+    fn injection_replaces_a_directory_squatting_on_the_agent_path() {
+        let (dir, root, _host, _file) = rootfs_with_host_file();
+        std::fs::create_dir_all(root.join("sbin/temps-vm-agent/nested")).unwrap();
+        let src = staged_agent(dir.path(), b"agent");
+        rootfs_inject(&root, Path::new("sbin/temps-vm-agent"), &src).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("sbin/temps-vm-agent")).unwrap(),
+            b"agent"
+        );
     }
 
     // ── Terminal attach (ADR-029 §5) ─────────────────────────────────
