@@ -5302,6 +5302,11 @@ export type ConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * `ai` (a conversation with an AI harness) or `terminal` (an interactive
+     * shell in the workspace sandbox). Fixed at creation.
+     */
+    kind: string;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -5501,9 +5506,14 @@ export type CreateApiKeyResponse = {
 export type CreateApplicationConversationRequest = {
     /**
      * A registered development harness (for example `claude_cli`).
-     * Application threads never inherit an API-gateway provider.
+     * Application threads never inherit an API-gateway provider. Ignored for
+     * terminal threads, which have no harness.
      */
     ai_provider?: string | null;
+    /**
+     * `ai` (default) or `terminal`.
+     */
+    kind?: string | null;
 };
 
 export type CreateApplicationPreviewLinkRequest = {
@@ -5947,6 +5957,11 @@ export type CreateGlobalConversationRequest = {
      */
     ai_provider?: string | null;
     ai_thinking_level?: string | null;
+    /**
+     * `ai` (default) or `terminal`. A terminal thread has no harness, model
+     * or turns.
+     */
+    kind?: string | null;
 };
 
 export type CreateIncidentRequest = {
@@ -12255,6 +12270,10 @@ export type GlobalConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * `"ai"` for an agent conversation, `"terminal"` for a shell thread.
+     */
+    kind: string;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -30372,6 +30391,43 @@ export type UploadApplicationWorkspaceFilesResponses = {
 
 export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
 
+export type AttachApplicationWorkspaceTerminalData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        /**
+         * Public id of the terminal thread to attach to.
+         */
+        thread: string;
+        /**
+         * Initial terminal width in columns (default 80).
+         */
+        cols?: number | null;
+        /**
+         * Initial terminal height in rows (default 24).
+         */
+        rows?: number | null;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/terminal';
+};
+
+export type AttachApplicationWorkspaceTerminalErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    /**
+     * The workspace sandbox cannot be attached to right now
+     */
+    409: unknown;
+    /**
+     * Too many concurrent terminals
+     */
+    429: unknown;
+    503: unknown;
+};
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -32262,6 +32318,40 @@ export type CreateGlobalWorkspacePreviewLinkResponses = {
 };
 
 export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
+
+export type AttachGlobalWorkspaceTerminalData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Public id of the terminal thread to attach to.
+         */
+        thread: string;
+        /**
+         * Initial terminal width in columns (default 80).
+         */
+        cols?: number | null;
+        /**
+         * Initial terminal height in rows (default 24).
+         */
+        rows?: number | null;
+    };
+    url: '/ai/workspace/terminal';
+};
+
+export type AttachGlobalWorkspaceTerminalErrors = {
+    401: unknown;
+    403: unknown;
+    /**
+     * The workspace sandbox cannot be attached to right now
+     */
+    409: unknown;
+    /**
+     * Too many concurrent terminals
+     */
+    429: unknown;
+    503: unknown;
+};
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;

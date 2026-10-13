@@ -1677,6 +1677,13 @@ export type AppSettings = {
      */
     bunny_new_projects?: boolean;
     /**
+     * How Temps talks to the instance's ClickHouse server (wire compression
+     * of query responses). Read once when the process starts, so a change
+     * is applied by the next restart; the Settings API reports the mode the
+     * running process actually uses next to the stored one.
+     */
+    clickhouse?: ClickHouseSettings;
+    /**
      * Managed control-plane connection. Credentials are deliberately not
      * stored here; they live in the owner-only cloud-link state file.
      */
@@ -1915,6 +1922,13 @@ export type AppSettingsResponse = {
      */
     build_limits: BuildLimitsSettings;
     bunny_new_projects: boolean;
+    /**
+     * ClickHouse wire compression: the stored choice, the mode the running
+     * process actually uses, and what the startup probe found. Always
+     * present; `configured: false` explains what is missing instead of the
+     * section disappearing.
+     */
+    clickhouse: ClickHouseSettingsResponse;
     /**
      * Managed control-plane destination and explicit export consent flags.
      */
@@ -3657,6 +3671,119 @@ export type CliLoginRequest = {
     username: string;
 };
 
+/**
+ * Wire compression used on the HTTP connection to the instance's ClickHouse
+ * server.
+ *
+ * The `clickhouse` client asks for compressed responses (`compress=1`) and
+ * decodes exactly one codec, LZ4, but it never says which codec it wants, so
+ * it silently depends on the server's `network_compression_method` default.
+ * ClickHouse 26.9 changed that default to ZSTD, after which every response
+ * that carries rows fails with `decompression error: incorrect magic
+ * number`. Temps therefore makes the choice itself and never leaves it to the
+ * server default.
+ */
+export type ClickHouseCompression = 'lz4' | 'none';
+
+/**
+ * Where the connection to the instance's ClickHouse server stands.
+ */
+export type ClickHouseConnectionState = 'not_configured' | 'not_checked' | 'reachable' | 'failing';
+
+/**
+ * Result of the ClickHouse startup/background probe. Carries no credentials:
+ * `host` is `host[:port]` only.
+ */
+export type ClickHouseConnectionStatus = {
+    database?: string | null;
+    /**
+     * Full operator-facing description of the failure.
+     */
+    detail?: string | null;
+    failure_kind?: ClickHouseFailureKind | null;
+    /**
+     * `host[:port]` of the configured server.
+     */
+    host?: string | null;
+    /**
+     * When the last probe finished (ISO 8601, `Z`).
+     */
+    last_checked_at?: string | null;
+    /**
+     * For decode failures: the compression method byte seen on the wire,
+     * e.g. `zstd (0x90)`.
+     */
+    observed_compression_method?: string | null;
+    /**
+     * What to do about the failure, when there is a known remedy.
+     */
+    remedy?: string | null;
+    /**
+     * Server version from the last successful probe, e.g. `26.9.17`.
+     */
+    server_version?: string | null;
+    state: ClickHouseConnectionState;
+};
+
+/**
+ * Why the last ClickHouse probe failed.
+ */
+export type ClickHouseFailureKind = 'decode' | 'unreachable' | 'server' | 'other';
+
+/**
+ * Settings for the connection to the instance's ClickHouse server.
+ *
+ * The connection itself (URL, database, user, password) is bootstrap
+ * configuration in `TEMPS_CLICKHOUSE_*`; only behaviour an operator may need
+ * to change at runtime lives here.
+ */
+export type ClickHouseSettings = {
+    /**
+     * Wire compression for query responses. See [`ClickHouseCompression`].
+     */
+    compression?: ClickHouseCompression;
+};
+
+/**
+ * ClickHouse wire compression and connection state, as the settings page
+ * needs them. Not a credential holder: the connection string is never echoed.
+ */
+export type ClickHouseSettingsResponse = {
+    /**
+     * The modes that can be chosen.
+     */
+    available_compressions: Array<ClickHouseCompression>;
+    /**
+     * The stored mode: what the next start will use.
+     */
+    compression: ClickHouseCompression;
+    /**
+     * Whether the instance has a ClickHouse connection
+     * (`TEMPS_CLICKHOUSE_*`). When `false` the compression setting is stored
+     * but has nothing to apply to yet.
+     */
+    configured: boolean;
+    /**
+     * Result of the last connection probe.
+     */
+    connection: ClickHouseConnectionStatus;
+    effective_compression?: ClickHouseCompression | null;
+    /**
+     * Why ClickHouse is unavailable, when `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * True when `compression` differs from `effective_compression`: the
+     * stored change takes effect on the next restart.
+     */
+    restart_required: boolean;
+    /**
+     * Console path where the operator manages this, when `configured` is
+     * `false` or the probe is failing.
+     */
+    setup_path?: string | null;
+};
+
 export type CloudAiCapability = {
     configured: boolean;
     model?: string | null;
@@ -5175,6 +5302,11 @@ export type ConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * `ai` (a conversation with an AI harness) or `terminal` (an interactive
+     * shell in the workspace sandbox). Fixed at creation.
+     */
+    kind: string;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -5374,9 +5506,14 @@ export type CreateApiKeyResponse = {
 export type CreateApplicationConversationRequest = {
     /**
      * A registered development harness (for example `claude_cli`).
-     * Application threads never inherit an API-gateway provider.
+     * Application threads never inherit an API-gateway provider. Ignored for
+     * terminal threads, which have no harness.
      */
     ai_provider?: string | null;
+    /**
+     * `ai` (default) or `terminal`.
+     */
+    kind?: string | null;
 };
 
 export type CreateApplicationPreviewLinkRequest = {
@@ -5820,6 +5957,11 @@ export type CreateGlobalConversationRequest = {
      */
     ai_provider?: string | null;
     ai_thinking_level?: string | null;
+    /**
+     * `ai` (default) or `terminal`. A terminal thread has no harness, model
+     * or turns.
+     */
+    kind?: string | null;
 };
 
 export type CreateIncidentRequest = {
@@ -12128,6 +12270,10 @@ export type GlobalConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * `"ai"` for an agent conversation, `"terminal"` for a shell thread.
+     */
+    kind: string;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -30629,6 +30775,43 @@ export type UploadApplicationWorkspaceFilesResponses = {
 
 export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
 
+export type AttachApplicationWorkspaceTerminalData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        /**
+         * Public id of the terminal thread to attach to.
+         */
+        thread: string;
+        /**
+         * Initial terminal width in columns (default 80).
+         */
+        cols?: number | null;
+        /**
+         * Initial terminal height in rows (default 24).
+         */
+        rows?: number | null;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/terminal';
+};
+
+export type AttachApplicationWorkspaceTerminalErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    /**
+     * The workspace sandbox cannot be attached to right now
+     */
+    409: unknown;
+    /**
+     * Too many concurrent terminals
+     */
+    429: unknown;
+    503: unknown;
+};
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -32519,6 +32702,40 @@ export type CreateGlobalWorkspacePreviewLinkResponses = {
 };
 
 export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
+
+export type AttachGlobalWorkspaceTerminalData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Public id of the terminal thread to attach to.
+         */
+        thread: string;
+        /**
+         * Initial terminal width in columns (default 80).
+         */
+        cols?: number | null;
+        /**
+         * Initial terminal height in rows (default 24).
+         */
+        rows?: number | null;
+    };
+    url: '/ai/workspace/terminal';
+};
+
+export type AttachGlobalWorkspaceTerminalErrors = {
+    401: unknown;
+    403: unknown;
+    /**
+     * The workspace sandbox cannot be attached to right now
+     */
+    409: unknown;
+    /**
+     * Too many concurrent terminals
+     */
+    429: unknown;
+    503: unknown;
+};
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;

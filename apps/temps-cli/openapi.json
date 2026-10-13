@@ -11048,6 +11048,10 @@
               }
             ]
           },
+          "kind": {
+            "description": "`ai` (a conversation with an AI harness) or `terminal` (an interactive\nshell in the workspace sandbox). Fixed at creation.",
+            "type": "string"
+          },
           "last_activity_at": {
             "type": "string"
           },
@@ -11083,6 +11087,7 @@
         },
         "required": [
           "public_id",
+          "kind",
           "context_type",
           "context_id",
           "status",
@@ -11507,7 +11512,14 @@
       "CreateApplicationConversationRequest": {
         "properties": {
           "ai_provider": {
-            "description": "A registered development harness (for example `claude_cli`).\nApplication threads never inherit an API-gateway provider.",
+            "description": "A registered development harness (for example `claude_cli`).\nApplication threads never inherit an API-gateway provider. Ignored for\nterminal threads, which have no harness.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`ai` (default) or `terminal`.",
             "type": [
               "string",
               "null"
@@ -12494,6 +12506,13 @@
             ]
           },
           "ai_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`ai` (default) or `terminal`. A terminal thread has no harness, model\nor turns.",
             "type": [
               "string",
               "null"
@@ -25955,6 +25974,10 @@
               }
             ]
           },
+          "kind": {
+            "description": "`\"ai\"` for an agent conversation, `\"terminal\"` for a shell thread.",
+            "type": "string"
+          },
           "last_activity_at": {
             "type": "string"
           },
@@ -25999,6 +26022,7 @@
           "context_type",
           "context_id",
           "status",
+          "kind",
           "created_at",
           "last_activity_at",
           "ai_provider",
@@ -64927,6 +64951,84 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/applications/{application_public_id}/workspace/terminal": {
+      "get": {
+        "description": "Upgrades to a WebSocket carrying a PTY in the application's persistent workspace sandbox. Binary frames are raw terminal bytes in both directions; text frames are JSON control (`{\"type\":\"resize\",\"cols\":N,\"rows\":N}`) and events (`ready`, `exit`, `error`). The `thread` query parameter names a terminal thread, which owns its shell: attaching the same thread again resumes the running program. Requires `sandboxes:exec`.",
+        "operationId": "attach_application_workspace_terminal",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Public id of the terminal thread to attach to.",
+            "in": "query",
+            "name": "thread",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Initial terminal width in columns (default 80).",
+            "in": "query",
+            "name": "cols",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Initial terminal height in rows (default 24).",
+            "in": "query",
+            "name": "rows",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket established; PTY attached"
+          },
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {
+            "description": "The workspace sandbox cannot be attached to right now"
+          },
+          "429": {
+            "description": "Too many concurrent terminals"
+          },
+          "503": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Attach an interactive terminal to an application workspace",
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/conversations": {
       "get": {
         "operationId": "list_all_conversations",
@@ -68613,6 +68715,75 @@
           }
         ],
         "summary": "Mint a short-lived preview URL for a port in the user's shared global AI\nworkspace. The gateway grant is identical to application previews; the\nonly difference is how the owning sandbox is resolved.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/workspace/terminal": {
+      "get": {
+        "description": "Same protocol as the application workspace terminal, for a terminal thread of the signed-in user's private default workspace. Requires `sandboxes:exec`.",
+        "operationId": "attach_global_workspace_terminal",
+        "parameters": [
+          {
+            "description": "Public id of the terminal thread to attach to.",
+            "in": "query",
+            "name": "thread",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Initial terminal width in columns (default 80).",
+            "in": "query",
+            "name": "cols",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Initial terminal height in rows (default 24).",
+            "in": "query",
+            "name": "rows",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket established; PTY attached"
+          },
+          "401": {},
+          "403": {},
+          "409": {
+            "description": "The workspace sandbox cannot be attached to right now"
+          },
+          "429": {
+            "description": "Too many concurrent terminals"
+          },
+          "503": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Attach an interactive terminal to the user's global workspace",
         "tags": [
           "AI Chat"
         ],
