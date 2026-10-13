@@ -4,7 +4,9 @@
 import { afterEach, expect, test } from 'bun:test'
 import { cleanup, render } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
+import githubDark from 'shiki/themes/github-dark.mjs'
 import { CodeBlock } from './code-block'
+import { withReadableDarkComments } from './code-block-theme'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -48,4 +50,23 @@ test('the code scroller becomes a tab stop once the code overflows', () => {
       else Reflect.deleteProperty(HTMLElement.prototype, key)
     }
   }
+})
+
+// github-dark's comment grey measured 3.45:1 on the dark code panel; axe
+// `color-contrast` needs 4.5:1.
+test('dark comments are lightened and other token colours are untouched', () => {
+  const colours = (theme: typeof githubDark) =>
+    (theme.tokenColors ?? []).map((rule) =>
+      rule.settings?.foreground?.toLowerCase()
+    )
+  const before = colours(githubDark)
+  const after = colours(withReadableDarkComments(githubDark))
+
+  expect(before).toContain('#6a737d')
+  expect(after).not.toContain('#6a737d')
+  expect(after).toContain('#8b949e')
+  expect(after).toHaveLength(before.length)
+  before.forEach((colour, index) => {
+    if (colour !== '#6a737d') expect(after[index]).toBe(colour)
+  })
 })

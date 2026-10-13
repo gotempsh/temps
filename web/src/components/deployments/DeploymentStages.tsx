@@ -635,13 +635,22 @@ export function DeploymentStages({
                   <Settings className="h-4 w-4" />
                 </Button>
                 <button
+                  type="button"
                   onClick={() => toggleStage(stage.id)}
-                  className="cursor-pointer"
+                  aria-expanded={expandedStageIds.has(stage.id)}
+                  aria-label={`${expandedStageIds.has(stage.id) ? 'Hide' : 'Show'} logs for ${stage.name}`}
+                  className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 >
                   {expandedStageIds.has(stage.id) ? (
-                    <ChevronUpIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronUpIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <ChevronDownIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronDownIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   )}
                 </button>
               </div>
