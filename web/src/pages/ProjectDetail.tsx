@@ -162,7 +162,7 @@ export function ProjectDetail() {
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
 
-  const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
+  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } = useQuery(
     {
       ...getLastDeploymentOptions({
         path: {
@@ -191,6 +191,9 @@ export function ProjectDetail() {
       refetchOnWindowFocus: true,
     }
   )
+  // The API answers 200 with `deployment: null` for a project that has never
+  // deployed; consumers take `undefined` for "nothing yet".
+  const lastDeployment = lastDeploymentOrNull ?? undefined
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({

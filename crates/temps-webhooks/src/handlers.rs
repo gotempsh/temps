@@ -741,6 +741,7 @@ async fn get_delivery(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Delivery not found"),
+        (status = 409, description = "A concurrent retry already holds this attempt; nothing was sent"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -771,17 +772,20 @@ async fn retry_delivery(
                 delivery_id, result.success
             );
 
-            let audit = WebhookAudit {
-                context: AuditContext {
-                    user_id: auth.user_id(),
-                    ip_address: Some(metadata.ip_address.clone()),
-                    user_agent: metadata.user_agent.clone(),
-                },
-                webhook_id,
-                action: "WEBHOOK_DELIVERY_RETRIED".to_string(),
-            };
-            if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-                error!("Failed to create audit log: {}", e);
+            // Only an attempt that was recorded (and so sent) is audited as a retry.
+            if result.record.is_some() {
+                let audit = WebhookAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    webhook_id,
+                    action: "WEBHOOK_DELIVERY_RETRIED".to_string(),
+                };
+                if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+                    error!("Failed to create audit log: {}", e);
+                }
             }
 
             // The response is the history row of the new attempt: same
@@ -819,6 +823,12 @@ fn retry_delivery_problem(error: crate::service::WebhookError) -> Problem {
             ErrorBuilder::new(StatusCode::NOT_FOUND)
                 .title("Delivery not found")
                 .detail("Delivery does not exist in the requested project and webhook")
+                .build()
+        }
+        e @ crate::service::WebhookError::RetryInProgress { .. } => {
+            ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Retry already in progress")
+                .detail(e.to_string())
                 .build()
         }
         other => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)

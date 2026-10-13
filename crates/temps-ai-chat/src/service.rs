@@ -5507,6 +5507,7 @@ impl ConversationService {
                                     );
                                 }
                                 retained_diagnostic = None;
+                                stream_interruption = None;
                                 continue 'rounds;
                             }
                             // Provider subprocess failures arrive as stream items
@@ -5866,7 +5867,20 @@ impl ConversationService {
                                     Ok(ChatStreamEvent::ContextUsage(usage)),
                                 );
                             }
-                            _ => {}
+                            Ok(_) => {}
+                            Err(e) => {
+                                // The salvage answer is the turn's final text; a
+                                // stream cut short here must fail the turn just
+                                // like one cut short in a tool round.
+                                if let temps_ai::AiError::StreamInterrupted { reason, .. } = &e {
+                                    stream_interruption = Some(reason.clone());
+                                }
+                                tracing::warn!(
+                                    "chat_stream_turn item error for conv {conv_id} (salvage): {e}"
+                                );
+                                remember_provider_error(&mut last_provider_error, e.to_string());
+                                break;
+                            }
                         }
                     }
                     if !salvage_text.is_empty() {

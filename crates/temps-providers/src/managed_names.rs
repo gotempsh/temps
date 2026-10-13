@@ -263,6 +263,16 @@ pub enum ManagedNameError {
         requested: String,
     },
 
+    #[error(
+        "Cannot use '{requested}' as the {} container name: a service named '{service_name}' already exists on this instance and is not the managed {} service. Pick a different name, or delete that service first",
+        .kind.label(), .kind.label()
+    )]
+    ServiceNameTaken {
+        kind: ManagedServiceKind,
+        service_name: String,
+        requested: String,
+    },
+
     #[error("Failed to read the settings while resolving the {} container name: {source}", .kind.label())]
     SettingsRead {
         kind: ManagedServiceKind,
@@ -299,6 +309,11 @@ impl From<ManagedNameError> for Problem {
                 .detail(error.to_string())
                 .value("service_name", service_name)
                 .value("container", current_container)
+                .build(),
+            ManagedNameError::ServiceNameTaken { service_name, .. } => error_builder::conflict()
+                .title("Service name already in use")
+                .detail(error.to_string())
+                .value("service_name", service_name)
                 .build(),
             ManagedNameError::SettingsRead { .. }
             | ManagedNameError::SettingsWrite { .. }
@@ -339,6 +354,30 @@ fn check_rename(
             .map(|service| kind.container_name_for(service))
             .unwrap_or_default(),
     ))
+}
+
+/// Refuse a service name that is already held by a different service row.
+///
+/// The managed service is looked up by name, so saving a name that belongs to
+/// an unrelated service (a user's own Redis called `cache`, or the other
+/// managed kind's service) would make enabling or disabling it act on that
+/// service. Pure, so the rule is testable without a database.
+fn check_name_free(
+    kind: ManagedServiceKind,
+    current: &ResolvedManagedName,
+    requested: Option<&str>,
+    row_exists: bool,
+) -> Result<(), ManagedNameError> {
+    match requested {
+        Some(service) if row_exists && service != current.service_name => {
+            Err(ManagedNameError::ServiceNameTaken {
+                kind,
+                service_name: service.to_string(),
+                requested: kind.container_name_for(service),
+            })
+        }
+        Some(_) | None => Ok(()),
+    }
 }
 
 /// Resolves and edits the container names of the managed KV and Blob
@@ -433,6 +472,16 @@ impl ManagedServiceNames {
         let Some(saved) = check_rename(kind, &current, requested.as_deref())? else {
             return Ok(current);
         };
+        let row_exists = match requested.as_deref() {
+            Some(service) => external_services::Entity::find()
+                .filter(external_services::Column::Name.eq(service))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|source| ManagedNameError::Database { kind, source })?
+                .is_some(),
+            None => false,
+        };
+        check_name_free(kind, &current, requested.as_deref(), row_exists)?;
         let setting = kind.setting_key();
         match kind {
             ManagedServiceKind::Kv => {
@@ -797,6 +846,32 @@ mod tests {
         assert_eq!(check_rename(KV, &current, Some("temps-kv")).unwrap(), None);
         // The empty submission resolves to the same legacy container.
         assert_eq!(check_rename(KV, &current, None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_name_held_by_another_service_is_refused() {
+        let current = choose_service_name(KV, None, "temps-kv-3fa91c07", &names(&[]));
+
+        // A user's own service called `cache` exists: saving `redis-cache`
+        // would make KV adopt and later stop it.
+        let error = check_name_free(KV, &current, Some("cache"), true).unwrap_err();
+        match &error {
+            ManagedNameError::ServiceNameTaken {
+                service_name,
+                requested,
+                ..
+            } => {
+                assert_eq!(service_name, "cache");
+                assert_eq!(requested, "redis-cache");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
+
+        // Free names, resets, and re-saving the resolved name are fine.
+        assert!(check_name_free(KV, &current, Some("cache"), false).is_ok());
+        assert!(check_name_free(KV, &current, None, true).is_ok());
+        assert!(check_name_free(KV, &current, Some(&current.service_name), true).is_ok());
     }
 
     #[test]

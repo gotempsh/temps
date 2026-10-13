@@ -113,9 +113,22 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Creation Failed")
                     .with_detail(error.to_string())
             }
-            SandboxError::ImageUnavailable { ref image, .. } => {
+            SandboxError::ImageUnavailable {
+                ref sandbox_id,
+                ref image,
+                ref reason,
+            } => {
+                // The registry's own error text can carry hostnames and request
+                // detail, so it goes to the log; the response names the image.
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    image = %image,
+                    reason = %reason,
+                    "sandbox image could not be pulled"
+                );
                 let detail = format!(
-                    "{error}. Check that this host can reach the image registry and that the \
+                    "Sandbox image '{image}' could not be pulled for sandbox {sandbox_id}. \
+                     Check that this host can reach the image registry and that the \
                      tag is published; an administrator can pre-load it with `docker pull {image}`."
                 );
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)

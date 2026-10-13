@@ -111,13 +111,15 @@ fn parent_key(entry: &CreateProxyLogRequest) -> ParentKey {
 /// batch with `40P01 deadlock detected` and the whole batch was lost
 /// (issue #1425).
 ///
-/// Sorting by parent id makes every batch -- from this process, another
-/// proxy node, or the next flush -- acquire parents in the same ascending
-/// order, which removes the batch-ordering half of the cycle. The sort is
-/// stable, so rows that share all parents keep their arrival order. The
-/// remaining half, an unrelated transaction taking its own locks in the
-/// opposite order, cannot be fixed from here and is covered by the bounded
-/// retry in `ProxyLogBatchWriter`.
+/// Sorting by (project, environment, deployment, ...) gives every batch --
+/// from this process, another proxy node, or the next flush -- one consistent
+/// lock order for any given set of parents, which removes most of the
+/// batch-against-batch cycles. It does not make environment ids globally
+/// ascending across rows (the project is the leading key), so it narrows the
+/// window rather than closing it. The sort is stable, so rows that share all
+/// parents keep their arrival order. What remains, including an unrelated
+/// transaction taking its own locks in the opposite order, cannot be fixed from
+/// here and is covered by the bounded retry in `ProxyLogBatchWriter`.
 pub(crate) fn fk_lock_order(entries: &[CreateProxyLogRequest]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&index| parent_key(&entries[index]));

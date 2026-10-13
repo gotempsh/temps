@@ -24,6 +24,9 @@ export function selectCustomDomainLookup<T>(response: {
 }
 
 /** `GET /domains/{id}/order` -> the ACME order, or `null` when there is none. */
-export function selectDomainOrder<T>(response: { order?: T | null }): T | null {
+export function selectDomainOrder<T>(response: {
+  order?: T | null
+  reason?: string | null
+}): T | null {
   return response.order ?? null
 }

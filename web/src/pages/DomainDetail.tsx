@@ -981,7 +981,13 @@ export function DomainDetail() {
               <FailedPanel
                 domain={domain}
                 dnsTxtRecords={dnsTxtRecords}
-                retryAction={failedRetryAction(order)}
+                retryAction={
+                  // Until the order is known, claiming the CA rejected the
+                  // challenge would be a guess; fall back to the neutral copy.
+                  orderKnown && !orderReadFailed
+                    ? failedRetryAction(order)
+                    : 'verify'
+                }
                 onRetry={handleCompleteDns}
                 onNewOrder={handleCreateOrder}
                 onCancel={handleCancelOrder}

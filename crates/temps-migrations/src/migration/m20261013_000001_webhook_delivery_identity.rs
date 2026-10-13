@@ -13,10 +13,11 @@
 //! Backfill: rows are grouped by `(webhook_id, event_id)` -- an event id is a
 //! fresh UUID per event and a webhook receives each event at most once, so a
 //! group can only be an original send plus its retries -- and every row gets
-//! the smallest id of its group. Existing `attempt_number` values are left
-//! exactly as stored (a legacy retried pair keeps its odd 2 / 1 numbering
-//! rather than being rewritten); only the new column is populated, and new
-//! attempts continue after the group's highest attempt number.
+//! the smallest id of its group. Attempts are then renumbered 1, 2, 3... in
+//! row-id (that is, chronological) order, which repairs the old retried pair
+//! that read "failed = 2, retry = 1" and makes `(webhook_id, delivery_id,
+//! attempt_number)` unique, so two concurrent retries of one delivery cannot
+//! both claim the same attempt number.
 
 use sea_orm_migration::prelude::*;
 
@@ -43,8 +44,23 @@ WHERE d.delivery_id IS NULL
   AND d.webhook_id = g.webhook_id
   AND d.event_id = g.event_id;
 
-CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook_delivery
-    ON webhook_deliveries(webhook_id, delivery_id);
+UPDATE webhook_deliveries AS d
+SET attempt_number = r.attempt
+FROM (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               PARTITION BY webhook_id, delivery_id
+               ORDER BY id
+           )::INTEGER AS attempt
+    FROM webhook_deliveries
+    WHERE delivery_id IS NOT NULL
+) AS r
+WHERE d.id = r.id
+  AND d.attempt_number IS DISTINCT FROM r.attempt;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_attempt
+    ON webhook_deliveries(webhook_id, delivery_id, attempt_number)
+    WHERE delivery_id IS NOT NULL;
 "#,
             )
             .await?;
@@ -56,6 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook_delivery
             .get_connection()
             .execute_unprepared(
                 r#"
+DROP INDEX IF EXISTS idx_webhook_deliveries_attempt;
 DROP INDEX IF EXISTS idx_webhook_deliveries_webhook_delivery;
 ALTER TABLE webhook_deliveries DROP COLUMN IF EXISTS delivery_id;
 "#,

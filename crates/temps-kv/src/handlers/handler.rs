@@ -411,10 +411,26 @@ pub async fn kv_status(
     // Status check requires SystemRead permission
     permission_guard!(auth, SystemRead);
 
+    // This is the endpoint the console uses to onboard the feature, so an
+    // unreadable container-name setting degrades to "not enabled" instead of
+    // failing the whole status check.
+    let service_name = match state.managed_names.resolve(ManagedServiceKind::Kv).await {
+        Ok(resolved) => resolved.service_name,
+        Err(error) => {
+            tracing::warn!("KV status could not resolve its service name: {}", error);
+            return Ok(Json(KvStatusResponse {
+                enabled: false,
+                healthy: false,
+                version: None,
+                docker_image: None,
+            }));
+        }
+    };
+
     // Check if the service exists in the database via ExternalServiceManager
     let service_result = state
         .external_service_manager
-        .get_service_by_name(&kv_service_name(&state).await?)
+        .get_service_by_name(&service_name)
         .await;
 
     match service_result {

@@ -86,7 +86,9 @@ export function SampleDeployTracker({
   const deployment = deploymentQuery.data ?? undefined
   // `useQuery` does not expose the success counter, so read it from the cache.
   // `dataUpdatedAt` is read first so a new answer re-renders this component
-  // even when the (still-null) selected data is structurally unchanged.
+  // even when the (still-null) selected data is structurally unchanged. The
+  // counter belongs to the cache entry, so another poller of the same project
+  // advances it too; that only ever shortens the wait, never extends it.
   const emptyAnswers =
     deploymentQuery.dataUpdatedAt > 0
       ? (queryClient.getQueryState(

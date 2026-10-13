@@ -130,7 +130,8 @@ pub const METRIC_LOG_WRITE_RETRIES: &str = "proxy.log_write_retries";
 /// non-retryable error such as an unreachable database). Their entries are
 /// gone; see `proxy.log_entries_dropped` for how many.
 pub const METRIC_LOG_BATCHES_DROPPED: &str = "proxy.log_batches_dropped";
-/// Request-log entries lost with the dropped batches above.
+/// Request-log entries lost: with the dropped batches above, plus entries shed
+/// because the writer's bounded channel was full.
 pub const METRIC_LOG_ENTRIES_DROPPED: &str = "proxy.log_entries_dropped";
 
 /// Where a request was routed. The three variants are mutually exclusive and
@@ -329,6 +330,13 @@ impl ProxyMetrics {
     /// background batch writer, never the request path.
     pub fn record_log_batch_dropped(&self, entries: u64) {
         self.log_batches_dropped.fetch_add(1, Ordering::Relaxed);
+        self.log_entries_dropped
+            .fetch_add(entries, Ordering::Relaxed);
+    }
+
+    /// Count request-log entries shed because the batch writer's bounded
+    /// channel was full. Called from the request path: one relaxed atomic add.
+    pub fn record_log_entries_shed(&self, entries: u64) {
         self.log_entries_dropped
             .fetch_add(entries, Ordering::Relaxed);
     }

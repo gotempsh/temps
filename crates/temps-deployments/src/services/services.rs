@@ -1829,25 +1829,27 @@ impl DeploymentService {
         &self,
         project_id: i32,
     ) -> Result<Option<Deployment>, DeploymentError> {
+        // Check the project first: a soft-deleted project keeps its deployment
+        // rows, and must read as "not found" rather than returning them.
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "project {} not found",
+                project_id
+            )));
+        }
+
         let Some(deployment) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
         else {
-            let project_exists = projects::Entity::find_by_id(project_id)
-                .filter(projects::Column::IsDeleted.eq(false))
-                .one(self.db.as_ref())
-                .await?
-                .is_some();
-            return if project_exists {
-                Ok(None)
-            } else {
-                Err(DeploymentError::NotFound(format!(
-                    "project {} not found",
-                    project_id
-                )))
-            };
+            return Ok(None);
         };
 
         // Check if this deployment is current for any environment
@@ -9554,6 +9556,21 @@ mod tests {
             .get_last_deployment(empty_project.id)
             .await?
             .is_none());
+
+        // A soft-deleted project keeps its deployment rows but reads as not found.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .expect("project exists")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.update(db.as_ref()).await?;
+        let result = service.get_last_deployment(project.id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {} not found", project.id)
+        ));
 
         // Unknown project -> NotFound naming the project.
         let missing_id = empty_project.id + 10_000;

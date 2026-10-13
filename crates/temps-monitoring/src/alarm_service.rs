@@ -350,7 +350,19 @@ fn rule_identity_condition(identity: Option<&AlarmRuleIdentity>) -> Condition {
                 .get_json_field("series_key")
                 .eq(series_key.clone()),
         ),
-        None => condition.add(metadata().get_json_field("series_key").is_null()),
+        // A static rule has no series. An absent key is SQL NULL for `->`, but a
+        // stored JSON `null` comes back as jsonb `'null'`, so match both or an
+        // alarm written with an explicit `"series_key": null` would never
+        // match its own cooldown.
+        None => condition.add(
+            Condition::any()
+                .add(metadata().get_json_field("series_key").is_null())
+                .add(
+                    metadata()
+                        .get_json_field("series_key")
+                        .eq(serde_json::Value::Null),
+                ),
+        ),
     }
 }
 
@@ -3048,6 +3060,12 @@ mod tests {
         assert!(
             sql.contains("\"status\" <> $"),
             "silence needs an open alarm: {sql}"
+        );
+        // A static rule has no series: both an absent key and a stored JSON
+        // `null` must match, so `metadata -> 'series_key'` is read twice.
+        assert!(
+            sql.matches("\"metadata\" -> $").count() >= 2,
+            "an explicit JSON null series key must match too: {sql}"
         );
         assert!(
             sql.contains("String(Some(\"42\"))") && sql.contains("otel_metric_alert"),

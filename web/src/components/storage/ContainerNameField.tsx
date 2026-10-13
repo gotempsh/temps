@@ -49,6 +49,8 @@ interface ContainerNameFieldProps {
 
 interface ContainerNameFormProps {
   settings: ContainerNameSettings
+  /** Whether the form is shown. It stays mounted so its state is kept. */
+  open: boolean
   isSaving: boolean
   onSave: (containerName: string) => void
   onCancel: () => void
@@ -56,6 +58,7 @@ interface ContainerNameFormProps {
 
 function ContainerNameForm({
   settings,
+  open,
   isSaving,
   onSave,
   onCancel,
@@ -69,9 +72,13 @@ function ContainerNameForm({
     <Form {...form}>
       <form
         className="space-y-3"
-        onSubmit={form.handleSubmit((values) =>
-          onSave(values.container_name.trim())
-        )}
+        hidden={!open}
+        onSubmit={form.handleSubmit((values) => {
+          const name = values.container_name.trim()
+          // Submitting the derived default unchanged restores the default
+          // rather than pinning it as a custom name.
+          onSave(name === settings.default_container_name ? '' : name)
+        })}
       >
         <FormField
           control={form.control}
@@ -112,7 +119,10 @@ function ContainerNameForm({
             type="button"
             variant="outline"
             size="sm"
-            onClick={onCancel}
+            onClick={() => {
+              form.reset({ container_name: settings.container_name })
+              onCancel()
+            }}
             disabled={isSaving}
           >
             Cancel
@@ -189,10 +199,11 @@ export function ContainerNameField({
           ? 'It cannot change while the service exists; delete the service first to pick another name.'
           : `If another Temps instance on this Docker host already uses it, enabling ${serviceName} fails with a conflict. Pick a unique name first.`}
       </p>
-      {canEdit && editing && (
+      {canEdit && (
         <ContainerNameForm
           key={settings.container_name}
           settings={settings}
+          open={editing}
           isSaving={isSaving}
           onSave={(name) => onSave(name, () => setEditing(false))}
           onCancel={() => setEditing(false)}

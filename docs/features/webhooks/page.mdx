@@ -573,7 +573,7 @@ Authorization: Bearer {token}
 ```
 
 <Note>
-Deliveries recorded by earlier releases have their `delivery_id` filled in by grouping the rows of one webhook that carry the same `event_id`. Their `attempt_number` values are left as recorded, so an old manually retried delivery can still show the failed row as attempt 2 and the retry as attempt 1; further retries continue after the highest number.
+Deliveries recorded by earlier releases have their `delivery_id` filled in by grouping the rows of one webhook that carry the same `event_id`, and their attempts are renumbered 1, 2, 3... in the order they were made, so an old manually retried delivery no longer shows the failed row as attempt 2 and the retry as attempt 1. Two retries submitted at the same moment cannot both take the same attempt number: the second is rejected with `409` and nothing is sent.
 </Note>
 
 ## Security

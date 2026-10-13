@@ -36,6 +36,15 @@ pub enum WebhookError {
         delivery_id: i32,
     },
 
+    #[error(
+        "Attempt {attempt_number} of delivery {delivery_id} for webhook {webhook_id} was already claimed by a concurrent retry; nothing was sent"
+    )]
+    RetryInProgress {
+        webhook_id: i32,
+        delivery_id: i32,
+        attempt_number: i32,
+    },
+
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
 
@@ -726,7 +735,7 @@ impl WebhookService {
             .max(delivery.attempt_number);
         let slot = AttemptSlot::next(stable_id, latest);
 
-        Ok(self
+        let result = self
             .send_attempt(
                 &webhook,
                 &delivery.event_type,
@@ -734,7 +743,38 @@ impl WebhookService {
                 delivery.payload,
                 slot,
             )
-            .await)
+            .await;
+
+        // The attempt row is inserted before anything is sent, and
+        // `(webhook_id, delivery_id, attempt_number)` is unique. If the row was
+        // not recorded because a concurrent retry already holds this attempt
+        // number, nothing went out and the caller must be told that, not that
+        // the retry failed.
+        if result.record.is_none() && self.attempt_exists(webhook.id, stable_id, slot).await? {
+            return Err(WebhookError::RetryInProgress {
+                webhook_id: webhook.id,
+                delivery_id: stable_id,
+                attempt_number: slot.attempt_number,
+            });
+        }
+        Ok(result)
+    }
+
+    async fn attempt_exists(
+        &self,
+        webhook_id: i32,
+        stable_delivery_id: i32,
+        slot: AttemptSlot,
+    ) -> Result<bool, WebhookError> {
+        use temps_entities::webhook_deliveries::Column;
+
+        Ok(temps_entities::webhook_deliveries::Entity::find()
+            .filter(Column::WebhookId.eq(webhook_id))
+            .filter(Column::DeliveryId.eq(stable_delivery_id))
+            .filter(Column::AttemptNumber.eq(slot.attempt_number))
+            .one(self.db.as_ref())
+            .await?
+            .is_some())
     }
 
     /// Decrypt webhook secret for display (masked)

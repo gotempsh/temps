@@ -60,7 +60,9 @@ pub fn read_temps_yaml(
         Err(error) => {
             return Err(TempsYamlError::Unreadable {
                 path: path.display().to_string(),
-                reason: error.to_string(),
+                reason: format!(
+                    "{error}. .temps.yaml must be a regular file inside the project source, not a symlink or a file outside it"
+                ),
             })
         }
     };

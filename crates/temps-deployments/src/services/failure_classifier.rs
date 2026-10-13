@@ -1403,7 +1403,10 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     // own prefix ("Failed to build image: ..."), so it needs an explicit
     // sign that the produced image itself is what is missing.
     let build_failed = phase == Some(JobPhase::Build) || r.contains("failed to build image");
-    let built_image_gone = contains_any(r, &["built image not found", "no such image"]);
+    // "No such image" is the daemon talking about whichever image it was asked
+    // for. During a build that is a base image, not the one just produced, so
+    // only the explicit "built image not found" counts there.
+    let built_image_gone = r.contains("built image not found");
     if r.contains("image")
         && contains_any(r, &["not found", "missing", "no such image"])
         && (built_image_gone || !build_failed)
@@ -1806,6 +1809,7 @@ mod tests {
             "Failed to build image: Build failed: Docker stream error: failed to solve: process \"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 1\nERROR: no matching distribution found for example-lib",
             "Failed to build image for linux/amd64: the builder reported a missing layer for the build image cache",
             "Failed to build image: Build failed: Docker stream error: failed to solve: rpc error: code = Unknown desc = no builder instance found",
+            "Failed to build image: Build failed: Docker stream error: No such image: registry.example.test/base:1.0",
         ] {
             let reason = wrapped("build_image", inner);
             let got = classify_failure_reason(Some(&reason));

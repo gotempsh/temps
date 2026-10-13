@@ -504,6 +504,7 @@ pub fn setup_proxy_server(
             proxy_log_storage,
         );
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
+    let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -908,6 +909,7 @@ pub fn create_proxy_service(
             proxy_log_storage,
         );
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
+    let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
