@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   LoginFlowError,
+  progressLogger,
   runProviderLogin,
   type LoginIo,
   type LoginPhase,
@@ -216,5 +217,33 @@ describe('runProviderLogin', () => {
     await expect(
       runProviderLogin(api, io, 'claude_cli', { pollIntervalMs: 0 })
     ).rejects.toThrow(/may keep running/)
+  })
+})
+
+describe('progressLogger', () => {
+  test('keeps stdout clean for --json by writing progress to stderr', () => {
+    const out: string[] = []
+    const err: string[] = []
+    const log = progressLogger(
+      true,
+      (line) => out.push(line),
+      (line) => err.push(line)
+    )
+    log('Open this link')
+    expect(out).toEqual([])
+    expect(err).toEqual(['Open this link'])
+  })
+
+  test('uses stdout for interactive runs', () => {
+    const out: string[] = []
+    const err: string[] = []
+    const log = progressLogger(
+      false,
+      (line) => out.push(line),
+      (line) => err.push(line)
+    )
+    log('Open this link')
+    expect(out).toEqual(['Open this link'])
+    expect(err).toEqual([])
   })
 })

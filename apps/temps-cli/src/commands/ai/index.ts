@@ -17,6 +17,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { promptPassword } from '../../ui/prompts.js'
 import {
   LoginFlowError,
+  progressLogger,
   runProviderLogin,
   type LoginSession,
   type ProviderLoginApi,
@@ -168,7 +169,7 @@ async function providerLogin(
   const onInterrupt = () => {
     if (interrupted) process.exit(130)
     interrupted = true
-    console.log(colors.warning('\nCancelling the sign-in…'))
+    console.error(colors.warning('\nCancelling the sign-in…'))
     if (cancelSignIn) {
       void cancelSignIn()
         .catch((error: unknown) => {
@@ -189,8 +190,11 @@ async function providerLogin(
     const session = await runProviderLogin(
       api,
       {
-        log: (line) => console.log(line),
-        promptCode: (message) => promptPassword({ message }),
+        // With --json, stdout carries only the final JSON document; the link,
+        // progress and prompt go to stderr so scripts can parse stdout.
+        log: progressLogger(options.json),
+        promptCode: (message) =>
+          promptPassword({ message, toStderr: options.json }),
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       },
       providerId,

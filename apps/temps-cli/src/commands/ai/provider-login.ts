@@ -64,6 +64,18 @@ const TERMINAL: ReadonlySet<LoginPhase> = new Set([
   'cancelled',
 ])
 
+/**
+ * Where human-readable progress goes. With `--json` stdout is reserved for the
+ * final JSON document, so the link, progress and prompts move to stderr.
+ */
+export function progressLogger(
+  json: boolean | undefined,
+  stdout: (line: string) => void = (line) => console.log(line),
+  stderr: (line: string) => void = (line) => console.error(line)
+): (line: string) => void {
+  return json ? stderr : stdout
+}
+
 export class LoginFlowError extends Error {
   constructor(
     message: string,
