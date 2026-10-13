@@ -1713,6 +1713,15 @@ fn extract_entry_from_tarball_file(
 /// with the host binary or the two drift apart on the wire protocol.
 pub(crate) const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
 
+/// How an operator recovers when the guest agent could not be refreshed.
+///
+/// Deliberately not "re-run `temps upgrade`": by the time this is shown the
+/// host binary is already the new version, so a second run stops at "Already
+/// up to date" before it downloads anything and could never repair the agent.
+const VM_AGENT_MANUAL_INSTALL_HINT: &str = "To refresh it, extract temps-vm-agent from this \
+     release's temps-linux-<arch>.tar.gz and pass it to \
+     `temps firecracker setup --vm-agent-bin <path>`.";
+
 /// A guest agent extracted from the release tarball and sealed, waiting to be
 /// moved over the copy that sits beside the `temps` binary.
 ///
@@ -1795,7 +1804,10 @@ fn stage_vm_agent_reporting(
                 "  Warning: could not stage {} from the release: {}",
                 VM_AGENT_BINARY_NAME, e
             );
-            println!("  The existing guest agent (if any) was left untouched.");
+            println!(
+                "  The existing guest agent (if any) was left untouched. {}",
+                VM_AGENT_MANUAL_INSTALL_HINT
+            );
             None
         }
     }
@@ -1820,8 +1832,8 @@ fn install_vm_agent_reporting(staged: Option<StagedVmAgent>) {
                 e
             );
             println!(
-                "  The host is upgraded but the guest agent is the previous version; \
-                 re-run `temps upgrade` or pass --vm-agent-bin to `temps firecracker setup`."
+                "  The host is upgraded but the guest agent is the previous version. {}",
+                VM_AGENT_MANUAL_INSTALL_HINT
             );
         }
     }
