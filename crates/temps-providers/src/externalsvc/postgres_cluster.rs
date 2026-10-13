@@ -300,11 +300,72 @@ fn is_valid_cluster_secret(value: &str) -> bool {
 // switched to SCRAM, so no connection that is needed for replication or
 // failover ever presents without a password.
 
+/// Shell functions the prepare snippets use to change a member's pg_autoctl
+/// configuration: `autoctl_config_run` (one `config get|set` that survives
+/// the keeper rewriting the file under it) and `autoctl_config_set` (store a
+/// value and read it back). Expect `PGDATA`.
+///
+/// pg_autoctl rewrites `pg_autoctl.cfg` in place -- truncate, then write, no
+/// lock -- every time a running keeper reloads (`keeper_ensure_configuration`
+/// calls `keeper_config_update`, which always writes the file), and every
+/// `pg_autoctl config set` signals that reload. A one-shot `config get` or
+/// `config set` that lands in the rewrite reads a half-written file and
+/// fails with "Failed to find section pg_autoctl" (exit status 1, 2 or 12);
+/// its own write can also be overwritten by the keeper's older copy. The
+/// in-place upgrade runs several of these back to back against a live
+/// keeper, so a single failure proves nothing: retry while the file exists,
+/// verify what was stored, and only then report -- with pg_autoctl's own
+/// message. `config set` echoes the value it stored, which can be a
+/// password, so stdout is captured into `AUTOCTL_OUT` and never printed.
+macro_rules! autoctl_config_helpers {
+    () => {
+        r#"autoctl_config_run() {
+  local attempt=1 status err_file
+  err_file=$(mktemp)
+  while :; do
+    status=0
+    AUTOCTL_OUT=$(gosu postgres pg_autoctl config "$1" --pgdata "$PGDATA" "${@:2}" 2>"$err_file") || status=$?
+    if [ "$status" -eq 0 ]; then
+      rm -f "$err_file"
+      return 0
+    fi
+    if [ "$attempt" -ge 20 ] || [ ! -f "$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config 2>/dev/null)" ]; then
+      echo "temps: pg_autoctl config $1 ${2:-} exited $status after $attempt attempt(s) on $PGDATA:" >&2
+      cat "$err_file" >&2
+      rm -f "$err_file"
+      return "$status"
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+  done
+}
+autoctl_config_set() {
+  local key=$1 value=$2 attempt=1
+  while :; do
+    autoctl_config_run set "$key" "$value" || return 1
+    autoctl_config_run get "$key" || return 1
+    if [ "$AUTOCTL_OUT" = "$value" ]; then
+      return 0
+    fi
+    if [ "$attempt" -ge 5 ]; then
+      echo "temps: pg_autoctl config $key was overwritten by the running keeper $attempt times in a row on $PGDATA" >&2
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+  done
+}
+"#
+    };
+}
+
 /// Monitor, prepare: record `scram-sha-256` as the auth method pg_autoctl
 /// uses for rules it adds later, and set the `autoctl_node` password once
 /// Postgres accepts connections. Expects `PGDATA`, `MONITOR_PORT` and
 /// `AUTOCTL_NODE_PASSWORD`. Starts a background retry loop.
-const MONITOR_PREPARE_SNIPPET: &str = r#"gosu postgres pg_autoctl config set --pgdata "$PGDATA" postgresql.auth_method scram-sha-256 >/dev/null 2>&1 || true
+const MONITOR_PREPARE_SNIPPET: &str = concat!(
+    autoctl_config_helpers!(),
+    r#"autoctl_config_set postgresql.auth_method scram-sha-256 || true
 (
   for _ in $(seq 1 120); do
     if printf '%s\n' "ALTER ROLE autoctl_node PASSWORD :'pw';" \
@@ -315,7 +376,8 @@ const MONITOR_PREPARE_SNIPPET: &str = r#"gosu postgres pg_autoctl config set --p
     sleep 1
   done
   exit 1
-) &"#;
+) &"#
+);
 
 /// Monitor, enforce: rewrite every `trust` rule for `autoctl_node` (the
 /// legacy `0.0.0.0/0` rules, and pg_auto_failover's own LAN rule on clusters
@@ -364,6 +426,10 @@ chmod 600 "$PGPASS_FILE""#;
 /// `AUTOCTL_NODE_PASSWORD` and `REPLICATION_PASSWORD`. Starts a background
 /// retry loop.
 ///
+/// Every configuration change goes through `autoctl_config_helpers!`: during
+/// the in-place upgrade the keeper is running and rewrites the file these
+/// calls read, and a failed step has to say which setting failed and why.
+///
 /// During the in-place upgrade (`TEMPS_AUTH_UPGRADE=1`, see
 /// [`PostgresClusterService::auth_upgrade_command`]), a standby that is still
 /// taking its initial base backup has pg_autoctl configuration but no
@@ -372,14 +438,17 @@ chmod 600 "$PGPASS_FILE""#;
 /// the loop exits 0 instead of waiting for a server that cannot start until
 /// the backup completes. The entrypoint does not set the flag: there the loop
 /// must keep waiting for `pg_autoctl run` to start PostgreSQL.
-const NODE_PREPARE_SNIPPET: &str = r#"if gosu postgres pg_autoctl config get --pgdata "$PGDATA" postgresql.pgdata >/dev/null 2>&1; then
-  gosu postgres pg_autoctl config set --pgdata "$PGDATA" replication.password "$REPLICATION_PASSWORD" >/dev/null 2>&1 || exit 1
-  gosu postgres pg_autoctl config set --pgdata "$PGDATA" postgresql.auth_method scram-sha-256 >/dev/null 2>&1 || true
-  CURRENT_MONITOR=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" pg_autoctl.monitor 2>/dev/null || true)
+const NODE_PREPARE_SNIPPET: &str = concat!(
+    autoctl_config_helpers!(),
+    r#"if [ -f "$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config 2>/dev/null)" ]; then
+  autoctl_config_set replication.password "$REPLICATION_PASSWORD" || exit 1
+  autoctl_config_set postgresql.auth_method scram-sha-256 || true
+  autoctl_config_run get pg_autoctl.monitor || exit 1
+  CURRENT_MONITOR=$AUTOCTL_OUT
   if [ -n "$CURRENT_MONITOR" ]; then
     WANTED_MONITOR=$(printf '%s' "$CURRENT_MONITOR" | sed -E "s#^(postgres(ql)?://autoctl_node)(:[^@]*)?@#\1:${AUTOCTL_NODE_PASSWORD}@#")
     if [ "$WANTED_MONITOR" != "$CURRENT_MONITOR" ]; then
-      gosu postgres pg_autoctl config set --pgdata "$PGDATA" pg_autoctl.monitor "$WANTED_MONITOR" >/dev/null 2>&1 || exit 1
+      autoctl_config_set pg_autoctl.monitor "$WANTED_MONITOR" || exit 1
     fi
   fi
 fi
@@ -403,7 +472,8 @@ fi
   done
   echo "temps: PostgreSQL on port $NODE_PORT did not accept local connections within 300s; the replication password was not confirmed on this member" >&2
   exit 1
-) &"#;
+) &"#
+);
 
 /// Data node, enforce: rewrite every `trust` rule for
 /// `pgautofailover_replicator` (the legacy `0.0.0.0/0` rules and
@@ -697,6 +767,11 @@ impl PostgresClusterService {
         };
         let mut script = vec![
             "set -e".to_string(),
+            // `set -e` ends the script on a failing command, and several of
+            // them discard their own output. Name the command so a non-zero
+            // exit is never an empty string for the control plane to report.
+            r#"trap 'echo "temps: upgrade step stopped at line $LINENO: $BASH_COMMAND" >&2' ERR"#
+                .to_string(),
             format!("PGDATA={pgdata}"),
             // Lets the shared snippets tell this exec from the entrypoint.
             "TEMPS_AUTH_UPGRADE=1".to_string(),
@@ -712,7 +787,10 @@ impl PostgresClusterService {
             // the backup that pg_autoctl moves into place, so it is skipped.
             script.push(
                 r#"CONFIG_FILE=$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config)
-[ -f "$CONFIG_FILE" ]
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "temps: pg_autoctl configuration file \"$CONFIG_FILE\" for $PGDATA does not exist; this member is not initialized" >&2
+  exit 1
+fi
 if [ -d "$PGDATA" ] && [ "$CONFIG_FILE" != "$PGDATA/pg_autoctl.cfg" ] && [ ! -e "$PGDATA/pg_autoctl.cfg" ]; then
   ln -s "$CONFIG_FILE" "$PGDATA/pg_autoctl.cfg"
   chown -h postgres:postgres "$PGDATA/pg_autoctl.cfg"
@@ -742,7 +820,7 @@ fi"#
             // Existing keepers must load the new monitor/replication secrets
             // before any peer switches its HBA from trust to SCRAM.
             script.push(
-                "gosu postgres pg_autoctl reload --pgdata \"$PGDATA\" >/dev/null 2>&1".to_string(),
+                "gosu postgres pg_autoctl reload --pgdata \"$PGDATA\" >/dev/null".to_string(),
             );
         }
         vec!["bash".to_string(), "-c".to_string(), script.join("\n")]
@@ -1745,6 +1823,208 @@ exit 0
         }
     }
 
+    /// The monitor URI a pre-SCRAM keeper has in its configuration.
+    const LEGACY_MONITOR_URI: &str = "postgresql://autoctl_node@monitor-host:5432/pg_auto_failover";
+
+    /// A `gosu` standing in for `gosu postgres pg_autoctl ...` on a member.
+    ///
+    /// `show file` answers from `$CONFIG_FILE`; `config get|set` persist into
+    /// `$CONFIG_STORE.<key>` the way pg_autoctl's own file does; PostgreSQL
+    /// is down, so every psql call fails. The first `$FLAKY_CONFIG_CALLS`
+    /// `config` calls fail with the error pg_autoctl prints when it reads
+    /// its configuration mid-rewrite, and the first `$STALE_SETS`
+    /// `config set` calls store an older value, as the keeper's own copy
+    /// overwrites a value written between its read and its write.
+    const FAKE_GOSU: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$COMMAND_LOG"
+case "$*" in
+  *"pg_autoctl show file"*) printf '%s\n' "$CONFIG_FILE" ;;
+  *"pg_autoctl config "*)
+    CALLS=$(cat "$CONFIG_STORE.calls" 2>/dev/null || echo 0)
+    CALLS=$((CALLS + 1))
+    echo "$CALLS" > "$CONFIG_STORE.calls"
+    if [ "$CALLS" -le "${FLAKY_CONFIG_CALLS:-0}" ]; then
+      echo "ERROR Failed to find section pg_autoctl in \"$CONFIG_FILE\"" >&2
+      exit 1
+    fi
+    # gosu postgres pg_autoctl config <verb> --pgdata <dir> <key> [value]
+    case "$4" in
+      set)
+        STALE=$(cat "$CONFIG_STORE.stale" 2>/dev/null || echo 0)
+        if [ "$STALE" -lt "${STALE_SETS:-0}" ]; then
+          echo $((STALE + 1)) > "$CONFIG_STORE.stale"
+          printf '%s' stale > "$CONFIG_STORE.$7"
+        else
+          printf '%s' "$8" > "$CONFIG_STORE.$7"
+        fi
+        printf '%s\n' "$8"
+        ;;
+      get)
+        cat "$CONFIG_STORE.$7" 2>/dev/null || exit 1
+        echo
+        ;;
+    esac
+    ;;
+  *psql*) exit 2 ;;
+esac
+exit 0
+"#;
+
+    struct NodePrepareRun {
+        success: bool,
+        stderr: String,
+        replication_password: String,
+        monitor_uri: String,
+    }
+
+    /// Runs the NodePrepare script against [`FAKE_GOSU`] on a standby with
+    /// no database yet (so the script ends after the configuration steps).
+    /// `None` when bash is unavailable.
+    fn run_node_prepare(
+        flaky_config_calls: u32,
+        stale_sets: u32,
+        config_file_exists: bool,
+    ) -> Option<NodePrepareRun> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // `sleep` is a no-op so the retry backoff does not slow the test.
+        for command in ["chown", "chmod", "sleep"] {
+            let path = bin.join(command);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let gosu = bin.join("gosu");
+        std::fs::write(&gosu, FAKE_GOSU).unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config_file = dir.path().join("xdg/pg_autoctl.cfg");
+        std::fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        if config_file_exists {
+            std::fs::write(&config_file, "[pg_autoctl]\n").unwrap();
+        }
+        let store = dir.path().join("config-store");
+        std::fs::write(
+            format!("{}.pg_autoctl.monitor", store.display()),
+            LEGACY_MONITOR_URI,
+        )
+        .unwrap();
+        let pgdata = dir.path().join("pgdata");
+        let script = PostgresClusterService::auth_upgrade_command(AuthUpgradeStep::NodePrepare)[2]
+            .replace("/var/lib/postgresql/pgdata", pgdata.to_str().unwrap())
+            .replace(
+                "/var/lib/postgresql/.pgpass",
+                dir.path().join(".pgpass").to_str().unwrap(),
+            );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("COMMAND_LOG", dir.path().join("commands"))
+            .env("CONFIG_FILE", &config_file)
+            .env("CONFIG_STORE", &store)
+            .env("FLAKY_CONFIG_CALLS", flaky_config_calls.to_string())
+            .env("STALE_SETS", stale_sets.to_string())
+            .env("NODE_PORT", "6201")
+            .env("AUTOCTL_NODE_PASSWORD", "node-secret")
+            .env("REPLICATION_PASSWORD", "replication-secret")
+            .output()
+            .ok()?;
+        let read = |key: &str| {
+            std::fs::read_to_string(format!("{}.{key}", store.display())).unwrap_or_default()
+        };
+        Some(NodePrepareRun {
+            success: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            replication_password: read("replication.password"),
+            monitor_uri: read("pg_autoctl.monitor"),
+        })
+    }
+
+    /// A running keeper rewrites its configuration file in place on every
+    /// reload, and each `pg_autoctl config set` of the upgrade signals one.
+    /// The next `config get|set` can therefore read a half-written file and
+    /// fail ("Failed to find section pg_autoctl"). NodePrepare must retry
+    /// rather than turn that into a failed upgrade step.
+    #[test]
+    fn node_prepare_retries_pg_autoctl_config_while_the_keeper_rewrites_it() {
+        let Some(run) = run_node_prepare(7, 0, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(run.success, "NodePrepare failed: {}", run.stderr);
+        assert_eq!(run.replication_password, "replication-secret");
+        assert_eq!(
+            run.monitor_uri,
+            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover"
+        );
+        assert!(
+            !run.stderr.contains("replication-secret") && !run.stderr.contains("node-secret"),
+            "credentials must never be printed: {}",
+            run.stderr
+        );
+    }
+
+    /// The keeper may write back its older copy over a value just stored.
+    /// NodePrepare reads every value back and stores it again.
+    #[test]
+    fn node_prepare_stores_again_a_value_the_keeper_overwrote() {
+        let Some(run) = run_node_prepare(0, 2, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(run.success, "NodePrepare failed: {}", run.stderr);
+        assert_eq!(run.replication_password, "replication-secret");
+        assert_eq!(
+            run.monitor_uri,
+            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover"
+        );
+    }
+
+    /// A step that cannot store the configuration must say which setting
+    /// failed and why -- the control plane reports this output, and an empty
+    /// string leaves nothing to act on -- without printing the password.
+    #[test]
+    fn node_prepare_reports_why_the_configuration_could_not_be_stored() {
+        let Some(run) = run_node_prepare(1_000_000, 0, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(!run.success, "a permanent pg_autoctl failure must fail");
+        assert!(
+            run.stderr.contains("config set replication.password"),
+            "names the setting: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("Failed to find section pg_autoctl"),
+            "carries pg_autoctl's own message: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("replication-secret"),
+            "credentials must never be printed: {}",
+            run.stderr
+        );
+    }
+
+    /// A member whose pg_autoctl configuration does not exist is not
+    /// initialized; the step must say so instead of exiting silently.
+    #[test]
+    fn node_prepare_explains_a_missing_pg_autoctl_configuration() {
+        let Some(run) = run_node_prepare(0, 0, false) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(!run.success);
+        assert!(
+            run.stderr.contains("does not exist"),
+            "explains the failure: {}",
+            run.stderr
+        );
+    }
+
     /// Regression for #1352: adding a replica re-ran the in-place upgrade on
     /// an existing standby still waiting for its initial base backup. It has
     /// pg_autoctl configuration but no `$PGDATA` directory, so NodePrepare
@@ -1769,19 +2049,14 @@ exit 0
         // pg_autoctl answers from its configuration; PostgreSQL is not
         // running, so every psql call fails.
         let gosu = bin.join("gosu");
+        std::fs::write(&gosu, FAKE_GOSU).unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_store = dir.path().join("config-store");
         std::fs::write(
-            &gosu,
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> "$COMMAND_LOG"
-case "$*" in
-  *"pg_autoctl show file"*) printf '%s\n' "$CONFIG_FILE" ;;
-  *psql*) exit 2 ;;
-esac
-exit 0
-"#,
+            format!("{}.pg_autoctl.monitor", config_store.display()),
+            LEGACY_MONITOR_URI,
         )
         .unwrap();
-        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let pgdata = dir.path().join("pgdata");
         let pgpass = dir.path().join(".pgpass");
@@ -1797,6 +2072,7 @@ exit 0
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .env("COMMAND_LOG", &log)
                 .env("CONFIG_FILE", &config_file)
+                .env("CONFIG_STORE", &config_store)
                 .env("NODE_PORT", "6201")
                 .env("AUTOCTL_NODE_PASSWORD", "node-secret")
                 .env("REPLICATION_PASSWORD", "replication-secret")
@@ -3340,7 +3616,13 @@ mod scram_docker_tests {
                             &auth.env(),
                         )
                         .await;
-                    assert_eq!(code, 0, "{step:?} on {target}: {out}");
+                    if code != 0 {
+                        panic!(
+                            "{step:?} on {target} exited {code}: {out:?}\n{}\ncluster state:\n{}",
+                            fx.describe(target).await,
+                            fx.state(&monitor).await,
+                        );
+                    }
                 }
             }
             for node in [&n1, &n2] {
