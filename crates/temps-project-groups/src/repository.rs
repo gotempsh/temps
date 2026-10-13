@@ -855,9 +855,9 @@ pub(crate) mod tests {
     /// A public provider whose branches, and the refs its tree lookup
     /// resolves, are fixed, counting the tree lookups made.
     struct FakeProvider {
-        branches: Vec<&'static str>,
+        branches: Vec<String>,
         /// Refs `get_file_tree` resolves (tags and commits).
-        trees: Vec<&'static str>,
+        trees: Vec<String>,
         tree_error: Option<fn() -> PublicRepoError>,
         branch_error: Option<fn() -> PublicRepoError>,
         tree_calls: std::sync::atomic::AtomicUsize,
@@ -866,8 +866,8 @@ pub(crate) mod tests {
     impl FakeProvider {
         fn new(branches: &[&'static str], trees: &[&'static str]) -> Self {
             Self {
-                branches: branches.to_vec(),
-                trees: trees.to_vec(),
+                branches: branches.iter().map(|b| (*b).to_string()).collect(),
+                trees: trees.iter().map(|t| (*t).to_string()).collect(),
                 tree_error: None,
                 branch_error: None,
                 tree_calls: Default::default(),
