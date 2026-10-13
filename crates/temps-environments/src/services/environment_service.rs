@@ -2549,6 +2549,7 @@ mod tests {
             "enable_preview_environments": false, "preview_envs_on_demand": false,
             "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
             "source_type": source_type, "project_type": temps_entities::types::ProjectType::Server,
+            "hosting": "hosted",
             "cross_project_trace_sharing": true,
             "cloud_telemetry_fidelity": "metered", "cloud_telemetry_attribute_allowlist": [],
             "cloud_telemetry_write_mode": "local", "cloud_analytics_write_mode": "local"

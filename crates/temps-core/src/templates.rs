@@ -873,6 +873,7 @@ pub const VALID_PRESETS: &[&str] = &[
     "nixpacks-csharp",
     "nixpacks-dart",
     "nixpacks-static",
+    "nixpacks-swift",
 ];
 
 /// Validation error for a single template
