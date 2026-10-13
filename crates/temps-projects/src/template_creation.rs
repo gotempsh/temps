@@ -851,6 +851,11 @@ pub struct TemplateServiceRequest {
     pub runtime_overrides: TemplateRuntimeOverrides,
     /// Hold the first deployment until [`TemplateServiceCreator::queue_first_deployment`].
     pub defer_initial_deployment: bool,
+    /// Ownership marker of the instantiation creating this service, built
+    /// with [`temps_entities::projects::instantiation_token`]. Stored in the
+    /// same `INSERT` as the project, so a resumed instantiation can recognise
+    /// the project as its own. `None` outside an instantiation.
+    pub instantiation_token: Option<String>,
     /// Label for telemetry and messages: `image`, `fork`, `public_repo` or
     /// `repository`.
     pub deploy_mode: &'static str,
@@ -975,7 +980,7 @@ impl TemplateServiceCreator {
                     preset: service.preset.clone(),
                     preset_config: service.preset_config.clone(),
                     environment_variables: env_vars,
-                    automatic_deploy: repository.automatic_deploy && !repository.is_public,
+                    automatic_deploy: repository_automatic_deploy(repository),
                     storage_service_ids: request.storage_service_ids.clone(),
                     storage_service_claim_ids: request.storage_service_claim_ids.clone(),
                     storage_service_claim_user_id: Some(caller.auth.user_id()),
@@ -1010,6 +1015,7 @@ impl TemplateServiceCreator {
                 request.release.clone(),
                 caller.slug_claim,
                 request.defer_initial_deployment,
+                request.instantiation_token.clone(),
             )
             .await
             .inspect_err(|error| {
@@ -1175,6 +1181,39 @@ impl TemplateServiceCreator {
     }
 }
 
+/// Whether pushes to a template's repository deploy the project.
+///
+/// Only a repository the project reaches through a Git connection can send
+/// push webhooks, so the unconnected public-upstream mode never deploys on
+/// push. Visibility is irrelevant: a public repository created through an
+/// authenticated connection (a fork or a new repository the caller owns)
+/// keeps the caller's choice.
+pub fn repository_automatic_deploy(repository: &RepositoryTarget) -> bool {
+    repository.automatic_deploy && repository.git_provider_connection_id.is_some()
+}
+
+/// Check that `requested` is acceptable for `variables` without creating
+/// anything, so callers can fail before an irreversible side effect (such as
+/// creating a remote repository) instead of after it.
+///
+/// This is the same resolution [`TemplateServiceCreator::create`] performs,
+/// so a request accepted here is not rejected for its variables later. The
+/// resolved values are discarded: generated secrets are produced again, and
+/// `app_url` is stood in for by a placeholder because the real address needs
+/// the planned project slug.
+pub fn validate_template_variables(
+    variables: &[EnvVarTemplate],
+    requested: &[EnvVarInput],
+) -> Result<(), Problem> {
+    canonicalize_template_environment_variables(
+        variables,
+        requested,
+        Some("https://app-url-placeholder.invalid"),
+    )
+    .map(|_| ())
+    .map_err(template_environment_problem)
+}
+
 fn template_environment_problem(error: TemplateEnvironmentError) -> Problem {
     if matches!(&error, TemplateEnvironmentError::SecureGeneration { .. }) {
         error!(%error, "Secure template environment generation failed");
@@ -1207,5 +1246,127 @@ pub fn public_repository_target(source: &temps_core::templates::GitRef) -> Repos
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| ".".to_string()),
         automatic_deploy: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variable(name: &str, required: bool) -> EnvVarTemplate {
+        EnvVarTemplate {
+            name: name.to_string(),
+            example: None,
+            default: None,
+            description: None,
+            required,
+            secret: false,
+            default_generator: None,
+        }
+    }
+
+    fn input(name: &str, value: &str) -> EnvVarInput {
+        EnvVarInput {
+            name: name.to_string(),
+            value: value.to_string(),
+            is_secret: false,
+        }
+    }
+
+    fn connected_repository(is_public: bool, automatic_deploy: bool) -> RepositoryTarget {
+        RepositoryTarget {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            branch: "main".to_string(),
+            git_url: Some("https://github.com/owner/repo.git".to_string()),
+            git_provider_connection_id: Some(3),
+            is_public,
+            directory: ".".to_string(),
+            automatic_deploy,
+        }
+    }
+
+    #[test]
+    fn a_public_repository_created_through_a_connection_keeps_automatic_deploy() {
+        for is_public in [true, false] {
+            assert!(
+                repository_automatic_deploy(&connected_repository(is_public, true)),
+                "is_public={is_public}: the caller's choice must survive"
+            );
+            assert!(
+                !repository_automatic_deploy(&connected_repository(is_public, false)),
+                "is_public={is_public}: an explicit opt-out must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unconnected_public_upstream_never_deploys_on_push() {
+        let upstream = public_repository_target(&temps_core::templates::GitRef {
+            url: "https://github.com/example/starter.git".to_string(),
+            r#ref: "main".to_string(),
+            path: Some("apps/web".to_string()),
+        });
+        assert!(!upstream.automatic_deploy);
+        assert!(!repository_automatic_deploy(&upstream));
+
+        // Even if a caller asks for it, a repository with no connection cannot
+        // send push webhooks.
+        let mut requested = upstream;
+        requested.automatic_deploy = true;
+        assert!(!repository_automatic_deploy(&requested));
+    }
+
+    #[test]
+    fn variables_are_validated_without_creating_anything() {
+        let variables = vec![
+            variable("API_TOKEN", true),
+            EnvVarTemplate {
+                default: Some("info".to_string()),
+                ..variable("LOG_LEVEL", true)
+            },
+            EnvVarTemplate {
+                default_generator: Some("app_url".to_string()),
+                ..variable("PUBLIC_URL", true)
+            },
+        ];
+
+        assert!(validate_template_variables(&variables, &[input("API_TOKEN", "x")]).is_ok());
+
+        let missing = validate_template_variables(&variables, &[])
+            .expect_err("a required variable without a value is rejected");
+        assert_eq!(missing.status_code, StatusCode::BAD_REQUEST);
+        let detail = missing
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("API_TOKEN"), "{detail}");
+
+        let duplicate = validate_template_variables(
+            &variables,
+            &[input("API_TOKEN", "one"), input("API_TOKEN", "two")],
+        )
+        .expect_err("a variable supplied twice is rejected");
+        assert_eq!(duplicate.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_handler_validates_variables_before_it_creates_a_repository() {
+        let source = include_str!("handlers/handlers.rs");
+        let start = source
+            .find("pub async fn create_project_from_template(")
+            .expect("handler exists");
+        let body = &source[start..];
+        let validate = body
+            .find("validate_template_variables(")
+            .expect("the handler validates variables");
+        let create = body
+            .find("create_repository_and_push_template(")
+            .expect("the handler creates the fork repository");
+        assert!(
+            validate < create,
+            "variables must be validated before the irreversible repository creation"
+        );
     }
 }

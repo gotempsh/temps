@@ -95,9 +95,27 @@ pub fn is_container_runtime_unavailable(error: &str) -> bool {
         "docker client is unavailable",
         "could not find docker environment",
         "docker socket",
+        // testcontainers when no runtime is installed or running, e.g.
+        // "failed to initialize a docker client: Socket not found: /var/run/docker.sock"
+        "failed to initialize a docker client",
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
     ]
     .iter()
     .any(|marker| message.contains(marker))
+        || is_missing_docker_socket(&message)
+}
+
+/// "Socket not found" / "No such file or directory" only mean the container
+/// runtime is missing when the message also names a Docker socket path, so a
+/// missing migration file or unrelated socket still fails the test.
+fn is_missing_docker_socket(message: &str) -> bool {
+    let names_docker_socket = message.contains("docker.sock") || message.contains("docker socket");
+    names_docker_socket
+        && (message.contains("socket not found")
+            || message.contains("no such file or directory")
+            || message.contains("connection refused")
+            || message.contains("permission denied"))
 }
 
 /// Shared test database container that lives for the duration of the test run
@@ -1085,6 +1103,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_runtime_unavailable_recognises_missing_docker_runtime() {
+        for message in [
+            "failed to initialize a docker client: Socket not found: /var/run/docker.sock",
+            "Failed to Initialize a Docker Client: client error",
+            "Socket not found: /var/run/docker.sock",
+            "error trying to connect: No such file or directory (os error 2) while opening /var/run/docker.sock",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            "could not find Docker environment",
+            "hyper legacy client: client error (connect)",
+        ] {
+            assert!(
+                is_container_runtime_unavailable(message),
+                "expected {message:?} to be classified as runtime unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn container_runtime_unavailable_does_not_swallow_real_failures() {
+        for message in [
+            "migration m20260101_000001 failed: relation \"projects\" already exists",
+            "No such file or directory (os error 2): /tmp/fixtures/missing.sql",
+            "Socket not found: /run/postgresql/.s.PGSQL.5432",
+            "error returned from database: duplicate key value violates unique constraint",
+            "pull access denied for timescale/does-not-exist",
+        ] {
+            assert!(
+                !is_container_runtime_unavailable(message),
+                "expected {message:?} NOT to be classified as runtime unavailable"
+            );
+        }
+    }
 
     async fn test_database_or_skip() -> anyhow::Result<Option<TestDatabase>> {
         match TestDatabase::new().await {

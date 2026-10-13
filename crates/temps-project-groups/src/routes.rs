@@ -132,12 +132,28 @@ impl GroupRouteService {
         }
         .insert(self.db.as_ref())
         .await
-        .map_err(|e| match e.sql_err() {
-            Some(SqlErr::UniqueConstraintViolation(_)) => ProjectGroupError::RouteConflict {
-                source_name: source.name.clone(),
-                path_prefix: path_prefix.clone(),
-            },
-            _ => ProjectGroupError::db(format!("creating a route in project group {group_id}"))(e),
+        .map_err(|e| {
+            if let Some(SqlErr::UniqueConstraintViolation(_)) = e.sql_err() {
+                return ProjectGroupError::RouteConflict {
+                    source_name: source.name.clone(),
+                    path_prefix: path_prefix.clone(),
+                };
+            }
+            // The membership guard trigger rejected the row: a service left
+            // the group after `group` was loaded.
+            match departed_endpoint(&e) {
+                Some(DepartedEndpoint::Source) => ProjectGroupError::NotAMember {
+                    group_id,
+                    project_id: req.source_project_id,
+                },
+                Some(DepartedEndpoint::Target) => ProjectGroupError::NotAMember {
+                    group_id,
+                    project_id: req.target_project_id,
+                },
+                None => ProjectGroupError::db(format!(
+                    "creating a route in project group {group_id}"
+                ))(e),
+            }
         })?;
 
         let environments = self.environments_of(&group.members).await?;
@@ -191,6 +207,45 @@ impl GroupRouteService {
             by_project.entry(env.project_id).or_default().push(env);
         }
         Ok(by_project)
+    }
+}
+
+/// Which end of a route the membership guard trigger rejected.
+#[derive(Debug, PartialEq, Eq)]
+enum DepartedEndpoint {
+    Source,
+    Target,
+}
+
+/// SQLSTATE `check_violation`, raised by the route membership trigger.
+const CHECK_VIOLATION: &str = "23514";
+
+/// Recognises the membership trigger's rejection (`source project N is not a
+/// member of group G` / `target project ...`), as opposed to the table's own
+/// CHECK constraints, which share the SQLSTATE.
+fn departed_endpoint(err: &sea_orm::DbErr) -> Option<DepartedEndpoint> {
+    let (sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
+    | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
+    else {
+        return None;
+    };
+    let db_err = sqlx_err.as_database_error()?;
+    if db_err.code().as_deref() != Some(CHECK_VIOLATION) {
+        return None;
+    }
+    classify_trigger_message(db_err.message())
+}
+
+fn classify_trigger_message(message: &str) -> Option<DepartedEndpoint> {
+    if !message.contains("is not a member of group") {
+        return None;
+    }
+    if message.starts_with("source project") {
+        Some(DepartedEndpoint::Source)
+    } else if message.starts_with("target project") {
+        Some(DepartedEndpoint::Target)
+    } else {
+        None
     }
 }
 
@@ -260,6 +315,72 @@ mod tests {
     use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     use temps_database::test_utils::TestDatabase;
+
+    #[test]
+    fn trigger_message_names_the_departed_endpoint() {
+        assert_eq!(
+            classify_trigger_message("source project 4 is not a member of group 9"),
+            Some(DepartedEndpoint::Source)
+        );
+        assert_eq!(
+            classify_trigger_message("target project 4 is not a member of group 9"),
+            Some(DepartedEndpoint::Target)
+        );
+        // The table's own CHECK constraints share the SQLSTATE.
+        assert_eq!(
+            classify_trigger_message(
+                "new row violates check constraint \"ck_project_group_routes_prefix\""
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_that_left_after_the_group_was_loaded_is_not_a_member() {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Docker/TimescaleDB unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let conn = db.connection_arc();
+        for id in [9811, 9812] {
+            insert_service(conn.as_ref(), id).await;
+        }
+        let groups = ProjectGroupService::new(conn.clone());
+        let created = groups
+            .create_group(CreateProjectGroupRequest {
+                name: "Stale".into(),
+                slug: None,
+                description: None,
+                project_ids: vec![9811, 9812],
+            })
+            .await
+            .unwrap();
+        // The snapshot a request handler would be holding...
+        let stale = groups.get_group(created.group.id).await.unwrap();
+        // ...while a concurrent request removes the target.
+        groups.remove_project(created.group.id, 9812).await.unwrap();
+
+        let routes = GroupRouteService::new(conn);
+        let err = routes
+            .create(&stale, request(9811, "/api", 9812))
+            .await
+            .expect_err("the membership guard must reject a departed target");
+        assert!(
+            matches!(
+                err,
+                ProjectGroupError::NotAMember {
+                    project_id: 9812,
+                    ..
+                }
+            ),
+            "expected NotAMember for the departed target, got {err:?}"
+        );
+        let fresh = groups.get_group(created.group.id).await.unwrap();
+        assert!(routes.list(&fresh).await.unwrap().is_empty());
+    }
 
     async fn insert_service(conn: &impl ConnectionTrait, id: i32) {
         conn.execute(Statement::from_sql_and_values(

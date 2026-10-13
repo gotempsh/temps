@@ -252,9 +252,51 @@ fn same_service_release(
     }
 }
 
+/// Why a one-service app cannot be moved onto a release that has several
+/// services through the single-service upgrade.
+fn single_to_multi_service_upgrade_detail(
+    project_id: i32,
+    target: &temps_core::templates::ServiceTemplateInstance,
+) -> String {
+    format!(
+        "Project {project_id} runs a single service of '{}', but release {}@{} has {} services that must be created together. It cannot be upgraded one service at a time: deploy {} as a whole app from the template catalog instead.",
+        target.slug,
+        target.slug,
+        target.version,
+        target.template.services.len(),
+        target.template.name,
+    )
+}
+
+/// What changes between two releases of the same service, comparing the
+/// variables each release actually configures the service with
+/// ([`temps_core::templates::ServiceTemplateInstance::service_variables`]):
+/// a single-service template's shared variables are part of its service.
+fn service_release_changes(
+    applied: &temps_core::templates::ServiceTemplateInstance,
+    target: &temps_core::templates::ServiceTemplateInstance,
+) -> Vec<ServiceTemplateUpgradeChange> {
+    template_spec_changes(
+        release_spec(applied),
+        &applied.service_variables(),
+        release_spec(target),
+        &target.service_variables(),
+    )
+}
+
+#[cfg(test)]
 fn service_template_changes(
     applied: &temps_core::templates::TemplateServiceSpec,
     target: &temps_core::templates::TemplateServiceSpec,
+) -> Vec<ServiceTemplateUpgradeChange> {
+    template_spec_changes(applied, &applied.env_vars, target, &target.env_vars)
+}
+
+fn template_spec_changes(
+    applied: &temps_core::templates::TemplateServiceSpec,
+    applied_variables: &[temps_core::templates::EnvVarTemplate],
+    target: &temps_core::templates::TemplateServiceSpec,
+    target_variables: &[temps_core::templates::EnvVarTemplate],
 ) -> Vec<ServiceTemplateUpgradeChange> {
     let mut changes = Vec::new();
     push_template_change(
@@ -309,13 +351,11 @@ fn service_template_changes(
         push_template_change(&mut changes, field, text_option(current), text_option(next));
     }
 
-    let applied_inputs = applied
-        .env_vars
+    let applied_inputs = applied_variables
         .iter()
         .map(|input| (input.name.as_str(), input))
         .collect::<BTreeMap<_, _>>();
-    let target_inputs = target
-        .env_vars
+    let target_inputs = target_variables
         .iter()
         .map(|input| (input.name.as_str(), input))
         .collect::<BTreeMap<_, _>>();
@@ -1423,9 +1463,11 @@ pub async fn set_project_hosting(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<SetProjectHostingRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
+    // Deciding whether Temps deploys this project is a project-scoped write:
+    // a user with the global permission but only a viewer grant on this
+    // project must be refused, which membership alone would not do.
+    project_permission_guard!(auth, ProjectsWrite, id, state.project_access_checker);
     project_scope_guard!(auth, id);
-    project_access_guard!(auth, id, state.project_access_checker);
 
     let updated = state
         .project_service
@@ -2228,24 +2270,33 @@ pub async fn get_project_service_template(
         ),
         latest => (latest, catalog_error),
     };
-    let applied_spec = release_spec(&applied);
+    // A one-service app cannot be moved onto a release that has several
+    // services from here: that is the whole-app upgrade of a project.
+    let (latest, catalog_error) = match latest {
+        Some(latest)
+            if latest.template.is_multi_service() && !applied.template.is_multi_service() =>
+        {
+            let detail = single_to_multi_service_upgrade_detail(project_id, &latest);
+            (Some(latest), Some(detail))
+        }
+        other => (other, catalog_error),
+    };
     let catalog_drift = latest.as_ref().is_some_and(|latest| {
         latest.version == applied.version && latest.template != applied.template
     });
-    let upgrade_available = latest
-        .as_ref()
-        .is_some_and(|latest| latest.is_newer_than(&applied).unwrap_or(false));
+    let upgrade_available = latest.as_ref().is_some_and(|latest| {
+        !latest.template.is_multi_service() && latest.is_newer_than(&applied).unwrap_or(false)
+    });
     let changes = latest
         .as_ref()
-        .map(|latest| service_template_changes(applied_spec, release_spec(latest)))
+        .map(|latest| service_release_changes(&applied, latest))
         .unwrap_or_default();
+    // The same variable set creation and the upgrade itself use, so a newly
+    // introduced shared variable is reported as required configuration.
     let required_configuration = latest
         .as_ref()
         .map(|latest| {
-            missing_required_template_configuration(
-                &release_spec(latest).env_vars,
-                &configured_names,
-            )
+            missing_required_template_configuration(&latest.service_variables(), &configured_names)
         })
         .unwrap_or_default();
     let missing_services = latest
@@ -2343,6 +2394,12 @@ pub async fn upgrade_project_service_template(
             ))
             .build());
     }
+    if target.template.is_multi_service() {
+        return Err(temps_core::error_builder::conflict()
+            .title("Upgrade Needs The Whole App")
+            .detail(single_to_multi_service_upgrade_detail(project_id, &target))
+            .build());
+    }
     let target = same_service_release(target, &applied);
     let Some(target_spec) = target.spec().cloned() else {
         return Err(temps_core::error_builder::bad_request()
@@ -2410,8 +2467,12 @@ pub async fn upgrade_project_service_template(
             .await
             .map_err(Problem::from)?,
     );
+    // The variables this service is configured with: its own plus, for a
+    // one-service template, the template's shared ones. Creation and
+    // `upgrade_service_template` resolve exactly this set.
+    let target_variables = target.service_variables();
     let generated_app_url = if upgrade_needs_generated_app_url(
-        &target_spec.env_vars,
+        &target_variables,
         &request.environment_variables,
         &configured_names,
     ) {
@@ -2420,7 +2481,7 @@ pub async fn upgrade_project_service_template(
         None
     };
     let new_environment_variables = canonicalize_template_upgrade_environment_variables(
-        &target_spec.env_vars,
+        &target_variables,
         &request.environment_variables,
         &configured_names,
         generated_app_url.as_deref(),
@@ -3123,6 +3184,20 @@ pub async fn create_project_from_template(
             .detail(error.to_string())
             .build()
     })?;
+    // A one-service template's shared variables belong to its only service.
+    let variable_templates = template
+        .shared_env_vars
+        .iter()
+        .chain(service.env_vars.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    // Fork mode creates and populates a remote repository below, which cannot
+    // be undone and would block a corrected retry under the same name. Reject
+    // missing, duplicate or unknown variables before that side effect.
+    crate::template_creation::validate_template_variables(
+        &variable_templates,
+        &request.environment_variables,
+    )?;
     let planned_project_slug = state
         .project_service
         .plan_project_slug(&request.project_name)
@@ -3269,12 +3344,7 @@ pub async fn create_project_from_template(
     let created = template_creator(state.as_ref())
         .create(
             crate::template_creation::TemplateServiceRequest {
-                variable_templates: template
-                    .shared_env_vars
-                    .iter()
-                    .chain(service.env_vars.iter())
-                    .cloned()
-                    .collect(),
+                variable_templates,
                 template: template.clone(),
                 service: service.clone(),
                 release,
@@ -3287,6 +3357,7 @@ pub async fn create_project_from_template(
                 repository,
                 runtime_overrides,
                 defer_initial_deployment: false,
+                instantiation_token: None,
                 deploy_mode,
             },
             &caller,
@@ -3463,6 +3534,148 @@ mod tests {
                 && change.current.as_deref() == Some("required, default=false")
                 && change.target.as_deref() == Some("required, default=true")
         }));
+    }
+
+    fn shared_variable(
+        name: &str,
+        required: bool,
+        generator: Option<&str>,
+    ) -> temps_core::templates::EnvVarTemplate {
+        temps_core::templates::EnvVarTemplate {
+            name: name.to_string(),
+            example: None,
+            default: None,
+            description: None,
+            required,
+            secret: false,
+            default_generator: generator.map(str::to_string),
+        }
+    }
+
+    fn keycloak_release() -> temps_core::templates::ServiceTemplateInstance {
+        temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_core::templates::bundled_template_by_slug("keycloak")
+                .expect("Keycloak should be bundled"),
+        )
+    }
+
+    #[test]
+    fn single_service_upgrade_resolves_newly_introduced_shared_variables() {
+        let applied = keycloak_release();
+        let mut target = applied.clone();
+        target.version = "99.0.0".to_string();
+        target.template.version = target.version.clone();
+        target
+            .template
+            .shared_env_vars
+            .push(shared_variable("NEW_SHARED_TOKEN", true, None));
+        target.template.shared_env_vars.push(shared_variable(
+            "NEW_SHARED_SECRET",
+            true,
+            Some("random_secret"),
+        ));
+        assert!(!target.template.is_multi_service());
+
+        // The preview reports the shared variables the upgrade will ask for.
+        let changes = super::service_release_changes(&applied, &target);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.field == "configuration.NEW_SHARED_TOKEN"),
+            "{changes:?}"
+        );
+        let configured = BTreeSet::new();
+        let required =
+            missing_required_template_configuration(&target.service_variables(), &configured);
+        assert!(required.iter().any(|v| v.name == "NEW_SHARED_TOKEN"));
+        // A generator satisfies the requirement, so it is not asked for.
+        assert!(!required.iter().any(|v| v.name == "NEW_SHARED_SECRET"));
+
+        let supplied = [super::super::templates::EnvVarInput {
+            name: "NEW_SHARED_TOKEN".to_string(),
+            value: "operator-value".to_string(),
+            is_secret: false,
+        }];
+        let variables = target.service_variables();
+
+        // A supplied shared variable is accepted rather than rejected as
+        // unknown, and defaults/generators are applied to the rest.
+        let resolved = canonicalize_template_upgrade_environment_variables(
+            &variables,
+            &supplied,
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("shared variables are part of the service's variables");
+        let value_of = |name: &str| {
+            resolved
+                .iter()
+                .find(|variable| variable.key == name)
+                .map(|variable| variable.value.clone())
+        };
+        assert_eq!(
+            value_of("NEW_SHARED_TOKEN").as_deref(),
+            Some("operator-value")
+        );
+        assert!(value_of("NEW_SHARED_SECRET").is_some_and(|value| value.len() >= 32));
+
+        // Omitting the required one fails required validation by name.
+        assert!(matches!(
+            canonicalize_template_upgrade_environment_variables(
+                &variables,
+                &[],
+                &BTreeSet::new(),
+                None,
+            ),
+            Err(TemplateEnvironmentError::MissingRequired { name }) if name == "NEW_SHARED_TOKEN"
+        ));
+
+        // The service-only set (what the endpoint used before) would have
+        // rejected the same supplied value as unknown.
+        assert!(matches!(
+            canonicalize_template_upgrade_environment_variables(
+                &target.spec().expect("service").env_vars,
+                &supplied,
+                &BTreeSet::new(),
+                None,
+            ),
+            Err(TemplateEnvironmentError::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn multi_service_releases_keep_shared_variables_on_the_project() {
+        let mut release = keycloak_release();
+        release
+            .template
+            .shared_env_vars
+            .push(shared_variable("SHARED_ONLY", true, None));
+        let mut second = release.template.services[0].clone();
+        second.name = "worker".to_string();
+        second.env_vars.clear();
+        release.template.services.push(second);
+
+        assert!(release.template.is_multi_service());
+        assert!(!release
+            .service_variables()
+            .iter()
+            .any(|variable| variable.name == "SHARED_ONLY"));
+    }
+
+    #[test]
+    fn single_service_upgrade_to_a_multi_service_release_names_project_and_release() {
+        let mut target = keycloak_release();
+        target.version = "2.0.0".to_string();
+        target.template.version = target.version.clone();
+        let mut second = target.template.services[0].clone();
+        second.name = "worker".to_string();
+        target.template.services.push(second);
+
+        let detail = super::single_to_multi_service_upgrade_detail(41, &target);
+        assert!(detail.contains("Project 41"), "{detail}");
+        assert!(detail.contains("keycloak@2.0.0"), "{detail}");
+        assert!(detail.contains("whole app"), "{detail}");
     }
 
     #[test]

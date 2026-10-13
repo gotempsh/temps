@@ -303,6 +303,7 @@ mod m20260928_000003_add_project_group_repository;
 mod m20260928_000004_create_project_group_routes;
 mod m20260929_000001_create_template_instantiations;
 mod m20260929_000002_add_project_hosting;
+mod m20260930_000001_add_project_instantiation_token;
 
 pub struct Migrator;
 
@@ -668,6 +669,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260928_000004_create_project_group_routes::Migration),
             Box::new(m20260929_000001_create_template_instantiations::Migration),
             Box::new(m20260929_000002_add_project_hosting::Migration),
+            Box::new(m20260930_000001_add_project_instantiation_token::Migration),
         ]
     }
 }

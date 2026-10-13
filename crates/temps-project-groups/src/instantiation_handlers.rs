@@ -42,10 +42,11 @@ use crate::handlers::{
     ProjectGroupAudit, ProjectGroupsAppState,
 };
 use crate::instantiation::{
-    build_plan, import_template, DatabaseChoice, ForkRequest, ImportServicesRequest, ImportedApp,
-    InstantiateTemplateRequest, InstantiatedService, InstantiationEngine, InstantiationPlan,
-    InstantiationResponse, InstantiationStatus, InstantiationStep, InstantiationTarget, PlanInput,
-    PlannedService, PlannedTarget, RequestOrigin, StepStatus, TemplateVariableInput,
+    build_plan, ensure_secrets_available, import_template, validate_plan_variables, DatabaseChoice,
+    ForkRequest, ImportServicesRequest, ImportedApp, InstantiateTemplateRequest,
+    InstantiatedService, InstantiationEngine, InstantiationPlan, InstantiationResponse,
+    InstantiationStatus, InstantiationStep, InstantiationTarget, PlanInput, PlannedService,
+    PlannedTarget, RequestOrigin, StepStatus, TemplateVariableInput,
 };
 use crate::service::ProjectGroupService;
 
@@ -247,6 +248,9 @@ async fn plan_service_slugs(
             slug,
             runtime_overrides: Default::default(),
             project_id: None,
+            creation_started: false,
+            // Filled in by `build_plan`, which assigns the variables.
+            supplied_variable_names: Vec::new(),
         });
     }
     Ok(services)
@@ -585,6 +589,13 @@ pub async fn instantiate_template(
         }
     }
 
+    // The values every service will be created with must resolve now. A fork
+    // creates a remote repository before the first service is made, so a
+    // value that only fails then (a duplicate, a generator that cannot run)
+    // would leave that repository behind and block a corrected retry under
+    // the same name.
+    validate_plan_variables(&plan, &secrets)?;
+
     let key = request.idempotency_key.trim();
     let (status, response) = store_or_replay(
         &state,
@@ -915,6 +926,10 @@ pub async fn retry_instantiation(
                 .build());
         }
     }
+    // The retention cleanup clears the stored variable values of a failed
+    // run. Retrying then would create services without what the caller
+    // supplied and skip the shared variables, yet report success.
+    ensure_secrets_available(id, model.secrets.is_some(), &plan).map_err(Problem::from)?;
     if let Some(group_id) = plan.group_id {
         authorize_group_env(&state.groups, &auth, group_id, true).await?;
     }

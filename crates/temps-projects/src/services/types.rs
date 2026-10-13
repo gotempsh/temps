@@ -559,6 +559,19 @@ pub enum ProjectError {
         "Additional verification is required before moving a slug that grants host Docker access"
     )]
     SlugClaimStepUpRequired { problem: Box<Problem> },
+
+    /// A one-service project was asked to move onto a template release that
+    /// has several services. Only the first service's runtime could be
+    /// applied, so the release must be deployed as a whole app instead.
+    #[error(
+        "Project {project_id} runs a single service of template '{template_slug}', but release {template_slug}@{target_version} has {service_count} services that must be created together; it cannot be upgraded one service at a time. Deploy the template as a whole app instead"
+    )]
+    SingleServiceUpgradeToMultiService {
+        project_id: i32,
+        template_slug: String,
+        target_version: String,
+        service_count: usize,
+    },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

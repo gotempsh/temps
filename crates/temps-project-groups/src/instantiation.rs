@@ -27,7 +27,7 @@ use temps_core::templates::{
     TemplateServiceSpec, SERVICE_TEMPLATE_SCHEMA_VERSION,
 };
 use temps_core::EncryptionService;
-use temps_entities::template_instantiations;
+use temps_entities::{projects, template_instantiations};
 use temps_projects::services::types::SlugClaimCaller;
 use temps_projects::template_creation::{
     EnvVarInput, RepositoryTarget, TemplateCreationCaller, TemplateRuntimeOverrides,
@@ -194,6 +194,19 @@ pub struct PlannedService {
     pub runtime_overrides: TemplateRuntimeOverrides,
     /// The created service, once known.
     pub project_id: Option<i32>,
+    /// Recorded before the service is created, so a plan that failed after
+    /// this point is known to have attempted it (a project may exist that
+    /// the plan does not name yet). Whether a project is this service's is
+    /// decided by its ownership token, never by this flag.
+    #[serde(default)]
+    pub creation_started: bool,
+    /// Names (never values) of the variables the caller supplied for this
+    /// service, declared by the template or not. The values live only in the
+    /// sealed [`PlanSecrets`], which the retention cleanup removes; this is
+    /// what tells a retry afterwards that the service would be created
+    /// without them. Empty for plans stored before this existed.
+    #[serde(default)]
+    pub supplied_variable_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -250,6 +263,174 @@ impl InstantiationPlan {
 
     fn step_mut(&mut self, key: &str) -> Option<&mut InstantiationStep> {
         self.steps.iter_mut().find(|step| step.key == key)
+    }
+
+    /// Keys of the steps still to run that read values kept only in the
+    /// sealed [`PlanSecrets`]: the shared variables (generated ones
+    /// included) and the values supplied for a service that is not created
+    /// yet. A service needs them when the template declares variables for it
+    /// (generated ones cannot be told apart from supplied ones once the
+    /// secrets are gone) or when the caller supplied any, declared or not:
+    /// a variable the template never declared exists only in the secrets.
+    /// Running without them would report success for a service that lacks
+    /// them.
+    fn steps_needing_secrets(&self) -> Vec<String> {
+        let pending = |key: &str| {
+            self.steps
+                .iter()
+                .any(|step| step.key == key && step.status != StepStatus::Done)
+        };
+        let mut keys = Vec::new();
+        if !self.template.shared_env_vars.is_empty() && pending("variables") {
+            keys.push("variables".to_string());
+        }
+        // Without a project the shared variables go to the one service.
+        let shared_into_service = matches!(self.target, PlannedTarget::NoProject)
+            && !self.template.shared_env_vars.is_empty();
+        for service in &self.services {
+            let key = format!("service:{}", service.template_service);
+            if service.project_id.is_some() || !pending(&key) {
+                continue;
+            }
+            let declares_variables = self
+                .template
+                .service(&service.template_service)
+                .is_some_and(|spec| !spec.env_vars.is_empty());
+            let has_supplied_variables = !service.supplied_variable_names.is_empty();
+            if declares_variables || shared_into_service || has_supplied_variables {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+}
+
+/// The variable templates a service's supplied values are resolved against:
+/// its own declared variables, preceded by the template's shared ones when
+/// the service goes without a project (it then holds them itself).
+fn service_variable_templates(
+    plan: &InstantiationPlan,
+    spec: &TemplateServiceSpec,
+) -> Vec<EnvVarTemplate> {
+    let mut variable_templates = spec.env_vars.clone();
+    if matches!(plan.target, PlannedTarget::NoProject) {
+        variable_templates.splice(0..0, plan.template.shared_env_vars.iter().cloned());
+    }
+    variable_templates
+}
+
+/// Check that every service not yet created will accept the values it is to
+/// be created with, without creating anything. Runs the same resolution as
+/// service creation (missing required values, duplicates, unsupported
+/// generators), so a request accepted here is not refused for its variables
+/// halfway through, after a remote repository was already created.
+pub fn validate_plan_variables(
+    plan: &InstantiationPlan,
+    secrets: &PlanSecrets,
+) -> Result<(), Problem> {
+    for planned in plan
+        .services
+        .iter()
+        .filter(|service| service.project_id.is_none())
+    {
+        let Some(spec) = plan.template.service(&planned.template_service) else {
+            continue;
+        };
+        let supplied = secrets
+            .services
+            .get(&planned.template_service)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        temps_projects::template_creation::validate_template_variables(
+            &service_variable_templates(plan, spec),
+            supplied,
+        )
+        .map_err(|problem| {
+            if problem.status_code != axum::http::StatusCode::BAD_REQUEST {
+                return problem;
+            }
+            temps_core::problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
+                .with_title("Invalid Template Environment")
+                .with_detail(format!(
+                    "Service '{}': {}",
+                    planned.template_service,
+                    problem_message(problem)
+                ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Whether instantiation `instantiation_id` can still run, given whether its
+/// sealed secrets are still stored.
+///
+/// A stored instantiation always has sealed secrets (even when empty), so a
+/// missing value means the retention cleanup removed it. Such a run could
+/// only continue with empty values: `step_variables` would write nothing and
+/// report success, and services would be created without what the caller
+/// supplied. It is refused instead, naming what is lost.
+pub fn ensure_secrets_available(
+    instantiation_id: i32,
+    secrets_present: bool,
+    plan: &InstantiationPlan,
+) -> Result<(), ProjectGroupError> {
+    if secrets_present {
+        return Ok(());
+    }
+    let steps = plan.steps_needing_secrets();
+    if steps.is_empty() {
+        return Ok(());
+    }
+    Err(ProjectGroupError::InstantiationSecretsPurged {
+        instantiation_id,
+        steps: steps.join(", "),
+    })
+}
+
+/// Aborts the heartbeat task when dropped, so the lease stops being renewed
+/// on every way out of a run, including an early `?` return and a panic. A
+/// dropped `JoinHandle` only detaches the task: it would keep refreshing the
+/// row of a run that is gone, and the instantiation would read as running
+/// (and refuse a retry) for as long as the process lives.
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatGuard {
+    /// Run `beat` every `interval` until the guard is dropped.
+    fn start<F, Fut>(interval: std::time::Duration, beat: F) -> Self
+    where
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the first immediate tick
+            loop {
+                ticker.tick().await;
+                beat().await;
+            }
+        });
+        Self { handle }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Releases an instantiation's in-process claim when dropped, so a run that
+/// panics does not leave it reading as running until the process restarts.
+struct LocalClaim {
+    engine: InstantiationEngine,
+    id: i32,
+}
+
+impl Drop for LocalClaim {
+    fn drop(&mut self) {
+        self.engine.release(self.id);
     }
 }
 
@@ -605,6 +786,18 @@ pub fn build_plan(input: PlanInput<'_>) -> Result<(InstantiationPlan, PlanSecret
         }
     }
 
+    // Record which services were given values, by name only: the values are
+    // sealed in `secrets` and eventually purged, and the plan has to keep
+    // knowing that a service cannot be created without them.
+    let mut services = input.services;
+    for service in &mut services {
+        service.supplied_variable_names = secrets
+            .services
+            .get(&service.template_service)
+            .map(|supplied| supplied.iter().map(|input| input.name.clone()).collect())
+            .unwrap_or_default();
+    }
+
     let mut plan = InstantiationPlan {
         template: template.clone(),
         carries_release: input.carries_release,
@@ -614,7 +807,7 @@ pub fn build_plan(input: PlanInput<'_>) -> Result<(InstantiationPlan, PlanSecret
         repository: input.repository,
         follow_repository: input.follow_repository,
         databases,
-        services: input.services,
+        services,
         storage_claim_ids: input.storage_claim_ids,
         group_id: input.group_id,
         steps: Vec::new(),
@@ -1024,10 +1217,13 @@ impl InstantiationEngine {
         }
         let engine = self.clone();
         tokio::spawn(async move {
+            let _claim = LocalClaim {
+                engine: engine.clone(),
+                id,
+            };
             if let Err(error) = engine.run(id, &auth, &origin).await {
                 error!(instantiation_id = id, %error, "Instantiation stopped");
             }
-            engine.release(id);
         });
         true
     }
@@ -1053,6 +1249,13 @@ impl InstantiationEngine {
             instantiation_id: Some(id),
             ..origin.clone()
         };
+        // The retention cleanup clears the secrets of a failed run. Going on
+        // without them would skip the shared variables and report success.
+        if let Err(error) = ensure_secrets_available(id, model.secrets.is_some(), &plan) {
+            let message = error.to_string();
+            self.finish(&model, &plan, Err(message.clone())).await;
+            return Err(message);
+        }
         let secrets = match self.open(model.secrets.as_deref()) {
             Ok(secrets) => secrets,
             Err(message) => {
@@ -1064,17 +1267,14 @@ impl InstantiationEngine {
 
         // Heartbeat task: writes heartbeat_at every HEARTBEAT_INTERVAL so that
         // other processes (and the `describe` method) can tell this run is
-        // still alive. The task is cancelled by dropping the abort handle when
-        // the loop below ends, whether by success, failure, or panic.
-        let heartbeat_engine = self.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Self::HEARTBEAT_INTERVAL);
-            ticker.tick().await; // skip the first immediate tick
-            loop {
-                ticker.tick().await;
-                heartbeat_engine.heartbeat(id).await;
-            }
-        });
+        // still alive. The guard aborts it when `run` returns by any path.
+        let heartbeat = {
+            let engine = self.clone();
+            HeartbeatGuard::start(Self::HEARTBEAT_INTERVAL, move || {
+                let engine = engine.clone();
+                async move { engine.heartbeat(id).await }
+            })
+        };
 
         // Emit STARTED on first run (status transitions from pending to running).
         // On a resume from failure the row was already running once, so we
@@ -1126,13 +1326,23 @@ impl InstantiationEngine {
             }
             if let Some(message) = failed {
                 warn!(instantiation_id = id, step = %key, %message, "Instantiation step failed");
-                heartbeat_handle.abort();
+                drop(heartbeat);
                 self.finish(&model, &plan, Err(message)).await;
                 return Ok(());
             }
-            self.save(&model, &plan, "running", None).await?;
+            if let Err(message) = self.save(&model, &plan, "running", None).await {
+                // The step ran but its result could not be stored. Stop
+                // renewing the lease and try to mark the run failed with the
+                // plan as it is now, so a retry resumes after this step. If
+                // the database is still unreachable the row is left running
+                // with a lease that expires, which reads as interrupted.
+                error!(instantiation_id = id, step = %key, %message, "Could not store the progress of an instantiation");
+                drop(heartbeat);
+                self.finish(&model, &plan, Err(message.clone())).await;
+                return Err(message);
+            }
         }
-        heartbeat_handle.abort();
+        drop(heartbeat);
         self.finish(&model, &plan, Ok(())).await;
         Ok(())
     }
@@ -1199,7 +1409,10 @@ impl InstantiationEngine {
         let (kind, subject) = key.split_once(':').unwrap_or((key, ""));
         match kind {
             "project" => self.step_project(plan, auth, origin).await,
-            "repository" => self.step_repository(plan, model, auth, origin).await,
+            "repository" => {
+                self.step_repository(plan, secrets, model, auth, origin)
+                    .await
+            }
             "database" => self.step_database(plan, subject, model, auth).await,
             "service" => {
                 self.step_service(plan, subject, secrets, model, auth, origin)
@@ -1275,6 +1488,7 @@ impl InstantiationEngine {
     async fn step_repository(
         &self,
         plan: &mut InstantiationPlan,
+        secrets: &PlanSecrets,
         model: &template_instantiations::Model,
         auth: &AuthContext,
         origin: &RequestOrigin,
@@ -1282,6 +1496,12 @@ impl InstantiationEngine {
         if plan.repository.is_none() {
             let target = match plan.fork.clone() {
                 Some(fork) => {
+                    // Creating the repository cannot be undone and would
+                    // block a corrected retry under the same name, so the
+                    // values every service will be created with are checked
+                    // first (the request handler did this already; this
+                    // covers a plan stored by an earlier build).
+                    validate_plan_variables(plan, secrets).map_err(problem_message)?;
                     // A template with several services keeps its layout: the
                     // services build from their directories of the fork. A
                     // single service's directory becomes the fork's root.
@@ -1572,40 +1792,78 @@ impl InstantiationEngine {
             return Ok(());
         }
 
-        // Crash-safety adoption: if the planned slug already exists and was
-        // created after this instantiation started by the same user, it was
-        // created by a previous run of this instantiation that crashed between
-        // creation and recording. Adopt it instead of creating a duplicate.
+        // The project this instantiation created for this service, if a
+        // previous run inserted it and crashed before recording its id. It is
+        // told apart by the token written in the same INSERT as the row (see
+        // `temps_entities::projects::instantiation_token`): nothing else
+        // about a project identifies the run that made it, so the name, the
+        // creator or the timing of one that merely sits at the planned slug
+        // prove nothing.
+        let token = temps_entities::projects::instantiation_token(model.id, template_service);
+        if let Some(owned) =
+            project_created_for_service(self.db.as_ref(), model.id, template_service).await?
+        {
+            if owned.is_deleted {
+                return Err(format!(
+                    "Service '{template_service}' of instantiation {} was created as project {} \
+                     ('{}') and has since been deleted; start a new instantiation",
+                    model.id, owned.id, owned.slug
+                ));
+            }
+            info!(
+                instantiation_id = model.id,
+                project_id = owned.id,
+                slug = %owned.slug,
+                service = template_service,
+                "Adopting a service created by a previous run that crashed before recording it"
+            );
+            if let Some(service) = plan.service_mut(template_service) {
+                service.project_id = Some(owned.id);
+                service.slug.clone_from(&owned.slug);
+                service.creation_started = true;
+            }
+            return Ok(());
+        }
+
+        // Any other project at the planned slug is someone else's. A planned
+        // slug is not reserved, so one may have been made since the plan was
+        // stored; taking it over would move it into this project and hand
+        // it the shared variables. Another slug is planned instead.
         let slug = match self
             .creator
             .project_service
             .get_project_by_slug(&planned.slug)
             .await
         {
-            Ok(existing) if existing.created_at >= model.created_at => {
-                // The project at this slug was created after this instantiation
-                // started: it was made by a previous run that crashed before it
-                // could record the project_id. Adopt it.
-                if let Some(service) = plan.service_mut(template_service) {
-                    service.project_id = Some(existing.id);
-                }
-                return Ok(());
-            }
             Ok(_) => {
-                // Taken by an unrelated project; plan a different slug.
-                let slug = self
-                    .creator
+                warn!(
+                    instantiation_id = model.id,
+                    slug = %planned.slug,
+                    service = template_service,
+                    "The planned slug belongs to a project this instantiation did not create; planning another"
+                );
+                self.creator
                     .project_service
                     .plan_project_slug(&planned.name)
                     .await
-                    .map_err(|error| error.to_string())?;
-                if let Some(service) = plan.service_mut(template_service) {
-                    service.slug = slug.clone();
-                }
-                slug
+                    .map_err(|error| error.to_string())?
             }
             Err(_) => planned.slug.clone(),
         };
+        // Write down that creation begins before it does, so that a crash
+        // from here on can be told apart from a project that merely holds
+        // the slug.
+        if let Some(service) = plan.service_mut(template_service) {
+            service.slug = slug.clone();
+            service.creation_started = true;
+        }
+        self.save(model, plan, "running", None)
+            .await
+            .map_err(|error| {
+                format!(
+                    "recording that service '{template_service}' is about to be created: {error}"
+                )
+            })?;
 
         let storage_service_ids: Vec<i32> = plan
             .databases
@@ -1640,10 +1898,7 @@ impl InstantiationEngine {
         } else {
             "repository"
         };
-        let mut variable_templates = spec.env_vars.clone();
-        if matches!(plan.target, PlannedTarget::NoProject) {
-            variable_templates.splice(0..0, plan.template.shared_env_vars.iter().cloned());
-        }
+        let variable_templates = service_variable_templates(plan, &spec);
         let release = plan.carries_release.then(|| {
             ServiceTemplateInstance::new(SERVICE_TEMPLATE_SCHEMA_VERSION, plan.template.clone())
                 .for_service(template_service)
@@ -1679,6 +1934,7 @@ impl InstantiationEngine {
                     runtime_overrides: planned.runtime_overrides.clone(),
                     // Deploys wait until the project is assembled.
                     defer_initial_deployment: true,
+                    instantiation_token: Some(token),
                     deploy_mode,
                 },
                 &caller,
@@ -1917,6 +2173,33 @@ impl InstantiationEngine {
     }
 }
 
+/// The project instantiation `instantiation_id` created for
+/// `template_service`, found by the ownership token stored in the same
+/// `INSERT` as the project row (soft-deleted ones included, since they still
+/// hold the token and the slug).
+///
+/// This is the only proof of ownership. A project at the service's planned
+/// slug without the token is never ours, whatever its name, provenance,
+/// creator or age: the same user may well have created the same service
+/// independently or through another instantiation.
+async fn project_created_for_service(
+    db: &DatabaseConnection,
+    instantiation_id: i32,
+    template_service: &str,
+) -> Result<Option<projects::Model>, String> {
+    let token = temps_entities::projects::instantiation_token(instantiation_id, template_service);
+    projects::Entity::find()
+        .filter(projects::Column::InstantiationToken.eq(token.as_str()))
+        .one(db)
+        .await
+        .map_err(|error| {
+            format!(
+                "looking up the project created for service '{template_service}' of \
+                 instantiation {instantiation_id}: {error}"
+            )
+        })
+}
+
 /// Where a service that builds from source reads its code.
 fn service_repository(plan: &InstantiationPlan, spec: &TemplateServiceSpec) -> RepositoryTarget {
     match (&spec.git, &plan.repository) {
@@ -2028,6 +2311,8 @@ routes:
                 slug: service.name.clone(),
                 runtime_overrides: Default::default(),
                 project_id: None,
+                creation_started: false,
+                supplied_variable_names: Vec::new(),
             })
             .collect()
     }
@@ -2337,6 +2622,598 @@ routes:
         assert_eq!(template_service_name("API Server"), "api-server");
         assert_eq!(template_service_name("2fa"), "app-2fa");
         assert_eq!(template_service_name("--web--"), "web");
+    }
+
+    // -----------------------------------------------------------------
+    // Heartbeat and local claim
+    // -----------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn beats_stop_after(counter: &Arc<AtomicUsize>) {
+        // Let any beat already scheduled run, then check none follow.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let settled = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            settled,
+            "the heartbeat kept running after its guard was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_beats_while_the_guard_lives_and_stops_when_it_drops() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let beats = counter.clone();
+        let guard = HeartbeatGuard::start(std::time::Duration::from_millis(5), move || {
+            let beats = beats.clone();
+            async move {
+                beats.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            counter.load(Ordering::SeqCst) > 0,
+            "the heartbeat never beat while the guard was alive"
+        );
+        drop(guard);
+        beats_stop_after(&counter).await;
+    }
+
+    /// Stands in for `run`: a step succeeds, then storing its progress fails
+    /// and `?` returns before any explicit cleanup.
+    async fn run_that_fails_to_save(beats: Arc<AtomicUsize>) -> Result<(), String> {
+        let _heartbeat = HeartbeatGuard::start(std::time::Duration::from_millis(5), move || {
+            let beats = beats.clone();
+            async move {
+                beats.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        Err::<(), String>("saving instantiation 1: connection closed".to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stops_when_a_run_returns_early_on_an_error() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = run_that_fails_to_save(counter.clone()).await;
+        assert!(result.is_err());
+        assert!(counter.load(Ordering::SeqCst) > 0);
+        beats_stop_after(&counter).await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stops_when_the_run_panics() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let beats = counter.clone();
+        let task = tokio::spawn(async move {
+            let _heartbeat =
+                HeartbeatGuard::start(std::time::Duration::from_millis(5), move || {
+                    let beats = beats.clone();
+                    async move {
+                        beats.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            panic!("a step panicked");
+        });
+        assert!(task.await.is_err(), "the run should have panicked");
+        beats_stop_after(&counter).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Secrets purged by the retention cleanup
+    // -----------------------------------------------------------------
+
+    fn plan_with(
+        steps: &[(&str, StepStatus)],
+        target: PlannedTarget,
+        shared: bool,
+    ) -> InstantiationPlan {
+        let mut template = template();
+        if !shared {
+            template.shared_env_vars.clear();
+        }
+        let services = planned(&template);
+        InstantiationPlan {
+            template,
+            carries_release: true,
+            provenance: Some("secrets-manager".to_string()),
+            target,
+            fork: None,
+            repository: None,
+            follow_repository: false,
+            databases: Vec::new(),
+            services,
+            storage_claim_ids: Vec::new(),
+            group_id: Some(3),
+            steps: steps
+                .iter()
+                .map(|(key, status)| InstantiationStep {
+                    key: key.to_string(),
+                    label: key.to_string(),
+                    status: *status,
+                    error: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn new_project() -> PlannedTarget {
+        PlannedTarget::NewProject {
+            name: "Secrets".to_string(),
+            slug: "secrets".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_run_that_still_needs_shared_variables_is_refused_once_secrets_are_purged() {
+        let plan = plan_with(
+            &[
+                ("service:backend", StepStatus::Done),
+                ("service:frontend", StepStatus::Done),
+                ("variables", StepStatus::Failed),
+                ("deploy:backend", StepStatus::Pending),
+            ],
+            new_project(),
+            true,
+        );
+        // Present: fine, whatever the plan needs.
+        assert!(ensure_secrets_available(12, true, &plan).is_ok());
+        // Purged: refused, naming the instantiation and the lost step.
+        let error = ensure_secrets_available(12, false, &plan).expect_err("purged");
+        assert!(matches!(
+            error,
+            ProjectGroupError::InstantiationSecretsPurged {
+                instantiation_id: 12,
+                ..
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("Instantiation 12"), "{message}");
+        assert!(message.contains("variables"), "{message}");
+        assert!(message.contains("Start a new instantiation"), "{message}");
+        // Surfaces as a 4xx the caller can act on, not a server error.
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn a_run_needing_supplied_service_values_is_refused_once_secrets_are_purged() {
+        // The backend declares SMTP_HOST and is not created yet.
+        let plan = plan_with(
+            &[
+                ("service:backend", StepStatus::Failed),
+                ("service:frontend", StepStatus::Pending),
+            ],
+            new_project(),
+            false,
+        );
+        let error = ensure_secrets_available(5, false, &plan).expect_err("purged");
+        assert!(error.to_string().contains("service:backend"));
+        // The frontend declares nothing, so it alone would not need them.
+        let mut plan = plan;
+        plan.services[0].project_id = Some(90);
+        assert!(ensure_secrets_available(5, false, &plan).is_ok());
+    }
+
+    #[test]
+    fn a_run_with_nothing_left_that_reads_secrets_may_still_be_retried() {
+        // Failed at the deploy step, long after every value was written.
+        let plan = plan_with(
+            &[
+                ("service:backend", StepStatus::Done),
+                ("service:frontend", StepStatus::Done),
+                ("variables", StepStatus::Done),
+                ("deploy:backend", StepStatus::Failed),
+                ("deploy:frontend", StepStatus::Pending),
+            ],
+            new_project(),
+            true,
+        );
+        assert!(plan.steps_needing_secrets().is_empty());
+        assert!(ensure_secrets_available(8, false, &plan).is_ok());
+    }
+
+    #[test]
+    fn shared_variables_flow_into_the_only_service_without_a_project() {
+        let mut template = template();
+        template.services.truncate(1);
+        template.routes.clear();
+        let services = planned(&template);
+        let mut plan = plan_with(
+            &[("service:backend", StepStatus::Pending)],
+            PlannedTarget::NoProject,
+            true,
+        );
+        plan.template = template;
+        plan.services = services;
+        plan.template.services[0].env_vars.clear();
+        // No declared variables of its own, but it receives the shared ones.
+        assert_eq!(plan.steps_needing_secrets(), vec!["service:backend"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Supplied variables the template never declared
+    // -----------------------------------------------------------------
+
+    /// A service that declares no variables, given one the template never
+    /// declared (the caller's own token, say).
+    fn plan_with_undeclared_variable() -> (InstantiationPlan, PlanSecrets) {
+        let mut template = template();
+        template.shared_env_vars.clear();
+        template.routes.clear();
+        for service in &mut template.services {
+            service.env_vars.clear();
+        }
+        let mut plan_input = input(
+            template,
+            PlannedTarget::ExistingProject { group_id: 3 },
+            &[],
+        );
+        let supplied = [variable("API_TOKEN", "sk-test-value", Some("frontend"))];
+        plan_input.variables = &supplied;
+        let (plan, secrets) = build_plan(plan_input).expect("plan");
+        (plan, secrets)
+    }
+
+    #[test]
+    fn a_plan_records_which_services_were_given_values_but_never_the_values() {
+        let (plan, secrets) = plan_with_undeclared_variable();
+        assert_eq!(secrets.services["frontend"][0].value, "sk-test-value");
+        let frontend = plan
+            .services
+            .iter()
+            .find(|service| service.template_service == "frontend")
+            .expect("frontend");
+        assert_eq!(frontend.supplied_variable_names, vec!["API_TOKEN"]);
+        let backend = plan
+            .services
+            .iter()
+            .find(|service| service.template_service == "backend")
+            .expect("backend");
+        assert!(backend.supplied_variable_names.is_empty());
+        let stored = serde_json::to_string(&plan).expect("serialize");
+        assert!(stored.contains("API_TOKEN"));
+        assert!(!stored.contains("sk-test-value"));
+    }
+
+    #[test]
+    fn an_undeclared_supplied_variable_blocks_a_retry_once_secrets_are_purged() {
+        let (mut plan, _) = plan_with_undeclared_variable();
+        plan.steps = vec![
+            InstantiationStep {
+                key: "service:backend".to_string(),
+                label: "backend".to_string(),
+                status: StepStatus::Done,
+                error: None,
+            },
+            InstantiationStep {
+                key: "service:frontend".to_string(),
+                label: "frontend".to_string(),
+                status: StepStatus::Failed,
+                error: None,
+            },
+        ];
+        plan.services[0].project_id = Some(90);
+        // The template declares nothing for either service: before the plan
+        // recorded supplied names this was indistinguishable from "nothing
+        // was lost", and the service was created without its token.
+        assert_eq!(plan.steps_needing_secrets(), vec!["service:frontend"]);
+        assert!(ensure_secrets_available(21, true, &plan).is_ok());
+        let error = ensure_secrets_available(21, false, &plan).expect_err("purged");
+        assert!(matches!(
+            error,
+            ProjectGroupError::InstantiationSecretsPurged {
+                instantiation_id: 21,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("service:frontend"));
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+
+        // Once the service exists the values are no longer needed.
+        plan.services[1].project_id = Some(91);
+        assert!(plan.steps_needing_secrets().is_empty());
+        assert!(ensure_secrets_available(21, false, &plan).is_ok());
+    }
+
+    #[test]
+    fn plans_stored_before_supplied_names_were_recorded_read_as_empty() {
+        let json = serde_json::json!({
+            "template_service": "frontend",
+            "name": "frontend",
+            "slug": "secrets-frontend",
+            "project_id": null,
+            "creation_started": true,
+        });
+        let service: PlannedService = serde_json::from_value(json).expect("old plan");
+        assert!(service.supplied_variable_names.is_empty());
+        assert!(service.creation_started);
+
+        // And such a plan keeps the earlier rule: only declared variables
+        // (here none) make a pending service need the secrets.
+        let (mut plan, _) = plan_with_undeclared_variable();
+        plan.services[1].supplied_variable_names.clear();
+        plan.steps = vec![InstantiationStep {
+            key: "service:frontend".to_string(),
+            label: "frontend".to_string(),
+            status: StepStatus::Pending,
+            error: None,
+        }];
+        assert!(plan.steps_needing_secrets().is_empty());
+    }
+
+    #[test]
+    fn variables_supplied_without_a_project_are_recorded_on_the_only_service() {
+        let mut template = template();
+        template.services.truncate(1);
+        template.routes.clear();
+        let (plan, _) = build_plan(input(
+            template,
+            PlannedTarget::NoProject,
+            &[variable("LOG_LEVEL", "debug", None)],
+        ))
+        .expect("plan");
+        assert_eq!(plan.services[0].supplied_variable_names, vec!["LOG_LEVEL"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Values are checked before any remote side effect
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn missing_or_duplicate_values_are_refused_before_a_fork_repository_exists() {
+        // The backend declares SMTP_HOST, which has no default.
+        let mut template = template();
+        template.services[0].env_vars[0].required = true;
+        let (plan, secrets) = build_plan(input(
+            template.clone(),
+            PlannedTarget::ExistingProject { group_id: 3 },
+            &[],
+        ))
+        .expect("plan");
+        let problem = validate_plan_variables(&plan, &secrets).expect_err("missing");
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        let message = problem_message(problem);
+        assert!(message.contains("backend"), "{message}");
+        assert!(message.contains("SMTP_HOST"), "{message}");
+
+        // Supplied: accepted.
+        let (plan, secrets) = build_plan(input(
+            template.clone(),
+            PlannedTarget::ExistingProject { group_id: 3 },
+            &[variable("SMTP_HOST", "mail.example.test", None)],
+        ))
+        .expect("plan");
+        assert!(validate_plan_variables(&plan, &secrets).is_ok());
+
+        // The same name twice for one service.
+        let (plan, secrets) = build_plan(input(
+            template,
+            PlannedTarget::ExistingProject { group_id: 3 },
+            &[
+                variable("SMTP_HOST", "a.example.test", None),
+                variable("SMTP_HOST", "b.example.test", None),
+            ],
+        ))
+        .expect("plan");
+        let problem = validate_plan_variables(&plan, &secrets).expect_err("duplicate");
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        assert!(problem_message(problem).contains("SMTP_HOST"));
+    }
+
+    #[test]
+    fn services_that_already_exist_are_not_revalidated() {
+        let mut template = template();
+        template.services[0].env_vars[0].required = true;
+        let (mut plan, secrets) = build_plan(input(
+            template,
+            PlannedTarget::ExistingProject { group_id: 3 },
+            &[],
+        ))
+        .expect("plan");
+        plan.services[0].project_id = Some(7);
+        assert!(validate_plan_variables(&plan, &secrets).is_ok());
+    }
+
+    #[test]
+    fn the_fork_step_validates_variables_before_creating_the_repository() {
+        // `step_repository` needs a database and a git provider to run, so
+        // pin the ordering in the source: the check precedes the creation.
+        let source = include_str!("instantiation.rs");
+        let start = source
+            .find("async fn step_repository(")
+            .expect("step_repository");
+        let body = &source[start..];
+        let validated = body
+            .find("validate_plan_variables(plan, secrets)")
+            .expect("step_repository validates the plan's variables");
+        let created = body
+            .find(".create_repository_and_push_template(")
+            .expect("step_repository creates the fork");
+        assert!(validated < created);
+    }
+
+    // -----------------------------------------------------------------
+    // Adopting a project found at a planned slug
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn creation_started_defaults_to_false_for_plans_stored_before_it_existed() {
+        let json = serde_json::json!({
+            "template_service": "backend",
+            "name": "backend",
+            "slug": "secrets-backend",
+            "project_id": null,
+        });
+        let service: PlannedService = serde_json::from_value(json).expect("old plan");
+        assert!(!service.creation_started);
+    }
+
+    async fn insert_project(
+        db: &DatabaseConnection,
+        slug: &str,
+        name: &str,
+        token: Option<String>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> projects::Model {
+        projects::ActiveModel {
+            name: Set(name.to_string()),
+            slug: Set(slug.to_string()),
+            repo_name: Set("secrets".to_string()),
+            repo_owner: Set("example".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            template_slug: Set(Some("secrets-manager".to_string())),
+            instantiation_token: Set(token),
+            created_at: Set(created_at),
+            updated_at: Set(created_at),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert project")
+    }
+
+    #[test]
+    fn the_token_names_the_instantiation_and_the_service() {
+        let token = temps_entities::projects::instantiation_token(7, "backend");
+        assert_ne!(
+            token,
+            temps_entities::projects::instantiation_token(7, "frontend")
+        );
+        assert_ne!(
+            token,
+            temps_entities::projects::instantiation_token(8, "backend")
+        );
+        // `1` + `1:service:x` must never read as `11` + `:service:x`.
+        assert_ne!(
+            temps_entities::projects::instantiation_token(1, "backend"),
+            temps_entities::projects::instantiation_token(11, "backend")
+        );
+    }
+
+    /// A run that crashed after inserting its project and before recording
+    /// the id finds that project again; nothing else is taken for it.
+    #[tokio::test]
+    async fn a_project_is_adopted_only_by_the_instantiation_that_created_it() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let now = Utc::now();
+
+        // Run 7 inserted its backend, then crashed before recording it.
+        let own = insert_project(
+            conn.as_ref(),
+            "secrets-backend",
+            "backend",
+            Some(temps_entities::projects::instantiation_token(7, "backend")),
+            now,
+        )
+        .await;
+        let found = project_created_for_service(conn.as_ref(), 7, "backend")
+            .await
+            .expect("lookup")
+            .expect("the run's own project");
+        assert_eq!(found.id, own.id);
+        assert!(!found.is_deleted);
+
+        // Not the same instantiation, not the same service, and not an id
+        // that merely begins the same.
+        assert!(project_created_for_service(conn.as_ref(), 8, "backend")
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(project_created_for_service(conn.as_ref(), 7, "frontend")
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(project_created_for_service(conn.as_ref(), 70, "backend")
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(project_created_for_service(conn.as_ref(), 1, "backend")
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lookalike_project_of_the_same_user_is_never_adopted() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let now = Utc::now();
+
+        // Run 7 failed before inserting anything. The same user then made
+        // the same service on their own, and another run (8) made one too.
+        // Both have the planned name and provenance, were created after run
+        // 7 began, and would have a PROJECT_CREATED audit row for the user.
+        let independent =
+            insert_project(conn.as_ref(), "secrets-backend", "backend", None, now).await;
+        let other_run = insert_project(
+            conn.as_ref(),
+            "secrets-backend-2",
+            "backend",
+            Some(temps_entities::projects::instantiation_token(8, "backend")),
+            now,
+        )
+        .await;
+
+        assert!(project_created_for_service(conn.as_ref(), 7, "backend")
+            .await
+            .expect("lookup")
+            .is_none());
+        // Each is found only by its own owner (an independent project has none).
+        let found = project_created_for_service(conn.as_ref(), 8, "backend")
+            .await
+            .expect("lookup")
+            .expect("run 8's project");
+        assert_eq!(found.id, other_run.id);
+        assert_ne!(found.id, independent.id);
+        assert_eq!(independent.instantiation_token, None);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_of_the_run_is_still_recognised_as_its_own() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let own = insert_project(
+            conn.as_ref(),
+            "secrets-worker",
+            "worker",
+            Some(temps_entities::projects::instantiation_token(9, "worker")),
+            Utc::now(),
+        )
+        .await;
+        let mut active: projects::ActiveModel = own.into();
+        active.is_deleted = Set(true);
+        active.deleted_at = Set(Some(Utc::now()));
+        active.update(conn.as_ref()).await.expect("soft delete");
+
+        let found = project_created_for_service(conn.as_ref(), 9, "worker")
+            .await
+            .expect("lookup")
+            .expect("still holds the token");
+        assert!(
+            found.is_deleted,
+            "the caller must see the deletion, not adopt the project"
+        );
     }
 
     #[test]

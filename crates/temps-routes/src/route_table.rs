@@ -950,6 +950,14 @@ impl CachedPeerTable {
         };
 
         let mut routes = HashMap::new();
+        // Hostnames whose backend is the environment's PRIMARY service: the
+        // route built from the first public Compose port (or the only
+        // service of a non-Compose project). Per-service hostnames
+        // (`<service>--<env>`) and custom domains pinned to a service are
+        // never recorded. Path routes (ADR 050) resolve their target from
+        // this set, so a secondary Compose service can never be selected by
+        // hostname ordering.
+        let mut primary_route_hosts: HashSet<String> = HashSet::new();
         let mut sleeping_environments: Vec<SleepingEnvironmentEntry> = Vec::new();
 
         // Build entity caches as we go - only cache what we actually need for routing
@@ -1168,6 +1176,7 @@ impl CachedPeerTable {
                                 cert_eligible: true,
                             },
                         );
+                        primary_route_hosts.insert(env_domain.domain.clone());
 
                         match &backend {
                             BackendType::Upstream { backends, .. } => {
@@ -1269,6 +1278,7 @@ impl CachedPeerTable {
             }
 
             // Also add to legacy routes map for backward compatibility
+            primary_route_hosts.remove(&custom_route.domain);
             routes.insert(custom_route.domain.clone(), route_info);
         }
 
@@ -1421,6 +1431,9 @@ impl CachedPeerTable {
                             continue;
                         };
 
+                        // A custom domain may be pinned to any service, so
+                        // it is never the environment's primary route.
+                        primary_route_hosts.remove(&custom_domain.domain);
                         routes.insert(
                             custom_domain.domain.clone(),
                             RouteInfo {
@@ -1707,6 +1720,7 @@ impl CachedPeerTable {
                                 cert_eligible: true,
                             },
                         );
+                        primary_route_hosts.insert(main_url.clone());
                         match &backend {
                             BackendType::Upstream { backends, .. } => {
                                 let addresses: Vec<&str> =
@@ -1744,6 +1758,7 @@ impl CachedPeerTable {
                                 cert_eligible: true,
                             },
                         );
+                        primary_route_hosts.insert(full_domain.clone());
                         match &backend {
                             BackendType::Upstream { backends, .. } => {
                                 let addresses: Vec<&str> =
@@ -1797,6 +1812,7 @@ impl CachedPeerTable {
                                         cert_eligible: false,
                                     },
                                 );
+                                primary_route_hosts.insert(internal_fqdn.clone());
                                 debug!(
                                     "Loaded internal temps.local route: {} (project={}, env={}, deploy={})",
                                     internal_fqdn, env.project_id, env.id, deployment_id
@@ -2085,6 +2101,7 @@ impl CachedPeerTable {
                                 cert_eligible: false,
                             },
                         );
+                        primary_route_hosts.insert(fallback_domain.clone());
                         match &backend {
                             BackendType::Upstream { backends, .. } => {
                                 let addresses: Vec<&str> =
@@ -2297,7 +2314,7 @@ impl CachedPeerTable {
         // log the error and carry forward the previous snapshot's path routes
         // (empty if none) rather than failing the whole reload. A subsequent
         // reload after the migration will pick them up.
-        let path_routes = match self.load_path_routes(&routes).await {
+        let path_routes = match self.load_path_routes(&routes, &primary_route_hosts).await {
             Ok(pr) => pr,
             Err(e) => {
                 tracing::warn!(
@@ -2490,6 +2507,7 @@ impl CachedPeerTable {
     async fn load_path_routes(
         &self,
         routes: &HashMap<String, RouteInfo>,
+        primary_hosts: &HashSet<String>,
     ) -> Result<HashMap<i32, Arc<[PathRoute]>>, sea_orm::DbErr> {
         use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
         use temps_entities::project_group_routes;
@@ -2539,6 +2557,7 @@ impl CachedPeerTable {
             &environments_by_project,
             &project_names,
             routes,
+            primary_hosts,
         ))
     }
 
@@ -2613,6 +2632,12 @@ impl CachedPeerTable {
     /// control-plane request policy. Routes requiring redirect, wake-up,
     /// attack-mode, or per-project security processing stay on the control
     /// plane until those policies have a worker-side representation.
+    ///
+    /// Hosts of a source environment that has path routes (ADR 050) are not
+    /// exported either: the worker snapshot carries no path rules, so a
+    /// worker-side ingress would send `/api` to the frontend instead of the
+    /// target service. They stay on control-plane ingress, where the rules
+    /// are applied.
     pub fn snapshot_worker_public_routes(&self) -> Vec<(String, RouteInfo)> {
         let snapshot = self.route_snapshot.load();
         snapshot
@@ -2623,6 +2648,12 @@ impl CachedPeerTable {
                 !host.ends_with(".temps.local")
                     && route.redirect_to.is_none()
                     && matches!(route.backend, BackendType::Upstream { .. })
+                    && !route.environment.as_ref().is_some_and(|environment| {
+                        snapshot
+                            .path_routes
+                            .get(&environment.id)
+                            .is_some_and(|rules| !rules.is_empty())
+                    })
                     && route.environment.as_ref().is_some_and(|environment| {
                         !environment.sleeping
                             && environment.attack_mode != Some(true)
@@ -2810,21 +2841,30 @@ impl Drop for RouteTableListener {
 /// older deployments stay routable on their own, but a path route always
 /// follows what the environment serves now. A target with no backend at all
 /// is left unresolved so the proxy reports it instead of falling back.
+///
+/// `primary_hosts` lists the hostnames whose backend is the environment's
+/// primary service (see `load_routes`). Only those are candidates: a Docker
+/// Compose environment publishes one hostname per public service, all of
+/// which carry the same environment and deployment, so choosing by hostname
+/// order alone could hand `/api` to an admin or metrics service.
 fn resolve_path_routes(
     rules: &[temps_entities::project_group_routes::Model],
     environments_by_project: &HashMap<i32, Vec<environments::Model>>,
     project_names: &HashMap<i32, String>,
     routes: &HashMap<String, RouteInfo>,
+    primary_hosts: &HashSet<String>,
 ) -> HashMap<i32, Arc<[PathRoute]>> {
     use temps_entities::project_group_routes::target_environment;
 
     // Build a deterministic map from environment_id to the "best" currently
-    // serving route for that environment. Preference (highest wins):
+    // serving PRIMARY route for that environment. Preference (highest wins):
     //   1. Non-redirect + project set  (the typical service hostname)
     //   2. Non-redirect + no project
     //   3. Redirect route (a `www` → apex alias, used as last resort)
     // Within the same tier the smallest route host string is chosen so the
-    // result is independent of HashMap iteration order.
+    // result is independent of HashMap iteration order. Hosts outside
+    // `primary_hosts` (per-service Compose hostnames, custom domains) are
+    // never considered, so the choice cannot flip to a secondary service.
     fn route_tier(r: &RouteInfo) -> u8 {
         match (r.redirect_to.is_none(), r.project.is_some()) {
             (true, true) => 0,  // non-redirect with project — best
@@ -2834,6 +2874,9 @@ fn resolve_path_routes(
     }
     let mut current_by_environment: HashMap<i32, (&RouteInfo, &str, u8)> = HashMap::new();
     for (host, route) in routes {
+        if !primary_hosts.contains(host) {
+            continue;
+        }
         let (Some(env), Some(deployment)) = (&route.environment, &route.deployment) else {
             continue;
         };
@@ -3027,6 +3070,12 @@ mod tests {
             }
         }
 
+        /// Treat every fixture host as a primary route, as plain
+        /// (non-Compose) environments are in `load_routes`.
+        fn hosts_of(routes: &HashMap<String, RouteInfo>) -> HashSet<String> {
+            routes.keys().cloned().collect()
+        }
+
         fn rule(id: i32, source: i32, target: i32, prefix: &str) -> project_group_routes::Model {
             project_group_routes::Model {
                 id,
@@ -3083,7 +3132,13 @@ mod tests {
         fn targets_follow_the_current_deployment() {
             let (envs, routes) = fixture();
             let names = HashMap::from([(2, "backend".to_string())]);
-            let resolved = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let resolved = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &names,
+                &routes,
+                &hosts_of(&routes),
+            );
             let path_route = &resolved[&10][0];
             assert_eq!(path_route.target_service, "backend");
             let target = path_route.target.as_ref().expect("backend is deployed");
@@ -3096,8 +3151,13 @@ mod tests {
             let (mut envs, mut routes) = fixture();
             envs.insert(2, vec![env(20, 2, "production", None)]);
             routes.retain(|host, _| host == "web.example.com");
-            let resolved =
-                resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &HashMap::new(), &routes);
+            let resolved = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &HashMap::new(),
+                &routes,
+                &hosts_of(&routes),
+            );
             assert!(resolved[&10][0].target.is_none());
             assert_eq!(resolved[&10][0].target_service, "project 2");
             // Not deployed is not asleep: nothing for the proxy to wake.
@@ -3113,8 +3173,13 @@ mod tests {
             backend.sleeping = true;
             envs.insert(2, vec![backend]);
             routes.retain(|host, _| host == "web.example.com");
-            let resolved =
-                resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &HashMap::new(), &routes);
+            let resolved = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &HashMap::new(),
+                &routes,
+                &hosts_of(&routes),
+            );
             assert!(resolved[&10][0].target.is_none());
             assert_eq!(resolved[&10][0].sleeping_environment_id, Some(20));
         }
@@ -3123,7 +3188,8 @@ mod tests {
         fn longest_prefix_wins_and_segments_match_whole() {
             let (envs, routes) = fixture();
             let rules = [rule(1, 1, 2, "/api"), rule(2, 1, 2, "/api/v2/admin")];
-            let resolved = resolve_path_routes(&rules, &envs, &HashMap::new(), &routes);
+            let resolved =
+                resolve_path_routes(&rules, &envs, &HashMap::new(), &routes, &hosts_of(&routes));
             let table = table_with(routes, resolved);
 
             let matched = table.match_path_route("web.example.com", "/api/v2/admin/users");
@@ -3223,7 +3289,13 @@ mod tests {
             envs.insert(2, vec![backend]);
 
             let names = HashMap::from([(2, "backend".to_string())]);
-            let resolved = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let resolved = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &names,
+                &routes,
+                &hosts_of(&routes),
+            );
             let path_route = &resolved[&10][0];
             // Must resolve — the non-redirect route wins.
             let target = path_route.target.as_ref().expect("backend is deployed");
@@ -3260,8 +3332,20 @@ mod tests {
 
             let names = HashMap::from([(2, "backend".to_string())]);
             // Run twice; HashMap iteration order is random across runs.
-            let r1 = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
-            let r2 = resolve_path_routes(&[rule(1, 1, 2, "/api")], &envs, &names, &routes);
+            let r1 = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &names,
+                &routes,
+                &hosts_of(&routes),
+            );
+            let r2 = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &names,
+                &routes,
+                &hosts_of(&routes),
+            );
             let addr1 = r1[&10][0]
                 .target
                 .as_ref()
@@ -3275,6 +3359,196 @@ mod tests {
             assert_eq!(addr1, addr2, "lex tie-breaking must be stable across runs");
             // "a-api" < "z-api", so "a-api"'s address wins.
             assert_eq!(addr1, "10.0.0.9:9090");
+        }
+
+        /// A Compose target publishes one hostname per public service, all
+        /// with the same environment and deployment. A secondary service
+        /// whose hostname sorts BEFORE the primary's (and a custom domain
+        /// pinned to another service) must never receive the path route.
+        #[test]
+        fn secondary_service_hostname_never_wins_over_primary() {
+            let backend = env(20, 2, "production", Some(200));
+            let frontend = env(10, 1, "production", Some(100));
+
+            let mut routes = HashMap::new();
+            routes.insert(
+                "web.example.com".to_string(),
+                route_with_redirect(&frontend, 100, "10.0.0.1:3000", None),
+            );
+            // Primary service: the environment hostname.
+            routes.insert(
+                "prod.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.2:8080", None),
+            );
+            // Secondary services whose hostnames sort before the primary's.
+            routes.insert(
+                "admin--prod.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.3:9000", None),
+            );
+            routes.insert(
+                "a-custom.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.4:9100", None),
+            );
+            let primary_hosts = HashSet::from([
+                "web.example.com".to_string(),
+                "prod.example.com".to_string(),
+            ]);
+
+            let mut envs = HashMap::new();
+            envs.insert(1, vec![frontend]);
+            envs.insert(2, vec![backend]);
+            let names = HashMap::from([(2, "backend".to_string())]);
+
+            // HashMap iteration order is not fixed; resolve repeatedly.
+            for _ in 0..16 {
+                let resolved = resolve_path_routes(
+                    &[rule(1, 1, 2, "/api")],
+                    &envs,
+                    &names,
+                    &routes,
+                    &primary_hosts,
+                );
+                let target = resolved[&10][0]
+                    .target
+                    .as_ref()
+                    .expect("primary service is deployed");
+                assert_eq!(target.get_backend_addr(), "10.0.0.2:8080");
+            }
+        }
+
+        /// When the primary service has no live route (its containers are
+        /// down) but a secondary service does, the path route must stay
+        /// unresolved rather than fall through to the secondary service.
+        #[test]
+        fn missing_primary_does_not_fall_back_to_a_secondary_service() {
+            let backend = env(20, 2, "production", Some(200));
+            let frontend = env(10, 1, "production", Some(100));
+
+            let mut routes = HashMap::new();
+            routes.insert(
+                "web.example.com".to_string(),
+                route_with_redirect(&frontend, 100, "10.0.0.1:3000", None),
+            );
+            routes.insert(
+                "admin--prod.example.com".to_string(),
+                route_with_redirect(&backend, 200, "10.0.0.3:9000", None),
+            );
+            let primary_hosts = HashSet::from(["web.example.com".to_string()]);
+
+            let mut envs = HashMap::new();
+            envs.insert(1, vec![frontend]);
+            envs.insert(2, vec![backend]);
+
+            let resolved = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &HashMap::new(),
+                &routes,
+                &primary_hosts,
+            );
+            assert!(resolved[&10][0].target.is_none());
+        }
+
+        fn project(id: i32) -> Arc<projects::Model> {
+            let now = chrono::Utc::now();
+            Arc::new(projects::Model {
+                id,
+                name: format!("project-{id}"),
+                repo_name: format!("project-{id}"),
+                repo_owner: "test".to_string(),
+                directory: String::new(),
+                pull_only_root_directory: false,
+                main_branch: "main".to_string(),
+                preset: temps_entities::preset::Preset::NextJs,
+                preset_config: None,
+                deployment_config: None,
+                created_at: now,
+                updated_at: now,
+                slug: format!("project-{id}"),
+                is_deleted: false,
+                deleted_at: None,
+                last_deployment: None,
+                is_public_repo: false,
+                git_url: None,
+                git_provider_connection_id: None,
+                attack_mode: false,
+                ai_alert_summaries_enabled: None,
+                ai_debug_chat_enabled: None,
+                ai_write_actions_enabled: false,
+                error_source_context_enabled: false,
+                vulnerability_scanning_enabled: false,
+                error_source_root: None,
+                enable_preview_environments: false,
+                preview_envs_on_demand: false,
+                preview_envs_idle_timeout_seconds: 300,
+                preview_envs_wake_timeout_seconds: 30,
+                source_type: Default::default(),
+                project_type: temps_entities::types::ProjectType::Server,
+                allow_alternate_sources: None,
+                hosting: Default::default(),
+                template_slug: None,
+                service_template: None,
+                gitlab_webhook_id: None,
+                gitlab_webhook_signing_token: None,
+                gitea_webhook_signing_token: None,
+                bitbucket_webhook_token: None,
+                bitbucket_webhook_hook_id: None,
+                generic_webhook_token: None,
+                cross_project_trace_sharing: false,
+                ai_api_traffic_summary_enabled: None,
+                image_retention_hours: None,
+                cloud_telemetry_fidelity: Default::default(),
+                cloud_telemetry_attribute_allowlist: Vec::new(),
+                cloud_telemetry_write_mode: Default::default(),
+                cloud_analytics_write_mode: Default::default(),
+                instantiation_token: None,
+            })
+        }
+
+        /// Worker public ingress carries no path rules, so a source
+        /// environment's hosts must stay on control-plane ingress while
+        /// unrelated hosts (including the rule's target) are still exported.
+        #[test]
+        fn worker_public_routes_exclude_hosts_with_path_routes() {
+            let frontend = env(10, 1, "production", Some(100));
+            let backend = env(20, 2, "production", Some(200));
+            let mut web = route(&frontend, 100, "10.0.0.1:3000");
+            web.project = Some(project(1));
+            let mut api = route(&backend, 200, "10.0.0.2:8080");
+            api.project = Some(project(2));
+
+            let routes = HashMap::from([
+                ("web.example.com".to_string(), web),
+                ("api.example.com".to_string(), api),
+            ]);
+
+            // Without path rules both hosts are exported.
+            let table = table_with(routes.clone(), HashMap::new());
+            let mut hosts: Vec<String> = table
+                .snapshot_worker_public_routes()
+                .into_iter()
+                .map(|(host, _)| host)
+                .collect();
+            hosts.sort();
+            assert_eq!(hosts, vec!["api.example.com", "web.example.com"]);
+
+            // With a path route on the frontend its host stays on the
+            // control plane; the backend host is unaffected.
+            let (envs, fixture_routes) = fixture();
+            let resolved = resolve_path_routes(
+                &[rule(1, 1, 2, "/api")],
+                &envs,
+                &HashMap::new(),
+                &fixture_routes,
+                &hosts_of(&fixture_routes),
+            );
+            let table = table_with(routes, resolved);
+            let hosts: Vec<String> = table
+                .snapshot_worker_public_routes()
+                .into_iter()
+                .map(|(host, _)| host)
+                .collect();
+            assert_eq!(hosts, vec!["api.example.com"]);
         }
     }
 

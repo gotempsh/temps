@@ -1279,6 +1279,12 @@ impl From<ProjectError> for Problem {
                     .with_title("Host Docker Access Project Settings Require An Admin")
                     .with_detail(error.to_string())
             }
+
+            ProjectError::SingleServiceUpgradeToMultiService { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Upgrade Needs The Whole App")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

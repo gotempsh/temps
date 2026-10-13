@@ -16,6 +16,12 @@ use utoipa::OpenApi as OpenApiTrait;
 /// than `retention` ago. Secrets are only needed while steps are running; once
 /// an instantiation succeeds or fails they serve no purpose and holding them
 /// indefinitely is a liability.
+///
+/// A purged instantiation that still has steps reading those values can no
+/// longer be resumed: `ensure_secrets_available` makes the retry endpoint and
+/// the engine refuse it with a typed error (HTTP 409) rather than run with
+/// empty values and report success. One that failed after writing every
+/// value (a deploy step, say) is unaffected and stays retryable.
 async fn purge_stale_instantiation_secrets(
     db: Arc<DatabaseConnection>,
     retention: std::time::Duration,

@@ -908,7 +908,7 @@ impl ProjectService {
         request: CreateProjectRequest,
         caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
-        self.create_project_with_identity(request, None, caller, false)
+        self.create_project_with_identity(request, None, caller, false, None)
             .await
     }
 
@@ -937,7 +937,7 @@ impl ProjectService {
         caller: &SlugClaimCaller<'_>,
     ) -> Result<Project, ProjectError> {
         Self::check_service_release(&request, &service_template)?;
-        self.create_project_with_identity(request, Some(service_template), caller, false)
+        self.create_project_with_identity(request, Some(service_template), caller, false, None)
             .await
     }
 
@@ -947,18 +947,32 @@ impl ProjectService {
     /// [`Self::queue_initial_deployment`] is called, so a service created
     /// as part of a larger app first gets its project, shared variables and
     /// routes.
+    ///
+    /// `instantiation_token` is the ownership marker of the instantiation
+    /// creating the service (see
+    /// [`temps_entities::projects::instantiation_token`]). It is written in
+    /// the same `INSERT` as the project row, so a run that crashes after the
+    /// insert can still recognise the project as its own; `None` for every
+    /// creation that is not part of an instantiation.
     pub async fn create_template_service_as(
         &self,
         request: CreateProjectRequest,
         release: Option<temps_core::templates::ServiceTemplateInstance>,
         caller: &SlugClaimCaller<'_>,
         defer_initial_deployment: bool,
+        instantiation_token: Option<String>,
     ) -> Result<Project, ProjectError> {
         if let Some(release) = release.as_ref() {
             Self::check_service_release(&request, release)?;
         }
-        self.create_project_with_identity(request, release, caller, defer_initial_deployment)
-            .await
+        self.create_project_with_identity(
+            request,
+            release,
+            caller,
+            defer_initial_deployment,
+            instantiation_token,
+        )
+        .await
     }
 
     fn check_service_release(
@@ -1022,6 +1036,7 @@ impl ProjectService {
         service_template: Option<temps_core::templates::ServiceTemplateInstance>,
         caller: &SlugClaimCaller<'_>,
         defer_initial_deployment: bool,
+        instantiation_token: Option<String>,
     ) -> Result<Project, ProjectError> {
         if request.template_slug.as_deref().is_some_and(|slug| {
             slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
@@ -1155,6 +1170,7 @@ impl ProjectService {
             })?;
         }
 
+        let token_for_diagnosis = instantiation_token.clone();
         let project = projects::ActiveModel {
             name: Set(validated_name),
             repo_name: Set(request.repo_name.unwrap_or_default()),
@@ -1177,6 +1193,7 @@ impl ProjectService {
             template_slug: Set(request.template_slug),
             service_template: Set(service_template_json),
             hosting: Set(request.hosting),
+            instantiation_token: Set(instantiation_token),
             ..Default::default()
         };
 
@@ -1186,6 +1203,25 @@ impl ProjectService {
         let project_found_db = match project.insert(self.db.as_ref()).await {
             Ok(model) => model,
             Err(e) if super::types::is_unique_violation(&e) => {
+                // The token has its own unique index: say so when it is the
+                // token that collided, not the slug.
+                if let Some(token) = token_for_diagnosis {
+                    let holder = projects::Entity::find()
+                        .filter(projects::Column::InstantiationToken.eq(token.as_str()))
+                        .one(self.db.as_ref())
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(holder) = holder {
+                        return Err(ProjectError::DatabaseError {
+                            reason: format!(
+                                "Project {} ('{}') already holds instantiation token '{token}'; \
+                                 not creating a second project for '{}'",
+                                holder.id, holder.slug, project_slug
+                            ),
+                        });
+                    }
+                }
                 return Err(ProjectError::SlugConflict { slug: project_slug });
             }
             Err(e) => {
@@ -4776,6 +4812,18 @@ impl ProjectService {
             ))
         })?;
 
+        // Only one service's runtime is applied here. A release with several
+        // services would persist its full snapshot without creating the extra
+        // services or routes, so it can only be deployed as a whole app.
+        if target.template.is_multi_service() {
+            return Err(ProjectError::SingleServiceUpgradeToMultiService {
+                project_id,
+                template_slug: target.slug.clone(),
+                target_version: target.version.clone(),
+                service_count: target.template.services.len(),
+            });
+        }
+
         let applied = applied_service_template_from_model(&project)?;
 
         if applied.slug != target.slug {
@@ -6661,6 +6709,118 @@ mod tests {
         assert_eq!(external.hosting, temps_entities::types::Hosting::External);
     }
 
+    fn template_service_request(name: &str, slug: &str) -> CreateProjectRequest {
+        CreateProjectRequest {
+            name: name.to_string(),
+            expected_slug: Some(slug.to_string()),
+            repo_name: Some("starter".to_string()),
+            repo_owner: Some("example".to_string()),
+            directory: ".".to_string(),
+            main_branch: "main".to_string(),
+            preset: Preset::Nixpacks.to_string(),
+            preset_config: None,
+            environment_variables: None,
+            git_url: None,
+            git_provider_connection_id: None,
+            automatic_deploy: false,
+            exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            is_public_repo: None,
+            storage_service_ids: vec![],
+            storage_service_claim_ids: vec![],
+            storage_service_claim_user_id: None,
+            source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
+            hosting: Default::default(),
+        }
+    }
+
+    /// The ownership token is written in the same INSERT as the project, is
+    /// absent from every other creation path, never reaches a serialized
+    /// project row, and can be held by only one project.
+    #[tokio::test]
+    async fn a_template_service_stores_its_instantiation_token_atomically() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let caller = SlugClaimCaller::project_writer();
+
+        let token = temps_entities::projects::instantiation_token(41, "backend");
+        let owned = service
+            .create_template_service_as(
+                template_service_request("Owned Backend", "owned-backend"),
+                None,
+                &caller,
+                true,
+                Some(token.clone()),
+            )
+            .await
+            .unwrap();
+        let stored = temps_entities::projects::Entity::find_by_id(owned.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        assert_eq!(stored.instantiation_token.as_deref(), Some(token.as_str()));
+        let serialized = serde_json::to_value(&stored).unwrap();
+        assert!(
+            serialized.get("instantiation_token").is_none(),
+            "the ownership token must not be serialized: {serialized}"
+        );
+
+        // Every other creation path leaves the column NULL.
+        let plain = service
+            .create_template_service_as(
+                template_service_request("Plain Template Service", "plain-template-service"),
+                None,
+                &caller,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let ordinary = service
+            .create_project(template_service_request("Ordinary", "ordinary"))
+            .await
+            .unwrap();
+        for id in [plain.id, ordinary.id] {
+            let row = temps_entities::projects::Entity::find_by_id(id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("project row");
+            assert_eq!(row.instantiation_token, None, "project {id}");
+        }
+
+        // A second project cannot carry the same token.
+        let error = service
+            .create_template_service_as(
+                template_service_request("Imposter", "imposter"),
+                None,
+                &caller,
+                true,
+                Some(token.clone()),
+            )
+            .await
+            .err()
+            .expect("a token has at most one project");
+        let message = error.to_string();
+        assert!(
+            message.contains(&token) && message.contains("owned-backend"),
+            "the error names the token and its holder: {message}"
+        );
+        assert!(
+            service.get_project_by_slug("imposter").await.is_err(),
+            "the refused creation left no project behind"
+        );
+    }
+
     /// Opting a Git project into alternate sources must leave everything that
     /// makes it a Git project intact. If `source_type` flipped here, the
     /// project would lose rollback rebuild-from-source (which keys off
@@ -7909,6 +8069,109 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect()
+        );
+    }
+
+    /// A one-service app cannot be moved onto a release with several
+    /// services: only the first service's runtime would be applied while the
+    /// whole snapshot was persisted.
+    #[tokio::test]
+    async fn service_template_upgrade_rejects_a_multi_service_target() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let applied = temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_core::templates::bundled_template_by_slug("browserless")
+                .expect("bundled Browserless release"),
+        );
+        let mut request = create_request("Single service upgrade");
+        request.preset = Preset::Dockerfile.to_string();
+        request.source_type = temps_entities::source_type::SourceType::DockerImage;
+        request.template_slug = Some(applied.slug.clone());
+        request.preset_config = Some(
+            serde_json::to_value(temps_entities::preset::PresetConfig::Dockerfile(
+                temps_entities::preset::DockerfileConfig {
+                    image_runtime: Some(temps_entities::preset::ImageRuntimeConfig {
+                        image_ref: applied.template.services[0]
+                            .image
+                            .clone()
+                            .unwrap_or_default(),
+                        command: applied.template.services[0].command.clone(),
+                        health_check_path: applied.template.services[0].health_check_path.clone(),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .expect("Dockerfile config serialization"),
+        );
+        request.exposed_port = applied.template.services[0].exposed_port;
+        request.environment_variables = Some(vec![
+            CreateProjectEnvVar {
+                key: "TOKEN".to_string(),
+                value: "existing-secret".to_string(),
+                is_secret: true,
+            },
+            CreateProjectEnvVar {
+                key: "EXTERNAL".to_string(),
+                value: "https://browser.example.test".to_string(),
+                is_secret: false,
+            },
+        ]);
+        let created = project_service
+            .create_service_project(request, applied.clone())
+            .await
+            .expect("service project creation");
+
+        let mut target = applied.clone();
+        target.version = "1.1.0".to_string();
+        target.template.version = target.version.clone();
+        let mut worker = target.template.services[0].clone();
+        worker.name = "worker".to_string();
+        target.template.services.push(worker);
+        assert!(target.template.is_multi_service());
+
+        let refused = project_service
+            .upgrade_service_template(
+                created.id,
+                target,
+                Vec::new(),
+                temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::Platform,
+            )
+            .await;
+        match refused {
+            Err(ProjectError::SingleServiceUpgradeToMultiService {
+                project_id,
+                template_slug,
+                target_version,
+                service_count,
+            }) => {
+                assert_eq!(project_id, created.id);
+                assert_eq!(template_slug, applied.slug);
+                assert_eq!(target_version, "1.1.0");
+                assert_eq!(service_count, 2);
+            }
+            Err(other) => panic!("expected SingleServiceUpgradeToMultiService, got {other:?}"),
+            Ok(_) => panic!("a multi-service target must be refused"),
+        }
+
+        // Nothing was persisted: the project still carries the applied release.
+        let stored = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            applied_service_template_from_model(&stored)
+                .unwrap()
+                .version,
+            applied.version
         );
     }
 

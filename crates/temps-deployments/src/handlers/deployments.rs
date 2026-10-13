@@ -136,25 +136,6 @@ fn public_compose_service_urls(
         .collect()
 }
 
-/// Refuse to create a deployment for a project whose app runs outside Temps.
-async fn refuse_if_external(state: &AppState, project_id: i32) -> Result<(), Problem> {
-    use sea_orm::EntityTrait;
-    let project = temps_entities::projects::Entity::find_by_id(project_id)
-        .one(state.db.as_ref())
-        .await
-        .map_err(|error| {
-            error!(%error, project_id, "Could not load project before deploying");
-            temps_core::error_builder::internal_server_error()
-                .title("Database Error")
-                .detail("Could not load the project")
-                .build()
-        })?;
-    match project {
-        Some(project) => super::remote_deployments::refuse_external_project(&project),
-        None => Ok(()),
-    }
-}
-
 /// Build deployment responses with their environment's public Compose service
 /// URLs, so deployment views list every public service port and not just the
 /// primary environment URL.
@@ -582,6 +563,15 @@ impl From<crate::services::services::DeploymentError> for Problem {
                 .with_detail(format!(
                     "Container exec for {container_id} timed out after {timeout_seconds} seconds"
                 )),
+            // Same response the other external-hosting refusals give
+            // (`refuse_external_project`): the request is well-formed, but
+            // the project's state does not allow it.
+            DeploymentError::ProjectHostedExternally { reason, .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/project-hosted-externally")
+                    .with_title("Project Runs Outside Temps")
+                    .with_detail(reason)
+            }
             error @ (DeploymentError::AssetOriginNotFound { .. }
             | DeploymentError::AssetOriginCycle { .. }
             | DeploymentError::EnvironmentResolution(_)) => {
@@ -816,7 +806,10 @@ pub async fn rollback_to_deployment(
         project_id,
         state.project_access_checker
     );
-    refuse_if_external(&state, project_id).await?;
+    state
+        .deployment_service
+        .ensure_project_hosted_locally(project_id)
+        .await?;
 
     let deployment = state
         .deployment_service
@@ -882,7 +875,10 @@ pub async fn promote_deployment(
         project_id,
         state.project_access_checker
     );
-    refuse_if_external(&state, project_id).await?;
+    state
+        .deployment_service
+        .ensure_project_hosted_locally(project_id)
+        .await?;
 
     info!(
         "Promoting deployment {} to environment {} (project {})",
@@ -2857,6 +2853,26 @@ mod tests {
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    #[test]
+    fn external_hosting_refusal_is_a_conflict_that_names_the_project() {
+        let problem = Problem::from(
+            crate::services::services::DeploymentError::ProjectHostedExternally {
+                project_id: 7,
+                project_name: "edge-app".to_string(),
+                reason: "edge-app runs outside Temps".to_string(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("Project Runs Outside Temps")
+        );
+        assert_eq!(
+            problem.body.get("detail").and_then(|value| value.as_str()),
+            Some("edge-app runs outside Temps")
+        );
+    }
 
     /// Test double for handlers unrelated to sensitive-action gating --
     /// always allows, so existing tests built before that gate was added

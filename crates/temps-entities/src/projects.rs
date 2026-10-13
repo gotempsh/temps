@@ -228,6 +228,22 @@ pub struct Model {
     /// `project_telemetry_write_intervals` (signal_group = 'analytics').
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
+    /// Which template instantiation created this project, and for which of
+    /// the template's services. Written in the same `INSERT` as the row so a
+    /// resumed instantiation can tell its own project from one that merely
+    /// holds the planned slug. NULL for every project created any other way.
+    /// An internal ownership marker: never serialized in API responses.
+    #[serde(skip_serializing)]
+    pub instantiation_token: Option<String>,
+}
+
+/// The ownership token stored in [`Model::instantiation_token`] for the
+/// project created for `template_service` by instantiation `instantiation_id`.
+///
+/// One token per (instantiation, service): the partial unique index on the
+/// column makes a second project for the same step impossible.
+pub fn instantiation_token(instantiation_id: i32, template_service: &str) -> String {
+    format!("instantiation:{instantiation_id}:service:{template_service}")
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

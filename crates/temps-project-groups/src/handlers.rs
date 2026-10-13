@@ -3,7 +3,7 @@
 
 //! HTTP surface for project groups.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -21,7 +21,7 @@ use temps_core::problemdetails::Problem;
 use temps_core::{
     AuditContext, AuditLogger, AuditOperation, ProjectAccessChecker, RequestMetadata,
 };
-use temps_entities::{project_group_env_vars, project_groups, projects};
+use temps_entities::{project_group_env_vars, project_group_routes, project_groups, projects};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::env_vars::{CreateGroupEnvVarRequest, GroupEnvVarService, UpdateGroupEnvVarRequest};
@@ -538,6 +538,103 @@ async fn require_on_projects(
     Ok(())
 }
 
+/// A project leaving its group (removed, moved to another group, or listed
+/// when creating a new one) takes the old group's routes involving it with
+/// it: the database deletes them. That rewrites traffic of the route's other
+/// endpoint, so it takes what deleting the route directly takes
+/// ([`delete_group_route`]): the other endpoint must be visible to the caller
+/// (a route naming a service the caller cannot open is reported as missing,
+/// not described) and the caller needs project-scoped `ProjectsWrite` on both
+/// endpoints.
+///
+/// Returns the ids of the authorized routes, which the `*_checked` service
+/// mutators compare against what they find under lock, so a route created
+/// after this check cannot be dropped unauthorized.
+pub(crate) async fn authorize_route_drops(
+    auth: &temps_auth::context::AuthContext,
+    project_access_checker: &Option<Arc<dyn ProjectAccessChecker>>,
+    hidden: &HashSet<i32>,
+    routes: &[project_group_routes::Model],
+) -> Result<HashSet<i32>, Problem> {
+    let mut endpoints: Vec<i32> = Vec::with_capacity(routes.len() * 2);
+    for route in routes {
+        if hidden.contains(&route.source_project_id) || hidden.contains(&route.target_project_id) {
+            return Err(ProjectGroupError::RouteNotFound {
+                group_id: route.group_id,
+                route_id: route.id,
+            }
+            .into());
+        }
+        for id in [route.source_project_id, route.target_project_id] {
+            if !endpoints.contains(&id) {
+                endpoints.push(id);
+            }
+        }
+    }
+    require_on_projects(
+        auth,
+        project_access_checker,
+        &endpoints,
+        MemberPermission::ProjectsWrite,
+    )
+    .await?;
+    Ok(routes.iter().map(|r| r.id).collect())
+}
+
+/// One `PROJECT_GROUP_ROUTE_REMOVED` audit event per route a membership
+/// change dropped, recorded against the group the route belonged to.
+async fn audit_dropped_routes(
+    state: &ProjectGroupsAppState,
+    auth: &temps_auth::context::AuthContext,
+    metadata: &RequestMetadata,
+    routes: &[project_group_routes::Model],
+    reason: &str,
+) {
+    if routes.is_empty() {
+        return;
+    }
+    let mut group_ids: Vec<i32> = routes.iter().map(|r| r.group_id).collect();
+    group_ids.sort_unstable();
+    group_ids.dedup();
+    let slugs: HashMap<i32, String> = match state.service.group_slugs(&group_ids).await {
+        Ok(slugs) => slugs,
+        Err(e) => {
+            tracing::warn!(error = %e, "project groups: could not resolve group slugs for route audit");
+            HashMap::new()
+        }
+    };
+    audit_dropped_routes_in(state, auth, metadata, routes, reason, &slugs).await;
+}
+
+/// [`audit_dropped_routes`] for callers that already know the slugs of the
+/// groups the routes belonged to, as when the group itself was just deleted
+/// and can no longer be looked up.
+async fn audit_dropped_routes_in(
+    state: &ProjectGroupsAppState,
+    auth: &temps_auth::context::AuthContext,
+    metadata: &RequestMetadata,
+    routes: &[project_group_routes::Model],
+    reason: &str,
+    slugs: &HashMap<i32, String>,
+) {
+    for route in routes {
+        let slug = slugs.get(&route.group_id).map_or("", String::as_str);
+        let mut audit = ProjectGroupAudit::new(
+            "PROJECT_GROUP_ROUTE_REMOVED",
+            auth,
+            metadata,
+            route.group_id,
+            slug,
+        );
+        audit.project_ids = vec![route.source_project_id, route.target_project_id];
+        audit.path_route = Some(format!(
+            "project {} {} → project {} ({reason})",
+            route.source_project_id, route.path_prefix, route.target_project_id
+        ));
+        audit.record(&state.audit).await;
+    }
+}
+
 /// A group whose every member is hidden from the caller is reported exactly
 /// like a missing one, so its name and id existence do not leak.
 pub(crate) fn visible_or_not_found(
@@ -604,8 +701,8 @@ pub async fn list_project_groups(
         (status = 201, description = "Project group created", body = ProjectGroupResponse),
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "A listed project does not exist"),
-        (status = 409, description = "Slug already taken"),
+        (status = 404, description = "A listed project does not exist, or a route dropped by moving a listed project involves a service the caller cannot see"),
+        (status = 409, description = "Slug already taken, or a listed project gained a route or changed group while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -626,7 +723,21 @@ pub async fn create_project_group(
         );
     }
 
-    let created = state.service.create_group(req).await?;
+    // A listed project that is already in another group is moved out of it,
+    // and that group's routes involving it are dropped. Authorize those the
+    // way deleting them would be.
+    let hidden = hidden_projects(&state, &auth).await?;
+    let dropping = state
+        .service
+        .routes_dropped_by_leaving_group(&req.project_ids, None)
+        .await?;
+    let authorized =
+        authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
+
+    let (created, dropped) = state
+        .service
+        .create_group_checked(req, Some(&authorized))
+        .await?;
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_CREATED",
         &auth,
@@ -636,8 +747,15 @@ pub async fn create_project_group(
     );
     audit.project_ids = created.members.iter().map(|p| p.id).collect();
     audit.record(&state.audit).await;
+    audit_dropped_routes(
+        &state,
+        &auth,
+        &metadata,
+        &dropped,
+        "project moved into a new group",
+    )
+    .await;
 
-    let hidden = hidden_projects(&state, &auth).await?;
     Ok((
         StatusCode::CREATED,
         Json(ProjectGroupResponse::build(created, &hidden)),
@@ -753,8 +871,9 @@ pub async fn update_project_group(
     params(("group_id" = i32, Path, description = "Project group ID")),
     responses(
         (status = 204, description = "Project group deleted; its projects are now ungrouped and otherwise unchanged"),
-        (status = 403, description = "Insufficient permissions or no access to a member project"),
-        (status = 404, description = "Project group not found"),
+        (status = 403, description = "Insufficient permissions, no access to a member project, or no ProjectsWrite on a service whose route in the group is deleted with it"),
+        (status = 404, description = "Project group not found, or a route that would be deleted involves a service the caller cannot see"),
+        (status = 409, description = "A route appeared in the group while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -771,7 +890,34 @@ pub async fn delete_project_group(
     // the same gate as editing a group variable.
     authorize_group_env(&state, &auth, group_id, true).await?;
 
-    let (group, released) = state.service.delete_group(group_id).await?;
+    // The database deletes the group's routes with it. That rewrites traffic
+    // between its services, so it takes what deleting each route directly
+    // takes: both endpoints visible and project-scoped ProjectsWrite on both.
+    // The deletion re-reads the routes under lock and refuses (409) any that
+    // appeared after this check.
+    let hidden = hidden_projects(&state, &auth).await?;
+    let dropping = state.service.routes_of_group(group_id).await?;
+    let authorized =
+        authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
+
+    let deletion = state
+        .service
+        .delete_group_checked(group_id, &authorized)
+        .await?;
+    let group = deletion.group;
+
+    // The group is gone, so its slug cannot be looked up for the route audit.
+    let slugs = HashMap::from([(group.id, group.slug.clone())]);
+    audit_dropped_routes_in(
+        &state,
+        &auth,
+        &metadata,
+        &deletion.dropped_routes,
+        "project group deleted",
+        &slugs,
+    )
+    .await;
+
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_DELETED",
         &auth,
@@ -779,7 +925,7 @@ pub async fn delete_project_group(
         group.id,
         &group.slug,
     );
-    audit.project_ids = released;
+    audit.project_ids = deletion.released_project_ids;
     audit.record(&state.audit).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -794,8 +940,9 @@ pub async fn delete_project_group(
     ),
     responses(
         (status = 200, description = "Project placed in the group (moved out of any other group)", body = ProjectGroupResponse),
-        (status = 403, description = "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them"),
-        (status = 404, description = "Project group or project not found"),
+        (status = 403, description = "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group"),
+        (status = 404, description = "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"),
+        (status = 409, description = "A route involving the project appeared, or the project changed group, while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -827,8 +974,29 @@ pub async fn add_project_to_group(
     authorize_group_env(&state, &auth, group_id, true).await?;
     let hidden = hidden_projects(&state, &auth).await?;
 
-    let previous = state.service.add_project(group_id, project_id).await?;
+    // Moving out of another group drops that group's routes involving the
+    // project; deleting those takes ProjectsWrite on both of their ends.
+    let dropping = state
+        .service
+        .routes_dropped_by_leaving_group(&[project_id], Some(group_id))
+        .await?;
+    let authorized =
+        authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
+
+    let placement = state
+        .service
+        .add_project_checked(group_id, project_id, &authorized)
+        .await?;
+    let previous = placement.previous_group_id;
     let group = state.service.get_group(group_id).await?;
+    audit_dropped_routes(
+        &state,
+        &auth,
+        &metadata,
+        &placement.dropped_routes,
+        "project moved to another group",
+    )
+    .await;
     if previous != Some(group_id) {
         let mut audit = ProjectGroupAudit::new(
             "PROJECT_GROUP_PROJECT_ADDED",
@@ -855,8 +1023,9 @@ pub async fn add_project_to_group(
     ),
     responses(
         (status = 204, description = "Project removed from the group; it is now ungrouped"),
-        (status = 403, description = "Insufficient permissions on the project"),
-        (status = 404, description = "Project group not found, or the project is not in it"),
+        (status = 403, description = "Insufficient permissions on the project, or no ProjectsWrite on a service whose route to or from it is dropped with it"),
+        (status = 404, description = "Project group not found, the project is not in it, or a route that would be dropped involves a service the caller cannot see"),
+        (status = 409, description = "A route involving the project appeared while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -875,62 +1044,37 @@ pub async fn remove_project_from_group(
     );
 
     let hidden = hidden_projects(&state, &auth).await?;
-    let group_with_members = visible_or_not_found(
+    visible_or_not_found(
         state.service.get_group(group_id).await?,
         &hidden,
         ProjectGroupError::NotFound { group_id },
     )?;
 
-    // Collect routes that will be cascade-dropped by the DB trigger so we
-    // can (a) check the caller has ProjectsWrite on the other side, and
-    // (b) audit each one with PROJECT_GROUP_ROUTE_REMOVED.
-    let affected_routes = state
+    // Routes of this group involving the project go with it (the database
+    // deletes them). Authorize them as deleting each would be, then remove
+    // under a lock that re-checks the set.
+    let dropping = state
         .service
         .routes_involving_project(group_id, project_id)
         .await?;
+    let authorized =
+        authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
 
-    // For every affected route: the project being removed is one side. Check
-    // the caller has ProjectsWrite on the other side too (access grant system
-    // hides projects the caller cannot touch; checking the hidden set is the
-    // same gate `require_access_to_all_members` uses).
-    for route in &affected_routes {
-        let other_project_id = if route.source_project_id == project_id {
-            route.target_project_id
-        } else {
-            route.source_project_id
-        };
-        if hidden.contains(&other_project_id) {
-            return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
-                .type_("https://temps.sh/probs/route-drop-requires-access")
-                .title("Route Removal Requires Write Access on Both Services")
-                .detail(format!(
-                    "Removing service {project_id} from group {group_id} would drop \
-                         route '{}' which involves service {other_project_id}; you do not \
-                         have ProjectsWrite on that service",
-                    route.path_prefix
-                ))
-                .build());
-        }
-    }
-
-    state.service.remove_project(group_id, project_id).await?;
+    let dropped = state
+        .service
+        .remove_project_checked(group_id, project_id, &authorized)
+        .await?;
     let group = state.service.get_group(group_id).await?;
 
     // Audit each dropped route before the member audit so the log is complete.
-    for route in &affected_routes {
-        let mut route_audit = ProjectGroupAudit::new(
-            "PROJECT_GROUP_ROUTE_REMOVED",
-            &auth,
-            &metadata,
-            group.group.id,
-            &group.group.slug,
-        );
-        route_audit.path_route = Some(format!(
-            "source:{} /{}→target:{}  (member removal)",
-            route.source_project_id, route.path_prefix, route.target_project_id
-        ));
-        route_audit.record(&state.audit).await;
-    }
+    audit_dropped_routes(
+        &state,
+        &auth,
+        &metadata,
+        &dropped,
+        "project removed from the group",
+    )
+    .await;
 
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_PROJECT_REMOVED",
@@ -941,7 +1085,6 @@ pub async fn remove_project_from_group(
     );
     audit.project_id = Some(project_id);
     audit.record(&state.audit).await;
-    let _ = &group_with_members; // group was used for visibility check above
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1897,6 +2040,486 @@ mod tests {
         );
     }
 
+    /// A checker with per-project roles: each listed project maps to the
+    /// permission strings the caller holds there, and unlisted projects are
+    /// outside the caller's access. `hidden` is what `hidden_project_ids`
+    /// reports.
+    struct PerProject {
+        perms: std::collections::HashMap<i32, Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for PerProject {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.perms.contains_key(&project_id))
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(
+                self.perms.get(&project_id).cloned().unwrap_or_default(),
+            ))
+        }
+    }
+
+    fn per_project(roles: &[(i32, &[&str])]) -> Option<Arc<dyn ProjectAccessChecker>> {
+        Some(Arc::new(PerProject {
+            perms: roles
+                .iter()
+                .map(|(id, perms)| (*id, perms.iter().map(|p| p.to_string()).collect()))
+                .collect(),
+        }))
+    }
+
+    fn route(id: i32, group_id: i32, source: i32, target: i32) -> project_group_routes::Model {
+        let now = chrono::Utc::now();
+        project_group_routes::Model {
+            id,
+            group_id,
+            source_project_id: source,
+            target_project_id: target,
+            path_prefix: "/api".to_string(),
+            strip_prefix: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    const WRITE: &str = "projects:write";
+    const READ: &str = "projects:read";
+
+    #[tokio::test]
+    async fn dropping_a_route_requires_write_on_the_other_endpoint() {
+        // Caller administers A (10) but is only a viewer of B (20): removing
+        // A from the group would silently delete the A -> B route.
+        let auth = user_auth(Role::User);
+        let checker = per_project(&[(10, &[WRITE]), (20, &[READ])]);
+        let routes = [route(1, 5, 10, 20)];
+        let denied = authorize_route_drops(&auth, &checker, &HashSet::new(), &routes)
+            .await
+            .expect_err("a viewer of the route's other end cannot drop the route");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        // The same holds with the roles of the two ends swapped.
+        let checker = per_project(&[(10, &[READ]), (20, &[WRITE])]);
+        let denied = authorize_route_drops(&auth, &checker, &HashSet::new(), &routes)
+            .await
+            .expect_err("the departing project's own end is checked too");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_route_is_allowed_with_write_on_both_endpoints() {
+        let auth = user_auth(Role::User);
+        let checker = per_project(&[(10, &[WRITE]), (20, &[WRITE]), (30, &[WRITE])]);
+        let routes = [route(1, 5, 10, 20), route(2, 5, 30, 10)];
+        let authorized = authorize_route_drops(&auth, &checker, &HashSet::new(), &routes)
+            .await
+            .expect("write on every endpoint authorizes the drop");
+        assert_eq!(authorized, [1, 2].into_iter().collect::<HashSet<i32>>());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_route_to_a_hidden_project_is_reported_as_missing() {
+        // B (20) is hidden: the caller must not learn that a route to it
+        // exists, exactly like delete-route's 404.
+        let auth = user_auth(Role::User);
+        let checker = per_project(&[(10, &[WRITE]), (20, &[WRITE])]);
+        let hidden: HashSet<i32> = [20].into_iter().collect();
+        let routes = [route(7, 5, 10, 20)];
+        let denied = authorize_route_drops(&auth, &checker, &hidden, &routes)
+            .await
+            .expect_err("a route involving a hidden project cannot be dropped");
+        assert_eq!(denied.status_code, StatusCode::NOT_FOUND);
+        // The hidden project may sit on either end.
+        let routes = [route(8, 5, 20, 10)];
+        let denied = authorize_route_drops(&auth, &checker, &hidden, &routes)
+            .await
+            .expect_err("a route involving a hidden project cannot be dropped");
+        assert_eq!(denied.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_routes_to_drop_requires_nothing_further() {
+        let auth = user_auth(Role::User);
+        let checker = per_project(&[]);
+        let authorized = authorize_route_drops(&auth, &checker, &HashSet::new(), &[])
+            .await
+            .expect("nothing is dropped, so nothing needs authorizing");
+        assert!(authorized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn instance_admins_and_unchecked_instances_may_drop_routes() {
+        let routes = [route(1, 5, 10, 20)];
+        // OSS instance without an access checker: the instance-wide role decides.
+        let user = user_auth(Role::User);
+        assert!(
+            authorize_route_drops(&user, &None, &HashSet::new(), &routes)
+                .await
+                .is_ok()
+        );
+        // Instance admins are not narrowed by project roles.
+        let admin = user_auth(Role::Admin);
+        let checker = per_project(&[]);
+        assert!(
+            authorize_route_drops(&admin, &checker, &HashSet::new(), &routes)
+                .await
+                .is_ok()
+        );
+        // But a read-only role never is, with or without a checker.
+        let reader = user_auth(Role::Reader);
+        let denied = authorize_route_drops(&reader, &None, &HashSet::new(), &routes)
+            .await
+            .expect_err("readers cannot write");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    // -----------------------------------------------------------------
+    // Deleting a group, end to end. These boot a TimescaleDB container and
+    // skip (not fail) when no container runtime is available.
+    // -----------------------------------------------------------------
+
+    /// Keeps every audit event the handler records as `(operation, json)`.
+    #[derive(Default)]
+    struct RecordedAudit(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl AuditLogger for RecordedAudit {
+        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            let json = operation.serialize()?;
+            if let Ok(mut events) = self.0.lock() {
+                events.push((operation.operation_type(), json));
+            }
+            Ok(())
+        }
+    }
+
+    impl RecordedAudit {
+        fn operations(&self) -> Vec<(String, String)> {
+            self.0
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    fn request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
+
+    struct DeleteFixture {
+        _db: temps_database::test_utils::TestDatabase,
+        state: Arc<ProjectGroupsAppState>,
+        audit: Arc<RecordedAudit>,
+        conn: Arc<sea_orm::DatabaseConnection>,
+        group_id: i32,
+        route_id: i32,
+    }
+
+    /// A group of two projects `base` and `base + 1` with one route between
+    /// them, behind `checker`.
+    async fn delete_fixture(
+        base: i32,
+        checker: Option<Arc<dyn ProjectAccessChecker>>,
+    ) -> Option<DeleteFixture> {
+        use crate::repository::tests::{insert_project, repository_service};
+        use sea_orm::ActiveModelTrait;
+        use sea_orm::ActiveValue::Set;
+
+        let db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .ok()?;
+        let conn = db.connection_arc();
+        insert_project(conn.as_ref(), base, "front").await;
+        insert_project(conn.as_ref(), base + 1, "api").await;
+        let service = Arc::new(ProjectGroupService::new(conn.clone()));
+        let group = service
+            .create_group(crate::service::CreateProjectGroupRequest {
+                name: "Delete Me".to_string(),
+                slug: Some("delete-me".to_string()),
+                description: None,
+                project_ids: vec![base, base + 1],
+            })
+            .await
+            .ok()?;
+        let now = chrono::Utc::now();
+        let route = project_group_routes::ActiveModel {
+            group_id: Set(group.group.id),
+            source_project_id: Set(base),
+            target_project_id: Set(base + 1),
+            path_prefix: Set("/api".to_string()),
+            strip_prefix: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .ok()?;
+        let encryption = Arc::new(temps_core::EncryptionService::new(&"0".repeat(64)).ok()?);
+        let audit = Arc::new(RecordedAudit::default());
+        let state = Arc::new(ProjectGroupsAppState {
+            service,
+            env_vars: Arc::new(GroupEnvVarService::new(conn.clone(), encryption)),
+            repository: Arc::new(repository_service(conn.clone()).await?),
+            routes: Arc::new(crate::routes::GroupRouteService::new(conn.clone())),
+            audit: audit.clone(),
+            project_access_checker: checker,
+        });
+        Some(DeleteFixture {
+            _db: db,
+            state,
+            audit,
+            conn,
+            group_id: group.group.id,
+            route_id: route.id,
+        })
+    }
+
+    async fn call_delete(
+        fixture: &DeleteFixture,
+        auth: temps_auth::context::AuthContext,
+    ) -> Result<StatusCode, Problem> {
+        delete_project_group(
+            RequireAuth(auth),
+            State(fixture.state.clone()),
+            Extension(request_metadata()),
+            Path(fixture.group_id),
+        )
+        .await
+        .map(|response| response.into_response().status())
+    }
+
+    const ENV_WRITE: &str = "environments:write";
+
+    #[tokio::test]
+    async fn deleting_a_group_requires_write_on_both_ends_of_each_route() {
+        // The caller manages the env vars of both members and administers the
+        // route's source, but is only a viewer of its target: deleting the
+        // group would silently delete the route, which deleting the route
+        // directly would refuse.
+        let base = 9811;
+        let checker = per_project(&[(base, &[WRITE, ENV_WRITE]), (base + 1, &[READ, ENV_WRITE])]);
+        let Some(fixture) = delete_fixture(base, checker).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group deletion handler test");
+            return;
+        };
+
+        let denied = call_delete(&fixture, user_auth(Role::User))
+            .await
+            .expect_err("a viewer of the route's target cannot delete the group");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        // Nothing was deleted and nothing was audited.
+        assert!(fixture
+            .state
+            .service
+            .get_group(fixture.group_id)
+            .await
+            .is_ok());
+        assert_eq!(
+            fixture
+                .state
+                .service
+                .routes_of_group(fixture.group_id)
+                .await
+                .map(|routes| routes.len())
+                .ok(),
+            Some(1)
+        );
+        assert!(fixture.audit.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_audits_the_routes_it_drops() {
+        let base = 9821;
+        let checker = per_project(&[(base, &[WRITE, ENV_WRITE]), (base + 1, &[WRITE, ENV_WRITE])]);
+        let Some(fixture) = delete_fixture(base, checker).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group deletion handler test");
+            return;
+        };
+
+        let status = call_delete(&fixture, user_auth(Role::User))
+            .await
+            .expect("write on every route endpoint authorizes the deletion");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert!(matches!(
+            fixture.state.service.get_group(fixture.group_id).await,
+            Err(ProjectGroupError::NotFound { .. })
+        ));
+        use sea_orm::EntityTrait;
+        let remaining = project_group_routes::Entity::find_by_id(fixture.route_id)
+            .one(fixture.conn.as_ref())
+            .await
+            .expect("route lookup");
+        assert!(remaining.is_none(), "the route goes with its group");
+
+        let events = fixture.audit.operations();
+        let operations: Vec<&str> = events.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            operations,
+            vec!["PROJECT_GROUP_ROUTE_REMOVED", "PROJECT_GROUP_DELETED"]
+        );
+        // The group no longer exists to be looked up, so the route event must
+        // carry the slug it was deleted under.
+        assert!(
+            events[0].1.contains("\"group_slug\":\"delete-me\""),
+            "route audit lost the group slug: {}",
+            events[0].1
+        );
+        assert!(events[1].1.contains(&format!("{}", base)));
+    }
+
+    /// [`PerProject`] that also reports a set of projects as hidden from the
+    /// caller, as a team-scoped checker does.
+    struct HidingChecker {
+        inner: PerProject,
+        hidden: Vec<i32>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for HidingChecker {
+        async fn user_can_access_project(
+            &self,
+            user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.hidden.contains(&project_id) {
+                return Ok(false);
+            }
+            self.inner
+                .user_can_access_project(user_id, project_id)
+                .await
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner
+                .effective_project_permissions(user_id, project_id)
+                .await
+        }
+
+        async fn hidden_project_ids(
+            &self,
+            _user_id: i32,
+        ) -> Result<Option<Vec<i32>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(self.hidden.clone()))
+        }
+    }
+
+    fn hiding(roles: &[(i32, &[&str])], hidden: &[i32]) -> Option<Arc<dyn ProjectAccessChecker>> {
+        Some(Arc::new(HidingChecker {
+            inner: PerProject {
+                perms: roles
+                    .iter()
+                    .map(|(id, perms)| (*id, perms.iter().map(|p| p.to_string()).collect()))
+                    .collect(),
+            },
+            hidden: hidden.to_vec(),
+        }))
+    }
+
+    async fn assert_group_untouched(fixture: &DeleteFixture) {
+        assert!(fixture
+            .state
+            .service
+            .get_group(fixture.group_id)
+            .await
+            .is_ok());
+        assert_eq!(
+            fixture
+                .state
+                .service
+                .routes_of_group(fixture.group_id)
+                .await
+                .map(|routes| routes.len())
+                .ok(),
+            Some(1)
+        );
+        assert!(fixture.audit.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_whose_members_are_all_hidden_is_not_found() {
+        // Both route endpoints are hidden from the caller: the group and its
+        // route must be reported exactly like a missing group.
+        let base = 9831;
+        let perms: &[(i32, &[&str])] =
+            &[(base, &[WRITE, ENV_WRITE]), (base + 1, &[WRITE, ENV_WRITE])];
+        let Some(fixture) = delete_fixture(base, hiding(perms, &[base, base + 1])).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group deletion handler test");
+            return;
+        };
+
+        let denied = call_delete(&fixture, user_auth(Role::User))
+            .await
+            .expect_err("a fully hidden group cannot be deleted");
+        assert_eq!(denied.status_code, StatusCode::NOT_FOUND);
+        assert_group_untouched(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_with_a_hidden_member_is_forbidden() {
+        // One endpoint of the route is hidden: deleting the group would
+        // silently delete a route the caller cannot even see.
+        let base = 9841;
+        let perms: &[(i32, &[&str])] =
+            &[(base, &[WRITE, ENV_WRITE]), (base + 1, &[WRITE, ENV_WRITE])];
+        let Some(fixture) = delete_fixture(base, hiding(perms, &[base + 1])).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group deletion handler test");
+            return;
+        };
+
+        let denied = call_delete(&fixture, user_auth(Role::User))
+            .await
+            .expect_err("a partially hidden group cannot be deleted");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+        assert_group_untouched(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_group_is_not_found_and_audits_nothing() {
+        let base = 9851;
+        let perms: &[(i32, &[&str])] =
+            &[(base, &[WRITE, ENV_WRITE]), (base + 1, &[WRITE, ENV_WRITE])];
+        let Some(mut fixture) = delete_fixture(base, per_project(perms)).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group deletion handler test");
+            return;
+        };
+        let real_group = fixture.group_id;
+        fixture.group_id = 999_999;
+
+        let denied = call_delete(&fixture, user_auth(Role::User))
+            .await
+            .expect_err("a missing group cannot be deleted");
+        assert_eq!(denied.status_code, StatusCode::NOT_FOUND);
+        assert!(fixture.audit.operations().is_empty());
+        fixture.group_id = real_group;
+        assert_group_untouched(&fixture).await;
+    }
+
     fn minimal_group(id: i32, member_ids: &[i32]) -> ProjectGroupWithMembers {
         let now = chrono::Utc::now();
         let group = temps_entities::project_groups::Model {
@@ -1968,6 +2591,7 @@ mod tests {
                         cloud_telemetry_attribute_allowlist: Vec::new(),
                         cloud_telemetry_write_mode: Default::default(),
                         cloud_analytics_write_mode: Default::default(),
+                        instantiation_token: None,
                     }
                 })
                 .collect(),

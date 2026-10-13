@@ -440,7 +440,7 @@ impl TryFrom<RawProjectTemplate> for ProjectTemplate {
                     ));
                 };
                 let service = TemplateServiceSpec {
-                    name: raw.slug.clone(),
+                    name: service_name_from_slug(&raw.slug),
                     git: None,
                     directory: None,
                     preset,
@@ -765,6 +765,43 @@ pub fn is_valid_service_name(name: &str) -> bool {
         && chars.next().is_some_and(|first| first.is_ascii_lowercase())
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
         && !name.ends_with('-')
+}
+
+/// The name of the only service of a template written before services had
+/// names of their own: it was the template's slug.
+///
+/// Slugs were never restricted to DNS labels (`my_app`, `2fa` and 255
+/// characters were all accepted), while service names must be. A slug that
+/// already is a valid name is used as it is; any other is mapped to a valid
+/// one deterministically, so the same snapshot always decodes to the same
+/// name and stays valid. The template's own slug is not changed.
+fn service_name_from_slug(slug: &str) -> String {
+    if is_valid_service_name(slug) {
+        return slug.to_string();
+    }
+    let mut name = String::with_capacity(slug.len().min(63));
+    for ch in slug.chars() {
+        let ch = ch.to_ascii_lowercase();
+        let mapped = if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            ch
+        } else {
+            '-'
+        };
+        if mapped != '-' || !name.ends_with('-') {
+            name.push(mapped);
+        }
+    }
+    let mut name = name.trim_matches('-').to_string();
+    if name.is_empty() {
+        name = "app".to_string();
+    } else if !name.starts_with(|first: char| first.is_ascii_lowercase()) {
+        name.insert_str(0, "app-");
+    }
+    // Every character is ASCII here, so truncating by bytes is safe.
+    name.truncate(63);
+    let trimmed = name.trim_end_matches('-').len();
+    name.truncate(trimmed);
+    name
 }
 
 /// Coarse shape check; the full rules (reserved paths, allowed characters)
@@ -2551,6 +2588,95 @@ routes:
             "POSTGRES_HOST"
         );
         assert_eq!(spec.env_vars[0].name, "KC_DB");
+    }
+
+    fn legacy_snapshot(slug: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "2",
+            "slug": slug,
+            "version": "1.0.0",
+            "template": {
+                "slug": slug,
+                "name": "Legacy App",
+                "version": "1.0.0",
+                "kind": "service",
+                "git": {"url": "https://github.com/example/legacy.git", "ref": "main"},
+                "preset": "dockerfile",
+                "image": format!("registry.example.test/legacy@sha256:{}", "b".repeat(64)),
+                "exposed_port": 8080,
+            }
+        })
+    }
+
+    #[test]
+    fn legacy_snapshots_with_non_dns_slugs_stay_valid() {
+        let long_slug = "a".repeat(64);
+        for (slug, expected) in [
+            ("my_app", "my-app"),
+            ("2fa", "app-2fa"),
+            ("My App!!", "my-app"),
+            ("___", "app"),
+            (long_slug.as_str(), &long_slug[..63]),
+            ("plain", "plain"),
+        ] {
+            let instance: ServiceTemplateInstance =
+                serde_json::from_value(legacy_snapshot(slug)).expect("snapshot decodes");
+            assert_eq!(instance.slug, slug, "the template slug is untouched");
+            assert_eq!(instance.template.slug, slug);
+            assert_eq!(
+                instance.spec().map(|spec| spec.name.as_str()),
+                Some(expected),
+                "slug {slug:?}"
+            );
+            assert!(
+                instance.validate().is_ok(),
+                "slug {slug:?}: {:?}",
+                instance.validate()
+            );
+
+            // The derived name is stable across a persist/reload cycle.
+            let json = serde_json::to_value(&instance).expect("serialize");
+            let back: ServiceTemplateInstance =
+                serde_json::from_value(json).expect("persisted snapshot decodes");
+            assert_eq!(back, instance, "slug {slug:?}");
+            assert!(back.validate().is_ok(), "slug {slug:?}");
+        }
+    }
+
+    #[test]
+    fn slug_derived_service_names_are_always_valid_and_deterministic() {
+        for slug in [
+            "x",
+            "9",
+            "-",
+            "a-",
+            "-a",
+            "Ünïcode",
+            "a b c",
+            "UPPER",
+            "dots.and_underscores",
+            &"9".repeat(255),
+            &format!("{}-{}", "a".repeat(62), "b"),
+        ] {
+            let name = service_name_from_slug(slug);
+            assert!(is_valid_service_name(&name), "{slug:?} -> {name:?}");
+            assert_eq!(name, service_name_from_slug(slug));
+        }
+    }
+
+    #[test]
+    fn explicit_service_names_are_still_validated() {
+        let template: ProjectTemplate =
+            serde_yaml::from_str(MULTI_SERVICE).expect("multi-service template parses");
+        let mut template = template;
+        template.services[0].name = "Not_A_Label".to_string();
+        let errors = TemplateService::validate_template(&template);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Not_A_Label") && error.contains("lowercase")),
+            "{errors:?}"
+        );
     }
 
     #[test]

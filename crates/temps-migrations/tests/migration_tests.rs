@@ -5617,6 +5617,324 @@ async fn test_project_group_routes_migration_up_down_up() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Seeds two member projects (`frontend`, `backend`) of one group, and returns
+/// `(group_id, frontend_id, backend_id)`, for the route/membership race tests.
+async fn seed_group_with_two_members(
+    db: &DatabaseConnection,
+    suffix: &str,
+) -> anyhow::Result<(i32, i32, i32)> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let ids = |rows: Vec<sea_orm::QueryResult>| -> anyhow::Result<i32> {
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("insert returned no row"))?;
+        Ok(row.try_get_by_index::<i32>(0)?)
+    };
+    let mut project_ids = Vec::new();
+    for name in ["frontend", "backend"] {
+        let rows = db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO projects \
+                     (name, repo_name, repo_owner, directory, main_branch, preset, \
+                      created_at, updated_at, slug) \
+                     VALUES ('{name}', '', '', '.', 'main', 'nodejs', now(), now(), \
+                             'race-{suffix}-{name}') RETURNING id"
+                ),
+            ))
+            .await?;
+        project_ids.push(ids(rows)?);
+    }
+    let rows = db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO project_groups (name, slug) \
+                 VALUES ('Race {suffix}', 'race-{suffix}') RETURNING id"
+            ),
+        ))
+        .await?;
+    let group_id = ids(rows)?;
+    for project_id in &project_ids {
+        db.execute_unprepared(&format!(
+            "INSERT INTO project_group_members (project_id, group_id) \
+             VALUES ({project_id}, {group_id})"
+        ))
+        .await?;
+    }
+    Ok((group_id, project_ids[0], project_ids[1]))
+}
+
+async fn route_count(db: &DatabaseConnection, group_id: i32) -> anyhow::Result<i64> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT COUNT(*) FROM project_group_routes WHERE group_id = {group_id}"),
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("count returned no row"))?;
+    Ok(row.try_get_by_index::<i64>(0)?)
+}
+
+/// A route insert that overlaps an uncommitted membership delete must not
+/// commit a route for the departed member (the trigger's membership read has
+/// to wait on the in-flight delete and then see it).
+#[tokio::test]
+async fn test_project_group_route_insert_waits_for_concurrent_membership_delete(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_route_insert_waits_for_concurrent_membership_delete"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+    let (group_id, frontend, backend) = seed_group_with_two_members(&db, "insert-waits").await?;
+
+    // Transaction 1 removes `backend` from the group but has not committed.
+    let leaver = db.begin().await?;
+    leaver
+        .execute_unprepared(&format!(
+            "DELETE FROM project_group_members WHERE project_id = {backend}"
+        ))
+        .await?;
+
+    // Transaction 2 inserts a route to it. It has to wait for transaction 1.
+    let inserter_db = std::sync::Arc::clone(&db);
+    let inserter = tokio::spawn(async move {
+        let txn = inserter_db.begin().await?;
+        txn.execute_unprepared(&format!(
+            "INSERT INTO project_group_routes \
+             (group_id, source_project_id, target_project_id, path_prefix) \
+             VALUES ({group_id}, {frontend}, {backend}, '/api')"
+        ))
+        .await?;
+        txn.commit().await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !inserter.is_finished(),
+        "the route insert must block on the uncommitted membership delete"
+    );
+
+    leaver.commit().await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(20), inserter).await??;
+    let err = outcome.expect_err("the route must be rejected once the member has left");
+    assert!(
+        err.to_string().contains("is not a member of group"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(route_count(&db, group_id).await?, 0);
+    Ok(())
+}
+
+/// The reverse order: a membership delete that overlaps an uncommitted route
+/// insert must wait for it and then drop the committed route, so no route
+/// survives between ex-members.
+#[tokio::test]
+async fn test_project_group_membership_delete_waits_for_concurrent_route_insert(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_membership_delete_waits_for_concurrent_route_insert"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+
+    // Both a delete and a move to another group must serialize behind the
+    // route insert.
+    for (suffix, statement) in [("delete-waits", None), ("move-waits", Some("move"))] {
+        let (group_id, frontend, backend) = seed_group_with_two_members(&db, suffix).await?;
+        let other_group = {
+            use sea_orm::{DatabaseBackend, Statement};
+            let row = db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "INSERT INTO project_groups (name, slug) \
+                         VALUES ('Other {suffix}', 'other-{suffix}') RETURNING id"
+                    ),
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("insert returned no row"))?;
+            row.try_get_by_index::<i32>(0)?
+        };
+
+        // Transaction 1 inserts the route and holds it uncommitted.
+        let writer = db.begin().await?;
+        writer
+            .execute_unprepared(&format!(
+                "INSERT INTO project_group_routes \
+                 (group_id, source_project_id, target_project_id, path_prefix) \
+                 VALUES ({group_id}, {frontend}, {backend}, '/api')"
+            ))
+            .await?;
+
+        // Transaction 2 removes (or moves) `backend`. It has to wait.
+        let leaver_db = std::sync::Arc::clone(&db);
+        let leave_sql = match statement {
+            Some(_) => format!(
+                "UPDATE project_group_members SET group_id = {other_group} \
+                 WHERE project_id = {backend}"
+            ),
+            None => format!("DELETE FROM project_group_members WHERE project_id = {backend}"),
+        };
+        let leaver = tokio::spawn(async move {
+            let txn = leaver_db.begin().await?;
+            txn.execute_unprepared(&leave_sql).await?;
+            txn.commit().await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !leaver.is_finished(),
+            "{suffix}: the membership change must block on the uncommitted route insert"
+        );
+
+        writer.commit().await?;
+        tokio::time::timeout(Duration::from_secs(20), leaver).await???;
+        assert_eq!(
+            route_count(&db, group_id).await?,
+            0,
+            "{suffix}: a route between ex-members must not survive"
+        );
+    }
+    Ok(())
+}
+
+/// A project that is in no group has no membership row to lock, so a
+/// membership writer's lock on the project row is what a route insert must
+/// wait for. Without it the trigger would read "not a member" while the
+/// writer's placement is still uncommitted and reject a route that is valid
+/// the moment the writer commits; and, worse, the writer could have read the
+/// project's routes before the insert and then moved it.
+#[tokio::test]
+async fn test_project_group_route_insert_waits_for_membership_writers_project_lock(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_route_insert_waits_for_membership_writers_project_lock"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+    let (group_id, frontend, backend) = seed_group_with_two_members(&db, "project-lock").await?;
+    // Take `backend` out of the group so it is a project with no membership.
+    db.execute_unprepared(&format!(
+        "DELETE FROM project_group_members WHERE project_id = {backend}"
+    ))
+    .await?;
+
+    // The writer locks the project row, as the service layer does, and
+    // places it back into the group without committing.
+    let writer = db.begin().await?;
+    writer
+        .execute_unprepared(&format!(
+            "SELECT 1 FROM projects WHERE id = {backend} FOR NO KEY UPDATE"
+        ))
+        .await?;
+    writer
+        .execute_unprepared(&format!(
+            "INSERT INTO project_group_members (project_id, group_id) \
+             VALUES ({backend}, {group_id})"
+        ))
+        .await?;
+
+    let inserter_db = std::sync::Arc::clone(&db);
+    let inserter = tokio::spawn(async move {
+        inserter_db
+            .execute_unprepared(&format!(
+                "INSERT INTO project_group_routes \
+                 (group_id, source_project_id, target_project_id, path_prefix) \
+                 VALUES ({group_id}, {frontend}, {backend}, '/api')"
+            ))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !inserter.is_finished(),
+        "the route insert must wait for the writer's lock on the project row"
+    );
+
+    writer.commit().await?;
+    tokio::time::timeout(Duration::from_secs(20), inserter).await???;
+    assert_eq!(route_count(&db, group_id).await?, 1);
+    Ok(())
+}
+
+/// The reverse: a route insert holds its endpoint project rows `FOR SHARE`
+/// until it commits, so a membership writer that starts with the project
+/// lock (the service layer's step 1) cannot read the routes around it.
+#[tokio::test]
+async fn test_project_group_membership_writer_project_lock_waits_for_route_insert(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_membership_writer_project_lock_waits_for_route_insert"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+    let (group_id, frontend, backend) = seed_group_with_two_members(&db, "writer-waits").await?;
+
+    let router = db.begin().await?;
+    router
+        .execute_unprepared(&format!(
+            "INSERT INTO project_group_routes \
+             (group_id, source_project_id, target_project_id, path_prefix) \
+             VALUES ({group_id}, {frontend}, {backend}, '/api')"
+        ))
+        .await?;
+
+    let writer_db = std::sync::Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        let txn = writer_db.begin().await?;
+        // Both endpoints, ascending id, like the service layer.
+        txn.execute_unprepared(&format!(
+            "SELECT 1 FROM projects WHERE id IN ({frontend}, {backend}) \
+             ORDER BY id FOR NO KEY UPDATE"
+        ))
+        .await?;
+        txn.commit().await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !writer.is_finished(),
+        "the membership writer's project lock must wait for the uncommitted route insert"
+    );
+
+    router.commit().await?;
+    tokio::time::timeout(Duration::from_secs(20), writer).await???;
+    assert_eq!(route_count(&db, group_id).await?, 1);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // m20260929_000001 — template_instantiations
 // ---------------------------------------------------------------------------
@@ -5644,8 +5962,8 @@ async fn test_template_instantiations_migration_up_down_up() -> anyhow::Result<(
 
     // Insert a user and a minimal instantiation row.
     db.execute_unprepared(
-        "INSERT INTO users (name, email, password, created_at, updated_at) \
-         VALUES ('Test User', 'ti-test@example.com', 'hashed', now(), now())",
+        "INSERT INTO users (name, email, created_at, updated_at) \
+         VALUES ('Test User', 'ti-test@example.com', now(), now())",
     )
     .await?;
     db.execute_unprepared(
@@ -5775,6 +6093,103 @@ async fn test_project_hosting_migration_up_down_up() -> anyhow::Result<()> {
         bad_hosting_again.is_err(),
         "invalid hosting value must still be rejected after re-up"
     );
+
+    Ok(())
+}
+
+/// The `instantiation_token` of the project with `slug`.
+async fn project_instantiation_token(
+    db: &DatabaseConnection,
+    slug: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT instantiation_token FROM projects WHERE slug = $1",
+            [slug.into()],
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project {slug} not found"))?;
+    Ok(row.try_get::<Option<String>>("", "instantiation_token")?)
+}
+
+// ---------------------------------------------------------------------------
+// m20260930_000001 — projects.instantiation_token column
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_instantiation_token_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_instantiation_token_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260930_000001_add_project_instantiation_token";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!column_exists(&db, "projects", "instantiation_token").await?);
+
+    // A project that exists before the migration stays valid, with no token.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) \
+         VALUES ('token-test', '', '', '.', 'main', 'nodejs', now(), now(), 'token-test')",
+    )
+    .await?;
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "instantiation_token").await?);
+    assert_eq!(project_instantiation_token(&db, "token-test").await?, None);
+
+    // At most one project can carry a given token; NULL is unconstrained.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug, instantiation_token) \
+         VALUES ('owned', '', '', '.', 'main', 'nodejs', now(), now(), 'owned', \
+                 'instantiation:7:service:backend')",
+    )
+    .await?;
+    assert_eq!(
+        project_instantiation_token(&db, "owned").await?.as_deref(),
+        Some("instantiation:7:service:backend")
+    );
+    let duplicate = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, \
+              created_at, updated_at, slug, instantiation_token) \
+             VALUES ('imposter', '', '', '.', 'main', 'nodejs', now(), now(), 'imposter', \
+                     'instantiation:7:service:backend')",
+        )
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "a second project must not carry an existing instantiation token"
+    );
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) \
+         VALUES ('plain-2', '', '', '.', 'main', 'nodejs', now(), now(), 'plain-2')",
+    )
+    .await?;
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "projects", "instantiation_token").await?);
+
+    // Up again.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "instantiation_token").await?);
+    assert_eq!(project_instantiation_token(&db, "owned").await?, None);
 
     Ok(())
 }

@@ -92,8 +92,34 @@ pub enum ProjectGroupError {
         source: temps_projects::services::types::ProjectError,
     },
 
+    #[error(
+        "Instantiation {instantiation_id} cannot be resumed: the variable values it needs for {steps} were removed when its retention period ended. Start a new instantiation instead"
+    )]
+    InstantiationSecretsPurged {
+        instantiation_id: i32,
+        /// Keys of the remaining steps that need the removed values.
+        steps: String,
+    },
+
     #[error("Route {route_id} not found in project group {group_id}")]
     RouteNotFound { group_id: i32, route_id: i32 },
+
+    /// The routes a membership change would drop are not the ones the caller
+    /// authorized: a route involving the project was created in between.
+    #[error(
+        "Route {route_id} in project group {group_id} involves the project being moved and was \
+         created while this request was being authorized; retry the request"
+    )]
+    RouteSetChanged { group_id: i32, route_id: i32 },
+
+    /// The project was not in the group the placement was computed against:
+    /// another request moved it between the check and the write, so the
+    /// routes that were authorized may not be the ones the move drops.
+    #[error(
+        "Project {project_id} changed project group while it was being placed in project group \
+         {group_id}; retry the request"
+    )]
+    MembershipChanged { group_id: i32, project_id: i32 },
 
     #[error("{source_name} already sends {path_prefix} to another service")]
     RouteConflict {
@@ -151,6 +177,12 @@ impl From<ProjectGroupError> for Problem {
                 .with_title("Repository Not Connected")
                 .with_detail(error.to_string()),
 
+            ProjectGroupError::InstantiationSecretsPurged { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Instantiation Cannot Be Resumed")
+                    .with_detail(error.to_string())
+            }
+
             // Keep the status the service's own git endpoint would return
             // (e.g. 403 for the host-socket guard), with the service named.
             ProjectGroupError::ServiceGit { name, source, .. } => {
@@ -166,6 +198,16 @@ impl From<ProjectGroupError> for Problem {
             ProjectGroupError::RouteConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Route Already Exists")
                 .with_detail(error.to_string()),
+
+            ProjectGroupError::RouteSetChanged { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Routes Changed")
+                .with_detail(error.to_string()),
+
+            ProjectGroupError::MembershipChanged { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Membership Changed")
+                    .with_detail(error.to_string())
+            }
 
             ProjectGroupError::EnvVarConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Variable Already Exists")

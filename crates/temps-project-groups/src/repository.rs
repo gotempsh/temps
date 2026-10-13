@@ -25,7 +25,9 @@ use temps_entities::{
     git_provider_connections, project_group_members, project_groups, projects, repositories,
     source_type::SourceType,
 };
-use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
+use temps_git::services::public_repo::{
+    PublicRepoError, PublicRepoProvider, PublicRepoProviderFactory,
+};
 use temps_git::GitProviderManager;
 use temps_projects::ProjectService;
 use utoipa::ToSchema;
@@ -117,7 +119,23 @@ pub fn follows(group: &project_groups::Model, project: &projects::Model) -> bool
         &project.repo_owner,
         &project.repo_name,
         &project.main_branch,
+        project.git_url.as_deref(),
     )
+}
+
+/// `url` without scheme, `www.`, a trailing `.git` or slash, lowercased, so
+/// two spellings of one clone URL compare equal.
+fn normalize_clone_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    let url = url
+        .strip_suffix(".git")
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let url = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    url.strip_prefix("www.").unwrap_or(url).to_ascii_lowercase()
 }
 
 fn points_at(
@@ -127,17 +145,34 @@ fn points_at(
     repo_owner: &str,
     repo_name: &str,
     branch: &str,
+    git_url: Option<&str>,
 ) -> bool {
-    matches!(
-        (&group.repo_owner, &group.repo_name, &group.main_branch),
-        (Some(owner), Some(name), Some(group_branch))
-            if repo_owner == owner
-                && repo_name == name
-                && branch == group_branch
-                && connection_id == group.git_provider_connection_id
-                // A public group's members clone anonymously.
-                && (group.public_provider.is_none() || is_public_repo)
-    )
+    let (Some(owner), Some(name), Some(group_branch)) =
+        (&group.repo_owner, &group.repo_name, &group.main_branch)
+    else {
+        return false;
+    };
+    if repo_owner != owner
+        || repo_name != name
+        || branch != group_branch
+        || connection_id != group.git_provider_connection_id
+    {
+        return false;
+    }
+    match &group.public_provider {
+        // A public group's members clone anonymously, from the group's URL.
+        // Owner, name and branch alone do not tell providers apart: moving a
+        // group from one host to another with the same names leaves every
+        // member pointing at the old host, so the URL must match too.
+        Some(provider) => {
+            is_public_repo
+                && git_url.is_some_and(|url| {
+                    normalize_clone_url(url)
+                        == normalize_clone_url(&public_clone_url(provider, owner, name))
+                })
+        }
+        None => true,
+    }
 }
 
 fn clean_field(label: &str, value: &str) -> Result<String, ProjectGroupError> {
@@ -213,16 +248,18 @@ async fn validate_public(
         ));
     }
     if branch != info.default_branch {
-        let found = client
-            .get_branch(&owner, &name, &branch)
+        let exists = ref_exists(client.as_ref(), &owner, &name, &branch)
             .await
             .map_err(|e| unavailable(public_error_reason(e)))?;
-        if found.is_none() {
+        if !exists {
             return Err(ProjectGroupError::BranchNotFound {
                 owner: owner.clone(),
                 name: name.clone(),
                 branch: branch.clone(),
-                reason: format!("the default branch is {}", info.default_branch),
+                reason: format!(
+                    "it is not a branch, tag or commit of the repository; the default branch is {}",
+                    info.default_branch
+                ),
             });
         }
     }
@@ -235,6 +272,30 @@ async fn validate_public(
         main_branch: branch,
         repository_id: None,
     })
+}
+
+/// Whether `reference` is a branch, tag or commit of a public repository.
+///
+/// Templates pin their source to a release tag or a commit as often as to a
+/// branch, and a branch-only lookup would reject those and strand the
+/// instantiation. The branch lookup is one cheap request and settles the
+/// common case; anything else falls back to reading the tree at that ref,
+/// which the providers resolve for any of the three kinds. A tree too large
+/// to return still proves the ref exists: the provider answered for it.
+async fn ref_exists(
+    client: &dyn PublicRepoProvider,
+    owner: &str,
+    name: &str,
+    reference: &str,
+) -> Result<bool, PublicRepoError> {
+    if client.get_branch(owner, name, reference).await?.is_some() {
+        return Ok(true);
+    }
+    match client.get_file_tree(owner, name, reference).await {
+        Ok(_) | Err(PublicRepoError::ResponseTooLarge { .. }) => Ok(true),
+        Err(PublicRepoError::NotFound(_)) | Err(PublicRepoError::BranchNotFound(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// A safe, actionable reason for a failed public-repository lookup. Provider
@@ -632,7 +693,7 @@ impl GroupRepositoryService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn group(connection: Option<i32>, repo: Option<(&str, &str, &str)>) -> project_groups::Model {
@@ -655,20 +716,93 @@ mod tests {
     #[test]
     fn follows_requires_same_connection_repo_and_branch() {
         let g = group(Some(7), Some(("acme", "shop", "main")));
-        assert!(points_at(&g, Some(7), false, "acme", "shop", "main"));
-        assert!(!points_at(&g, Some(7), false, "acme", "shop", "develop"));
-        assert!(!points_at(&g, Some(7), false, "acme", "other", "main"));
-        assert!(!points_at(&g, Some(8), false, "acme", "shop", "main"));
+        assert!(points_at(&g, Some(7), false, "acme", "shop", "main", None));
+        assert!(!points_at(
+            &g,
+            Some(7),
+            false,
+            "acme",
+            "shop",
+            "develop",
+            None
+        ));
+        assert!(!points_at(
+            &g,
+            Some(7),
+            false,
+            "acme",
+            "other",
+            "main",
+            None
+        ));
+        assert!(!points_at(&g, Some(8), false, "acme", "shop", "main", None));
     }
 
     #[test]
     fn a_public_group_is_followed_only_by_anonymous_clones() {
         let mut g = group(None, Some(("acme", "shop", "main")));
         g.public_provider = Some("github".into());
-        assert!(points_at(&g, None, true, "acme", "shop", "main"));
+        let url = Some("https://github.com/acme/shop.git");
+        assert!(points_at(&g, None, true, "acme", "shop", "main", url));
         // Same repo but still set up to clone through a (deleted) connection.
-        assert!(!points_at(&g, None, false, "acme", "shop", "main"));
-        assert!(!points_at(&g, Some(7), true, "acme", "shop", "main"));
+        assert!(!points_at(&g, None, false, "acme", "shop", "main", url));
+        assert!(!points_at(&g, Some(7), true, "acme", "shop", "main", url));
+    }
+
+    #[test]
+    fn moving_a_public_group_to_another_provider_unsynchronizes_its_members() {
+        // Same owner, name and branch; only the host differs.
+        let mut g = group(None, Some(("acme", "shop", "main")));
+        g.public_provider = Some("gitlab".into());
+        let old = Some("https://github.com/acme/shop.git");
+        let new = Some("https://gitlab.com/acme/shop.git");
+        assert!(
+            !points_at(&g, None, true, "acme", "shop", "main", old),
+            "a member still cloning from the old host must be written through"
+        );
+        assert!(points_at(&g, None, true, "acme", "shop", "main", new));
+
+        // The other direction.
+        g.public_provider = Some("github".into());
+        assert!(!points_at(&g, None, true, "acme", "shop", "main", new));
+        assert!(points_at(&g, None, true, "acme", "shop", "main", old));
+    }
+
+    #[test]
+    fn a_public_member_without_a_clone_url_is_written_through() {
+        let mut g = group(None, Some(("acme", "shop", "main")));
+        g.public_provider = Some("github".into());
+        assert!(!points_at(&g, None, true, "acme", "shop", "main", None));
+        assert!(!points_at(&g, None, true, "acme", "shop", "main", Some("")));
+    }
+
+    #[test]
+    fn clone_urls_compare_across_spellings() {
+        let mut g = group(None, Some(("acme", "shop", "main")));
+        g.public_provider = Some("github".into());
+        for spelling in [
+            "https://github.com/acme/shop",
+            "https://github.com/acme/shop.git",
+            "https://github.com/acme/shop/",
+            "http://www.github.com/acme/shop.git",
+            "https://GitHub.com/acme/shop.git",
+        ] {
+            assert!(
+                points_at(&g, None, true, "acme", "shop", "main", Some(spelling)),
+                "{spelling}"
+            );
+        }
+        // A look-alike host or a different path is a different repository.
+        for other in [
+            "https://github.com.evil.test/acme/shop.git",
+            "https://github.com/acme/shop-fork.git",
+            "git@github.com:acme/shop.git",
+        ] {
+            assert!(
+                !points_at(&g, None, true, "acme", "shop", "main", Some(other)),
+                "{other}"
+            );
+        }
     }
 
     #[test]
@@ -696,7 +830,7 @@ mod tests {
     #[test]
     fn nothing_follows_a_group_without_a_repository() {
         let g = group(None, None);
-        assert!(!points_at(&g, None, false, "", "", ""));
+        assert!(!points_at(&g, None, false, "", "", "", None));
     }
 
     #[test]
@@ -713,6 +847,168 @@ mod tests {
             );
         }
         assert!(clean_field("Branch", &"b".repeat(MAX_FIELD_LEN + 1)).is_err());
+    }
+
+    use temps_git::services::git_provider::FileContent;
+    use temps_git::services::public_repo::{PublicBranch, PublicRepoInfo};
+
+    /// A public provider whose branches, and the refs its tree lookup
+    /// resolves, are fixed, counting the tree lookups made.
+    struct FakeProvider {
+        branches: Vec<&'static str>,
+        /// Refs `get_file_tree` resolves (tags and commits).
+        trees: Vec<&'static str>,
+        tree_error: Option<fn() -> PublicRepoError>,
+        branch_error: Option<fn() -> PublicRepoError>,
+        tree_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeProvider {
+        fn new(branches: &[&'static str], trees: &[&'static str]) -> Self {
+            Self {
+                branches: branches.to_vec(),
+                trees: trees.to_vec(),
+                tree_error: None,
+                branch_error: None,
+                tree_calls: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PublicRepoProvider for FakeProvider {
+        fn provider_name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn get_repository(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<PublicRepoInfo, PublicRepoError> {
+            Err(PublicRepoError::Internal("not used".into()))
+        }
+
+        async fn list_branches(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            branch: &str,
+        ) -> Result<Option<PublicBranch>, PublicRepoError> {
+            if let Some(error) = self.branch_error {
+                return Err(error());
+            }
+            Ok(self
+                .branches
+                .iter()
+                .any(|b| *b == branch)
+                .then(|| PublicBranch {
+                    name: branch.to_string(),
+                    commit_sha: "0".repeat(40),
+                    protected: false,
+                }))
+        }
+
+        async fn get_file_tree(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            reference: &str,
+        ) -> Result<Vec<String>, PublicRepoError> {
+            self.tree_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.tree_error {
+                return Err(error());
+            }
+            if self.trees.iter().any(|t| *t == reference) {
+                Ok(vec!["README.md".to_string()])
+            } else {
+                Err(PublicRepoError::NotFound(format!("tree at {reference}")))
+            }
+        }
+
+        async fn get_file_content(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _path: &str,
+            _reference: &str,
+        ) -> Result<FileContent, PublicRepoError> {
+            Err(PublicRepoError::Internal("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_is_confirmed_without_reading_the_tree() {
+        let provider = FakeProvider::new(&["main", "develop"], &[]);
+        assert!(ref_exists(&provider, "acme", "shop", "develop")
+            .await
+            .expect("lookup"));
+        assert_eq!(
+            provider
+                .tree_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tag_or_commit_pinned_by_a_template_is_accepted() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let provider = FakeProvider::new(&["main"], &["v1.2.3", sha]);
+        for reference in ["v1.2.3", sha] {
+            assert!(
+                ref_exists(&provider, "acme", "shop", reference)
+                    .await
+                    .expect("lookup"),
+                "{reference} must be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ref_that_is_nothing_is_rejected() {
+        let provider = FakeProvider::new(&["main"], &["v1.2.3"]);
+        assert!(!ref_exists(&provider, "acme", "shop", "v9.9.9")
+            .await
+            .expect("lookup"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_tree_still_proves_the_ref_exists() {
+        let mut provider = FakeProvider::new(&["main"], &[]);
+        provider.tree_error = Some(|| PublicRepoError::ResponseTooLarge {
+            context: "repository tree".into(),
+            limit_bytes: 1,
+        });
+        assert!(ref_exists(&provider, "acme", "shop", "v1.2.3")
+            .await
+            .expect("lookup"));
+    }
+
+    #[tokio::test]
+    async fn provider_failures_are_not_reported_as_a_missing_ref() {
+        let mut provider = FakeProvider::new(&["main"], &[]);
+        provider.tree_error = Some(|| PublicRepoError::RateLimitExceeded);
+        assert!(matches!(
+            ref_exists(&provider, "acme", "shop", "v1.2.3").await,
+            Err(PublicRepoError::RateLimitExceeded)
+        ));
+
+        let mut provider = FakeProvider::new(&["main"], &[]);
+        provider.branch_error = Some(|| PublicRepoError::ApiError("HTTP 500".into()));
+        assert!(matches!(
+            ref_exists(&provider, "acme", "shop", "main").await,
+            Err(PublicRepoError::ApiError(_))
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -736,7 +1032,9 @@ mod tests {
         }
     }
 
-    async fn repository_service(db: Arc<DatabaseConnection>) -> Option<GroupRepositoryService> {
+    pub(crate) async fn repository_service(
+        db: Arc<DatabaseConnection>,
+    ) -> Option<GroupRepositoryService> {
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
                 "127.0.0.1:3000".to_string(),
@@ -781,7 +1079,7 @@ mod tests {
         Some(GroupRepositoryService::new(db, projects, git))
     }
 
-    async fn insert_project(conn: &impl ConnectionTrait, id: i32, name: &str) {
+    pub(crate) async fn insert_project(conn: &impl ConnectionTrait, id: i32, name: &str) {
         let stmt = Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"

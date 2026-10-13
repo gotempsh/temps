@@ -4,6 +4,7 @@
 import type {
   EnvVarTemplate,
   ProjectResponse,
+  ServiceTemplateInstance,
   ServiceTemplateInstanceResponse,
 } from '@/api/client'
 import {
@@ -484,7 +485,7 @@ export function ServiceTemplateRuntimeCard({
   )
 }
 
-function ServiceTemplateUpgradeCard({
+export function ServiceTemplateUpgradeCard({
   project,
   instance,
   onUpgraded,
@@ -522,7 +523,16 @@ function ServiceTemplateUpgradeCard({
   }
 
   if (!instance.upgrade_available && !instance.catalog_drift) {
-    return null
+    // A newer release exists but cannot be applied to this service from here
+    // (e.g. it is now a multi-service app). The backend explains what to do
+    // instead; never leave the operator with nothing.
+    return instance.catalog_error ? (
+      <ServiceTemplateNewerReleaseNotice
+        applied={instance.applied}
+        latest={latest}
+        message={instance.catalog_error}
+      />
+    ) : null
   }
 
   const blocked =
@@ -581,6 +591,13 @@ function ServiceTemplateUpgradeCard({
         </span>
       </CardHeader>
       <CardContent className="space-y-5">
+        {instance.catalog_error && (
+          <div className="flex gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <p className="text-muted-foreground">{instance.catalog_error}</p>
+          </div>
+        )}
+
         {instance.catalog_drift && (
           <div className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm">
             <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
@@ -697,6 +714,43 @@ function ServiceTemplateUpgradeCard({
           Apply template update
         </Button>
       </CardFooter>
+    </Card>
+  )
+}
+
+export function ServiceTemplateNewerReleaseNotice({
+  applied,
+  latest,
+  message,
+}: {
+  applied: ServiceTemplateInstance
+  latest: ServiceTemplateInstance
+  message: string
+}) {
+  return (
+    <Card className="border-amber-500/30">
+      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="space-y-1">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <ArrowUpCircle className="size-4 text-amber-500" />
+            Newer release cannot be applied to this service
+          </CardTitle>
+          <CardDescription>
+            {applied.slug} <span className="font-mono">{applied.version}</span>
+            {' → '}
+            <span className="font-mono">{latest.version}</span> is available.{' '}
+            {message} Your saved runtime remains deployable and editable below.
+          </CardDescription>
+        </div>
+        <Button variant="outline" size="sm" className="w-fit" asChild>
+          <Link
+            to={`/projects/new?source=templates&template=${encodeURIComponent(latest.slug)}`}
+          >
+            <Boxes className="mr-2 size-4" />
+            Open in template catalog
+          </Link>
+        </Button>
+      </CardHeader>
     </Card>
   )
 }

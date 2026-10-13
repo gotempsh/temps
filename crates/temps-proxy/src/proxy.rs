@@ -5038,10 +5038,24 @@ impl ProxyHttp for LoadBalancer {
 
         // Path routes (ADR 050): `frontend: /api -> backend` serves this
         // path from another service of the project. In-memory lookup only.
+        //
+        // The password form rendered for a path-routed target posts to the
+        // reserved `/_temps/password-verify`, which never matches a path
+        // route; `resolve_request_path_route` matches it by the routed path
+        // the form carries, so the password is checked (and the cookie
+        // issued) for the target environment the form was rendered for,
+        // never the host's own. Client input only selects among the
+        // prefixes this host already serves.
         if ctx.preview_route.is_none() {
-            ctx.path_route = self
-                .project_context_resolver
-                .match_path_route(&ctx.host, &ctx.path);
+            ctx.path_route = crate::handler::password_wall::resolve_request_path_route(
+                &ctx.method,
+                &ctx.path,
+                ctx.query_string.as_deref(),
+                |path| {
+                    self.project_context_resolver
+                        .match_path_route(&ctx.host, path)
+                },
+            );
         }
 
         // Path-route wake-on-demand: if the target service is sleeping
@@ -5109,16 +5123,23 @@ impl ProxyHttp for LoadBalancer {
                             // Re-resolve the path route after the target is awake.
                             let resolve_deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(5);
-                            ctx.path_route = self
-                                .project_context_resolver
-                                .match_path_route(&ctx.host, &ctx.path);
+                            let rematch = |ctx: &ProxyContext| {
+                                crate::handler::password_wall::resolve_request_path_route(
+                                    &ctx.method,
+                                    &ctx.path,
+                                    ctx.query_string.as_deref(),
+                                    |path| {
+                                        self.project_context_resolver
+                                            .match_path_route(&ctx.host, path)
+                                    },
+                                )
+                            };
+                            ctx.path_route = rematch(ctx);
                             while ctx.path_route.as_ref().is_none_or(|r| r.target.is_none())
                                 && std::time::Instant::now() < resolve_deadline
                             {
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                ctx.path_route = self
-                                    .project_context_resolver
-                                    .match_path_route(&ctx.host, &ctx.path);
+                                ctx.path_route = rematch(ctx);
                             }
                             if ctx.path_route.as_ref().is_none_or(|r| r.target.is_none()) {
                                 error!(
@@ -5535,9 +5556,10 @@ impl ProxyHttp for LoadBalancer {
                 let env_id = project_ctx.environment.id;
                 let project_name = &project_ctx.project.name;
                 let environment_name = &project_ctx.environment.name;
-
                 // Check if this is the password verify POST endpoint
-                if ctx.path == "/_temps/password-verify" && ctx.method == "POST" {
+                if ctx.path == crate::handler::password_wall::PASSWORD_VERIFY_PATH
+                    && ctx.method == "POST"
+                {
                     // Read the POST body to get the password
                     let body = session.read_request_body().await.map_err(|e| {
                         error!("Failed to read password verify body: {}", e);
@@ -5617,11 +5639,18 @@ impl ProxyHttp for LoadBalancer {
                         self.preview_auth_limiter
                             .clear_password_wall(client_ip, env_id);
                         let host = ctx.host.clone();
-                        let set_cookie = crate::handler::password_wall::build_set_cookie_header(
-                            env_id,
-                            &password_hash,
-                            &host,
-                        );
+                        let set_cookie =
+                            crate::handler::password_wall::build_set_cookie_header_for_path(
+                                env_id,
+                                &password_hash,
+                                &host,
+                                // A path-routed target is unlocked under
+                                // its prefix only, so its cookie coexists
+                                // with the host's own `Path=/` one.
+                                ctx.path_route
+                                    .as_ref()
+                                    .map_or("/", |route| route.prefix.as_str()),
+                            );
 
                         let mut resp = ResponseHeader::build(303, None)?;
                         resp.insert_header("Location", redirect)?;
@@ -5636,12 +5665,22 @@ impl ProxyHttp for LoadBalancer {
                     } else {
                         // Wrong password — the attempt is already counted;
                         // show the form again with an error
-                        let html = crate::handler::password_wall::generate_password_form_html(
-                            redirect,
-                            true,
-                            project_name,
-                            environment_name,
-                        );
+                        let html =
+                            crate::handler::password_wall::generate_password_form_html_for_route(
+                                redirect,
+                                true,
+                                project_name,
+                                environment_name,
+                                // Behind a path route the form posts back
+                                // the routed path, so the next attempt
+                                // resolves to this environment again.
+                                crate::handler::password_wall::routed_form_path(
+                                    ctx.path_route.is_some(),
+                                    &ctx.path,
+                                    ctx.query_string.as_deref(),
+                                )
+                                .as_deref(),
+                            );
                         let html_bytes = Bytes::from(html);
 
                         let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
@@ -5659,17 +5698,22 @@ impl ProxyHttp for LoadBalancer {
                     }
                 }
 
-                // Check for valid password cookie
-                // The first cookie with this name decides, as before.
+                // Check for valid password cookie. Several cookies may carry
+                // this name: the host's own environment (`Path=/`) and a
+                // path-routed target's (`Path=<prefix>`) coexist, and the
+                // browser sends both on a routed path. Each is bound to its
+                // environment id and password hash, so any one that
+                // validates for THIS environment unlocks it.
                 let has_valid_cookie = find_request_cookie(
                     session.req_header(),
                     crate::handler::password_wall::PASSWORD_COOKIE_NAME,
                     |value| {
-                        Some(crate::handler::password_wall::validate_cookie(
+                        crate::handler::password_wall::validate_cookie(
                             value,
                             env_id,
                             &password_hash,
-                        ))
+                        )
+                        .then_some(true)
                     },
                 )
                 .unwrap_or(false);
@@ -5686,11 +5730,20 @@ impl ProxyHttp for LoadBalancer {
                         ctx.path.clone()
                     };
 
-                    let html = crate::handler::password_wall::generate_password_form_html(
+                    let html = crate::handler::password_wall::generate_password_form_html_for_route(
                         &current_path,
                         false,
                         project_name,
                         environment_name,
+                        // Behind a path route the form posts back the routed
+                        // path, so the verify request resolves to this
+                        // (target) environment, not the host's own.
+                        crate::handler::password_wall::routed_form_path(
+                            ctx.path_route.is_some(),
+                            &ctx.path,
+                            ctx.query_string.as_deref(),
+                        )
+                        .as_deref(),
                     );
                     let html_bytes = Bytes::from(html);
 
