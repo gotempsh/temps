@@ -183,4 +183,38 @@ describe('runProviderLogin', () => {
     expect(prompts).toHaveLength(0)
     expect(submitted).toHaveLength(0)
   })
+
+  test('says so when an interrupted sign-in could not be cancelled', async () => {
+    const { api, calls } = fakeApi([session('waiting', { verification_url: LINK })])
+    api.cancel = async () => {
+      calls.push('cancel')
+      throw new Error('connection reset')
+    }
+    const { io } = fakeIo()
+
+    const error = await runProviderLogin(api, io, 'claude_cli', {
+      pollIntervalMs: 0,
+      shouldAbort: () => true,
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(LoginFlowError)
+    const message = (error as LoginFlowError).message
+    expect(message).toContain('Sign-in cancelled.')
+    expect(message).toContain('connection reset')
+    expect(message).toContain('may keep running')
+    // One retry before giving up.
+    expect(calls.filter((call) => call === 'cancel')).toHaveLength(2)
+  })
+
+  test('an empty code reports a failed cancel too', async () => {
+    const { api } = fakeApi([session('waiting', { verification_url: LINK })])
+    api.cancel = async () => {
+      throw new Error('503')
+    }
+    const { io } = fakeIo('  ')
+
+    await expect(
+      runProviderLogin(api, io, 'claude_cli', { pollIntervalMs: 0 })
+    ).rejects.toThrow(/may keep running/)
+  })
 })

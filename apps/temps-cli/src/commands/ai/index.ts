@@ -170,7 +170,15 @@ async function providerLogin(
     interrupted = true
     console.log(colors.warning('\nCancelling the sign-in…'))
     if (cancelSignIn) {
-      void cancelSignIn().finally(() => process.exit(130))
+      void cancelSignIn()
+        .catch((error: unknown) => {
+          console.error(
+            colors.warning(
+              `Could not cancel the sign-in on the server (${getErrorMessage(error)}). It may keep running until it times out; cancel it from Settings → AI Agents.`
+            )
+          )
+        })
+        .finally(() => process.exit(130))
     }
     // Otherwise the start request is still in flight: the flow cancels the
     // sign-in the moment it exists (see `shouldAbort`), then exits below.

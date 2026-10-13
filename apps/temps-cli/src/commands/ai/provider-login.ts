@@ -74,6 +74,36 @@ export class LoginFlowError extends Error {
   }
 }
 
+/**
+ * Stop the sign-in the user walked away from, and say so when that did not
+ * work. A failed cancel leaves the server-side sign-in running until its
+ * timeout, holding the provider's single slot, so the user has to be told how
+ * to clear it rather than being shown a clean "cancelled".
+ */
+async function cancelAndExplain(
+  api: ProviderLoginApi,
+  providerId: string,
+  reason: string,
+  timeoutSeconds: number
+): Promise<never> {
+  let failure: unknown
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await api.cancel(providerId)
+      throw new LoginFlowError(reason, 'cancelled')
+    } catch (error) {
+      if (error instanceof LoginFlowError) throw error
+      failure = error
+    }
+  }
+  const why = failure instanceof Error ? failure.message : String(failure)
+  throw new LoginFlowError(
+    `${reason} The server could not be told to stop it (${why}), so it may keep running for up to ${Math.round(timeoutSeconds / 60)} minutes and block another attempt. ` +
+      `Cancel it from Settings → AI Agents, or run \`temps ai provider login ${providerId}\` again to resume it.`,
+    'cancelled'
+  )
+}
+
 function describe(session: LoginSession): string {
   return `${session.phase} (${session.elapsed_seconds}s of ${session.timeout_seconds}s)`
 }
@@ -94,8 +124,12 @@ export async function runProviderLogin(
     await api.cancel(providerId)
   })
   if (options.shouldAbort?.()) {
-    await api.cancel(providerId).catch(() => undefined)
-    throw new LoginFlowError('Sign-in cancelled.', 'cancelled')
+    return cancelAndExplain(
+      api,
+      providerId,
+      'Sign-in cancelled.',
+      session.timeout_seconds
+    )
   }
 
   let announcedLink = false
@@ -126,8 +160,12 @@ export async function runProviderLogin(
           await io.promptCode('Paste the code shown after approving access')
         ).trim()
         if (!code) {
-          await api.cancel(providerId).catch(() => undefined)
-          throw new LoginFlowError('No code entered; sign-in cancelled.', 'cancelled')
+          return cancelAndExplain(
+            api,
+            providerId,
+            'No code entered; sign-in cancelled.',
+            session.timeout_seconds
+          )
         }
         submitted = true
         session = await api.submitCode(providerId, code)
