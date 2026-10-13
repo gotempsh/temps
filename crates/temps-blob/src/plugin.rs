@@ -15,7 +15,9 @@ use temps_providers::externalsvc::{
     legacy_managed_instance_names, managed_instance_name, ExternalService, RustfsService,
     ServiceType,
 };
-use temps_providers::managed_names::{ManagedServiceKind, ManagedServiceNames};
+use temps_providers::managed_names::{
+    get_managed_service, ManagedServiceKind, ManagedServiceNames,
+};
 use temps_providers::ExternalServiceManager;
 use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
@@ -212,9 +214,12 @@ impl TempsPlugin for BlobPlugin {
                     report_legacy_duplicate_containers(docker, encryption_service).await;
                 }
 
-                match external_service_manager
-                    .get_service_by_name(&service_name)
-                    .await
+                match get_managed_service(
+                    &external_service_manager,
+                    ManagedServiceKind::Blob,
+                    &service_name,
+                )
+                .await
                 {
                     Ok(service_model) => {
                         if service_model.status == "stopped" {

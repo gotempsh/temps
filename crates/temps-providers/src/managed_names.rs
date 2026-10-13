@@ -82,6 +82,11 @@ impl ManagedServiceKind {
         }
     }
 
+    /// Whether a service row with this `service_type` is this kind's.
+    pub fn owns(self, service_type: &str) -> bool {
+        self.service_types().contains(&service_type)
+    }
+
     /// The other managed kind.
     fn other(self) -> Self {
         match self {
@@ -375,6 +380,28 @@ fn check_rename(
     ))
 }
 
+/// Look up the managed service for `kind` by name, treating a row of another
+/// service type as not found.
+///
+/// KV and Blob can be saved under the same service name, and a user's own
+/// service can carry it too. A lookup by name alone would then hand one kind
+/// another's row, and stopping or reconfiguring it would act on the wrong
+/// service.
+pub async fn get_managed_service(
+    manager: &crate::services::ExternalServiceManager,
+    kind: ManagedServiceKind,
+    name: &str,
+) -> Result<external_services::Model, ExternalServiceError> {
+    let row = manager.get_service_by_name(name).await?;
+    if kind.owns(&row.service_type) {
+        Ok(row)
+    } else {
+        Err(ExternalServiceError::ServiceNotFoundByName {
+            name: name.to_string(),
+        })
+    }
+}
+
 /// Refuse a service name that is already held by a different service row.
 ///
 /// The managed service is looked up by name, so saving a name that belongs to
@@ -489,7 +516,12 @@ impl ManagedServiceNames {
     }
 
     /// Save the container name for `kind`; an empty `submitted` clears it back
-    /// to the per-instance default. Returns the name as resolved afterwards.
+    /// to the per-instance default. Returns the name as it was and as it
+    /// resolves afterwards.
+    ///
+    /// `apply_to_engine` runs with the resolved name while the naming lock is
+    /// still held, so the plugin's engine and the saved setting change as one
+    /// step with respect to an enable.
     ///
     /// Refused while the service exists unless the submission resolves to the
     /// name it already has.
@@ -497,13 +529,18 @@ impl ManagedServiceNames {
         &self,
         kind: ManagedServiceKind,
         submitted: &str,
-    ) -> Result<ResolvedManagedName, ManagedNameError> {
+        apply_to_engine: impl FnOnce(&ResolvedManagedName),
+    ) -> Result<ContainerNameChange, ManagedNameError> {
         let requested = parse_container_name(kind, submitted)?;
         let _naming = self.lock_naming().await;
         let current = self.resolve(kind).await?;
 
         let Some(saved) = check_rename(kind, &current, requested.as_deref())? else {
-            return Ok(current);
+            apply_to_engine(&current);
+            return Ok(ContainerNameChange {
+                previous: current.clone(),
+                saved: current,
+            });
         };
         // Taken by any service row (a user's own service, or the other managed
         // kind's), or by the name the other managed kind already resolves to:
@@ -536,8 +573,20 @@ impl ManagedServiceNames {
                     .map_err(|source| ManagedNameError::SettingsWrite { setting, source })?;
             }
         }
-        self.resolve(kind).await
+        let resolved = self.resolve(kind).await?;
+        apply_to_engine(&resolved);
+        Ok(ContainerNameChange {
+            previous: current,
+            saved: resolved,
+        })
     }
+}
+
+/// A saved container name: what it was, and what it resolves to now.
+#[derive(Debug, Clone)]
+pub struct ContainerNameChange {
+    pub previous: ResolvedManagedName,
+    pub saved: ResolvedManagedName,
 }
 
 /// Response of the container-name settings endpoints.
@@ -902,6 +951,9 @@ mod tests {
                 "{kind_type} is claimed by both kinds"
             );
         }
+        // Handlers go through `get_managed_service`, which keys on `owns`.
+        assert!(KV.owns("redis") && !KV.owns("blob") && !KV.owns("postgres"));
+        assert!(BLOB.owns("blob") && !BLOB.owns("redis"));
         assert_eq!(KV.other(), BLOB);
         assert_eq!(BLOB.other(), KV);
     }

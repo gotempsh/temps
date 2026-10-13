@@ -21,7 +21,7 @@ use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
 use temps_providers::managed_names::{
-    enable_failure_problem, ManagedContainerNameSettings, ManagedServiceKind,
+    enable_failure_problem, get_managed_service, ManagedContainerNameSettings, ManagedServiceKind,
     UpdateManagedContainerName,
 };
 use temps_providers::{CreateExternalServiceRequest, UpdateExternalServiceRequest};
@@ -514,10 +514,12 @@ pub async fn blob_status(
     };
 
     // Check if the service exists in the database via ExternalServiceManager
-    let service_result = state
-        .external_service_manager
-        .get_service_by_name(&service_name)
-        .await;
+    let service_result = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &service_name,
+    )
+    .await;
 
     match service_result {
         Ok(service) => {
@@ -615,11 +617,13 @@ pub async fn blob_enable(
         .set_instance_name(resolved_name.service_name.clone());
 
     // Check if the service already exists (might be stopped)
-    let existing_service = state
-        .external_service_manager
-        .get_service_by_name(&resolved_name.service_name)
-        .await
-        .ok();
+    let existing_service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &resolved_name.service_name,
+    )
+    .await
+    .ok();
 
     let service_info = if let Some(existing) = existing_service {
         // Service exists - need to initialize the plugin's RustfsService and start the container
@@ -810,15 +814,17 @@ pub async fn blob_update(
     info!("Updating Blob service with config: {:?}", request);
 
     // Get existing service
-    let service = state
-        .external_service_manager
-        .get_service_by_name(&blob_service_name(&state).await?)
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Blob Service Not Found")
-                .with_detail("Blob service is not enabled. Enable it first before updating.")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &blob_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Blob Service Not Found")
+            .with_detail("Blob service is not enabled. Enable it first before updating.")
+    })?;
 
     // Get current details for audit log
     let current_details = state
@@ -937,15 +943,17 @@ pub async fn blob_disable(
     info!("Disabling Blob service");
 
     // Get the service record
-    let service = state
-        .external_service_manager
-        .get_service_by_name(&blob_service_name(&state).await?)
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Blob Service Not Found")
-                .with_detail("Blob service is not enabled")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &blob_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Blob Service Not Found")
+            .with_detail("Blob service is not enabled")
+    })?;
 
     // Stop the service through external_service_manager (stops container + updates DB status)
     state
@@ -1039,20 +1047,18 @@ pub async fn blob_update_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SystemAdmin);
 
-    let previous = state
+    // The engine is pointed at the saved name while the naming lock is still
+    // held, so an enable running at the same moment never sees a name that
+    // differs from the engine's.
+    let change = state
         .managed_names
-        .resolve(ManagedServiceKind::Blob)
+        .set_container_name(ManagedServiceKind::Blob, &request.container_name, |saved| {
+            state
+                .rustfs_service
+                .set_instance_name(saved.service_name.clone());
+        })
         .await?;
-    let saved = state
-        .managed_names
-        .set_container_name(ManagedServiceKind::Blob, &request.container_name)
-        .await?;
-
-    // Keep the plugin's engine in step so the next enable targets the new
-    // container without a restart.
-    state
-        .rustfs_service
-        .set_instance_name(saved.service_name.clone());
+    let (previous, saved) = (change.previous, change.saved);
 
     info!(
         user_id = auth.user_id(),

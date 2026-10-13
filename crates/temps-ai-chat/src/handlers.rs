@@ -4688,25 +4688,24 @@ async fn global_workspace_sandbox(
 fn global_workspace_failure_problem(error: &temps_sandbox::error::SandboxError) -> Problem {
     use temps_sandbox::error::SandboxError;
 
-    match error {
-        SandboxError::ImageUnavailable { image, .. } => {
-            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                .with_type("https://temps.sh/probs/sandbox-image-unavailable")
-                .with_title("Global Workspace Image Unavailable")
-                .with_detail(format!(
-                    "Temps could not pull the sandbox image '{image}' needed for the persistent \
-                     global workspace. Check that this host can reach the image registry and \
-                     that the image tag is published, then try again."
-                ))
-        }
-        // `SandboxError` is `#[non_exhaustive]` and lives in another crate, so
-        // the compiler requires this wildcard. Every other variant is the same
-        // server-side failure from the caller's point of view; the detail is
-        // deliberately generic so no sandbox internals reach the response.
-        _ => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Global Workspace Failed")
-            .with_detail("Temps could not prepare the persistent global workspace."),
+    // Only the image-pull failure gets its own response here. `SandboxError`
+    // is `#[non_exhaustive]` and owned by `temps-sandbox`, which maps every
+    // variant explicitly in its own `From<SandboxError> for Problem`; this
+    // workspace-preparation path deliberately returns one generic 500 for the
+    // rest so no sandbox internals reach the response.
+    if let SandboxError::ImageUnavailable { image, .. } = error {
+        return problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_type("https://temps.sh/probs/sandbox-image-unavailable")
+            .with_title("Global Workspace Image Unavailable")
+            .with_detail(format!(
+                "Temps could not pull the sandbox image '{image}' needed for the persistent \
+                 global workspace. Check that this host can reach the image registry and \
+                 that the image tag is published, then try again."
+            ));
     }
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title("Global Workspace Failed")
+        .with_detail("Temps could not prepare the persistent global workspace.")
 }
 
 async fn run_workspace_command(

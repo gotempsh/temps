@@ -18,7 +18,9 @@ use temps_core::AuditLogger;
 use temps_providers::externalsvc::{
     managed_instance_name, ExternalService, RedisService, ServiceType,
 };
-use temps_providers::managed_names::{ManagedServiceKind, ManagedServiceNames};
+use temps_providers::managed_names::{
+    get_managed_service, ManagedServiceKind, ManagedServiceNames,
+};
 use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
@@ -155,9 +157,12 @@ impl TempsPlugin for KvPlugin {
             let service_name = redis_service.instance_name();
 
             tokio::spawn(async move {
-                match external_service_manager
-                    .get_service_by_name(&service_name)
-                    .await
+                match get_managed_service(
+                    &external_service_manager,
+                    ManagedServiceKind::Kv,
+                    &service_name,
+                )
+                .await
                 {
                     Ok(service_model) => {
                         if service_model.status == "stopped" {

@@ -18,7 +18,7 @@ use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
 use temps_providers::managed_names::{
-    enable_failure_problem, ManagedContainerNameSettings, ManagedServiceKind,
+    enable_failure_problem, get_managed_service, ManagedContainerNameSettings, ManagedServiceKind,
     UpdateManagedContainerName,
 };
 use temps_providers::{CreateExternalServiceRequest, UpdateExternalServiceRequest};
@@ -428,10 +428,12 @@ pub async fn kv_status(
     };
 
     // Check if the service exists in the database via ExternalServiceManager
-    let service_result = state
-        .external_service_manager
-        .get_service_by_name(&service_name)
-        .await;
+    let service_result = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &service_name,
+    )
+    .await;
 
     match service_result {
         Ok(service) => {
@@ -523,11 +525,13 @@ pub async fn kv_enable(
         .set_instance_name(resolved_name.service_name.clone());
 
     // Check if the service already exists (might be stopped)
-    let existing_service = state
-        .external_service_manager
-        .get_service_by_name(&resolved_name.service_name)
-        .await
-        .ok();
+    let existing_service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &resolved_name.service_name,
+    )
+    .await
+    .ok();
 
     let service_info = if let Some(existing) = existing_service {
         // Service exists - start it (will be a no-op if already running)
@@ -719,15 +723,17 @@ pub async fn kv_update(
     info!("Updating KV service with config: {:?}", request);
 
     // Get existing service
-    let service = state
-        .external_service_manager
-        .get_service_by_name(&kv_service_name(&state).await?)
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("KV Service Not Found")
-                .with_detail("KV service is not enabled. Enable it first before updating.")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &kv_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("KV Service Not Found")
+            .with_detail("KV service is not enabled. Enable it first before updating.")
+    })?;
 
     // Get current details for audit log
     let current_details = state
@@ -846,15 +852,17 @@ pub async fn kv_disable(
     info!("Disabling KV service");
 
     // Get the service record
-    let service = state
-        .external_service_manager
-        .get_service_by_name(&kv_service_name(&state).await?)
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("KV Service Not Found")
-                .with_detail("KV service is not enabled")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &kv_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("KV Service Not Found")
+            .with_detail("KV service is not enabled")
+    })?;
 
     // Stop the service through external_service_manager (stops container + updates DB status)
     state
@@ -945,17 +953,18 @@ pub async fn kv_update_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SystemAdmin);
 
-    let previous = state.managed_names.resolve(ManagedServiceKind::Kv).await?;
-    let saved = state
+    // The engine is pointed at the saved name while the naming lock is still
+    // held, so an enable running at the same moment never sees a name that
+    // differs from the engine's.
+    let change = state
         .managed_names
-        .set_container_name(ManagedServiceKind::Kv, &request.container_name)
+        .set_container_name(ManagedServiceKind::Kv, &request.container_name, |saved| {
+            state
+                .redis_service
+                .set_instance_name(saved.service_name.clone());
+        })
         .await?;
-
-    // Keep the plugin's engine in step so the next enable targets the new
-    // container without a restart.
-    state
-        .redis_service
-        .set_instance_name(saved.service_name.clone());
+    let (previous, saved) = (change.previous, change.saved);
 
     info!(
         user_id = auth.user_id(),
