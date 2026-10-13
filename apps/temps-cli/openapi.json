@@ -15704,6 +15704,9 @@
           "registry_unavailable",
           "image_pull_failed",
           "dockerfile_copy_not_found",
+          "static_output_rejected",
+          "build_node_unreachable",
+          "static_deploy_failed",
           "unknown"
         ],
         "type": "string"
