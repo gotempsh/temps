@@ -21,6 +21,10 @@ use crate::{server_version, ClickHouseConfig, ClickHouseError, ServerVersion};
 /// How long the startup probe waits for `SELECT version()`.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The remedies name `PUT /settings` rather than a console control: the
+/// ClickHouse section of the settings page is a separate follow-up, and a
+/// remedy must never point at a control that is not there yet.
+///
 /// What to do about a decode failure when the codec the server used is not
 /// known (a failure that reached us only as a string, or a raw probe that
 /// could not observe one). Names both fixes; Temps never switches modes on its
@@ -28,21 +32,19 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const COMPRESSION_REMEDY: &str = "Retrying cannot fix this. Either set the ClickHouse \
 server's `network_compression_method` to `lz4` (for example in a `users.d` profile), or set \
 Temps' ClickHouse compression to `none` (PUT /settings with \
-{\"clickhouse\":{\"compression\":\"none\"}}, or the ClickHouse section of Settings > Monitoring) \
-and restart Temps.";
+{\"clickhouse\":{\"compression\":\"none\"}}) and restart Temps.";
 
 const REMEDY_ALTERED_LZ4: &str = "The server answered with LZ4 as requested, so its codec is \
 not the problem: the response was altered or cut short on the way (a proxy or load balancer \
 in front of ClickHouse re-encoding bodies, or a dropped connection). If it persists, set \
 Temps' ClickHouse compression to `none` (PUT /settings with \
-{\"clickhouse\":{\"compression\":\"none\"}}, or the ClickHouse section of Settings > Monitoring) \
-and restart Temps; the failure is re-checked periodically, so a transient one clears by itself.";
+{\"clickhouse\":{\"compression\":\"none\"}}) and restart Temps; the failure is re-checked periodically, so a transient one clears by itself.";
 
 const REMEDY_NOT_A_BLOCK: &str = "The response was not a ClickHouse compressed block (no \
 recognisable compression header). Check that the configured URL is ClickHouse's HTTP port and \
 that nothing in front of it rewrites response bodies; setting Temps' ClickHouse compression to \
-`none` (PUT /settings with {\"clickhouse\":{\"compression\":\"none\"}}, or the ClickHouse section \
-of Settings > Monitoring) removes the block framing altogether. Restart Temps to apply it.";
+`none` (PUT /settings with {\"clickhouse\":{\"compression\":\"none\"}}) removes the block \
+framing altogether. Restart Temps to apply it.";
 
 const REMEDY_UNDECODABLE_UNCOMPRESSED: &str = "Temps asked for uncompressed responses and still \
 received a body it could not decode, so something between Temps and ClickHouse is compressing or \
