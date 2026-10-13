@@ -662,10 +662,51 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
             .title(title)
             .detail(error.to_string())
             .build(),
-        other => error_builder::internal_server_error()
+        // Every remaining variant is a failure to create the service that the
+        // operator cannot fix through the container-name setting; they are
+        // listed so a new `ExternalServiceError` has to be given a response
+        // decision here.
+        ExternalServiceError::ServiceNotFound { .. }
+        | ExternalServiceError::ServiceNotFoundByName { .. }
+        | ExternalServiceError::ServiceNotFoundBySlug { .. }
+        | ExternalServiceError::InitializationFailed { .. }
+        | ExternalServiceError::UpgradeRejected { .. }
+        | ExternalServiceError::EncryptionFailed { .. }
+        | ExternalServiceError::DecryptionFailed { .. }
+        | ExternalServiceError::InvalidServiceType { .. }
+        | ExternalServiceError::ServiceNotLinkedToProject { .. }
+        | ExternalServiceError::ServiceClaimDenied { .. }
+        | ExternalServiceError::InvalidDatabaseProvisioning { .. }
+        | ExternalServiceError::ProjectNotFound { .. }
+        | ExternalServiceError::EnvironmentNotFound { .. }
+        | ExternalServiceError::DatabaseError { .. }
+        | ExternalServiceError::ArchiveSourceDesynced { .. }
+        | ExternalServiceError::ParameterValidationFailed { .. }
+        | ExternalServiceError::DataSafetyRefusal { .. }
+        | ExternalServiceError::StartFailed { .. }
+        | ExternalServiceError::UpgradeInProgress { .. }
+        | ExternalServiceError::StopFailed { .. }
+        | ExternalServiceError::ClusterMemberProvisioning { .. }
+        | ExternalServiceError::ClusterNotSettled { .. }
+        | ExternalServiceError::ClusterBusy { .. }
+        | ExternalServiceError::DeletionFailed { .. }
+        | ExternalServiceError::ServiceHasLinkedProjects { .. }
+        | ExternalServiceError::EnvironmentVariableNotFound { .. }
+        | ExternalServiceError::ParameterNotFound { .. }
+        | ExternalServiceError::ParameterNotSensitive { .. }
+        | ExternalServiceError::EncryptedVariableAccessDenied { .. }
+        | ExternalServiceError::DockerError { .. }
+        | ExternalServiceError::DuplicateServiceType { .. }
+        | ExternalServiceError::InternalError { .. }
+        | ExternalServiceError::DockerUnavailable { .. }
+        | ExternalServiceError::LocalWorkloadsDisabled { .. }
+        | ExternalServiceError::ControlPlaneAddressRequired { .. }
+        | ExternalServiceError::ControlPlaneMemberUnreachable { .. }
+        | ExternalServiceError::ClusterPortsUnavailable { .. }
+        | ExternalServiceError::ClusterMemberLimitExceeded { .. } => error_builder::internal_server_error()
             .title(title)
             .detail(format!(
-                "Could not create the {} service: {other}",
+                "Could not create the {} service: {error}",
                 kind.label()
             ))
             .build(),

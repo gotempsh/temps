@@ -46,7 +46,7 @@ import {
   deleteDnsProvider,
 } from '@temps-sdk/api'
 import type { Client } from '@temps-sdk/api/client'
-import type { CreatableServiceTypeRoute } from '@temps-sdk/api'
+import type { CreatableServiceTypeRoute, DeploymentResponse } from '@temps-sdk/api'
 import tls, { type TLSSocket } from 'node:tls'
 import { unwrap, normalizeApiUrl } from './client.ts'
 
@@ -149,6 +149,32 @@ export async function createE2eGitProject(
 }
 
 /**
+ * The deployment out of a `GET /projects/{id}/last-deployment` body.
+ *
+ * The endpoint answers `{ deployment: <deployment> | null }`: a project that
+ * has never deployed is a normal state, not a 404. The shared SDK snapshot
+ * still types the bare deployment (what older servers returned), so both
+ * shapes are accepted here and "nothing yet" is `null` either way.
+ */
+type WrappedLastDeployment = { deployment?: DeploymentResponse | null }
+
+function isWrappedLastDeployment(
+  body: DeploymentResponse | WrappedLastDeployment,
+): body is WrappedLastDeployment {
+  return 'deployment' in body
+}
+
+export function lastDeploymentOf(
+  body: DeploymentResponse | WrappedLastDeployment | undefined,
+): DeploymentResponse | null {
+  if (!body) return null
+  if (isWrappedLastDeployment(body)) return body.deployment ?? null
+  // The bare shape older servers returned; an object with neither a
+  // `deployment` key nor an id is "nothing yet", not a deployment.
+  return typeof body.id === 'number' ? body : null
+}
+
+/**
  * Trigger a real build+deploy pipeline for a project (the same action a git
  * push to the tracked branch would cause) and return the id of the
  * deployment it created. `GET /projects/{id}/last-deployment` answers
@@ -176,7 +202,7 @@ export async function triggerPipelineAndGetDeploymentId(
   const baseline = await pollUntil(
     async () => {
       const res = await getLastDeployment({ client, path: { id: opts.projectId } })
-      return res.data?.deployment ?? null
+      return lastDeploymentOf(res.data)
     },
     (d) => d !== null,
     { timeoutMs: 15_000, intervalMs: 1000, label: 'the auto-queued initial deployment to land' },
@@ -194,7 +220,7 @@ export async function triggerPipelineAndGetDeploymentId(
   const deployment = await pollUntil(
     async () => {
       const res = await getLastDeployment({ client, path: { id: opts.projectId } })
-      return res.data?.deployment ?? null
+      return lastDeploymentOf(res.data)
     },
     (d) => d !== null && d.id > baselineId,
     { timeoutMs: 30_000, intervalMs: 2000, label: 'a NEW deployment row (id > baseline) to appear after trigger-pipeline' },
