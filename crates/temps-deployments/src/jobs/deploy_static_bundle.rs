@@ -688,6 +688,10 @@ impl WorkflowTask for DeployStaticBundleJob {
             WorkflowError::JobExecutionFailed(format!("Failed to deploy static files: {}", e))
         })?;
 
+        if let Some(summary) = result.skipped_summary() {
+            self.log(LogLevel::Warning, &summary).await;
+        }
+
         self.log(
             LogLevel::Success,
             &format!("Deployed to: {}", result.storage_path),

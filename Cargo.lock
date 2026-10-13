@@ -12456,6 +12456,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "temps-clickhouse",
  "temps-core",
  "thiserror 2.0.21",
  "tokio",
@@ -12478,6 +12479,7 @@ dependencies = [
  "temps-analytics",
  "temps-analytics-backend",
  "temps-auth",
+ "temps-clickhouse",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -12898,11 +12900,17 @@ dependencies = [
 name = "temps-clickhouse"
 version = "0.1.0-beta.57"
 dependencies = [
+ "chrono",
  "clickhouse",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
  "serde",
+ "temps-core",
+ "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -13007,6 +13015,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "temps-auth",
+ "temps-clickhouse",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -14258,6 +14267,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "temps-clickhouse",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -14448,6 +14458,7 @@ dependencies = [
  "tempfile",
  "temps-ai",
  "temps-auth",
+ "temps-clickhouse",
  "temps-cloud-client",
  "temps-cloud-protocol",
  "temps-config",
@@ -14690,6 +14701,7 @@ dependencies = [
  "temps-analytics",
  "temps-audit",
  "temps-auth",
+ "temps-clickhouse",
  "temps-config",
  "temps-core",
  "temps-database",
