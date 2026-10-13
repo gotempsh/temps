@@ -460,6 +460,13 @@ struct AcmeOrderResponse {
     challenge_validation: Option<ChallengeValidationStatus>,
 }
 
+/// `GET /domains/{id}/order`: `order` is `null` when the domain has none.
+#[derive(Debug, Deserialize, Serialize)]
+struct DomainOrderResponse {
+    order: Option<AcmeOrderResponse>,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ChallengeValidationStatus {
     #[serde(rename = "type")]
@@ -1505,32 +1512,30 @@ async fn execute_order_show(cmd: OrderShowCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    // A domain with no order (an active certificate has none) answers 200 with
-    // `null`; that is a state to report, not a decode failure.
-    let order_resp: Option<AcmeOrderResponse> = parse_api_response(response, "GET", &url).await?;
-    let Some(order_resp) = order_resp else {
-        if cmd.json {
-            println!("null");
-        } else {
-            println!();
-            println!(
-                "{} Domain {} has no ACME order.",
-                "ℹ".bright_blue(),
-                cmd.domain_id
-            );
-            println!();
-        }
-        return Ok(());
-    };
+    let lookup: DomainOrderResponse = parse_api_response(response, "GET", &url).await?;
 
     if cmd.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&order_resp)
+            serde_json::to_string_pretty(&lookup)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))?
         );
         return Ok(());
     }
+
+    let Some(order_resp) = lookup.order else {
+        println!();
+        println!(
+            "  {} {}",
+            "No ACME order:".bright_white(),
+            lookup
+                .reason
+                .unwrap_or_else(|| format!("domain ID {} has no ACME order", cmd.domain_id))
+                .bright_yellow()
+        );
+        println!();
+        return Ok(());
+    };
 
     println!();
     println!(

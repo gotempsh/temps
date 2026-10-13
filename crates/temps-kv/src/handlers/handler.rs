@@ -17,12 +17,17 @@ use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
+use temps_providers::managed_names::{
+    enable_failure_problem, get_managed_service, ManagedContainerNameSettings, ManagedServiceKind,
+    UpdateManagedContainerName,
+};
 use temps_providers::{CreateExternalServiceRequest, UpdateExternalServiceRequest};
 use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::audit::{
-    AuditContext, KvServiceDisabledAudit, KvServiceEnabledAudit, KvServiceUpdatedAudit,
+    AuditContext, KvServiceDisabledAudit, KvServiceEnabledAudit, KvServiceSettingsUpdatedAudit,
+    KvServiceUpdatedAudit,
 };
 
 use super::types::*;
@@ -43,6 +48,8 @@ use crate::services::SetOptions;
         kv_enable,
         kv_update,
         kv_disable,
+        kv_get_settings,
+        kv_update_settings,
     ),
     components(
         schemas(
@@ -66,6 +73,8 @@ use crate::services::SetOptions;
             UpdateKvRequest,
             UpdateKvResponse,
             DisableKvResponse,
+            ManagedContainerNameSettings,
+            UpdateManagedContainerName,
         )
     ),
     tags(
@@ -91,6 +100,20 @@ pub fn configure_routes() -> Router<Arc<KvAppState>> {
         .route("/kv/enable", post(kv_enable))
         .route("/kv/update", patch(kv_update))
         .route("/kv/disable", delete(kv_disable))
+        .route(
+            "/kv/settings",
+            get(kv_get_settings).patch(kv_update_settings),
+        )
+}
+
+/// The name of this instance's KV service: the one that already exists, else
+/// the saved or per-instance default (see `temps_providers::managed_names`).
+async fn kv_service_name(state: &KvAppState) -> Result<String, Problem> {
+    Ok(state
+        .managed_names
+        .resolve(ManagedServiceKind::Kv)
+        .await?
+        .service_name)
 }
 
 /// Get a value by key
@@ -388,11 +411,29 @@ pub async fn kv_status(
     // Status check requires SystemRead permission
     permission_guard!(auth, SystemRead);
 
+    // This is the endpoint the console uses to onboard the feature, so an
+    // unreadable container-name setting degrades to "not enabled" instead of
+    // failing the whole status check.
+    let service_name = match state.managed_names.resolve(ManagedServiceKind::Kv).await {
+        Ok(resolved) => resolved.service_name,
+        Err(error) => {
+            tracing::warn!("KV status could not resolve its service name: {}", error);
+            return Ok(Json(KvStatusResponse {
+                enabled: false,
+                healthy: false,
+                version: None,
+                docker_image: None,
+            }));
+        }
+    };
+
     // Check if the service exists in the database via ExternalServiceManager
-    let service_result = state
-        .external_service_manager
-        .get_service_by_name("temps-kv")
-        .await;
+    let service_result = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &service_name,
+    )
+    .await;
 
     match service_result {
         Ok(service) => {
@@ -445,35 +486,6 @@ pub async fn kv_status(
     }
 }
 
-/// Problem for a failed `create_service` while enabling KV.
-///
-/// The KV store's Docker resources have fixed names (`redis-temps-kv` and its
-/// volume), so two Temps instances sharing one Docker host collide on them. The
-/// manager refuses to adopt a resource it did not create, which is correct —
-/// but it is a conflict the operator can resolve, not an internal failure, and
-/// the 500 it was reported as gave no hint of the cause.
-fn kv_create_failure_problem(error: &temps_providers::ExternalServiceError) -> Problem {
-    if let temps_providers::ExternalServiceError::ServiceResourceConflict { resource, .. } = error {
-        return temps_core::problemdetails::new(StatusCode::CONFLICT)
-            .with_title("KV Resource Already Exists")
-            .with_detail(format!(
-                "Docker resource '{resource}' already exists on this host and is not owned \
-                 by this Temps instance. The KV store uses fixed, host-wide resource names, \
-                 so this usually means another Temps instance sharing this Docker host has \
-                 already enabled KV. Remove the resource if it is a leftover, or enable \
-                 KV on a Docker host this instance does not share."
-            ));
-    }
-    // Every other variant goes through the providers crate's exhaustive
-    // classification (missing worker node, name conflicts, cluster placement),
-    // so a new `ExternalServiceError` variant is reviewed there, not swallowed
-    // by a catch-all here.
-    temps_providers::handlers::external_service_problem(
-        error,
-        format!("Could not create Redis service: {error}"),
-    )
-}
-
 /// Enable KV service
 #[utoipa::path(
     tag = "KV Management",
@@ -483,7 +495,7 @@ fn kv_create_failure_problem(error: &temps_providers::ExternalServiceError) -> P
     responses(
         (status = 200, description = "KV service enabled", body = EnableKvResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 409, description = "A Docker resource this service needs already exists on the host and is not owned by this instance"),
+        (status = 409, description = "The KV container name is already taken on this Docker host by something that is not this instance's KV service. Set a unique kv.container_name via PATCH /kv/settings", body = temps_core::ProblemDetails),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -499,12 +511,27 @@ pub async fn kv_enable(
 
     info!("Enabling KV service with config: {:?}", request);
 
+    // A container-name change must not land between resolving the name below
+    // and creating the service under it.
+    let _naming = state.managed_names.lock_naming().await;
+
+    // What this instance calls its KV service. The plugin built its engine at
+    // startup; point it at the name resolved now (the operator may have chosen
+    // another container name since) before anything creates or starts a
+    // container.
+    let resolved_name = state.managed_names.resolve(ManagedServiceKind::Kv).await?;
+    state
+        .redis_service
+        .set_instance_name(resolved_name.service_name.clone());
+
     // Check if the service already exists (might be stopped)
-    let existing_service = state
-        .external_service_manager
-        .get_service_by_name("temps-kv")
-        .await
-        .ok();
+    let existing_service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &resolved_name.service_name,
+    )
+    .await
+    .ok();
 
     let service_info = if let Some(existing) = existing_service {
         // Service exists - start it (will be a no-op if already running)
@@ -585,7 +612,7 @@ pub async fn kv_enable(
 
         // Create service request for ExternalServiceManager
         let create_request = CreateExternalServiceRequest {
-            name: "temps-kv".to_string(),
+            name: resolved_name.service_name.clone(),
             service_type: ServiceType::Redis,
             version,
             parameters,
@@ -601,8 +628,11 @@ pub async fn kv_enable(
             .create_service(create_request)
             .await
             .map_err(|e| {
-                error!("Failed to create KV service: {}", e);
-                kv_create_failure_problem(&e)
+                error!(
+                    "Failed to create KV service '{}': {}",
+                    resolved_name.service_name, e
+                );
+                enable_failure_problem(ManagedServiceKind::Kv, &e)
             })?;
 
         // `create_service` builds its own service instance to start the
@@ -646,7 +676,7 @@ pub async fn kv_enable(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        service_name: "temps-kv".to_string(),
+        service_name: service_info.name.clone(),
         docker_image: docker_image.clone(),
         version: version.clone(),
     };
@@ -693,15 +723,17 @@ pub async fn kv_update(
     info!("Updating KV service with config: {:?}", request);
 
     // Get existing service
-    let service = state
-        .external_service_manager
-        .get_service_by_name("temps-kv")
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("KV Service Not Found")
-                .with_detail("KV service is not enabled. Enable it first before updating.")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &kv_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("KV Service Not Found")
+            .with_detail("KV service is not enabled. Enable it first before updating.")
+    })?;
 
     // Get current details for audit log
     let current_details = state
@@ -769,7 +801,7 @@ pub async fn kv_update(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        service_name: "temps-kv".to_string(),
+        service_name: service.name.clone(),
         old_docker_image,
         new_docker_image: new_docker_image.clone(),
         old_version,
@@ -820,15 +852,17 @@ pub async fn kv_disable(
     info!("Disabling KV service");
 
     // Get the service record
-    let service = state
-        .external_service_manager
-        .get_service_by_name("temps-kv")
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("KV Service Not Found")
-                .with_detail("KV service is not enabled")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Kv,
+        &kv_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("KV Service Not Found")
+            .with_detail("KV service is not enabled")
+    })?;
 
     // Stop the service through external_service_manager (stops container + updates DB status)
     state
@@ -849,7 +883,7 @@ pub async fn kv_disable(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        service_name: "temps-kv".to_string(),
+        service_name: service.name.clone(),
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
@@ -862,38 +896,97 @@ pub async fn kv_disable(
     }))
 }
 
-#[cfg(test)]
-mod enable_conflict_tests {
-    use super::kv_create_failure_problem;
-    use axum::http::StatusCode;
-    use temps_providers::ExternalServiceError;
+/// Get the KV container-name setting
+///
+/// Returns the Docker container the KV service runs in on this instance, the
+/// default an empty setting resolves to, and whether the name can still be
+/// changed (it cannot once the service exists).
+#[utoipa::path(
+    tag = "KV Management",
+    get,
+    path = "/kv/settings",
+    responses(
+        (status = 200, description = "KV container-name settings", body = ManagedContainerNameSettings),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn kv_get_settings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<KvAppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemRead);
 
-    /// Enabling KV on a Docker host that another Temps instance already
-    /// provisioned KV on hit `ServiceResourceConflict` and answered 500.
-    #[test]
-    fn shared_docker_host_resource_conflict_is_a_409_naming_the_resource() {
-        let problem = kv_create_failure_problem(&ExternalServiceError::ServiceResourceConflict {
-            name: "temps-kv".to_string(),
-            resource: "redis-temps-kv".to_string(),
-        });
+    let resolved = state.managed_names.resolve(ManagedServiceKind::Kv).await?;
+    Ok(Json(ManagedContainerNameSettings::from(&resolved)))
+}
 
-        assert_eq!(problem.status_code, StatusCode::CONFLICT);
-        let detail = problem
-            .body
-            .get("detail")
-            .and_then(|detail| detail.as_str())
-            .unwrap_or_default();
-        assert!(detail.contains("redis-temps-kv"), "{detail}");
-        assert!(detail.contains("another Temps instance"), "{detail}");
+/// Set the KV container name
+///
+/// Several Temps instances sharing one Docker daemon each need their own KV
+/// container. The default is already unique per instance; set a name here to
+/// choose it yourself. Must start with `redis-`; an empty value restores the
+/// default. Refused with 409 while the KV service exists: renaming its
+/// container would orphan the data, so delete the service first.
+#[utoipa::path(
+    tag = "KV Management",
+    patch,
+    path = "/kv/settings",
+    request_body = UpdateManagedContainerName,
+    responses(
+        (status = 200, description = "Container name saved", body = ManagedContainerNameSettings),
+        (status = 400, description = "The container name is not one Docker and Temps accept", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "The KV service already exists, so its container cannot be renamed", body = temps_core::ProblemDetails),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn kv_update_settings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<KvAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateManagedContainerName>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    // The engine is pointed at the saved name while the naming lock is still
+    // held, so an enable running at the same moment never sees a name that
+    // differs from the engine's.
+    let change = state
+        .managed_names
+        .set_container_name(ManagedServiceKind::Kv, &request.container_name, |saved| {
+            state
+                .redis_service
+                .set_instance_name(saved.service_name.clone());
+        })
+        .await?;
+    let (previous, saved) = (change.previous, change.saved);
+
+    info!(
+        user_id = auth.user_id(),
+        previous = %previous.container_name,
+        container = %saved.container_name,
+        "KV container name setting saved"
+    );
+
+    let audit = KvServiceSettingsUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        previous_container_name: previous.container_name,
+        new_container_name: saved.container_name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
     }
 
-    #[test]
-    fn other_create_failures_stay_internal_errors() {
-        let problem = kv_create_failure_problem(&ExternalServiceError::InternalError {
-            reason: "disk full".to_string(),
-        });
-        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
-    }
+    Ok(Json(ManagedContainerNameSettings::from(&saved)))
 }
 
 #[cfg(test)]

@@ -1819,37 +1819,38 @@ impl DeploymentService {
         Ok(deployment)
     }
 
-    /// The project's most recent deployment, or `None` when it has never been
-    /// deployed.
+    /// Most recent deployment of a project, or `None` when the project exists
+    /// but has never been deployed (a normal state, not an error).
     ///
-    /// A project with no deployments yet is a normal state (a fresh project, or
-    /// every list in the console asking about each project it shows), not a
-    /// missing resource. Only a project that does not exist is `NotFound`.
+    /// A project that does not exist (or was soft-deleted) is a
+    /// [`DeploymentError::NotFound`] naming the project, so callers can tell
+    /// "nothing deployed yet" apart from "wrong project id".
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
     ) -> Result<Option<Deployment>, DeploymentError> {
-        let Some(deployment_with_pipeline) = deployments::Entity::find()
+        // Check the project first: a soft-deleted project keeps its deployment
+        // rows, and must read as "not found" rather than returning them.
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "project {} not found",
+                project_id
+            )));
+        }
+
+        let Some(deployment) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
         else {
-            let project_exists = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .is_some();
-            return if project_exists {
-                Ok(None)
-            } else {
-                Err(DeploymentError::NotFound(format!(
-                    "project {} not found",
-                    project_id
-                )))
-            };
+            return Ok(None);
         };
-
-        let deployment = deployment_with_pipeline;
 
         // Check if this deployment is current for any environment
         let is_current = environments::Entity::find()
@@ -9516,6 +9517,69 @@ mod tests {
             .unwrap();
         assert_eq!(updated_deployment2.state, "stopped");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_distinguishes_empty_project_from_missing_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping get_last_deployment integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let service = create_deployment_service_for_test(db.clone());
+
+        // Project with a deployment -> Some(latest).
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let last = service
+            .get_last_deployment(project.id)
+            .await?
+            .expect("project with a deployment must return it");
+        assert_eq!(last.id, deployment.id);
+
+        // Project that exists but was never deployed -> Ok(None).
+        let empty_project = projects::ActiveModel {
+            name: Set("Never Deployed".to_string()),
+            slug: Set("never-deployed".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo-empty".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        assert!(service
+            .get_last_deployment(empty_project.id)
+            .await?
+            .is_none());
+
+        // A soft-deleted project keeps its deployment rows but reads as not found.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .expect("project exists")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.update(db.as_ref()).await?;
+        let result = service.get_last_deployment(project.id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {} not found", project.id)
+        ));
+
+        // Unknown project -> NotFound naming the project.
+        let missing_id = empty_project.id + 10_000;
+        let result = service.get_last_deployment(missing_id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {missing_id} not found")
+        ));
         Ok(())
     }
 

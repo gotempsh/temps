@@ -86,7 +86,6 @@ impl AuditOperation for WebhookAudit {
             CreateWebhookRequestBody,
             UpdateWebhookRequestBody,
             WebhookDeliveryResponse,
-            DeliveryRetryResult,
             EventTypeResponse,
         )
     ),
@@ -106,22 +105,6 @@ pub struct WebhooksApiDoc;
 // Request/Response Types
 // ============================================================================
 
-/// Outcome of a manual delivery retry. The retry is another attempt of the
-/// same delivery, so `delivery_id` is the id that was retried.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DeliveryRetryResult {
-    /// The delivery that was retried (unchanged by the retry).
-    pub delivery_id: i32,
-    /// Whether the receiver answered 2xx on this attempt.
-    pub success: bool,
-    /// HTTP status the receiver answered with, when it answered.
-    pub status_code: Option<u16>,
-    /// Why the attempt failed, when it did.
-    pub error_message: Option<String>,
-    /// Attempts made on this delivery, including this one.
-    pub attempt_number: i32,
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WebhookResponse {
     pub id: i32,
@@ -138,7 +121,17 @@ pub struct WebhookResponse {
 
 impl From<temps_entities::webhooks::Model> for WebhookResponse {
     fn from(webhook: temps_entities::webhooks::Model) -> Self {
-        let events: Vec<String> = serde_json::from_str(&webhook.events).unwrap_or_default();
+        // Subscriptions stored before event names were aligned use the legacy
+        // snake_case spelling; always report the canonical dotted name.
+        let events: Vec<String> = serde_json::from_str::<Vec<String>>(&webhook.events)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| {
+                WebhookEventType::from_str(&name)
+                    .map(|event_type| event_type.as_str().to_string())
+                    .unwrap_or(name)
+            })
+            .collect();
         Self {
             id: webhook.id,
             project_id: webhook.project_id,
@@ -181,7 +174,11 @@ pub struct UpdateWebhookRequestBody {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WebhookDeliveryResponse {
+    /// Id of this history row, i.e. of this single attempt.
     pub id: i32,
+    /// Stable identity of the delivery, identical for every attempt of it and
+    /// sent as the `X-Webhook-Delivery` header. Dedupe on this value.
+    pub delivery_id: i32,
     pub webhook_id: i32,
     pub event_type: String,
     pub event_id: String,
@@ -193,6 +190,7 @@ pub struct WebhookDeliveryResponse {
     // SECURITY: response_body field removed to prevent data exfiltration via SSRF
     // This prevents attackers from reading responses from internal services
     pub error_message: Option<String>,
+    /// 1-based attempt number within the delivery (sent as `X-Webhook-Attempt`).
     pub attempt_number: i32,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -201,8 +199,10 @@ pub struct WebhookDeliveryResponse {
 
 impl From<temps_entities::webhook_deliveries::Model> for WebhookDeliveryResponse {
     fn from(delivery: temps_entities::webhook_deliveries::Model) -> Self {
+        let delivery_id = delivery.stable_delivery_id();
         Self {
             id: delivery.id,
+            delivery_id,
             webhook_id: delivery.webhook_id,
             event_type: delivery.event_type,
             event_id: delivery.event_id,
@@ -727,15 +727,21 @@ async fn get_delivery(
     }
 }
 
-/// Retry a failed delivery
+/// Retry a delivery
+///
+/// Re-sends the stored payload and records the retry as the next attempt of the
+/// same delivery: `delivery_id` (and the `X-Webhook-Delivery` header) stay the
+/// same, `attempt_number` (and `X-Webhook-Attempt`) increases. `delivery_id` in
+/// the path may be the row id of any attempt of that delivery.
 #[utoipa::path(
     post,
     path = "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
     responses(
-        (status = 200, description = "Delivery retried", body = DeliveryRetryResult),
+        (status = 200, description = "Delivery retried", body = WebhookDeliveryResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Delivery not found"),
+        (status = 409, description = "A concurrent retry already holds this attempt; nothing was sent"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -766,26 +772,50 @@ async fn retry_delivery(
                 delivery_id, result.success
             );
 
-            let audit = WebhookAudit {
-                context: AuditContext {
-                    user_id: auth.user_id(),
-                    ip_address: Some(metadata.ip_address.clone()),
-                    user_agent: metadata.user_agent.clone(),
-                },
-                webhook_id,
-                action: "WEBHOOK_DELIVERY_RETRIED".to_string(),
-            };
-            if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-                error!("Failed to create audit log: {}", e);
+            // An attempt with a history row was sent, whether or not its
+            // outcome could be saved; one without was never sent.
+            if result.attempt_id != 0 {
+                let audit = WebhookAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    webhook_id,
+                    action: "WEBHOOK_DELIVERY_RETRIED".to_string(),
+                };
+                if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+                    error!("Failed to create audit log: {}", e);
+                }
             }
 
-            Ok(Json(DeliveryRetryResult {
-                delivery_id: result.delivery_id,
-                success: result.success,
-                status_code: result.status_code,
-                error_message: result.error_message,
-                attempt_number: result.attempt_number,
-            }))
+            // The response is the history row of the new attempt: same
+            // `delivery_id` as the delivery that was retried, next
+            // `attempt_number`.
+            match result.record {
+                Some(record) => Ok(Json(WebhookDeliveryResponse::from(record))),
+                None => {
+                    let cause = result
+                        .recording_error
+                        .or(result.error_message)
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    let detail = if result.attempt_id != 0 {
+                        format!(
+                            "Attempt {} of delivery {} for webhook {} was sent (success: {}) but its result could not be saved, so delivery history still shows it as pending: {}",
+                            result.attempt_number, delivery_id, webhook_id, result.success, cause
+                        )
+                    } else {
+                        format!(
+                            "Attempt {} of delivery {} for webhook {} could not be recorded and was not sent: {}",
+                            result.attempt_number, delivery_id, webhook_id, cause
+                        )
+                    };
+                    Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to retry delivery")
+                        .detail(detail)
+                        .build())
+                }
+            }
         }
         Err(e @ crate::service::WebhookError::DeliveryNotInScope { .. }) => {
             Err(retry_delivery_problem(e))
@@ -803,6 +833,12 @@ fn retry_delivery_problem(error: crate::service::WebhookError) -> Problem {
             ErrorBuilder::new(StatusCode::NOT_FOUND)
                 .title("Delivery not found")
                 .detail("Delivery does not exist in the requested project and webhook")
+                .build()
+        }
+        e @ crate::service::WebhookError::RetryInProgress { .. } => {
+            ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Retry already in progress")
+                .detail(e.to_string())
                 .build()
         }
         other => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1177,5 +1213,73 @@ mod retry_delivery_tests {
             assert!(!title_and_detail.contains("99"));
             assert!(!title_and_detail.contains("999"));
         }
+    }
+}
+
+#[cfg(test)]
+mod response_shape_tests {
+    use super::{WebhookDeliveryResponse, WebhookResponse};
+    use chrono::Utc;
+
+    #[allow(deprecated)]
+    fn attempt(
+        id: i32,
+        delivery_id: Option<i32>,
+        attempt_number: i32,
+    ) -> temps_entities::webhook_deliveries::Model {
+        temps_entities::webhook_deliveries::Model {
+            id,
+            webhook_id: 10,
+            event_type: "deployment.succeeded".to_string(),
+            event_id: "event-1".to_string(),
+            payload: "{}".to_string(),
+            success: false,
+            status_code: Some(500),
+            response_body: None,
+            error_message: None,
+            attempt_number,
+            delivery_id,
+            created_at: Utc::now(),
+            delivered_at: None,
+        }
+    }
+
+    #[test]
+    fn retry_attempt_reports_the_delivery_it_belongs_to() {
+        let first = WebhookDeliveryResponse::from(attempt(20, Some(20), 1));
+        let retry = WebhookDeliveryResponse::from(attempt(21, Some(20), 2));
+
+        assert_eq!(first.delivery_id, retry.delivery_id);
+        assert_eq!((first.id, first.attempt_number), (20, 1));
+        assert_eq!((retry.id, retry.attempt_number), (21, 2));
+    }
+
+    #[test]
+    fn row_without_a_recorded_delivery_id_is_its_own_delivery() {
+        let legacy = WebhookDeliveryResponse::from(attempt(7, None, 1));
+        assert_eq!(legacy.delivery_id, 7);
+    }
+
+    #[test]
+    fn subscriptions_are_reported_with_the_canonical_dotted_names() {
+        let model = temps_entities::webhooks::Model {
+            id: 1,
+            project_id: 1,
+            url: "https://example.com/hook".to_string(),
+            secret: None,
+            // One subscription stored before the names were aligned, one after,
+            // and one name this build does not know.
+            events: r#"["deployment_succeeded","deployment.failed","future.event"]"#.to_string(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let response = WebhookResponse::from(model);
+
+        assert_eq!(
+            response.events,
+            vec!["deployment.succeeded", "deployment.failed", "future.event"]
+        );
     }
 }

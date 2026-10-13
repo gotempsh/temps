@@ -4,8 +4,8 @@
 use super::types::{
     AcmeOrderResponse, CertStatusResponse, ChallengeError, ChallengeValidationStatus,
     CreateDomainRequest, DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState,
-    DomainChallengeResponse, DomainError, DomainResponse, HttpChallengeDebugResponse,
-    ListDomainsResponse, ListOnDemandCertsResponse, ListOrdersResponse,
+    DomainChallengeResponse, DomainError, DomainOrderResponse, DomainResponse,
+    HttpChallengeDebugResponse, ListDomainsResponse, ListOnDemandCertsResponse, ListOrdersResponse,
     ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
     RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
@@ -297,10 +297,12 @@ impl From<ProviderError> for Problem {
                 .title("Challenge Failed")
                 .detail(msg)
                 .build(),
-            ProviderError::OrderInvalid(msg) => ErrorBuilder::new(StatusCode::CONFLICT)
-                .title("ACME Order Rejected")
-                .detail(msg)
-                .build(),
+            error @ ProviderError::ChallengeInvalidated { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("ACME Challenge No Longer Valid")
+                    .detail(error.to_string())
+                    .build()
+            }
             ProviderError::ValidationFailed(msg) => ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .title("Validation Failed")
                 .detail(msg)
@@ -345,27 +347,10 @@ impl From<DomainServiceError> for Problem {
                 .title("Challenge Error")
                 .detail(msg)
                 .build(),
-            DomainServiceError::ChallengeRestarted {
-                domain,
-                challenge_type,
-                previous_error,
-                instructions,
-                txt_records,
-            } => {
-                let records: Vec<TxtRecord> = txt_records
-                    .into_iter()
-                    .map(|record| TxtRecord {
-                        name: record.name,
-                        value: record.value,
-                    })
-                    .collect();
+            error @ DomainServiceError::ChallengeInvalidated { .. } => {
                 ErrorBuilder::new(StatusCode::CONFLICT)
-                    .title("New Challenge Created")
-                    .detail(format!(
-                        "The previous ACME order for {domain} was rejected ({previous_error}) and cannot be retried. A new {challenge_type} order was created: {instructions}."
-                    ))
-                    .value("domain_status", "challenge_requested")
-                    .value("txt_records", records)
+                    .title("ACME Challenge No Longer Valid")
+                    .detail(error.to_string())
                     .build()
             }
             DomainServiceError::Tls(e) => Problem::from(e),
@@ -444,6 +429,7 @@ impl From<DomainServiceError> for Problem {
             ListDomainsResponse,
             DomainError,
             AcmeOrderResponse,
+            DomainOrderResponse,
             ListOrdersResponse,
             HttpChallengeDebugResponse,
             ChallengeValidationStatus,
@@ -1032,7 +1018,7 @@ async fn check_domain_status(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Domain or DNS provider permission denied"),
         (status = 404, description = "Domain or order not found"),
-        (status = 409, description = "The previous order was rejected by the CA and a new order was created (new TXT records in `txt_records` must be published, then verify again), or the certificate was issued but DNS cleanup requires operator action"),
+        (status = 409, description = "The ACME challenge was invalidated and cannot be retried (start a new order with POST /domains/{domain_id}/order), or the certificate was issued but DNS cleanup requires operator action"),
         (status = 502, description = "Certificate issued but DNS provider cleanup failed"),
         (status = 503, description = "Certificate issued but DNS provider service is unavailable"),
         (status = 500, description = "Internal server error")
@@ -2270,11 +2256,14 @@ async fn create_or_recreate_order(
 }
 
 /// Get ACME order for a domain
+///
+/// A domain without an ACME order (for example once its certificate is active)
+/// answers 200 with `order: null` and a `reason`; only an unknown domain is a 404.
 #[utoipa::path(
     get,
     path = "/domains/{domain_id}/order",
     responses(
-        (status = 200, description = "The current order, or `null` when the domain has none", body = Option<AcmeOrderResponse>),
+        (status = 200, description = "Order lookup result; `order` is null when the domain has no ACME order", body = DomainOrderResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Domain not found"),
         (status = 500, description = "Internal server error")
@@ -2296,26 +2285,29 @@ async fn get_domain_order(
 
     info!("Getting ACME order for domain ID: {}", domain_id);
 
-    let order = app_state
-        .repository
-        .find_acme_order_by_domain(domain_id)
-        .await?;
-    let Some(order) = order else {
-        // A domain with no order is a normal state — an active certificate has
-        // its order removed once issued, and the domain page asks regardless.
-        // Only a domain that does not exist is a 404.
-        let domain_exists = app_state
-            .domain_service
-            .get_domain_by_id(domain_id)
-            .await?
-            .is_some();
-        if !domain_exists {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+    let domain = app_state
+        .domain_service
+        .get_domain_by_id(domain_id)
+        .await?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
                 .title("Domain not found")
                 .detail(format!("Domain with ID {} not found", domain_id))
-                .build());
-        }
-        return Ok((StatusCode::OK, Json(Option::<AcmeOrderResponse>::None)));
+                .build()
+        })?;
+
+    let Some(order) = app_state
+        .repository
+        .find_acme_order_by_domain(domain_id)
+        .await?
+    else {
+        return Ok((
+            StatusCode::OK,
+            Json(DomainOrderResponse::without_order(
+                &domain.domain,
+                &domain.status,
+            )),
+        ));
     };
 
     // Convert order to response
@@ -2334,42 +2326,11 @@ async fn get_domain_order(
             response.challenge_validation = Some(challenge_status);
         }
     }
-    reconcile_order_with_live_challenge(&mut response);
 
-    Ok((StatusCode::OK, Json(Some(response))))
-}
-
-/// Order statuses an ACME order can still progress out of.
-const OPEN_ORDER_STATUSES: [&str; 3] = ["pending", "ready", "processing"];
-
-/// Report a challenge the CA has already invalidated as a failed order.
-///
-/// The stored order status only changes when Temps itself submits the
-/// challenge. A challenge the CA invalidated on its own (its validation window
-/// passed, or the attempt was driven from another path) would otherwise keep
-/// reading `pending` here — "challenge requested" forever — while the live
-/// state next to it says `invalid`. The live state is authoritative once the
-/// CA has given up, so surface it as the order's status and error.
-fn reconcile_order_with_live_challenge(order: &mut AcmeOrderResponse) {
-    let Some(live) = order.challenge_validation.as_ref() else {
-        return;
-    };
-    if live.status != "invalid" || !OPEN_ORDER_STATUSES.contains(&order.status.as_str()) {
-        return;
-    }
-    let detail = live.error.as_ref().map(|error| {
-        if error.detail.is_empty() {
-            error.error_type.clone()
-        } else {
-            format!("{}: {}", error.error_type, error.detail)
-        }
-    });
-    order.status = "invalid".to_string();
-    if order.error.is_none() {
-        order.error = Some(detail.unwrap_or_else(|| {
-            "The certificate authority marked the challenge invalid".to_string()
-        }));
-    }
+    Ok((
+        StatusCode::OK,
+        Json(DomainOrderResponse::with_order(response)),
+    ))
 }
 
 /// List all ACME orders
@@ -3475,88 +3436,52 @@ mod tests {
         assert!(ensure_dns_cleanup_permission(&test_auth(temps_auth::Role::Admin), true).is_ok());
     }
 
-    fn order_response(status: &str) -> AcmeOrderResponse {
-        AcmeOrderResponse {
-            id: 1,
-            order_url: "https://acme.test/order/1".to_string(),
-            domain_id: 1,
-            email: "ops@example.test".to_string(),
-            status: status.to_string(),
-            identifiers: serde_json::json!([]),
-            authorizations: None,
-            finalize_url: None,
-            certificate_url: None,
-            error: None,
-            error_type: None,
-            created_at: 0,
-            updated_at: 0,
-            expires_at: None,
-            challenge_validation: None,
-        }
-    }
-
-    fn live_challenge(status: &str, error: Option<ChallengeError>) -> ChallengeValidationStatus {
-        ChallengeValidationStatus {
-            challenge_type: "dns-01".to_string(),
-            url: "https://acme.test/chall/1".to_string(),
-            status: status.to_string(),
-            validated: None,
-            error,
-            token: "token-1".to_string(),
-        }
-    }
-
-    /// The order row only turns `invalid` when Temps submits the challenge
-    /// itself. A challenge the CA already invalidated must not read "pending"
-    /// (the page's "challenge requested") next to a live status of `invalid`.
-    #[test]
-    fn invalidated_live_challenge_is_reported_as_a_failed_order_with_its_error() {
-        let mut order = order_response("pending");
-        order.challenge_validation = Some(live_challenge(
-            "invalid",
-            Some(ChallengeError {
-                error_type: "urn:ietf:params:acme:error:unauthorized".to_string(),
-                detail: "No TXT record found at _acme-challenge.example.test".to_string(),
-                status: 403,
-            }),
-        ));
-
-        reconcile_order_with_live_challenge(&mut order);
-
-        assert_eq!(order.status, "invalid");
-        let error = order.error.expect("the CA's reason is surfaced");
-        assert!(error.contains("No TXT record found"), "{error}");
-    }
-
-    #[test]
-    fn live_reconciliation_leaves_healthy_and_already_final_orders_alone() {
-        let mut pending = order_response("pending");
-        pending.challenge_validation = Some(live_challenge("pending", None));
-        reconcile_order_with_live_challenge(&mut pending);
-        assert_eq!(pending.status, "pending");
-        assert!(pending.error.is_none());
-
-        let mut valid = order_response("valid");
-        valid.challenge_validation = Some(live_challenge("invalid", None));
-        reconcile_order_with_live_challenge(&mut valid);
-        assert_eq!(valid.status, "valid", "an issued order is never downgraded");
-
-        let mut recorded = order_response("invalid");
-        recorded.error = Some("recorded by Temps".to_string());
-        recorded.challenge_validation = Some(live_challenge("invalid", None));
-        reconcile_order_with_live_challenge(&mut recorded);
-        assert_eq!(recorded.error.as_deref(), Some("recorded by Temps"));
-
-        let mut unknown = order_response("pending");
-        reconcile_order_with_live_challenge(&mut unknown);
-        assert_eq!(unknown.status, "pending", "no live status, no change");
-    }
-
     #[test]
     fn active_domain_with_cleanup_receipt_retries_without_acme_reissuance() {
         assert!(should_retry_dns_cleanup_without_issuance("active", true));
         assert!(!should_retry_dns_cleanup_without_issuance("pending", true));
         assert!(!should_retry_dns_cleanup_without_issuance("active", false));
+    }
+
+    #[test]
+    fn invalidated_challenge_maps_to_conflict_that_names_the_new_order_endpoint() {
+        let problem = Problem::from(DomainServiceError::ChallengeInvalidated {
+            domain: "app.example.com".to_string(),
+            domain_id: 17,
+            order_url: "https://acme.example.test/order/9".to_string(),
+            detail: "no TXT record found".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("ACME Challenge No Longer Valid")
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("app.example.com"));
+        assert!(detail.contains("ID 17"));
+        assert!(detail.contains("https://acme.example.test/order/9"));
+        assert!(detail.contains("no TXT record found"));
+        assert!(detail.contains("POST /domains/17/order"));
+    }
+
+    #[test]
+    fn provider_level_invalidation_also_maps_to_conflict() {
+        let problem = Problem::from(ProviderError::ChallengeInvalidated {
+            domain: "app.example.com".to_string(),
+            order_url: "https://acme.example.test/order/9".to_string(),
+            detail: "authorization is Invalid".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("ACME Challenge No Longer Valid")
+        );
     }
 
     #[test]

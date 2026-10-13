@@ -64,6 +64,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import { projectLoadState } from '@/lib/project-load-state'
 import {
@@ -161,16 +162,19 @@ export function ProjectDetail() {
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
 
-  const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
+  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } = useQuery(
     {
       ...getLastDeploymentOptions({
         path: {
           id: project?.id || 0,
         },
       }),
+      select: selectLastDeployment,
       enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
-        const data = query.state.data
+        // `state.data` is the raw response; the deployment is `null` until the
+        // first deploy.
+        const data = query.state.data?.deployment
         // Poll more frequently for active deployments
         if (
           data &&
@@ -187,6 +191,9 @@ export function ProjectDetail() {
       refetchOnWindowFocus: true,
     }
   )
+  // The API answers 200 with `deployment: null` for a project that has never
+  // deployed; consumers take `undefined` for "nothing yet".
+  const lastDeployment = lastDeploymentOrNull ?? undefined
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({
@@ -609,7 +616,7 @@ export function ProjectDetail() {
             repository?.clone_url || project.git_url || undefined
           }
           repositoryProviderType={repositoryProviderType}
-          lastDeployment={lastDeployment ?? undefined}
+          lastDeployment={lastDeployment}
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
@@ -674,7 +681,7 @@ export function ProjectDetail() {
                 element={
                   <ProjectOverview
                     project={project}
-                    lastDeployment={lastDeployment ?? undefined}
+                    lastDeployment={lastDeployment}
                   />
                 }
               />

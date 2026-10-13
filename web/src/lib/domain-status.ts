@@ -29,3 +29,41 @@ export const CERT_SERVING_STATUSES: readonly string[] = [
 export function isServingCert(status: string | null | undefined): boolean {
   return !!status && CERT_SERVING_STATUSES.includes(status)
 }
+
+/**
+ * ACME order states (RFC 8555) that can never lead to a certificate: the order
+ * was cancelled, or the CA invalidated/revoked/deactivated it. Nothing can be
+ * re-submitted on such an order; a new one has to be created.
+ */
+export const TERMINAL_ORDER_STATUSES: readonly string[] = [
+  'cancelled',
+  'canceled',
+  'invalid',
+  'revoked',
+  'deactivated',
+]
+
+/** True when an ACME order in `status` can no longer be finalized. */
+export function isTerminalOrderStatus(
+  status: string | null | undefined
+): boolean {
+  return !!status && TERMINAL_ORDER_STATUSES.includes(status)
+}
+
+/**
+ * What "Retry" means for a failed domain.
+ *
+ * - `verify`: the ACME challenge is still open (e.g. the lookup timed out), so
+ *   asking the CA to check it again is meaningful.
+ * - `new-order`: there is no order, or the CA already invalidated it. Verifying
+ *   again would only resubmit a dead challenge ("Cannot update challenge with
+ *   status invalid"), so the retry must create a new order with new DNS/HTTP
+ *   challenge values.
+ */
+export type FailedRetryAction = 'verify' | 'new-order'
+
+export function failedRetryAction(
+  order: { status: string } | null | undefined
+): FailedRetryAction {
+  return !order || isTerminalOrderStatus(order.status) ? 'new-order' : 'verify'
+}

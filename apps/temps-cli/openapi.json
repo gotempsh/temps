@@ -3553,6 +3553,13 @@
               "null"
             ]
           },
+          "blob": {
+            "$ref": "#/components/schemas/BlobSettings",
+            "default": {
+              "container_name": ""
+            },
+            "description": "Managed Blob service (RustFS container) settings. Owned by\n`PATCH /blob/settings`; the generic settings update preserves the\nstored value."
+          },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "default": {
@@ -3704,6 +3711,13 @@
               "string",
               "null"
             ]
+          },
+          "kv": {
+            "$ref": "#/components/schemas/KvSettings",
+            "default": {
+              "container_name": ""
+            },
+            "description": "Managed KV service (Redis container) settings. Owned by\n`PATCH /kv/settings`; the generic settings update preserves the stored\nvalue."
           },
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings",
@@ -6087,6 +6101,18 @@
           "size",
           "uploadedAt"
         ],
+        "type": "object"
+      },
+      "BlobSettings": {
+        "description": "Settings of the managed Blob service (the RustFS container behind `/blob`).\n\nSame reasoning as [`KvSettings`]: the container is named\n`rustfs-<service name>`.",
+        "properties": {
+          "container_name": {
+            "default": "",
+            "description": "Docker container name of the Blob RustFS container. Empty means the\nper-instance default. A custom value must start with `rustfs-`.",
+            "example": "rustfs-temps-blob-staging",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "BlobStatusResponse": {
@@ -13940,6 +13966,23 @@
         ],
         "type": "object"
       },
+      "CustomDomainLookupResponse": {
+        "description": "Result of looking a hostname up among the custom domains the caller can see.\n\n\"Not assigned to any project\" is a normal state for a certificate that has\nnot been attached yet, so it is expressed as `custom_domain: null` with a\n200 rather than a 404. A hostname that belongs to a project the caller\ncannot see is deliberately reported the same way.",
+        "properties": {
+          "custom_domain": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CustomDomainResponse",
+                "description": "The matching assignment, or `null` when the hostname is not assigned to\na project environment visible to the caller."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CustomDomainRequest": {
         "properties": {
           "branch": {
@@ -14975,47 +15018,6 @@
         ],
         "type": "object"
       },
-      "DeliveryRetryResult": {
-        "description": "Outcome of a manual delivery retry. The retry is another attempt of the\nsame delivery, so `delivery_id` is the id that was retried.",
-        "properties": {
-          "attempt_number": {
-            "description": "Attempts made on this delivery, including this one.",
-            "format": "int32",
-            "type": "integer"
-          },
-          "delivery_id": {
-            "description": "The delivery that was retried (unchanged by the retry).",
-            "format": "int32",
-            "type": "integer"
-          },
-          "error_message": {
-            "description": "Why the attempt failed, when it did.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status_code": {
-            "description": "HTTP status the receiver answered with, when it answered.",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "success": {
-            "description": "Whether the receiver answered 2xx on this attempt.",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "delivery_id",
-          "success",
-          "attempt_number"
-        ],
-        "type": "object"
-      },
       "DeliveryRoutingPlan": {
         "properties": {
           "custom_domain_id": {
@@ -15701,7 +15703,7 @@
           "route_activation",
           "registry_unavailable",
           "image_pull_failed",
-          "build_context_path_missing",
+          "dockerfile_copy_not_found",
           "unknown"
         ],
         "type": "string"
@@ -18671,6 +18673,30 @@
           "message",
           "code"
         ],
+        "type": "object"
+      },
+      "DomainOrderResponse": {
+        "description": "Result of looking up the ACME order of a domain.\n\nHaving no order is a normal state (the certificate is already issued, or no\norder has been started yet), so it is reported as `order: null` with a\n`reason` and a 200 instead of a 404. Only an unknown domain is a 404.",
+        "properties": {
+          "order": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AcmeOrderResponse",
+                "description": "The ACME order, or `null` when the domain has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "description": "Why there is no order. Present only when `order` is `null`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "DomainPlan": {
@@ -29622,6 +29648,18 @@
         ],
         "type": "object"
       },
+      "KvSettings": {
+        "description": "Settings of the managed KV service (the Redis container behind `/kv`).\n\nThe Docker container is named `redis-<service name>`, so two Temps\ninstances sharing one Docker daemon collide unless each has its own name.\nAn unset value follows the per-instance default (the pre-existing\n`redis-temps-kv` for an install that already enabled KV, a name derived\nfrom this instance otherwise).",
+        "properties": {
+          "container_name": {
+            "default": "",
+            "description": "Docker container name of the KV Redis container. Empty means the\nper-instance default. A custom value must start with `redis-`.",
+            "example": "redis-temps-kv-staging",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "KvStatusResponse": {
         "description": "Response for KV service status",
         "properties": {
@@ -29654,6 +29692,23 @@
           "enabled",
           "healthy"
         ],
+        "type": "object"
+      },
+      "LastDeploymentResponse": {
+        "description": "Most recent deployment of a project.\n\nA project that has never been deployed is a normal state, so it is\nreported as `deployment: null` with a 200 instead of a 404.",
+        "properties": {
+          "deployment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentResponse",
+                "description": "The most recent deployment, or `null` when the project exists but has\nno deployments yet."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
         "type": "object"
       },
       "LatestDeploymentMediaResponse": {
@@ -31345,6 +31400,42 @@
           "unavailable"
         ],
         "type": "string"
+      },
+      "ManagedContainerNameSettings": {
+        "description": "Response of the container-name settings endpoints.",
+        "properties": {
+          "container_name": {
+            "description": "Docker container the service runs in on this instance.",
+            "example": "redis-temps-kv-3fa91c07",
+            "type": "string"
+          },
+          "custom": {
+            "description": "Whether an operator-chosen name is saved.",
+            "type": "boolean"
+          },
+          "default_container_name": {
+            "description": "The container an empty setting resolves to: the pre-existing fixed\nname when this install already enabled the service, otherwise a name\nderived from this instance.",
+            "example": "redis-temps-kv-3fa91c07",
+            "type": "string"
+          },
+          "in_use": {
+            "description": "Whether the service already exists. The name cannot change then:\ndelete the service first.",
+            "type": "boolean"
+          },
+          "required_prefix": {
+            "description": "Every container name for this service must start with this.",
+            "example": "redis-",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_name",
+          "default_container_name",
+          "custom",
+          "in_use",
+          "required_prefix"
+        ],
+        "type": "object"
       },
       "ManagedDomainResponse": {
         "description": "Managed domain response",
@@ -42401,6 +42492,35 @@
         ],
         "type": "object"
       },
+      "PublicUrlStatus": {
+        "description": "Whether published status pages have an address people can open.\n\nFollows the capability-endpoint pattern: an unconfigured install answers\nwith `configured: false`, a reason and the console path that fixes it,\nrather than a made-up URL.",
+        "properties": {
+          "configured": {
+            "description": "`true` when `public_url` is present on the page.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why there is no public URL, or why the one there will not open from\noutside this network (for example a loopback address). `None` when\nnothing is known to be wrong.",
+            "example": "Public URL is not configured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path where the operator sets it. Present whenever `reason` is.",
+            "example": "/settings#public-ingress",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
       "PurgeLogsRequest": {
         "properties": {
           "before": {
@@ -52525,23 +52645,22 @@
             "type": "integer"
           },
           "public_json_url": {
-            "description": "Machine-readable form of the public page; relative in the same case as\n`public_url`.",
-            "type": "string"
-          },
-          "public_url": {
-            "description": "Public HTML page. Serves 404 while the page is unpublished. An absolute\nURL, or — while `public_url_configured` is `false` — a path relative to\nthe console origin (`/api/status/<slug>`).",
-            "type": "string"
-          },
-          "public_url_configured": {
-            "description": "`false` when no public or external URL is configured: the links above\nare then relative to the console and only work where the console is\nreachable. Configure a public URL so customers can open the page.",
-            "type": "boolean"
-          },
-          "public_url_setup_path": {
-            "description": "Console path where the public URL is configured; set only while\n`public_url_configured` is `false`.",
+            "description": "Machine-readable form of the public page. `None` exactly when\n`public_url` is.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "public_url": {
+            "description": "Public HTML page. Serves 404 while the page is unpublished. `None`\nwhen this install has no public address to build it from; see\n`public_url_status` for why and where to fix it. Temps never invents a\nhost for it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_url_status": {
+            "$ref": "#/components/schemas/PublicUrlStatus",
+            "description": "Whether `public_url` exists, and if not (or if it will not open from\noutside this network) what to do about it."
           },
           "published_at": {
             "format": "date-time",
@@ -52568,9 +52687,7 @@
           "title",
           "slug",
           "is_published",
-          "public_url",
-          "public_json_url",
-          "public_url_configured",
+          "public_url_status",
           "monitors",
           "created_at",
           "updated_at"
@@ -57153,6 +57270,20 @@
         ],
         "type": "object"
       },
+      "UpdateManagedContainerName": {
+        "description": "Request body of the container-name settings endpoints.",
+        "properties": {
+          "container_name": {
+            "description": "New container name. Empty resets to the per-instance default. Must\nstart with the service's prefix (`redis-` for KV, `rustfs-` for Blob).",
+            "example": "redis-temps-kv-staging",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_name"
+        ],
+        "type": "object"
+      },
       "UpdateManagedDomainApiRequest": {
         "description": "Request to update a managed domain's settings.",
         "properties": {
@@ -60896,6 +61027,7 @@
       "WebhookDeliveryResponse": {
         "properties": {
           "attempt_number": {
+            "description": "1-based attempt number within the delivery (sent as `X-Webhook-Attempt`).",
             "format": "int32",
             "type": "integer"
           },
@@ -60911,6 +61043,11 @@
               "null"
             ]
           },
+          "delivery_id": {
+            "description": "Stable identity of the delivery, identical for every attempt of it and\nsent as the `X-Webhook-Delivery` header. Dedupe on this value.",
+            "format": "int32",
+            "type": "integer"
+          },
           "error_message": {
             "type": [
               "string",
@@ -60924,6 +61061,7 @@
             "type": "string"
           },
           "id": {
+            "description": "Id of this history row, i.e. of this single attempt.",
             "format": "int32",
             "type": "integer"
           },
@@ -60954,6 +61092,7 @@
         },
         "required": [
           "id",
+          "delivery_id",
           "webhook_id",
           "event_type",
           "event_id",
@@ -75269,7 +75408,14 @@
             "description": "Unauthorized"
           },
           "409": {
-            "description": "A Docker resource this service needs already exists on the host and is not owned by this instance"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Blob container name is already taken on this Docker host by something that is not this instance's Blob service. Set a unique blob.container_name via PATCH /blob/settings"
           },
           "500": {
             "description": "Internal server error"
@@ -75281,6 +75427,106 @@
           }
         ],
         "summary": "Enable Blob service",
+        "tags": [
+          "Blob Management"
+        ]
+      }
+    },
+    "/blob/settings": {
+      "get": {
+        "description": "Returns the Docker container the Blob service runs in on this instance, the\ndefault an empty setting resolves to, and whether the name can still be\nchanged (it cannot once the service exists).",
+        "operationId": "blob_get_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedContainerNameSettings"
+                }
+              }
+            },
+            "description": "Blob container-name settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the Blob container-name setting",
+        "tags": [
+          "Blob Management"
+        ]
+      },
+      "patch": {
+        "description": "Several Temps instances sharing one Docker daemon each need their own Blob\ncontainer. The default is already unique per instance; set a name here to\nchoose it yourself. Must start with `rustfs-`; an empty value restores the\ndefault. Refused with 409 while the Blob service exists: renaming its\ncontainer would orphan the data, so delete the service first.",
+        "operationId": "blob_update_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateManagedContainerName"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedContainerNameSettings"
+                }
+              }
+            },
+            "description": "Container name saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The container name is not one Docker and Temps accept"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Blob service already exists, so its container cannot be renamed"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set the Blob container name",
         "tags": [
           "Blob Management"
         ]
@@ -78181,6 +78427,7 @@
         ]
       },
       "get": {
+        "description": "A domain without an ACME order (for example once its certificate is active)\nanswers 200 with `order: null` and a `reason`; only an unknown domain is a 404.",
         "operationId": "get_domain_order",
         "parameters": [
           {
@@ -78199,18 +78446,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/AcmeOrderResponse"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/DomainOrderResponse"
                 }
               }
             },
-            "description": "The current order, or `null` when the domain has none"
+            "description": "Order lookup result; `order` is null when the domain has no ACME order"
           },
           "401": {
             "description": "Unauthorized"
@@ -78319,7 +78559,7 @@
             "description": "Domain or order not found"
           },
           "409": {
-            "description": "The previous order was rejected by the CA and a new order was created (new TXT records in `txt_records` must be published, then verify again), or the certificate was issued but DNS cleanup requires operator action"
+            "description": "The ACME challenge was invalidated and cannot be retried (start a new order with POST /domains/{domain_id}/order), or the certificate was issued but DNS cleanup requires operator action"
           },
           "500": {
             "description": "Internal server error"
@@ -84547,7 +84787,7 @@
             "description": "List of containers"
           },
           "400": {
-            "description": "The path is not a container of this data source's hierarchy"
+            "description": "Path is deeper than this data source's container hierarchy (the container has no child containers; list its entities instead)"
           },
           "401": {
             "description": "Unauthorized"
@@ -84626,6 +84866,9 @@
             },
             "description": "Paginated list of entities"
           },
+          "400": {
+            "description": "Path is not a valid container for this data source"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -84691,6 +84934,9 @@
               }
             },
             "description": "Entity details"
+          },
+          "400": {
+            "description": "Path is not a valid container for this data source"
           },
           "401": {
             "description": "Unauthorized"
@@ -85008,6 +85254,9 @@
               }
             },
             "description": "Container information"
+          },
+          "400": {
+            "description": "Path is not a valid container for this data source"
           },
           "401": {
             "description": "Unauthorized"
@@ -89842,7 +90091,14 @@
             "description": "Unauthorized"
           },
           "409": {
-            "description": "A Docker resource this service needs already exists on the host and is not owned by this instance"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The KV container name is already taken on this Docker host by something that is not this instance's KV service. Set a unique kv.container_name via PATCH /kv/settings"
           },
           "500": {
             "description": "Internal server error"
@@ -90066,6 +90322,106 @@
         "summary": "Set a value with optional expiration",
         "tags": [
           "KV Store"
+        ]
+      }
+    },
+    "/kv/settings": {
+      "get": {
+        "description": "Returns the Docker container the KV service runs in on this instance, the\ndefault an empty setting resolves to, and whether the name can still be\nchanged (it cannot once the service exists).",
+        "operationId": "kv_get_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedContainerNameSettings"
+                }
+              }
+            },
+            "description": "KV container-name settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the KV container-name setting",
+        "tags": [
+          "KV Management"
+        ]
+      },
+      "patch": {
+        "description": "Several Temps instances sharing one Docker daemon each need their own KV\ncontainer. The default is already unique per instance; set a name here to\nchoose it yourself. Must start with `redis-`; an empty value restores the\ndefault. Refused with 409 while the KV service exists: renaming its\ncontainer would orphan the data, so delete the service first.",
+        "operationId": "kv_update_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateManagedContainerName"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedContainerNameSettings"
+                }
+              }
+            },
+            "description": "Container name saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The container name is not one Docker and Temps accept"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The KV service already exists, so its container cannot be renamed"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set the KV container name",
+        "tags": [
+          "KV Management"
         ]
       }
     },
@@ -101023,6 +101379,7 @@
     },
     "/projects/custom-domains/by-host/{hostname}": {
       "get": {
+        "description": "A hostname that is not assigned to a project (or is assigned to a project\nthe caller cannot see) is a normal state, so it answers 200 with\n`custom_domain: null` rather than a 404.",
         "operationId": "get_visible_custom_domain_by_hostname",
         "parameters": [
           {
@@ -101040,18 +101397,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/CustomDomainResponse"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/CustomDomainLookupResponse"
                 }
               }
             },
-            "description": "Custom domain assignment, or `null` when the hostname is not assigned to a project"
+            "description": "Lookup result; `custom_domain` is null when the hostname is not assigned to a visible project"
+          },
+          "400": {
+            "description": "Hostname is not a valid domain name"
           },
           "401": {
             "description": "Unauthorized"
@@ -101515,6 +101868,7 @@
     },
     "/projects/{id}/last-deployment": {
       "get": {
+        "description": "A project that exists but has never been deployed answers 200 with\n`deployment: null`; only an unknown project is a 404.",
         "operationId": "get_last_deployment",
         "parameters": [
           {
@@ -101533,18 +101887,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/DeploymentResponse"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/LastDeploymentResponse"
                 }
               }
             },
-            "description": "Last deployment details, or `null` when the project has not been deployed yet"
+            "description": "Last deployment, or `deployment: null` when the project has no deployments yet"
           },
           "404": {
             "description": "Project not found"
@@ -104156,6 +104503,57 @@
       }
     },
     "/projects/{project_id}/alarms/{alarm_id}/silence": {
+      "delete": {
+        "operationId": "unsilenceAlarm",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alarm ID",
+            "in": "path",
+            "name": "alarm_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alarm unsilenced (or it was not silenced)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alarm not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Lift an alarm's silence before it expires, so the next breach of the same\nalert notifies again.",
+        "tags": [
+          "Alarms"
+        ]
+      },
       "post": {
         "operationId": "silenceAlarm",
         "parameters": [
@@ -119083,6 +119481,7 @@
     },
     "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry": {
       "post": {
+        "description": "Re-sends the stored payload and records the retry as the next attempt of the\nsame delivery: `delivery_id` (and the `X-Webhook-Delivery` header) stay the\nsame, `attempt_number` (and `X-Webhook-Attempt`) increases. `delivery_id` in\nthe path may be the row id of any attempt of that delivery.",
         "operationId": "retry_delivery",
         "parameters": [
           {
@@ -119121,7 +119520,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeliveryRetryResult"
+                  "$ref": "#/components/schemas/WebhookDeliveryResponse"
                 }
               }
             },
@@ -119136,6 +119535,9 @@
           "404": {
             "description": "Delivery not found"
           },
+          "409": {
+            "description": "A concurrent retry already holds this attempt; nothing was sent"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -119145,7 +119547,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Retry a failed delivery",
+        "summary": "Retry a delivery",
         "tags": [
           "Webhook Deliveries"
         ],
@@ -125852,6 +126254,47 @@
       }
     },
     "/system/alarms/{alarm_id}/silence": {
+      "delete": {
+        "operationId": "unsilenceSystemAlarm",
+        "parameters": [
+          {
+            "description": "Alarm ID",
+            "in": "path",
+            "name": "alarm_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alarm unsilenced (or it was not silenced)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alarm not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Lift a system alarm's silence before it expires.",
+        "tags": [
+          "Alarms"
+        ]
+      },
       "post": {
         "operationId": "silenceSystemAlarm",
         "parameters": [
@@ -127225,6 +127668,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -127270,7 +127716,7 @@
             "description": "Unauthorized or current password is incorrect"
           },
           "403": {
-            "description": "Only an interactive browser session can manage MFA"
+            "description": "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"
           },
           "409": {
             "description": "MFA is already enabled; verify and disable it before re-enrollment"
@@ -127311,6 +127757,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"
           },
           "500": {
             "description": "Internal server error"

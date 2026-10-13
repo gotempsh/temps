@@ -192,6 +192,14 @@ pub struct ParamSpec {
     /// `SchemaType`; defaults to "string" when the schema is absent or
     /// is a `$ref` (the full schema is not resolved here — Phase 2).
     pub ty: String,
+    /// Item type of an `"array"` body parameter (same vocabulary as `ty`:
+    /// "string", "integer", "number", "boolean", "array", "object", or "any").
+    /// `None` for non-arrays and for arrays whose item schema is unknown.
+    /// Request bodies are the only place arrays are modelled: a CLI token has
+    /// no intrinsic type, so without this `--environment_ids 15` was sent as
+    /// the scalar `15` (or the string `"15"`) where the API wants `[15]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_ty: Option<String>,
     /// Enum variants if the parameter schema declares them.  Empty when the
     /// parameter accepts any value.
     pub enum_values: Vec<String>,
@@ -758,10 +766,19 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         // them before extracting their type; treating a string enum as an opaque
         // object makes the CLI tell the model to JSON-encode a value that the API
         // actually expects as a plain string.
-        let (mut ty, enum_values) = match deref_schema(prop_schema, openapi) {
+        let resolved_prop = deref_schema(prop_schema, openapi);
+        let (mut ty, enum_values) = match resolved_prop {
             Some(schema) => extract_schema_type_and_enum(schema),
             None => ("string".to_string(), vec![]),
         };
+        // `Vec<T>` / `Option<Vec<T>>` fields are `Schema::Array`, which the
+        // generic extractor above does not understand (it reports "string").
+        // Typing them as arrays is what lets the CLI wrap a bare `15` into
+        // `[15]` and coerce each item to the declared item type.
+        let item_ty = resolved_prop.and_then(|schema| array_item_type(schema, openapi));
+        if item_ty.is_some() {
+            ty = "array".to_string();
+        }
         let object_shape =
             resolve_object_shape(prop_schema, openapi).filter(ObjectShape::is_informative);
         // A resolved object shape is authoritative even when utoipa encodes it
@@ -791,12 +808,50 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
             location: ParamLocation::Body,
             required,
             ty,
+            item_ty,
             enum_values,
             description,
             object_shape,
         });
     }
     params
+}
+
+/// When `schema` is an array — or a nullable wrapper around exactly one array,
+/// which is how `Option<Vec<T>>` may be encoded — return the item type in the
+/// short vocabulary of [`ParamSpec::ty`]. `None` for anything that is not an
+/// array.
+fn array_item_type(schema: &Schema, openapi: &utoipa::openapi::OpenApi) -> Option<String> {
+    use utoipa::openapi::schema::ArrayItems;
+    match schema {
+        Schema::Array(array) => Some(match &array.items {
+            ArrayItems::RefOrSchema(item) => match deref_schema(item, openapi) {
+                Some(Schema::Array(_)) => "array".to_string(),
+                Some(item_schema) => match extract_schema_type_and_enum(item_schema).0.as_str() {
+                    // An item that does not resolve to a typed scalar/object.
+                    "null" => "any".to_string(),
+                    ty => ty.to_string(),
+                },
+                None => "any".to_string(),
+            },
+            ArrayItems::False => "any".to_string(),
+        }),
+        Schema::OneOf(one_of) => {
+            let mut non_null = one_of.items.iter().filter(|item| {
+                !matches!(
+                    deref_schema(item, openapi),
+                    Some(Schema::Object(o)) if schema_type_to_string(&o.schema_type) == "null"
+                )
+            });
+            match (non_null.next(), non_null.next()) {
+                (Some(only), None) => {
+                    deref_schema(only, openapi).and_then(|inner| array_item_type(inner, openapi))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Resolve a body property's schema into an [`ObjectShape`], if it names one.
@@ -959,6 +1014,7 @@ fn build_param_spec(param: &utoipa::openapi::path::Parameter) -> Option<ParamSpe
         location,
         required,
         ty,
+        item_ty: None,
         enum_values,
         description: param.description.clone(),
         // Path/query params are scalars in this API; only body fields carry
@@ -981,13 +1037,6 @@ pub(crate) fn extract_type_and_enum(schema: Option<&RefOr<Schema>>) -> (String, 
 }
 
 fn extract_schema_type_and_enum(schema: &Schema) -> (String, Vec<String>) {
-    // A `Vec<T>` field is its own schema kind (`Schema::Array`), not a
-    // `Schema::Object`. Falling through to the "string" default below told the
-    // model to pass `--environment_ids 15`, which the CLI then sent as a JSON
-    // string and the API rejected ("expected a sequence").
-    if matches!(schema, Schema::Array(_)) {
-        return ("array".to_string(), vec![]);
-    }
     let Schema::Object(obj) = schema else {
         return ("string".to_string(), vec![]);
     };
@@ -1996,82 +2045,6 @@ mod tests {
         );
     }
 
-    /// A `Vec<T>` body field must be indexed as an `array`.
-    ///
-    /// `Schema::Array` is not a `Schema::Object`, so the type extractor used to
-    /// fall through to its "string" default and the help advertised
-    /// `--environment_ids <string>` — the CLI then sent `"15"` for a field the
-    /// API deserializes as a sequence, and every variable-create failed with
-    /// `invalid type: string "15", expected a sequence`.
-    #[test]
-    fn vec_body_fields_are_indexed_as_arrays() {
-        use utoipa::openapi::{
-            request_body::RequestBodyBuilder, schema::ComponentsBuilder, ContentBuilder,
-        };
-
-        #[derive(utoipa::ToSchema)]
-        #[allow(dead_code)]
-        struct CreateVariableBody {
-            key: String,
-            environment_ids: Vec<i32>,
-            include_in_preview: Option<Vec<String>>,
-        }
-
-        let components = ComponentsBuilder::new()
-            .schema(
-                "CreateVariableBody",
-                <CreateVariableBody as utoipa::PartialSchema>::schema(),
-            )
-            .build();
-        let create_variable = OperationBuilder::new()
-            .operation_id(Some("create_environment_variable"))
-            .tag("Projects")
-            .request_body(Some(
-                RequestBodyBuilder::new()
-                    .content(
-                        "application/json",
-                        ContentBuilder::new()
-                            .schema(Some(RefOr::Ref(
-                                utoipa::openapi::schema::Ref::from_schema_name(
-                                    "CreateVariableBody",
-                                ),
-                            )))
-                            .build(),
-                    )
-                    .build(),
-            ))
-            .build();
-        let mut item = PathItem::default();
-        item.post = Some(create_variable);
-        let api = OpenApiBuilder::new()
-            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
-            .paths(PathsBuilder::new().path("/variables", item).build())
-            .components(Some(components))
-            .build();
-
-        let index =
-            ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_environment_variable"]);
-        let op = index
-            .get("create_environment_variable")
-            .expect("write op indexed");
-        let ty_of = |name: &str| {
-            op.params
-                .iter()
-                .find(|p| p.name == name)
-                .unwrap_or_else(|| panic!("param {name} indexed"))
-                .ty
-                .clone()
-        };
-
-        assert_eq!(ty_of("key"), "string");
-        assert_eq!(ty_of("environment_ids"), "array");
-        assert_eq!(
-            ty_of("include_in_preview"),
-            "array",
-            "a nullable array is still an array"
-        );
-    }
-
     #[test]
     fn safe_posts_are_indexed_with_post_method_and_body_params() {
         let api = write_test_openapi();
@@ -2134,5 +2107,105 @@ mod tests {
             0,
             "PATCH/DELETE must be structurally unreachable from the read index"
         );
+    }
+
+    fn array_body_openapi() -> utoipa::openapi::OpenApi {
+        serde_json::from_value(serde_json::json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/projects/{project_id}/env-vars": {
+                    "post": {
+                        "operationId": "create_environment_variable",
+                        "tags": ["Projects"],
+                        "parameters": [{
+                            "name": "project_id", "in": "path", "required": true,
+                            "schema": { "type": "integer", "format": "int32" }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": { "schema": {
+                                "$ref": "#/components/schemas/CreateEnvVarRequest"
+                            }}}
+                        },
+                        "responses": { "201": { "description": "created" } }
+                    }
+                }
+            },
+            "components": { "schemas": {
+                "LogLevel": { "type": "string", "enum": ["info", "error"] },
+                "CreateEnvVarRequest": {
+                    "type": "object",
+                    "required": ["key", "environment_ids"],
+                    "properties": {
+                        "key": { "type": "string" },
+                        "environment_ids": {
+                            "type": "array",
+                            "items": { "type": "integer", "format": "int32" }
+                        },
+                        "labels": {
+                            "type": ["array", "null"],
+                            "items": { "type": "string" }
+                        },
+                        "levels": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/LogLevel" }
+                        },
+                        "nullable_ids": {
+                            "oneOf": [
+                                { "type": "null" },
+                                { "type": "array", "items": { "type": "integer" } }
+                            ]
+                        },
+                        "matrix": {
+                            "type": "array",
+                            "items": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "include_in_preview": { "type": "boolean" }
+                    }
+                }
+            }}
+        }))
+        .expect("test OpenAPI document parses")
+    }
+
+    #[test]
+    fn body_array_fields_are_typed_as_arrays_with_their_item_type() {
+        let api = array_body_openapi();
+        let index =
+            ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_environment_variable"]);
+        let op = index
+            .get("create_environment_variable")
+            .expect("operation is indexed");
+        let param = |name: &str| {
+            op.params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("param {name} missing"))
+        };
+
+        let ids = param("environment_ids");
+        assert_eq!(ids.ty, "array");
+        assert_eq!(ids.item_ty.as_deref(), Some("integer"));
+        assert!(ids.required);
+
+        // `Option<Vec<String>>` encoded as a `["array", "null"]` type union.
+        assert_eq!(param("labels").ty, "array");
+        assert_eq!(param("labels").item_ty.as_deref(), Some("string"));
+
+        // A `$ref`'d string enum item is a string on the wire.
+        assert_eq!(param("levels").item_ty.as_deref(), Some("string"));
+
+        // `Option<Vec<T>>` encoded as `oneOf: [null, array]`.
+        assert_eq!(param("nullable_ids").ty, "array");
+        assert_eq!(param("nullable_ids").item_ty.as_deref(), Some("integer"));
+
+        assert_eq!(param("matrix").item_ty.as_deref(), Some("array"));
+
+        // Scalars are untouched.
+        assert_eq!(param("key").ty, "string");
+        assert_eq!(param("key").item_ty, None);
+        assert_eq!(param("include_in_preview").ty, "boolean");
+        assert_eq!(param("include_in_preview").item_ty, None);
     }
 }

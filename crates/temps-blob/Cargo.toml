@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 # Internal crates
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
 temps-database = { path = "../temps-database" }
 temps-providers = { path = "../temps-providers" }

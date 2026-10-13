@@ -43,7 +43,12 @@ use utoipa::ToSchema;
 /// v4: a worker refusing a build's inputs (build arguments, registry
 /// credentials, cache imports) is a configuration failure, not an invalid
 /// Dockerfile.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 4;
+///
+/// v5: a failed build is never reported as a missing built image (that code is
+/// reserved for a build that succeeded and then lost its image), and a
+/// Dockerfile `COPY`/`ADD` of a path that is not in the build context gets its
+/// own code, `dockerfile_copy_not_found`.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 5;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -174,10 +179,10 @@ pub enum DeploymentFailureCode {
     RegistryUnavailable,
     /// Pulling the deploy image failed for a reason not covered above.
     ImagePullFailed,
-    // ── v4 ──────────────────────────────────────────────────────────────
-    /// A `COPY`/`ADD` instruction names a file or directory that is not in
-    /// the build context (or in the stage it copies from).
-    BuildContextPathMissing,
+    // ── v5 ──────────────────────────────────────────────────────────────
+    /// A Dockerfile `COPY`/`ADD` names a path that is not in the build
+    /// context.
+    DockerfileCopyNotFound,
     Unknown,
 }
 
@@ -230,7 +235,7 @@ impl DeploymentFailureCode {
             Self::RouteActivation => "route_activation",
             Self::RegistryUnavailable => "registry_unavailable",
             Self::ImagePullFailed => "image_pull_failed",
-            Self::BuildContextPathMissing => "build_context_path_missing",
+            Self::DockerfileCopyNotFound => "dockerfile_copy_not_found",
             Self::Unknown => "unknown",
         }
     }
@@ -283,7 +288,7 @@ impl DeploymentFailureCode {
         Self::RouteActivation,
         Self::RegistryUnavailable,
         Self::ImagePullFailed,
-        Self::BuildContextPathMissing,
+        Self::DockerfileCopyNotFound,
         Self::Unknown,
     ];
 }
@@ -489,11 +494,6 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "The image produced by the build was not found when deploying. Redeploy to rebuild it; if it keeps happening, check disk space and image retention settings.",
             Some(S::Deploy),
         ),
-        C::BuildContextPathMissing => (
-            "File missing from the build context",
-            "A COPY or ADD instruction in the Dockerfile names a path that is not in the build context. Uploaded archives and git checkouts never include node_modules, .git, environment files or anything listed in .dockerignore, so a Dockerfile that copies them fails. Remove that instruction, or create the directory inside the build (for example by running the install step in the Dockerfile).",
-            Some(S::Build),
-        ),
         C::StaticOutputMissing => (
             "Build output not found",
             "The build finished but the expected output directory was not produced. Set the correct output directory in the build settings (for example dist or build).",
@@ -634,6 +634,11 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "The image this deployment runs could not be pulled from its registry. Check the image reference and tag, add registry credentials if the image is private, then redeploy.",
             Some(S::Source),
         ),
+        C::DockerfileCopyNotFound => (
+            "Dockerfile COPY source not found",
+            "A COPY or ADD instruction in the Dockerfile names a path that is not in the build context, so the build stopped before an image existed. The failing path is the one quoted in the build error (see cancelled_reason or the build_image log). Check its spelling relative to the build context and that it is not excluded by .dockerignore. Uploaded sources never include node_modules, .git, environment files or OS metadata: install dependencies inside the Dockerfile (RUN npm ci) instead of copying them, and put secrets in the environment's variables.",
+            Some(S::Build),
+        ),
         C::Unknown => (
             "Deployment failed",
             "Temps could not classify this failure. Open the failed stage below for the full error and logs; sending the failure report helps improve this message.",
@@ -672,6 +677,31 @@ fn registry_refused_credentials(r: &str) -> bool {
         ],
     );
     refusal && (token_step || r.contains("401 unauthorized"))
+}
+
+/// The path BuildKit reports as missing in a `COPY`/`ADD`:
+/// `failed to calculate checksum of ref ...: "/node_modules": not found`
+/// yields `/node_modules`. Handles reasons that were Debug-escaped (`\"`) as
+/// well as plain text. `None` when the text is not in that shape.
+fn buildkit_missing_path(lower: &str) -> Option<&str> {
+    let marker = [
+        "failed to calculate checksum",
+        "failed to compute cache key",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min()?;
+    let tail = &lower[marker..];
+    // Current daemons print `"<path>": not found`; older ones (Docker 20.10
+    // era, still found on self-hosted workers) print `"<path>" not found: not
+    // found`. Take whichever closes the quoted path first.
+    let end = ["\": not found", "\" not found"]
+        .iter()
+        .filter_map(|closing| tail.find(closing))
+        .min()?;
+    let quoted = tail[..end].trim_end_matches('\\');
+    let start = quoted.rfind('"')?;
+    Some(quoted[start + 1..].trim_end_matches('\\'))
 }
 
 /// Extract the id of the required job that failed, e.g. `build_image` from
@@ -802,38 +832,6 @@ fn timeout_limit_seconds(lower: &str) -> Option<u64> {
 /// Elapsed time stated in a timeout message: "waited 312s".
 fn elapsed_seconds(lower: &str) -> Option<u64> {
     number_after(lower, "waited ")
-}
-
-/// The quoted path of a BuildKit `failed to compute cache key` /
-/// `failed to calculate checksum` error: the `"<path>"` right before the
-/// `not found`. `None` when the text is not that error.
-///
-/// Two daemon generations word it differently, and self-hosted workers still
-/// run both:
-/// - current: `... of ref abc: "/node_modules": not found`
-/// - older (Docker 20.10 era): `failed to compute cache key: "/app/dist" not
-///   found: not found`
-fn buildkit_missing_path(lower: &str) -> Option<String> {
-    // The failure text is often a Debug-quoted string, which escapes the quotes
-    // around the path (`\"/node_modules\": not found`).
-    let text = lower.replace("\\\"", "\"");
-    let phrase_at = [
-        "failed to calculate checksum",
-        "failed to compute cache key",
-    ]
-    .iter()
-    .filter_map(|phrase| text.find(phrase))
-    .min()?;
-    let after_phrase = &text[phrase_at..];
-    // The closing quote of the path is followed by `: not found` (current) or
-    // ` not found` (older); take whichever comes first.
-    let closing_quote_at = ["\": not found", "\" not found"]
-        .iter()
-        .filter_map(|marker| after_phrase.find(marker))
-        .min()?;
-    let before = &after_phrase[..closing_quote_at];
-    let opening_quote = before.rfind('"')?;
-    Some(before[opening_quote + 1..].to_string())
 }
 
 /// Preserve the pre-taxonomy `reason` wire value exactly for existing
@@ -1350,27 +1348,32 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     ) {
         return make(S::Build, C::CompileError);
     }
-    // BuildKit's COPY of a path that does not exist:
-    // `failed to compute cache key: failed to calculate checksum of ref ...:
-    // "/app/dist": not found`. What the path *is* decides the cause, so key on
-    // the quoted missing path itself rather than on `/app/` appearing anywhere in
-    // the text (a Dockerfile excerpt with `COPY . /app/` would otherwise claim
-    // every such failure):
-    //
-    // - Generated images build under /app, so a missing absolute /app path is a
-    //   build output that was never produced (`COPY --from=builder /app/dist`
-    //   after a build that wrote to `build/`).
-    // - Anything else is a context-relative file the build context does not
-    //   contain (`node_modules`, an ignored file, a misspelt name) — the user's
-    //   Dockerfile, not a missing image.
-    //
-    // Checked before the generic Dockerfile and "image ... not found" rules,
-    // which the same text also matches (the failed job is `build_image`).
-    if let Some(missing_path) = buildkit_missing_path(r) {
-        return if missing_path.starts_with("/app/") {
+    // BuildKit's COPY/ADD of a path that is not there: `failed to compute
+    // cache key: failed to calculate checksum of ref ...: "<path>": not found`.
+    // The kind of path decides the cause. Generated images build under /app, so
+    // an absolute /app path is a build stage's output that the build never
+    // produced (e.g. `COPY --from=builder /app/dist ...` after a build that
+    // wrote to `build/`). Any other path is a COPY/ADD source that is not in
+    // the build context (something the upload leaves out, a typo, a
+    // .dockerignore entry). Either way the build failed, so this runs before
+    // the generic Dockerfile and "image ... not found" rules, which the same
+    // text also matches.
+    if contains_any(
+        r,
+        &[
+            "failed to calculate checksum",
+            "failed to compute cache key",
+        ],
+    ) && r.contains("not found")
+    {
+        let is_build_output = match buildkit_missing_path(r) {
+            Some(path) => path.starts_with("/app/"),
+            None => r.contains("/app/"),
+        };
+        return if is_build_output {
             make(S::Build, C::StaticOutputMissing)
         } else {
-            make(S::Build, C::BuildContextPathMissing)
+            make(S::Build, C::DockerfileCopyNotFound)
         };
     }
     if r.contains("dockerfile")
@@ -1400,7 +1403,20 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             make(S::Image, C::BaseImagePull)
         };
     }
-    if r.contains("image") && contains_any(r, &["not found", "missing", "no such image"]) {
+    // `ImageMissing` means the build finished and the image was gone
+    // afterwards. A build that failed says "not found" about a build input
+    // (a COPY source, a base image), and the word "image" appears in its
+    // own prefix ("Failed to build image: ..."), so it needs an explicit
+    // sign that the produced image itself is what is missing.
+    let build_failed = phase == Some(JobPhase::Build) || r.contains("failed to build image");
+    // "No such image" is the daemon talking about whichever image it was asked
+    // for. During a build that is a base image, not the one just produced, so
+    // only the explicit "built image not found" counts there.
+    let built_image_gone = r.contains("built image not found");
+    if r.contains("image")
+        && contains_any(r, &["not found", "missing", "no such image"])
+        && (built_image_gone || !build_failed)
+    {
         return make(S::Image, C::ImageMissing);
     }
     if contains_any(
@@ -1705,62 +1721,172 @@ mod tests {
         );
     }
 
-    /// A `COPY` of a path the build context does not contain (uploads strip
-    /// `node_modules`) failed the `build_image` job. It was reported as
-    /// "Built image missing — check disk space" because the job name and
-    /// "not found" matched the generic missing-image rule.
+    /// BuildKit's report for `COPY node_modules ./` in an upload, whose
+    /// bundle never contains `node_modules`.
+    const COPY_NODE_MODULES: &str = "Failed to build image: Build failed: Docker stream error: Dockerfile:6\n--------------------\n   4 |     WORKDIR /app\n   5 |     COPY package.json ./\n   6 | >>> COPY node_modules ./\n   7 |     COPY . .\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3c1f::q8m2: \"/node_modules\": not found";
+
     #[test]
-    fn copy_of_a_path_missing_from_the_build_context_is_not_a_missing_image() {
+    fn copy_of_a_path_missing_from_the_bundle_is_a_build_failure_not_a_missing_image() {
+        // The bug: the words "image" (from "Failed to build image") and
+        // "not found" matched the generic missing-image rule.
+        let reason = wrapped("build_image", COPY_NODE_MODULES);
+        assert_class(&reason, S::Build, C::DockerfileCopyNotFound);
+
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert_eq!(info.code.as_str(), "dockerfile_copy_not_found");
+        assert_eq!(info.failed_job.as_deref(), Some("build_image"));
+        assert_eq!(info.settings_section, Some(FailureSettingsSection::Build));
+        assert!(info.title.contains("COPY"), "{}", info.title);
+        assert!(
+            info.remediation.contains("build context") && info.remediation.contains("node_modules"),
+            "{}",
+            info.remediation
+        );
+        assert!(
+            !info.remediation.contains("disk space"),
+            "{}",
+            info.remediation
+        );
+        // The raw BuildKit line stays in the stored reason the API returns
+        // next to the classification.
+        assert!(reason.contains("node_modules"));
+    }
+
+    #[test]
+    fn copy_not_found_is_recognised_in_plain_and_escaped_reasons() {
+        let plain = "Failed to build image: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/requirements.txt\": not found";
+        assert_class(plain, S::Build, C::DockerfileCopyNotFound);
+        assert_class(
+            &wrapped("build_image", plain),
+            S::Build,
+            C::DockerfileCopyNotFound,
+        );
+        // Nothing wraps it in a failed-job envelope at all.
+        assert_class(
+            "failed to calculate checksum of ref x: \"/dist\": not found",
+            S::Build,
+            C::DockerfileCopyNotFound,
+        );
+    }
+
+    #[test]
+    fn a_dockerfile_excerpt_naming_app_does_not_turn_a_context_miss_into_missing_output() {
+        // Only the failing path decides: `/app/` in the *destination* of the
+        // COPY shown in the excerpt must not make this a build-output problem.
         let reason = wrapped(
             "build_image",
-            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3c1f::q8m2: \"/node_modules\": not found",
+            "Failed to build image: Dockerfile:5\n--------------------\n   5 | >>> COPY vendor /app/vendor\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/vendor\": not found",
         );
-        assert_class(&reason, S::Build, C::BuildContextPathMissing);
+        assert_class(&reason, S::Build, C::DockerfileCopyNotFound);
 
-        let with_dockerfile_excerpt = wrapped(
+        // A missing path under /app is still the stage output.
+        let output = wrapped(
             "build_image",
-            "Failed to build image: Dockerfile:6\n--------------------\n   6 | >>> COPY node_modules ./node_modules\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/node_modules\": not found",
+            "Failed to build image: Dockerfile:9\n--------------------\n   9 | >>> COPY --from=builder /app/dist /srv\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/app/dist\": not found",
         );
-        assert_class(
-            &with_dockerfile_excerpt,
-            S::Build,
-            C::BuildContextPathMissing,
-        );
+        assert_class(&output, S::Build, C::StaticOutputMissing);
+    }
 
-        // Older BuildKit daemons word the same failure as `"<path>" not
-        // found: not found`; both the output and the context-file cases must
-        // still be classified, not fall through to the generic image rule.
-        let old_format_output = wrapped(
+    #[test]
+    fn older_buildkit_wording_is_classified_like_the_current_one() {
+        let context_file = wrapped(
             "build_image",
-            "Failed to build image: failed to solve: failed to compute cache key: \"/app/dist\" not found: not found",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: \"/requirements.txt\" not found: not found",
         );
-        assert_class(&old_format_output, S::Build, C::StaticOutputMissing);
-        let old_format_context = wrapped(
+        assert_class(&context_file, S::Build, C::DockerfileCopyNotFound);
+
+        let output = wrapped(
             "build_image",
-            "Failed to build image: failed to solve: failed to compute cache key: \"/node_modules\" not found: not found",
+            "Failed to build image: Dockerfile:9\n   9 | >>> COPY --from=builder /app/dist /srv\nERROR: failed to solve: failed to compute cache key: \"/app/dist\" not found: not found",
         );
-        assert_class(&old_format_context, S::Build, C::BuildContextPathMissing);
+        assert_class(&output, S::Build, C::StaticOutputMissing);
+    }
 
-        // A `/app/` anywhere in the excerpt (WORKDIR, a COPY destination) must
-        // not turn a missing context file into "build output not found".
-        let excerpt_mentions_app = wrapped(
+    #[test]
+    fn buildkit_missing_path_extracts_the_quoted_source() {
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to compute cache key: failed to calculate checksum of ref a: \"/node_modules\": not found"
+            ),
+            Some("/node_modules")
+        );
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to calculate checksum of ref a: \\\"/app/dist\\\": not found"
+            ),
+            Some("/app/dist")
+        );
+        // Older daemons close the quoted path with `" not found: not found`.
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to compute cache key: \"/app/dist\" not found: not found"
+            ),
+            Some("/app/dist")
+        );
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to calculate checksum of ref a: \\\"/node_modules\\\" not found: not found"
+            ),
+            Some("/node_modules")
+        );
+        assert_eq!(buildkit_missing_path("COPY node_modules ./"), None);
+        assert_eq!(
+            buildkit_missing_path("failed to compute cache key: no quoted path here: not found"),
+            None
+        );
+    }
+
+    #[test]
+    fn other_failed_builds_are_never_reported_as_a_missing_image() {
+        for inner in [
+            "Failed to build image: Build failed: failed to solve: process \"/bin/sh -c npm run build\" did not complete successfully: exit code: 1",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: process \"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 1\nERROR: no matching distribution found for example-lib",
+            "Failed to build image for linux/amd64: the builder reported a missing layer for the build image cache",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: rpc error: code = Unknown desc = no builder instance found",
+            "Failed to build image: Build failed: Docker stream error: No such image: registry.example.test/base:1.0",
+        ] {
+            let reason = wrapped("build_image", inner);
+            let got = classify_failure_reason(Some(&reason));
+            assert_ne!(got.code, C::ImageMissing, "reason: {inner}");
+            assert_eq!(got.stage, S::Build, "reason: {inner}");
+        }
+    }
+
+    #[test]
+    fn a_build_error_reaching_the_failure_summary_names_the_build_not_disk_space() {
+        let reason = wrapped(
             "build_image",
-            "Failed to build image: Dockerfile:9\n--------------------\n   9 | >>> COPY node_modules /app/node_modules\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/node_modules\": not found",
+            "Failed to build image: Build failed: failed to solve: process \"/bin/sh -c make release\" did not complete successfully: exit code: 2",
         );
-        assert_class(&excerpt_mentions_app, S::Build, C::BuildContextPathMissing);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert_eq!(info.stage, S::Build);
+        assert_eq!(info.code, C::BuildError);
+        assert!(!info.remediation.contains("disk space"));
+    }
 
-        let guidance = guidance_for(C::BuildContextPathMissing);
-        assert!(
-            !guidance.remediation.contains("disk space"),
-            "a build-context error must not send the user to check disk space"
+    #[test]
+    fn a_built_image_that_is_gone_afterwards_is_still_a_missing_image() {
+        // The builder finished and then could not find what it just built.
+        let built = wrapped(
+            "build_image",
+            "Failed to build image: Built image not found",
         );
+        assert_class(&built, S::Image, C::ImageMissing);
+        let info = describe_failure(Some(&built)).unwrap();
+        assert!(info.remediation.contains("disk space"));
 
-        // A genuinely missing built image keeps its classification.
-        let image = wrapped(
+        // Docker no longer has the image when the deploy job needs it.
+        let deploy = wrapped(
+            "deploy_container",
+            "Failed to deploy container: No such image: app:2f9c1e",
+        );
+        assert_class(&deploy, S::Image, C::ImageMissing);
+
+        let untouched = wrapped(
             "deploy_container",
             "Failed to deploy container: image 'app:latest' not found",
         );
-        assert_class(&image, S::Image, C::ImageMissing);
+        assert_class(&untouched, S::Image, C::ImageMissing);
     }
 
     #[test]

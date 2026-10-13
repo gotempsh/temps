@@ -7,8 +7,49 @@ import {
   domainStateLabel,
   parseMonitorSpec,
   parseMonitorSpecs,
-  resolveLink,
+  publicUrlLabel,
+  publicUrlNote,
 } from './index.js'
+
+describe('public URL display', () => {
+  const unconfigured = {
+    public_url: null,
+    public_url_status: {
+      configured: false,
+      reason: 'Public URL is not configured.',
+      setup_path: '/settings#public-ingress',
+    },
+  }
+
+  test('prints the URL when there is one', () => {
+    expect(
+      publicUrlLabel({
+        public_url: 'https://temps.example.com/api/status/abc',
+        public_url_status: { configured: true },
+      }),
+    ).toBe('https://temps.example.com/api/status/abc')
+  })
+
+  test('says "not configured" instead of printing a made-up address', () => {
+    expect(publicUrlLabel(unconfigured)).toBe('not configured')
+    expect(publicUrlLabel({})).toBe('not configured')
+  })
+
+  test('explains an unconfigured URL and where to fix it', () => {
+    const note = publicUrlNote(unconfigured)
+    expect(note).toContain('Public URL is not configured.')
+    expect(note).toContain('/settings#public-ingress')
+  })
+
+  test('has nothing to say when the URL is fine', () => {
+    expect(
+      publicUrlNote({
+        public_url: 'https://temps.example.com/api/status/abc',
+        public_url_status: { configured: true, reason: null, setup_path: null },
+      }),
+    ).toBeNull()
+  })
+})
 
 describe('parseMonitorSpec', () => {
   test('parses <id>=<public name>', () => {
@@ -65,34 +106,5 @@ describe('domainNextStep', () => {
     expect(domainNextStep({ status: 'renewal_pending', verification_method: 'dns-01' })).toContain('domains verify')
     expect(domainNextStep({ status: 'renewal_failed', verification_method: 'http-01' })).toContain('domains renew')
     expect(domainNextStep({ status: 'pending', verification_method: 'http-01' })).toContain('domains verify')
-  })
-})
-
-describe('resolveLink', () => {
-  test('resolves a console-relative link against the instance URL', () => {
-    expect(resolveLink('/api/status/abc123', 'https://temps.example.test')).toBe(
-      'https://temps.example.test/api/status/abc123',
-    )
-  })
-
-  test('keeps the port of the instance URL', () => {
-    expect(resolveLink('/api/status/abc123/summary.json', 'http://localhost:3000')).toBe(
-      'http://localhost:3000/api/status/abc123/summary.json',
-    )
-  })
-
-  test('an instance URL that already carries /api does not double the prefix', () => {
-    expect(resolveLink('/api/status/abc123', 'https://temps.example.test/api')).toBe(
-      'https://temps.example.test/api/status/abc123',
-    )
-  })
-
-  test('leaves an absolute public URL untouched', () => {
-    const url = 'https://status.example.test/api/status/abc123'
-    expect(resolveLink(url, 'https://temps.example.test')).toBe(url)
-  })
-
-  test('returns the relative link when the instance URL cannot be a base', () => {
-    expect(resolveLink('/api/status/abc123', 'not a url')).toBe('/api/status/abc123')
   })
 })

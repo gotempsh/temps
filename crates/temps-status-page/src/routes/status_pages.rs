@@ -1330,9 +1330,15 @@ mod tests {
         let page = create_page(&fx, api_selection(&fx)).await;
         assert_eq!(page.slug.len(), SLUG_LEN);
         assert!(!page.is_published);
-        assert!(page
-            .public_url
-            .ends_with(&format!("/api/status/{}", page.slug)));
+        // The fixture install has neither `external_url` nor
+        // `public_ingress_url`: no address is invented, the page says why.
+        assert_eq!(page.public_url, None);
+        assert_eq!(page.public_json_url, None);
+        assert!(!page.public_url_status.configured);
+        assert_eq!(
+            page.public_url_status.setup_path.as_deref(),
+            Some("/settings#public-ingress")
+        );
         assert_eq!(page.monitors[0].monitor_name, SELECTED_INTERNAL_NAME);
 
         // Draft pages are not served.

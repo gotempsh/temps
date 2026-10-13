@@ -25,11 +25,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { resolvePublicUrl } from './public-url'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -53,7 +51,6 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  ExternalLink,
   Eye,
   EyeOff,
   MoreVertical,
@@ -66,6 +63,7 @@ import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { StatusPageStateBadge } from './ProjectStatusPages'
 import { StatusPageDomains } from './StatusPageDomains'
+import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageIncidents } from './StatusPageIncidents'
 import {
   formDefaults,
@@ -82,53 +80,6 @@ function DetailSkeleton() {
       <Skeleton className="h-20 w-full" />
       <Skeleton className="h-64 w-full" />
     </div>
-  )
-}
-
-function PublicLinkSection({ page }: { page: StatusPageResponse }) {
-  const publicUrl = resolvePublicUrl(page.public_url, window.location.origin)
-  return (
-    <section className="space-y-2">
-      <h3 className="text-lg font-semibold">Public link</h3>
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
-        <code className="min-w-0 truncate rounded-md border bg-muted px-3 py-2 text-sm">
-          {publicUrl}
-        </code>
-        <div className="flex gap-2">
-          <CopyButton value={publicUrl} variant="outline" size="sm">
-            Copy
-          </CopyButton>
-          {page.is_published && (
-            <Button variant="outline" size="sm" asChild>
-              <a href={publicUrl} target="_blank" rel="noreferrer">
-                <ExternalLink className="size-4 sm:mr-2" />
-                <span className="hidden sm:inline">Open</span>
-              </a>
-            </Button>
-          )}
-        </div>
-      </div>
-      <p className="text-sm text-muted-foreground">
-        {page.is_published
-          ? 'Anyone with this link can see the page. Unpublish or rotate the link to revoke access immediately. Search engines are asked not to index it.'
-          : 'This link returns “not found” until you publish the page.'}{' '}
-        A machine-readable version is at{' '}
-        <code className="text-xs">…/summary.json</code>.
-      </p>
-      {!page.public_url_configured && (
-        <p className="text-sm text-amber-700 dark:text-amber-400">
-          No public URL is configured, so this link uses the console address and
-          only works where the console is reachable.{' '}
-          <Link
-            to={page.public_url_setup_path ?? '/settings'}
-            className="font-medium underline underline-offset-4"
-          >
-            Set the external URL
-          </Link>{' '}
-          so customers can open the page.
-        </p>
-      )}
-    </section>
   )
 }
 

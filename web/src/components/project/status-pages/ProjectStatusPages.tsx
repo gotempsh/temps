@@ -9,7 +9,6 @@ import {
 import type { ProjectResponse, StatusPageResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
@@ -46,9 +45,9 @@ import { Globe, Plus } from 'lucide-react'
 import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link, useNavigate } from 'react-router'
+import { PublicLinkCell } from './StatusPagePublicLink'
 import { toast } from 'sonner'
 import * as z from 'zod'
-import { resolvePublicUrl } from './public-url'
 import { MAX_TITLE_CHARS, operationQueries } from './status-page-form'
 
 const createSchema = z.object({
@@ -262,23 +261,7 @@ export function ProjectStatusPages({ project }: { project: ProjectResponse }) {
                   {page.monitors.length}
                 </TableCell>
                 <TableCell className="hidden md:table-cell">
-                  {page.is_published ? (
-                    <CopyButton
-                      value={resolvePublicUrl(
-                        page.public_url,
-                        window.location.origin
-                      )}
-                      variant="ghost"
-                      size="sm"
-                      label="Copy public link"
-                    >
-                      Copy link
-                    </CopyButton>
-                  ) : (
-                    <span className="text-sm text-muted-foreground">
-                      Not public
-                    </span>
-                  )}
+                  <PublicLinkCell page={page} />
                 </TableCell>
                 <TableCell className="hidden text-muted-foreground lg:table-cell">
                   {formatDistanceToNow(new Date(page.created_at), {

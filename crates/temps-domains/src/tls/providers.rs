@@ -4,8 +4,9 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
-    HttpClient, Identifier, NewAccount, NewOrder, Order, OrderStatus,
+    Account, AccountCredentials, AuthorizationState, AuthorizationStatus,
+    ChallengeType as AcmeChallengeType, HttpClient, Identifier, NewAccount, NewOrder, Order,
+    OrderStatus,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde_json;
@@ -684,7 +685,11 @@ impl LetsEncryptProvider {
         })
     }
 
-    async fn wait_for_order_ready(&self, order: &mut Order) -> Result<(), ProviderError> {
+    async fn wait_for_order_ready(
+        &self,
+        order: &mut Order,
+        domain: &str,
+    ) -> Result<(), ProviderError> {
         const MAX_ATTEMPTS: u8 = 6;
         const BASE_DELAY_SECS: u64 = 1;
         const MAX_DELAY_SECS: u64 = 30;
@@ -720,7 +725,11 @@ impl LetsEncryptProvider {
                         )
                     };
                     error!("{}", error_msg);
-                    return Err(ProviderError::OrderInvalid(error_msg));
+                    return Err(ProviderError::ChallengeInvalidated {
+                        domain: domain.to_string(),
+                        order_url: order.url().to_string(),
+                        detail: error_msg,
+                    });
                 }
                 _ => {
                     if attempt < MAX_ATTEMPTS {
@@ -749,13 +758,9 @@ impl LetsEncryptProvider {
         )))
     }
 
-    /// Per-challenge ACME error details (type + detail) of one authorization,
-    /// joined into a single human-readable string; empty when the CA attached
-    /// none.
-    fn authorization_error_detail(
-        identifier: &str,
-        authorization: &instant_acme::AuthorizationState,
-    ) -> String {
+    /// Render the per-challenge ACME errors (type + detail) recorded on one
+    /// authorization as a single string; empty when none carries an error.
+    fn challenge_error_summary(identifier: &str, authorization: &AuthorizationState) -> String {
         authorization
             .challenges
             .iter()
@@ -785,16 +790,9 @@ impl LetsEncryptProvider {
             match result {
                 Ok(handle) => {
                     let identifier = handle.identifier().to_string();
-                    for challenge in handle.challenges.iter() {
-                        if let Some(err) = challenge.error.as_ref() {
-                            parts.push(format!(
-                                "[{} {:?}] {}: {}",
-                                identifier,
-                                challenge.r#type,
-                                err.r#type.as_deref().unwrap_or("(no type)"),
-                                err.detail.as_deref().unwrap_or("(no detail)")
-                            ));
-                        }
+                    let summary = Self::challenge_error_summary(&identifier, &handle);
+                    if !summary.is_empty() {
+                        parts.push(summary);
                     }
                 }
                 Err(e) => parts.push(format!("failed to fetch authorization: {}", e)),
@@ -924,6 +922,23 @@ impl CertificateProvider for LetsEncryptProvider {
         debug!("Loading existing ACME order from URL: {}", order_url);
         let mut order = acme_account.order(order_url.clone()).await?;
 
+        // An order the ACME server already marked invalid can never be
+        // finalized, and its challenges can no longer be set ready. Fail with
+        // a typed error up front instead of letting the server reject the
+        // challenge update with an opaque "cannot update challenge" message.
+        if order.state().status == OrderStatus::Invalid {
+            let detail = self.collect_authorization_errors(&mut order).await;
+            return Err(ProviderError::ChallengeInvalidated {
+                domain: domain.to_string(),
+                order_url: order_url.clone(),
+                detail: if detail.is_empty() {
+                    "the ACME server reports the order as invalid".to_string()
+                } else {
+                    detail
+                },
+            });
+        }
+
         // 0.8.5: `Order::set_challenge_ready(url)` was removed. Instead, drive the
         // `Authorizations` stream, obtain the `ChallengeHandle` for the requested
         // type on each (still-pending) authorization, and call `set_ready()` on it
@@ -956,24 +971,24 @@ impl CertificateProvider for LetsEncryptProvider {
                     continue;
                 }
 
-                // Only a pending authorization can still be answered. One the
-                // CA already invalidated (the previous attempt's TXT record
-                // or token was not there) stays invalid, and asking to set its
-                // challenge ready fails with an opaque "Cannot update
-                // challenge with status invalid". Say what happened instead,
-                // and let the caller start a new order.
+                // A non-pending authorization cannot be re-submitted. Invalid
+                // (validation already failed), expired, revoked and
+                // deactivated are all terminal on the ACME side.
                 if handle.status != AuthorizationStatus::Pending {
                     let identifier = handle.identifier().to_string();
                     let status = handle.status;
-                    let detail = Self::authorization_error_detail(&identifier, &handle);
-                    let message = if detail.is_empty() {
-                        format!(
-                            "Authorization for {identifier} is {status:?}; the certificate authority will not accept another attempt on this order"
-                        )
-                    } else {
-                        format!("Authorization for {identifier} is {status:?}: {detail}")
-                    };
-                    return Err(ProviderError::OrderInvalid(message));
+                    let mut detail = Self::challenge_error_summary(&identifier, &handle);
+                    if detail.is_empty() {
+                        detail = format!(
+                            "authorization for {} is {:?} on the ACME server",
+                            identifier, status
+                        );
+                    }
+                    return Err(ProviderError::ChallengeInvalidated {
+                        domain: domain.to_string(),
+                        order_url: order_url.clone(),
+                        detail,
+                    });
                 }
 
                 let mut challenge =
@@ -1003,7 +1018,7 @@ impl CertificateProvider for LetsEncryptProvider {
         }
 
         // Wait for validation
-        self.wait_for_order_ready(&mut order).await?;
+        self.wait_for_order_ready(&mut order, domain).await?;
 
         // Generate certificate, stamping the real challenge type (ADR-041 §7a b).
         let challenge_type_str = match challenge_data.challenge_type {

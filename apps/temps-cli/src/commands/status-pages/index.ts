@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
-import { config, requireAuth } from '../../config/store.js'
+import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listStatusPages,
@@ -83,6 +83,35 @@ export function parseMonitorSpec(spec: string): StatusPageMonitorInput | string 
   return { monitor_id: id, display_name: name }
 }
 
+/** The part of a status page that says whether it has a public address. */
+export interface PublicUrlFields {
+  public_url?: string | null
+  public_url_status?: {
+    configured: boolean
+    reason?: string | null
+    setup_path?: string | null
+  } | null
+}
+
+/** The page's public URL, or a plain statement that there is none. */
+export function publicUrlLabel(page: PublicUrlFields): string {
+  return page.public_url ? page.public_url : 'not configured'
+}
+
+/**
+ * Explanation to print under a page whose public URL is missing or will not
+ * open from outside the network, or `null` when nothing is wrong. Points at
+ * the console path that fixes it; the CLI never invents a URL.
+ */
+export function publicUrlNote(page: PublicUrlFields): string | null {
+  const status = page.public_url_status
+  if (!status || !status.reason) return null
+  const fix = status.setup_path
+    ? ` Fix it in the console: ${status.setup_path}`
+    : ''
+  return `${status.reason}${fix}`
+}
+
 export function parseMonitorSpecs(
   specs: string[] | undefined,
 ): StatusPageMonitorInput[] | string {
@@ -104,35 +133,18 @@ function parseId(value: string, what: string): number | null {
   return id
 }
 
-/**
- * Until a public or external URL is configured the API returns links relative
- * to the console (`/api/status/<slug>`). Resolve them against the instance this
- * CLI talks to, so they can be opened. An absolute URL is returned unchanged,
- * and so is a relative one when `apiUrl` cannot be used as a base.
- */
-export function resolveLink(url: string, apiUrl: string): string {
-  if (!url.startsWith('/')) {
-    return url
-  }
-  try {
-    return new URL(url, apiUrl).toString()
-  } catch {
-    return url
-  }
-}
-
 function printPage(page: StatusPageResponse): void {
   newline()
   header(`${icons.info} ${page.title}`)
   keyValue('ID', page.id)
   keyValue('State', page.is_published ? colors.success('published') : colors.muted('draft'))
-  keyValue('Public URL', resolveLink(page.public_url, config.get('apiUrl')))
-  keyValue('JSON', resolveLink(page.public_json_url, config.get('apiUrl')))
-  if (!page.public_url_configured) {
-    warning(
-      'No public URL is configured, so these links use the console address and only work '
-      + `where the console is reachable. Set the external URL in the console (${page.public_url_setup_path ?? '/settings'}).`,
-    )
+  keyValue('Public URL', publicUrlLabel(page))
+  if (page.public_json_url) {
+    keyValue('JSON', page.public_json_url)
+  }
+  const urlNote = publicUrlNote(page)
+  if (urlNote) {
+    warning(urlNote)
   }
   if (page.published_at) {
     keyValue('Published', formatDate(page.published_at))
@@ -427,9 +439,14 @@ export function registerStatusPagesCommands(program: Command): void {
         { header: 'Title', key: 'title', color: (v) => colors.bold(v) },
         { header: 'State', accessor: (p) => (p.is_published ? 'published' : 'draft') },
         { header: 'Monitors', accessor: (p) => String(p.monitors.length) },
-        { header: 'Public URL', accessor: (p) => (p.is_published ? resolveLink(p.public_url, config.get('apiUrl')) : '-') },
+        { header: 'Public URL', accessor: (p) => (p.is_published ? publicUrlLabel(p) : '-') },
       ]
       printTable(result.items, columns, { style: 'minimal' })
+      const note = result.items.map(publicUrlNote).find((n) => n !== null)
+      if (note) {
+        newline()
+        warning(note)
+      }
       newline()
     })
 

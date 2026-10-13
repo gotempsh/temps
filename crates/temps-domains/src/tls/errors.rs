@@ -81,12 +81,16 @@ pub enum ProviderError {
     #[error("Challenge failed: {0}")]
     ChallengeFailed(String),
 
-    /// The certificate authority rejected the order's authorization (for
-    /// example the DNS-01 TXT record was missing). An invalid ACME order is
-    /// final: re-submitting its challenge can only fail again, so the caller
-    /// must start a new order.
-    #[error("ACME order was rejected and cannot be retried: {0}")]
-    OrderInvalid(String),
+    /// The ACME server has permanently invalidated the order or one of its
+    /// authorizations (typically because validation failed). An invalid
+    /// challenge can never become valid again and cannot be re-submitted, so
+    /// the only way forward is a brand-new order with new challenge values.
+    #[error("ACME challenge for {domain} is no longer valid (order {order_url}): {detail}")]
+    ChallengeInvalidated {
+        domain: String,
+        order_url: String,
+        detail: String,
+    },
 
     #[error("Validation failed: {0}")]
     ValidationFailed(String),

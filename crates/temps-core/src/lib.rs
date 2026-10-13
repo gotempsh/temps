@@ -173,11 +173,11 @@ pub use utils::*;
 pub use anyhow;
 pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
-    AppSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings, ClusterDnsSettings,
-    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
-    ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
-    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    AppSettings, BlobSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings,
+    ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings,
+    DnsProviderSettings, DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings,
+    GeoSettingsError, ImageRetentionSettings, KvSettings, LetsEncryptSettings, McpServerSettings,
+    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, OnDemandTlsSettings, PreviewGatewaySettings, ProviderConfig,
     RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     SelfUpdateSettings, TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,

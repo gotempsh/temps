@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::types::{
-    AppState, CustomDomainRequest, CustomDomainResponse, CustomDomainWithInfo, DomainEnvironment,
-    DomainInfo, ListCustomDomainsResponse, ReassignCustomDomainRequest, UpdateCustomDomainRequest,
+    AppState, CustomDomainLookupResponse, CustomDomainRequest, CustomDomainResponse,
+    CustomDomainWithInfo, DomainEnvironment, DomainInfo, ListCustomDomainsResponse,
+    ReassignCustomDomainRequest, UpdateCustomDomainRequest,
 };
 use super::{
     audit::AuditContext, audit::CustomDomainReassignedAudit,
@@ -45,6 +46,7 @@ use utoipa::OpenApi;
         schemas(
             CustomDomainRequest,
             CustomDomainResponse,
+            CustomDomainLookupResponse,
             UpdateCustomDomainRequest,
             ReassignCustomDomainRequest,
             ListCustomDomainsResponse,
@@ -242,12 +244,17 @@ pub async fn list_custom_domains_for_project(
 }
 
 /// Find the project assignment for a certificate hostname.
+///
+/// A hostname that is not assigned to a project (or is assigned to a project
+/// the caller cannot see) is a normal state, so it answers 200 with
+/// `custom_domain: null` rather than a 404.
 #[utoipa::path(
     get,
     path = "/custom-domains/by-host/{hostname}",
     operation_id = "get_visible_custom_domain_by_hostname",
     responses(
-        (status = 200, description = "Custom domain assignment, or `null` when the hostname is not assigned to a project", body = Option<CustomDomainResponse>),
+        (status = 200, description = "Lookup result; `custom_domain` is null when the hostname is not assigned to a visible project", body = CustomDomainLookupResponse),
+        (status = 400, description = "Hostname is not a valid domain name"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Project access denied")
     ),
@@ -269,30 +276,19 @@ pub async fn get_custom_domain_by_hostname(
         .get_visible_custom_domain_by_hostname(&hostname, &hidden_project_ids)
         .await?;
 
-    // A hostname that is not attached to a project is a normal state the domain
-    // page asks about for every certificate, not a missing resource.
-    let Some(custom_domain) = custom_domain else {
-        return Ok((StatusCode::OK, hostname_assignment_response(None)));
+    let domain_with_info = match custom_domain {
+        Some(custom_domain) => Some(CustomDomainWithInfo::from(
+            state
+                .custom_domain_service
+                .get_domain_with_info(custom_domain)
+                .await?,
+        )),
+        None => None,
     };
-
-    let domain_with_info = state
-        .custom_domain_service
-        .get_domain_with_info(custom_domain)
-        .await?;
     Ok((
         StatusCode::OK,
-        hostname_assignment_response(Some(CustomDomainResponse::from(
-            CustomDomainWithInfo::from(domain_with_info),
-        ))),
+        Json(CustomDomainLookupResponse::from(domain_with_info)),
     ))
-}
-
-/// Body of a hostname assignment lookup: the assignment, or `null` when the
-/// hostname is not attached to any project environment.
-fn hostname_assignment_response(
-    assignment: Option<CustomDomainResponse>,
-) -> Json<Option<CustomDomainResponse>> {
-    Json(assignment)
 }
 
 /// Move a domain between projects without deleting its route or certificate.
@@ -1008,31 +1004,5 @@ mod tests {
 
         assert!(deny_token < scoped_lookup);
         assert!(hidden_projects < scoped_lookup);
-    }
-
-    /// An unassigned hostname is answered with an explicit empty state (JSON
-    /// `null`), not a 404 the console logs as an error for every certificate.
-    #[test]
-    fn unassigned_hostname_serializes_as_an_explicit_null() {
-        let Json(body) = hostname_assignment_response(None);
-        assert_eq!(
-            serde_json::to_value(&body).expect("response serializes"),
-            serde_json::Value::Null
-        );
-    }
-
-    #[test]
-    fn hostname_lookup_no_longer_declares_a_404_for_unassigned_domains() {
-        let source = include_str!("custom_domains.rs");
-        let start = source
-            .find("pub async fn get_custom_domain_by_hostname")
-            .expect("hostname handler must exist");
-        let remainder = &source[start + 1..];
-        let end = remainder.find("pub async fn").unwrap_or(remainder.len());
-        let handler = &source[start..start + 1 + end];
-        assert!(
-            !handler.contains("Domain is not assigned"),
-            "an unassigned hostname must not be turned into a NOT_FOUND problem"
-        );
     }
 }

@@ -415,7 +415,7 @@ fn example_image() -> &'static str {
 use super::port_util::{find_available_port, find_available_port_async, is_port_available_async};
 
 pub struct RustfsService {
-    name: String,
+    name: std::sync::RwLock<String>,
     config: Arc<RwLock<Option<RustfsConfig>>>,
     client: Arc<RwLock<Option<Client>>>,
     /// Resource limits captured at init time, applied to recreate paths.
@@ -478,13 +478,36 @@ impl RustfsService {
         encryption_service: Arc<EncryptionService>,
     ) -> Self {
         Self {
-            name,
+            name: std::sync::RwLock::new(name),
             config: Arc::new(RwLock::new(None)),
             client: Arc::new(RwLock::new(None)),
             resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
             encryption_service,
         }
+    }
+
+    /// The instance name this engine currently works under: the service name
+    /// its container (`{prefix}-{name}`) and volumes are derived from.
+    pub fn instance_name(&self) -> String {
+        self.name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Point this engine at a different instance name.
+    ///
+    /// Only meaningful before the service is created: the managed KV and Blob
+    /// plugins build their engine once at startup, and the operator may pick
+    /// another container name (while the service does not exist) before
+    /// enabling it. Renaming an engine whose container exists would make it
+    /// lose track of that container.
+    pub fn set_instance_name(&self, name: String) {
+        *self
+            .name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
     }
 
     /// Restart-loop note for this service's container, if it has restarted.
@@ -502,7 +525,7 @@ impl RustfsService {
     /// plugin checking for a duplicate left by the pre-#495 naming split, for
     /// one — can ask instead of re-deriving `rustfs-{name}` themselves.
     pub fn get_container_name(&self) -> String {
-        rustfs_container_name(&self.name)
+        rustfs_container_name(&self.instance_name())
     }
 
     /// Host ports this service's container already publishes, when it is
@@ -617,7 +640,7 @@ impl RustfsService {
             if require_new {
                 return Err(anyhow::anyhow!(
                     "Cannot create restored RustFS service '{}': Docker container '{}' already exists",
-                    self.name,
+                    self.instance_name(),
                     container_name
                 ));
             }
@@ -670,7 +693,7 @@ impl RustfsService {
                     // Refreshing the specification is optional; the data is
                     // not. Start the stopped container as it is.
                     warn!(
-                        service = %self.name,
+                        service = %self.instance_name(),
                         container = %container_name,
                         error = %e,
                         "Not recreating the RustFS container; starting it unchanged"
@@ -709,11 +732,11 @@ impl RustfsService {
             data_dir: "/data".to_string(),
             mounts: vec![
                 super::recreate_guard::PlannedMount {
-                    volume: format!("rustfs_{}_data", self.name),
+                    volume: format!("rustfs_{}_data", self.instance_name()),
                     target: "/data".to_string(),
                 },
                 super::recreate_guard::PlannedMount {
-                    volume: format!("rustfs_{}_logs", self.name),
+                    volume: format!("rustfs_{}_logs", self.instance_name()),
                     target: "/logs".to_string(),
                 },
             ],
@@ -736,11 +759,12 @@ impl RustfsService {
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
+        let service_name = self.instance_name();
         super::recreate_guard::recreate_preserving_data(
             super::recreate_guard::RecreateRequest {
                 docker,
                 engine: super::recreate_guard::ManagedEngine::Rustfs,
-                service_name: &self.name,
+                service_name: &service_name,
                 container_name: &container_name,
                 replacement: self.replacement_storage(),
                 operation,
@@ -761,8 +785,8 @@ impl RustfsService {
         require_new: bool,
     ) -> Result<()> {
         let container_name = self.get_container_name();
-        let data_volume_name = format!("rustfs_{}_data", self.name);
-        let logs_volume_name = format!("rustfs_{}_logs", self.name);
+        let data_volume_name = format!("rustfs_{}_data", self.instance_name());
+        let logs_volume_name = format!("rustfs_{}_logs", self.instance_name());
 
         if require_new {
             for volume_name in [&data_volume_name, &logs_volume_name] {
@@ -770,7 +794,7 @@ impl RustfsService {
                     Ok(_) => {
                         return Err(anyhow::anyhow!(
                             "Cannot create restored RustFS service '{}': derived Docker volume '{}' already exists",
-                            self.name,
+                            self.instance_name(),
                             volume_name
                         ));
                     }
@@ -779,7 +803,7 @@ impl RustfsService {
                         return Err(anyhow::anyhow!(
                             "Cannot verify Docker volume '{}' is available for restored RustFS service '{}': {}",
                             volume_name,
-                            self.name,
+                            self.instance_name(),
                             error
                         ));
                     }
@@ -829,11 +853,12 @@ impl RustfsService {
         }
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
+        let instance_name = self.instance_name();
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
 
         let container_labels = HashMap::from([
             (service_label_key.as_str(), "rustfs"),
-            (name_label_key.as_str(), self.name.as_str()),
+            (name_label_key.as_str(), instance_name.as_str()),
         ]);
 
         // RustFS uses RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY and, on the pinned
@@ -1542,8 +1567,8 @@ impl ExternalService for RustfsService {
 
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
-            containers: vec![rustfs_container_name(&self.name)],
-            volumes: rustfs_volume_names(&self.name).to_vec(),
+            containers: vec![rustfs_container_name(&self.instance_name())],
+            volumes: rustfs_volume_names(&self.instance_name()).to_vec(),
         })
     }
 
@@ -1554,7 +1579,8 @@ impl ExternalService for RustfsService {
             Err(e) => {
                 warn!(
                     "RustFS service {} has no readiness gate: its configuration did not parse: {}",
-                    self.name, e
+                    self.instance_name(),
+                    e
                 );
                 return None;
             }
@@ -1597,7 +1623,8 @@ impl ExternalService for RustfsService {
         let new_cfg = self.get_rustfs_config(new_config)?;
         info!(
             "Starting RustFS upgrade to image {} for service {}",
-            new_cfg.docker_image, self.name
+            new_cfg.docker_image,
+            self.instance_name()
         );
 
         let resource_limits = upgrade_limits;
@@ -1611,7 +1638,7 @@ impl ExternalService for RustfsService {
 
         info!(
             "RustFS upgrade completed successfully for service {}",
-            self.name
+            self.instance_name()
         );
         Ok(())
     }
@@ -1756,7 +1783,7 @@ impl ExternalService for RustfsService {
     }
 
     fn get_name(&self) -> String {
-        self.name.clone()
+        self.instance_name()
     }
 
     fn get_connection_info(&self) -> Result<String> {
@@ -1820,7 +1847,7 @@ impl ExternalService for RustfsService {
             .map_err(|e| anyhow::anyhow!("Failed to remove RustFS container: {}", e))?;
 
         // Remove volumes
-        let [data_volume_name, logs_volume_name] = rustfs_volume_names(&self.name);
+        let [data_volume_name, logs_volume_name] = rustfs_volume_names(&self.instance_name());
 
         let _ = self
             .docker
@@ -2074,7 +2101,7 @@ impl ExternalService for RustfsService {
                 s3_location: Set(backup_prefix.to_string()),
                 metadata: Set(serde_json::json!({
                     "service_type": "rustfs",
-                    "service_name": self.name,
+                    "service_name": self.instance_name(),
                     "timestamp": Utc::now().to_rfc3339(),
                 })),
                 compression_type: Set("none".to_string()),

@@ -1527,25 +1527,6 @@ impl PostgresSource {
     }
 }
 
-/// Child containers of a path at or below the schema level.
-///
-/// The PostgreSQL hierarchy is database → schema, and a schema is a *leaf*
-/// container: it advertises `can_contain_containers: false` and holds tables,
-/// which are listed with `list_entities`. Asking a schema for its child
-/// containers is therefore a well-formed question with an empty answer — it
-/// used to be an `InvalidQuery`, which the data browser hit on every schema
-/// expansion and which the API reported as a 500. Anything deeper than a
-/// schema is not a path in this hierarchy at all.
-fn containers_below_schema(path: &ContainerPath) -> Result<Vec<ContainerInfo>> {
-    match path.depth() {
-        2 => Ok(Vec::new()),
-        depth => Err(DataError::InvalidQuery(format!(
-            "PostgreSQL hierarchy only supports 2 levels (database/schema). Path depth: {}",
-            depth
-        ))),
-    }
-}
-
 #[async_trait]
 impl DataSource for PostgresSource {
     fn source_type(&self) -> &'static str {
@@ -1685,8 +1666,8 @@ impl DataSource for PostgresSource {
                 Ok(schemas)
             }
 
-            // Depth >= 2: a schema holds tables, not further containers.
-            _ => containers_below_schema(path),
+            // Depth >= 2: Not supported
+            _ => Err(DataError::container_path_too_deep("PostgreSQL", path, 2)),
         }
     }
 
@@ -2587,28 +2568,6 @@ mod tests {
         ]
         .iter()
         .any(|marker| message.contains(marker))
-    }
-
-    /// Expanding a schema in the data browser asks for its child containers.
-    /// A schema is a leaf (it holds tables), so the answer is "none" — not an
-    /// `InvalidQuery`, which surfaced as a 500 on every expansion.
-    #[test]
-    fn a_schema_has_no_child_containers() {
-        let schema = ContainerPath::new(vec!["app".to_string(), "pg_catalog".to_string()]);
-        let children = containers_below_schema(&schema).expect("schemas are valid paths");
-        assert!(children.is_empty());
-    }
-
-    #[test]
-    fn a_path_deeper_than_a_schema_is_not_in_the_hierarchy() {
-        let table = ContainerPath::new(vec![
-            "app".to_string(),
-            "public".to_string(),
-            "users".to_string(),
-        ]);
-        let error = containers_below_schema(&table).expect_err("three levels do not exist");
-        assert!(matches!(error, DataError::InvalidQuery(_)), "{error}");
-        assert!(error.to_string().contains("Path depth: 3"), "{error}");
     }
 
     #[test]

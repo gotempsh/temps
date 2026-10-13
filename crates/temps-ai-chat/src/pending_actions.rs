@@ -35,12 +35,19 @@ pub enum PendingActionError {
     #[error("pending action '{public_id}' not found")]
     NotFound { public_id: String },
 
-    #[error(
-        "pending action '{public_id}' has status '{status}', which this operation cannot act on: \
-         only 'proposed' actions use the confirm/reject endpoints, while an action in \
-         'awaiting_inline_approval' is answered from the chat message that is waiting for it"
-    )]
+    #[error("pending action '{public_id}' has status '{status}', expected 'proposed'")]
     InvalidState { public_id: String, status: String },
+
+    /// A legacy (detached) confirm/reject was aimed at an action that is
+    /// waiting on a live inline approval. Resolving it here would race the
+    /// chat turn that is paused on it, so the only valid path is the
+    /// approval prompt inside the conversation.
+    #[error(
+        "pending action '{public_id}' is waiting for inline approval in the chat conversation. \
+         Approve or reject it there; this endpoint only resolves actions proposed before inline \
+         approvals existed"
+    )]
+    InlineApprovalRequired { public_id: String },
 
     #[error(
         "step {step_index} of this plan cannot run yet — {pending} earlier step(s) \
@@ -68,6 +75,35 @@ pub enum PendingActionError {
         operation: &'static str,
         reason: String,
     },
+}
+
+/// Status of an action paused on a live inline approval in a chat turn.
+const INLINE_APPROVAL_STATUS: &str = "awaiting_inline_approval";
+
+/// Check that `action` is in the lifecycle state the caller resolves, naming
+/// the actual reason when it is not.
+///
+/// The legacy detached endpoints resolve `proposed` rows, the inline flow
+/// resolves `awaiting_inline_approval` rows. Aiming a detached endpoint at an
+/// inline row used to surface as "already handled (concurrent confirm/reject)",
+/// which sends the user hunting for a race that never happened.
+fn ensure_expected_status(
+    action: &ai_pending_actions::Model,
+    public_id: &str,
+    expected_status: &str,
+) -> Result<(), PendingActionError> {
+    if action.status == expected_status {
+        return Ok(());
+    }
+    if action.status == INLINE_APPROVAL_STATUS && expected_status != INLINE_APPROVAL_STATUS {
+        return Err(PendingActionError::InlineApprovalRequired {
+            public_id: public_id.to_string(),
+        });
+    }
+    Err(PendingActionError::InvalidState {
+        public_id: public_id.to_string(),
+        status: action.status.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -429,12 +465,7 @@ impl PendingActionService {
         // 2. Status pre-check. Project-level feature toggles do not participate
         // in authorization: the native harness approval and the confirming
         // user's current RBAC/project scope are the authoritative controls.
-        if action.status != expected_status {
-            return Err(PendingActionError::InvalidState {
-                public_id: public_id.to_string(),
-                status: action.status.clone(),
-            });
-        }
+        ensure_expected_status(&action, public_id, expected_status)?;
 
         // 3b. Plan ordering: a chained step can only run once every earlier step
         //     has executed. Blocks before the atomic claim so a premature confirm
@@ -594,15 +625,9 @@ impl PendingActionService {
         let user_id = auth.user_id();
         let action = self.get(project_id, user_id, public_id).await?;
 
-        // Say which lifecycle owns the row instead of letting the atomic claim
-        // below report a "concurrent" race: an inline approval answered through
-        // the detached endpoint is a wrong-endpoint call, not a lost race.
-        if action.status != expected_status {
-            return Err(PendingActionError::InvalidState {
-                public_id: public_id.to_string(),
-                status: action.status.clone(),
-            });
-        }
+        // Name the real reason before attempting the claim: an inline approval
+        // or an already-resolved action is not a "concurrent confirm/reject".
+        ensure_expected_status(&action, public_id, expected_status)?;
 
         let now = Utc::now();
 
@@ -944,9 +969,77 @@ mod tests {
             .expect_err("legacy confirmation must reject inline lifecycle rows");
         assert!(matches!(
             error,
-            PendingActionError::InvalidState { ref status, .. }
-                if status == "awaiting_inline_approval"
+            PendingActionError::InlineApprovalRequired { ref public_id } if public_id == "inline"
         ));
+    }
+
+    #[tokio::test]
+    async fn detached_reject_of_an_inline_action_points_to_the_inline_flow() {
+        let mut action = make_proposed(1, "inline", 7);
+        action.status = "awaiting_inline_approval".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![action]])
+            .into_connection();
+        let svc = make_svc(db);
+        let auth = make_auth();
+
+        let error = svc
+            .reject(Some(7), "inline", &auth, Some(auth.user_id()))
+            .await
+            .expect_err("legacy rejection must not resolve an inline approval");
+
+        assert!(
+            matches!(error, PendingActionError::InlineApprovalRequired { ref public_id } if public_id == "inline"),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("inline approval"), "{message}");
+        assert!(!message.contains("concurrent"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn detached_reject_of_a_resolved_action_reports_its_real_status() {
+        let mut action = make_proposed(1, "done", 7);
+        action.status = "executed".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![action]])
+            .into_connection();
+        let svc = make_svc(db);
+        let auth = make_auth();
+
+        let error = svc
+            .reject(Some(7), "done", &auth, Some(auth.user_id()))
+            .await
+            .expect_err("an executed action cannot be rejected");
+
+        assert!(
+            matches!(error, PendingActionError::InvalidState { ref status, .. } if status == "executed"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_reject_still_resolves_an_inline_action() {
+        let mut action = make_proposed(1, "inline", 7);
+        action.status = "awaiting_inline_approval".to_string();
+        let mut rejected = action.clone();
+        rejected.status = "rejected".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![action]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![rejected]])
+            .into_connection();
+        let svc = make_svc(db);
+        let auth = make_auth();
+
+        let result = svc
+            .reject_inline(Some(7), "inline", &auth, Some(auth.user_id()))
+            .await
+            .expect("the inline flow resolves its own rows");
+        assert_eq!(result.status, "rejected");
     }
 
     #[tokio::test]
@@ -1232,36 +1325,6 @@ mod tests {
             matches!(err, PendingActionError::InvalidState { .. }),
             "unexpected: {err:?}"
         );
-    }
-
-    // Rejecting an inline approval through the detached endpoint is a
-    // wrong-lifecycle call: it must name the row's status (and the inline flow),
-    // not claim a "concurrent confirm/reject" race, and must not touch the row.
-    #[tokio::test]
-    async fn test_reject_of_inline_approval_names_the_inline_flow() {
-        let mut row = make_proposed(1, "abc", 7);
-        row.status = "awaiting_inline_approval".to_string();
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![row]])
-            .into_connection();
-        let svc = make_svc(db);
-        let auth = make_auth();
-
-        let err = svc
-            .reject(Some(7), "abc", &auth, Some(1))
-            .await
-            .expect_err("a detached reject must not claim an inline approval");
-
-        match &err {
-            PendingActionError::InvalidState { status, .. } => {
-                assert_eq!(status, "awaiting_inline_approval");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        let message = err.to_string();
-        assert!(message.contains("awaiting_inline_approval"), "{message}");
-        assert!(message.contains("chat message"), "{message}");
-        assert!(!message.contains("concurrent"), "{message}");
     }
 
     // list_for_conversation: returns rows ordered by created_at DESC (project-scoped).

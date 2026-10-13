@@ -1728,6 +1728,7 @@ impl WorkflowPlanner {
 
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
+        let is_uploaded_source = source_job_id == "prepare_source_bundle";
 
         // Job 1: Download repository (only if git info is available)
         if let Some(archive_path) = source_bundle_path {
@@ -2168,15 +2169,13 @@ impl WorkflowPlanner {
         });
         debug!("Added mark_deployment_complete job as barrier between core and optional jobs");
 
-        // Job 5: Configure cron jobs (only if a source checkout is available)
-        // This job reads .temps.yaml from the checked-out source and configures cron jobs.
-        // The source is either a git checkout (`download_repo`) or an uploaded
-        // archive (`prepare_source_bundle`); both publish the same `repo_dir`
-        // output, so an uploaded deployment gets the same `.temps.yaml` handling
-        // (crons, metric alerts, agents) as a git one.
-        // It runs AFTER deployment is marked complete (via mark_deployment_complete job)
-        // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info || source_job_id == "prepare_source_bundle" {
+        // Job 5: Configure cron jobs and metric alert rules from .temps.yaml.
+        // Both read the file from the source tree the source job produced
+        // (a git checkout, or the extracted upload for a Drop deployment), so
+        // they are planned whenever there is a source tree to read.
+        // They run AFTER deployment is marked complete (via mark_deployment_complete job)
+        // NOT required for deployment completion - if they fail, deployment still succeeds
+        if has_git_info || is_uploaded_source {
             jobs.push(JobDefinition {
                 job_id: "configure_crons".to_string(),
                 job_type: "ConfigureCronsJob".to_string(),
@@ -2216,7 +2215,13 @@ impl WorkflowPlanner {
             debug!(
                 "Added configure_metric_alerts job to workflow (runs after deployment is marked complete)"
             );
+        } else {
+            debug!("Skipping configure_crons job - no source tree to read .temps.yaml from");
+        }
 
+        // Agent definitions come from `.temps/agents/*.yaml` of a git
+        // repository; uploaded sources do not sync them.
+        if has_git_info {
             // Job: Sync agent definitions from .temps/agents/*.yaml
             // Runs in parallel with configure_crons, after deployment is complete
             jobs.push(JobDefinition {
@@ -2234,8 +2239,6 @@ impl WorkflowPlanner {
             debug!(
                 "Added configure_agents job to workflow (runs after deployment is marked complete)"
             );
-        } else {
-            debug!("Skipping configure_crons job - no git info or uploaded source available");
         }
 
         // Job 6: Take screenshot (only if screenshots are enabled in config)
@@ -3394,82 +3397,6 @@ mod tests {
         Ok(())
     }
 
-    /// An uploaded-source (drop) deployment has no git info, but it does have a
-    /// source checkout. `.temps.yaml` cron jobs, metric alerts and agents must
-    /// still be configured from it — they used to be planned only `if
-    /// has_git_info`, so the documented "deploy reads .temps.yaml" did nothing.
-    #[tokio::test]
-    async fn uploaded_source_deployment_plans_temps_yaml_jobs(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(test_db) => test_db,
-            Err(error) => {
-                eprintln!("Database unavailable; skipping uploaded-source planner test: {error}");
-                return Ok(());
-            }
-        };
-        let db = test_db.connection_arc();
-        let planner = WorkflowPlanner::new(
-            db.clone(),
-            Arc::new(LogService::new(std::env::temp_dir())),
-            create_test_external_service_manager(db.clone()),
-            create_test_config_service(db.clone()),
-            create_test_dsn_service(db.clone()),
-            create_test_encryption_service(),
-        );
-        let (project, _environment, deployment) =
-            create_test_project(db.as_ref(), Preset::NextJs).await?;
-
-        let mut project_update: projects::ActiveModel = project.into();
-        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
-        project_update.repo_owner = Set(String::new());
-        project_update.repo_name = Set(String::new());
-        project_update.git_provider_connection_id = Set(None);
-        project_update.update(db.as_ref()).await?;
-
-        let mut deployment_update: deployments::ActiveModel = deployment.into();
-        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
-            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
-            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
-            ..Default::default()
-        }));
-        let deployment = deployment_update.update(db.as_ref()).await?;
-
-        let jobs = planner
-            .create_deployment_jobs(
-                deployment.id,
-                temps_core::docker_socket_grant::DeployCaller::Platform,
-            )
-            .await?;
-
-        for (job_id, job_type) in [
-            ("configure_crons", "ConfigureCronsJob"),
-            ("configure_metric_alerts", "ConfigureMetricAlertsJob"),
-            ("configure_agents", "ConfigureAgentsJob"),
-        ] {
-            let job = jobs
-                .iter()
-                .find(|job| job.job_id == job_id)
-                .unwrap_or_else(|| panic!("uploaded source must plan {job_id}"));
-            assert_eq!(job.job_type, job_type);
-            assert_eq!(
-                job.dependencies,
-                Some(serde_json::json!(["mark_deployment_complete"])),
-                "{job_id} runs only once the deployment is live"
-            );
-            assert_eq!(
-                job.job_config
-                    .as_ref()
-                    .and_then(|config| config.get("download_job_id"))
-                    .and_then(serde_json::Value::as_str),
-                Some("prepare_source_bundle"),
-                "{job_id} must read .temps.yaml from the extracted upload"
-            );
-        }
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn test_job_execution_order() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -3861,6 +3788,150 @@ mod tests {
             Some("saved-root")
         );
 
+        Ok(())
+    }
+
+    /// Plan the jobs of an uploaded-source (Drop) deployment of `preset`.
+    /// `None` when the test database (Docker) is unavailable.
+    async fn plan_uploaded_source_jobs(
+        preset: Preset,
+    ) -> Result<Option<Vec<deployment_jobs::Model>>, Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping uploaded-source planner test: {error}");
+                return Ok(None);
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _environment, deployment) = create_test_project(db.as_ref(), preset).await?;
+
+        let mut project_update: projects::ActiveModel = project.into();
+        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        project_update.repo_owner = Set(String::new());
+        project_update.repo_name = Set(String::new());
+        project_update.git_provider_connection_id = Set(None);
+        project_update.directory = Set(".".to_string());
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.into();
+        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        let deployment = deployment_update.update(db.as_ref()).await?;
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+        Ok(Some(jobs))
+    }
+
+    fn planned_job<'a>(
+        jobs: &'a [deployment_jobs::Model],
+        id: &str,
+    ) -> Option<&'a deployment_jobs::Model> {
+        jobs.iter().find(|job| job.job_id == id)
+    }
+
+    fn assert_reads_temps_yaml_from(job: &deployment_jobs::Model, source_job: &str) {
+        assert_eq!(
+            job.dependencies,
+            Some(serde_json::json!(["mark_deployment_complete"])),
+            "{} must wait until the deployment is live",
+            job.job_id
+        );
+        assert_eq!(
+            job.job_config
+                .as_ref()
+                .and_then(|config| config.get("download_job_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(source_job),
+            "{} must read the tree {source_job} produced",
+            job.job_id
+        );
+    }
+
+    /// A Drop deployment has no git info, but its extracted bundle can carry a
+    /// `.temps.yaml`; the cron and metric-alert jobs read it from there.
+    #[tokio::test]
+    async fn uploaded_source_deployment_plans_temps_yaml_jobs_from_the_bundle(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A static site (no build) and a container app take different deploy
+        // paths; both must reconcile `.temps.yaml`.
+        for preset in [Preset::Static, Preset::NextJs] {
+            let Some(jobs) = plan_uploaded_source_jobs(preset).await? else {
+                return Ok(());
+            };
+            assert!(
+                planned_job(&jobs, "prepare_source_bundle").is_some(),
+                "{preset:?}: the upload must be extracted"
+            );
+            assert!(planned_job(&jobs, "download_repo").is_none());
+
+            let crons = planned_job(&jobs, "configure_crons")
+                .unwrap_or_else(|| panic!("{preset:?}: configure_crons must be planned"));
+            assert_eq!(crons.job_type, "ConfigureCronsJob");
+            assert_reads_temps_yaml_from(crons, "prepare_source_bundle");
+
+            let alerts = planned_job(&jobs, "configure_metric_alerts")
+                .unwrap_or_else(|| panic!("{preset:?}: configure_metric_alerts must be planned"));
+            assert_eq!(alerts.job_type, "ConfigureMetricAlertsJob");
+            assert_reads_temps_yaml_from(alerts, "prepare_source_bundle");
+
+            // Agent definitions are synced from a git repository only.
+            assert!(planned_job(&jobs, "configure_agents").is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn git_deployment_still_plans_crons_alerts_and_agents_from_download_repo(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping git planner test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+
+        assert!(planned_job(&jobs, "prepare_source_bundle").is_none());
+        for id in ["configure_crons", "configure_metric_alerts"] {
+            let job = planned_job(&jobs, id).unwrap_or_else(|| panic!("{id} must be planned"));
+            assert_reads_temps_yaml_from(job, "download_repo");
+        }
+        assert!(planned_job(&jobs, "configure_agents").is_some());
         Ok(())
     }
 

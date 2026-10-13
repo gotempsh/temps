@@ -4,10 +4,10 @@
 use super::AuthState;
 use crate::audit::{
     AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit,
-    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit,
-    MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
-    StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit,
-    UserUpdatedAudit,
+    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaSetupStartedAudit,
+    MfaVerificationFailedAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit,
+    RoleRemovedAudit, StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit,
+    UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 pub use temps_core::AuditContext;
-use temps_core::{problemdetails, RequestMetadata};
+use temps_core::RequestMetadata;
 use temps_entities::types::RoleType;
 use tracing::{debug, error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -2654,22 +2654,44 @@ async fn reset_user_password(
         .into_response())
 }
 
-/// MFA enrolment changes the account's own security factors, so it is an
-/// interactive action: only a live browser session may perform it. An API key,
-/// CLI token or deployment token — whatever its role or permission set — is
-/// refused, so a narrowly scoped or read-only credential cannot enrol an
-/// authenticator on its owner's account (an SSO-only account has no password
-/// to re-verify), and the factor would then outlive the key's revocation.
-fn require_interactive_session(auth: &AuthContext) -> Result<(), Problem> {
-    if !auth.is_session() {
-        return Err(problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Browser Session Required")
-            .with_detail(
-                "Managing multi-factor authentication requires an interactive browser \
-                 session; API keys, CLI tokens and deployment tokens cannot do it.",
-            ));
+/// Authorize a self-service MFA request (`/users/me/mfa/*`) and return the
+/// caller's own user row.
+///
+/// Enrolling, confirming and removing a second factor on your *own* account is
+/// not a user-management operation, so it must not depend on `users:write`:
+/// that permission is an admin capability, and gating self-service MFA on it
+/// locked every `User`-role account out of the 2FA setup the console offers
+/// them. The only requirement is that the caller is the account holder, proven
+/// by an interactive session.
+///
+/// Machine credentials are refused even though API keys and CLI tokens carry
+/// the owner's user row: MFA enrollment is a human, interactive ceremony
+/// (password re-entry, an authenticator app, recovery codes shown once), and a
+/// leaked non-interactive credential must not be able to bind an attacker's
+/// authenticator to the owner's account or tamper with an existing factor.
+///
+/// The target account is always the authenticated user's id taken from the
+/// session, never from the request, so a caller can only ever touch their own
+/// factor. Acting on *other* users stays behind the admin permissions on the
+/// `/users/{user_id}/...` routes.
+fn require_self_service_mfa_user(
+    auth: &AuthContext,
+) -> Result<&temps_entities::users::Model, Problem> {
+    match (&auth.source, auth.user.as_ref()) {
+        (crate::context::AuthSource::Session { .. }, Some(user)) => Ok(user),
+        (crate::context::AuthSource::Session { .. }, None)
+        | (crate::context::AuthSource::CliToken { .. }, _)
+        | (crate::context::AuthSource::ApiKey { .. }, _)
+        | (crate::context::AuthSource::DeploymentToken { .. }, _) => {
+            Err(problem_new(StatusCode::FORBIDDEN)
+                .with_title("Interactive Session Required")
+                .with_detail(
+                    "Managing multi-factor authentication requires a signed-in user session. \
+                     API keys, CLI tokens and deployment tokens cannot enroll, confirm or \
+                     remove MFA.",
+                ))
+        }
     }
-    Ok(())
 }
 
 #[utoipa::path(
@@ -2681,7 +2703,7 @@ fn require_interactive_session(auth: &AuthContext) -> Result<(), Problem> {
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
         (status = 400, description = "Current password is required but was not provided"),
         (status = 401, description = "Unauthorized or current password is incorrect"),
-        (status = 403, description = "Only an interactive browser session can manage MFA"),
+        (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
@@ -2692,18 +2714,32 @@ fn require_interactive_session(auth: &AuthContext) -> Result<(), Problem> {
 async fn setup_mfa(
     State(app_state): State<Arc<AuthState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<SetupMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Self-service: this enrols MFA on the caller's own account, so it is gated
-    // on an interactive browser session, not on `users:write` (the permission
-    // to manage *other* accounts, which a `User`-role account does not hold and
-    // was refused its own MFA for).
-    require_interactive_session(&auth)?;
+    // Self-service: authenticated session only, acting on the caller's own
+    // account (see `require_self_service_mfa_user`).
+    let user = require_self_service_mfa_user(&auth)?;
 
     let setup_data = app_state
         .user_service
-        .setup_mfa(auth.user_id(), req.current_password.as_deref())
+        .setup_mfa(user.id, req.current_password.as_deref())
         .await?;
+
+    // Starting enrollment replaces the account's pending MFA secret, so it is
+    // a write. Neither the secret nor the recovery codes are ever audited.
+    let mfa_audit = MfaSetupStartedAudit {
+        context: AuditContext {
+            user_id: user.id,
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        username: user.name.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&mfa_audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
     Ok(Json(MfaSetupResponse {
         secret_key: setup_data.secret_key,
         qr_code: setup_data.qr_code,
@@ -2827,6 +2863,7 @@ async fn change_password_self(
     responses(
         (status = 204, description = "MFA verified and enabled"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 400, description = "Invalid code"),
         (status = 500, description = "Internal server error")
     ),
@@ -2840,24 +2877,17 @@ async fn verify_and_enable_mfa(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<VerifyMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Self-service on the caller's own account, proven by the TOTP code from
-    // setup — see `setup_mfa` for why this is not a `users:write` operation.
-    require_interactive_session(&auth)?;
-
-    // Require a user for this endpoint (deployment tokens not allowed)
-    let user = auth.require_user().map_err(|msg| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("User Required")
-            .with_detail(msg)
-    })?;
+    // Self-service: authenticated session only, acting on the caller's own
+    // account (see `require_self_service_mfa_user`).
+    let user = require_self_service_mfa_user(&auth)?;
 
     app_state
         .user_service
-        .verify_and_enable_mfa(auth.user_id(), &req.code)
+        .verify_and_enable_mfa(user.id, &req.code)
         .await?;
     // Create audit log
     let audit_context = AuditContext {
-        user_id: auth.user_id(),
+        user_id: user.id,
         ip_address: Some(metadata.ip_address.to_string()),
         user_agent: metadata.user_agent.as_str().to_string(),
     };
@@ -2882,6 +2912,7 @@ async fn verify_and_enable_mfa(
     responses(
         (status = 204, description = "MFA disabled"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 400, description = "Invalid verification code"),
         (status = 500, description = "Internal server error")
     ),
@@ -2895,26 +2926,18 @@ async fn disable_mfa(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Self-service on the caller's own account, proven by a valid TOTP or
-    // recovery code — see `setup_mfa` for why this is not a `users:write`
-    // operation.
-    require_interactive_session(&auth)?;
-
-    // Require a user for this endpoint (deployment tokens not allowed)
-    let user = auth.require_user().map_err(|msg| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("User Required")
-            .with_detail(msg)
-    })?;
+    // Self-service: authenticated session only, acting on the caller's own
+    // account (see `require_self_service_mfa_user`).
+    let user = require_self_service_mfa_user(&auth)?;
 
     // First verify code and then disable MFA
     app_state
         .user_service
-        .verify_and_disable_mfa(auth.user_id(), &req.code)
+        .verify_and_disable_mfa(user.id, &req.code)
         .await?;
     // Create audit log
     let audit_context = AuditContext {
-        user_id: auth.user_id(),
+        user_id: user.id,
         ip_address: Some(metadata.ip_address.to_string()),
         user_agent: metadata.user_agent.as_str().to_string(),
     };
@@ -2936,16 +2959,15 @@ mod tests {
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
         create_user, delete_user, login, normalized_login_email, parse_user_roles,
-        record_pending_login, remove_role, restore_user, setup_mfa, update_user,
-        verify_mfa_challenge, AdminTargetDenied, AssignRoleRequest, CreateUserRequest,
-        LoginRequest, RoleChangeDenied, UpdateUserRequest,
+        record_pending_login, remove_role, restore_user, update_user, verify_mfa_challenge,
+        AdminTargetDenied, AssignRoleRequest, CreateUserRequest, LoginRequest, RoleChangeDenied,
+        UpdateUserRequest,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
     use crate::permissions::{Permission, Role};
     use crate::state::AuthState;
     use crate::types::MfaVerificationRequest;
-    use crate::types::SetupMfaRequest;
     use crate::user_service::UserServiceError;
     use crate::RequireAuth;
     use async_trait::async_trait;
@@ -3173,95 +3195,6 @@ mod tests {
             Ok(_) => panic!("{message}"),
             Err(problem) => problem,
         }
-    }
-
-    /// A `User`-role account does not hold `users:write` (that permission is
-    /// for managing other accounts), yet `POST /users/me/mfa/setup` required
-    /// it, so the console's "Set up 2FA" answered 403 for ordinary users.
-    #[tokio::test]
-    async fn user_role_account_can_enrol_mfa_for_itself() {
-        let account = test_user(1);
-        assert!(
-            !Role::User.has_permission(&Permission::UsersWrite),
-            "the regression only exists while the User role lacks users:write"
-        );
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([
-                vec![account.clone()],
-                vec![account.clone()],
-                vec![account.clone()],
-            ])
-            .into_connection();
-        let state = auth_state_with_audit(db, Arc::new(NoopAuditLogger));
-
-        let result = setup_mfa(
-            State(state),
-            RequireAuth(session_auth(Role::User)),
-            Json(SetupMfaRequest {
-                current_password: None,
-            }),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "a User-role session must be able to start MFA enrolment: {:?}",
-            result.err().map(|problem| problem.status_code)
-        );
-    }
-
-    /// A scoped or read-only API key of the account owner must not enrol MFA
-    /// on the owner's account: `require_user` alone would let it through.
-    #[tokio::test]
-    async fn api_keys_cannot_enrol_mfa_even_with_a_user_attached() {
-        for key in [
-            api_key_auth(Some(Role::Reader), None),
-            api_key_auth(None, Some(vec![Permission::ProjectsRead])),
-            api_key_auth(Some(Role::Admin), None),
-        ] {
-            let state = auth_state_with_audit(
-                MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-                Arc::new(NoopAuditLogger),
-            );
-
-            let result = setup_mfa(
-                State(state),
-                RequireAuth(key),
-                Json(SetupMfaRequest {
-                    current_password: None,
-                }),
-            )
-            .await;
-
-            assert_problem_status(
-                expect_problem(result, "an API key is not an interactive session"),
-                StatusCode::FORBIDDEN,
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn deployment_tokens_cannot_enrol_mfa() {
-        let state = auth_state_with_audit(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-            Arc::new(NoopAuditLogger),
-        );
-        let token =
-            AuthContext::new_deployment_token(1, None, None, 9, "deploy-token".to_string(), vec![]);
-
-        let result = setup_mfa(
-            State(state),
-            RequireAuth(token),
-            Json(SetupMfaRequest {
-                current_password: None,
-            }),
-        )
-        .await;
-
-        assert_problem_status(
-            expect_problem(result, "a deployment token is not a user"),
-            StatusCode::FORBIDDEN,
-        );
     }
 
     #[test]
@@ -3812,6 +3745,277 @@ mod tests {
                 Ok(_) => panic!("restricted API key unexpectedly restored a user"),
                 Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
             }
+        }
+    }
+
+    // ---- Self-service MFA (`/users/me/mfa/*`) -------------------------------
+    //
+    // These endpoints used to be guarded by `users:write`, an admin capability
+    // the `User` role lacks, so ordinary accounts could not enroll the 2FA the
+    // console offers them. They now require only an interactive session of the
+    // account being changed.
+
+    mod self_service_mfa {
+        use super::*;
+        use crate::context::AuthContext;
+        use crate::types::{DisableMfaRequest, SetupMfaRequest, VerifyMfaRequest};
+        use temps_entities::deployment_tokens::DeploymentTokenPermission;
+
+        use super::super::{disable_mfa, reset_user_password, setup_mfa, verify_and_enable_mfa};
+
+        const SECRET_BASE32: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+        fn user_row(id: i32) -> users::Model {
+            test_user(id)
+        }
+
+        fn cli_token_auth() -> AuthContext {
+            AuthContext::new_cli_token(test_user(1), Role::Admin)
+        }
+
+        fn deployment_token_auth() -> AuthContext {
+            AuthContext::new_deployment_token(
+                7,
+                None,
+                None,
+                123,
+                "ci-token".to_string(),
+                vec![DeploymentTokenPermission::AnalyticsRead],
+            )
+        }
+
+        /// Every non-interactive principal, including ones holding `users:write`
+        /// and the admin role, which used to sail through the old guard.
+        fn machine_principals() -> Vec<(&'static str, AuthContext)> {
+            vec![
+                (
+                    "api key with users:write",
+                    api_key_auth(None, Some(vec![Permission::UsersWrite])),
+                ),
+                ("admin api key", api_key_auth(Some(Role::Admin), None)),
+                ("cli token", cli_token_auth()),
+                ("deployment token", deployment_token_auth()),
+            ]
+        }
+
+        fn current_totp_code(secret_base32: &str) -> String {
+            use totp_rs::{Algorithm, Builder};
+            let decoded =
+                base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret_base32)
+                    .expect("valid base32 secret");
+            Builder::new()
+                .with_algorithm(Algorithm::SHA1)
+                .with_digits(6)
+                .with_skew(1)
+                .with_step_duration(30)
+                .with_secret(decoded)
+                .build()
+                .expect("totp builds")
+                .generate_current()
+                .to_string()
+        }
+
+        #[test]
+        fn the_user_role_does_not_hold_users_write() {
+            // Documents the premise of the bug: gating self-service MFA on
+            // `users:write` excludes every plain account.
+            assert!(!Role::User.has_permission(&Permission::UsersWrite));
+            assert!(!Role::Reader.has_permission(&Permission::UsersWrite));
+        }
+
+        #[tokio::test]
+        async fn user_and_admin_sessions_can_start_enrollment_for_themselves() {
+            for (role, user_id) in [(Role::User, 5), (Role::Admin, 6), (Role::Reader, 7)] {
+                let audit = Arc::new(RecordingAuditLogger::default());
+                let row = user_row(user_id);
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    // initial lookup, locked re-read, then the UPDATE ... RETURNING
+                    .append_query_results([vec![row.clone()], vec![row.clone()], vec![row]])
+                    .into_connection();
+                let state = auth_state_with_audit(db, audit.clone());
+
+                let result = setup_mfa(
+                    State(state),
+                    RequireAuth(AuthContext::new_session(test_user(user_id), role.clone())),
+                    Extension(request_metadata()),
+                    Json(SetupMfaRequest {
+                        current_password: None,
+                    }),
+                )
+                .await;
+
+                assert!(
+                    result.is_ok(),
+                    "{role} session must be able to enroll MFA for itself"
+                );
+                let events = audit.events();
+                assert_eq!(events.len(), 1, "enrollment start is audited once");
+                assert_eq!(events[0].operation_type, "MFA_SETUP_STARTED");
+                assert_eq!(events[0].user_id, Some(user_id));
+                let serialized = events[0].data.to_string();
+                assert!(
+                    !serialized.contains("recovery") && !serialized.contains("secret"),
+                    "audit payload must not carry credentials: {serialized}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn user_role_session_can_confirm_enrollment_with_a_valid_code() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut pending = user_row(5);
+            pending.mfa_secret = Some(SECRET_BASE32.to_string());
+            let mut enabled = pending.clone();
+            enabled.mfa_enabled = true;
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![pending], vec![enabled]])
+                .into_connection();
+            let state = auth_state_with_audit(db, audit.clone());
+
+            let result = verify_and_enable_mfa(
+                State(state),
+                RequireAuth(AuthContext::new_session(test_user(5), Role::User)),
+                Extension(request_metadata()),
+                Json(VerifyMfaRequest {
+                    code: current_totp_code(SECRET_BASE32),
+                }),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "User-role session must be able to enable MFA"
+            );
+            let events = audit.events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].operation_type, "MFA_ENABLED");
+            assert_eq!(events[0].user_id, Some(5));
+        }
+
+        #[tokio::test]
+        async fn a_wrong_code_still_fails_for_the_account_holder() {
+            let mut pending = user_row(5);
+            pending.mfa_secret = Some(SECRET_BASE32.to_string());
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![pending]])
+                .into_connection();
+            let state = auth_state_with_audit(db, Arc::new(NoopAuditLogger));
+
+            let result = verify_and_enable_mfa(
+                State(state),
+                RequireAuth(AuthContext::new_session(test_user(5), Role::User)),
+                Extension(request_metadata()),
+                Json(VerifyMfaRequest {
+                    code: "000000".to_string(),
+                }),
+            )
+            .await;
+
+            // Authorization passed; the TOTP check is what rejects it.
+            let problem = expect_problem(result, "an invalid code must not enable MFA");
+            assert_ne!(problem.status_code, StatusCode::FORBIDDEN);
+            assert_ne!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        #[tokio::test]
+        async fn machine_credentials_cannot_manage_mfa() {
+            for (label, auth) in machine_principals() {
+                // An empty mock database: any attempt to reach the service
+                // would surface as a 500, so a 403 proves the guard ran first.
+                let state = || {
+                    auth_state_with_audit(
+                        MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+                        Arc::new(NoopAuditLogger),
+                    )
+                };
+
+                let setup = setup_mfa(
+                    State(state()),
+                    RequireAuth(auth.clone()),
+                    Extension(request_metadata()),
+                    Json(SetupMfaRequest {
+                        current_password: None,
+                    }),
+                )
+                .await;
+                assert_problem_status(
+                    expect_problem(setup, &format!("{label} must not start MFA enrollment")),
+                    StatusCode::FORBIDDEN,
+                );
+
+                let verify = verify_and_enable_mfa(
+                    State(state()),
+                    RequireAuth(auth.clone()),
+                    Extension(request_metadata()),
+                    Json(VerifyMfaRequest {
+                        code: "123456".to_string(),
+                    }),
+                )
+                .await;
+                assert_problem_status(
+                    expect_problem(verify, &format!("{label} must not enable MFA")),
+                    StatusCode::FORBIDDEN,
+                );
+
+                let disable = disable_mfa(
+                    State(state()),
+                    RequireAuth(auth.clone()),
+                    Extension(request_metadata()),
+                    Json(DisableMfaRequest {
+                        code: "123456".to_string(),
+                    }),
+                )
+                .await;
+                assert_problem_status(
+                    expect_problem(disable, &format!("{label} must not disable MFA")),
+                    StatusCode::FORBIDDEN,
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_user_role_session_cannot_use_admin_endpoints_on_another_account() {
+            let session = || AuthContext::new_session(test_user(5), Role::User);
+
+            let reset = reset_user_password(
+                State(admin_owner_state()),
+                RequireAuth(session()),
+                Extension(request_metadata()),
+                Path(2),
+            )
+            .await;
+            assert_problem_status(
+                expect_problem(reset, "User role must not reset another user's password"),
+                StatusCode::FORBIDDEN,
+            );
+
+            let update = update_user(
+                State(admin_owner_state()),
+                RequireAuth(session()),
+                Extension(request_metadata()),
+                Path(2),
+                Json(UpdateUserRequest {
+                    email: Some("changed@example.com".to_string()),
+                    name: None,
+                }),
+            )
+            .await;
+            assert_problem_status(
+                expect_problem(update, "User role must not edit another account"),
+                StatusCode::FORBIDDEN,
+            );
+
+            let delete = delete_user(
+                State(admin_owner_state()),
+                RequireAuth(session()),
+                Extension(request_metadata()),
+                Path(2),
+            )
+            .await;
+            assert_problem_status(
+                expect_problem(delete, "User role must not delete another account"),
+                StatusCode::FORBIDDEN,
+            );
         }
     }
 

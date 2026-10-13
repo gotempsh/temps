@@ -1620,12 +1620,37 @@ fn emit_turn_event(
     let _ = tx.send(item);
 }
 
+#[cfg(test)]
 fn assistant_message_metadata(
     tools: &[serde_json::Value],
     parts: &[serde_json::Value],
     draft: bool,
 ) -> Option<serde_json::Value> {
+    assistant_message_metadata_with(tools, parts, draft, None)
+}
+
+/// Like [`assistant_message_metadata`], additionally flagging a message whose
+/// text is partial because the provider stream was cut short. The flag is what
+/// lets a reload (and any API consumer) tell this message from a finished
+/// answer.
+fn assistant_message_metadata_with(
+    tools: &[serde_json::Value],
+    parts: &[serde_json::Value],
+    draft: bool,
+    interruption: Option<&crate::PublicChatFailure>,
+) -> Option<serde_json::Value> {
     let mut metadata = serde_json::Map::new();
+    if let Some(failure) = interruption {
+        metadata.insert("interrupted".to_string(), serde_json::Value::Bool(true));
+        metadata.insert(
+            "interruption".to_string(),
+            serde_json::json!({
+                "code": failure.code,
+                "title": failure.title,
+                "detail": failure.detail,
+            }),
+        );
+    }
     if !tools.is_empty() {
         metadata.insert(
             "tools".to_string(),
@@ -1766,6 +1791,30 @@ async fn persist_assistant_message(
     open_text: &str,
     draft: bool,
 ) -> Result<(), sea_orm::DbErr> {
+    persist_assistant_message_with(
+        db,
+        message_id,
+        content,
+        tools,
+        completed_parts,
+        open_text,
+        draft,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_assistant_message_with(
+    db: &DatabaseConnection,
+    message_id: i64,
+    content: &str,
+    tools: &[serde_json::Value],
+    completed_parts: &[serde_json::Value],
+    open_text: &str,
+    draft: bool,
+    interruption: Option<&crate::PublicChatFailure>,
+) -> Result<(), sea_orm::DbErr> {
     let mut parts = completed_parts.to_vec();
     if !open_text.is_empty() {
         parts.push(serde_json::json!({ "type": "text", "text": open_text }));
@@ -1778,7 +1827,12 @@ async fn persist_assistant_message(
         )
         .col_expr(
             ai_messages::Column::Metadata,
-            Expr::value(assistant_message_metadata(tools, &parts, draft)),
+            Expr::value(assistant_message_metadata_with(
+                tools,
+                &parts,
+                draft,
+                interruption,
+            )),
         )
         .exec(db)
         .await?;
@@ -4867,14 +4921,13 @@ impl ConversationService {
             // so that a turn which ends up with nothing to show can explain WHY
             // instead of just stopping — see the empty-turn check after salvage.
             let mut last_provider_error: Option<String> = None;
-            // The provider's stream broke while a reply was being written (the
-            // connection dropped, the upstream timed out, or it closed without a
-            // terminal chunk) and no later call recovered an answer. Whatever
-            // text arrived is a fragment, not an answer: the turn is reported
-            // failed instead of "completed".
-            let mut provider_stream_failed = false;
             let mut retained_diagnostic: Option<(String, String)> = None;
             let mut durable_failure: Option<crate::PublicChatFailure> = None;
+            // Set when the provider's reply stream ended before the provider
+            // said it was finished (dropped connection, mid-reply error, client
+            // timeout, no terminal chunk). The text received so far is partial:
+            // the turn is failed, not completed.
+            let mut stream_interruption: Option<String> = None;
             let mut provider_session_id: Option<String> = None;
             let mut provider_session_title: Option<String> = None;
             let mut resume_session_id = resume_session_id;
@@ -5050,9 +5103,6 @@ impl ConversationService {
                 let mut native_tool_ids = std::collections::HashSet::new();
                 let mut pending_managed_process_ids = std::collections::HashSet::new();
                 let mut provider_stream_finished = false;
-                // The stream yielded an error item this round (see
-                // `provider_stream_failed` above).
-                let mut round_stream_failed = false;
                 // Did anything this round return usable data (vs. only rejections)?
                 let mut round_produced_something = false;
                 let mut first_delta_seen = false;
@@ -5420,6 +5470,9 @@ impl ConversationService {
                             {
                                 retained_diagnostic = Some((purpose.clone(), reason.clone()));
                             }
+                            if let temps_ai::AiError::StreamInterrupted { reason, .. } = &e {
+                                stream_interruption = Some(reason.clone());
+                            }
                             tracing::warn!(
                                 "chat_stream_turn item error for conv {conv_id}: {reason}"
                             );
@@ -5454,6 +5507,7 @@ impl ConversationService {
                                     );
                                 }
                                 retained_diagnostic = None;
+                                stream_interruption = None;
                                 continue 'rounds;
                             }
                             // Provider subprocess failures arrive as stream items
@@ -5462,7 +5516,6 @@ impl ConversationService {
                             // the authentication/model error instead of the generic
                             // "provider returned no response" fallback.
                             remember_provider_error(&mut last_provider_error, reason);
-                            round_stream_failed = true;
                             break;
                         }
                     }
@@ -5477,14 +5530,26 @@ impl ConversationService {
                         round = round_index + 1,
                         phase_ms = provider_call_started.elapsed().as_millis() as u64,
                         total_ms = turn_started.elapsed().as_millis() as u64,
+                        failed = stream_interruption.is_some(),
                         "AI turn timing"
                     );
 
-                if round_stream_failed {
-                    // The reply was cut off. Do not treat what arrived as the
-                    // final answer, and never dispatch tool calls whose
-                    // arguments may be partial: stop and report the failure.
-                    provider_stream_failed = true;
+                if let Some(cause) = stream_interruption.as_deref() {
+                    // Do not execute tool calls from, or ask for another round
+                    // after, a reply the provider never finished.
+                    tracing::warn!(
+                        component = "ai_turn_timing",
+                        turn_id = trace_id,
+                        conversation_id = conv_id,
+                        project_id,
+                        provider = %ai_provider,
+                        phase = "provider_stream_interrupted",
+                        round = round_index + 1,
+                        partial_bytes = content.len() + round_text.len(),
+                        failed = true,
+                        cause,
+                        "AI provider stream ended before the reply was complete"
+                    );
                     break 'rounds;
                 }
 
@@ -5660,7 +5725,7 @@ impl ConversationService {
             // hit a bound while still calling tools). Make one tool-free streaming
             // call so the model answers from the evidence it gathered. The result
             // is persisted even when no browser is currently attached.
-            if !answered && !tools_meta.is_empty() {
+            if !answered && !tools_meta.is_empty() && stream_interruption.is_none() {
                 if harness_workspace.is_some() {
                     let permission_mode = active_permission_mode(&task_permission_mode);
                     if let Err(error) = refresh_harness_authorization(
@@ -5724,10 +5789,6 @@ impl ConversationService {
                 }
                 if let Ok(mut stream) = salvage {
                     let mut salvage_text = String::new();
-                    // The closing call is itself a provider stream. Text that
-                    // arrived before it broke off is another fragment, not the
-                    // recovered answer.
-                    let mut salvage_stream_failed = false;
                     let mut authorization_check = tokio::time::interval(Duration::from_secs(1));
                     authorization_check
                         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5806,35 +5867,24 @@ impl ConversationService {
                                     Ok(ChatStreamEvent::ContextUsage(usage)),
                                 );
                             }
-                            Err(error) => {
+                            Ok(_) => {}
+                            Err(e) => {
+                                // The salvage answer is the turn's final text; a
+                                // stream cut short here must fail the turn just
+                                // like one cut short in a tool round.
+                                if let temps_ai::AiError::StreamInterrupted { reason, .. } = &e {
+                                    stream_interruption = Some(reason.clone());
+                                }
                                 tracing::warn!(
-                                    conversation_id = conv_id,
-                                    %error,
-                                    "salvage stream failed"
+                                    "chat_stream_turn item error for conv {conv_id} (salvage): {e}"
                                 );
-                                remember_provider_error(
-                                    &mut last_provider_error,
-                                    error.to_string(),
-                                );
-                                salvage_stream_failed = true;
-                                // Whatever it already sent is a fragment. This
-                                // holds even when the main loop ended cleanly
-                                // (a stop reason, native tools without prose):
-                                // the closing answer was still cut off.
-                                provider_stream_failed = true;
+                                remember_provider_error(&mut last_provider_error, e.to_string());
                                 break;
                             }
-                            Ok(_) => {}
                         }
                     }
                     if !salvage_text.is_empty() {
                         parts.push(serde_json::json!({ "type": "text", "text": salvage_text }));
-                        // A closing call that produced an answer and finished
-                        // recovers a reply that broke off earlier. One that
-                        // broke off itself does not.
-                        if !salvage_stream_failed {
-                            provider_stream_failed = false;
-                        }
                     }
                 }
             }
@@ -5871,32 +5921,43 @@ impl ConversationService {
             // a provider failure just ended the loop.
             //
             let empty_turn_failed = content.is_empty() && tools_meta.is_empty();
-            // A reply that started and then broke off. The fragment is kept (it
-            // is persisted below, with its tool work) but the turn is failed and
-            // says why; a retained harness diagnostic already explains itself.
-            let reply_interrupted =
-                provider_stream_failed && !empty_turn_failed && retained_diagnostic.is_none();
             let turn_failed = proposal_not_staged
                 || empty_turn_failed
                 || retained_diagnostic.is_some()
-                || reply_interrupted;
+                || stream_interruption.is_some();
             let provider_stopped_early = last_provider_error.is_some() || stop_reason.is_some();
-            if reply_interrupted {
-                let detail = last_provider_error
-                    .take()
-                    .unwrap_or_else(|| "the provider's stream ended early".to_string());
-                let error = ChatError::Ai(format!(
-                    "the reply was cut off before it finished: {detail}. \
-                     The part that arrived is kept above; send the message again to retry."
-                ));
-                durable_failure = Some(error.public_failure());
+            // A reply the provider never finished is a failed turn even when
+            // text arrived: persisting that text as a finished answer is how a
+            // truncated reply used to be shown with no error. The text is kept,
+            // flagged as partial, and the failure is both emitted and persisted.
+            let mut interrupted_message: Option<crate::PublicChatFailure> = None;
+            if let Some(cause) = stream_interruption.take() {
+                let error = ChatError::StreamInterrupted {
+                    conversation_id: conv_id,
+                    turn_id: trace_id.to_string(),
+                    partial_bytes: content.len(),
+                    cause,
+                };
+                let failure = error.public_failure();
+                tracing::warn!(
+                    component = "ai_turn_timing",
+                    turn_id = trace_id,
+                    conversation_id = conv_id,
+                    failed = true,
+                    %error,
+                    "AI turn failed: provider stream interrupted"
+                );
                 emit_turn_event(&tx, &turn_live, Err(error));
+                durable_failure.get_or_insert(failure.clone());
+                interrupted_message = Some(failure);
             }
-            if empty_turn_failed {
+            if empty_turn_failed && interrupted_message.is_some() {
+                // Already reported with the precise cause above; do not follow
+                // it with the generic "no reply was produced" error.
+            } else if empty_turn_failed {
                 // `ChatError::Ai` already renders an "AI provider error: " prefix,
                 // so the message continues that sentence rather than restating it.
                 let detail = last_provider_error
-                    .take()
                     .unwrap_or_else(|| "the provider returned no response".to_string());
                 let error = if let Some((purpose, reason)) = retained_diagnostic.take() {
                     ChatError::RetainedHarnessDiagnostic { purpose, reason }
@@ -5999,7 +6060,7 @@ impl ConversationService {
             if !content.is_empty() || !tools_meta.is_empty() {
                 let persisted_message_id = match draft_message_id {
                     Some(message_id) => {
-                        match persist_assistant_message(
+                        match persist_assistant_message_with(
                             db.as_ref(),
                             message_id,
                             &content,
@@ -6007,6 +6068,7 @@ impl ConversationService {
                             &parts,
                             "",
                             false,
+                            interrupted_message.as_ref(),
                         )
                         .await
                         {
@@ -6027,7 +6089,12 @@ impl ConversationService {
                             conversation_id: Set(conv_id),
                             role: Set("assistant".to_string()),
                             content: Set(content.clone()),
-                            metadata: Set(assistant_message_metadata(&tools_meta, &parts, false)),
+                            metadata: Set(assistant_message_metadata_with(
+                                &tools_meta,
+                                &parts,
+                                false,
+                                interrupted_message.as_ref(),
+                            )),
                             created_at: Set(Utc::now()),
                             ..Default::default()
                         };
@@ -9535,94 +9602,6 @@ mod tests {
         }
     }
 
-    /// Streams a fragment of prose and then breaks, as an upstream does when
-    /// the connection drops (or times out) mid-reply.
-    struct PartialTextThenErrorAi;
-
-    #[async_trait]
-    impl AiService for PartialTextThenErrorAi {
-        async fn is_available(&self) -> bool {
-            true
-        }
-
-        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
-            Err(AiError::NotAvailable)
-        }
-
-        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
-            Err(AiError::NotAvailable)
-        }
-
-        async fn chat_stream_turn(
-            &self,
-            _request: ChatTurnRequest,
-        ) -> Result<ChatTurnStream, AiError> {
-            let stream = async_stream::stream! {
-                yield Ok(ChatStreamDelta::Text("Your deployment is".to_string()));
-                yield Err(AiError::Provider {
-                    purpose: "chat.test.tools".to_string(),
-                    reason: "the provider's response stream ended without a terminal chunk"
-                        .to_string(),
-                });
-            };
-            Ok(Box::pin(stream))
-        }
-    }
-
-    /// A native tool call breaks the first stream; the closing (salvage) call
-    /// then sends some text and breaks off as well.
-    struct NativeToolThenBrokenSalvageAi {
-        calls: std::sync::atomic::AtomicUsize,
-        /// Whether the first stream itself breaks after the tool call. When
-        /// `false` it ends cleanly and only the closing call fails.
-        first_stream_breaks: bool,
-    }
-
-    #[async_trait]
-    impl AiService for NativeToolThenBrokenSalvageAi {
-        async fn is_available(&self) -> bool {
-            true
-        }
-
-        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
-            Err(AiError::NotAvailable)
-        }
-
-        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
-            Err(AiError::NotAvailable)
-        }
-
-        async fn chat_stream_turn(
-            &self,
-            _request: ChatTurnRequest,
-        ) -> Result<ChatTurnStream, AiError> {
-            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let first_stream_breaks = self.first_stream_breaks;
-            let stream = async_stream::stream! {
-                if call == 0 {
-                    yield Ok(ChatStreamDelta::ToolCall(ToolCall {
-                        id: "native-1".to_string(),
-                        name: "Bash".to_string(),
-                        arguments: r#"{"command":"pwd"}"#.to_string(),
-                    }));
-                    if first_stream_breaks {
-                        yield Err(AiError::Provider {
-                            purpose: "chat.application.tools".to_string(),
-                            reason: "first stream dropped".to_string(),
-                        });
-                    }
-                } else {
-                    yield Ok(ChatStreamDelta::Text("The directory is".to_string()));
-                    yield Err(AiError::Provider {
-                        purpose: "chat.application.tools.final".to_string(),
-                        reason: "salvage stream dropped".to_string(),
-                    });
-                }
-            };
-            Ok(Box::pin(stream))
-        }
-    }
-
     struct NativeToolThenErrorAi {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -9983,122 +9962,6 @@ mod tests {
             !error.to_string().contains("Check the provider's key and model"),
             "sandbox and harness failures must not be mislabeled as API key/model failures: {error}"
         );
-    }
-
-    /// A reply that breaks off mid-text used to be taken as the final answer:
-    /// the fragment was persisted and the turn finished `completed` with no
-    /// error. It must keep the fragment, fail the turn, and say why.
-    #[tokio::test]
-    async fn provider_stream_cut_off_mid_reply_fails_the_turn_instead_of_completing_it() {
-        let ai: Arc<dyn AiService> = Arc::new(PartialTextThenErrorAi);
-        let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
-            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
-        let (svc, tools) = service_with(ai);
-
-        let mut stream = svc
-            .try_tool_loop(
-                &test_conversation(),
-                vec![],
-                Some(provider),
-                tools,
-                &test_auth(),
-            )
-            .await;
-
-        let mut tokens = String::new();
-        let mut errors = Vec::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(ChatStreamEvent::Token(text)) => tokens.push_str(&text),
-                Ok(_) => {}
-                Err(error) => errors.push(error),
-            }
-        }
-
-        assert_eq!(tokens, "Your deployment is", "the fragment is still shown");
-        assert_eq!(errors.len(), 1, "exactly one failure: {errors:?}");
-        let message = errors[0].to_string();
-        assert!(message.contains("cut off"), "{message}");
-        assert!(message.contains("terminal chunk"), "{message}");
-    }
-
-    /// Drive a turn whose closing (salvage) call sends some text and breaks off,
-    /// and return the streamed tokens and the errors the turn reported.
-    async fn run_turn_with_broken_salvage(first_stream_breaks: bool) -> (String, Vec<ChatError>) {
-        let ai: Arc<dyn AiService> = Arc::new(NativeToolThenBrokenSalvageAi {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            first_stream_breaks,
-        });
-        let (svc, tools, auth) = service_with_current_tool_auth(ai);
-        let mut conversation = test_conversation();
-        conversation.context_type = "application".to_string();
-        conversation.ai_provider = "claude_cli".to_string();
-        conversation.ai_permission_mode = "default".to_string();
-        let mut stream = svc
-            .try_tool_loop_in_workspace(
-                &conversation,
-                vec![],
-                None,
-                tools,
-                &auth,
-                &test_request_metadata(),
-                None,
-                Vec::new(),
-                Some(temps_ai::HarnessWorkspace {
-                    sandbox_label: "app_test".to_string(),
-                    host_work_dir: std::path::PathBuf::from("/tmp/app_test"),
-                }),
-                temps_ai::SensitiveEnvironment::default(),
-                Vec::new(),
-                None,
-                false,
-                None,
-            )
-            .await;
-
-        let mut tokens = String::new();
-        let mut errors = Vec::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(ChatStreamEvent::Token(text)) => tokens.push_str(&text),
-                Ok(_) => {}
-                Err(error) => errors.push(error),
-            }
-        }
-        (tokens, errors)
-    }
-
-    /// The closing call can break off after sending some text too. That text
-    /// is a second fragment: the turn must stay failed, not be marked complete
-    /// because "some answer arrived".
-    #[tokio::test]
-    async fn salvage_stream_that_breaks_off_does_not_recover_the_turn() {
-        let (tokens, errors) = run_turn_with_broken_salvage(true).await;
-
-        assert!(tokens.contains("The directory is"), "{tokens}");
-        assert_eq!(
-            errors.len(),
-            1,
-            "the broken salvage must fail the turn: {errors:?}"
-        );
-        assert!(errors[0].to_string().contains("cut off"), "{}", errors[0]);
-    }
-
-    /// The same when the main loop itself ended cleanly (native tools ran and
-    /// produced no prose, so the closing call is made): a closing answer that
-    /// breaks off is still a failed turn, not a completed one.
-    #[tokio::test]
-    async fn salvage_stream_that_breaks_off_fails_a_turn_whose_main_loop_ended_cleanly() {
-        let (tokens, errors) = run_turn_with_broken_salvage(false).await;
-
-        assert!(tokens.contains("The directory is"), "{tokens}");
-        assert_eq!(
-            errors.len(),
-            1,
-            "a cut-off closing answer must fail the turn: {errors:?}"
-        );
-        assert!(errors[0].to_string().contains("cut off"), "{}", errors[0]);
     }
 
     #[tokio::test]
@@ -12773,5 +12636,231 @@ mod tests {
         let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(response["result"]["isError"], true);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A provider whose reply stream is cut short after `partial_text` (if any)
+    /// with the typed interruption error the gateway raises when the connection
+    /// drops, the client times out, or no terminal chunk arrives.
+    struct InterruptedStreamAi {
+        partial_text: Option<&'static str>,
+        cause: &'static str,
+    }
+
+    #[async_trait]
+    impl AiService for InterruptedStreamAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: ChatTurnRequest,
+        ) -> Result<ChatTurnStream, AiError> {
+            let partial_text = self.partial_text;
+            let cause = self.cause;
+            let stream = async_stream::stream! {
+                if let Some(text) = partial_text {
+                    yield Ok(ChatStreamDelta::Text(text.to_string()));
+                }
+                yield Err(AiError::StreamInterrupted {
+                    purpose: "chat.test.tools".to_string(),
+                    reason: cause.to_string(),
+                });
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    async fn collect_all(
+        stream: Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>>,
+    ) -> Vec<Result<ChatStreamEvent, ChatError>> {
+        let mut stream = stream;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item);
+        }
+        out
+    }
+
+    async fn run_interrupted_turn(
+        partial_text: Option<&'static str>,
+        cause: &'static str,
+    ) -> Vec<Result<ChatStreamEvent, ChatError>> {
+        let ai: Arc<dyn AiService> = Arc::new(InterruptedStreamAi {
+            partial_text,
+            cause,
+        });
+        let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let (svc, tools) = service_with(ai);
+        let stream = svc
+            .try_tool_loop(
+                &test_conversation(),
+                vec![],
+                Some(provider),
+                tools,
+                &test_auth(),
+            )
+            .await;
+        collect_all(stream).await
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_keeps_the_partial_text_and_reports_a_typed_failure() {
+        let events = run_interrupted_turn(
+            Some("Once upon a"),
+            "the provider closed the stream before sending a final chunk",
+        )
+        .await;
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Ok(ChatStreamEvent::Token(text)) if text == "Once upon a"
+            )),
+            "the partial text must still reach the client: {events:?}"
+        );
+        let errors: Vec<&ChatError> = events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one failure event: {events:?}");
+        match errors[0] {
+            ChatError::StreamInterrupted {
+                partial_bytes,
+                cause,
+                turn_id,
+                ..
+            } => {
+                assert_eq!(*partial_bytes, "Once upon a".len());
+                assert!(cause.contains("before sending a final chunk"), "{cause}");
+                assert!(!turn_id.is_empty());
+            }
+            other => panic!("expected StreamInterrupted, got {other:?}"),
+        }
+        let message = errors[0].to_string();
+        assert!(message.contains("conversation"), "{message}");
+        assert!(message.contains("11 bytes of partial text"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_with_no_text_reports_only_the_interruption() {
+        let events = run_interrupted_turn(None, "the connection failed mid-reply: timed out").await;
+
+        let errors: Vec<&ChatError> = events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect();
+        assert_eq!(errors.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                errors[0],
+                ChatError::StreamInterrupted {
+                    partial_bytes: 0,
+                    ..
+                }
+            ),
+            "{errors:?}"
+        );
+        assert!(
+            !errors[0].to_string().contains("no reply was produced"),
+            "the interruption replaces the generic empty-turn error"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_stream_reports_no_failure() {
+        let ai = Arc::new(ScriptedAi::new(vec![Ok(vec![
+            ChatStreamDelta::Text("Hello, ".to_string()),
+            ChatStreamDelta::Text("world".to_string()),
+        ])]));
+        let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
+        let stream = svc
+            .try_tool_loop(&test_conversation(), vec![], Some(provider), tools, &auth)
+            .await;
+        let events = collect_all(stream).await;
+
+        assert!(
+            events.iter().all(Result::is_ok),
+            "a finished reply must not report a failure: {events:?}"
+        );
+        assert_eq!(
+            joined_text(
+                &events
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .collect::<Vec<_>>()
+            ),
+            "Hello, world"
+        );
+    }
+
+    #[test]
+    fn stream_interruption_public_failure_is_safe_and_retryable() {
+        let error = ChatError::StreamInterrupted {
+            conversation_id: 7,
+            turn_id: "turn-1".to_string(),
+            partial_bytes: 12,
+            cause: "error sending request for url (https://provider.internal.example/v1)"
+                .to_string(),
+        };
+        let failure = error.public_failure();
+
+        assert_eq!(failure.code, "provider_stream_interrupted");
+        assert!(failure.retryable);
+        assert!(failure.detail.contains("marked incomplete"));
+        assert!(
+            !failure.detail.contains("provider.internal.example"),
+            "the raw transport cause must stay in the server log: {}",
+            failure.detail
+        );
+
+        let empty = ChatError::StreamInterrupted {
+            conversation_id: 7,
+            turn_id: "turn-1".to_string(),
+            partial_bytes: 0,
+            cause: "timed out".to_string(),
+        };
+        assert!(empty
+            .public_failure()
+            .detail
+            .contains("nothing was received"));
+    }
+
+    #[test]
+    fn interrupted_message_metadata_is_flagged_partial() {
+        let failure = ChatError::StreamInterrupted {
+            conversation_id: 7,
+            turn_id: "turn-1".to_string(),
+            partial_bytes: 3,
+            cause: "eof".to_string(),
+        }
+        .public_failure();
+        let parts = vec![serde_json::json!({"type": "text", "text": "abc"})];
+
+        let flagged = assistant_message_metadata_with(&[], &parts, false, Some(&failure))
+            .expect("metadata is produced");
+        assert_eq!(flagged["interrupted"], serde_json::json!(true));
+        assert_eq!(
+            flagged["interruption"]["code"],
+            serde_json::json!("provider_stream_interrupted")
+        );
+        assert_eq!(flagged["parts"], serde_json::json!(parts));
+
+        let normal = assistant_message_metadata(&[], &parts, false).expect("metadata");
+        assert!(normal.get("interrupted").is_none());
+        assert!(normal.get("interruption").is_none());
     }
 }
