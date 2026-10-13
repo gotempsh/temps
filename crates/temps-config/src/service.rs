@@ -46,7 +46,8 @@ const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
-    AgentSandboxSettings, AppSettings, BlobSettings, GeoLicenseKeyIntent, KvSettings,
+    AgentSandboxSettings, AppSettings, BlobSettings, ClickHouseCompression, GeoLicenseKeyIntent,
+    KvSettings,
     PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
@@ -794,6 +795,26 @@ pub async fn installation_mode(db: &DbConnection) -> Result<InstallationMode, Co
     })
 }
 
+/// Read the stored `clickhouse.compression` setting straight from the
+/// `settings` row, for one-shot CLI commands that talk to ClickHouse but have
+/// no [`ConfigService`] (the backfills). A missing row, an undecodable row or
+/// a failed read all yield the default (LZ4), with a warning for the last.
+pub async fn stored_clickhouse_compression(db: &DbConnection) -> ClickHouseCompression {
+    match settings::Entity::find_by_id(1).one(db).await {
+        Ok(record) => record
+            .map(|r| AppSettings::from_json(r.data).clickhouse.compression)
+            .unwrap_or_default(),
+        Err(error) => {
+            warn!(
+                %error,
+                default = %ClickHouseCompression::default(),
+                "Could not read the stored ClickHouse compression setting; using the default"
+            );
+            ClickHouseCompression::default()
+        }
+    }
+}
+
 /// Return the stable instance identifier for a stateless installation.
 pub async fn stateless_instance_id(
     db: &DbConnection,
@@ -892,6 +913,17 @@ pub struct ConfigService {
     /// this (via [`ConfigService::start_settings_listener`]); throwaway
     /// `ConfigService::new()` instances never start it.
     listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The ClickHouse wire-compression mode this process builds its clients
+    /// with. Resolved once at startup from the stored
+    /// `clickhouse.compression` setting (see
+    /// [`ConfigService::stored_clickhouse_compression`]) and fixed for the
+    /// life of the process: clients are cloned throughout the server and carry
+    /// their codec, so a changed setting is applied by the next restart. The
+    /// Settings API reports this next to the stored value.
+    ///
+    /// Defaults to [`ClickHouseCompression::Lz4`] for throwaway
+    /// `ConfigService::new()` instances that never build ClickHouse clients.
+    clickhouse_compression: ClickHouseCompression,
 }
 
 /// Publish the settings that sync call sites read from process-wide caches
@@ -928,6 +960,41 @@ impl ConfigService {
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
+            clickhouse_compression: ClickHouseCompression::default(),
+        }
+    }
+
+    /// Fix the ClickHouse compression mode this process builds clients with.
+    /// Called once by the composition root, with the value read from
+    /// [`ConfigService::stored_clickhouse_compression`].
+    pub fn with_clickhouse_compression(mut self, mode: ClickHouseCompression) -> Self {
+        self.clickhouse_compression = mode;
+        self
+    }
+
+    /// The ClickHouse compression mode this process's clients were built with
+    /// (not necessarily the stored setting: a change applies on restart).
+    pub fn clickhouse_compression(&self) -> ClickHouseCompression {
+        self.clickhouse_compression
+    }
+
+    /// Read the stored `clickhouse.compression` setting.
+    ///
+    /// A failed read falls back to the default (LZ4) with a warning rather
+    /// than failing startup: every other component that needs the database is
+    /// about to fail loudly on its own, and LZ4 is what the clients did before
+    /// the mode was configurable.
+    pub async fn stored_clickhouse_compression(&self) -> ClickHouseCompression {
+        match self.get_settings().await {
+            Ok(settings) => settings.clickhouse.compression,
+            Err(error) => {
+                warn!(
+                    %error,
+                    default = %ClickHouseCompression::default(),
+                    "Could not read the stored ClickHouse compression setting; using the default"
+                );
+                ClickHouseCompression::default()
+            }
         }
     }
 

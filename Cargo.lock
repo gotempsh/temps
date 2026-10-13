@@ -13013,6 +13013,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "temps-auth",
+ "temps-clickhouse",
  "temps-core",
  "temps-database",
  "temps-entities",
