@@ -301,7 +301,49 @@ impl Drop for TestDatabase {
     }
 }
 
+/// Longest a test database's cleanup waits for a lock on its schema.
+///
+/// `Drop` runs cleanup on a blocked thread and joins it, so an unbounded
+/// `DROP SCHEMA ... CASCADE` that queues behind a lock held by a connection
+/// of the same test (one left idle in a transaction) hangs the test process
+/// with no output: the holder's own rollback can only run once this returns.
+/// The schema belongs to a throwaway test run, so giving up after a warning
+/// leaks a few empty tables at worst.
+const SCHEMA_CLEANUP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl TestDatabase {
+    /// `DROP SCHEMA ... CASCADE` that gives up after `lock_timeout` instead
+    /// of waiting on a lock indefinitely. `SET LOCAL` scopes the timeout to
+    /// this one transaction, so the connection is returned unchanged.
+    async fn drop_schema_bounded<C>(
+        conn: &C,
+        schema_name: &str,
+        lock_timeout: std::time::Duration,
+    ) -> Result<(), sea_orm::DbErr>
+    where
+        C: ConnectionTrait + sea_orm::TransactionTrait,
+    {
+        let txn = conn.begin().await?;
+        let result = async {
+            txn.execute_unprepared(&format!(
+                "SET LOCAL lock_timeout = '{}ms'",
+                lock_timeout.as_millis().max(1)
+            ))
+            .await?;
+            txn.execute_unprepared(&format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name))
+                .await
+        }
+        .await;
+        match result {
+            Ok(_) => txn.commit().await,
+            Err(error) => {
+                // Roll back now rather than at Drop, which only queues it.
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Internal cleanup logic shared between Drop and the async cleanup() method.
     /// Uses the existing SeaORM connection pool.
     async fn run_cleanup(
@@ -310,10 +352,10 @@ impl TestDatabase {
         needs_counter_decrement: bool,
     ) {
         if let Some(schema_name) = schema {
-            let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-            let statement = Statement::from_string(DatabaseBackend::Postgres, drop_schema_sql);
-
-            if let Err(e) = db.execute(statement).await {
+            if let Err(e) =
+                Self::drop_schema_bounded(db.as_ref(), schema_name, SCHEMA_CLEANUP_LOCK_TIMEOUT)
+                    .await
+            {
                 eprintln!("Warning: Failed to drop test schema {}: {}", schema_name, e);
             }
         }
@@ -342,11 +384,13 @@ impl TestDatabase {
 
             match Database::connect(connect_options).await {
                 Ok(fresh_db) => {
-                    let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-                    let statement =
-                        Statement::from_string(DatabaseBackend::Postgres, drop_schema_sql);
-
-                    if let Err(e) = fresh_db.execute(statement).await {
+                    if let Err(e) = Self::drop_schema_bounded(
+                        &fresh_db,
+                        schema_name,
+                        SCHEMA_CLEANUP_LOCK_TIMEOUT,
+                    )
+                    .await
+                    {
                         eprintln!("Warning: Failed to drop test schema {}: {}", schema_name, e);
                     }
                     let _ = fresh_db.close().await;
@@ -1121,6 +1165,58 @@ mod tests {
         assert!(!is_container_runtime_unavailable(
             "Failed to pull timescale/timescaledb-ha: manifest unknown"
         ));
+    }
+
+    #[tokio::test]
+    async fn schema_cleanup_gives_up_when_a_lock_is_held() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+        let Some(test_db) = test_database_or_skip().await? else {
+            return Ok(());
+        };
+        let schema = test_db
+            .schema_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("test database has no schema of its own"))?;
+        test_db
+            .execute_sql("CREATE TABLE held_lock_table (id INT)")
+            .await?;
+
+        // Another connection of the same test sits in a transaction holding a
+        // lock that DROP SCHEMA ... CASCADE needs on the table.
+        let holder = test_db.db.begin().await?;
+        holder
+            .execute_unprepared(&format!(
+                "LOCK TABLE {schema}.held_lock_table IN ACCESS SHARE MODE"
+            ))
+            .await?;
+
+        let started = std::time::Instant::now();
+        let dropped = TestDatabase::drop_schema_bounded(
+            test_db.db.as_ref(),
+            &schema,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let error = dropped.expect_err("a held lock must stop the schema drop");
+        assert!(
+            error.to_string().contains("lock timeout"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the drop must be bounded by the lock timeout, took {:?}",
+            started.elapsed()
+        );
+
+        // Once the holder is gone the same drop goes through.
+        holder.rollback().await?;
+        TestDatabase::drop_schema_bounded(
+            test_db.db.as_ref(),
+            &schema,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+        Ok(())
     }
 
     #[tokio::test]
