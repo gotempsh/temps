@@ -62,10 +62,13 @@ pub fn remedy_for(
     match (mode, observed) {
         (ClickHouseCompression::None, _) => REMEDY_UNDECODABLE_UNCOMPRESSED,
         (ClickHouseCompression::Lz4, Some(CompressionMethod::Lz4)) => REMEDY_ALTERED_LZ4,
+        // A well-formed block in some other codec (including NONE, `0x02`):
+        // the server answered differently from what the request pinned.
         (ClickHouseCompression::Lz4, Some(CompressionMethod::Zstd))
+        | (ClickHouseCompression::Lz4, Some(CompressionMethod::None))
         | (ClickHouseCompression::Lz4, Some(CompressionMethod::Other(_))) => COMPRESSION_REMEDY,
-        (ClickHouseCompression::Lz4, Some(CompressionMethod::None))
-        | (ClickHouseCompression::Lz4, None) => REMEDY_NOT_A_BLOCK,
+        // No block header at all: nothing ClickHouse-shaped came back.
+        (ClickHouseCompression::Lz4, None) => REMEDY_NOT_A_BLOCK,
     }
 }
 
@@ -382,7 +385,12 @@ mod tests {
         use ClickHouseCompression::{Lz4, None as Uncompressed};
 
         // A different codec despite the pin: the server default is the cause.
-        for observed in [CompressionMethod::Zstd, CompressionMethod::Other(0x91)] {
+        // That includes a well-formed NONE (`0x02`) block.
+        for observed in [
+            CompressionMethod::Zstd,
+            CompressionMethod::None,
+            CompressionMethod::Other(0x91),
+        ] {
             let remedy = remedy_for(Lz4, Some(observed));
             assert!(remedy.contains("network_compression_method"), "{remedy}");
         }
@@ -393,14 +401,12 @@ mod tests {
             "{altered}"
         );
         assert!(altered.contains("altered or cut short"), "{altered}");
-        // Not a block at all.
-        for observed in [Some(CompressionMethod::None), None] {
-            let remedy = remedy_for(Lz4, observed);
-            assert!(
-                remedy.contains("not a ClickHouse compressed block"),
-                "{remedy}"
-            );
-        }
+        // Not a block at all: no header to read a method byte from.
+        let remedy = remedy_for(Lz4, None);
+        assert!(
+            remedy.contains("not a ClickHouse compressed block"),
+            "{remedy}"
+        );
         // Uncompressed mode never involves a codec.
         let uncompressed = remedy_for(Uncompressed, None);
         assert!(
