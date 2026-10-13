@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod ai_provider_harness_update;
+pub mod ai_provider_login;
 pub mod ai_providers;
 pub mod autofixer;
 pub mod config;
@@ -128,6 +130,12 @@ use crate::services::secret_service::SecretService;
         ai_providers::activate_ai_provider,
         ai_providers::update_ai_provider,
         ai_providers::refresh_ai_provider_models,
+        ai_provider_harness_update::get_ai_provider_harness_update,
+        ai_provider_harness_update::update_ai_provider_harness,
+        ai_provider_login::start_ai_provider_login,
+        ai_provider_login::get_ai_provider_login,
+        ai_provider_login::submit_ai_provider_login_code,
+        ai_provider_login::cancel_ai_provider_login,
     ),
     components(schemas(
         // Agent config
@@ -203,6 +211,11 @@ use crate::services::secret_service::SecretService;
         ai_providers::UpdateProviderRequest,
         ai_providers::UpdateProviderResponse,
         ai_providers::RefreshProviderModelsResponse,
+        ai_provider_login::AiProviderLoginResponse,
+        temps_ai::HarnessUpdateStatus,
+        ai_provider_login::SubmitLoginCodeRequest,
+        crate::services::provider_login_service::LoginSessionView,
+        crate::ai_cli::login::LoginPhase,
         temps_ai::ModelCatalogSource,
         temps_ai::HarnessCheck,
         temps_ai::HarnessCheckMode,
@@ -242,11 +255,18 @@ pub struct AppState {
     /// Late-bound normalized AI registry. Model refresh uses this service so
     /// it observes the same credential/environment as the next workspace turn.
     pub ai_service: Option<Arc<dyn temps_ai::AiService>>,
+    /// Console sign-in for subscription-backed AI CLIs (one-click login).
+    pub provider_login: Arc<crate::services::provider_login_service::ProviderLoginService>,
+    /// Sink that persists a finished sign-in; kept so the late-bound AI
+    /// registry can be attached once it exists.
+    pub login_sink: Arc<ai_provider_login::SettingsLoginSink>,
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(ai_providers::routes())
+        .merge(ai_provider_login::routes())
+        .merge(ai_provider_harness_update::routes())
         .merge(autofixer::routes())
         .merge(config::routes())
         .merge(definitions::routes())

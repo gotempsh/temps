@@ -426,9 +426,17 @@ impl UpgradeCommand {
         // preflight: Unix rejects an executable that is still open for write.
         let staged_path = seal_staged_binary(staged_file)?;
 
+        // The Linux tarball also carries the Firecracker guest agent, which
+        // must stay in step with the host's wire protocol. Stage it now, while
+        // a failure can still be reported before anything on disk changes, and
+        // swap it in right after the host binary. A miss is only a warning.
+        let staged_agent =
+            stage_vm_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
+
         // Replace the binary atomically
         println!("  Replacing binary at {}...", binary_path.display());
         finalize_staged_binary(&binary_path, staged_path)?;
+        install_vm_agent_reporting(staged_agent);
 
         println!();
         println!(
@@ -594,8 +602,13 @@ impl UpgradeCommand {
 
         let staged_path = seal_staged_binary(staged_file)?;
 
+        // Same guest-agent handling as the OSS path: see `run_oss`.
+        let staged_agent =
+            stage_vm_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
+
         println!("  Replacing binary at {}...", binary_path.display());
         finalize_staged_binary(&binary_path, staged_path)?;
+        install_vm_agent_reporting(staged_agent);
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
@@ -1563,6 +1576,25 @@ pub(crate) fn extract_binary_from_tarball_file(
     dest: &mut fs::File,
     dest_path: &Path,
 ) -> anyhow::Result<u64> {
+    extract_entry_from_tarball_file(tarball, tarball_path, dest, dest_path, "temps")?
+        .ok_or_else(|| anyhow::anyhow!("Binary 'temps' not found in the downloaded tarball"))
+}
+
+/// Stream one named regular-file entry out of an open gzipped tarball.
+///
+/// Returns `Ok(None)` when the tarball has no entry called `entry_name`, so a
+/// caller can tell "this release does not ship it" (the Linux tarballs carry
+/// `temps-vm-agent`, macOS and older ones do not) from a real extraction
+/// failure. Every validation [`extract_binary_from_tarball_file`] documents
+/// applies unchanged: regular files only, size checked against the tar header,
+/// and an empty entry is an error.
+fn extract_entry_from_tarball_file(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    dest: &mut fs::File,
+    dest_path: &Path,
+    entry_name: &str,
+) -> anyhow::Result<Option<u64>> {
     use flate2::read::GzDecoder;
 
     tarball.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
@@ -1597,7 +1629,7 @@ pub(crate) fn extract_binary_from_tarball_file(
                 )
             })?
             .file_name()
-            .map(|n| n == "temps")
+            .map(|n| n == entry_name)
             .unwrap_or(false);
 
         if !is_binary {
@@ -1611,7 +1643,8 @@ pub(crate) fn extract_binary_from_tarball_file(
         let entry_type = entry.header().entry_type();
         if !entry_type.is_file() {
             return Err(anyhow::anyhow!(
-                "Entry 'temps' in tarball {} is not a regular file ({:?})",
+                "Entry '{}' in tarball {} is not a regular file ({:?})",
+                entry_name,
                 tarball_path.display(),
                 entry_type
             ));
@@ -1656,18 +1689,154 @@ pub(crate) fn extract_binary_from_tarball_file(
         }
         if written == 0 {
             return Err(anyhow::anyhow!(
-                "Entry 'temps' in tarball {} is empty",
+                "Entry '{}' in tarball {} is empty",
+                entry_name,
                 tarball_path.display()
             ));
         }
 
-        debug!("Extracted {} bytes to {}", written, dest_path.display());
-        return Ok(written);
+        debug!(
+            "Extracted {} ({} bytes) to {}",
+            entry_name,
+            written,
+            dest_path.display()
+        );
+        return Ok(Some(written));
     }
 
-    Err(anyhow::anyhow!(
-        "Binary 'temps' not found in the downloaded tarball"
-    ))
+    Ok(None)
+}
+
+/// File name of the Firecracker guest agent that the Linux release tarballs
+/// carry beside `temps`. `temps firecracker setup` stages it from the
+/// directory of the running executable, so an upgrade has to keep it in step
+/// with the host binary or the two drift apart on the wire protocol.
+pub(crate) const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
+
+/// How an operator recovers when the guest agent could not be refreshed.
+///
+/// Deliberately not "re-run `temps upgrade`": by the time this is shown the
+/// host binary is already the new version, so a second run stops at "Already
+/// up to date" before it downloads anything and could never repair the agent.
+const VM_AGENT_MANUAL_INSTALL_HINT: &str = "To refresh it, extract temps-vm-agent from this \
+     release's temps-linux-<arch>.tar.gz and pass it to \
+     `temps firecracker setup --vm-agent-bin <path>`.";
+
+/// A guest agent extracted from the release tarball and sealed, waiting to be
+/// moved over the copy that sits beside the `temps` binary.
+///
+/// Staging and installing are separate so the agent can be pulled out of the
+/// tarball (and any extraction failure known) before the host binary is
+/// replaced, then swapped in right after it, both by atomic rename.
+#[derive(Debug)]
+pub(crate) struct StagedVmAgent {
+    staged: TempPath,
+    dest: PathBuf,
+}
+
+impl StagedVmAgent {
+    /// Where [`StagedVmAgent::install`] will put the agent.
+    pub(crate) fn dest(&self) -> &Path {
+        &self.dest
+    }
+
+    /// Atomically replace (or create) the guest agent beside the binary.
+    pub(crate) fn install(self) -> anyhow::Result<PathBuf> {
+        let StagedVmAgent { staged, dest } = self;
+        finalize_staged_binary(&dest, staged)?;
+        Ok(dest)
+    }
+}
+
+/// Pull `temps-vm-agent` out of the downloaded tarball into a sealed staging
+/// file beside `binary_path`.
+///
+/// `Ok(None)` means the release does not ship an agent (macOS, or a Linux
+/// release from before it was bundled) and is not a problem. An `Err` means
+/// the tarball does carry one and it could not be staged; callers treat that
+/// as a warning, never as a reason to abandon the host upgrade, because the
+/// agent is secondary to the binary that carries the security and migration
+/// fixes.
+pub(crate) fn stage_vm_agent_from_tarball(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    binary_path: &Path,
+) -> anyhow::Result<Option<StagedVmAgent>> {
+    let parent = binary_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot determine the directory of {} to place {} in",
+            binary_path.display(),
+            VM_AGENT_BINARY_NAME
+        )
+    })?;
+    let dest = parent.join(VM_AGENT_BINARY_NAME);
+
+    let mut staged_file = create_upgrade_temp_file(parent, ".temps-upgrade-agent.")?;
+    let staged_path = staged_file.path().to_path_buf();
+    let extracted = extract_entry_from_tarball_file(
+        tarball,
+        tarball_path,
+        staged_file.as_file_mut(),
+        &staged_path,
+        VM_AGENT_BINARY_NAME,
+    )?;
+    if extracted.is_none() {
+        // Dropping the NamedTempFile removes the scratch file.
+        return Ok(None);
+    }
+
+    let staged = seal_staged_binary(staged_file)?;
+    Ok(Some(StagedVmAgent { staged, dest }))
+}
+
+/// `temps upgrade` wrapper over [`stage_vm_agent_from_tarball`]: a failure is
+/// printed as a warning and the upgrade carries on without refreshing the
+/// agent.
+fn stage_vm_agent_reporting(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    binary_path: &Path,
+) -> Option<StagedVmAgent> {
+    match stage_vm_agent_from_tarball(tarball, tarball_path, binary_path) {
+        Ok(staged) => staged,
+        Err(e) => {
+            println!(
+                "  Warning: could not stage {} from the release: {}",
+                VM_AGENT_BINARY_NAME, e
+            );
+            println!(
+                "  The existing guest agent (if any) was left untouched. {}",
+                VM_AGENT_MANUAL_INSTALL_HINT
+            );
+            None
+        }
+    }
+}
+
+/// Install a staged guest agent after the host binary has been replaced, and
+/// say what happened. Never fails the upgrade: `temps` is already on disk.
+fn install_vm_agent_reporting(staged: Option<StagedVmAgent>) {
+    let Some(staged) = staged else {
+        return;
+    };
+    let dest = staged.dest().to_path_buf();
+    match staged.install() {
+        Ok(path) => {
+            println!("  Updated Firecracker guest agent at {}", path.display());
+            println!("  Re-run `temps firecracker setup` to give new sandboxes the updated agent.");
+        }
+        Err(e) => {
+            println!(
+                "  Warning: could not update the Firecracker guest agent at {}: {}",
+                dest.display(),
+                e
+            );
+            println!(
+                "  The host is upgraded but the guest agent is the previous version. {}",
+                VM_AGENT_MANUAL_INSTALL_HINT
+            );
+        }
+    }
 }
 
 /// Securely create an upgrade scratch file beside the target binary.
@@ -2826,6 +2995,237 @@ mod tests {
         drop(tarball);
         assert!(!dest_path.exists());
         assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    /// Build a gzipped tarball of regular files, in the given order.
+    fn tarball_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            for (name, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder.append_data(&mut header, name, *content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    /// Write `tarball_bytes` into a scratch file inside `dir` the way the
+    /// upgrade does, ready to be handed to the staging helpers.
+    fn downloaded_tarball(dir: &Path, tarball_bytes: &[u8]) -> NamedTempFile {
+        let mut tarball = create_upgrade_temp_file(dir, ".temps-upgrade-dl.").unwrap();
+        tarball.as_file_mut().write_all(tarball_bytes).unwrap();
+        tarball
+    }
+
+    #[test]
+    fn test_stage_vm_agent_replaces_existing_agent_beside_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let agent = dir.path().join(VM_AGENT_BINARY_NAME);
+        std::fs::write(&binary, b"old-host").unwrap();
+        std::fs::write(&agent, b"old-agent").unwrap();
+
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-vm-agent", b"new-agent")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged = stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap()
+            .expect("tarball carries the guest agent");
+        // Staging alone must not touch the live agent.
+        assert_eq!(std::fs::read(&agent).unwrap(), b"old-agent");
+        assert_eq!(staged.dest(), agent.as_path());
+
+        let installed = staged.install().unwrap();
+        assert_eq!(installed, agent);
+        assert_eq!(std::fs::read(&agent).unwrap(), b"new-agent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&agent).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "agent must be executable");
+        }
+        // The host binary is none of this helper's business.
+        assert_eq!(std::fs::read(&binary).unwrap(), b"old-host");
+        drop(tarball);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_vm_agent_installs_when_none_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        std::fs::write(&binary, b"old-host").unwrap();
+
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-vm-agent", b"new-agent")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged = stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap()
+            .expect("tarball carries the guest agent");
+        staged.install().unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join(VM_AGENT_BINARY_NAME)).unwrap(),
+            b"new-agent"
+        );
+    }
+
+    #[test]
+    fn test_stage_vm_agent_returns_none_when_release_does_not_ship_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let agent = dir.path().join(VM_AGENT_BINARY_NAME);
+        std::fs::write(&agent, b"existing-agent").unwrap();
+
+        // A macOS / pre-bundling Linux tarball: `temps` only.
+        let mut tarball = downloaded_tarball(dir.path(), &tarball_with_binary(b"new-host"));
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged =
+            stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary).unwrap();
+        assert!(staged.is_none());
+        assert_eq!(std::fs::read(&agent).unwrap(), b"existing-agent");
+        drop(tarball);
+        assert!(
+            upgrade_scratch_paths(dir.path()).is_empty(),
+            "a miss must not leave a staging file behind"
+        );
+    }
+
+    #[test]
+    fn test_stage_vm_agent_rejects_symlink_entry_and_leaves_existing_agent() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let agent = dir.path().join(VM_AGENT_BINARY_NAME);
+        std::fs::write(&agent, b"existing-agent").unwrap();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "temps-vm-agent", "/etc/passwd")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut tarball = downloaded_tarball(dir.path(), &encoder.finish().unwrap());
+        let tarball_path = tarball.path().to_path_buf();
+
+        let err = stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "error was: {err}");
+        assert!(err.contains("temps-vm-agent"), "error was: {err}");
+        assert_eq!(std::fs::read(&agent).unwrap(), b"existing-agent");
+        drop(tarball);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_vm_agent_rejects_empty_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-vm-agent", b"")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let err = stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is empty"), "error was: {err}");
+        drop(tarball);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_vm_agent_dropped_without_install_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let agent = dir.path().join(VM_AGENT_BINARY_NAME);
+        std::fs::write(&agent, b"existing-agent").unwrap();
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-vm-agent", b"new-agent")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged = stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap()
+            .unwrap();
+        // The host swap failed, so the staged agent is abandoned.
+        drop(staged);
+        drop(tarball);
+
+        assert_eq!(std::fs::read(&agent).unwrap(), b"existing-agent");
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_vm_agent_install_into_a_directory_fails_with_destination_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        // A directory cannot be replaced by a file rename.
+        std::fs::create_dir(dir.path().join(VM_AGENT_BINARY_NAME)).unwrap();
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-vm-agent", b"new-agent")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged = stage_vm_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap()
+            .unwrap();
+        let err = staged.install().unwrap_err().to_string();
+        assert!(err.contains("temps-vm-agent"), "error was: {err}");
+        drop(tarball);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    /// The host binary must still be found when the guest agent precedes it
+    /// in the archive: the shared extractor matches by name, not position.
+    #[test]
+    fn test_extract_binary_ignores_vm_agent_entry_ordered_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps-vm-agent", b"the-agent"), ("temps", b"the-host")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest_path).unwrap(), b"the-host");
     }
 
     #[test]

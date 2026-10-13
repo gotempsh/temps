@@ -502,6 +502,26 @@ info "Extracting temps..."
 tar -xzf "$tarball" -C "$bin_dir" temps ||
     error "Failed to extract temps"
 
+# Linux tarballs also carry the Firecracker guest agent, which
+# `temps firecracker setup` looks for next to the temps binary. macOS tarballs
+# and older Linux ones don't contain it, so its absence is not an error -- but a
+# failure to extract it when it IS there (full disk, bad permissions) is
+# reported instead of being mistaken for "not in this archive". The listing is
+# captured rather than piped into `grep -q`, which would SIGPIPE tar and fail
+# the pipeline under `pipefail` even on a match.
+if archive_members=$(tar -tzf "$tarball"); then
+    if grep -qE '^(\./)?temps-vm-agent$' <<<"$archive_members"; then
+        if tar -xzf "$tarball" -C "$bin_dir" temps-vm-agent; then
+            chmod +x "$bin_dir/temps-vm-agent" ||
+                warning 'Failed to set permissions on temps-vm-agent'
+        else
+            warning "Failed to extract temps-vm-agent to \"$bin_dir\"; Firecracker sandboxes will be unavailable until it is installed"
+        fi
+    fi
+else
+    warning 'Failed to list tarball contents; skipping temps-vm-agent'
+fi
+
 rm "$tarball" ||
     warning "Failed to remove temporary tarball"
 

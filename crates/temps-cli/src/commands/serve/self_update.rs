@@ -43,7 +43,8 @@ use crate::commands::upgrade::{
     check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_to_file,
     extract_binary_from_tarball_file, fetch_expected_checksum, fetch_latest_release_in_channel,
     fetch_specific_release, finalize_staged_binary, is_newer_version, is_older_version,
-    platform_target, seal_staged_binary, verify_computed_checksum, GitHubRelease, UpgradeChannel,
+    platform_target, seal_staged_binary, stage_vm_agent_from_tarball, verify_computed_checksum,
+    GitHubRelease, UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -959,11 +960,50 @@ impl UpdateJob {
         let staged_path = seal_staged_binary(staged_file)?;
         preflight_staged_binary(staged_path.as_ref())?;
 
+        // The Firecracker guest agent ships in the same tarball and has to
+        // match the host's wire protocol, so refresh it alongside the binary.
+        // Strictly best-effort: staging happens before the swap so a failure
+        // is known up front, and neither it nor the install below can turn a
+        // verified host update into a failed one.
+        let staged_agent = match stage_vm_agent_from_tarball(
+            download_file.as_file_mut(),
+            &download_path,
+            &self.binary_path,
+        ) {
+            Ok(staged) => staged,
+            Err(e) => {
+                warn!(
+                    to = %to_version,
+                    binary = %self.binary_path.display(),
+                    error = %e,
+                    "Could not stage the Firecracker guest agent from the release; the existing one was left untouched"
+                );
+                None
+            }
+        };
+
         self.set_phase(SelfUpdatePhase::Installing, None);
         // Keep the outgoing binary next to the new one so a release that boots
         // but misbehaves can be reverted with a single `mv`, without network.
         let backup_path = backup_current_binary(&self.binary_path)?;
         finalize_staged_binary(&self.binary_path, staged_path)?;
+
+        if let Some(staged_agent) = staged_agent {
+            let agent_path = staged_agent.dest().to_path_buf();
+            match staged_agent.install() {
+                Ok(path) => info!(
+                    to = %to_version,
+                    agent = %path.display(),
+                    "Updated the Firecracker guest agent beside the binary; re-run `temps firecracker setup` to give new sandboxes the updated agent"
+                ),
+                Err(e) => warn!(
+                    to = %to_version,
+                    agent = %agent_path.display(),
+                    error = %e,
+                    "Host binary updated but the Firecracker guest agent could not be replaced; it is still the previous version"
+                ),
+            }
+        }
 
         Ok((to_version, backup_path))
     }

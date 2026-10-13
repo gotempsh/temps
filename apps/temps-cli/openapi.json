@@ -2229,6 +2229,14 @@
         ],
         "type": "object"
       },
+      "AiProviderLoginResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/LoginSessionView"
+          }
+        ],
+        "description": "Response wrapper kept separate from the service view so the wire shape is\nowned by the handler layer."
+      },
       "AiProviderStatusResponse": {
         "description": "Current API-gateway availability for this instance.\n\nThe `configured` field drives the UI onboarding state: when `false` the UI\nmust show _exactly what is missing_ (`reason`) and _where to fix it_\n(`setup_path`), not hide the feature.",
         "properties": {
@@ -27175,6 +27183,56 @@
         ],
         "type": "object"
       },
+      "HarnessUpdateStatus": {
+        "description": "Installed and latest version of a provider's harness CLI inside the\ncaller's persistent workspace.\n\nA harness that is behind the latest release cannot offer models released\nafter it, so the console shows this and lets the operator update it.",
+        "properties": {
+          "checked_at": {
+            "description": "When the versions were last read from the workspace (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "Why the versions could not be determined, when they could not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installed_version": {
+            "description": "Version reported by the CLI in the workspace, when it could be read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latest_version": {
+            "description": "Latest version published for the CLI, when it could be looked up.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "update_available": {
+            "description": "True only when both versions are known and `latest_version` is newer.",
+            "type": "boolean"
+          },
+          "updating": {
+            "description": "An update is running right now.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider_id",
+          "update_available",
+          "updating"
+        ],
+        "type": "object"
+      },
       "HasAnalyticsEventsResponse": {
         "properties": {
           "has_events": {
@@ -31428,6 +31486,17 @@
         ],
         "type": "string"
       },
+      "LoginPhase": {
+        "enum": [
+          "starting",
+          "waiting",
+          "verifying",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
       "LoginRequest": {
         "properties": {
           "email": {
@@ -31440,6 +31509,74 @@
         "required": [
           "email",
           "password"
+        ],
+        "type": "object"
+      },
+      "LoginSessionView": {
+        "description": "Snapshot of one sign-in, safe to return to a browser: it carries the link\nand device code the operator needs and no credential material.",
+        "properties": {
+          "detail": {
+            "description": "Human-readable status of the current phase, or why it ended.",
+            "type": "string"
+          },
+          "elapsed_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "$ref": "#/components/schemas/LoginPhase"
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "requires_code": {
+            "description": "True when the operator must paste a code back into Temps.",
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "user_code": {
+            "description": "Device code to enter on that page, for device-code providers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verification_url": {
+            "description": "Page the operator opens in their browser. Present from `waiting`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "provider_id",
+          "phase",
+          "detail",
+          "requires_code",
+          "started_at",
+          "elapsed_seconds",
+          "timeout_seconds"
         ],
         "type": "object"
       },
@@ -41206,6 +41343,17 @@
               }
             ]
           },
+          "login_supported": {
+            "description": "True when this provider's CLI can sign in to a subscription from the\nconsole (\"Sign in with Claude\"). The UI shows the control whenever this\nis true, even if `login_unavailable_reason` says it cannot run yet.",
+            "type": "boolean"
+          },
+          "login_unavailable_reason": {
+            "description": "Why signing in cannot start right now (CLI not installed on this\nserver, data directory unavailable) or why the provider has no\nconsole sign-in. `None` when the sign-in can be started.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "max_turns_analysis": {
             "description": "Default max turns for the autofixer analysis phase. `None` = built-in\ndefault (10). Only enforced for CLIs with a turn flag (Claude Code).",
             "format": "int32",
@@ -41302,7 +41450,8 @@
           "supports_max_turns",
           "host_authenticated",
           "model_source",
-          "workspace_ready"
+          "workspace_ready",
+          "login_supported"
         ],
         "type": "object"
       },
@@ -53207,6 +53356,19 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "SubmitLoginCodeRequest": {
+        "description": "Body for `POST /settings/ai-providers/{provider_id}/login/code`.",
+        "properties": {
+          "code": {
+            "description": "The authorization code shown by the provider after approving access.\nNever logged and never echoed back.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
         "type": "object"
       },
       "SupervisorKind": {
@@ -124061,6 +124223,322 @@
           }
         ],
         "summary": "Verify a previously imported OpenCode credential against a user-selected\nmodel without asking the browser to receive or resubmit the secret.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/harness-update": {
+      "get": {
+        "operationId": "get_ai_provider_harness_update",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Look inside the workspace again instead of returning the cached check.",
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessUpdateStatus"
+                }
+              }
+            },
+            "description": "Harness version status"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Unknown provider"
+          },
+          "503": {
+            "description": "The workspace could not be inspected"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Installed and latest version of the provider's harness CLI in your\npersistent workspace, and whether an update is available.",
+        "tags": [
+          "Agents"
+        ]
+      },
+      "post": {
+        "operationId": "update_ai_provider_harness",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessUpdateStatus"
+                }
+              }
+            },
+            "description": "Harness updated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Unknown provider"
+          },
+          "409": {
+            "description": "The workspace is busy or already updating"
+          },
+          "503": {
+            "description": "The update could not run"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Install the latest release of the provider's harness CLI in your\npersistent workspace so newly released models become available.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/login": {
+      "get": {
+        "operationId": "get_ai_provider_login",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderLoginResponse"
+                }
+              }
+            },
+            "description": "Sign-in state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No sign-in has been started"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Current sign-in state for a provider: phase, link, device code, elapsed time.",
+        "tags": [
+          "Agents"
+        ]
+      },
+      "post": {
+        "description": "Returns immediately in the `starting` phase; poll `GET` for the link.",
+        "operationId": "start_ai_provider_login",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderLoginResponse"
+                }
+              }
+            },
+            "description": "Sign-in started"
+          },
+          "400": {
+            "description": "Provider has no console sign-in"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Unknown provider"
+          },
+          "409": {
+            "description": "A sign-in is already in progress"
+          },
+          "429": {
+            "description": "Too many sign-ins running"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Start signing an AI provider's CLI in to a subscription.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/login/cancel": {
+      "post": {
+        "operationId": "cancel_ai_provider_login",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderLoginResponse"
+                }
+              }
+            },
+            "description": "Sign-in cancelled"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No sign-in has been started"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Cancel an in-progress sign-in and stop its CLI process.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/login/code": {
+      "post": {
+        "operationId": "submit_ai_provider_login_code",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitLoginCodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderLoginResponse"
+                }
+              }
+            },
+            "description": "Code submitted"
+          },
+          "400": {
+            "description": "Invalid code"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No sign-in in progress"
+          },
+          "409": {
+            "description": "Sign-in is not waiting for a code"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Hand the provider's authorization code to the waiting CLI.",
         "tags": [
           "Agents"
         ]
