@@ -174,8 +174,21 @@ impl TempsPlugin for LogAggregatorPlugin {
             // skipped is logged; the chosen store is reported by the
             // capabilities endpoint so the operator always knows where the
             // index is (never a silent downgrade).
+            //
+            // The wire-compression mode comes from the stored
+            // `clickhouse.compression` setting, resolved once by
+            // `ConfigPlugin`, so this client agrees with every other
+            // ClickHouse client of the process.
+            let clickhouse_compression = context
+                .get_service::<temps_config::ConfigService>()
+                .map(|config_service| config_service.clickhouse_compression())
+                .unwrap_or_default();
+            let local_index_config = self
+                .line_index_config
+                .clone()
+                .map(|config| config.with_compression(clickhouse_compression));
             let selected_index = select_line_index(
-                self.line_index_config.as_ref(),
+                local_index_config.as_ref(),
                 context.get_service::<temps_cloud_client::CloudLink>(),
                 db.clone(),
             )

@@ -907,12 +907,20 @@ fn inspect_zip_archive(path: &std::path::Path) -> Result<DropZipInspection, Prob
         if entry.is_dir() {
             continue;
         }
+        // The decoded name is what `enclosed_name` and the classifier see
+        // (legacy CP437 names included), so diagnostics must show the same
+        // one. `ZipFile::name` is fallible since zip 9; only on an actual
+        // decode error fall back to a lossy rendering of the raw bytes.
+        let display_name = || match entry.name() {
+            Ok(name) => name,
+            Err(_) => String::from_utf8_lossy(entry.name_raw()),
+        };
         let path = entry.enclosed_name().ok_or_else(|| {
             problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Unsafe ZIP Entry")
                 .with_detail(format!(
                     "Archive entry '{}' escapes the project root",
-                    entry.name()
+                    display_name()
                 ))
         })?;
         match temps_core::drop_entries::classify_drop_entry(&path) {
@@ -925,7 +933,7 @@ fn inspect_zip_archive(path: &std::path::Path) -> Result<DropZipInspection, Prob
                 continue;
             }
             temps_core::drop_entries::DropEntryDisposition::Refuse { reason } => {
-                return Err(sensitive_zip_entry_problem(entry.name(), reason));
+                return Err(sensitive_zip_entry_problem(&display_name(), reason));
             }
         }
         if entry
@@ -934,7 +942,7 @@ fn inspect_zip_archive(path: &std::path::Path) -> Result<DropZipInspection, Prob
         {
             return Err(problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Unsupported ZIP Entry")
-                .with_detail(format!("Symbolic link '{}' is not allowed", entry.name())));
+                .with_detail(format!("Symbolic link '{}' is not allowed", display_name())));
         }
         let normalized = path.to_string_lossy().replace('\\', "/");
         let (directory, basename) = normalized.rsplit_once('/').unwrap_or((".", &normalized));
@@ -4471,6 +4479,31 @@ mod tests {
         let detail = problem.body["detail"].as_str().unwrap();
         assert!(detail.contains("'certs/server.key'"), "{detail}");
         assert!(detail.contains("private key"), "{detail}");
+    }
+
+    /// A legacy archive writes names in CP437 with no UTF-8 flag. zip decodes
+    /// those names, so the classifier sees `café/server.key`; the diagnostic
+    /// the console turns into "remove X from the archive" must say the same,
+    /// not the replacement-character rendering of the raw bytes.
+    #[test]
+    fn drop_names_a_legacy_cp437_entry_with_its_decoded_name() {
+        // `X` is patched to 0x82 (é in CP437) below. Same length, so offsets
+        // and CRCs are untouched, and an ASCII name carries no UTF-8 flag.
+        let zip = drop_test_zip(&[("package.json", "{}"), ("cafX/server.key", "fixture-only")]);
+        let mut bytes = std::fs::read(zip.path()).unwrap();
+        let mut patched = 0;
+        while let Some(at) = bytes.windows(4).position(|window| window == b"cafX") {
+            bytes[at + 3] = 0x82;
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "local header and central directory");
+        std::fs::write(zip.path(), &bytes).unwrap();
+
+        let problem = inspect_zip_archive(zip.path()).err().unwrap();
+        assert_eq!(problem.body["title"], "Sensitive ZIP Entry");
+        assert_eq!(problem.body["entry"], "caf\u{e9}/server.key");
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(detail.contains("'caf\u{e9}/server.key'"), "{detail}");
     }
 
     #[test]

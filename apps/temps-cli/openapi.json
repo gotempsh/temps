@@ -3574,6 +3574,13 @@
             "description": "Enable Bunny delivery by default only for projects created after this is set.",
             "type": "boolean"
           },
+          "clickhouse": {
+            "$ref": "#/components/schemas/ClickHouseSettings",
+            "default": {
+              "compression": "lz4"
+            },
+            "description": "How Temps talks to the instance's ClickHouse server (wire compression\nof query responses). Read once when the process starts, so a change\nis applied by the next restart; the Settings API reports the mode the\nrunning process actually uses next to the stored one."
+          },
           "cloud": {
             "$ref": "#/components/schemas/CloudSettings",
             "default": {
@@ -3942,6 +3949,10 @@
           "bunny_new_projects": {
             "type": "boolean"
           },
+          "clickhouse": {
+            "$ref": "#/components/schemas/ClickHouseSettingsResponse",
+            "description": "ClickHouse wire compression: the stored choice, the mode the running\nprocess actually uses, and what the startup probe found. Always\npresent; `configured: false` explains what is missing instead of the\nsection disappearing."
+          },
           "cloud": {
             "$ref": "#/components/schemas/CloudSettings",
             "description": "Managed control-plane destination and explicit export consent flags."
@@ -4143,6 +4154,7 @@
           "monitoring",
           "observability_compression",
           "observability_retention",
+          "clickhouse",
           "geo",
           "effective_metrics_store",
           "effective_observability_store",
@@ -7819,6 +7831,177 @@
         "required": [
           "username",
           "password"
+        ],
+        "type": "object"
+      },
+      "ClickHouseCompression": {
+        "description": "Wire compression used on the HTTP connection to the instance's ClickHouse\nserver.\n\nThe `clickhouse` client asks for compressed responses (`compress=1`) and\ndecodes exactly one codec, LZ4, but it never says which codec it wants, so\nit silently depends on the server's `network_compression_method` default.\nClickHouse 26.9 changed that default to ZSTD, after which every response\nthat carries rows fails with `decompression error: incorrect magic\nnumber`. Temps therefore makes the choice itself and never leaves it to the\nserver default.",
+        "enum": [
+          "lz4",
+          "none"
+        ],
+        "type": "string"
+      },
+      "ClickHouseConnectionState": {
+        "description": "Where the connection to the instance's ClickHouse server stands.",
+        "enum": [
+          "not_configured",
+          "not_checked",
+          "reachable",
+          "failing"
+        ],
+        "type": "string"
+      },
+      "ClickHouseConnectionStatus": {
+        "description": "Result of the ClickHouse startup/background probe. Carries no credentials:\n`host` is `host[:port]` only.",
+        "properties": {
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "Full operator-facing description of the failure.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failure_kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClickHouseFailureKind",
+                "description": "Set when `state` is `failing`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "host": {
+            "description": "`host[:port]` of the configured server.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_checked_at": {
+            "description": "When the last probe finished (ISO 8601, `Z`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_compression_method": {
+            "description": "For decode failures: the compression method byte seen on the wire,\ne.g. `zstd (0x90)`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remedy": {
+            "description": "What to do about the failure, when there is a known remedy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "server_version": {
+            "description": "Server version from the last successful probe, e.g. `26.9.17`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/ClickHouseConnectionState"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "ClickHouseFailureKind": {
+        "description": "Why the last ClickHouse probe failed.",
+        "enum": [
+          "decode",
+          "unreachable",
+          "server",
+          "other"
+        ],
+        "type": "string"
+      },
+      "ClickHouseSettings": {
+        "description": "Settings for the connection to the instance's ClickHouse server.\n\nThe connection itself (URL, database, user, password) is bootstrap\nconfiguration in `TEMPS_CLICKHOUSE_*`; only behaviour an operator may need\nto change at runtime lives here.",
+        "properties": {
+          "compression": {
+            "$ref": "#/components/schemas/ClickHouseCompression",
+            "default": "lz4",
+            "description": "Wire compression for query responses. See [`ClickHouseCompression`]."
+          }
+        },
+        "type": "object"
+      },
+      "ClickHouseSettingsResponse": {
+        "description": "ClickHouse wire compression and connection state, as the settings page\nneeds them. Not a credential holder: the connection string is never echoed.",
+        "properties": {
+          "available_compressions": {
+            "description": "The modes that can be chosen.",
+            "items": {
+              "$ref": "#/components/schemas/ClickHouseCompression"
+            },
+            "type": "array"
+          },
+          "compression": {
+            "$ref": "#/components/schemas/ClickHouseCompression",
+            "description": "The stored mode: what the next start will use."
+          },
+          "configured": {
+            "description": "Whether the instance has a ClickHouse connection\n(`TEMPS_CLICKHOUSE_*`). When `false` the compression setting is stored\nbut has nothing to apply to yet.",
+            "type": "boolean"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/ClickHouseConnectionStatus",
+            "description": "Result of the last connection probe."
+          },
+          "effective_compression": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClickHouseCompression",
+                "description": "The mode the running process built its ClickHouse clients with.\n`None` when ClickHouse is not configured."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "description": "Why ClickHouse is unavailable, when `configured` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restart_required": {
+            "description": "True when `compression` differs from `effective_compression`: the\nstored change takes effect on the next restart.",
+            "type": "boolean"
+          },
+          "setup_path": {
+            "description": "Console path where the operator manages this, when `configured` is\n`false` or the probe is failing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "compression",
+          "restart_required",
+          "available_compressions",
+          "connection"
         ],
         "type": "object"
       },
@@ -15849,6 +16032,9 @@
           "registry_unavailable",
           "image_pull_failed",
           "dockerfile_copy_not_found",
+          "static_output_rejected",
+          "build_node_unreachable",
+          "static_deploy_failed",
           "unknown"
         ],
         "type": "string"

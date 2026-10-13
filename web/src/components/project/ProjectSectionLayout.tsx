@@ -35,7 +35,8 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 
-const sectionIcons: Record<string, LucideIcon> = {
+/** Icon per section link URL; a link missing here falls back to a plug. */
+export const sectionIcons: Record<string, LucideIcon> = {
   project: Home,
   observe: History,
   runtime: ScrollText,
@@ -46,6 +47,7 @@ const sectionIcons: Record<string, LucideIcon> = {
   'ai-gateway?tab=activity': Bot,
   metrics: Gauge,
   monitors: Activity,
+  'status-pages': Globe,
   'errors/alert-rules': Bell,
   analytics: BarChart3,
   'analytics/visitors': Users,

@@ -1677,6 +1677,13 @@ export type AppSettings = {
      */
     bunny_new_projects?: boolean;
     /**
+     * How Temps talks to the instance's ClickHouse server (wire compression
+     * of query responses). Read once when the process starts, so a change
+     * is applied by the next restart; the Settings API reports the mode the
+     * running process actually uses next to the stored one.
+     */
+    clickhouse?: ClickHouseSettings;
+    /**
      * Managed control-plane connection. Credentials are deliberately not
      * stored here; they live in the owner-only cloud-link state file.
      */
@@ -1915,6 +1922,13 @@ export type AppSettingsResponse = {
      */
     build_limits: BuildLimitsSettings;
     bunny_new_projects: boolean;
+    /**
+     * ClickHouse wire compression: the stored choice, the mode the running
+     * process actually uses, and what the startup probe found. Always
+     * present; `configured: false` explains what is missing instead of the
+     * section disappearing.
+     */
+    clickhouse: ClickHouseSettingsResponse;
     /**
      * Managed control-plane destination and explicit export consent flags.
      */
@@ -3655,6 +3669,119 @@ export type CliDeviceStartResponse = {
 export type CliLoginRequest = {
     password: string;
     username: string;
+};
+
+/**
+ * Wire compression used on the HTTP connection to the instance's ClickHouse
+ * server.
+ *
+ * The `clickhouse` client asks for compressed responses (`compress=1`) and
+ * decodes exactly one codec, LZ4, but it never says which codec it wants, so
+ * it silently depends on the server's `network_compression_method` default.
+ * ClickHouse 26.9 changed that default to ZSTD, after which every response
+ * that carries rows fails with `decompression error: incorrect magic
+ * number`. Temps therefore makes the choice itself and never leaves it to the
+ * server default.
+ */
+export type ClickHouseCompression = 'lz4' | 'none';
+
+/**
+ * Where the connection to the instance's ClickHouse server stands.
+ */
+export type ClickHouseConnectionState = 'not_configured' | 'not_checked' | 'reachable' | 'failing';
+
+/**
+ * Result of the ClickHouse startup/background probe. Carries no credentials:
+ * `host` is `host[:port]` only.
+ */
+export type ClickHouseConnectionStatus = {
+    database?: string | null;
+    /**
+     * Full operator-facing description of the failure.
+     */
+    detail?: string | null;
+    failure_kind?: ClickHouseFailureKind | null;
+    /**
+     * `host[:port]` of the configured server.
+     */
+    host?: string | null;
+    /**
+     * When the last probe finished (ISO 8601, `Z`).
+     */
+    last_checked_at?: string | null;
+    /**
+     * For decode failures: the compression method byte seen on the wire,
+     * e.g. `zstd (0x90)`.
+     */
+    observed_compression_method?: string | null;
+    /**
+     * What to do about the failure, when there is a known remedy.
+     */
+    remedy?: string | null;
+    /**
+     * Server version from the last successful probe, e.g. `26.9.17`.
+     */
+    server_version?: string | null;
+    state: ClickHouseConnectionState;
+};
+
+/**
+ * Why the last ClickHouse probe failed.
+ */
+export type ClickHouseFailureKind = 'decode' | 'unreachable' | 'server' | 'other';
+
+/**
+ * Settings for the connection to the instance's ClickHouse server.
+ *
+ * The connection itself (URL, database, user, password) is bootstrap
+ * configuration in `TEMPS_CLICKHOUSE_*`; only behaviour an operator may need
+ * to change at runtime lives here.
+ */
+export type ClickHouseSettings = {
+    /**
+     * Wire compression for query responses. See [`ClickHouseCompression`].
+     */
+    compression?: ClickHouseCompression;
+};
+
+/**
+ * ClickHouse wire compression and connection state, as the settings page
+ * needs them. Not a credential holder: the connection string is never echoed.
+ */
+export type ClickHouseSettingsResponse = {
+    /**
+     * The modes that can be chosen.
+     */
+    available_compressions: Array<ClickHouseCompression>;
+    /**
+     * The stored mode: what the next start will use.
+     */
+    compression: ClickHouseCompression;
+    /**
+     * Whether the instance has a ClickHouse connection
+     * (`TEMPS_CLICKHOUSE_*`). When `false` the compression setting is stored
+     * but has nothing to apply to yet.
+     */
+    configured: boolean;
+    /**
+     * Result of the last connection probe.
+     */
+    connection: ClickHouseConnectionStatus;
+    effective_compression?: ClickHouseCompression | null;
+    /**
+     * Why ClickHouse is unavailable, when `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * True when `compression` differs from `effective_compression`: the
+     * stored change takes effect on the next restart.
+     */
+    restart_required: boolean;
+    /**
+     * Console path where the operator manages this, when `configured` is
+     * `false` or the probe is failing.
+     */
+    setup_path?: string | null;
 };
 
 export type CloudAiCapability = {
@@ -7655,7 +7782,7 @@ export type DeploymentEnvironmentResponse = {
  * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
  * variants rather than renaming existing ones.
  */
-export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'unknown';
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'static_output_rejected' | 'build_node_unreachable' | 'static_deploy_failed' | 'unknown';
 
 /**
  * API view of a failed deployment's classification.

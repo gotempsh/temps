@@ -48,7 +48,16 @@ use utoipa::ToSchema;
 /// reserved for a build that succeeded and then lost its image), and a
 /// Dockerfile `COPY`/`ADD` of a path that is not in the build context gets its
 /// own code, `dockerfile_copy_not_found`.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 5;
+///
+/// v6: failures of the static-site deploy jobs (`deploy_static`,
+/// `deploy_static_bundle`, `deploy_static_from_source`) are classified by what
+/// went wrong instead of falling through to `deploy`/`unknown`: a missing
+/// output path is `static_output_missing`, output the platform refuses to
+/// publish is `static_output_rejected`, an unreachable build node is
+/// `build_node_unreachable`, and any other extraction or publish error is
+/// `static_deploy_failed`. A Docker archive download is no longer reported as a
+/// dependency download.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 6;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -183,6 +192,16 @@ pub enum DeploymentFailureCode {
     /// A Dockerfile `COPY`/`ADD` names a path that is not in the build
     /// context.
     DockerfileCopyNotFound,
+    // ── v6 ──────────────────────────────────────────────────────────────
+    /// The static output was extracted but the platform refuses to publish it
+    /// (too large, too many files, links or special files, sensitive files).
+    StaticOutputRejected,
+    /// The node that built the image could not be reached to fetch the static
+    /// output (transient; a retry may succeed).
+    BuildNodeUnreachable,
+    /// Extracting or publishing static files failed for a reason not covered
+    /// above.
+    StaticDeployFailed,
     Unknown,
 }
 
@@ -236,6 +255,9 @@ impl DeploymentFailureCode {
             Self::RegistryUnavailable => "registry_unavailable",
             Self::ImagePullFailed => "image_pull_failed",
             Self::DockerfileCopyNotFound => "dockerfile_copy_not_found",
+            Self::StaticOutputRejected => "static_output_rejected",
+            Self::BuildNodeUnreachable => "build_node_unreachable",
+            Self::StaticDeployFailed => "static_deploy_failed",
             Self::Unknown => "unknown",
         }
     }
@@ -289,6 +311,9 @@ impl DeploymentFailureCode {
         Self::RegistryUnavailable,
         Self::ImagePullFailed,
         Self::DockerfileCopyNotFound,
+        Self::StaticOutputRejected,
+        Self::BuildNodeUnreachable,
+        Self::StaticDeployFailed,
         Self::Unknown,
     ];
 }
@@ -633,6 +658,21 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "Deployment image could not be pulled",
             "The image this deployment runs could not be pulled from its registry. Check the image reference and tag, add registry credentials if the image is private, then redeploy.",
             Some(S::Source),
+        ),
+        C::StaticOutputRejected => (
+            "Static output cannot be published",
+            "The build produced files the platform refuses to publish as a static site: the output is larger than the static size or file-count limits, or it contains symbolic links, special files or sensitive files such as .env. Remove them from the output directory (or exclude them in the build), or point the output directory at the folder that holds only the site.",
+            Some(S::Build),
+        ),
+        C::BuildNodeUnreachable => (
+            "Build node unreachable",
+            "The build finished on a worker node, but Temps could not reach that node to fetch the built files. Check the node is online (Nodes page) and reachable from the control plane, then redeploy. If the node was removed, redeploy so the build runs on an available node.",
+            Some(S::Deploy),
+        ),
+        C::StaticDeployFailed => (
+            "Static files could not be published",
+            "The site built, but Temps could not extract or store its files. This is usually transient or caused by the host: check free disk space on the control plane and that Docker is healthy, then redeploy. If it repeats, the deployment log shows the exact step that failed.",
+            Some(S::Deploy),
         ),
         C::DockerfileCopyNotFound => (
             "Dockerfile COPY source not found",
@@ -1241,6 +1281,95 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         }
         let stage = phase.map(phase_stage).unwrap_or(S::Platform);
         return make(stage, C::Timeout);
+    }
+
+    // ── Static-site deploy (extract the output, publish it) ─────────────
+    // These jobs run after a successful build, so their messages are about
+    // the built files, not the build. They must be matched before the generic
+    // download, permission and "not found" rules below, which would
+    // otherwise misread the Docker archive text.
+    //
+    // The failed job's id decides when the reason names one. The message
+    // markers are only a fallback for a reason stored without that wrapper:
+    // a build's own output or a Dockerfile excerpt can contain "docker
+    // archive" or "static deployment ", and must keep the code its text earns.
+    let static_job = match failed_job_id(raw) {
+        Some(job) => matches!(
+            job,
+            "deploy_static"
+                | "deploy_static_bundle"
+                | "deploy_static_from_source"
+                | "persist_static_assets"
+        ),
+        None => contains_any(
+            r,
+            &[
+                "failed to extract files from container path",
+                "failed to deploy static files",
+                "cannot reach the node that built image",
+                "extracting static files",
+                "static deployment ",
+                "docker archive",
+            ],
+        ),
+    };
+    if static_job {
+        // The image itself is gone: that is the existing "built image
+        // missing" case, not a problem with the output path.
+        if contains_any(
+            r,
+            &[
+                "is not present on this node",
+                "no such image",
+                "built image not found",
+            ],
+        ) {
+            return make(S::Image, C::ImageMissing);
+        }
+        if contains_any(r, &["could not find the file", "could not find the path"]) {
+            // Docker's own wording for an absent archive path. A bare
+            // "No such file or directory" is not matched: it also comes from
+            // the host (temp directory, publish step), which is not the
+            // build's output.
+            return make(S::Build, C::StaticOutputMissing);
+        }
+        if contains_any(
+            r,
+            &[
+                "cannot reach the node that built image",
+                "connection refused",
+                "error sending request",
+                "error trying to connect",
+            ],
+        ) {
+            return make(S::Deploy, C::BuildNodeUnreachable);
+        }
+        if contains_any(
+            r,
+            &[
+                "resource limit exceeded",
+                "extracted-size limit",
+                "entry limit",
+                "per-entry limit",
+                "component depth limit",
+                "download limit",
+                // Bundle and direct-source jobs state their size limits in
+                // their own words.
+                "exceeds maximum allowed decompressed size",
+                "byte per-file limit",
+                "byte aggregate limit",
+                "disallowed type",
+                "symbolic link",
+                "non-regular filesystem entry",
+                "is not publishable",
+                "unsafe entry",
+                "path traversal",
+                "did not resolve to a confined directory",
+            ],
+        ) {
+            return make(S::Deploy, C::StaticOutputRejected);
+        }
+        return make(S::Deploy, C::StaticDeployFailed);
     }
 
     // ── Source ──────────────────────────────────────────────────────────
@@ -2411,5 +2540,165 @@ mod tests {
         assert_eq!(info.classifier_version, FAILURE_CLASSIFIER_VERSION);
         assert!(describe_failure(None).is_none());
         assert!(describe_failure(Some("   ")).is_none());
+    }
+
+    // ── Static-site deploy jobs ─────────────────────────────────────────
+
+    fn static_extract(inner: &str) -> String {
+        wrapped(
+            "deploy_static",
+            &format!("❌ Failed to extract files from container path '/app/dist': {inner}"),
+        )
+    }
+
+    #[test]
+    fn static_output_path_missing_is_a_build_output_problem() {
+        // The platform's Docker archive text contains "failed to download",
+        // which must not be read as a dependency download.
+        let local = static_extract(
+            "Other error: Failed to download Docker archive for image 'temps-1-2:abc' path '/app/dist': Docker responded with status code 404: Could not find the file /app/dist in container 3f2a",
+        );
+        assert_class(&local, S::Build, C::StaticOutputMissing);
+
+        let worker = static_extract(
+            "Other error: Storage error: Cannot export path '/app/dist' from image 'temps-1-2:abc': Could not find the file /app/dist in container 9",
+        );
+        assert_class(&worker, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn static_extraction_from_a_missing_image_is_image_missing() {
+        let reason = static_extract(
+            "Image not found: Node 'w1' refused to export path '/app/dist' of image 'i' (HTTP 404 Not Found): Image 'i' is not present on this node",
+        );
+        assert_class(&reason, S::Image, C::ImageMissing);
+    }
+
+    #[test]
+    fn static_build_node_failures_are_unreachable_node() {
+        let unresolved = wrapped(
+            "deploy_static",
+            "❌ Cannot reach the node that built image temps-1-2:abc: Other error: node 3 is not reachable",
+        );
+        assert_class(&unresolved, S::Deploy, C::BuildNodeUnreachable);
+
+        let send_error = static_extract(
+            "Other error: Cannot export path '/app/dist' of image 'i' from node 'w1': error sending request for url (http://10.0.0.5:3001/agent/images/extract)",
+        );
+        assert_class(&send_error, S::Deploy, C::BuildNodeUnreachable);
+    }
+
+    #[test]
+    fn static_output_the_platform_refuses_is_rejected_output() {
+        for inner in [
+            "Resource limit exceeded: Docker archive for image 'x' path '/app/dist' exceeds the 1073741824 byte extracted-size limit",
+            "Invalid context: Docker archive entry 'dist/x' for image 'x' path '/app/dist' has disallowed type Symlink; only regular files and directories are accepted",
+            "Other error: Docker archive for image 'x' path '/app/dist' exceeds the 100000 entry limit",
+        ] {
+            assert_class(&static_extract(inner), S::Deploy, C::StaticOutputRejected);
+        }
+        let publish = wrapped(
+            "deploy_static",
+            "❌ Failed to deploy static files: Static deployment source contains a symbolic link: /tmp/x/dist/link",
+        );
+        assert_class(&publish, S::Deploy, C::StaticOutputRejected);
+    }
+
+    #[test]
+    fn bundle_and_source_size_limits_are_rejected_output() {
+        let bundle = wrapped(
+            "deploy_static_bundle",
+            "Archive exceeds maximum allowed decompressed size of 2147483648 bytes",
+        );
+        assert_class(&bundle, S::Deploy, C::StaticOutputRejected);
+        for inner in [
+            "❌ Failed to deploy static files: file 'assets/video.mp4' exceeds the 524288000 byte per-file limit",
+            "❌ Failed to deploy static files: deployment exceeds the 2147483648 byte aggregate limit",
+        ] {
+            let reason = wrapped("deploy_static", inner);
+            assert_class(&reason, S::Deploy, C::StaticOutputRejected);
+        }
+    }
+
+    #[test]
+    fn other_static_publish_failures_are_static_deploy_failed() {
+        for (job, inner) in [
+            (
+                "deploy_static",
+                "❌ Failed to deploy static files: Static deployment destination already exists: /data/static/p/e/d",
+            ),
+            (
+                "deploy_static_from_source",
+                "❌ Failed to deploy static files: Source directory not found: /tmp/x/dist",
+            ),
+            (
+                "deploy_static_bundle",
+                "Failed to deploy static files: Static deployment destination already exists: /d",
+            ),
+            (
+                "deploy_static",
+                "❌ Failed to create secure temp directory: Read-only file system",
+            ),
+        ] {
+            assert_class(&wrapped(job, inner), S::Deploy, C::StaticDeployFailed);
+        }
+    }
+
+    #[test]
+    fn static_deploy_rules_do_not_capture_other_jobs() {
+        // A container deploy keeps its own classification, and a dependency
+        // download in a build is still a dependency download.
+        let container = wrapped("deploy_container", "Failed to deploy container: boom");
+        assert_class(&container, S::Runtime, C::ContainerStart);
+        let install = wrapped(
+            "build_image",
+            "Failed to download package registry.npmjs.org: connection reset",
+        );
+        assert_class(&install, S::DependencyInstall, C::DependencyDownload);
+    }
+
+    #[test]
+    fn static_markers_do_not_capture_another_jobs_failure() {
+        // Build output and Dockerfile excerpts are free text; a build that
+        // mentions a "docker archive" or a "static deployment" is still a
+        // build, and keeps the code its own text earns.
+        let compile = wrapped(
+            "build_image",
+            "Build failed: step 4/9 `echo static deployment ready` ok; TypeScript error: failed to compile src/index.ts",
+        );
+        assert_class(&compile, S::Build, C::CompileError);
+        let lockfile = wrapped(
+            "build_image",
+            "Docker archive helper installed; ERR_PNPM_OUTDATED_LOCKFILE: frozen lockfile",
+        );
+        assert_class(
+            &lockfile,
+            S::DependencyInstall,
+            C::DependencyLockfileOutOfSync,
+        );
+        let clone = wrapped(
+            "download_repo",
+            "Failed to clone repository; the repo ships a docker archive of fixtures",
+        );
+        assert_class(&clone, S::Source, C::RepositoryClone);
+
+        // Without the job wrapper the static markers still apply.
+        let unwrapped = "Failed to extract files from container path '/app/dist': Other error: Docker archive for image 'i' path '/app/dist': Could not find the file /app/dist in container 1";
+        assert_class(unwrapped, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn host_io_errors_during_static_deploy_are_not_a_missing_output() {
+        let reason = wrapped(
+            "deploy_static",
+            "❌ Failed to deploy static files: IO error: No such file or directory (os error 2)",
+        );
+        assert_class(&reason, S::Deploy, C::StaticDeployFailed);
+    }
+
+    #[test]
+    fn disk_exhaustion_during_static_extraction_stays_disk_exhausted() {
+        let reason = static_extract("IO error: No space left on device (os error 28)");
+        assert_class(&reason, S::Resource, C::DiskExhausted);
     }
 }
