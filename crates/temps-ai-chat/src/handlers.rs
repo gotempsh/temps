@@ -10416,7 +10416,13 @@ mod tests {
         let mut zip =
             zip::ZipArchive::new(archive.reopen().expect("open archive")).expect("valid zip");
         let names = (0..zip.len())
-            .map(|index| zip.by_index(index).expect("zip entry").name().to_string())
+            .map(|index| {
+                zip.by_index(index)
+                    .expect("zip entry")
+                    .name()
+                    .expect("zip entry name")
+                    .to_string()
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["package.json"]);
