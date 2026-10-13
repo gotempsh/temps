@@ -2146,21 +2146,23 @@ impl AgentCliAiService {
         // inside the sandbox (`timeout`), so it cannot outlive its slot.
         let handle = resolved.handle.clone();
         let command = hu::update_command(package);
+        // The task hands the slot and the mark back when the install ends so
+        // the caller keeps both through the version check below: nothing may
+        // run in the workspace, or start another update, until the installed
+        // version has been read.
         let task = tokio::spawn(async move {
-            let _slot = slot;
-            let _guard = guard;
-            tokio::time::timeout(
+            let outcome = tokio::time::timeout(
                 hu::UPDATE_COMMAND_TIMEOUT,
                 sandbox_provider.exec_as_root(&handle, command, HashMap::new(), None),
             )
-            .await
+            .await;
+            (outcome, slot, guard)
         });
-        let output = task
-            .await
-            .map_err(|error| AiError::Provider {
-                purpose: purpose.to_string(),
-                reason: format!("the update task ended unexpectedly: {error}"),
-            })?
+        let (outcome, _slot, _guard) = task.await.map_err(|error| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!("the update task ended unexpectedly: {error}"),
+        })?;
+        let output = outcome
             .map_err(|_| AiError::Provider {
                 purpose: purpose.to_string(),
                 reason: format!(
