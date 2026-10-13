@@ -1982,6 +1982,38 @@ exit 0
         );
     }
 
+    /// A keeper that overwrites the value every time must not keep the step
+    /// looping: after five read-backs that disagree it stops, names the
+    /// setting, and fails without printing either password.
+    #[test]
+    fn node_prepare_gives_up_when_the_keeper_keeps_overwriting_a_value() {
+        let Some(run) = run_node_prepare(0, 1_000_000, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(!run.success, "repeated overwrites must fail the step");
+        assert!(
+            run.stderr
+                .contains("pg_autoctl config replication.password was overwritten"),
+            "names the setting and the cause: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("5 times in a row"),
+            "reports the attempt limit: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("replication-secret") && !run.stderr.contains("node-secret"),
+            "credentials must never be printed: {}",
+            run.stderr
+        );
+        assert_eq!(
+            run.monitor_uri, LEGACY_MONITOR_URI,
+            "no later setting may be touched once the step has failed"
+        );
+    }
+
     /// A step that cannot store the configuration must say which setting
     /// failed and why -- the control plane reports this output, and an empty
     /// string leaves nothing to act on -- without printing the password.
@@ -3178,6 +3210,20 @@ mod scram_docker_tests {
             .await
         }
 
+        /// Like `state`, for failure reports: a monitor that is down must
+        /// not replace the failure being reported with a second panic.
+        async fn state_for_report(&self, monitor: &str) -> String {
+            let command = vec![
+                "bash".to_string(),
+                "-c".to_string(),
+                format!("gosu postgres pg_autoctl show state --pgdata {MONITOR_PGDATA}"),
+            ];
+            match self.try_exec(monitor, command, &HashMap::new()).await {
+                Ok((_, out)) => out,
+                Err(e) => format!("cluster state unavailable: could not exec in {monitor}: {e}"),
+            }
+        }
+
         async fn state(&self, monitor: &str) -> String {
             self.sh(
                 monitor,
@@ -3620,7 +3666,7 @@ mod scram_docker_tests {
                         panic!(
                             "{step:?} on {target} exited {code}: {out:?}\n{}\ncluster state:\n{}",
                             fx.describe(target).await,
-                            fx.state(&monitor).await,
+                            fx.state_for_report(&monitor).await,
                         );
                     }
                 }
