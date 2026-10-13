@@ -141,6 +141,14 @@ pub struct ProviderCatalogDto {
     /// Importable credential already used by this host's CLI, if one can be
     /// copied directly into encrypted Temps settings. Contains metadata only.
     pub local_credential: Option<LocalCredentialDto>,
+    /// True when this provider's CLI can sign in to a subscription from the
+    /// console ("Sign in with Claude"). The UI shows the control whenever this
+    /// is true, even if `login_unavailable_reason` says it cannot run yet.
+    pub login_supported: bool,
+    /// Why signing in cannot start right now (CLI not installed on this
+    /// server, data directory unavailable) or why the provider has no
+    /// console sign-in. `None` when the sign-in can be started.
+    pub login_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -262,18 +270,18 @@ struct ProviderModelsRefreshedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProviderCredentialSavedAudit {
-    context: AuditContext,
-    provider_id: String,
-    auth_type: String,
-    source: String,
+pub(crate) struct ProviderCredentialSavedAudit {
+    pub(crate) context: AuditContext,
+    pub(crate) provider_id: String,
+    pub(crate) auth_type: String,
+    pub(crate) source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProviderSettingsChangedAudit {
-    context: AuditContext,
-    provider_id: String,
-    change: String,
+pub(crate) struct ProviderSettingsChangedAudit {
+    pub(crate) context: AuditContext,
+    pub(crate) provider_id: String,
+    pub(crate) change: String,
 }
 
 impl AuditOperation for ProviderSettingsChangedAudit {
@@ -749,7 +757,7 @@ pub async fn refresh_ai_provider_models(
     Ok(Json(response))
 }
 
-fn ensure_provider_runtime_permission(
+pub(crate) fn ensure_provider_runtime_permission(
     auth: &temps_auth::AuthContext,
     provider: &crate::ai_cli::catalog::ProviderCatalogEntry,
 ) -> Result<(), Problem> {
@@ -889,6 +897,7 @@ async fn provider_catalog_dto(
             None,
         ),
     };
+    let login_host_status = crate::ai_cli::cached_status(entry.id).await;
     let mut dto = provider_catalog_dto_from_runtime(
         entry,
         provider_cfg,
@@ -903,6 +912,10 @@ async fn provider_catalog_dto(
         models_refreshed_at,
         local_credential,
     );
+    let (login_supported, login_unavailable_reason) =
+        login_availability(entry, login_host_status.as_ref());
+    dto.login_supported = login_supported;
+    dto.login_unavailable_reason = login_unavailable_reason;
     if let Some(snapshot) = workspace_snapshot {
         dto.models = snapshot
             .capabilities
@@ -1077,6 +1090,56 @@ fn provider_catalog_dto_from_runtime(
             source: credential.source.as_str().to_string(),
             label: credential.source.label().to_string(),
         }),
+        // Filled in by `provider_catalog_dto`, which has the host status.
+        login_supported: false,
+        login_unavailable_reason: None,
+    }
+}
+
+/// Whether the console can sign `entry` in right now, and if not, why.
+/// Derived from the cached host status so listing the catalog never launches
+/// a CLI probe of its own.
+fn login_availability(
+    entry: &crate::ai_cli::catalog::ProviderCatalogEntry,
+    host_status: Option<&crate::ai_cli::AiCliStatus>,
+) -> (bool, Option<String>) {
+    let supported = crate::ai_cli::create_provider(entry.id)
+        .map(|provider| provider.supports_login())
+        .unwrap_or(false);
+    if !supported {
+        return (
+            false,
+            Some(format!(
+                "{} has no one-click sign-in. Paste its credential below instead.",
+                entry.name
+            )),
+        );
+    }
+    if crate::ai_cli::host_cli::state_root().is_none() {
+        return (
+            true,
+            Some(
+                "Temps has no data directory configured for CLI sign-ins on this server."
+                    .to_string(),
+            ),
+        );
+    }
+    match host_status {
+        Some(status) if !status.installed => {
+            let binary = entry
+                .auth_command
+                .split_whitespace()
+                .next()
+                .unwrap_or(entry.id);
+            (
+                true,
+                Some(format!(
+                    "`{binary}` is not installed on this server. Install it with `{}`, then refresh this page.",
+                    entry.install_command
+                )),
+            )
+        }
+        _ => (true, None),
     }
 }
 
@@ -1739,7 +1802,7 @@ async fn write_provider_credential_audit(
     }
 }
 
-async fn write_provider_settings_audit(
+pub(crate) async fn write_provider_settings_audit(
     app_state: &Arc<AppState>,
     auth: &temps_auth::AuthContext,
     metadata: &RequestMetadata,

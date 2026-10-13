@@ -756,13 +756,33 @@ impl TempsPlugin for AgentsPlugin {
             // `register_services` — races against other plugins' registration
             // order and would see `None` whenever the checker plugin loads
             // after this one.
+            // Console sign-in for subscription CLIs. The CLI-owned credential
+            // directory lives below the Temps data directory, and the same
+            // root is registered with `host_cli` so status checks and turns
+            // read exactly what a sign-in produced.
+            let ai_cli_state_root = platform_config_service.get_data_subdir("ai-cli");
+            crate::ai_cli::host_cli::set_state_root(ai_cli_state_root.clone());
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            let login_sink = Arc::new(crate::handlers::ai_provider_login::SettingsLoginSink::new(
+                platform_config_service.clone(),
+                encryption_service.clone(),
+                audit_service.clone(),
+            ));
+            let provider_login = Arc::new(
+                crate::services::provider_login_service::ProviderLoginService::new(
+                    ai_cli_state_root,
+                    login_sink.clone(),
+                ),
+            );
+
             let app_state = Arc::new(AppState {
                 db: context.require_service::<sea_orm::DatabaseConnection>(),
-                encryption_service: context.require_service::<temps_core::EncryptionService>(),
+                encryption_service,
                 config_service,
                 run_service,
                 executor,
-                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                audit_service,
                 autofixer_service,
                 secret_service,
                 definition_service,
@@ -774,6 +794,8 @@ impl TempsPlugin for AgentsPlugin {
                     .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
                 project_access_checker: None,
                 ai_service: None,
+                provider_login,
+                login_sink,
             });
             context.register_plugin_state("agents", app_state);
 
@@ -849,7 +871,14 @@ impl TempsPlugin for AgentsPlugin {
             telemetry: old.telemetry.clone(),
             project_access_checker,
             ai_service,
+            provider_login: old.provider_login.clone(),
+            login_sink: old.login_sink.clone(),
         });
+        // The AI registry is registered after this plugin, so it can only be
+        // bound once routes are configured.
+        if let Some(ai_service) = app_state.ai_service.clone() {
+            app_state.login_sink.bind_ai_service(ai_service);
+        }
 
         let router = crate::handlers::configure_routes().with_state(app_state);
 
