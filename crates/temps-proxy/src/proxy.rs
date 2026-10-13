@@ -1322,6 +1322,14 @@ impl LoadBalancer {
         self
     }
 
+    /// Record into a counter set shared with other components (the proxy-log
+    /// batch writer reports its retries and drops there) instead of this
+    /// instance's private one.
+    pub fn with_proxy_metrics(mut self, metrics: Arc<crate::metrics::ProxyMetrics>) -> Self {
+        self.proxy_metrics = metrics;
+        self
+    }
+
     /// Handle to the hot-path metrics counters, for the background sampler.
     /// The returned `Arc` shares the counters this instance records into.
     pub fn proxy_metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {

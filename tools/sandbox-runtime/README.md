@@ -25,14 +25,13 @@ Node.js includes Node, Bun and the Claude/Codex/OpenCode CLIs. Python adds
 Python, pip and venv. All adds build-essential and Debian's Go/Rust toolchains.
 The latter are distribution versions, not promises of the latest toolchains.
 
-Application workspaces use the managed `ghcr.io/gotempsh/temps-sandbox-{nodejs,python,all}:0.3.4`
-pins. For local application-workspace testing, build the corresponding managed
-tag with `build-local.sh`; arbitrary custom images are not accepted by this
-surface. These stable tags must be published before distributing a release that
-uses them; a main-branch build publishes only `0.3.4-beta`. Until the stable
-release publishes all three `0.3.4` flavors, build those tags locally when
-testing a checkout that selects the new default. Building locally does not
-publish an image.
+Release builds pin the images in their release manifest. A build without a
+release manifest (a source build) falls back to the
+`ghcr.io/gotempsh/temps-sandbox-{nodejs,python,all}:0.3.4-beta` tags that
+main-branch builds publish, because the stable `0.3.4` tags only exist once the
+release publishes them. For local application-workspace testing, build the
+corresponding managed tag with `build-local.sh`; arbitrary custom images are not
+accepted by this surface. Building locally does not publish an image.
 
 ## GitHub Actions publication
 

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::types::{
-    AppState, CustomDomainRequest, CustomDomainResponse, CustomDomainWithInfo, DomainEnvironment,
-    DomainInfo, ListCustomDomainsResponse, ReassignCustomDomainRequest, UpdateCustomDomainRequest,
+    AppState, CustomDomainLookupResponse, CustomDomainRequest, CustomDomainResponse,
+    CustomDomainWithInfo, DomainEnvironment, DomainInfo, ListCustomDomainsResponse,
+    ReassignCustomDomainRequest, UpdateCustomDomainRequest,
 };
 use super::{
     audit::AuditContext, audit::CustomDomainReassignedAudit,
@@ -45,6 +46,7 @@ use utoipa::OpenApi;
         schemas(
             CustomDomainRequest,
             CustomDomainResponse,
+            CustomDomainLookupResponse,
             UpdateCustomDomainRequest,
             ReassignCustomDomainRequest,
             ListCustomDomainsResponse,
@@ -242,15 +244,19 @@ pub async fn list_custom_domains_for_project(
 }
 
 /// Find the project assignment for a certificate hostname.
+///
+/// A hostname that is not assigned to a project (or is assigned to a project
+/// the caller cannot see) is a normal state, so it answers 200 with
+/// `custom_domain: null` rather than a 404.
 #[utoipa::path(
     get,
     path = "/custom-domains/by-host/{hostname}",
     operation_id = "get_visible_custom_domain_by_hostname",
     responses(
-        (status = 200, description = "Custom domain assignment retrieved", body = CustomDomainResponse),
+        (status = 200, description = "Lookup result; `custom_domain` is null when the hostname is not assigned to a visible project", body = CustomDomainLookupResponse),
+        (status = 400, description = "Hostname is not a valid domain name"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Project access denied"),
-        (status = 404, description = "Domain is not assigned to a project")
+        (status = 403, description = "Project access denied")
     ),
     params(("hostname" = String, Path, description = "Domain hostname")),
     tag = "Custom Domains",
@@ -268,24 +274,20 @@ pub async fn get_custom_domain_by_hostname(
     let custom_domain = state
         .custom_domain_service
         .get_visible_custom_domain_by_hostname(&hostname, &hidden_project_ids)
-        .await?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Domain is not assigned")
-                .with_detail(format!(
-                    "Domain {hostname} is not currently assigned to a project environment"
-                ))
-        })?;
-
-    let domain_with_info = state
-        .custom_domain_service
-        .get_domain_with_info(custom_domain)
         .await?;
+
+    let domain_with_info = match custom_domain {
+        Some(custom_domain) => Some(CustomDomainWithInfo::from(
+            state
+                .custom_domain_service
+                .get_domain_with_info(custom_domain)
+                .await?,
+        )),
+        None => None,
+    };
     Ok((
         StatusCode::OK,
-        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
-            domain_with_info,
-        ))),
+        Json(CustomDomainLookupResponse::from(domain_with_info)),
     ))
 }
 

@@ -78,6 +78,23 @@ pub enum DomainServiceError {
     InvalidDomain(String),
     #[error("Challenge error: {0}")]
     Challenge(String),
+
+    /// The ACME server permanently invalidated the order (or one of its
+    /// authorizations) for `domain`, usually because validation ran before the
+    /// DNS record / HTTP token was in place. An invalid challenge can never
+    /// become valid again and cannot be re-submitted, so retrying the same
+    /// order is pointless: a new order with fresh challenge values is required.
+    #[error(
+        "ACME challenge for domain {domain} (ID {domain_id}) is no longer valid and cannot be \
+         retried (order {order_url}): {detail}. Start a new order with \
+         POST /domains/{domain_id}/order to get fresh challenge values"
+    )]
+    ChallengeInvalidated {
+        domain: String,
+        domain_id: i32,
+        order_url: String,
+        detail: String,
+    },
     #[error("TLS error: {0}")]
     Tls(#[from] TlsError),
     #[error("Provider error: {0}")]
@@ -129,6 +146,10 @@ pub(crate) fn verification_method_label(raw: &str) -> &'static str {
         _ => "unknown",
     }
 }
+
+/// Stored `acme_orders.status` for an order the ACME server permanently
+/// invalidated. Terminal: the order cannot be finalized or re-submitted.
+pub(crate) const ORDER_STATUS_INVALID: &str = "invalid";
 
 pub struct DomainService {
     db: Arc<DatabaseConnection>,
@@ -518,6 +539,11 @@ impl DomainService {
                 // Update domain status based on challenge type
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("challenge_requested".to_string());
+                // A brand-new order supersedes whatever failed before it; leaving
+                // the previous attempt's error would show a stale failure next to
+                // fresh challenge instructions.
+                domain_active.last_error = Set(None);
+                domain_active.last_error_type = Set(None);
 
                 match challenge_data.challenge_type {
                     ChallengeType::Http01 => {
@@ -724,6 +750,21 @@ impl DomainService {
             ))?;
         let retain_order_for_dns_cleanup = has_pending_dns_cleanup(order.authorizations.as_ref());
 
+        // An order we already recorded as invalidated by the ACME server must
+        // not be re-submitted: the server would reject the challenge update.
+        // Point the caller at the new-order flow instead.
+        if order.status == ORDER_STATUS_INVALID {
+            return Err(DomainServiceError::ChallengeInvalidated {
+                domain: domain_name.to_string(),
+                domain_id: domain.id,
+                order_url: order.order_url.clone(),
+                detail: order
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "the order was previously marked invalid".to_string()),
+            });
+        }
+
         // Check if order is in a valid state
         if order.status != "pending" && order.status != "ready" {
             return Err(DomainServiceError::Challenge(
@@ -905,6 +946,38 @@ impl DomainService {
                     );
                 }
 
+                // When the ACME server itself invalidated the order, remember that on
+                // the stored order so the next retry starts a new one instead of
+                // re-submitting a dead challenge, and so the order endpoint reports a
+                // terminal state the console already knows how to render.
+                let invalidation_detail = match &e {
+                    crate::tls::ProviderError::ChallengeInvalidated { detail, .. } => {
+                        Some(detail.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(detail) = invalidation_detail.as_ref() {
+                    if let Err(update_err) = self
+                        .repository
+                        .update_acme_order_status(
+                            &order.order_url,
+                            ORDER_STATUS_INVALID,
+                            Some(detail.clone()),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to mark ACME order {} invalid for domain {} (ID {}): {}",
+                            order.order_url, domain_name, domain_id, update_err
+                        );
+                    }
+                }
+                let error_type = if invalidation_detail.is_some() {
+                    "challenge_invalidated"
+                } else {
+                    "challenge_completion"
+                };
+
                 // Persist the error so the failure is visible, and actually write it —
                 // the previous implementation built this ActiveModel but never called
                 // update(), silently dropping the status/error change. The full error is
@@ -913,7 +986,7 @@ impl DomainService {
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set(fallback_status.to_string());
                 domain_active.last_error = Set(Some(e.to_string()));
-                domain_active.last_error_type = Set(Some("challenge_completion".to_string()));
+                domain_active.last_error_type = Set(Some(error_type.to_string()));
 
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
@@ -928,15 +1001,23 @@ impl DomainService {
                     challenge_type_str,
                     "failed",
                     Some(e.to_string()),
-                    Some("challenge_completion".to_string()),
+                    Some(error_type.to_string()),
                     report_telemetry,
                 )
                 .await;
 
-                Err(DomainServiceError::Challenge(format!(
-                    "Failed to complete challenge: {}.",
-                    e
-                )))
+                match invalidation_detail {
+                    Some(detail) => Err(DomainServiceError::ChallengeInvalidated {
+                        domain: domain_name.to_string(),
+                        domain_id,
+                        order_url: order.order_url.clone(),
+                        detail,
+                    }),
+                    None => Err(DomainServiceError::Challenge(format!(
+                        "Failed to complete challenge: {}.",
+                        e
+                    ))),
+                }
             }
         }
     }
@@ -2347,6 +2428,347 @@ mod tests {
             .expect("status query should succeed for an unknown host");
         assert!(status.domain.is_none());
         assert!(status.latest_attempt.is_none());
+    }
+
+    // ---- DNS-01 retry after the CA invalidated the challenge (#1442) ----
+
+    /// How the scripted provider answers `complete_challenge`.
+    #[derive(Clone, Copy)]
+    enum CompletionMode {
+        /// The CA invalidated the order (e.g. the TXT record was missing).
+        Invalidate,
+        /// A transient failure that leaves the challenge open.
+        Transient,
+        /// Validation succeeds.
+        Succeed,
+    }
+
+    /// Provider that hands out a distinct order and TXT value on every
+    /// `provision` call and counts how often a challenge is submitted.
+    struct ScriptedProvider {
+        provisions: std::sync::atomic::AtomicUsize,
+        completions: std::sync::atomic::AtomicUsize,
+        mode: std::sync::Mutex<CompletionMode>,
+    }
+
+    impl ScriptedProvider {
+        fn new(mode: CompletionMode) -> Arc<Self> {
+            Arc::new(Self {
+                provisions: std::sync::atomic::AtomicUsize::new(0),
+                completions: std::sync::atomic::AtomicUsize::new(0),
+                mode: std::sync::Mutex::new(mode),
+            })
+        }
+
+        fn completions(&self) -> usize {
+            self.completions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_mode(&self, mode: CompletionMode) {
+            *self.mode.lock().unwrap() = mode;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateProvider for ScriptedProvider {
+        async fn provision(
+            &self,
+            domain: &str,
+            _challenge: ChallengeType,
+            _email: &str,
+        ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
+            let n = self
+                .provisions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            Ok(ProvisioningResult::Challenge(
+                crate::tls::models::ChallengeData {
+                    challenge_type: ChallengeType::Dns01,
+                    domain: domain.to_string(),
+                    token: format!("token-{n}"),
+                    key_authorization: format!("key-auth-{n}"),
+                    validation_url: Some(format!("https://acme.example.test/chall/{n}")),
+                    dns_txt_records: vec![crate::tls::models::DnsTxtRecord {
+                        name: format!("_acme-challenge.{domain}"),
+                        value: format!("txt-value-{n}"),
+                        validation_url: format!("https://acme.example.test/chall/{n}"),
+                    }],
+                    order_url: Some(format!("https://acme.example.test/order/{n}")),
+                },
+            ))
+        }
+
+        async fn complete_challenge(
+            &self,
+            domain: &str,
+            challenge_data: &crate::tls::models::ChallengeData,
+            _email: &str,
+        ) -> Result<crate::tls::models::Certificate, crate::tls::ProviderError> {
+            self.completions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mode = *self.mode.lock().unwrap();
+            match mode {
+                CompletionMode::Invalidate => {
+                    Err(crate::tls::ProviderError::ChallengeInvalidated {
+                        domain: domain.to_string(),
+                        order_url: challenge_data.order_url.clone().unwrap_or_default(),
+                        detail: "[example.com Dns01] urn:ietf:params:acme:error:unauthorized: \
+                                 no TXT record found"
+                            .to_string(),
+                    })
+                }
+                CompletionMode::Transient => Err(crate::tls::ProviderError::Network(
+                    "connection reset by ACME server".to_string(),
+                )),
+                CompletionMode::Succeed => Ok(mock_certificate(domain)),
+            }
+        }
+
+        fn supported_challenges(&self) -> Vec<ChallengeType> {
+            vec![ChallengeType::Dns01]
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _domain: &str,
+            _email: &str,
+        ) -> Result<crate::tls::models::ValidationResult, crate::tls::ProviderError> {
+            Ok(crate::tls::models::ValidationResult {
+                is_valid: true,
+                errors: vec![],
+                warnings: vec![],
+            })
+        }
+
+        async fn cancel_order(&self, _domain: &str) -> Result<(), crate::tls::ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// `DomainService` over a real (Docker) test schema and a scripted provider.
+    /// `None` when no database is available, so the test skips gracefully.
+    async fn scripted_service(
+        provider: Arc<ScriptedProvider>,
+    ) -> Option<(
+        DomainService,
+        Arc<dyn CertificateRepository>,
+        Arc<DatabaseConnection>,
+        temps_database::test_utils::TestDatabase,
+    )> {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping DNS-01 retry test: {e}");
+                return None;
+            }
+        };
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
+        let repository: Arc<dyn CertificateRepository> =
+            Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+                test_db.db.clone(),
+                encryption_service.clone(),
+            ));
+        let service = DomainService::new(
+            test_db.db.clone(),
+            provider,
+            repository.clone(),
+            encryption_service,
+        );
+        let db = test_db.db.clone();
+        Some((service, repository, db, test_db))
+    }
+
+    async fn domain_row(db: &DatabaseConnection, name: &str) -> domains::Model {
+        domains::Entity::find()
+            .filter(domains::Column::Domain.eq(name))
+            .one(db)
+            .await
+            .unwrap()
+            .expect("domain row should exist")
+    }
+
+    #[tokio::test]
+    async fn test_invalidated_challenge_is_recorded_and_not_resubmitted() {
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "app.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        // First verification: the CA rejects the challenge.
+        let err = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("an invalidated challenge must fail");
+        assert!(
+            matches!(
+                &err,
+                DomainServiceError::ChallengeInvalidated { domain, domain_id, .. }
+                    if domain == name && *domain_id == created.id
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(provider.completions(), 1);
+
+        // The domain is failed with a typed error type, and the stored order
+        // is terminal so the console offers a new order.
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.last_error_type.as_deref(),
+            Some("challenge_invalidated")
+        );
+        assert!(failed
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no longer valid"));
+        let order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("order is kept so the failure stays inspectable");
+        assert_eq!(order.status, "invalid");
+        assert!(order.error.as_deref().unwrap_or_default().contains("TXT"));
+
+        // Retrying must NOT submit the dead challenge again.
+        let retry = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("retrying an invalidated order must fail fast");
+        assert!(matches!(
+            retry,
+            DomainServiceError::ChallengeInvalidated { .. }
+        ));
+        assert_eq!(
+            provider.completions(),
+            1,
+            "the provider must not be asked to complete an invalidated order again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_order_after_invalidation_has_fresh_challenge_and_clears_the_error() {
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "app.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        let first = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("first attempt is invalidated");
+        let old_order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The retry path: start a new order.
+        let second = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.txt_records[0].value, second.txt_records[0].value,
+            "a new order must expose a new TXT value"
+        );
+        let new_order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_order.order_url, old_order.order_url);
+        assert_eq!(new_order.status, "pending");
+        assert!(repository
+            .find_acme_order_by_url(&old_order.order_url)
+            .await
+            .unwrap()
+            .is_none());
+
+        let domain = domain_row(&db, name).await;
+        assert_eq!(domain.status, "challenge_requested");
+        assert!(
+            domain.last_error.is_none() && domain.last_error_type.is_none(),
+            "the previous attempt's error must not linger next to fresh instructions"
+        );
+
+        // The new, still-valid challenge is submitted normally.
+        provider.set_mode(CompletionMode::Succeed);
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("a fresh order should complete");
+        assert_eq!(active.status, "active");
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_keeps_the_order_and_reuses_it_on_retry() {
+        let provider = ScriptedProvider::new(CompletionMode::Transient);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "app.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let order_before = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("a transient failure is reported");
+        assert!(
+            matches!(err, DomainServiceError::Challenge(_)),
+            "a transient failure is not an invalidation: {err:?}"
+        );
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.last_error_type.as_deref(),
+            Some("challenge_completion")
+        );
+        let order_after = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(order_after.status, "pending");
+        assert_eq!(order_after.order_url, order_before.order_url);
+
+        // The challenge is still open, so retrying reuses the same order.
+        provider.set_mode(CompletionMode::Succeed);
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("the open challenge is verified again");
+        assert_eq!(active.status, "active");
+        assert_eq!(provider.completions(), 2);
     }
 
     // ---- Pure unit tests (no DB) for the on-demand helpers ----

@@ -46,8 +46,8 @@ const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
-    AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PreviewGatewaySettings,
-    PublicHostnameStrategy,
+    AgentSandboxSettings, AppSettings, BlobSettings, GeoLicenseKeyIntent, KvSettings,
+    PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
 /// Whether a settings write explicitly changes outbound private-network trust.
@@ -1572,6 +1572,12 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // change the section outside that lock nor revert it from an older
         // snapshot.
         settings.preview_gateway = locked_settings.preview_gateway.clone();
+        // The KV and Blob container-name sections are owned by
+        // `update_kv_settings` / `update_blob_settings`, which their handlers
+        // call only while the service does not exist: a generic save built
+        // from an older snapshot must not rename a running service's container.
+        settings.kv = locked_settings.kv.clone();
+        settings.blob = locked_settings.blob.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
 
         // The handler checked that a new public ingress hostname was free, but
@@ -1915,8 +1921,51 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     where
         F: FnOnce(&mut PreviewGatewaySettings),
     {
+        self.update_settings_section("preview_gateway", update_fn)
+            .await
+    }
+
+    /// Change the managed KV service settings under the settings-row lock and
+    /// return them as saved. Generic settings saves restore this section from
+    /// the locked row, so this is its only write path.
+    pub async fn update_kv_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<KvSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut KvSettings),
+    {
+        self.update_settings_section("kv", update_fn).await
+    }
+
+    /// Change the managed Blob service settings under the settings-row lock
+    /// and return them as saved. Same write-path contract as
+    /// [`Self::update_kv_settings`].
+    pub async fn update_blob_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<BlobSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut BlobSettings),
+    {
+        self.update_settings_section("blob", update_fn).await
+    }
+
+    /// Read-modify-write one top-level section of the settings document under
+    /// the settings-row lock. A missing section starts from its default; a
+    /// stored section that does not parse is reported rather than replaced, so
+    /// nothing in it is lost to a partial update.
+    async fn update_settings_section<T, F>(
+        &self,
+        section_name: &'static str,
+        update_fn: F,
+    ) -> Result<T, ConfigServiceError>
+    where
+        T: Default + serde::Serialize + serde::de::DeserializeOwned,
+        F: FnOnce(&mut T),
+    {
         let malformed = || ConfigServiceError::MalformedSettingsSection {
-            section: "preview_gateway",
+            section: section_name,
         };
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -1933,17 +1982,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .map(|model| model.data.clone())
             .unwrap_or_else(|| AppSettings::default().to_json());
         let fields = document.as_object_mut().ok_or_else(malformed)?;
-        let mut gateway = match fields.get("preview_gateway") {
-            None | Some(serde_json::Value::Null) => PreviewGatewaySettings::default(),
+        let mut value = match fields.get(section_name) {
+            None | Some(serde_json::Value::Null) => T::default(),
             Some(section) => serde_json::from_value(section.clone()).map_err(|_| malformed())?,
         };
-        update_fn(&mut gateway);
-        let section = serde_json::to_value(&gateway).map_err(|error| {
+        update_fn(&mut value);
+        let section = serde_json::to_value(&value).map_err(|error| {
             ConfigServiceError::Serialization(format!(
-                "Failed to serialize the preview gateway settings section: {error}"
+                "Failed to serialize the {section_name} settings section: {error}"
             ))
         })?;
-        fields.insert("preview_gateway".to_string(), section);
+        fields.insert(section_name.to_string(), section);
 
         if let Some(model) = existing {
             let mut active: settings::ActiveModel = model.into();
@@ -1963,7 +2012,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         transaction.commit().await?;
         self.invalidate_settings_cache().await;
-        Ok(gateway)
+        Ok(value)
     }
 
     /// Set the sandbox placement allow-list (ADR-048) under the settings-row
@@ -4120,6 +4169,97 @@ mod tests {
                 }
             ),
             "unexpected preview gateway write error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn kv_and_blob_container_names_change_only_through_their_own_write_path() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping KV/Blob settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("KV/Blob settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert!(stale_bulk_document.kv.container_name.is_empty());
+        assert!(stale_bulk_document.blob.container_name.is_empty());
+
+        let kv = service
+            .update_kv_settings(|kv| kv.container_name = "redis-temps-kv-staging".into())
+            .await
+            .expect("save the KV container name");
+        let blob = service
+            .update_blob_settings(|blob| blob.container_name = "rustfs-files".into())
+            .await
+            .expect("save the Blob container name");
+        assert_eq!(kv.container_name, "redis-temps-kv-staging");
+        assert_eq!(blob.container_name, "rustfs-files");
+
+        // A settings-page save built before the change neither reverts the
+        // names nor, when it sets them itself, changes them.
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save");
+        let mut rewrite = stale_bulk_document;
+        rewrite.kv.container_name = "redis-rewritten".into();
+        rewrite.blob.container_name = "rustfs-rewritten".into();
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the KV and Blob sections");
+
+        let stored = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read settings")
+            .expect("settings row");
+        let stored = AppSettings::from_json(stored.data);
+        assert_eq!(stored.kv.container_name, "redis-temps-kv-staging");
+        assert_eq!(stored.blob.container_name, "rustfs-files");
+
+        // Resetting writes the empty default back.
+        let reset = service
+            .update_kv_settings(|kv| kv.container_name.clear())
+            .await
+            .expect("reset the KV container name");
+        assert!(reset.container_name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kv_write_rejects_a_malformed_section_without_overwriting_it() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["kv"] = serde_json::json!({ "container_name": 7 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_kv_settings(|kv| kv.container_name = "redis-x".into())
+            .await
+            .expect_err("a malformed KV section must abort the write");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection { section: "kv" }
+            ),
+            "unexpected KV write error: {error:?}"
         );
         drop(service);
         let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
