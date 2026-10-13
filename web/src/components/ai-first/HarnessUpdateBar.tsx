@@ -124,14 +124,18 @@ export function HarnessUpdateBar({
     },
   })
 
-  const checkProblem = recheck.isError
-    ? problemDetail(
-        recheck.error,
-        `Could not check whether ${providerName} has an update.`
-      )
+  // A known update (or one running) is the answer: an older failed re-check or
+  // a failed background poll must not replace it with an error.
+  const failure = recheck.isError
+    ? recheck.error
     : status.isError
+      ? status.error
+      : null
+  const checkProblem = shouldShowHarnessUpdate(status.data)
+    ? null
+    : failure
       ? problemDetail(
-          status.error,
+          failure,
           `Could not check whether ${providerName} has an update.`
         )
       : harnessUpdateCheckProblem(status.data, providerName)
