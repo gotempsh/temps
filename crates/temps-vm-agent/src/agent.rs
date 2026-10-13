@@ -8,9 +8,16 @@
 //! host-side conversion pipeline as a static musl binary, so it works on
 //! glibc, musl, and distroless images alike.
 //!
+//! Interactive terminals (ADR-029 §5): at boot it also starts
+//! `temps-pty-agent` under a supervisor and serves a second vsock listener
+//! ([`PTY_PORT`]) that relays bytes to that agent's unix socket. Everything
+//! about terminals — tabs, replay, reattach — lives in the PTY agent, so it
+//! behaves identically to the Docker backend.
+//!
 //! Not yet a full init: orphaned grandchildren that outlive their exec
-//! session accumulate as zombies until proper subreaping lands with the
-//! PTY integration. Sandbox exec workloads don't daemonize in practice.
+//! session accumulate as zombies until proper subreaping lands. The
+//! supervised PTY agent reaps its own children; sandbox exec workloads don't
+//! daemonize in practice.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -19,9 +26,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use temps_vm_agent::{read_frame, write_frame, Request, Response, AGENT_PORT, WORK_DIR};
+use temps_vm_agent::{
+    read_frame, relay, write_frame, Request, Response, AGENT_PORT, MAX_PTY_RELAYS, PTY_AGENT_BIN,
+    PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
+};
+
+/// `PATH` for processes this agent starts: PID 1's own environment is empty
+/// and guest images vary, so every child gets the same sane default.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Relays currently being served; bounded by [`MAX_PTY_RELAYS`].
+static ACTIVE_PTY_RELAYS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn run() {
     let is_init = std::process::id() == 1;
@@ -29,10 +47,12 @@ pub fn run() {
         setup_system();
     }
     log(&format!(
-        "temps-vm-agent starting (pid {}, vsock port {})",
+        "temps-vm-agent starting (pid {}, vsock port {}, pty port {})",
         std::process::id(),
-        AGENT_PORT
+        AGENT_PORT,
+        PTY_PORT
     ));
+    start_terminal_support();
     serve();
 }
 
@@ -113,19 +133,16 @@ fn log(msg: &str) {
 
 // ── Vsock server ────────────────────────────────────────────────────────
 
-fn serve() {
+/// Bind and listen on a vsock `port`, accepting connections from any CID.
+fn listen_vsock(port: u32) -> Result<RawFd, String> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        log(&format!(
-            "fatal: vsock socket: {}",
-            std::io::Error::last_os_error()
-        ));
-        halt_forever();
+        return Err(format!("vsock socket: {}", std::io::Error::last_os_error()));
     }
     let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
     addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
     addr.svm_cid = libc::VMADDR_CID_ANY;
-    addr.svm_port = AGENT_PORT;
+    addr.svm_port = port;
     let rc = unsafe {
         libc::bind(
             fd,
@@ -134,19 +151,26 @@ fn serve() {
         )
     };
     if rc != 0 {
-        log(&format!(
-            "fatal: vsock bind: {}",
-            std::io::Error::last_os_error()
-        ));
-        halt_forever();
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(format!("vsock bind on port {}: {}", port, err));
     }
     if unsafe { libc::listen(fd, 16) } != 0 {
-        log(&format!(
-            "fatal: vsock listen: {}",
-            std::io::Error::last_os_error()
-        ));
-        halt_forever();
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(format!("vsock listen on port {}: {}", port, err));
     }
+    Ok(fd)
+}
+
+fn serve() {
+    let fd = match listen_vsock(AGENT_PORT) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log(&format!("fatal: {}", e));
+            halt_forever();
+        }
+    };
     log("ready");
 
     loop {
@@ -158,6 +182,185 @@ fn serve() {
         // just an fd wrapper and gives us Read/Write + Drop-closes.
         let stream = unsafe { UnixStream::from_raw_fd(conn) };
         std::thread::spawn(move || handle_connection(stream));
+    }
+}
+
+// ── Interactive terminals (ADR-029 §5) ──────────────────────────────────
+
+/// Start the PTY agent supervisor and the terminal relay listener. Both are
+/// best effort: a guest without the PTY agent (an older rootfs, or a host
+/// that never staged the binary) still serves exec/fs RPCs normally, it just
+/// has no terminals.
+fn start_terminal_support() {
+    if !Path::new(PTY_AGENT_BIN).exists() {
+        log(&format!(
+            "{} not present; interactive terminals are disabled in this guest",
+            PTY_AGENT_BIN
+        ));
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("pty-supervisor".to_string())
+        .spawn(supervise_pty_agent)
+    {
+        log(&format!("could not start the PTY agent supervisor: {}", e));
+        return;
+    }
+    match listen_vsock(PTY_PORT) {
+        Ok(fd) => {
+            let spawned = std::thread::Builder::new()
+                .name("pty-listener".to_string())
+                .spawn(move || serve_pty(fd));
+            if let Err(e) = spawned {
+                log(&format!("could not start the PTY relay listener: {}", e));
+            }
+        }
+        Err(e) => log(&format!("terminal relay unavailable: {}", e)),
+    }
+}
+
+/// Keep `temps-pty-agent` running. It owns every PTY in the guest, so the
+/// terminal feature is dead without it: a crash is retried after a short
+/// pause rather than leaving the guest with a listener that has nobody to
+/// talk to.
+fn supervise_pty_agent() {
+    let socket_dir = Path::new(PTY_AGENT_SOCKET)
+        .parent()
+        .unwrap_or_else(|| Path::new("/run"));
+    loop {
+        secure_pty_agent_binary();
+        // 0700 root: the agent's socket is the trust boundary (ADR-008), and
+        // /run is tmpfs so this directory has to be re-created each boot.
+        let _ = std::fs::create_dir_all(socket_dir);
+        let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700));
+
+        let started = Instant::now();
+        let spawned = std::process::Command::new(PTY_AGENT_BIN)
+            .args(["--socket", PTY_AGENT_SOCKET])
+            .env_clear()
+            .env("PATH", DEFAULT_PATH)
+            .env("HOME", "/root")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                log(&format!("temps-pty-agent started (pid {})", child.id()));
+                match child.wait() {
+                    Ok(status) => log(&format!(
+                        "temps-pty-agent exited ({}) after {:?}; restarting",
+                        status,
+                        started.elapsed()
+                    )),
+                    Err(e) => log(&format!("waiting on temps-pty-agent failed: {}", e)),
+                }
+            }
+            Err(e) => log(&format!("could not start {}: {}", PTY_AGENT_BIN, e)),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Make the PTY agent binary and its directory root-owned and not writable
+/// by anyone else, before every start.
+///
+/// The host builds the rootfs without privileges, so injected files carry the
+/// *host* user's uid. Left like that, a guest account that happens to share
+/// the uid could replace the binary this PID 1 then runs as root. Running as
+/// root here, normalizing ownership closes that gap on every boot.
+fn secure_pty_agent_binary() {
+    let bin = Path::new(PTY_AGENT_BIN);
+    for path in [Some(bin), bin.parent()].into_iter().flatten() {
+        if let Err(e) = std::os::unix::fs::chown(path, Some(0), Some(0)) {
+            log(&format!("chown {}: {}", path.display(), e));
+        }
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
+            log(&format!("chmod {}: {}", path.display(), e));
+        }
+    }
+}
+
+/// Accept terminal connections and relay each to the PTY agent's socket.
+fn serve_pty(fd: RawFd) {
+    log(&format!("terminal relay ready on vsock port {}", PTY_PORT));
+    loop {
+        let conn: RawFd = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if conn < 0 {
+            continue;
+        }
+        let stream = unsafe { UnixStream::from_raw_fd(conn) };
+        let Some(slot) = RelaySlot::acquire() else {
+            log(&format!(
+                "terminal relay refused: {} relays already active",
+                MAX_PTY_RELAYS
+            ));
+            continue;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("pty-relay".to_string())
+            .spawn(move || {
+                let _slot = slot;
+                relay_to_pty_agent(stream);
+            });
+        if let Err(e) = spawned {
+            log(&format!("could not start a terminal relay thread: {}", e));
+        }
+    }
+}
+
+/// RAII claim on one of the [`MAX_PTY_RELAYS`] slots.
+struct RelaySlot;
+
+impl RelaySlot {
+    fn acquire() -> Option<Self> {
+        let mut current = ACTIVE_PTY_RELAYS.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_PTY_RELAYS {
+                return None;
+            }
+            match ACTIVE_PTY_RELAYS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(RelaySlot),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for RelaySlot {
+    fn drop(&mut self) {
+        ACTIVE_PTY_RELAYS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn relay_to_pty_agent(host: UnixStream) {
+    // The agent may still be binding its socket when the very first terminal
+    // is opened right after boot, so allow a short window before giving up.
+    let mut attempts = 0;
+    let agent = loop {
+        match UnixStream::connect(PTY_AGENT_SOCKET) {
+            Ok(stream) => break stream,
+            Err(_) if attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                // Closing the vsock connection is the only signal the host
+                // gets; the cause belongs on the serial console.
+                log(&format!(
+                    "terminal relay: cannot connect to {}: {}",
+                    PTY_AGENT_SOCKET, e
+                ));
+                return;
+            }
+        }
+    };
+    if let Err(e) = relay(host, agent) {
+        log(&format!("terminal relay ended with an error: {}", e));
     }
 }
 
@@ -386,4 +589,26 @@ fn kill_matching(pattern: &str, signal: i32) -> Response {
         }
     }
     Response::Ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_slots_are_bounded_and_returned_on_drop() {
+        let held: Vec<RelaySlot> = (0..MAX_PTY_RELAYS)
+            .map(|_| RelaySlot::acquire().expect("slot below the cap"))
+            .collect();
+        assert!(
+            RelaySlot::acquire().is_none(),
+            "the {}th relay must be refused",
+            MAX_PTY_RELAYS + 1
+        );
+        drop(held);
+        assert!(
+            RelaySlot::acquire().is_some(),
+            "slots must be returned when relays end"
+        );
+    }
 }
