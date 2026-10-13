@@ -547,7 +547,7 @@ mod tests {
         spawn_retrying(
             "test",
             policy,
-            || std::future::pending::<Result<(), String>>(),
+            std::future::pending::<Result<(), String>>,
             |()| {},
         );
 

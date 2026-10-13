@@ -1000,7 +1000,8 @@ mod tests {
 
     #[test]
     fn no_clickhouse_configuration_reads_the_postgres_span_table() {
-        let source = build_source(&args(), disconnected_db()).expect("default source must build");
+        let source = build_source(&args(), disconnected_db(), Default::default())
+            .expect("default source must build");
         assert_eq!(source.describe(), "PostgreSQL `otel_spans`");
     }
 
