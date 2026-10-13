@@ -81,10 +81,12 @@ export function decodeFile(contentsB64: string): DecodedFile {
 export const DEFAULT_FILE_MODE = 0o644
 
 /**
- * Where the sandbox hands uploaded files to the sandbox user. Anywhere else
- * `fs/write` creates them as `root:root` (see `runtime_user_owns_uploaded_file`
- * in the sandbox provider), which the console cannot undo: the sandbox user
- * cannot `chown` a root-owned file back.
+ * Which paths `fs/write` hands to the sandbox user; every other path is
+ * created as `root:root`, which the console cannot undo (the sandbox user
+ * cannot `chown` a root-owned file back). This mirrors
+ * `runtime_user_owns_uploaded_file` in the sandbox provider exactly, quirks
+ * included: a bare prefix match on the home directory (so `/home/temps-x/y`
+ * counts), plus the per-turn chat secrets.
  */
 export const SANDBOX_HOME = '/home/temps'
 const SANDBOX_USER_UID = 1000
@@ -135,9 +137,23 @@ export function writeMode(properties: FileProperties | null): number {
   return properties ? properties.mode & 0o777 : DEFAULT_FILE_MODE
 }
 
-/** True when `path` is inside the sandbox user's home. */
-export function isUnderSandboxHome(path: string): boolean {
-  return path === SANDBOX_HOME || path.startsWith(`${SANDBOX_HOME}/`)
+function isTurnSecretPath(path: string): boolean {
+  const prefix = '/run/secrets/temps-chat-'
+  if (!path.startsWith(prefix)) return false
+  return /^[A-Za-z0-9.-]+$/.test(path.slice(prefix.length))
+}
+
+/** The uid `fs/write` will give a file at `path`, whatever it was before. */
+export function ownerAfterWrite(path: string): number {
+  return path.startsWith(SANDBOX_HOME) || isTurnSecretPath(path)
+    ? SANDBOX_USER_UID
+    : 0
+}
+
+function describeUid(uid: number): string {
+  if (uid === 0) return 'root'
+  if (uid === SANDBOX_USER_UID) return 'the sandbox user'
+  return `uid ${uid}`
 }
 
 /**
@@ -159,9 +175,12 @@ export function saveRisks(
       'This path is a symbolic link. Saving replaces the link with a regular file holding your text; the file it pointed to is not changed.'
     )
   }
-  if (!isUnderSandboxHome(path) && properties.uid !== 0) {
+  const owner = ownerAfterWrite(path)
+  if (properties.uid !== owner) {
     risks.push(
-      `Outside ${SANDBOX_HOME} the sandbox writes files as root, so the sandbox user may lose access to it (this matters most for 0600 files).`
+      owner === 0
+        ? `Outside ${SANDBOX_HOME} the sandbox writes files as root, so its owner changes from ${describeUid(properties.uid)} to root and the sandbox user may lose access to it (this matters most for 0600 files).`
+        : `Under ${SANDBOX_HOME} the sandbox writes files as the sandbox user, so its owner changes from ${describeUid(properties.uid)} to ${describeUid(owner)}.`
     )
   }
   if ((properties.mode & ~0o777) !== 0) {
@@ -179,7 +198,7 @@ export function propertiesAfterSave(
 ): FileProperties {
   return {
     mode,
-    uid: isUnderSandboxHome(path) ? SANDBOX_USER_UID : 0,
+    uid: ownerAfterWrite(path),
     symlink: false,
   }
 }

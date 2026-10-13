@@ -9,6 +9,7 @@ import {
   filePropertiesArgv,
   filesUnavailableReason,
   formatFileMode,
+  ownerAfterWrite,
   parseFileProperties,
   propertiesAfterSave,
   saveRisks,
@@ -184,9 +185,28 @@ describe('saveRisks', () => {
   test('warns when a sandbox-user file outside the home would become root-owned', () => {
     const risks = saveRisks('/srv/app/.env', file({ mode: 0o600 }))
     expect(risks).toHaveLength(1)
-    expect(risks[0]).toContain('as root')
-    // /home/temps-other is not inside /home/temps.
-    expect(saveRisks('/home/temps-other/x', file({}))).toHaveLength(1)
+    expect(risks[0]).toContain('the sandbox user to root')
+    expect(risks[0]).toContain('may lose access')
+  })
+
+  test('warns the other way: a root-owned file in the home becomes sandbox-owned', () => {
+    const risks = saveRisks('/home/temps/.npmrc', file({ uid: 0, mode: 0o600 }))
+    expect(risks).toHaveLength(1)
+    expect(risks[0]).toContain('root to the sandbox user')
+  })
+
+  test('follows the backend prefix rule: /home/temps-x counts as the home', () => {
+    // The provider uses a bare starts_with, so this IS written as uid 1000.
+    expect(ownerAfterWrite('/home/temps-other/x')).toBe(1000)
+    expect(saveRisks('/home/temps-other/x', file({}))).toEqual([])
+    expect(ownerAfterWrite('/home/templates/x')).toBe(0)
+  })
+
+  test('per-turn chat secrets are sandbox-owned, other secrets are not', () => {
+    expect(ownerAfterWrite('/run/secrets/temps-chat-mcp-7f.json')).toBe(1000)
+    expect(ownerAfterWrite('/run/secrets/temps-chat-')).toBe(0)
+    expect(ownerAfterWrite('/run/secrets/operator-owned')).toBe(0)
+    expect(ownerAfterWrite('/run/secrets/temps-chat-a/b')).toBe(0)
   })
 
   test('a root-owned file outside the home is already root, so nothing changes', () => {
