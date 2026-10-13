@@ -43,7 +43,10 @@ describe('harness update bar', () => {
       'Claude Code update available'
     )
     expect(harnessUpdateDetail('Claude Code', available)).toContain(
-      "Models released after your installed version won't be offered"
+      "Models released after the installed version won't be offered"
+    )
+    expect(harnessUpdateDetail('Claude Code', available)).toContain(
+      'in your AI workspace'
     )
   })
 

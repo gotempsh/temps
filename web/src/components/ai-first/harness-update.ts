@@ -69,7 +69,7 @@ export function harnessUpdateDetail(
   const change = harnessVersionChange(status)
   const versions = change ? ` (${change})` : ''
   if (status.updating) {
-    return `Installing the latest ${providerName}${versions} in your workspace. This can take a minute.`
+    return `Installing the latest ${providerName}${versions} in your AI workspace. This can take a minute.`
   }
-  return `A newer ${providerName}${versions} is available. Models released after your installed version won't be offered until you update.`
+  return `A newer ${providerName}${versions} is available in your AI workspace. Models released after the installed version won't be offered until you update it.`
 }

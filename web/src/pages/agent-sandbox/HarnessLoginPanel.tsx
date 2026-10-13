@@ -38,6 +38,7 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
 import {
+  INITIAL_SUCCESS_ANNOUNCEMENT,
   formatElapsed,
   isLoginActive,
   isLoginTerminal,
@@ -45,6 +46,7 @@ import {
   loginButtonLabel,
   loginCodeSchema,
   loginPhaseTitle,
+  nextSuccessAnnouncement,
   type LoginCodeFormValues,
 } from './harness-login'
 
@@ -94,12 +96,9 @@ export function HarnessLoginPanel({
   const queryKey = ['ai-provider-login', providerId] as const
   const [open, setOpen] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
-  const announcedSession = useRef<string | null>(null)
-  // The first session this panel sees may be an old, finished one (the server
-  // keeps it, and so does the query cache). Only a sign-in that finishes while
-  // the panel is mounted is announced, otherwise reopening this panel to
-  // replace a credential would report the previous success again.
-  const baselineTaken = useRef(false)
+  // The first session this panel sees may be an old, finished one; only a
+  // sign-in that finishes while the panel is mounted is announced.
+  const announcement = useRef(INITIAL_SUCCESS_ANNOUNCEMENT)
   const codeForm = useForm<LoginCodeFormValues>({
     resolver: zodResolver(loginCodeSchema),
     defaultValues: { code: '' },
@@ -133,7 +132,13 @@ export function HarnessLoginPanel({
       })
       return data
     },
-    onMutate: () => setStartError(null),
+    onMutate: async () => {
+      setStartError(null)
+      // A mount-time read of the previous (finished) session may still be in
+      // flight; if it landed after this start it would overwrite the new
+      // session in the cache and stop the polling.
+      await queryClient.cancelQueries({ queryKey })
+    },
     onSuccess: (data) => {
       queryClient.setQueryData(queryKey, data)
       codeForm.reset({ code: '' })
@@ -159,6 +164,7 @@ export function HarnessLoginPanel({
   })
 
   const submitMutation = useMutation({
+    onMutate: () => queryClient.cancelQueries({ queryKey }),
     mutationFn: async (value: string) => {
       const { data } = await submitAiProviderLoginCode({
         path: { provider_id: providerId },
@@ -201,17 +207,9 @@ export function HarnessLoginPanel({
   const phase = session?.phase
   const sessionId = session?.session_id
   useEffect(() => {
-    if (!phase || !sessionId) return
-    if (!baselineTaken.current) {
-      baselineTaken.current = true
-      if (isLoginTerminal(phase)) {
-        announcedSession.current = sessionId
-        return
-      }
-    }
-    if (phase !== 'succeeded') return
-    if (announcedSession.current === sessionId) return
-    announcedSession.current = sessionId
+    const next = nextSuccessAnnouncement(announcement.current, phase, sessionId)
+    announcement.current = next.state
+    if (!next.announce) return
     toast.success(`${provider.name} signed in`)
     void Promise.resolve(onSucceeded())
     // eslint-disable-next-line react-hooks/exhaustive-deps

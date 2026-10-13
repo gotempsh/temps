@@ -53,6 +53,50 @@ export function isLoginActive(phase: string | undefined | null): boolean {
   return phase != null && !TERMINAL_PHASES.has(phase)
 }
 
+/** What a panel has already seen of the server's sign-in state. */
+export interface SuccessAnnouncementState {
+  /** True once the first session the panel saw has been taken as baseline. */
+  baselineTaken: boolean
+  /** The finished session already reported (or deliberately not reported). */
+  announcedSession: string | null
+}
+
+export const INITIAL_SUCCESS_ANNOUNCEMENT: SuccessAnnouncementState = {
+  baselineTaken: false,
+  announcedSession: null,
+}
+
+/**
+ * Decide whether a session update is a sign-in that just finished.
+ *
+ * The server and the query cache keep the last sign-in after it ends, so the
+ * first session a freshly mounted panel sees can be an old, finished one. That
+ * baseline is never announced; otherwise reopening the panel to replace a
+ * credential would report the previous success again and close itself.
+ */
+export function nextSuccessAnnouncement(
+  state: SuccessAnnouncementState,
+  phase: string | undefined | null,
+  sessionId: string | undefined | null
+): { state: SuccessAnnouncementState; announce: boolean } {
+  if (!phase || !sessionId) return { state, announce: false }
+  if (!state.baselineTaken) {
+    const baseline: SuccessAnnouncementState = {
+      baselineTaken: true,
+      announcedSession: isLoginTerminal(phase) ? sessionId : null,
+    }
+    if (isLoginTerminal(phase)) return { state: baseline, announce: false }
+    state = baseline
+  }
+  if (phase !== 'succeeded' || state.announcedSession === sessionId) {
+    return { state, announce: false }
+  }
+  return {
+    state: { ...state, announcedSession: sessionId },
+    announce: true,
+  }
+}
+
 /** `m:ss`, clamped at zero. */
 export function formatElapsed(seconds: number): string {
   const whole = Math.max(0, Math.floor(seconds))

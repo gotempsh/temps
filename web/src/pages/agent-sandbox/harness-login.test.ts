@@ -9,7 +9,9 @@ import {
   loginButtonLabel,
   loginCodeSchema,
   loginPhaseTitle,
+  INITIAL_SUCCESS_ANNOUNCEMENT,
   MAX_LOGIN_CODE_LENGTH,
+  nextSuccessAnnouncement,
 } from './harness-login'
 
 describe('harness login helpers', () => {
@@ -57,5 +59,38 @@ describe('harness login helpers', () => {
     expect(parse('caf\u00e9').success).toBe(false)
     expect(parse('a'.repeat(MAX_LOGIN_CODE_LENGTH)).success).toBe(true)
     expect(parse('a'.repeat(MAX_LOGIN_CODE_LENGTH + 1)).success).toBe(false)
+  })
+
+  test('a sign-in finished before the panel mounted is not announced again', () => {
+    let state = INITIAL_SUCCESS_ANNOUNCEMENT
+    // Stale success from an earlier sign-in is the baseline, not news.
+    let step = nextSuccessAnnouncement(state, 'succeeded', 's1')
+    expect(step.announce).toBe(false)
+    state = step.state
+    step = nextSuccessAnnouncement(state, 'succeeded', 's1')
+    expect(step.announce).toBe(false)
+    state = step.state
+
+    // A new sign-in started here is announced exactly once when it succeeds.
+    step = nextSuccessAnnouncement(state, 'starting', 's2')
+    expect(step.announce).toBe(false)
+    state = step.state
+    step = nextSuccessAnnouncement(state, 'succeeded', 's2')
+    expect(step.announce).toBe(true)
+    state = step.state
+    expect(nextSuccessAnnouncement(state, 'succeeded', 's2').announce).toBe(
+      false
+    )
+  })
+
+  test('a sign-in that was already running when the panel mounted is announced', () => {
+    let step = nextSuccessAnnouncement(
+      INITIAL_SUCCESS_ANNOUNCEMENT,
+      'waiting',
+      's1'
+    )
+    expect(step.announce).toBe(false)
+    step = nextSuccessAnnouncement(step.state, 'succeeded', 's1')
+    expect(step.announce).toBe(true)
   })
 })

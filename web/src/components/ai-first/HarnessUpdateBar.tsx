@@ -59,6 +59,20 @@ export function HarnessUpdateBar({
     refetchInterval: (query) => harnessUpdateRefetchInterval(query.state.data),
   })
 
+  // An explicit retry looks inside the workspace again: the server keeps a
+  // failed check for hours, so a plain refetch would return the same failure.
+  const recheck = useMutation({
+    mutationFn: async () => {
+      const { data } = await getAiProviderHarnessUpdate({
+        path: { provider_id: providerId },
+        query: { refresh: true },
+        throwOnError: true,
+      })
+      return data
+    },
+    onSuccess: (next) => queryClient.setQueryData(queryKey, next),
+  })
+
   const update = useMutation({
     mutationFn: async () => {
       const { data } = await updateAiProviderHarness({
@@ -110,12 +124,17 @@ export function HarnessUpdateBar({
     },
   })
 
-  const checkProblem = status.isError
+  const checkProblem = recheck.isError
     ? problemDetail(
-        status.error,
+        recheck.error,
         `Could not check whether ${providerName} has an update.`
       )
-    : harnessUpdateCheckProblem(status.data, providerName)
+    : status.isError
+      ? problemDetail(
+          status.error,
+          `Could not check whether ${providerName} has an update.`
+        )
+      : harnessUpdateCheckProblem(status.data, providerName)
   if (checkProblem) {
     return (
       <div
@@ -142,10 +161,10 @@ export function HarnessUpdateBar({
           type="button"
           size="sm"
           variant="outline"
-          disabled={status.isFetching}
-          onClick={() => void status.refetch()}
+          disabled={status.isFetching || recheck.isPending}
+          onClick={() => recheck.mutate()}
         >
-          {status.isFetching ? (
+          {status.isFetching || recheck.isPending ? (
             <Loader2 className="mr-1.5 size-4 animate-spin" />
           ) : (
             <RefreshCw className="mr-1.5 size-4" />

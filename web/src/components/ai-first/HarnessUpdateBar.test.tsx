@@ -42,6 +42,20 @@ describe('HarnessUpdateBar', () => {
     expect(html).toContain('disabled')
   })
 
+  test('explains a check that could not tell and offers to retry', () => {
+    const html = render({
+      provider_id: 'claude_cli',
+      installed_version: null,
+      latest_version: null,
+      update_available: false,
+      updating: false,
+      detail: 'The workspace is not running.',
+    })
+    expect(html).toContain('check for a Claude Code update')
+    expect(html).toContain('The workspace is not running.')
+    expect(html).toContain('Check again')
+  })
+
   test('renders nothing when the harness is current or unknown', () => {
     expect(render({ ...base, update_available: false })).toBe('')
     expect(render(undefined)).toBe('')
