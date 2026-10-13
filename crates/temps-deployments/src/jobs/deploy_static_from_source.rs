@@ -105,7 +105,17 @@ impl DeployStaticFromSourceJob {
         } else {
             LogLevel::Info
         };
+        self.log_at(context, level, message).await
+    }
 
+    /// Write a log message at an explicit level, bypassing content sniffing
+    /// (a skipped path named `failed.map` must not turn a warning into an error).
+    async fn log_at(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_structured_log(log_id, level, message.clone())
@@ -168,14 +178,13 @@ impl DeployStaticFromSourceJob {
     ///
     /// A raw git checkout routinely carries files like `.gitignore` or
     /// `.github/` that were never meant to be served and are never something
-    /// the repository owner is asking to publish — unlike an uploaded
-    /// archive or a build tool's output directory, where the same policy
-    /// violation in `StaticDeployer::deploy` hard-fails the deployment on
-    /// purpose (there, a stray `.env` is a real red flag worth surfacing).
-    /// The policy predicate itself is untouched and still enforced a second
-    /// time by `StaticDeployer::deploy` on whatever survives this filter, and
-    /// a third time per-request by the proxy — this only changes the failure
-    /// mode for the *first* of those three checks.
+    /// the repository owner is asking to publish. `StaticDeployer::deploy`
+    /// applies the same skip-and-report behavior to whatever it is given;
+    /// filtering here additionally keeps `.git/` and friends out of this
+    /// staging copy, where they would otherwise count against the size and
+    /// entry limits for files that will never be published. The policy
+    /// predicate itself is untouched and still enforced a second time by
+    /// `StaticDeployer::deploy`, and a third time per-request by the proxy.
     ///
     /// Enforces the same `MAX_STATIC_ENTRIES`/`MAX_STATIC_ENTRY_BYTES`/
     /// `MAX_STATIC_TOTAL_BYTES` bounds `StaticDeployer::deploy` enforces on its
@@ -341,8 +350,9 @@ impl WorkflowTask for DeployStaticFromSourceJob {
         }
 
         if !stats.skipped.is_empty() {
-            self.log(
+            self.log_at(
                 &context,
+                LogLevel::Warning,
                 format!(
                     "⏭️  Skipped {} non-publishable path(s), e.g. {}",
                     stats.skipped.len(),
@@ -373,6 +383,13 @@ impl WorkflowTask for DeployStaticFromSourceJob {
                     .await);
             }
         };
+
+        // Entries the staging copy above could not see (e.g. created between
+        // the copy and the deploy) are still reported, never silently dropped.
+        if let Some(summary) = result.skipped_summary() {
+            self.log_at(&context, LogLevel::Warning, format!("⚠️ {summary}"))
+                .await?;
+        }
 
         self.log(&context, format!("📍 Deployed to: {}", result.storage_path))
             .await?;

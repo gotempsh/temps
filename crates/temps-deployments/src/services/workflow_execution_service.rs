@@ -5143,6 +5143,8 @@ mod tests {
                 file_count: 10,
                 total_size_bytes: 1024,
                 deployed_at: Utc::now(),
+                skipped_count: 0,
+                skipped_paths: Vec::new(),
             })
         }
 
