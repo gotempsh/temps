@@ -82,7 +82,7 @@
     "js-yaml": "^5.4.3",
     "lucide-react": "^1.54.0",
     "monaco-editor": "^0.57.0",
-    "nanoid": "^6.0.1",
+    "nanoid": "^6.0.2",
     "next-themes": "^0.4.6",
     "react": "^19.3.0",
     "react-day-picker": "10.0.2",
