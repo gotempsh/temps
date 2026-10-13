@@ -147,12 +147,20 @@ export function SampleDeployTracker({
     // read; keep waiting through the bounded polls before calling it absent.
     // Empty answers (`null`) count like errors did: the same bound that stops
     // the polling ends the waiting state, or the skeleton would never leave.
+    //
+    // Repeated `null` answers change none of `data`, `isPending` or
+    // `errorUpdateCount`, and React Query only re-renders for result fields a
+    // component reads. `dataUpdatedAt` moves on every successful answer, so
+    // reading it is what subscribes this component to the polls and lets the
+    // skeleton end after the last empty one. (`getQueryState` does not
+    // subscribe; it only supplies the current count.)
+    const lastAnswerAt = deploymentQuery.dataUpdatedAt
     const lastDeploymentState = queryClient.getQueryState(
       getLastDeploymentQueryKey({ path: { id: project.id } })
     )
     const emptyPolls =
       deploymentQuery.errorUpdateCount +
-      (lastDeploymentState?.dataUpdateCount ?? 0)
+      (lastAnswerAt > 0 ? (lastDeploymentState?.dataUpdateCount ?? 0) : 0)
     const stillWaiting =
       !startError && emptyPolls < MAX_POLLS_WITHOUT_DEPLOYMENT
     if (deploymentQuery.isPending || stillWaiting) {
