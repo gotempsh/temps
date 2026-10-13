@@ -843,9 +843,10 @@ pub struct TemplateServiceRequest {
     /// Hold the first deployment until [`TemplateServiceCreator::queue_first_deployment`].
     pub defer_initial_deployment: bool,
     /// Ownership marker of the instantiation creating this service, built
-    /// with [`temps_entities::projects::instantiation_token`]. Stored in the
-    /// same `INSERT` as the project, so a resumed instantiation can recognise
-    /// the project as its own. `None` outside an instantiation.
+    /// with [`temps_entities::projects::instantiation_token`]. The project is
+    /// inserted holding its pending spelling and takes this one once fully
+    /// initialized, so a resumed instantiation can tell a complete project
+    /// of its own from an unfinished one. `None` outside an instantiation.
     pub instantiation_token: Option<String>,
     /// Label for telemetry and messages: `image`, `fork`, `public_repo` or
     /// `repository`.

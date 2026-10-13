@@ -141,6 +141,81 @@ fn normalize_clone_url(url: &str) -> String {
     url.strip_prefix("www.").unwrap_or(url).to_ascii_lowercase()
 }
 
+/// A repository a group points at, as far as telling two repositories apart
+/// goes. Borrowed from a stored group or from a [`GroupRepository`].
+#[derive(Debug, Clone, Copy)]
+pub struct GroupRepositoryRef<'a> {
+    pub connection_id: Option<i32>,
+    /// `github` or `gitlab` for a repository read anonymously.
+    pub public_provider: Option<&'a str>,
+    pub owner: &'a str,
+    pub name: &'a str,
+    pub branch: &'a str,
+}
+
+impl<'a> From<&'a GroupRepository> for GroupRepositoryRef<'a> {
+    fn from(repo: &'a GroupRepository) -> Self {
+        Self {
+            connection_id: repo.git_provider_connection_id,
+            public_provider: repo.public_provider.as_deref(),
+            owner: &repo.repo_owner,
+            name: &repo.repo_name,
+            branch: &repo.main_branch,
+        }
+    }
+}
+
+/// Where a member project, or a service about to become one, reads its code.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberRepositoryRef<'a> {
+    pub connection_id: Option<i32>,
+    pub is_public: bool,
+    pub owner: &'a str,
+    pub name: &'a str,
+    pub branch: &'a str,
+    pub git_url: Option<&'a str>,
+}
+
+/// Whether `member` reads the repository and branch `group` points at.
+///
+/// The single definition of "follows the group's repository", shared by
+/// [`follows`] (existing members) and the instantiation engine (a service
+/// about to join), so the two cannot disagree about which repository is the
+/// group's. Owner, name and branch alone do not identify a repository: the
+/// same `acme/shop` exists on every provider and on every self-hosted
+/// instance, so the place it is read from must match too:
+///
+/// - a connected repository is read through exactly one connection, which
+///   must be the group's;
+/// - a public one is cloned anonymously from the group's provider, so the
+///   member must be public, have no connection, and clone from the URL the
+///   group's provider would give (compared spelling-insensitively).
+///
+/// Owner and name compare case-insensitively (hosts treat `Acme/Shop` and
+/// `acme/shop` as one repository); the branch is case-sensitive.
+pub fn same_repository(group: &GroupRepositoryRef<'_>, member: &MemberRepositoryRef<'_>) -> bool {
+    if !member.owner.eq_ignore_ascii_case(group.owner)
+        || !member.name.eq_ignore_ascii_case(group.name)
+        || member.branch != group.branch
+        || member.connection_id != group.connection_id
+    {
+        return false;
+    }
+    match group.public_provider {
+        // A public group's members clone anonymously, from the group's URL.
+        // Moving a group from one host to another with the same names leaves
+        // every member pointing at the old host, so the URL must match too.
+        Some(provider) => {
+            member.is_public
+                && member.git_url.is_some_and(|url| {
+                    normalize_clone_url(url)
+                        == normalize_clone_url(&public_clone_url(provider, group.owner, group.name))
+                })
+        }
+        None => true,
+    }
+}
+
 fn points_at(
     group: &project_groups::Model,
     connection_id: Option<i32>,
@@ -155,27 +230,23 @@ fn points_at(
     else {
         return false;
     };
-    if repo_owner != owner
-        || repo_name != name
-        || branch != group_branch
-        || connection_id != group.git_provider_connection_id
-    {
-        return false;
-    }
-    match &group.public_provider {
-        // A public group's members clone anonymously, from the group's URL.
-        // Owner, name and branch alone do not tell providers apart: moving a
-        // group from one host to another with the same names leaves every
-        // member pointing at the old host, so the URL must match too.
-        Some(provider) => {
-            is_public_repo
-                && git_url.is_some_and(|url| {
-                    normalize_clone_url(url)
-                        == normalize_clone_url(&public_clone_url(provider, owner, name))
-                })
-        }
-        None => true,
-    }
+    same_repository(
+        &GroupRepositoryRef {
+            connection_id: group.git_provider_connection_id,
+            public_provider: group.public_provider.as_deref(),
+            owner,
+            name,
+            branch: group_branch,
+        },
+        &MemberRepositoryRef {
+            connection_id,
+            is_public: is_public_repo,
+            owner: repo_owner,
+            name: repo_name,
+            branch,
+            git_url,
+        },
+    )
 }
 
 fn clean_field(label: &str, value: &str) -> Result<String, ProjectGroupError> {
@@ -930,6 +1001,103 @@ pub(crate) mod tests {
         }
     }
 
+    fn public_group_ref(provider: &'static str) -> GroupRepositoryRef<'static> {
+        GroupRepositoryRef {
+            connection_id: None,
+            public_provider: Some(provider),
+            owner: "acme",
+            name: "shop",
+            branch: "main",
+        }
+    }
+
+    fn public_member(url: &str) -> MemberRepositoryRef<'_> {
+        MemberRepositoryRef {
+            connection_id: None,
+            is_public: true,
+            owner: "acme",
+            name: "shop",
+            branch: "main",
+            git_url: Some(url),
+        }
+    }
+
+    #[test]
+    fn same_names_on_another_provider_are_not_the_same_repository() {
+        let github = "https://github.com/acme/shop.git";
+        let gitlab = "https://gitlab.com/acme/shop.git";
+        assert!(same_repository(
+            &public_group_ref("github"),
+            &public_member(github)
+        ));
+        assert!(same_repository(
+            &public_group_ref("gitlab"),
+            &public_member(gitlab)
+        ));
+        // Both directions: identical owner, name and branch, other host.
+        assert!(!same_repository(
+            &public_group_ref("github"),
+            &public_member(gitlab)
+        ));
+        assert!(!same_repository(
+            &public_group_ref("gitlab"),
+            &public_member(github)
+        ));
+    }
+
+    #[test]
+    fn a_repository_is_the_same_across_url_spellings_and_owner_case() {
+        let group = public_group_ref("github");
+        for url in [
+            "https://github.com/acme/shop",
+            "https://github.com/acme/shop.git",
+            "http://www.github.com/acme/shop.git/",
+            "https://GitHub.com/Acme/Shop.git",
+        ] {
+            let mut member = public_member(url);
+            // The owner and name a template parses out of such a URL keep
+            // the URL's spelling.
+            if url.contains("Acme") {
+                member.owner = "Acme";
+                member.name = "Shop";
+            }
+            assert!(same_repository(&group, &member), "{url}");
+        }
+        // A branch is not case-folded.
+        let mut other_branch = public_member("https://github.com/acme/shop.git");
+        other_branch.branch = "Main";
+        assert!(!same_repository(&group, &other_branch));
+    }
+
+    #[test]
+    fn a_connected_repository_is_only_followed_through_the_same_connection() {
+        let group = GroupRepositoryRef {
+            connection_id: Some(7),
+            public_provider: None,
+            owner: "acme",
+            name: "shop",
+            branch: "main",
+        };
+        let member = |connection_id: Option<i32>, is_public: bool, url: Option<&'static str>| {
+            MemberRepositoryRef {
+                connection_id,
+                is_public,
+                owner: "acme",
+                name: "shop",
+                branch: "main",
+                git_url: url,
+            }
+        };
+        assert!(same_repository(&group, &member(Some(7), false, None)));
+        // Another connection (a second self-hosted instance with the same
+        // owner and name) and an anonymous clone are other repositories.
+        assert!(!same_repository(&group, &member(Some(8), false, None)));
+        assert!(!same_repository(
+            &group,
+            &member(None, true, Some("https://github.com/acme/shop.git"))
+        ));
+    }
+
     #[test]
     fn public_repository_names_must_be_one_plain_segment() {
         for good in ["vercel", "next.js", "my_repo-2"] {
@@ -1160,6 +1328,15 @@ pub(crate) mod tests {
     pub(crate) async fn repository_service(
         db: Arc<DatabaseConnection>,
     ) -> Option<GroupRepositoryService> {
+        let (projects, git) = project_service(db.clone()).await?;
+        Some(GroupRepositoryService::new(db, projects, git))
+    }
+
+    /// A `ProjectService` over `db` whose collaborators are never exercised
+    /// by tests that only read or delete project rows.
+    pub(crate) async fn project_service(
+        db: Arc<DatabaseConnection>,
+    ) -> Option<(Arc<ProjectService>, Arc<GitProviderManager>)> {
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
                 "127.0.0.1:3000".to_string(),
@@ -1201,7 +1378,7 @@ pub(crate) mod tests {
             environments,
             encryption,
         ));
-        Some(GroupRepositoryService::new(db, projects, git))
+        Some((projects, git))
     }
 
     pub(crate) async fn insert_project(conn: &impl ConnectionTrait, id: i32, name: &str) {

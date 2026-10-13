@@ -1304,10 +1304,13 @@ impl ProjectService {
     ///
     /// `instantiation_token` is the ownership marker of the instantiation
     /// creating the service (see
-    /// [`temps_entities::projects::instantiation_token`]). It is written in
-    /// the same `INSERT` as the project row, so a run that crashes after the
-    /// insert can still recognise the project as its own; `None` for every
-    /// creation that is not part of an instantiation.
+    /// [`temps_entities::projects::instantiation_token`]). The project row
+    /// is inserted holding its *pending* spelling, so a run that crashes
+    /// after the insert can still recognise the project as its own and
+    /// discard it; the final token is only written once the project's
+    /// environment, variables and service links exist, so it proves a
+    /// complete project. `None` for every creation that is not part of an
+    /// instantiation.
     pub async fn create_template_service_as(
         &self,
         request: CreateProjectRequest,
@@ -1590,7 +1593,15 @@ impl ProjectService {
             })?;
         }
 
+        // The row is inserted holding the *pending* spelling of the token and
+        // only switched to the final one after it is fully initialized (see
+        // the crash-window note below), so the final token never marks a
+        // half-initialized project.
         let token_for_diagnosis = instantiation_token.clone();
+        let token_for_seal = instantiation_token.clone();
+        let pending_instantiation_token = instantiation_token
+            .as_deref()
+            .map(temps_entities::projects::pending_instantiation_token);
 
         // Explain a root directory the repository does not have now, rather
         // than as a bare ENOENT from the first build (issue #1350).
@@ -1608,6 +1619,21 @@ impl ProjectService {
                 },
             )
             .await?;
+        }
+
+        // A token has at most one project. Say so up front, before the
+        // project, its environment and its links are created and rolled
+        // back; the unique index stays the backstop for a concurrent holder.
+        if let Some(token) = token_for_diagnosis.as_deref() {
+            if let Some(holder) = self.instantiation_token_holder(token).await {
+                return Err(ProjectError::DatabaseError {
+                    reason: format!(
+                        "Project {} ('{}') already holds instantiation token '{token}'; \
+                         not creating a second project for '{}'",
+                        holder.id, holder.slug, project_slug
+                    ),
+                });
+            }
         }
 
         let project = projects::ActiveModel {
@@ -1632,7 +1658,7 @@ impl ProjectService {
             template_slug: Set(request.template_slug),
             service_template: Set(service_template_json),
             hosting: Set(request.hosting),
-            instantiation_token: Set(instantiation_token),
+            instantiation_token: Set(pending_instantiation_token.clone()),
             ..Default::default()
         };
 
@@ -1644,14 +1670,8 @@ impl ProjectService {
             Err(ProjectError::SlugConflict { slug }) => {
                 // The token has its own unique index: say so when it is the
                 // token that collided, not the slug.
-                if let Some(token) = token_for_diagnosis {
-                    let holder = projects::Entity::find()
-                        .filter(projects::Column::InstantiationToken.eq(token.as_str()))
-                        .one(self.db.as_ref())
-                        .await
-                        .ok()
-                        .flatten();
-                    if let Some(holder) = holder {
+                if let Some(token) = token_for_diagnosis.as_deref() {
+                    if let Some(holder) = self.instantiation_token_holder(token).await {
                         return Err(ProjectError::DatabaseError {
                             reason: format!(
                                 "Project {} ('{}') already holds instantiation token '{token}'; \
@@ -1678,8 +1698,27 @@ impl ProjectService {
         // in CLAUDE.md "Resource Cleanup" — a real txn would require pushing
         // a `&impl ConnectionTrait` through every dependent service, which
         // is a much larger refactor.
+        //
+        // Crash window. The environment, variables and service links are
+        // separate writes, so a process that stops between the INSERT and
+        // the end of `finalize_project_creation` leaves a project row that
+        // this rollback never saw. The ownership token is therefore written
+        // in two steps: the INSERT carries the *pending* token, and only
+        // once initialization succeeded is it switched to the final one
+        // (`seal_instantiation_token`, a single conditional UPDATE). Whoever
+        // finds a project holding the final token may rely on it being
+        // complete; one holding the pending token is provably the run's own
+        // but unfinished, and is discarded and recreated rather than
+        // adopted (`discard_unfinished_instantiation_project`). A crash
+        // after the seal and before this call returns loses only the
+        // best-effort `ProjectCreated` job below, which was never part of
+        // what the token vouches for. The unique index covers both
+        // spellings, so at most one project per (instantiation, service)
+        // can ever hold either, and a second creation that raced past the
+        // lease fails the seal and is rolled back here.
         let project_id = project_found_db.id;
-        let default_environment = match self
+        let mut project_found_db = project_found_db;
+        let initialized = match self
             .finalize_project_creation(
                 &project_found_db,
                 request.environment_variables,
@@ -1690,7 +1729,25 @@ impl ProjectService {
             )
             .await
         {
-            Ok(env) => env,
+            Ok(env) => match (
+                pending_instantiation_token.as_deref(),
+                token_for_seal.as_deref(),
+            ) {
+                (Some(pending), Some(token)) => self
+                    .seal_instantiation_token(project_id, pending, token)
+                    .await
+                    .map(|()| env),
+                _ => Ok(env),
+            },
+            Err(err) => Err(err),
+        };
+        let default_environment = match initialized {
+            Ok(env) => {
+                if let Some(token) = token_for_seal {
+                    project_found_db.instantiation_token = Some(token);
+                }
+                env
+            }
             Err(err) => {
                 tracing::error!(
                     "Project {} creation failed after insert, rolling back: {}",
@@ -1959,6 +2016,111 @@ impl ProjectService {
         };
 
         Ok(self.map_written_project(project_found_db).await)
+    }
+
+    /// The project holding instantiation token `token`, under either its
+    /// final or its pending spelling (soft-deleted ones included: they keep
+    /// the token). Best effort, for diagnostics and early refusal; the unique
+    /// index is what enforces "at most one".
+    async fn instantiation_token_holder(&self, token: &str) -> Option<projects::Model> {
+        let spellings = [
+            token.to_string(),
+            temps_entities::projects::pending_instantiation_token(token),
+        ];
+        projects::Entity::find()
+            .filter(projects::Column::InstantiationToken.is_in(spellings))
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Switch a project from its pending instantiation token to the final
+    /// one, declaring its initialization complete.
+    ///
+    /// Conditional on the row still holding `pending`, so it can never
+    /// re-label a project it did not just create. A unique violation means
+    /// another project already holds `token`: this run lost a race it should
+    /// not have been in, and the caller rolls its project back.
+    async fn seal_instantiation_token(
+        &self,
+        project_id: i32,
+        pending: &str,
+        token: &str,
+    ) -> Result<(), ProjectError> {
+        use sea_orm::sea_query::Expr;
+        let result = projects::Entity::update_many()
+            .col_expr(projects::Column::InstantiationToken, Expr::value(token))
+            .filter(projects::Column::Id.eq(project_id))
+            .filter(projects::Column::InstantiationToken.eq(pending))
+            .exec(self.db.as_ref())
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if super::types::is_unique_violation(&error) => {
+                let holder = match self.instantiation_token_holder(token).await {
+                    Some(holder) => format!("project {} ('{}')", holder.id, holder.slug),
+                    None => "another project".to_string(),
+                };
+                return Err(ProjectError::DatabaseError {
+                    reason: format!(
+                        "Project {project_id} cannot take instantiation token '{token}': \
+                         {holder} already holds it"
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(ProjectError::DatabaseError {
+                    reason: format!(
+                        "Failed to record that project {project_id} finished initializing \
+                         (instantiation token '{token}'): {error}"
+                    ),
+                });
+            }
+        };
+        if result.rows_affected != 1 {
+            return Err(ProjectError::DatabaseError {
+                reason: format!(
+                    "Project {project_id} no longer holds pending instantiation token \
+                     '{pending}'; it was not marked as initialized"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Hard-delete a project an instantiation began creating and never
+    /// finished: its row still holds the *pending* token `pending_token`, so
+    /// it has no (or only some of its) environment, variables and service
+    /// links, and was never exposed or deployed.
+    ///
+    /// Conditional on the row still holding that token, so a project that
+    /// has since been sealed (or anything else) is never touched. Returns
+    /// whether a row was removed. Dependent rows go with it through the same
+    /// cascade the in-process rollback of `create_project` relies on.
+    pub async fn discard_unfinished_instantiation_project(
+        &self,
+        project_id: i32,
+        pending_token: &str,
+    ) -> Result<bool, ProjectError> {
+        if !temps_entities::projects::is_pending_instantiation_token(pending_token) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Refusing to discard project {project_id}: '{pending_token}' is not a pending \
+                 instantiation token"
+            )));
+        }
+        let result = projects::Entity::delete_many()
+            .filter(projects::Column::Id.eq(project_id))
+            .filter(projects::Column::InstantiationToken.eq(pending_token))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|error| ProjectError::DatabaseError {
+                reason: format!(
+                    "Failed to discard unfinished project {project_id} \
+                     (instantiation token '{pending_token}'): {error}"
+                ),
+            })?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Post-insert steps for `create_project`. Returns the default environment
@@ -7734,11 +7896,12 @@ mod tests {
         }
     }
 
-    /// The ownership token is written in the same INSERT as the project, is
-    /// absent from every other creation path, never reaches a serialized
-    /// project row, and can be held by only one project.
+    /// The final ownership token appears only on a fully initialized project
+    /// (it has its environment), is absent from every other creation path,
+    /// never reaches a serialized project row, and can be held by only one
+    /// project.
     #[tokio::test]
-    async fn a_template_service_stores_its_instantiation_token_atomically() {
+    async fn a_template_service_takes_its_instantiation_token_once_initialized() {
         let Ok(test_db) = TestDatabase::with_migrations().await else {
             eprintln!("Test database unavailable, skipping");
             return;
@@ -7764,6 +7927,10 @@ mod tests {
             .unwrap()
             .expect("project row");
         assert_eq!(stored.instantiation_token.as_deref(), Some(token.as_str()));
+        assert!(
+            environment_count(db.as_ref(), owned.id).await > 0,
+            "a project holding the final token is initialized"
+        );
         let serialized = serde_json::to_value(&stored).unwrap();
         assert!(
             serialized.get("instantiation_token").is_none(),
@@ -7815,6 +7982,231 @@ mod tests {
             service.get_project_by_slug("imposter").await.is_err(),
             "the refused creation left no project behind"
         );
+    }
+
+    async fn environment_count(db: &sea_orm::DatabaseConnection, project_id: i32) -> u64 {
+        use sea_orm::PaginatorTrait;
+        temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .count(db)
+            .await
+            .unwrap()
+    }
+
+    async fn project_by_slug(
+        db: &sea_orm::DatabaseConnection,
+        slug: &str,
+    ) -> Option<temps_entities::projects::Model> {
+        temps_entities::projects::Entity::find()
+            .filter(temps_entities::projects::Column::Slug.eq(slug))
+            .one(db)
+            .await
+            .unwrap()
+    }
+
+    /// A creation that fails inside initialization (here, after the
+    /// environment and a first variable exist: a duplicate variable) leaves
+    /// no project, environment or variable at all, tokened or not -- neither the final token nor the pending one
+    /// stays behind to be adopted, and the same token creates a project on
+    /// the next attempt.
+    #[tokio::test]
+    async fn a_failed_initialization_leaves_no_tokened_project_behind() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let caller = SlugClaimCaller::project_writer();
+        let token = temps_entities::projects::instantiation_token(52, "backend");
+
+        let mut request = template_service_request("Half Backend", "half-backend");
+        // The second `API_TOKEN` is refused once the environment and the
+        // first one exist, so initialization is cut short half-way.
+        request.environment_variables = Some(vec![
+            CreateProjectEnvVar {
+                key: "API_TOKEN".to_string(),
+                value: "first".to_string(),
+                is_secret: false,
+            },
+            CreateProjectEnvVar {
+                key: "API_TOKEN".to_string(),
+                value: "second".to_string(),
+                is_secret: false,
+            },
+        ]);
+        let error = service
+            .create_template_service_as(request, None, &caller, true, Some(token.clone()))
+            .await
+            .err()
+            .expect("a duplicate variable fails initialization");
+        assert!(
+            matches!(error, ProjectError::EnvVarCreationFailed { .. }),
+            "the failure happens inside initialization, after the insert: {error:?}"
+        );
+
+        assert!(
+            project_by_slug(db.as_ref(), "half-backend").await.is_none(),
+            "the half-initialized project was rolled back"
+        );
+        assert_eq!(
+            temps_entities::environments::Entity::find()
+                .all(db.as_ref())
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "its environment went with it"
+        );
+        let holders = temps_entities::projects::Entity::find()
+            .filter(temps_entities::projects::Column::InstantiationToken.is_in([
+                token.clone(),
+                temps_entities::projects::pending_instantiation_token(&token),
+            ]))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            holders.is_empty(),
+            "no project holds the token: {holders:?}"
+        );
+
+        let retried = service
+            .create_template_service_as(
+                template_service_request("Half Backend", "half-backend"),
+                None,
+                &caller,
+                true,
+                Some(token.clone()),
+            )
+            .await
+            .unwrap();
+        let stored = temps_entities::projects::Entity::find_by_id(retried.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.instantiation_token.as_deref(), Some(token.as_str()));
+    }
+
+    /// The crash window: a project inserted and never sealed (the process
+    /// stopped before it finished initializing) holds the pending token. It
+    /// is not the final token an adopter looks for, it blocks a second
+    /// creation for the same service until discarded, and discarding it
+    /// frees the service for a clean creation.
+    #[tokio::test]
+    async fn an_unfinished_instantiation_project_is_discarded_not_adopted() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let caller = SlugClaimCaller::project_writer();
+        let token = temps_entities::projects::instantiation_token(53, "backend");
+        let pending = temps_entities::projects::pending_instantiation_token(&token);
+
+        // What a process that stopped right after the INSERT leaves.
+        let orphan = temps_entities::projects::ActiveModel {
+            name: Set("Orphan Backend".to_string()),
+            slug: Set("orphan-backend".to_string()),
+            repo_name: Set("starter".to_string()),
+            repo_owner: Set("example".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            instantiation_token: Set(Some(pending.clone())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(environment_count(db.as_ref(), orphan.id).await, 0);
+        assert!(
+            temps_entities::projects::Entity::find()
+                .filter(temps_entities::projects::Column::InstantiationToken.eq(token.as_str()))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unfinished project never holds the final token"
+        );
+
+        // It cannot be mistaken for a second creation succeeding.
+        let blocked = service
+            .create_template_service_as(
+                template_service_request("Replacement Backend", "replacement-backend"),
+                None,
+                &caller,
+                true,
+                Some(token.clone()),
+            )
+            .await
+            .err()
+            .expect("the unfinished project still holds the service");
+        assert!(
+            blocked.to_string().contains("orphan-backend"),
+            "the error names the holder: {blocked}"
+        );
+        assert!(project_by_slug(db.as_ref(), "replacement-backend")
+            .await
+            .is_none());
+
+        // Only a pending token can be discarded this way, and only the row
+        // that still holds it.
+        assert!(service
+            .discard_unfinished_instantiation_project(orphan.id, &token)
+            .await
+            .is_err());
+        assert!(!service
+            .discard_unfinished_instantiation_project(
+                orphan.id,
+                &temps_entities::projects::pending_instantiation_token(
+                    "instantiation:99:service:x"
+                ),
+            )
+            .await
+            .unwrap());
+        assert!(project_by_slug(db.as_ref(), "orphan-backend")
+            .await
+            .is_some());
+
+        assert!(service
+            .discard_unfinished_instantiation_project(orphan.id, &pending)
+            .await
+            .unwrap());
+        assert!(project_by_slug(db.as_ref(), "orphan-backend")
+            .await
+            .is_none());
+
+        // The service can now be created, completely, under the same token.
+        let created = service
+            .create_template_service_as(
+                template_service_request("Orphan Backend", "orphan-backend"),
+                None,
+                &caller,
+                true,
+                Some(token.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(environment_count(db.as_ref(), created.id).await > 0);
+        let stored = temps_entities::projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.instantiation_token.as_deref(), Some(token.as_str()));
+
+        // A sealed project is never discarded through its (old) pending token.
+        assert!(!service
+            .discard_unfinished_instantiation_project(created.id, &pending)
+            .await
+            .unwrap());
+        assert!(project_by_slug(db.as_ref(), "orphan-backend")
+            .await
+            .is_some());
     }
 
     /// Opting a Git project into alternate sources must leave everything that

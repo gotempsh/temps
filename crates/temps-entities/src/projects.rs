@@ -229,10 +229,13 @@ pub struct Model {
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
     /// Which template instantiation created this project, and for which of
-    /// the template's services. Written in the same `INSERT` as the row so a
-    /// resumed instantiation can tell its own project from one that merely
-    /// holds the planned slug. NULL for every project created any other way.
-    /// An internal ownership marker: never serialized in API responses.
+    /// the template's services, so a resumed instantiation can tell its own
+    /// project from one that merely holds the planned slug. The row is
+    /// inserted with [`pending_instantiation_token`] and switched to the
+    /// final [`instantiation_token`] once its environment, variables and
+    /// service links exist: the final value therefore means "ours and
+    /// complete". NULL for every project created any other way. An internal
+    /// ownership marker: never serialized in API responses.
     #[serde(skip_serializing)]
     pub instantiation_token: Option<String>,
 }
@@ -244,6 +247,25 @@ pub struct Model {
 /// column makes a second project for the same step impossible.
 pub fn instantiation_token(instantiation_id: i32, template_service: &str) -> String {
     format!("instantiation:{instantiation_id}:service:{template_service}")
+}
+
+/// The value [`Model::instantiation_token`] holds while a project made for an
+/// instantiation is still being initialized (its environment, variables and
+/// service links are written after the row).
+///
+/// The row is inserted with this value and only switched to `token` once
+/// initialization finished, so the final token proves a *complete* project
+/// and this one proves "ours, not finished" -- which a resumed run discards
+/// and recreates instead of adopting. It is a different string from every
+/// final token (those start with `instantiation:`), so the one unique index
+/// covers both spellings and a service can never hold two projects.
+pub fn pending_instantiation_token(token: &str) -> String {
+    format!("pending:{token}")
+}
+
+/// Whether `token` is a value produced by [`pending_instantiation_token`].
+pub fn is_pending_instantiation_token(token: &str) -> bool {
+    token.starts_with("pending:")
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -298,5 +320,31 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_token_is_never_a_final_token() {
+        let token = instantiation_token(7, "backend");
+        let pending = pending_instantiation_token(&token);
+        assert_ne!(pending, token);
+        assert!(is_pending_instantiation_token(&pending));
+        assert!(!is_pending_instantiation_token(&token));
+    }
+
+    #[test]
+    fn a_service_cannot_spell_a_final_token_as_another_pending_one() {
+        // Final tokens all start with `instantiation:`, pending ones with
+        // `pending:`, whatever the service is called.
+        let tricky = instantiation_token(1, "pending:instantiation:1:service:x");
+        assert!(!is_pending_instantiation_token(&tricky));
+        assert_ne!(
+            pending_instantiation_token(&instantiation_token(1, "x")),
+            tricky
+        );
     }
 }

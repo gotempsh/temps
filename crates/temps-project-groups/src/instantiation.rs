@@ -39,7 +39,10 @@ use utoipa::ToSchema;
 use crate::env_vars::{CreateGroupEnvVarRequest, GroupEnvVarService};
 use crate::error::ProjectGroupError;
 use crate::handlers::ProjectGroupAudit;
-use crate::repository::{GroupRepositoryInput, GroupRepositoryService, RepositorySource};
+use crate::repository::{
+    same_repository, GroupRepository, GroupRepositoryInput, GroupRepositoryRef,
+    GroupRepositoryService, MemberRepositoryRef, RepositorySource,
+};
 use crate::routes::{CreateGroupRouteRequest, GroupRouteService};
 use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
 
@@ -1614,9 +1617,7 @@ impl InstantiationEngine {
             .map_err(|error| error.to_string())?;
         match current {
             Some(current) => {
-                plan.follow_repository = current.repo_owner == target.repo_owner
-                    && current.repo_name == target.repo_name
-                    && current.main_branch == target.branch;
+                plan.follow_repository = target_follows_group_repository(&current, &target);
             }
             None => {
                 let source = match (target.git_provider_connection_id, target.is_public) {
@@ -1797,15 +1798,32 @@ impl InstantiationEngine {
         }
 
         // The project this instantiation created for this service, if a
-        // previous run inserted it and crashed before recording its id. It is
-        // told apart by the token written in the same INSERT as the row (see
+        // previous run created it and crashed before recording its id. It is
+        // told apart by an ownership token (see
         // `temps_entities::projects::instantiation_token`): nothing else
         // about a project identifies the run that made it, so the name, the
         // creator or the timing of one that merely sits at the planned slug
         // prove nothing.
-        let token = temps_entities::projects::instantiation_token(model.id, template_service);
-        if let Some(owned) =
-            project_created_for_service(self.db.as_ref(), model.id, template_service).await?
+        //
+        // The token proves ownership; *completion* is what its spelling
+        // says. A project is inserted with the pending token and switched to
+        // the final one only after its environment, variables and service
+        // links exist, so:
+        //   - a project with the final token is complete and is adopted;
+        //   - a project with the pending token is this run's own but was cut
+        //     short (no deployment was ever queued: those wait for this
+        //     engine). It is discarded and created again below, never
+        //     adopted and never marked done: adopting it would queue a
+        //     deployment for a project with no environment or no variables.
+        // The DB lease on the instantiation means no other runner is creating
+        // this service while we look.
+        if let Some(owned) = owned_project_for_service(
+            self.db.as_ref(),
+            &self.creator.project_service,
+            model.id,
+            template_service,
+        )
+        .await?
         {
             if owned.is_deleted {
                 return Err(format!(
@@ -1938,7 +1956,13 @@ impl InstantiationEngine {
                     runtime_overrides: planned.runtime_overrides.clone(),
                     // Deploys wait until the project is assembled.
                     defer_initial_deployment: true,
-                    instantiation_token: Some(token),
+                    // The final token: the project is created holding its
+                    // pending spelling and only takes this one once it is
+                    // fully initialized.
+                    instantiation_token: Some(temps_entities::projects::instantiation_token(
+                        model.id,
+                        template_service,
+                    )),
                     deploy_mode,
                     cloudflare_enabled: None,
                     delivery_provider: None,
@@ -2179,23 +2203,117 @@ impl InstantiationEngine {
     }
 }
 
-/// The project instantiation `instantiation_id` created for
-/// `template_service`, found by the ownership token stored in the same
-/// `INSERT` as the project row (soft-deleted ones included, since they still
-/// hold the token and the slug).
+/// The project a previous run of instantiation `instantiation_id` left for
+/// `template_service`, if it is one that may be adopted: complete, per the
+/// final token. A project the run began and did not finish (it still holds
+/// the pending token) is discarded first, so the caller creates the service
+/// afresh instead of adopting a project without its environment, variables
+/// or service links. May return a soft-deleted project (the caller reports
+/// it); never returns an unfinished one.
+async fn owned_project_for_service(
+    db: &DatabaseConnection,
+    project_service: &temps_projects::ProjectService,
+    instantiation_id: i32,
+    template_service: &str,
+) -> Result<Option<projects::Model>, String> {
+    if let Some(unfinished) =
+        unfinished_project_for_service(db, instantiation_id, template_service).await?
+    {
+        let pending = temps_entities::projects::pending_instantiation_token(
+            &temps_entities::projects::instantiation_token(instantiation_id, template_service),
+        );
+        warn!(
+            instantiation_id,
+            project_id = unfinished.id,
+            slug = %unfinished.slug,
+            service = template_service,
+            "Discarding a project a previous run created but did not finish initializing"
+        );
+        project_service
+            .discard_unfinished_instantiation_project(unfinished.id, &pending)
+            .await
+            .map_err(|error| {
+                format!(
+                    "discarding project {} ('{}'), which a previous run created for service \
+                     '{template_service}' of instantiation {instantiation_id} and did not \
+                     finish: {error}",
+                    unfinished.id, unfinished.slug
+                )
+            })?;
+    }
+    let Some(owned) = project_created_for_service(db, instantiation_id, template_service).await?
+    else {
+        return Ok(None);
+    };
+    // Defense in depth: the final token is only written once the production
+    // environment exists, so a project without one was not made by this code
+    // path. Never hand it on to be deployed.
+    if !owned.is_deleted && !project_has_environment(db, owned.id).await? {
+        return Err(format!(
+            "Service '{template_service}' of instantiation {instantiation_id} was created as \
+             project {} ('{}') but has no environment, so it was not fully initialized; delete \
+             that project and start a new instantiation",
+            owned.id, owned.slug
+        ));
+    }
+    Ok(Some(owned))
+}
+
+/// The *complete* project instantiation `instantiation_id` created for
+/// `template_service`, found by its final ownership token (soft-deleted ones
+/// included, since they still hold the token and the slug). The token is
+/// only written once the project's environment, variables and service links
+/// exist, so a project returned here has finished initializing.
 ///
 /// This is the only proof of ownership. A project at the service's planned
 /// slug without the token is never ours, whatever its name, provenance,
 /// creator or age: the same user may well have created the same service
-/// independently or through another instantiation.
+/// independently or through another instantiation. One that holds only the
+/// pending token is [`unfinished_project_for_service`], not this.
 async fn project_created_for_service(
     db: &DatabaseConnection,
     instantiation_id: i32,
     template_service: &str,
 ) -> Result<Option<projects::Model>, String> {
     let token = temps_entities::projects::instantiation_token(instantiation_id, template_service);
+    project_holding_token(db, instantiation_id, template_service, &token).await
+}
+
+/// The project instantiation `instantiation_id` began creating for
+/// `template_service` and did not finish: it holds the *pending* token, so
+/// its environment, variables or service links may be missing. Never
+/// adopted; the caller discards it.
+async fn unfinished_project_for_service(
+    db: &DatabaseConnection,
+    instantiation_id: i32,
+    template_service: &str,
+) -> Result<Option<projects::Model>, String> {
+    let token = temps_entities::projects::pending_instantiation_token(
+        &temps_entities::projects::instantiation_token(instantiation_id, template_service),
+    );
+    project_holding_token(db, instantiation_id, template_service, &token).await
+}
+
+/// Whether `project_id` has at least one environment (deleted or not: this
+/// asks whether initialization ever ran, not whether it is still deployable).
+async fn project_has_environment(db: &DatabaseConnection, project_id: i32) -> Result<bool, String> {
+    use sea_orm::PaginatorTrait;
+    temps_entities::environments::Entity::find()
+        .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+        .count(db)
+        .await
+        .map(|count| count > 0)
+        .map_err(|error| format!("looking up the environments of project {project_id}: {error}"))
+}
+
+async fn project_holding_token(
+    db: &DatabaseConnection,
+    instantiation_id: i32,
+    template_service: &str,
+    token: &str,
+) -> Result<Option<projects::Model>, String> {
     projects::Entity::find()
-        .filter(projects::Column::InstantiationToken.eq(token.as_str()))
+        .filter(projects::Column::InstantiationToken.eq(token))
         .one(db)
         .await
         .map_err(|error| {
@@ -2228,6 +2346,29 @@ fn service_repository(plan: &InstantiationPlan, spec: &TemplateServiceSpec) -> R
             &spec.source(&plan.template.git),
         ),
     }
+}
+
+/// Whether a service about to be created from `target` reads the repository
+/// `current` the group already points at, so it may inherit it.
+///
+/// The same comparison as [`crate::repository::follows`] makes for existing
+/// members (both go through [`same_repository`]): owner, name and branch are
+/// not enough, since `acme/shop@main` exists on every provider and every
+/// self-hosted instance. Writing the group's clone URL and connection into a
+/// service whose template meant another repository would build the wrong
+/// code on its first deployment.
+fn target_follows_group_repository(current: &GroupRepository, target: &RepositoryTarget) -> bool {
+    same_repository(
+        &GroupRepositoryRef::from(current),
+        &MemberRepositoryRef {
+            connection_id: target.git_provider_connection_id,
+            is_public: target.is_public,
+            owner: &target.repo_owner,
+            name: &target.repo_name,
+            branch: &target.branch,
+            git_url: target.git_url.as_deref(),
+        },
+    )
 }
 
 /// `github` or `gitlab` for a repository on those hosts.
@@ -3220,6 +3361,267 @@ routes:
             found.is_deleted,
             "the caller must see the deletion, not adopt the project"
         );
+    }
+
+    async fn insert_production_environment(db: &DatabaseConnection, project_id: i32) {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, \
+             updated_at, project_id, is_preview, protected, sleeping) \
+             VALUES ('production', 'production', $2, $2, '[]'::jsonb, NOW(), NOW(), $1, \
+             FALSE, FALSE, FALSE)",
+            [project_id.into(), format!("env-{project_id}").into()],
+        ))
+        .await
+        .expect("insert environment");
+    }
+
+    async fn project_exists(db: &DatabaseConnection, id: i32) -> bool {
+        projects::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .expect("lookup")
+            .is_some()
+    }
+
+    /// The crash window of project creation: a row inserted by the run and
+    /// never sealed (it holds the pending token, and has no environment yet)
+    /// is the run's own but unfinished. It is discarded and the service is
+    /// created afresh; it is never adopted, so a half-initialized project is
+    /// never marked done or deployed.
+    #[tokio::test]
+    async fn a_project_that_never_finished_initializing_is_discarded_not_adopted() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some((project_service, _)) =
+            crate::repository::tests::project_service(conn.clone()).await
+        else {
+            eprintln!("Docker client unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let pending = temps_entities::projects::pending_instantiation_token(
+            &temps_entities::projects::instantiation_token(11, "backend"),
+        );
+        let unfinished = insert_project(
+            conn.as_ref(),
+            "shop-backend",
+            "backend",
+            Some(pending),
+            Utc::now(),
+        )
+        .await;
+
+        let found = owned_project_for_service(conn.as_ref(), &project_service, 11, "backend")
+            .await
+            .expect("lookup");
+        assert!(found.is_none(), "an unfinished project is not adopted");
+        assert!(
+            !project_exists(conn.as_ref(), unfinished.id).await,
+            "it was discarded so the service is created afresh"
+        );
+        // A second look finds nothing either.
+        assert!(
+            owned_project_for_service(conn.as_ref(), &project_service, 11, "backend")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completely_initialized_project_is_adopted() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some((project_service, _)) =
+            crate::repository::tests::project_service(conn.clone()).await
+        else {
+            eprintln!("Docker client unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let complete = insert_project(
+            conn.as_ref(),
+            "shop-worker",
+            "worker",
+            Some(temps_entities::projects::instantiation_token(12, "worker")),
+            Utc::now(),
+        )
+        .await;
+        insert_production_environment(conn.as_ref(), complete.id).await;
+        // Another service of the same run is still mid-creation: only its
+        // own row is discarded, the finished one is untouched.
+        let other = insert_project(
+            conn.as_ref(),
+            "shop-backend-2",
+            "backend",
+            Some(temps_entities::projects::pending_instantiation_token(
+                &temps_entities::projects::instantiation_token(12, "backend"),
+            )),
+            Utc::now(),
+        )
+        .await;
+
+        let adopted = owned_project_for_service(conn.as_ref(), &project_service, 12, "worker")
+            .await
+            .expect("lookup")
+            .expect("the complete project");
+        assert_eq!(adopted.id, complete.id);
+        assert!(
+            project_exists(conn.as_ref(), other.id).await,
+            "looking up one service never discards another service's project"
+        );
+    }
+
+    /// A project holding the final token but no environment cannot come from
+    /// the current creation path (the token is written after the environment
+    /// exists); if one is ever found it is refused, not deployed.
+    #[tokio::test]
+    async fn a_tokened_project_without_an_environment_is_not_adopted() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some((project_service, _)) =
+            crate::repository::tests::project_service(conn.clone()).await
+        else {
+            eprintln!("Docker client unavailable, skipping instantiation adoption test");
+            return;
+        };
+        let bare = insert_project(
+            conn.as_ref(),
+            "shop-api",
+            "api",
+            Some(temps_entities::projects::instantiation_token(13, "api")),
+            Utc::now(),
+        )
+        .await;
+
+        let error = owned_project_for_service(conn.as_ref(), &project_service, 13, "api")
+            .await
+            .expect_err("a project without an environment is refused");
+        assert!(
+            error.contains(&bare.id.to_string()) && error.contains("no environment"),
+            "{error}"
+        );
+        assert!(
+            project_exists(conn.as_ref(), bare.id).await,
+            "a project that carries the final token is never deleted behind the user's back"
+        );
+    }
+
+    fn group_repository(
+        connection_id: Option<i32>,
+        public_provider: Option<&str>,
+    ) -> GroupRepository {
+        GroupRepository {
+            git_provider_connection_id: connection_id,
+            public_provider: public_provider.map(str::to_string),
+            repo_owner: "acme".to_string(),
+            repo_name: "shop".to_string(),
+            main_branch: "main".to_string(),
+            repository_id: None,
+            clone_url: None,
+        }
+    }
+
+    fn template_target(
+        url: Option<&str>,
+        connection_id: Option<i32>,
+        is_public: bool,
+    ) -> RepositoryTarget {
+        RepositoryTarget {
+            repo_owner: "acme".to_string(),
+            repo_name: "shop".to_string(),
+            branch: "main".to_string(),
+            git_url: url.map(str::to_string),
+            git_provider_connection_id: connection_id,
+            is_public,
+            directory: ".".to_string(),
+            automatic_deploy: false,
+        }
+    }
+
+    #[test]
+    fn a_service_on_another_provider_does_not_follow_the_groups_repository() {
+        let github_group = group_repository(None, Some("github"));
+        let gitlab_group = group_repository(None, Some("gitlab"));
+        let github = template_target(Some("https://github.com/acme/shop.git"), None, true);
+        let gitlab = template_target(Some("https://gitlab.com/acme/shop.git"), None, true);
+
+        assert!(target_follows_group_repository(&github_group, &github));
+        assert!(target_follows_group_repository(&gitlab_group, &gitlab));
+        // Identical owner, name and branch, different provider: both ways.
+        assert!(!target_follows_group_repository(&github_group, &gitlab));
+        assert!(!target_follows_group_repository(&gitlab_group, &github));
+        // A self-hosted host is neither of them.
+        let self_hosted = template_target(Some("https://git.example.test/acme/shop"), None, true);
+        assert!(!target_follows_group_repository(
+            &github_group,
+            &self_hosted
+        ));
+    }
+
+    #[test]
+    fn spelling_variants_of_the_same_repository_still_follow() {
+        let group = group_repository(None, Some("github"));
+        for url in [
+            "https://github.com/acme/shop",
+            "https://github.com/acme/shop.git",
+            "https://www.github.com/acme/shop.git",
+            "https://GitHub.com/acme/shop.git/",
+        ] {
+            assert!(
+                target_follows_group_repository(&group, &template_target(Some(url), None, true)),
+                "{url}"
+            );
+        }
+        let mut upper = template_target(Some("https://github.com/Acme/Shop.git"), None, true);
+        upper.repo_owner = "Acme".to_string();
+        upper.repo_name = "Shop".to_string();
+        assert!(target_follows_group_repository(&group, &upper));
+    }
+
+    #[test]
+    fn a_service_through_another_connection_does_not_follow() {
+        let group = group_repository(Some(7), None);
+        // The fork lives behind the group's own connection.
+        assert!(target_follows_group_repository(
+            &group,
+            &template_target(
+                Some("https://git.example.test/acme/shop.git"),
+                Some(7),
+                false
+            )
+        ));
+        // Same owner, name and branch on a second self-hosted connection.
+        assert!(!target_follows_group_repository(
+            &group,
+            &template_target(
+                Some("https://git.example.test/acme/shop.git"),
+                Some(8),
+                false
+            )
+        ));
+        // A public template repository is not the group's connected one.
+        assert!(!target_follows_group_repository(
+            &group,
+            &template_target(Some("https://github.com/acme/shop.git"), None, true)
+        ));
+        // And a connected fork is not a public group's anonymous clone.
+        assert!(!target_follows_group_repository(
+            &group_repository(None, Some("github")),
+            &template_target(Some("https://github.com/acme/shop.git"), Some(7), false)
+        ));
     }
 
     #[test]

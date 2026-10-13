@@ -5,11 +5,12 @@
 //!
 //! A template instantiation resumes after a crash, and the step that creates
 //! a service may have inserted its project without recording the id. The
-//! token is written in the same `INSERT` as the project row and names the
-//! instantiation and template service the project was created for, so a
-//! resumed run adopts a project only when it carries its own token. Nothing
-//! else about a project (name, slug, creator, timestamps) identifies the run
-//! that made it.
+//! token names the instantiation and template service the project was
+//! created for, so a resumed run adopts a project only when it carries its
+//! own token. The row is inserted with a `pending:` spelling and takes the
+//! final token once its environment, variables and links exist, so the final
+//! token also proves the project is complete. Nothing else about a project
+//! (name, slug, creator, timestamps) identifies the run that made it.
 //!
 //! The column is NULL for every project that did not come from an
 //! instantiation. The partial unique index means at most one project can ever
