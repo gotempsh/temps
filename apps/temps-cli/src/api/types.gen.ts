@@ -12050,6 +12050,41 @@ export type HarnessSmokeRequest = {
     model?: string | null;
 };
 
+/**
+ * Installed and latest version of a provider's harness CLI inside the
+ * caller's persistent workspace.
+ *
+ * A harness that is behind the latest release cannot offer models released
+ * after it, so the console shows this and lets the operator update it.
+ */
+export type HarnessUpdateStatus = {
+    /**
+     * When the versions were last read from the workspace (RFC 3339).
+     */
+    checked_at?: string | null;
+    /**
+     * Why the versions could not be determined, when they could not.
+     */
+    detail?: string | null;
+    /**
+     * Version reported by the CLI in the workspace, when it could be read.
+     */
+    installed_version?: string | null;
+    /**
+     * Latest version published for the CLI, when it could be looked up.
+     */
+    latest_version?: string | null;
+    provider_id: string;
+    /**
+     * True only when both versions are known and `latest_version` is newer.
+     */
+    update_available: boolean;
+    /**
+     * An update is running right now.
+     */
+    updating: boolean;
+};
+
 export type HasAnalyticsEventsResponse = {
     has_events: boolean;
 };
@@ -63928,6 +63963,95 @@ export type VerifySavedAiProviderCredentialResponses = {
 };
 
 export type VerifySavedAiProviderCredentialResponse = VerifySavedAiProviderCredentialResponses[keyof VerifySavedAiProviderCredentialResponses];
+
+export type GetAiProviderHarnessUpdateData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: {
+        /**
+         * Look inside the workspace again instead of returning the cached check.
+         */
+        refresh?: boolean;
+    };
+    url: '/settings/ai-providers/{provider_id}/harness-update';
+};
+
+export type GetAiProviderHarnessUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown provider
+     */
+    404: unknown;
+    /**
+     * The workspace could not be inspected
+     */
+    503: unknown;
+};
+
+export type GetAiProviderHarnessUpdateResponses = {
+    /**
+     * Harness version status
+     */
+    200: HarnessUpdateStatus;
+};
+
+export type GetAiProviderHarnessUpdateResponse = GetAiProviderHarnessUpdateResponses[keyof GetAiProviderHarnessUpdateResponses];
+
+export type UpdateAiProviderHarnessData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/harness-update';
+};
+
+export type UpdateAiProviderHarnessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown provider
+     */
+    404: unknown;
+    /**
+     * The workspace is busy or already updating
+     */
+    409: unknown;
+    /**
+     * The update could not run
+     */
+    503: unknown;
+};
+
+export type UpdateAiProviderHarnessResponses = {
+    /**
+     * Harness updated
+     */
+    200: HarnessUpdateStatus;
+};
+
+export type UpdateAiProviderHarnessResponse = UpdateAiProviderHarnessResponses[keyof UpdateAiProviderHarnessResponses];
 
 export type GetAiProviderLoginData = {
     body?: never;

@@ -26096,6 +26096,56 @@
         ],
         "type": "object"
       },
+      "HarnessUpdateStatus": {
+        "description": "Installed and latest version of a provider's harness CLI inside the\ncaller's persistent workspace.\n\nA harness that is behind the latest release cannot offer models released\nafter it, so the console shows this and lets the operator update it.",
+        "properties": {
+          "checked_at": {
+            "description": "When the versions were last read from the workspace (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "Why the versions could not be determined, when they could not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installed_version": {
+            "description": "Version reported by the CLI in the workspace, when it could be read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latest_version": {
+            "description": "Latest version published for the CLI, when it could be looked up.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "update_available": {
+            "description": "True only when both versions are known and `latest_version` is newer.",
+            "type": "boolean"
+          },
+          "updating": {
+            "description": "An update is running right now.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider_id",
+          "update_available",
+          "updating"
+        ],
+        "type": "object"
+      },
       "HasAnalyticsEventsResponse": {
         "properties": {
           "has_events": {
@@ -119688,6 +119738,114 @@
           }
         ],
         "summary": "Verify a previously imported OpenCode credential against a user-selected\nmodel without asking the browser to receive or resubmit the secret.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/harness-update": {
+      "get": {
+        "operationId": "get_ai_provider_harness_update",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Look inside the workspace again instead of returning the cached check.",
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessUpdateStatus"
+                }
+              }
+            },
+            "description": "Harness version status"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Unknown provider"
+          },
+          "503": {
+            "description": "The workspace could not be inspected"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Installed and latest version of the provider's harness CLI in your\npersistent workspace, and whether an update is available.",
+        "tags": [
+          "Agents"
+        ]
+      },
+      "post": {
+        "operationId": "update_ai_provider_harness",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessUpdateStatus"
+                }
+              }
+            },
+            "description": "Harness updated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Unknown provider"
+          },
+          "409": {
+            "description": "The workspace is busy or already updating"
+          },
+          "503": {
+            "description": "The update could not run"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Install the latest release of the provider's harness CLI in your\npersistent workspace so newly released models become available.",
         "tags": [
           "Agents"
         ]
