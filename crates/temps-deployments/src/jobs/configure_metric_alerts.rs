@@ -22,7 +22,6 @@
 
 use async_trait::async_trait;
 use sea_orm::EntityTrait;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
@@ -31,6 +30,7 @@ use temps_entities::projects;
 use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
+use crate::jobs::temps_yaml::{read_temps_yaml, TempsYamlLookup};
 use crate::jobs::RepositoryOutput;
 
 /// Hard cap on the number of `alerts:` entries a single `.temps.yaml` may
@@ -207,6 +207,10 @@ impl ConfigureMetricAlertsJob {
 
     async fn log(&self, message: String) -> Result<(), WorkflowError> {
         let level = Self::detect_log_level(&message);
+        self.log_at(level, message).await
+    }
+
+    async fn log_at(&self, level: LogLevel, message: String) -> Result<(), WorkflowError> {
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_structured_log(log_id, level, message.clone())
@@ -230,33 +234,42 @@ impl ConfigureMetricAlertsJob {
         }
     }
 
+    /// Load and parse .temps.yaml configuration.
+    ///
+    /// A missing file is normal (nothing to configure). A file that exists but
+    /// cannot be read or parsed is written to the deployment log as a warning
+    /// naming the file and the cause, so the user learns that the configuration
+    /// they wrote was not applied, and then fails this (non-required) job.
     async fn load_temps_config(
         &self,
         repo_dir: &Path,
         project: &projects::Model,
     ) -> Result<Option<TempsConfig>, WorkflowError> {
-        let project_dir = repo_dir.join(&project.directory);
-        let config_path = project_dir.join(".temps.yaml");
-
-        if !config_path.exists() {
-            self.log(format!(
-                "No .temps.yaml found at {:?}, skipping metric alert configuration",
-                config_path
-            ))
-            .await?;
-            return Ok(None);
+        match read_temps_yaml(repo_dir, &project.directory) {
+            Ok(TempsYamlLookup::Missing { path }) => {
+                self.log(format!(
+                    "No .temps.yaml found at {:?}, skipping metric alert configuration",
+                    path
+                ))
+                .await?;
+                Ok(None)
+            }
+            Ok(TempsYamlLookup::Found { path, config }) => {
+                self.log(format!("Found .temps.yaml at {:?}", path)).await?;
+                Ok(Some(*config))
+            }
+            Err(error) => {
+                self.log_at(
+                    LogLevel::Warning,
+                    format!(
+                        "⚠ {error}. The metric alert configuration from .temps.yaml was NOT applied \
+                         to this deployment; fix the file and deploy again"
+                    ),
+                )
+                .await?;
+                Err(WorkflowError::JobExecutionFailed(error.to_string()))
+            }
         }
-
-        self.log(format!("Found .temps.yaml at {:?}", config_path))
-            .await?;
-
-        let config_contents = fs::read_to_string(&config_path).map_err(WorkflowError::IoError)?;
-
-        let config = TempsConfig::from_yaml(&config_contents).map_err(|e| {
-            WorkflowError::JobExecutionFailed(format!("Failed to parse .temps.yaml: {}", e))
-        })?;
-
-        Ok(Some(config))
     }
 
     async fn configure_alerts(&self, repo_output: &RepositoryOutput) -> Result<(), WorkflowError> {

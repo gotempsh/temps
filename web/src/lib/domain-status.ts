@@ -31,6 +31,44 @@ export function isServingCert(status: string | null | undefined): boolean {
 }
 
 /**
+ * ACME order states (RFC 8555) that can never lead to a certificate: the order
+ * was cancelled, or the CA invalidated/revoked/deactivated it. Nothing can be
+ * re-submitted on such an order; a new one has to be created.
+ */
+export const TERMINAL_ORDER_STATUSES: readonly string[] = [
+  'cancelled',
+  'canceled',
+  'invalid',
+  'revoked',
+  'deactivated',
+]
+
+/** True when an ACME order in `status` can no longer be finalized. */
+export function isTerminalOrderStatus(
+  status: string | null | undefined
+): boolean {
+  return !!status && TERMINAL_ORDER_STATUSES.includes(status)
+}
+
+/**
+ * What "Retry" means for a failed domain.
+ *
+ * - `verify`: the ACME challenge is still open (e.g. the lookup timed out), so
+ *   asking the CA to check it again is meaningful.
+ * - `new-order`: there is no order, or the CA already invalidated it. Verifying
+ *   again would only resubmit a dead challenge ("Cannot update challenge with
+ *   status invalid"), so the retry must create a new order with new DNS/HTTP
+ *   challenge values.
+ */
+export type FailedRetryAction = 'verify' | 'new-order'
+
+export function failedRetryAction(
+  order: { status: string } | null | undefined
+): FailedRetryAction {
+  return !order || isTerminalOrderStatus(order.status) ? 'new-order' : 'verify'
+}
+
+/**
  * Statuses a domain passes through on its way to a certificate: the order is
  * being set up, waiting for the challenge to be published, or being validated
  * and issued. Anything else (`active`, `active_renewal_failed`, `failed`,
@@ -58,17 +96,12 @@ export const DOMAIN_POLL_SLOW_MS = 15_000
 export const DOMAIN_POLL_FAST_READS = 20
 
 /**
- * ACME order statuses after which the order cannot change on its own
- * (RFC 8555: `valid`, `invalid`, plus the cancelled/revoked variants the
- * console treats as terminal).
+ * ACME order statuses after which the order cannot change on its own: the
+ * terminal ones above, plus `valid` (issued).
  */
 export const ORDER_SETTLED_STATUSES: readonly string[] = [
   'valid',
-  'invalid',
-  'cancelled',
-  'canceled',
-  'revoked',
-  'deactivated',
+  ...TERMINAL_ORDER_STATUSES,
 ]
 
 /** How long a settled domain keeps re-reading an order that is still open. */

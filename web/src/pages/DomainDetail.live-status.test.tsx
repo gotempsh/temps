@@ -73,6 +73,11 @@ function order(status: string) {
   }
 }
 
+// `GET /domains/{id}/order` wraps the order: `order` is null when none exists.
+function orderBody(status: string) {
+  return { order: order(status), reason: null }
+}
+
 function renderPage() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -115,7 +120,7 @@ test('a failed verification shows the failed status without a reload', async () 
           : domain('challenge_requested')
       ),
     'GET /domains/1/order': () =>
-      jsonResponse(order(finalized ? 'invalid' : 'pending')),
+      jsonResponse(orderBody(finalized ? 'invalid' : 'pending')),
     'POST /domains/1/order/finalize': () => {
       finalized = true
       return jsonResponse(
@@ -145,7 +150,9 @@ test('a failed verification shows the failed status without a reload', async () 
     }
   )
   expect(view.queryByText('challenge_requested')).toBeNull()
-  expect(view.getByText(/Retry verification/)).toBeTruthy()
+  // The order was refreshed along with the domain, so the CA's `invalid`
+  // verdict is known and the retry offered is a new order, not another verify.
+  expect(await view.findByText(/Start new order/)).toBeTruthy()
   api.restore()
 })
 
@@ -158,7 +165,7 @@ test('an in-flight domain is polled and polling stops once it is settled', async
         reads < 2 ? domain('challenge_requested') : domain('failed', 'rejected')
       )
     },
-    'GET /domains/1/order': () => jsonResponse(order('invalid')),
+    'GET /domains/1/order': () => jsonResponse(orderBody('invalid')),
   })
   const view = renderPage()
 
@@ -191,10 +198,10 @@ test('the order is read again after the domain settles, so it never stays pendin
       )
     },
     'GET /domains/1/order': () => {
-      if (domainReads < 2) return jsonResponse(order('pending'))
+      if (domainReads < 2) return jsonResponse(orderBody('pending'))
       orderReadsAfterFailed += 1
       return jsonResponse(
-        order(orderReadsAfterFailed < 2 ? 'pending' : 'invalid')
+        orderBody(orderReadsAfterFailed < 2 ? 'pending' : 'invalid')
       )
     },
   })
@@ -207,7 +214,9 @@ test('the order is read again after the domain settles, so it never stays pendin
       timeout: 12_000,
     }
   )
-  await waitFor(() => expect(view.queryByText('pending')).toBeNull(), {
+  // The first order read after `failed` still says `pending`; the catch-up
+  // poll has to read it again to learn it is `invalid`.
+  await waitFor(() => expect(orderReadsAfterFailed).toBeGreaterThanOrEqual(2), {
     timeout: 12_000,
   })
   expect(orderReadsAfterFailed).toBeGreaterThanOrEqual(2)

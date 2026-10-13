@@ -712,6 +712,27 @@ impl From<CustomDomainWithInfo> for CustomDomainResponse {
     }
 }
 
+/// Result of looking a hostname up among the custom domains the caller can see.
+///
+/// "Not assigned to any project" is a normal state for a certificate that has
+/// not been attached yet, so it is expressed as `custom_domain: null` with a
+/// 200 rather than a 404. A hostname that belongs to a project the caller
+/// cannot see is deliberately reported the same way.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct CustomDomainLookupResponse {
+    /// The matching assignment, or `null` when the hostname is not assigned to
+    /// a project environment visible to the caller.
+    pub custom_domain: Option<CustomDomainResponse>,
+}
+
+impl From<Option<CustomDomainWithInfo>> for CustomDomainLookupResponse {
+    fn from(value: Option<CustomDomainWithInfo>) -> Self {
+        Self {
+            custom_domain: value.map(CustomDomainResponse::from),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CheckDomainConfigurationRequest {
     pub domain: String,
@@ -1497,6 +1518,41 @@ mod tests {
     use super::*;
     use crate::services::custom_domains::CustomDomainError;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn custom_domain_lookup_without_assignment_serializes_explicit_null() {
+        let response = CustomDomainLookupResponse::from(None);
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value, serde_json::json!({ "custom_domain": null }));
+    }
+
+    #[test]
+    fn custom_domain_lookup_with_assignment_wraps_the_domain() {
+        let now = chrono::Utc::now();
+        let model = temps_entities::project_custom_domains::Model {
+            id: 7,
+            project_id: 3,
+            environment_id: 5,
+            domain: "app.example.com".to_string(),
+            redirect_to: None,
+            status_code: None,
+            branch: None,
+            status: "active".to_string(),
+            message: None,
+            created_at: now,
+            updated_at: now,
+            certificate_id: None,
+            service_name: None,
+        };
+        let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
+            custom_domain: model,
+            domain_info: None,
+            environment: None,
+        }));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["custom_domain"]["id"], 7);
+        assert_eq!(value["custom_domain"]["domain"], "app.example.com");
+    }
 
     #[test]
     fn external_project_request_only_needs_name() {

@@ -2,7 +2,54 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { domainNextStep, domainStateLabel, parseMonitorSpec, parseMonitorSpecs } from './index.js'
+import {
+  domainNextStep,
+  domainStateLabel,
+  parseMonitorSpec,
+  parseMonitorSpecs,
+  publicUrlLabel,
+  publicUrlNote,
+} from './index.js'
+
+describe('public URL display', () => {
+  const unconfigured = {
+    public_url: null,
+    public_url_status: {
+      configured: false,
+      reason: 'Public URL is not configured.',
+      setup_path: '/settings#public-ingress',
+    },
+  }
+
+  test('prints the URL when there is one', () => {
+    expect(
+      publicUrlLabel({
+        public_url: 'https://temps.example.com/api/status/abc',
+        public_url_status: { configured: true },
+      }),
+    ).toBe('https://temps.example.com/api/status/abc')
+  })
+
+  test('says "not configured" instead of printing a made-up address', () => {
+    expect(publicUrlLabel(unconfigured)).toBe('not configured')
+    expect(publicUrlLabel({})).toBe('not configured')
+  })
+
+  test('explains an unconfigured URL and where to fix it', () => {
+    const note = publicUrlNote(unconfigured)
+    expect(note).toContain('Public URL is not configured.')
+    expect(note).toContain('/settings#public-ingress')
+  })
+
+  test('has nothing to say when the URL is fine', () => {
+    expect(
+      publicUrlNote({
+        public_url: 'https://temps.example.com/api/status/abc',
+        public_url_status: { configured: true, reason: null, setup_path: null },
+      }),
+    ).toBeNull()
+  })
+})
 
 describe('parseMonitorSpec', () => {
   test('parses <id>=<public name>', () => {

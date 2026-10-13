@@ -555,23 +555,23 @@ Manage provider API keys through the Temps admin panel or API. Keys are encrypte
 
 ```bash {{ title: 'Add a provider key via API' }}
 # Add an OpenAI key
-curl -X POST https://your-temps-instance.com/ai/providers/keys \
+curl -X POST https://your-temps-instance.com/api/ai/providers \
   -H "Authorization: Bearer your-admin-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "openai",
     "api_key": "sk-...",
-    "label": "Production OpenAI Key"
+    "display_name": "Production OpenAI Key"
   }'
 
 # Add an Anthropic key
-curl -X POST https://your-temps-instance.com/ai/providers/keys \
+curl -X POST https://your-temps-instance.com/api/ai/providers \
   -H "Authorization: Bearer your-admin-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "anthropic",
     "api_key": "sk-ant-...",
-    "label": "Production Anthropic Key"
+    "display_name": "Production Anthropic Key"
   }'
 ```
 
@@ -587,7 +587,7 @@ Track token usage and costs per user, model, and provider through the Temps dash
 
 ```bash {{ title: 'Query usage' }}
 # Get usage summary for a project
-curl https://your-temps-instance.com/ai/usage/summary?period=7d \
+curl https://your-temps-instance.com/api/ai/usage/summary?period=7d \
   -H "Authorization: Bearer your-admin-api-key"
 ```
 

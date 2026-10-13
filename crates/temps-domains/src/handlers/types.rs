@@ -232,6 +232,48 @@ pub struct AcmeOrderResponse {
     pub challenge_validation: Option<ChallengeValidationStatus>,
 }
 
+/// Result of looking up the ACME order of a domain.
+///
+/// Having no order is a normal state (the certificate is already issued, or no
+/// order has been started yet), so it is reported as `order: null` with a
+/// `reason` and a 200 instead of a 404. Only an unknown domain is a 404.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DomainOrderResponse {
+    /// The ACME order, or `null` when the domain has none.
+    pub order: Option<AcmeOrderResponse>,
+    /// Why there is no order. Present only when `order` is `null`.
+    pub reason: Option<String>,
+}
+
+impl DomainOrderResponse {
+    /// An order exists.
+    pub fn with_order(order: AcmeOrderResponse) -> Self {
+        Self {
+            order: Some(order),
+            reason: None,
+        }
+    }
+
+    /// The domain has no order; explain why from its current `status`.
+    pub fn without_order(domain: &str, status: &str) -> Self {
+        let reason = if temps_entities::domains::CERT_SERVING_STATUSES.contains(&status) {
+            format!(
+                "Domain {domain} already has an issued certificate, so no ACME order is pending. \
+                 An order is created when the certificate is renewed."
+            )
+        } else {
+            format!(
+                "No ACME order has been created for domain {domain} (status: {status}). \
+                 Create one to receive the challenge to fulfil."
+            )
+        };
+        Self {
+            order: None,
+            reason: Some(reason),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct ChallengeValidationStatus {
     /// Challenge type (e.g., "dns-01", "http-01")
@@ -498,4 +540,36 @@ pub struct ListRenewalAttemptsResponse {
     pub total: u64,
     pub page: u64,
     pub page_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_lookup_without_order_for_an_issued_certificate_says_so() {
+        for status in ["active", "active_renewal_failed"] {
+            let response = DomainOrderResponse::without_order("app.example.com", status);
+            assert!(response.order.is_none());
+            let reason = response.reason.expect("an empty lookup explains itself");
+            assert!(reason.contains("app.example.com"));
+            assert!(reason.contains("already has an issued certificate"));
+        }
+    }
+
+    #[test]
+    fn order_lookup_without_order_for_a_pending_domain_points_at_creating_one() {
+        let response = DomainOrderResponse::without_order("app.example.com", "failed");
+        let reason = response.reason.expect("an empty lookup explains itself");
+        assert!(reason.contains("No ACME order has been created"));
+        assert!(reason.contains("status: failed"));
+    }
+
+    #[test]
+    fn order_lookup_without_order_serializes_explicit_null_and_reason() {
+        let response = DomainOrderResponse::without_order("app.example.com", "active");
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(value["order"].is_null());
+        assert!(value["reason"].is_string());
+    }
 }
