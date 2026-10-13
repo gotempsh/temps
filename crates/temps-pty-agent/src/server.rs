@@ -596,6 +596,56 @@ mod tests {
         assert_eq!(probe, SocketProbe::Stale);
     }
 
+    /// A listener that never accepts, with its backlog full: on Linux a
+    /// blocking `connect(2)` to it waits for the peer forever. Startup must
+    /// still return, and must leave the occupied socket alone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_does_not_hang_on_a_listener_with_a_full_backlog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let wedged = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Shrink the backlog so the queue fills well inside the test's
+        // file-descriptor budget (std's default is the system maximum).
+        // SAFETY: `listen` on a descriptor `wedged` owns for this whole test.
+        let rc = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&wedged), 1) };
+        assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
+
+        // Fill the accept queue; the kernel pushes back once it is full.
+        let mut held = Vec::new();
+        let mut saturated = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(&path)).await
+            {
+                Ok(Ok(stream)) => held.push(stream),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!(
+                    "unexpected connect error after {} connects: {e}",
+                    held.len()
+                ),
+                Err(_) => {
+                    saturated = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saturated,
+            "the accept queue never filled after {} connects",
+            held.len()
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(20), run(&path.to_string_lossy()))
+            .await
+            .expect("startup must not hang on a listener that stopped accepting");
+        let err = result.expect_err("a wedged listener must not be displaced");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(path.exists(), "the occupied socket file must be untouched");
+    }
+
     #[test]
     fn ring_push_and_tail_under_capacity() {
         let mut r = Ring::new();
