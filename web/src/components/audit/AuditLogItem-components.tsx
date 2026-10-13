@@ -132,6 +132,8 @@ function describe(
       return `Reset the password of ${username ?? 'a user'}`
 
     // MFA
+    case 'MFA_SETUP_STARTED':
+      return `${user?.name ?? 'User'} started multi-factor authentication setup`
     case 'MFA_ENABLED':
       return `${user?.name ?? 'User'} enabled multi-factor authentication`
     case 'MFA_DISABLED':

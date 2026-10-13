@@ -42,9 +42,10 @@ use crate::handlers::types::{
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
-    LatestDeploymentMediaResponseItem, ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest,
-    ResourceLimitsResponse, SendFailureReportRequest,
+    EnvVarResponse, FailureReportPreviewResponse, LastDeploymentResponse,
+    LatestDeploymentMediaResponse, LatestDeploymentMediaResponseItem,
+    ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest, ResourceLimitsResponse,
+    SendFailureReportRequest,
 };
 use crate::services::{
     managed_environment_variables, ManagedEnvironmentVariable, ManagedEnvironmentVariableSource,
@@ -234,6 +235,7 @@ async fn deployment_response_with_service_urls(
         crate::services::DeploymentFailureStage,
         crate::services::DeploymentFailureCode,
         crate::services::FailureSettingsSection,
+        LastDeploymentResponse,
         LatestDeploymentMediaResponse,
         LatestDeploymentMediaResponseItem,
         DeploymentStateResponse,
@@ -582,6 +584,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
 }
 
 /// Get the last deployment for a specific project
+///
+/// A project that exists but has never been deployed answers 200 with
+/// `deployment: null`; only an unknown project is a 404.
 #[utoipa::path(
     tag = "Deployments",
     get,
@@ -589,8 +594,8 @@ impl From<crate::services::services::DeploymentError> for Problem {
         ("id" = i32, Path, description = "Project ID")
     ),
     responses(
-        (status = 200, description = "Last deployment details", body = DeploymentResponse),
-        (status = 404, description = "Project not found or no deployments"),
+        (status = 200, description = "Last deployment, or `deployment: null` when the project has no deployments yet", body = LastDeploymentResponse),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     path = "/projects/{id}/last-deployment"
@@ -605,9 +610,13 @@ pub async fn get_last_deployment(
     project_access_guard!(auth, id, state.project_access_checker);
 
     debug!("Getting last deployment for project with id: {}", id);
-    let deployment = state.deployment_service.get_last_deployment(id).await?;
-    let response = deployment_response_with_service_urls(&state, id, deployment).await?;
-    Ok(Json(response).into_response())
+    let deployment = match state.deployment_service.get_last_deployment(id).await? {
+        Some(deployment) => {
+            Some(deployment_response_with_service_urls(&state, id, deployment).await?)
+        }
+        None => None,
+    };
+    Ok(Json(LastDeploymentResponse { deployment }).into_response())
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
@@ -5045,10 +5054,106 @@ mod tests {
             "Response body: {}",
             serde_json::to_string_pretty(&body).unwrap()
         );
-        assert_eq!(body["id"], deployment.id);
-        assert_eq!(body["status"], "deployed");
+        assert_eq!(body["deployment"]["id"], deployment.id);
+        assert_eq!(body["deployment"]["status"], "deployed");
 
         println!("✅ GET /projects/{{id}}/last-deployment test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_endpoint_empty_state_and_missing_project() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::projects;
+
+        if !database_test_prerequisites_available().await {
+            println!("Docker/test database not available, skipping");
+            return;
+        }
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_last_deployment_empty_http_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temporary data directory");
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        // A project that exists but has never been deployed.
+        let project = projects::ActiveModel {
+            name: Set("Empty Project".to_string()),
+            slug: Set("empty-project".to_string()),
+            repo_name: Set("empty-repo".to_string()),
+            repo_owner: Set("example-owner".to_string()),
+            directory: Set("/tmp/empty-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(create_test_auth_context());
+                next.run(req).await
+            },
+        );
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+
+        // Exists but empty -> 200 with an explicit null.
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, project.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(body, serde_json::json!({ "deployment": null }));
+
+        // Unknown project -> 404 that names the project.
+        let missing_id = project.id + 10_000;
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, missing_id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(response.status(), 404);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(
+            body["detail"],
+            format!("project {missing_id} not found").as_str()
+        );
+
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 

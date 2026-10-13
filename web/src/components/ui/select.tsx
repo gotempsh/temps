@@ -31,24 +31,97 @@ const SelectGroup = SelectPrimitive.Group
 
 const SelectValue = SelectPrimitive.Value
 
+/**
+ * True when something other than the trigger's own content already names it:
+ * a `<label for>`, a wrapping `<label>`, or `aria-label(ledby)`.
+ */
+function hasExternalName(trigger: HTMLElement): boolean {
+  if ((trigger as HTMLButtonElement).labels?.length) return true
+  if (trigger.closest('label')) return true
+  return (
+    !!trigger.id &&
+    !!trigger.ownerDocument.querySelector(
+      `label[for="${trigger.id.replace(/"/g, '\\"')}"]`
+    )
+  )
+}
+
+// A Radix Select trigger is `<button role="combobox">`, and the combobox role
+// takes its name from the author, not from its content: with no label, the
+// control that visibly reads "All environments" has no accessible name at all
+// (axe `button-name`). Call sites should still say what the field is
+// (`aria-label` or a `<Label htmlFor>`); this only guarantees that a trigger
+// nobody labelled is named by the `<SelectValue>` it shows, through a live
+// `aria-labelledby` reference, rather than being announced as a bare
+// "combobox". (A reference to the trigger itself is not enough: axe ignores
+// self-references.)
 const SelectTrigger = React.forwardRef<
   React.ElementRef<typeof SelectPrimitive.Trigger>,
   React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger>
->(({ className, children, ...props }, ref) => (
-  <SelectPrimitive.Trigger
-    ref={ref}
-    className={cn(
-      'flex h-10 w-full items-center justify-between rounded-md border border-input bg-background aria-invalid:border-destructive aria-invalid:ring-destructive/20 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 [&>span]:line-clamp-1',
-      className
-    )}
-    {...props}
-  >
-    {children}
-    <SelectPrimitive.Icon asChild>
-      <ChevronDown className="h-4 w-4 opacity-50" />
-    </SelectPrimitive.Icon>
-  </SelectPrimitive.Trigger>
-))
+>(
+  (
+    {
+      className,
+      children,
+      id,
+      'aria-label': ariaLabel,
+      'aria-labelledby': ariaLabelledBy,
+      ...props
+    },
+    forwardedRef
+  ) => {
+    const generatedId = React.useId()
+    const triggerId = id ?? generatedId
+    const valueId = `${triggerId}-value`
+    const innerRef = React.useRef<HTMLButtonElement | null>(null)
+    const [nameFromValue, setNameFromValue] = React.useState(false)
+    const authorNamed = !!ariaLabel?.trim() || !!ariaLabelledBy?.trim()
+
+    // Re-checked whenever the parent re-renders (`children` is a new element
+    // each time): a `<label for>` can appear after the trigger.
+    React.useEffect(() => {
+      const trigger = innerRef.current
+      setNameFromValue(!authorNamed && !!trigger && !hasExternalName(trigger))
+    }, [authorNamed, children, triggerId])
+
+    const setRefs = React.useCallback(
+      (node: HTMLButtonElement | null) => {
+        innerRef.current = node
+        if (typeof forwardedRef === 'function') forwardedRef(node)
+        else if (forwardedRef) forwardedRef.current = node
+      },
+      [forwardedRef]
+    )
+
+    // Give the value a stable id so the trigger can be labelled by it.
+    const content = React.Children.map(children, (child) =>
+      React.isValidElement<{ id?: string }>(child) &&
+      child.type === SelectPrimitive.Value &&
+      !child.props.id
+        ? React.cloneElement(child, { id: valueId })
+        : child
+    )
+
+    return (
+      <SelectPrimitive.Trigger
+        ref={setRefs}
+        id={triggerId}
+        aria-label={ariaLabel}
+        aria-labelledby={nameFromValue ? valueId : ariaLabelledBy}
+        className={cn(
+          'flex h-10 w-full items-center justify-between rounded-md border border-input bg-background aria-invalid:border-destructive aria-invalid:ring-destructive/20 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 [&>span]:line-clamp-1',
+          className
+        )}
+        {...props}
+      >
+        {content}
+        <SelectPrimitive.Icon asChild>
+          <ChevronDown className="h-4 w-4 opacity-50" />
+        </SelectPrimitive.Icon>
+      </SelectPrimitive.Trigger>
+    )
+  }
+)
 SelectTrigger.displayName = SelectPrimitive.Trigger.displayName
 
 const SelectScrollUpButton = React.forwardRef<

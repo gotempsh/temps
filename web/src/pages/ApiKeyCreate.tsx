@@ -15,6 +15,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
@@ -30,13 +31,12 @@ import {
   ArrowLeft,
   Calendar,
   Check,
-  Copy,
   Key,
   Shield,
   ChevronRight,
   Edit,
 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -64,10 +64,17 @@ export default function ApiKeyCreate() {
   )
   const [useCustomPermissions, setUseCustomPermissions] = useState(false)
   const [newKeySecret, setNewKeySecret] = useState<string | null>(null)
-  const [copiedKey, setCopiedKey] = useState(false)
   const [openCategories, setOpenCategories] = useState<Set<string>>(new Set())
   const [createdKeyId, setCreatedKeyId] = useState<number | null>(null)
   const isSubmittingRef = useRef(false)
+  const resultHeadingRef = useRef<HTMLDivElement | null>(null)
+
+  // The form unmounts when the key is created, which would drop keyboard focus
+  // onto <body>. Move it to the result so the one-time secret is announced and
+  // reachable without searching the page.
+  useEffect(() => {
+    if (newKeySecret) resultHeadingRef.current?.focus()
+  }, [newKeySecret])
 
   const { data: permissionsData, isLoading: isLoadingPermissions } =
     useApiKeyPermissions()
@@ -98,14 +105,6 @@ export default function ApiKeyCreate() {
       )
     },
   })
-
-  const handleCopyKey = async () => {
-    if (newKeySecret) {
-      await navigator.clipboard.writeText(newKeySecret)
-      setCopiedKey(true)
-      setTimeout(() => setCopiedKey(false), 2000)
-    }
-  }
 
   const handleRoleSelect = (role: string) => {
     setSelectedRole(role)
@@ -214,7 +213,11 @@ export default function ApiKeyCreate() {
           <CardHeader>
             <div className="flex items-center justify-between">
               <div className="space-y-1">
-                <CardTitle className="text-2xl">
+                <CardTitle
+                  ref={resultHeadingRef}
+                  tabIndex={-1}
+                  className="text-2xl focus-visible:outline-none"
+                >
                   API Key Created Successfully
                 </CardTitle>
                 <CardDescription>
@@ -245,13 +248,12 @@ export default function ApiKeyCreate() {
                   readOnly
                   className="font-mono text-sm"
                 />
-                <Button size="icon" variant="outline" onClick={handleCopyKey}>
-                  {copiedKey ? (
-                    <Check className="h-4 w-4" />
-                  ) : (
-                    <Copy className="h-4 w-4" />
-                  )}
-                </Button>
+                <CopyButton
+                  value={newKeySecret}
+                  variant="outline"
+                  size="icon"
+                  label="Copy API key"
+                />
               </div>
             </div>
 
@@ -545,48 +547,53 @@ export default function ApiKeyCreate() {
                         onOpenChange={() => toggleCategory(category)}
                       >
                         <div className="border rounded-lg">
-                          <CollapsibleTrigger asChild>
-                            <div className="flex items-center justify-between p-4 hover:bg-muted/50 cursor-pointer">
-                              <div className="flex items-center gap-3">
-                                <Checkbox
-                                  aria-label={`Select all ${category} permissions`}
-                                  checked={allSelected}
-                                  ref={(ref) => {
-                                    if (ref) {
-                                      const element = ref as any
-                                      element.indeterminate =
-                                        someSelected && !allSelected
-                                    }
-                                  }}
-                                  onCheckedChange={() => {
-                                    toggleCategoryPermissions(
-                                      categoryPermissions
-                                    )
-                                  }}
-                                  onClick={(e) => e.stopPropagation()}
-                                />
-                                <div>
-                                  <h4 className="font-medium text-sm">
+                          {/* The select-all checkbox and the expander are
+                              sibling controls: a trigger that is a `div`
+                              wrapping a checkbox is unreachable from the
+                              keyboard and nests one control in another. */}
+                          <div className="flex items-center gap-3 p-4 hover:bg-muted/50">
+                            <Checkbox
+                              aria-label={`Select all ${category} permissions`}
+                              checked={allSelected}
+                              ref={(ref) => {
+                                if (ref) {
+                                  const element = ref as any
+                                  element.indeterminate =
+                                    someSelected && !allSelected
+                                }
+                              }}
+                              onCheckedChange={() => {
+                                toggleCategoryPermissions(categoryPermissions)
+                              }}
+                            />
+                            <CollapsibleTrigger asChild>
+                              <button
+                                type="button"
+                                className="flex flex-1 items-center justify-between gap-3 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              >
+                                <span>
+                                  <span className="block text-sm font-medium">
                                     {category}
-                                  </h4>
-                                  <p className="text-xs text-muted-foreground">
+                                  </span>
+                                  <span className="block text-xs text-muted-foreground">
                                     {categoryPermissions.length} permission
                                     {categoryPermissions.length !== 1
                                       ? 's'
                                       : ''}
                                     {someSelected &&
                                       ` • ${categoryPermissions.filter((p) => selectedPermissions.has(p.name)).length} selected`}
-                                  </p>
-                                </div>
-                              </div>
-                              <ChevronRight
-                                className={cn(
-                                  'h-4 w-4 transition-transform',
-                                  openCategories.has(category) && 'rotate-90'
-                                )}
-                              />
-                            </div>
-                          </CollapsibleTrigger>
+                                  </span>
+                                </span>
+                                <ChevronRight
+                                  aria-hidden="true"
+                                  className={cn(
+                                    'h-4 w-4 transition-transform',
+                                    openCategories.has(category) && 'rotate-90'
+                                  )}
+                                />
+                              </button>
+                            </CollapsibleTrigger>
+                          </div>
                           <CollapsibleContent>
                             <div className="border-t p-4 space-y-3">
                               {categoryPermissions.map((perm: any) => (

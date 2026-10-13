@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { isTerminalDeployStatus, pollUntil, waitForAppUnavailable } from './flows.ts'
+import {
+  isTerminalDeployStatus,
+  lastDeploymentOf,
+  pollUntil,
+  waitForAppUnavailable,
+} from './flows.ts'
 
 describe('isTerminalDeployStatus', () => {
   test('keeps running deployments non-terminal until readiness completes', () => {
@@ -12,6 +17,24 @@ describe('isTerminalDeployStatus', () => {
   test('recognizes completed and failed terminal states', () => {
     expect(isTerminalDeployStatus('completed')).toEqual({ terminal: true, ok: true })
     expect(isTerminalDeployStatus('failed')).toEqual({ terminal: true, ok: false })
+  })
+})
+
+describe('lastDeploymentOf', () => {
+  const deployment = { id: 7, status: 'running' } as never
+
+  test('unwraps the deployment from the current response shape', () => {
+    expect(lastDeploymentOf({ deployment })).toBe(deployment)
+  })
+
+  test('treats a project that has never deployed as null', () => {
+    expect(lastDeploymentOf({ deployment: null })).toBeNull()
+    expect(lastDeploymentOf({})).toBeNull()
+    expect(lastDeploymentOf(undefined)).toBeNull()
+  })
+
+  test('still accepts the bare deployment older servers returned', () => {
+    expect(lastDeploymentOf(deployment)).toBe(deployment)
   })
 })
 

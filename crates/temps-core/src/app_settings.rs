@@ -120,6 +120,16 @@ pub struct AppSettings {
     /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
 
+    /// Managed KV service (Redis container) settings. Owned by
+    /// `PATCH /kv/settings`; the generic settings update preserves the stored
+    /// value.
+    pub kv: KvSettings,
+
+    /// Managed Blob service (RustFS container) settings. Owned by
+    /// `PATCH /blob/settings`; the generic settings update preserves the
+    /// stored value.
+    pub blob: BlobSettings,
+
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
     // auto-enabled by `temps setup` for QuickStart (sslip.io) installs.
     pub on_demand_tls: OnDemandTlsSettings,
@@ -1490,6 +1500,35 @@ impl Default for PreviewGatewaySettings {
     }
 }
 
+/// Settings of the managed KV service (the Redis container behind `/kv`).
+///
+/// The Docker container is named `redis-<service name>`, so two Temps
+/// instances sharing one Docker daemon collide unless each has its own name.
+/// An unset value follows the per-instance default (the pre-existing
+/// `redis-temps-kv` for an install that already enabled KV, a name derived
+/// from this instance otherwise).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct KvSettings {
+    /// Docker container name of the KV Redis container. Empty means the
+    /// per-instance default. A custom value must start with `redis-`.
+    #[schema(example = "redis-temps-kv-staging")]
+    pub container_name: String,
+}
+
+/// Settings of the managed Blob service (the RustFS container behind `/blob`).
+///
+/// Same reasoning as [`KvSettings`]: the container is named
+/// `rustfs-<service name>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BlobSettings {
+    /// Docker container name of the Blob RustFS container. Empty means the
+    /// per-instance default. A custom value must start with `rustfs-`.
+    #[schema(example = "rustfs-temps-blob-staging")]
+    pub container_name: String,
+}
+
 /// On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
 ///
 /// When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
@@ -2032,6 +2071,8 @@ impl Default for AppSettings {
             multi_node: MultiNodeSettings::default(),
             agent_sandbox: AgentSandboxSettings::default(),
             preview_gateway: PreviewGatewaySettings::default(),
+            kv: KvSettings::default(),
+            blob: BlobSettings::default(),
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,

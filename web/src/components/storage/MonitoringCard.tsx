@@ -1203,7 +1203,7 @@ export function MonitoringCard({
             ) : (
               <PowerOff className="h-4 w-4" />
             )}
-            <span className="ml-1.5 hidden sm:inline">Disable</span>
+            <span className="ml-1.5 max-sm:sr-only">Disable</span>
           </Button>
         </CardContent>
       </Card>
@@ -1241,7 +1241,7 @@ export function MonitoringCard({
             ) : (
               <PowerOff className="h-4 w-4" />
             )}
-            <span className="ml-1.5 hidden sm:inline">Disable</span>
+            <span className="ml-1.5 max-sm:sr-only">Disable</span>
           </Button>
         </CardTitle>
       </CardHeader>

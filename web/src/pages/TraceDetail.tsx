@@ -845,7 +845,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           className="shrink-0 gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
-          <span className="hidden sm:inline">Back</span>
+          <span className="max-sm:sr-only">Back</span>
         </Button>
         <div className="flex-1 min-w-0">
           <h2 className="truncate text-base font-semibold sm:text-lg">

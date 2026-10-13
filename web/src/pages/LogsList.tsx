@@ -255,7 +255,10 @@ export default function LogsList({ project }: LogsListProps) {
             />
 
             <Select value={severity} onValueChange={setSeverity}>
-              <SelectTrigger className="w-full sm:w-[150px]">
+              <SelectTrigger
+                aria-label="Severity"
+                className="w-full sm:w-[150px]"
+              >
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
               <SelectContent>

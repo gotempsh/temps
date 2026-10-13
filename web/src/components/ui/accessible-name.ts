@@ -83,3 +83,17 @@ export function warnUnnamedIconButton(
     `[a11y] <${where}> is icon-only and has no accessible name. Add aria-label="..." (what the button does) or an sr-only text child.`
   )
 }
+
+/**
+ * Accessible name for a control that shows a current value, such as a combobox
+ * button: the field label followed by what it shows ("Project: All projects").
+ * The visible text stays inside the name (WCAG 2.5.3), so voice control that
+ * says the visible words still works. Without a label the shown value is the
+ * name.
+ */
+export function fieldValueName(
+  label: string | undefined,
+  shown: string
+): string {
+  return label ? `${label}: ${shown}` : shown
+}

@@ -311,7 +311,7 @@ export function SegmentVisitors({
               onClick={() => setPage((p) => Math.max(1, p - 1))}
             >
               <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline">Previous</span>
+              <span className="max-sm:sr-only">Previous</span>
             </Button>
             <Button
               variant="outline"
@@ -319,7 +319,7 @@ export function SegmentVisitors({
               disabled={page >= totalPages}
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
             >
-              <span className="hidden sm:inline">Next</span>
+              <span className="max-sm:sr-only">Next</span>
               <ChevronRight className="h-4 w-4" />
             </Button>
           </div>

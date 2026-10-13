@@ -425,7 +425,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
           <Button variant="outline" asChild>
             <Link to={`/projects/${project.slug}/status-pages`}>
               <Globe className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">Status pages</span>
+              <span className="max-sm:sr-only">Status pages</span>
             </Link>
           </Button>
           {monitors && monitors.length > 0 && (

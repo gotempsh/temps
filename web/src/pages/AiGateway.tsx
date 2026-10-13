@@ -371,7 +371,7 @@ function AiSummaryDefaultsCard({
       </CardHeader>
       <CardContent className="grid gap-4 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
         <div className="space-y-2">
-          <Label>Summary provider</Label>
+          <Label htmlFor="ai-summary-provider">Summary provider</Label>
           <Select
             value={providerId}
             onValueChange={(value) => {
@@ -380,7 +380,7 @@ function AiSummaryDefaultsCard({
               setThinking(inherit)
             }}
           >
-            <SelectTrigger>
+            <SelectTrigger id="ai-summary-provider">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -396,6 +396,7 @@ function AiSummaryDefaultsCard({
         <div className="space-y-2">
           <Label>Summary model</Label>
           <SearchableSelect
+            label="Summary model"
             value={model}
             disabled={!provider}
             options={modelOptions}
@@ -410,13 +411,13 @@ function AiSummaryDefaultsCard({
           />
         </div>
         <div className="space-y-2">
-          <Label>Thinking</Label>
+          <Label htmlFor="ai-summary-thinking">Thinking</Label>
           <Select
             value={thinking}
             disabled={!selectedModel?.thinking_options.length}
             onValueChange={setThinking}
           >
-            <SelectTrigger>
+            <SelectTrigger id="ai-summary-thinking">
               <SelectValue placeholder="Model default" />
             </SelectTrigger>
             <SelectContent>
@@ -1436,7 +1437,7 @@ export function UsageAnalytics() {
               onClick={() => setRecentFiltersOpen((open) => !open)}
             >
               <SlidersHorizontal className="h-4 w-4" />
-              <span className="hidden sm:inline">Filters</span>
+              <span className="max-sm:sr-only">Filters</span>
               {recentActiveFilterCount > 0 && (
                 <Badge
                   variant="secondary"
@@ -1456,7 +1457,10 @@ export function UsageAnalytics() {
                 providers={AI_PROVIDERS}
               />
               <Select value={recentStatus} onValueChange={setRecentStatus}>
-                <SelectTrigger className="w-full sm:w-[150px]">
+                <SelectTrigger
+                  aria-label="Status"
+                  className="w-full sm:w-[150px]"
+                >
                   <SelectValue placeholder="Status" />
                 </SelectTrigger>
                 <SelectContent>
@@ -1477,7 +1481,10 @@ export function UsageAnalytics() {
                     setRecentCostOp(v as typeof recentCostOp)
                   }
                 >
-                  <SelectTrigger className="w-[92px]">
+                  <SelectTrigger
+                    aria-label="Cost comparison"
+                    className="w-[92px]"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1512,7 +1519,10 @@ export function UsageAnalytics() {
                     setRecentTokensOp(v as typeof recentTokensOp)
                   }
                 >
-                  <SelectTrigger className="w-[104px]">
+                  <SelectTrigger
+                    aria-label="Tokens comparison"
+                    className="w-[104px]"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1658,7 +1668,10 @@ export function UsageAnalytics() {
                   value={String(recentPageSize)}
                   onValueChange={(v) => setRecentPageSize(Number(v))}
                 >
-                  <SelectTrigger className="h-8 w-[110px] text-xs">
+                  <SelectTrigger
+                    aria-label="Rows per page"
+                    className="h-8 w-[110px] text-xs"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1678,7 +1691,7 @@ export function UsageAnalytics() {
                   onClick={() => setRecentPage((p) => Math.max(0, p - 1))}
                 >
                   <ChevronLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline">Previous</span>
+                  <span className="max-sm:sr-only">Previous</span>
                 </Button>
                 <Button
                   variant="outline"
@@ -1686,7 +1699,7 @@ export function UsageAnalytics() {
                   disabled={recentPage + 1 >= recentTotalPages}
                   onClick={() => setRecentPage((p) => p + 1)}
                 >
-                  <span className="hidden sm:inline">Next</span>
+                  <span className="max-sm:sr-only">Next</span>
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>
@@ -2882,7 +2895,7 @@ function InvocationCard({
             onClick={() => onOpenSpan(span)}
           >
             <Info className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Details</span>
+            <span className="max-sm:sr-only">Details</span>
           </Button>
         </div>
         <CollapsibleContent>
@@ -3357,7 +3370,10 @@ export function AgentActivity() {
               value={projectId?.toString() ?? ''}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-full sm:w-[180px]">
+              <SelectTrigger
+                aria-label="Project"
+                className="w-full sm:w-[180px]"
+              >
                 <SelectValue placeholder="Select project" />
               </SelectTrigger>
               <SelectContent>
@@ -4313,7 +4329,10 @@ console.log(response.choices[0].message.content);`,
                   value={effectiveSnippetProvider}
                   onValueChange={setSnippetProvider}
                 >
-                  <SelectTrigger className="h-7 w-[150px] text-xs focus:ring-0 focus:ring-offset-0">
+                  <SelectTrigger
+                    aria-label="Snippet provider"
+                    className="h-7 w-[150px] text-xs focus:ring-0 focus:ring-offset-0"
+                  >
                     <SelectValue placeholder="Provider" />
                   </SelectTrigger>
                   <SelectContent>

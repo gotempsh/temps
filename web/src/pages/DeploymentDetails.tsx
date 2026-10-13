@@ -420,7 +420,7 @@ function SecondaryActions({
     <>
       <Button variant="outline" onClick={actions.onRedeploy} title="Redeploy">
         <RotateCw className="h-4 w-4" />
-        <span className="hidden sm:inline">Redeploy</span>
+        <span className="max-sm:sr-only">Redeploy</span>
       </Button>
       {showMenu && (
         <DropdownMenu>

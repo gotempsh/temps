@@ -1241,6 +1241,16 @@ impl From<ChatError> for Problem {
                     .with_title(failure.title)
                     .with_detail(failure.detail)
             }
+            error @ ChatError::StreamInterrupted { .. } => {
+                let failure = error.public_failure();
+                error!(
+                    failure_code = failure.code,
+                    "AI provider stream ended before a terminal chunk: {error}"
+                );
+                problemdetails::new(axum::http::StatusCode::BAD_GATEWAY)
+                    .with_title(failure.title)
+                    .with_detail(failure.detail)
+            }
             ChatError::PermissionKindMismatch { .. } => {
                 problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
                     .with_title("Permission Decision Mismatch")
@@ -1308,6 +1318,11 @@ impl From<PendingActionError> for Problem {
             PendingActionError::InvalidState { .. } => {
                 problemdetails::new(axum::http::StatusCode::CONFLICT)
                     .with_title("Invalid Action State")
+                    .with_detail(e.to_string())
+            }
+            PendingActionError::InlineApprovalRequired { .. } => {
+                problemdetails::new(axum::http::StatusCode::CONFLICT)
+                    .with_title("Inline Approval Required")
                     .with_detail(e.to_string())
             }
             PendingActionError::StepBlocked { .. } => {
@@ -4406,6 +4421,9 @@ fn application_workspace_failure_detail(
         SandboxError::Unavailable { .. } => {
             "The sandbox runtime is unavailable on this Temps host. Contact your Temps administrator, then try again."
         }
+        SandboxError::ImageUnavailable { .. } => {
+            "The workspace image could not be pulled on this Temps host. Contact your Temps administrator to check registry access and that the image tag is published, then try again."
+        }
         SandboxError::Timeout { .. } => {
             "The workspace did not become ready before the startup timeout. Try again; if it continues, contact your Temps administrator."
         }
@@ -4431,7 +4449,9 @@ fn application_workspace_failure_problem(error: &temps_sandbox::error::SandboxEr
     use temps_sandbox::error::SandboxError;
 
     let status = match error {
-        SandboxError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        SandboxError::Unavailable { .. } | SandboxError::ImageUnavailable { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         SandboxError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         SandboxError::InvalidState { .. } | SandboxError::RuntimeVariableConflict { .. } => {
             StatusCode::CONFLICT
@@ -4657,11 +4677,35 @@ async fn global_workspace_sandbox(
                 workspace_id,
                 "failed to prepare global AI workspace sandbox"
             );
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Global Workspace Failed")
-                .with_detail("Temps could not prepare the persistent global workspace.")
+            global_workspace_failure_problem(&error)
         })?;
     Ok((workspace_id, sandbox.public_id))
+}
+
+/// Problem returned when the persistent global workspace cannot be prepared.
+/// A sandbox image that cannot be pulled is reported as such (503, naming the
+/// image) instead of the generic 500, so the operator learns what to fix.
+fn global_workspace_failure_problem(error: &temps_sandbox::error::SandboxError) -> Problem {
+    use temps_sandbox::error::SandboxError;
+
+    // Only the image-pull failure gets its own response here. `SandboxError`
+    // is `#[non_exhaustive]` and owned by `temps-sandbox`, which maps every
+    // variant explicitly in its own `From<SandboxError> for Problem`; this
+    // workspace-preparation path deliberately returns one generic 500 for the
+    // rest so no sandbox internals reach the response.
+    if let SandboxError::ImageUnavailable { image, .. } = error {
+        return problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_type("https://temps.sh/probs/sandbox-image-unavailable")
+            .with_title("Global Workspace Image Unavailable")
+            .with_detail(format!(
+                "Temps could not pull the sandbox image '{image}' needed for the persistent \
+                 global workspace. Check that this host can reach the image registry and \
+                 that the image tag is published, then try again."
+            ));
+    }
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title("Global Workspace Failed")
+        .with_detail("Temps could not prepare the persistent global workspace.")
 }
 
 async fn run_workspace_command(
@@ -10586,6 +10630,50 @@ mod tests {
     }
 
     #[test]
+    fn global_workspace_image_pull_failure_is_a_503_naming_the_image() {
+        let error = temps_sandbox::error::SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_test".to_string(),
+            image: "registry.example.test/team/sandbox:1.2.3".to_string(),
+            reason: "manifest unknown".to_string(),
+        };
+
+        let problem = global_workspace_failure_problem(&error);
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(body.contains("Global Workspace Image Unavailable"));
+        assert!(body.contains("registry.example.test/team/sandbox:1.2.3"));
+    }
+
+    #[test]
+    fn global_workspace_other_failures_stay_generic_500s() {
+        let error = temps_sandbox::error::SandboxError::CreateFailed {
+            user_id: 7,
+            reason: "provider detail with container temps-sandbox-secret-id".to_string(),
+        };
+
+        let problem = global_workspace_failure_problem(&error);
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(!body.contains("temps-sandbox-secret-id"));
+    }
+
+    #[test]
+    fn application_workspace_image_pull_failure_is_a_503() {
+        let error = temps_sandbox::error::SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_test".to_string(),
+            image: "registry.example.test/team/sandbox:1.2.3".to_string(),
+            reason: "manifest unknown".to_string(),
+        };
+
+        let problem = application_workspace_failure_problem(&error);
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(application_workspace_failure_detail(&error).contains("image tag is published"));
+    }
+
+    #[test]
     fn workspace_provider_problem_never_serializes_raw_provider_details() {
         let error = temps_sandbox::error::SandboxError::CreateFailed {
             user_id: 7,
@@ -11444,6 +11532,22 @@ mod tests {
         .into();
         assert_eq!(p.status_code, StatusCode::CONFLICT);
         assert_eq!(title_of(&p).as_deref(), Some("Invalid Action State"));
+    }
+
+    #[test]
+    fn test_pending_action_inline_approval_required_maps_to_409_with_guidance() {
+        let p: Problem = PendingActionError::InlineApprovalRequired {
+            public_id: "abc".to_string(),
+        }
+        .into();
+        assert_eq!(p.status_code, StatusCode::CONFLICT);
+        assert_eq!(title_of(&p).as_deref(), Some("Inline Approval Required"));
+        let body = serde_json::to_string(&p.body).expect("problem body serializes");
+        assert!(
+            body.contains("inline approval in the chat conversation"),
+            "{body}"
+        );
+        assert!(!body.contains("concurrent"), "{body}");
     }
 
     #[test]

@@ -76,6 +76,25 @@ pub struct StatusPageMonitorResponse {
     pub position: i32,
 }
 
+/// Whether published status pages have an address people can open.
+///
+/// Follows the capability-endpoint pattern: an unconfigured install answers
+/// with `configured: false`, a reason and the console path that fixes it,
+/// rather than a made-up URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublicUrlStatus {
+    /// `true` when `public_url` is present on the page.
+    pub configured: bool,
+    /// Why there is no public URL, or why the one there will not open from
+    /// outside this network (for example a loopback address). `None` when
+    /// nothing is known to be wrong.
+    #[schema(example = "Public URL is not configured.")]
+    pub reason: Option<String>,
+    /// Console path where the operator sets it. Present whenever `reason` is.
+    #[schema(example = "/settings#public-ingress")]
+    pub setup_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StatusPageResponse {
     pub id: i32,
@@ -85,10 +104,17 @@ pub struct StatusPageResponse {
     /// Unguessable token in the public URL.
     pub slug: String,
     pub is_published: bool,
-    /// Public HTML page. Serves 404 while the page is unpublished.
-    pub public_url: String,
-    /// Machine-readable form of the public page.
-    pub public_json_url: String,
+    /// Public HTML page. Serves 404 while the page is unpublished. `None`
+    /// when this install has no public address to build it from; see
+    /// `public_url_status` for why and where to fix it. Temps never invents a
+    /// host for it.
+    pub public_url: Option<String>,
+    /// Machine-readable form of the public page. `None` exactly when
+    /// `public_url` is.
+    pub public_json_url: Option<String>,
+    /// Whether `public_url` exists, and if not (or if it will not open from
+    /// outside this network) what to do about it.
+    pub public_url_status: PublicUrlStatus,
     pub monitors: Vec<StatusPageMonitorResponse>,
     #[schema(value_type = Option<String>, format = "date-time")]
     pub published_at: Option<UtcDateTime>,

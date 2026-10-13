@@ -408,4 +408,152 @@ mod tests {
             "clone must see caller set on original"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // List parameters over a real serde body and a derived OpenAPI schema
+    // -----------------------------------------------------------------------
+
+    #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+    struct CreateEnvVarRequest {
+        key: String,
+        value: String,
+        environment_ids: Vec<i32>,
+    }
+
+    /// Same body shape as the platform's `create_environment_variable`: a
+    /// required `Vec<i32>`. Deserialization is real serde, so a scalar
+    /// `environment_ids` fails exactly as it did in production
+    /// (`invalid type: string "15", expected a sequence`).
+    #[utoipa::path(
+        post,
+        path = "/projects/{project_id}/env-vars",
+        operation_id = "create_environment_variable",
+        tag = "Projects",
+        params(("project_id" = i32, Path, description = "Project id")),
+        request_body = CreateEnvVarRequest,
+        responses((status = 201, description = "created"))
+    )]
+    async fn create_environment_variable(
+        axum::extract::Path(project_id): axum::extract::Path<i32>,
+        Json(body): Json<CreateEnvVarRequest>,
+    ) -> impl IntoResponse {
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "project_id": project_id,
+                "key": body.key,
+                "environment_ids": body.environment_ids,
+            })),
+        )
+    }
+
+    #[derive(utoipa::OpenApi)]
+    #[openapi(
+        paths(create_environment_variable),
+        components(schemas(CreateEnvVarRequest))
+    )]
+    struct EnvVarApiDoc;
+
+    fn env_var_caller() -> InternalApiCaller {
+        use utoipa::OpenApi;
+        let router = Router::new().route(
+            "/projects/{project_id}/env-vars",
+            axum::routing::post(create_environment_variable),
+        );
+        InternalApiCaller::new_write_allowlisted(
+            router,
+            &EnvVarApiDoc::openapi(),
+            vec!["create_environment_variable".to_string()],
+        )
+    }
+
+    fn env_var_scope() -> ApiCallScope {
+        ApiCallScope {
+            auth: auth_with_role(1, Role::Admin),
+            project_scope: ProjectSelectorScope::Allowed(vec![7]),
+        }
+    }
+
+    async fn propose_and_confirm(command: &str) -> Result<crate::ApiToolResponse, String> {
+        let caller = env_var_caller();
+        let scope = env_var_scope();
+        match caller.prepare_write_cli(command, &scope) {
+            crate::WritePrepareOutcome::Prepared(prepared) => caller
+                .execute_write(&prepared.operation_id, prepared.params, &scope)
+                .await
+                .map_err(|error| error.to_string()),
+            crate::WritePrepareOutcome::Help(text) => Err(format!("help: {text}")),
+            crate::WritePrepareOutcome::Invalid(text) => Err(format!("invalid: {text}")),
+        }
+    }
+
+    /// The reported bug: `--environment_ids 15` used to reach the API as a
+    /// scalar and be rejected with a 422 *after* the human approved it.
+    #[tokio::test]
+    async fn test_write_cli_list_flag_reaches_the_api_as_an_array() {
+        for tail in [
+            "--environment_ids 15",
+            "--environment_ids [15]",
+            "--environment_ids=15",
+        ] {
+            let command = format!("projects create_environment_variable --key K --value V {tail}");
+            let response = propose_and_confirm(&command)
+                .await
+                .unwrap_or_else(|error| panic!("`{tail}` must succeed: {error}"));
+            assert_eq!(response.status, 201, "{tail}");
+            assert_eq!(response.body["environment_ids"], json!([15]), "{tail}");
+            assert_eq!(response.body["project_id"], json!(7), "{tail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_cli_list_flag_accepts_several_values_in_every_spelling() {
+        for tail in [
+            "--environment_ids 15,16",
+            "--environment_ids [15,16]",
+            "--environment_ids 15 16",
+            "--environment_ids 15 --environment_ids 16",
+        ] {
+            let command = format!("projects create_environment_variable --key K --value V {tail}");
+            let response = propose_and_confirm(&command)
+                .await
+                .unwrap_or_else(|error| panic!("`{tail}` must succeed: {error}"));
+            assert_eq!(response.body["environment_ids"], json!([15, 16]), "{tail}");
+        }
+    }
+
+    /// A wrong item type is caught while proposing -- before a human is asked
+    /// to approve a request the API is guaranteed to reject.
+    #[tokio::test]
+    async fn test_write_cli_list_flag_with_a_bad_item_is_rejected_at_proposal_time() {
+        let error = propose_and_confirm(
+            "projects create_environment_variable --key K --value V --environment_ids 15,prod",
+        )
+        .await
+        .expect_err("a non-integer item must not be staged");
+
+        assert!(error.contains("--environment_ids"), "{error}");
+        assert!(error.contains("item 2"), "{error}");
+        assert!(error.contains("\"prod\""), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_write_cli_help_documents_the_list_flag_and_the_write_tool() {
+        let caller = env_var_caller();
+        let scope = env_var_scope();
+
+        let crate::WritePrepareOutcome::Help(help) =
+            caller.prepare_write_cli("projects create_environment_variable --help", &scope)
+        else {
+            panic!("--help must produce help text");
+        };
+        assert!(
+            help.contains("--environment_ids <int>[,<int>...] (required)"),
+            "{help}"
+        );
+
+        let root = caller.cli_write_root_help(&scope.auth);
+        assert!(root.contains("Temps write API"), "{root}");
+        assert!(!root.contains("read-only"), "{root}");
+    }
 }

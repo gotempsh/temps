@@ -1073,7 +1073,7 @@ if (isLoading) return <Spinner />
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
 - **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: use the shared PageHeader from `web/src/components/layout/PageContainer.tsx`.
-- **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
+- **Button text**: `max-sm:sr-only` for labels next to icons (icon-only on mobile, label still the accessible name); never `hidden sm:inline`, which removes the name below `sm`
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse
 
 ### Testing with Playwright

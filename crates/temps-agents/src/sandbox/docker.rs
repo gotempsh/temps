@@ -3731,7 +3731,7 @@ impl SandboxProvider for DockerSandboxProvider {
                         return Err(AgentError::SandboxCreationFailed {
                             run_id: config.run_id,
                             provider: "docker".to_string(),
-                            reason: format!("Failed to pull image {}: {}", image, e),
+                            reason: crate::error::image_pull_failure_reason(image, &e.to_string()),
                         });
                     }
                 }
