@@ -301,6 +301,21 @@ mod tests {
         // nothing answers, which is exactly the case probe must report.
         drop(listener);
         assert!(std::path::Path::new(&path).exists());
-        assert!(probe(&path).await.is_err());
+        // Other tests in this process spawn children, and a child forked
+        // just before `exec` still holds a copy of the closed listener's fd
+        // (CLOEXEC only takes effect at exec). Give that window a moment to
+        // close instead of assuming the close is instantaneous.
+        let mut refused = false;
+        for _ in 0..100 {
+            if probe(&path).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            refused,
+            "probe kept succeeding against a stale socket {path}"
+        );
     }
 }
