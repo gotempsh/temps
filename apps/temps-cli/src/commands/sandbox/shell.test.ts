@@ -236,6 +236,28 @@ describe('readBoundedBody', () => {
     expect(stream.destroyed).toBe(true)
   })
 
+  test('keeps only the leading bytes of one chunk far larger than the cap', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 16, 5000)
+    const huge = Buffer.alloc(1024 * 1024, 0x62)
+    huge.write('HEAD', 0)
+    stream.write(huge)
+    const body = await read
+    expect(body.length).toBe(16)
+    expect(body.subarray(0, 4).toString()).toBe('HEAD')
+  })
+
+  test('cuts exactly at the cap when the limit falls inside a later chunk', async () => {
+    const stream = new PassThrough()
+    const read = readBoundedBody(stream, 10, 5000)
+    stream.write('abcdef')
+    // Let the first chunk be consumed before the second arrives.
+    await new Promise((r) => setTimeout(r, 10))
+    stream.write('ghijklmnop')
+    expect((await read).toString()).toBe('abcdefghij')
+    expect(stream.destroyed).toBe(true)
+  })
+
   test('settles when the stream errors', async () => {
     const stream = new PassThrough()
     const read = readBoundedBody(stream, 1024, 5000)

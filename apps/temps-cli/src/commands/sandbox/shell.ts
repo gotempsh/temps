@@ -158,8 +158,9 @@ export function decodeChunkedBody(raw: Buffer): Buffer {
  * Always settles: on end, error, close, the byte cap, or the deadline — and in
  * the last two cases the stream is destroyed, so a peer that sends a rejection
  * and then leaves the response open can neither hold the command nor keep a
- * socket. Whatever arrived is returned; this is for error reporting, so a
- * short read is a degraded message, not a failure.
+ * socket. At most `maxBytes` are ever retained, even when one chunk is larger
+ * (only the part that fits is copied). Whatever arrived is returned; this is
+ * for error reporting, so a short read is a degraded message, not a failure.
  */
 export function readBoundedBody(
   stream: Readable,
@@ -175,14 +176,18 @@ export function readBoundedBody(
       settled = true
       clearTimeout(timer)
       if (destroy) stream.destroy()
-      resolve(Buffer.concat(chunks).subarray(0, maxBytes))
+      resolve(Buffer.concat(chunks, size))
     }
     const timer = setTimeout(() => done(true), timeoutMs)
     stream.on('data', (chunk: Buffer | string) => {
       if (settled) return
       const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
-      chunks.push(buf)
-      size += buf.length
+      // Keep only what still fits: a single oversized chunk must not be
+      // retained whole (a `subarray` of it would pin its entire allocation).
+      const room = maxBytes - size
+      const kept = buf.length > room ? Buffer.from(buf.subarray(0, room)) : buf
+      chunks.push(kept)
+      size += kept.length
       if (size >= maxBytes) done(true)
     })
     stream.on('end', () => done(false))
