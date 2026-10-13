@@ -63,6 +63,12 @@ pub const SETUP_PATH: &str = "/agent-sandbox/sandbox";
 /// Command that installs the runtime pair for this backend.
 pub const SETUP_COMMAND: &str = "temps microsandbox setup";
 
+/// The fix for a missing or unusable guest terminal agent. Plain
+/// [`SETUP_COMMAND`] is not enough: without a `temps-pty-agent` next to the
+/// running executable it only warns, so the operator also has to say where
+/// the static Linux build is.
+pub const TERMINAL_SETUP_COMMAND: &str = "temps microsandbox setup --pty-agent-bin <path>";
+
 /// Working directory inside the guest. Shared with the Firecracker backend
 /// (`temps_vm_agent::WORK_DIR`) so callers see one layout for both microVM
 /// backends.
@@ -285,7 +291,8 @@ pub(crate) fn host_virtualization() -> Result<(), MicrosandboxUnavailable> {
 /// endpoint and by the standalone sandbox API to explain a rejected request.
 pub fn microsandbox_capability(data_dir: &Path) -> MicrosandboxCapability {
     let config = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
-    let terminal = TerminalCapability::from_staged_binary(&config.pty_agent_bin(), SETUP_COMMAND);
+    let terminal =
+        TerminalCapability::from_staged_binary(&config.pty_agent_bin(), TERMINAL_SETUP_COMMAND);
     MicrosandboxCapability::from_probe(
         host_virtualization().and_then(|()| runtime_probe(&config)),
         terminal,
@@ -426,12 +433,19 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("not staged"));
-        assert_eq!(cap.terminal.setup_command.as_deref(), Some(SETUP_COMMAND));
+        assert_eq!(
+            cap.terminal.setup_command.as_deref(),
+            Some(TERMINAL_SETUP_COMMAND)
+        );
+        assert!(
+            TERMINAL_SETUP_COMMAND.contains("--pty-agent-bin"),
+            "the terminal fix must name the flag that stages the agent"
+        );
 
         let config = MicrosandboxSandboxConfig::from_data_dir(dir.path().to_path_buf());
         let staged = config.pty_agent_bin();
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"\x7fELF\x02\x01\x01\x00").unwrap();
+        std::fs::write(&staged, crate::sandbox::test_elf::static_for_host(b"")).unwrap();
         assert!(microsandbox_capability(dir.path()).terminal.supported);
     }
 

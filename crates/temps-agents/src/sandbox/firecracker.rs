@@ -520,12 +520,18 @@ impl FirecrackerSandboxProvider {
         // `guest_agent_fingerprint` above already proved the VM agent is
         // readable; the PTY agent is optional.
         let agent_src = self.config.agent_bin();
-        let pty_agent_src = Some(self.config.pty_agent_bin()).filter(|p| p.exists());
+        // Inject only an agent the guest can run. A file that exists but is
+        // for another CPU or needs a loader would otherwise be baked into the
+        // cached rootfs and fail at the first terminal.
+        let terminal = firecracker_terminal_capability_for(&self.config);
+        let pty_agent_src = terminal.supported.then(|| self.config.pty_agent_bin());
         if pty_agent_src.is_none() {
             tracing::warn!(
-                "temps-pty-agent is not staged at {}; sandboxes converted now will not \
-                 support interactive terminals — run `temps firecracker setup`",
-                self.config.pty_agent_bin().display()
+                pty_agent = %self.config.pty_agent_bin().display(),
+                reason = terminal.reason.as_deref().unwrap_or("unknown"),
+                "terminal agent not injected; sandboxes converted now will not support \
+                 interactive terminals — run `{}`",
+                PTY_AGENT_SETUP_COMMAND
             );
         }
         let workdir_rel = WORK_DIR.trim_start_matches('/').to_string();
@@ -2185,16 +2191,19 @@ impl SandboxProvider for FirecrackerSandboxProvider {
                     // The VMM drops the connection when the guest has nothing
                     // listening on the port, so a handshake failure here almost
                     // always means this guest was built without the PTY agent.
-                    let staged = self.config.pty_agent_bin();
-                    let remedy = if staged.exists() {
+                    let terminal = firecracker_terminal_capability_for(&self.config);
+                    let remedy = if terminal.supported {
                         "this sandbox was created before terminal support, or from a \
                      snapshot taken before it; recreate the sandbox to get it"
                             .to_string()
                     } else {
                         format!(
-                            "temps-pty-agent is not staged at {} — run `temps firecracker setup \
-                         --pty-agent-bin <path>`, then recreate the sandbox",
-                            staged.display()
+                            "{} — run `{}`, then recreate the sandbox",
+                            terminal
+                                .reason
+                                .as_deref()
+                                .unwrap_or("the guest terminal agent is unusable"),
+                            PTY_AGENT_SETUP_COMMAND
                         )
                     };
                     tracing::warn!(
@@ -2618,10 +2627,18 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
 /// ("stage the terminal agent") instead of surfacing a bare 409 later.
 pub fn firecracker_terminal_capability(data_dir: &Path) -> super::TerminalCapability {
     let config = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
-    super::TerminalCapability::from_staged_binary(
-        &config.pty_agent_bin(),
-        "temps firecracker setup --pty-agent-bin <path>",
-    )
+    firecracker_terminal_capability_for(&config)
+}
+
+/// The fix for a missing or unusable guest terminal agent. Names the flag:
+/// without a `temps-pty-agent` next to the running executable plain
+/// `temps firecracker setup` only warns.
+pub const PTY_AGENT_SETUP_COMMAND: &str = "temps firecracker setup --pty-agent-bin <path>";
+
+fn firecracker_terminal_capability_for(
+    config: &FirecrackerSandboxConfig,
+) -> super::TerminalCapability {
+    super::TerminalCapability::from_staged_binary(&config.pty_agent_bin(), PTY_AGENT_SETUP_COMMAND)
 }
 
 fn host_tool_available(tool: &str) -> bool {
@@ -2930,7 +2947,7 @@ mod tests {
         // The host has the agent staged now; this VM predates it.
         let staged = provider.config.pty_agent_bin();
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"\x7fELF").unwrap();
+        std::fs::write(&staged, crate::sandbox::test_elf::static_for_host(b"")).unwrap();
         let _keep = dir;
 
         let message = provider

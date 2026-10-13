@@ -21,13 +21,14 @@ use ::microsandbox::{
 
 use super::{
     host_virtualization, MicrosandboxSandboxConfig, MicrosandboxUnavailable, MICROSANDBOX_VERSION,
-    MSB_SANDBOX_NAME_PREFIX, PROVIDER_NAME, SETUP_COMMAND, WORK_DIR,
+    MSB_SANDBOX_NAME_PREFIX, PROVIDER_NAME, TERMINAL_SETUP_COMMAND, WORK_DIR,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
 use crate::sandbox::{
-    is_linux_elf, ExecStream, KillSignal, OnStreamEventCallback, PtyAttachment, SandboxBackend,
-    SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
+    check_guest_agent, ExecStream, KillSignal, OnStreamEventCallback, PtyAttachment,
+    SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
+    PTY_AGENT_SOCKET,
 };
 
 /// Image used when a sandbox doesn't specify one. Same default as the
@@ -94,6 +95,16 @@ const PTY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 const PTY_OUTPUT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 /// Frame-count bound on the same queue (guards many tiny frames).
 const PTY_OUTPUT_QUEUE_FRAMES: usize = 1024;
+
+/// Longest one write to (or the close of) the relay's stdin may take. Each is
+/// one message to the guest; a stalled guest must not park the pump — and with
+/// it a task, a duplex buffer and the relay process — forever.
+const PTY_STDIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest the relay process is given to acknowledge a kill. After this the
+/// attachment is abandoned regardless: the process is the guest's to reap
+/// (it also exits by itself when its stdin closes or the socket drops).
+const PTY_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Buffer between the terminal handler's writes and the guest's stdin. One
 /// per attachment; a stalled guest back-pressures the handler (whose writes
@@ -1284,31 +1295,35 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         // whose far end is pumped into the sink by a task. Dropping the
         // returned writer ends the pump, which closes the guest's stdin, so
         // the relay exits and the attachment ends — the agent stays up.
-        let (input, mut pump) = tokio::io::duplex(PTY_INPUT_BUFFER_BYTES);
-        let pump_name = name.to_string();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match pump.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if let Err(e) = stdin.write(&buf[..n]).await {
-                            tracing::debug!(
-                                sandbox = %pump_name,
-                                "terminal stdin pump stopped: {}",
-                                e
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = stdin.close().await;
-        });
-
+        //
+        // The pump is tied to the attachment, not just to its writer: it
+        // also stops when the *output* half is dropped (the handler's
+        // session ended), and every call into the guest is bounded, so a
+        // stalled guest cannot leave it parked on a write for good.
+        let (input, pump) = tokio::io::duplex(PTY_INPUT_BUFFER_BYTES);
+        let (alive, attachment_gone) = tokio::sync::oneshot::channel::<()>();
+        let terminator = exec.terminator();
         let output =
             bounded_terminal_output(exec, handle.sandbox_id.clone(), PTY_OUTPUT_BUDGET_BYTES);
+        tokio::spawn(pump_terminal_input(
+            pump,
+            TerminalStdinSink(stdin),
+            terminator,
+            attachment_gone,
+            handle.sandbox_id.clone(),
+            PTY_STDIN_TIMEOUT,
+        ));
+
+        // Keep `alive` for exactly as long as the output stream lives; its
+        // drop is what tells the input pump the attachment is over.
+        let output = futures::stream::unfold(
+            (Box::pin(output), alive),
+            |(mut stream, alive)| async move {
+                use futures::StreamExt;
+                let item = stream.next().await?;
+                Some((item, (stream, alive)))
+            },
+        );
         Ok(PtyAttachment {
             output: Box::pin(output),
             input: Box::pin(input),
@@ -1608,16 +1623,104 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
     }
 }
 
-/// Build the SDK backend bound to `<data_dir>/microsandbox`. Lazy: the SDK
-/// database and directories are only created on first sandbox operation.
+/// Destination for the relay's stdin. Abstracts the SDK's `ExecSink` so the
+/// input pump's deadlines can be tested without a hypervisor.
+#[async_trait]
+trait StdinSink: Send + 'static {
+    async fn write(&self, data: &[u8]) -> Result<(), String>;
+    async fn close(&self) -> Result<(), String>;
+}
+
+struct TerminalStdinSink(::microsandbox::sandbox::exec::ExecSink);
+
+#[async_trait]
+impl StdinSink for TerminalStdinSink {
+    async fn write(&self, data: &[u8]) -> Result<(), String> {
+        self.0.write(data).await.map_err(|e| e.to_string())
+    }
+
+    async fn close(&self) -> Result<(), String> {
+        self.0.close().await.map_err(|e| e.to_string())
+    }
+}
+
+/// Copy the terminal client's input into the relay's stdin until the
+/// attachment ends.
+///
+/// Ends on: the writer being dropped (client detached), `attachment_gone`
+/// resolving (the output half was dropped), a failed write, or a write that
+/// exceeds [`PTY_STDIN_TIMEOUT`]. On the last two the relay is also killed —
+/// closing stdin would not reach a guest that is not answering — and in every
+/// case stdin is closed, bounded, so a healthy relay exits by itself.
+async fn pump_terminal_input<K: StdinSink>(
+    mut input: tokio::io::DuplexStream,
+    sink: K,
+    terminator: Terminator,
+    mut attachment_gone: tokio::sync::oneshot::Receiver<()>,
+    sandbox_id: String,
+    call_timeout: Duration,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut kill = false;
+    loop {
+        let read = tokio::select! {
+            read = input.read(&mut buf) => read,
+            // `Err` means the sender was dropped: the stream is gone.
+            _ = &mut attachment_gone => break,
+        };
+        let n = match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        match tokio::time::timeout(call_timeout, sink.write(&buf[..n])).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(sandbox_id = %sandbox_id, error = %e, "terminal stdin pump stopped");
+                kill = true;
+                break;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_ms = call_timeout.as_millis() as u64,
+                    "terminal stdin write timed out; ending the attachment"
+                );
+                kill = true;
+                break;
+            }
+        }
+    }
+    if kill {
+        terminate_detached(&terminator, &sandbox_id);
+    }
+    if tokio::time::timeout(call_timeout, sink.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            timeout_ms = call_timeout.as_millis() as u64,
+            "closing terminal stdin timed out; killing the relay"
+        );
+        terminate_detached(&terminator, &sandbox_id);
+    }
+}
+
 /// Source of exec events. Abstracts the SDK's `ExecHandle` so the bounded
 /// output pump can be tested without a hypervisor.
 #[async_trait]
 trait ExecEventSource: Send + 'static {
     async fn next_event(&mut self) -> Option<ExecEvent>;
-    /// Stop the guest process. Best effort.
-    async fn terminate(&mut self);
+    /// A handle that stops the guest process and can be used while events
+    /// are still being received (and after the source is dropped).
+    fn terminator(&self) -> Terminator;
 }
+
+/// Stops the relay process in the guest. Best effort: the future resolves
+/// once the request was sent or failed, never errors.
+type Terminator = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 #[async_trait]
 impl ExecEventSource for ::microsandbox::ExecHandle {
@@ -1625,9 +1728,33 @@ impl ExecEventSource for ::microsandbox::ExecHandle {
         self.recv().await
     }
 
-    async fn terminate(&mut self) {
-        let _ = self.kill().await;
+    fn terminator(&self) -> Terminator {
+        let control = self.control();
+        Arc::new(move || {
+            let control = control.clone();
+            Box::pin(async move {
+                let _ = control.kill().await;
+            })
+        })
     }
+}
+
+/// Ask `terminator` to stop the relay without waiting for the answer: the
+/// request runs detached under [`PTY_KILL_TIMEOUT`], so the caller can go on
+/// releasing the event channel (and so stop the SDK's unbounded queue
+/// growing) while a stalled guest sits on the kill.
+fn terminate_detached(terminator: &Terminator, sandbox_id: &str) {
+    let kill = (terminator.clone())();
+    let sandbox_id = sandbox_id.to_string();
+    tokio::spawn(async move {
+        if tokio::time::timeout(PTY_KILL_TIMEOUT, kill).await.is_err() {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                timeout_secs = PTY_KILL_TIMEOUT.as_secs(),
+                "terminal relay did not acknowledge a kill in time; abandoning it"
+            );
+        }
+    });
 }
 
 /// Terminal output from a relay exec as a stream whose host-side buffering is
@@ -1655,6 +1782,7 @@ fn bounded_terminal_output<S: ExecEventSource>(
     let queued = Arc::new(AtomicUsize::new(0));
     let overflowed = Arc::new(AtomicBool::new(false));
 
+    let terminator = source.terminator();
     let relay_failure = {
         let sandbox_id = sandbox_id.clone();
         move |reason: String| AgentError::SandboxExecFailed {
@@ -1675,7 +1803,7 @@ fn bounded_terminal_output<S: ExecEventSource>(
                     // The consumer is gone (session ended): stop the relay
                     // now rather than when the guest next produces output.
                     _ = tx.closed() => {
-                        source.terminate().await;
+                        terminate_detached(&terminator, &sandbox_id);
                         return;
                     }
                 };
@@ -1692,7 +1820,7 @@ fn bounded_terminal_output<S: ExecEventSource>(
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => {
                                 overflowed.store(true, Ordering::Release);
-                                source.terminate().await;
+                                terminate_detached(&terminator, &sandbox_id);
                                 return;
                             }
                             Err(TrySendError::Closed(_)) => {
@@ -1700,7 +1828,7 @@ fn bounded_terminal_output<S: ExecEventSource>(
                                 if !tx.is_closed() {
                                     overflowed.store(true, Ordering::Release);
                                 }
-                                source.terminate().await;
+                                terminate_detached(&terminator, &sandbox_id);
                                 return;
                             }
                         }
@@ -1713,7 +1841,7 @@ fn bounded_terminal_output<S: ExecEventSource>(
                             "PTY agent relay error: {}",
                             String::from_utf8_lossy(&chunk).trim()
                         ))));
-                        source.terminate().await;
+                        terminate_detached(&terminator, &sandbox_id);
                         return;
                     }
                     Some(ExecEvent::Failed(failure)) => {
@@ -1773,9 +1901,9 @@ async fn read_staged_pty_agent(path: &Path) -> Result<Vec<u8>, String> {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "the guest terminal agent (temps-pty-agent) is not staged at {} — \
-                 run `{} --pty-agent-bin <path>`",
+                 run `{}`",
                 path.display(),
-                SETUP_COMMAND
+                TERMINAL_SETUP_COMMAND
             )
         } else {
             format!(
@@ -1800,12 +1928,12 @@ async fn read_staged_pty_agent(path: &Path) -> Result<Vec<u8>, String> {
             e
         )
     })?;
-    if !is_linux_elf(&bytes) {
+    if let Err(rejection) = check_guest_agent(&bytes) {
         return Err(format!(
-            "{} is not a Linux executable; stage the static Linux build with \
-             `{} --pty-agent-bin <path>`",
+            "the staged guest terminal agent {} {}; stage a usable build with `{}`",
             path.display(),
-            SETUP_COMMAND
+            rejection,
+            TERMINAL_SETUP_COMMAND
         ));
     }
     Ok(bytes)
@@ -2394,9 +2522,21 @@ mod tests {
         let foreign = read_staged_pty_agent(&staged).await.unwrap_err();
         assert!(foreign.contains("not a Linux executable"), "{foreign}");
 
-        std::fs::write(&staged, b"\x7fELF\x02\x01\x01\x00rest").unwrap();
+        // A Linux ELF the guest cannot run is refused with the reason.
+        let glibc = crate::sandbox::test_elf::elf(
+            crate::sandbox::test_elf::host_machine(),
+            Some("/lib64/ld-linux-x86-64.so.2"),
+            b"",
+        );
+        std::fs::write(&staged, glibc).unwrap();
+        let dynamic = read_staged_pty_agent(&staged).await.unwrap_err();
+        assert!(dynamic.contains("dynamically linked"), "{dynamic}");
+        assert!(dynamic.contains("--pty-agent-bin"), "{dynamic}");
+
+        let good = crate::sandbox::test_elf::static_for_host(b"rest");
+        std::fs::write(&staged, &good).unwrap();
         let bytes = read_staged_pty_agent(&staged).await.unwrap();
-        assert_eq!(bytes, b"\x7fELF\x02\x01\x01\x00rest");
+        assert_eq!(bytes, good);
     }
 
     const EGRESS_PROBE: &str = "wget -q -T 5 -O - http://1.1.1.1/cdn-cgi/trace";
@@ -2916,9 +3056,14 @@ mod tests {
             }
         }
 
-        async fn terminate(&mut self) {
-            self.terminated
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        fn terminator(&self) -> Terminator {
+            let terminated = self.terminated.clone();
+            Arc::new(move || {
+                let terminated = terminated.clone();
+                Box::pin(async move {
+                    terminated.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
         }
     }
 
@@ -3019,7 +3164,9 @@ mod tests {
             self.0.recv().await
         }
 
-        async fn terminate(&mut self) {}
+        fn terminator(&self) -> Terminator {
+            Arc::new(|| Box::pin(async {}))
+        }
     }
 
     #[tokio::test]
@@ -3047,6 +3194,129 @@ mod tests {
         tx.send(ExecEvent::Exited { code: 0 }).expect("pump alive");
         assert!(output.next().await.is_none());
         assert_eq!(total, 800);
+    }
+
+    /// A stdin sink that records writes and can be made to hang.
+    struct FakeStdin {
+        written: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        hang_writes: bool,
+        hang_close: bool,
+    }
+
+    #[async_trait]
+    impl StdinSink for FakeStdin {
+        async fn write(&self, data: &[u8]) -> Result<(), String> {
+            if self.hang_writes {
+                std::future::pending::<()>().await;
+            }
+            self.written
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), String> {
+            if self.hang_close {
+                std::future::pending::<()>().await;
+            }
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct PumpHarness {
+        input: tokio::io::DuplexStream,
+        alive: tokio::sync::oneshot::Sender<()>,
+        written: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        killed: Arc<std::sync::atomic::AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn start_pump(hang_writes: bool, hang_close: bool) -> PumpHarness {
+        let (input, pump_end) = tokio::io::duplex(1024);
+        let (alive, gone) = tokio::sync::oneshot::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (source, killed) = ScriptedSource::new(vec![]);
+        let sink = FakeStdin {
+            written: written.clone(),
+            closed: closed.clone(),
+            hang_writes,
+            hang_close,
+        };
+        let task = tokio::spawn(pump_terminal_input(
+            pump_end,
+            sink,
+            source.terminator(),
+            gone,
+            "sbx_test".to_string(),
+            Duration::from_millis(50),
+        ));
+        PumpHarness {
+            input,
+            alive,
+            written,
+            closed,
+            killed,
+            task,
+        }
+    }
+
+    async fn finished(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the pump must end, not park")
+            .expect("pump task");
+    }
+
+    #[tokio::test]
+    async fn input_is_forwarded_and_a_detach_closes_stdin_without_killing() {
+        use tokio::io::AsyncWriteExt;
+        let mut h = start_pump(false, false);
+        h.input.write_all(b"ls\n").await.unwrap();
+        drop(h.input);
+        finished(h.task).await;
+        assert_eq!(
+            *h.written.lock().unwrap_or_else(|p| p.into_inner()),
+            b"ls\n"
+        );
+        assert!(h.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !h.killed.load(std::sync::atomic::Ordering::SeqCst),
+            "a clean detach lets the relay exit by itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stdin_write_ends_the_pump_and_kills_the_relay() {
+        use tokio::io::AsyncWriteExt;
+        let mut h = start_pump(true, false);
+        h.input.write_all(b"x").await.unwrap();
+        finished(h.task).await;
+        wait_for(&h.killed).await;
+        assert!(h.closed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_output_half_ends_the_pump_even_if_the_writer_lives() {
+        let h = start_pump(false, false);
+        // The writer (`input`) stays alive; only the attachment's output
+        // stream goes away, as when the handler's session ends.
+        drop(h.alive);
+        finished(h.task).await;
+        assert!(h.closed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(h.input);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stdin_close_kills_the_relay_instead_of_hanging() {
+        let h = start_pump(false, true);
+        drop(h.input);
+        finished(h.task).await;
+        wait_for(&h.killed).await;
     }
 
     #[tokio::test]

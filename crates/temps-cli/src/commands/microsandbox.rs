@@ -289,6 +289,7 @@ fn report_terminal_support(terminal: &temps_agents::sandbox::TerminalCapability)
         ok("terminals: guest terminal agent is staged (`temps sandbox shell` works)");
         return;
     }
+    // `setup_command` is already the complete fix, flag included.
     println!(
         "  {} terminals unavailable: {}{}",
         "!".yellow().bold(),
@@ -296,7 +297,7 @@ fn report_terminal_support(terminal: &temps_agents::sandbox::TerminalCapability)
         terminal
             .setup_command
             .as_deref()
-            .map(|c| format!(" (run `{c} --pty-agent-bin <path>`)"))
+            .map(|c| format!(" (run `{c}`)"))
             .unwrap_or_default()
     );
 }

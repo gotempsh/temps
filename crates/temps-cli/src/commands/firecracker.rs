@@ -55,7 +55,7 @@ const SMOKE_IMAGE: &str = "busybox:stable";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Command that stages the guest terminal agent, shown with the reason when
 /// it is missing.
-const PTY_AGENT_SETUP_HINT: &str = "temps firecracker setup --pty-agent-bin <path>";
+const PTY_AGENT_SETUP_HINT: &str = temps_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
 
 /// Manage the Firecracker microVM sandbox backend
 #[derive(Args)]
