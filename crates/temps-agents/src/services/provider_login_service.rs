@@ -212,7 +212,7 @@ impl ProviderLoginService {
             state_root,
             HostIdentity::resolve(),
             LoginLimits::default(),
-            Arc::new(|id| crate::ai_cli::create_provider(id)),
+            Arc::new(crate::ai_cli::create_provider),
             sink,
         )
     }

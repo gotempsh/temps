@@ -408,6 +408,102 @@ impl LoginCredentialSink for SettingsLoginSink {
 mod tests {
     use super::*;
 
+    fn auth_with(permissions: Vec<temps_auth::Permission>) -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 7,
+            name: "Operator".to_string(),
+            email: "operator@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_api_key(
+            user,
+            None,
+            Some(permissions),
+            "login-test".to_string(),
+            1,
+        )
+    }
+
+    #[test]
+    fn sign_in_requires_settings_write_and_the_provider_host_permission() {
+        use temps_auth::Permission;
+
+        // Claude Code: AiGatewayWrite is its host access requirement.
+        assert!(authorize(
+            &auth_with(vec![Permission::SettingsWrite, Permission::AiGatewayWrite]),
+            "claude_cli"
+        )
+        .is_ok());
+        // Missing the host permission.
+        assert_eq!(
+            authorize(&auth_with(vec![Permission::SettingsWrite]), "claude_cli")
+                .expect_err("forbidden")
+                .status_code,
+            StatusCode::FORBIDDEN
+        );
+        // Missing settings write, which also guards GET (the response carries
+        // the sign-in link and device code).
+        assert_eq!(
+            authorize(&auth_with(vec![Permission::AiGatewayWrite]), "claude_cli")
+                .expect_err("forbidden")
+                .status_code,
+            StatusCode::FORBIDDEN
+        );
+        // Read-only settings access is not enough.
+        assert!(authorize(
+            &auth_with(vec![Permission::SettingsRead, Permission::AiGatewayWrite]),
+            "claude_cli"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codex_sign_in_requires_system_admin() {
+        use temps_auth::Permission;
+
+        assert!(authorize(
+            &auth_with(vec![Permission::SettingsWrite, Permission::SystemAdmin]),
+            "codex_cli"
+        )
+        .is_ok());
+        assert_eq!(
+            authorize(
+                &auth_with(vec![Permission::SettingsWrite, Permission::AiGatewayWrite]),
+                "codex_cli"
+            )
+            .expect_err("forbidden")
+            .status_code,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn unknown_providers_are_not_found_after_the_permission_check() {
+        use temps_auth::Permission;
+
+        let error = authorize(
+            &auth_with(vec![Permission::SettingsWrite, Permission::SystemAdmin]),
+            "no_such_provider",
+        )
+        .expect_err("unknown provider");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn code_request_debug_never_prints_the_code() {
         let request = SubmitLoginCodeRequest {
