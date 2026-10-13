@@ -5,8 +5,22 @@ import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
-import { getProjectBySlug, getChatReadiness } from '../../api/sdk.gen.js'
+import {
+  getProjectBySlug,
+  getChatReadiness,
+  startAiProviderLogin,
+  getAiProviderLogin,
+  submitAiProviderLoginCode,
+  cancelAiProviderLogin,
+} from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { promptPassword } from '../../ui/prompts.js'
+import {
+  LoginFlowError,
+  runProviderLogin,
+  type LoginSession,
+  type ProviderLoginApi,
+} from './provider-login.js'
 import {
   newline,
   header,
@@ -97,8 +111,110 @@ async function readiness(
   newline()
 }
 
+/** Adapt the generated SDK to the small interface the sign-in flow uses. */
+function providerLoginApi(): ProviderLoginApi {
+  const unwrap = (result: {
+    data?: LoginSession
+    error?: unknown
+  }): LoginSession => {
+    if (result.error) throw new Error(getErrorMessage(result.error))
+    if (!result.data) throw new Error('The server returned no sign-in state')
+    return result.data
+  }
+  return {
+    start: async (providerId) =>
+      unwrap(
+        await startAiProviderLogin({
+          client,
+          path: { provider_id: providerId },
+        })
+      ),
+    status: async (providerId) =>
+      unwrap(
+        await getAiProviderLogin({ client, path: { provider_id: providerId } })
+      ),
+    submitCode: async (providerId, code) =>
+      unwrap(
+        await submitAiProviderLoginCode({
+          client,
+          path: { provider_id: providerId },
+          body: { code },
+        })
+      ),
+    cancel: async (providerId) =>
+      unwrap(
+        await cancelAiProviderLogin({
+          client,
+          path: { provider_id: providerId },
+        })
+      ),
+  }
+}
+
+interface ProviderLoginOptions {
+  json?: boolean
+}
+
+async function providerLogin(
+  providerId: string,
+  options: ProviderLoginOptions
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const api = providerLoginApi()
+  let cancelSignIn: (() => Promise<void>) | undefined
+  let interrupted = false
+  const onInterrupt = () => {
+    if (interrupted) process.exit(130)
+    interrupted = true
+    console.log(colors.warning('\nCancelling the sign-in…'))
+    void (cancelSignIn?.() ?? Promise.resolve()).finally(() => process.exit(130))
+  }
+  process.on('SIGINT', onInterrupt)
+
+  try {
+    const session = await runProviderLogin(
+      api,
+      {
+        log: (line) => console.log(line),
+        promptCode: (message) => promptPassword({ message }),
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      },
+      providerId,
+      {
+        onCancelable: (cancel) => {
+          cancelSignIn = cancel
+        },
+      }
+    )
+    if (options.json) jsonOutput(session)
+  } catch (error) {
+    if (error instanceof LoginFlowError) {
+      console.error(colors.error(`${icons.error} ${error.message}`))
+      process.exitCode = 1
+      return
+    }
+    throw error
+  } finally {
+    process.off('SIGINT', onInterrupt)
+  }
+}
+
 export function registerAiCommands(program: Command): void {
   const ai = program.command('ai').description('AI assistant status for a project')
+
+  const provider = ai
+    .command('provider')
+    .description('Manage the AI CLIs (Claude Code, Codex) Temps runs on this server')
+
+  provider
+    .command('login <provider-id>')
+    .description(
+      'Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)'
+    )
+    .option('--json', 'Print the final sign-in state as JSON')
+    .action((providerId, opts) => providerLogin(providerId, opts))
 
   ai.command('readiness [project]')
     .description('Show which AI prerequisites this project meets, and how to fix the rest')

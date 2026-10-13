@@ -969,6 +969,12 @@ export type AiPageBreakdownRow = {
 };
 
 /**
+ * Response wrapper kept separate from the service view so the wire shape is
+ * owned by the handler layer.
+ */
+export type AiProviderLoginResponse = LoginSessionView;
+
+/**
  * Current API-gateway availability for this instance.
  *
  * The `configured` field drives the UI onboarding state: when `false` the UI
@@ -13902,9 +13908,41 @@ export type LogSourceKind = 'collected' | 'application' | 'service';
  */
 export type LogStream = 'stdout' | 'stderr';
 
+export type LoginPhase = 'starting' | 'waiting' | 'verifying' | 'succeeded' | 'failed' | 'cancelled';
+
 export type LoginRequest = {
     email: string;
     password: string;
+};
+
+/**
+ * Snapshot of one sign-in, safe to return to a browser: it carries the link
+ * and device code the operator needs and no credential material.
+ */
+export type LoginSessionView = {
+    /**
+     * Human-readable status of the current phase, or why it ended.
+     */
+    detail: string;
+    elapsed_seconds: number;
+    finished_at?: string | null;
+    phase: LoginPhase;
+    provider_id: string;
+    /**
+     * True when the operator must paste a code back into Temps.
+     */
+    requires_code: boolean;
+    session_id: string;
+    started_at: string;
+    timeout_seconds: number;
+    /**
+     * Device code to enter on that page, for device-code providers.
+     */
+    user_code?: string | null;
+    /**
+     * Page the operator opens in their browser. Present from `waiting`.
+     */
+    verification_url?: string | null;
 };
 
 export type LogsQuery = {
@@ -18313,6 +18351,18 @@ export type ProviderCatalogDto = {
     id: string;
     install_command: string;
     local_credential?: LocalCredentialDto | null;
+    /**
+     * True when this provider's CLI can sign in to a subscription from the
+     * console ("Sign in with Claude"). The UI shows the control whenever this
+     * is true, even if `login_unavailable_reason` says it cannot run yet.
+     */
+    login_supported: boolean;
+    /**
+     * Why signing in cannot start right now (CLI not installed on this
+     * server, data directory unavailable) or why the provider has no
+     * console sign-in. `None` when the sign-in can be started.
+     */
+    login_unavailable_reason?: string | null;
     /**
      * Default max turns for the autofixer analysis phase. `None` = built-in
      * default (10). Only enforced for CLIs with a turn flag (Claude Code).
@@ -23370,6 +23420,17 @@ export type StripeConfig = {
      * `price_allowlist` via OR — if either list has a match, accept.
      */
     product_allowlist?: Array<string>;
+};
+
+/**
+ * Body for `POST /settings/ai-providers/{provider_id}/login/code`.
+ */
+export type SubmitLoginCodeRequest = {
+    /**
+     * The authorization code shown by the provider after approving access.
+     * Never logged and never echoed back.
+     */
+    code: string;
 };
 
 /**
@@ -63867,6 +63928,170 @@ export type VerifySavedAiProviderCredentialResponses = {
 };
 
 export type VerifySavedAiProviderCredentialResponse = VerifySavedAiProviderCredentialResponses[keyof VerifySavedAiProviderCredentialResponses];
+
+export type GetAiProviderLoginData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login';
+};
+
+export type GetAiProviderLoginErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No sign-in has been started
+     */
+    404: unknown;
+};
+
+export type GetAiProviderLoginResponses = {
+    /**
+     * Sign-in state
+     */
+    200: AiProviderLoginResponse;
+};
+
+export type GetAiProviderLoginResponse = GetAiProviderLoginResponses[keyof GetAiProviderLoginResponses];
+
+export type StartAiProviderLoginData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login';
+};
+
+export type StartAiProviderLoginErrors = {
+    /**
+     * Provider has no console sign-in
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown provider
+     */
+    404: unknown;
+    /**
+     * A sign-in is already in progress
+     */
+    409: unknown;
+    /**
+     * Too many sign-ins running
+     */
+    429: unknown;
+};
+
+export type StartAiProviderLoginResponses = {
+    /**
+     * Sign-in started
+     */
+    202: AiProviderLoginResponse;
+};
+
+export type StartAiProviderLoginResponse = StartAiProviderLoginResponses[keyof StartAiProviderLoginResponses];
+
+export type CancelAiProviderLoginData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login/cancel';
+};
+
+export type CancelAiProviderLoginErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No sign-in has been started
+     */
+    404: unknown;
+};
+
+export type CancelAiProviderLoginResponses = {
+    /**
+     * Sign-in cancelled
+     */
+    200: AiProviderLoginResponse;
+};
+
+export type CancelAiProviderLoginResponse = CancelAiProviderLoginResponses[keyof CancelAiProviderLoginResponses];
+
+export type SubmitAiProviderLoginCodeData = {
+    body: SubmitLoginCodeRequest;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login/code';
+};
+
+export type SubmitAiProviderLoginCodeErrors = {
+    /**
+     * Invalid code
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No sign-in in progress
+     */
+    404: unknown;
+    /**
+     * Sign-in is not waiting for a code
+     */
+    409: unknown;
+};
+
+export type SubmitAiProviderLoginCodeResponses = {
+    /**
+     * Code submitted
+     */
+    200: AiProviderLoginResponse;
+};
+
+export type SubmitAiProviderLoginCodeResponse = SubmitAiProviderLoginCodeResponses[keyof SubmitAiProviderLoginCodeResponses];
 
 export type RefreshAiProviderModelsData = {
     body?: never;
