@@ -589,16 +589,6 @@ impl Driver {
         }
 
         let credential = read_snapshot(provider_id, scratch).await?;
-        let auth_type = "subscription";
-        self.sink
-            .store(StoreLoginCredential {
-                provider_id,
-                auth_type,
-                credential: &credential,
-                actor: &self.actor,
-            })
-            .await?;
-
         let canonical = ProviderLocation::below_home(
             provider_id,
             &host_cli::managed_home(&self.state_root, provider_id),
@@ -606,11 +596,38 @@ impl Driver {
         .ok_or_else(|| LoginError::NotSupported {
             provider_id: provider_id.to_string(),
         })?;
-        promote(scratch, &canonical).map_err(|error| LoginError::Io {
+
+        // Activate the new home first and keep the previous one aside, then
+        // save the credential. If saving fails the previous home is restored,
+        // so the live CLI sign-in and the saved credential never describe
+        // different accounts and a failed sign-in changes nothing.
+        let promotion = promote(scratch, &canonical).map_err(|error| LoginError::Io {
             provider_id: provider_id.to_string(),
             operation: "activating the new sign-in".to_string(),
             reason: error.to_string(),
         })?;
+        let stored = self
+            .sink
+            .store(StoreLoginCredential {
+                provider_id,
+                auth_type: "subscription",
+                credential: &credential,
+                actor: &self.actor,
+            })
+            .await;
+        match stored {
+            Ok(()) => promotion.commit(),
+            Err(error) => {
+                if let Err(rollback) = promotion.rollback() {
+                    tracing::error!(
+                        provider_id,
+                        error = %rollback,
+                        "could not restore the previous CLI sign-in after the credential save failed"
+                    );
+                }
+                return Err(error);
+            }
+        }
 
         Ok(match status.subscription_type.as_deref() {
             Some(plan) if !plan.is_empty() => format!("Signed in ({plan} plan)."),
@@ -648,30 +665,65 @@ async fn read_snapshot(
     })
 }
 
+/// A scratch home that has replaced the live one but is not yet final: the
+/// previous home is kept aside until the caller commits or rolls back.
+struct Promotion {
+    scratch_home: PathBuf,
+    live_home: PathBuf,
+    previous: Option<PathBuf>,
+}
+
+impl Promotion {
+    /// Keep the new home and discard the previous one.
+    fn commit(self) {
+        if let Some(previous) = self.previous {
+            let _ = std::fs::remove_dir_all(previous);
+        }
+    }
+
+    /// Put the previous home back and return the new one to its scratch path
+    /// (where it is cleaned up with the rest of the failed attempt).
+    fn rollback(self) -> std::io::Result<()> {
+        std::fs::rename(&self.live_home, &self.scratch_home)?;
+        if let Some(previous) = self.previous {
+            std::fs::rename(previous, &self.live_home)?;
+        }
+        Ok(())
+    }
+}
+
 /// Replace the live CLI home with the scratch one, whole.
 ///
 /// Both homes sit directly in the server-owned provider directory, which the
 /// run user cannot write to, so the swap is two renames of entries the run
 /// user cannot substitute. The previous home is moved aside first and restored
 /// if the swap fails, so a working sign-in is never left half-replaced.
-fn promote(scratch: &ProviderLocation, canonical: &ProviderLocation) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(&canonical.home).is_err() {
-        return std::fs::rename(&scratch.home, &canonical.home);
-    }
-    let parent = canonical.home.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the live sign-in directory has no parent",
-        )
-    })?;
-    let aside = parent.join(format!(".replaced-{}", random_hex(4)));
-    std::fs::rename(&canonical.home, &aside)?;
+fn promote(scratch: &ProviderLocation, canonical: &ProviderLocation) -> std::io::Result<Promotion> {
+    let had_previous = std::fs::symlink_metadata(&canonical.home).is_ok();
+    let previous = if had_previous {
+        let parent = canonical.home.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the live sign-in directory has no parent",
+            )
+        })?;
+        let aside = parent.join(format!(".replaced-{}", random_hex(4)));
+        std::fs::rename(&canonical.home, &aside)?;
+        Some(aside)
+    } else {
+        None
+    };
     if let Err(error) = std::fs::rename(&scratch.home, &canonical.home) {
-        let _ = std::fs::rename(&aside, &canonical.home);
+        if let Some(aside) = &previous {
+            let _ = std::fs::rename(aside, &canonical.home);
+        }
         return Err(error);
     }
-    let _ = std::fs::remove_dir_all(&aside);
-    Ok(())
+    Ok(Promotion {
+        scratch_home: scratch.home.clone(),
+        live_home: canonical.home.clone(),
+        previous,
+    })
 }
 
 #[cfg(test)]
@@ -1369,7 +1421,7 @@ done
         std::fs::create_dir_all(&scratch.config_dir).expect("new");
         std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
 
-        promote(&scratch, &canonical).expect("promote");
+        promote(&scratch, &canonical).expect("promote").commit();
 
         assert!(canonical.config_dir.join("new").is_file());
         assert!(!canonical.config_dir.join("old").exists());
@@ -1397,8 +1449,31 @@ done
         std::fs::create_dir_all(&scratch.config_dir).expect("new");
         std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
 
-        promote(&scratch, &canonical).expect("promote");
+        promote(&scratch, &canonical).expect("promote").commit();
         assert!(canonical.config_dir.join("new").is_file());
+    }
+
+    #[test]
+    fn rollback_restores_the_previous_home_and_returns_the_new_one_to_scratch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/home"))
+                .expect("canonical");
+        let scratch =
+            ProviderLocation::below_home("claude_cli", &dir.path().join("claude_cli/login-1"))
+                .expect("scratch");
+        std::fs::create_dir_all(&canonical.config_dir).expect("old");
+        std::fs::write(canonical.config_dir.join("old"), "old").expect("old file");
+        std::fs::create_dir_all(&scratch.config_dir).expect("new");
+        std::fs::write(scratch.config_dir.join("new"), "new").expect("new file");
+
+        let promotion = promote(&scratch, &canonical).expect("promote");
+        assert!(canonical.config_dir.join("new").is_file());
+        promotion.rollback().expect("rollback");
+
+        assert!(canonical.config_dir.join("old").is_file());
+        assert!(!canonical.config_dir.join("new").exists());
+        assert!(scratch.config_dir.join("new").is_file());
     }
 
     #[tokio::test]

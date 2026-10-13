@@ -733,9 +733,12 @@ Design: **one holder of the refresh token, access-token-only fan-out.**
    the run needs (run timeout plus margin; 30 minutes for a workspace turn),
    they take a per-process lock, let the host CLI refresh its own store with one
    minimal request, re-read it and re-snapshot.
-5. A sign-in is written to a scratch directory and promoted only after the CLI
-   reports success, `verify_login` confirms it and the snapshot was saved, so a
-   failed or cancelled attempt never damages a working sign-in.
+5. A sign-in is written to a scratch directory. Only after the CLI reports
+   success and `verify_login` confirms it is the scratch home swapped in for
+   the live one, with the previous home kept aside; the access-token snapshot is
+   then saved and, if saving fails, the previous home is restored. A failed or
+   cancelled attempt therefore never changes the live sign-in, and the saved
+   credential and the live CLI home never describe different accounts.
 
 Known limits: a workspace turn holds its access token for the whole turn (a
 turn that outlives the remaining validity fails and must be retried); the
