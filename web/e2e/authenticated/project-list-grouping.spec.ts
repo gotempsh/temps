@@ -21,7 +21,8 @@ import {
  */
 
 const RENAME_NOTICE = 'Your apps are now called Services.'
-const ONBOARDING_HEADING = 'Deploy one app. Watch your whole stack light up.'
+// The first-run empty state is a labelled landmark rather than a headline.
+const ONBOARDING_REGION = 'Get started with services'
 const RENAME_NOTICE_KEY = 'temps.servicesRenameNoticeDismissed'
 
 /**
@@ -92,7 +93,7 @@ test.describe('services rename notice', () => {
     await mockList(page, { services: [], groups: [] })
     await page.goto('/projects')
     await expect(
-      page.getByRole('heading', { name: ONBOARDING_HEADING })
+      page.getByRole('region', { name: ONBOARDING_REGION, exact: true })
     ).toBeVisible()
     await expect(page.getByText(RENAME_NOTICE)).toHaveCount(0)
     expect(errors).toEqual([])
@@ -105,7 +106,7 @@ test.describe('empty states', () => {
     const serviceRequests = await mockList(page, { services: [], groups: [] })
     await page.goto('/projects')
     await expect(
-      page.getByRole('heading', { name: ONBOARDING_HEADING })
+      page.getByRole('region', { name: ONBOARDING_REGION, exact: true })
     ).toBeVisible()
     // Nothing to filter yet.
     await expect(
@@ -119,6 +120,37 @@ test.describe('empty states', () => {
     expect(
       serviceRequests.every((url) => !url.searchParams.has('ungrouped'))
     ).toBe(true)
+    expect(errors).toEqual([])
+  })
+
+  test('an empty install still gets onboarding when projects cannot be loaded', async ({
+    page,
+  }) => {
+    const errors = collectPageErrors(page)
+    await mockList(page, { services: [], groups: [] })
+    // Registered after the mock above, so it answers the groups request.
+    await page.route(PROJECT_GROUPS_LIST_API, (route) =>
+      route.fulfill({
+        status: 403,
+        contentType: 'application/problem+json',
+        json: {
+          type: 'about:blank',
+          title: 'Forbidden',
+          status: 403,
+          detail: 'Missing permission to list projects',
+        },
+      })
+    )
+    await page.goto('/projects')
+    await expect(
+      page.getByRole('region', { name: ONBOARDING_REGION, exact: true })
+    ).toBeVisible()
+    // The failure is still said, above the onboarding.
+    await expect(
+      page
+        .getByRole('alert')
+        .filter({ hasText: 'Projects could not be loaded' })
+    ).toBeVisible()
     expect(errors).toEqual([])
   })
 
@@ -143,7 +175,7 @@ test.describe('empty states', () => {
       main.getByRole('button', { name: 'Add services', exact: true })
     ).toBeVisible()
     await expect(
-      page.getByRole('heading', { name: ONBOARDING_HEADING })
+      page.getByRole('region', { name: ONBOARDING_REGION, exact: true })
     ).toHaveCount(0)
     // No services, so nothing was renamed for this user.
     await expect(page.getByText(RENAME_NOTICE)).toHaveCount(0)

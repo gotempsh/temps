@@ -74,7 +74,9 @@ test('external hosting surfaces in the console', async ({ page }) => {
     await shot(page, '20-ext-list')
     console.log('LIST ext has "Runs outside Temps":', await page.getByText('Runs outside Temps').count(), ' "Not deployed":', await page.getByText('Not deployed').count(), ' External badge:', await page.getByText('External', { exact: true }).count())
     await page.getByPlaceholder('Filter projects and services…').fill('e2e-a-mon')
-    await expect(page.getByText('1 matching service outside them')).toBeVisible({ timeout: 30_000 })
+    // "1 matching service" alone on an install without projects, and
+    // "N matching projects · 1 matching service outside them" once any exists.
+    await expect(page.getByText(/\b1 matching service\b/)).toBeVisible({ timeout: 30_000 })
     await shot(page, '20b-mon-list')
     console.log('LIST mon has "Runs outside Temps":', await page.getByText('Runs outside Temps').count(), ' "Not deployed":', await page.getByText('Not deployed').count(), ' External badge:', await page.getByText('External', { exact: true }).count())
 

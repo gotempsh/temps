@@ -210,11 +210,13 @@ export function Projects() {
   // Every service the caller can see (without a filter, which is when it
   // decides between onboarding and the list).
   const serviceTotal = standaloneTotal + (grouped ? memberTotal : 0)
+  // A failed projects request must not hide first-run onboarding: with no
+  // services and no way to learn about projects, the page would otherwise
+  // be an alert above a blank list. The failure is still said above it.
   const isEmptyInstall =
     !normalizedProjectSearch &&
     projectsData?.total === 0 &&
-    groupsLoaded &&
-    visibleAllGroups.length === 0
+    (groupsQuery.isError || (groupsLoaded && visibleAllGroups.length === 0))
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])

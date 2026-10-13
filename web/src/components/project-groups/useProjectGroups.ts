@@ -9,6 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { listProjectGroups } from '@/api/client/sdk.gen'
 import type { ProjectGroupResponse, ProjectResponse } from '@/api/client'
+import { shouldRetryQuery } from '@/lib/query-retry'
 
 /** Groups per request; the API caps a page at 100. */
 export const GROUP_PAGE_SIZE = 100
@@ -20,6 +21,28 @@ const MAX_GROUP_PAGES = 50
 /** Services per page in pickers; the filter searches the rest server-side. */
 export const SERVICE_PICKER_PAGE_SIZE = 50
 
+/**
+ * A 200 whose body is not a page of groups. Asking again returns the same
+ * body, so it is never retried (see `shouldRetryGroupList`).
+ */
+export class MalformedGroupListError extends Error {
+  constructor(page: number) {
+    super(
+      `Project group list page ${page} did not contain a "groups" array and a numeric "total"`
+    )
+    this.name = 'MalformedGroupListError'
+  }
+}
+
+/** Retry transient failures only: a malformed body will not fix itself. */
+export function shouldRetryGroupList(
+  failureCount: number,
+  error: unknown
+): boolean {
+  if (error instanceof MalformedGroupListError) return false
+  return shouldRetryQuery(failureCount, error)
+}
+
 async function fetchAllGroups(signal: AbortSignal) {
   const groups: ProjectGroupResponse[] = []
   let total = 0
@@ -29,6 +52,9 @@ async function fetchAllGroups(signal: AbortSignal) {
       signal,
       throwOnError: true,
     })
+    if (!Array.isArray(data?.groups) || typeof data.total !== 'number') {
+      throw new MalformedGroupListError(page)
+    }
     total = data.total
     groups.push(...data.groups)
     if (data.groups.length < GROUP_PAGE_SIZE || groups.length >= total) break
@@ -54,6 +80,7 @@ export function useProjectGroups() {
       },
     ],
     queryFn: ({ signal }) => fetchAllGroups(signal),
+    retry: shouldRetryGroupList,
   })
   const groups = useMemo(() => query.data?.groups ?? [], [query.data])
   const truncated = (query.data?.total ?? 0) > groups.length
