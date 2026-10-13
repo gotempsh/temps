@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { useMutation } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -21,6 +21,7 @@ import { createProjectGroupMutation } from '@/api/client/@tanstack/react-query.g
 import { getErrorMessage } from '@/utils/errorHandling'
 import { groupHref } from '@/lib/terminology'
 import { ServicePicker, type PickedService } from './ServicePicker'
+import { useOpenSession } from './useOpenSession'
 import { useInvalidateGroups } from './useProjectGroups'
 
 interface CreateProjectGroupDialogProps {
@@ -41,23 +42,33 @@ export function CreateProjectGroupDialog({
   onOpenChange,
   initialServices = NO_SERVICES,
 }: CreateProjectGroupDialogProps) {
+  // Each opening remounts the form, so it starts empty (or pre-selected).
+  const session = useOpenSession(open)
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <CreateProjectGroupForm
+          key={session}
+          open={open}
+          onOpenChange={onOpenChange}
+          initialServices={initialServices}
+        />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function CreateProjectGroupForm({
+  open,
+  onOpenChange,
+  initialServices,
+}: CreateProjectGroupDialogProps & { initialServices: PickedService[] }) {
   const navigate = useNavigate()
   const invalidate = useInvalidateGroups()
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [selected, setSelected] = useState<PickedService[]>(initialServices)
   const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (open) {
-      setName('')
-      setDescription('')
-      setSelected(initialServices)
-      setError(null)
-    }
-    // Reset only when the dialog opens.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
 
   const create = useMutation({ ...createProjectGroupMutation() })
 
@@ -86,77 +97,72 @@ export function CreateProjectGroupDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
-        <form onSubmit={submit} className="space-y-4">
-          <DialogHeader>
-            <DialogTitle>New project</DialogTitle>
-            <DialogDescription>
-              Group the services that ship together — say a frontend, an API and
-              a worker — to see them in one overview and share environment
-              variables between them. Services keep deploying independently.
-            </DialogDescription>
-          </DialogHeader>
+    <form onSubmit={submit} className="space-y-4">
+      <DialogHeader>
+        <DialogTitle>New project</DialogTitle>
+        <DialogDescription>
+          Group the services that ship together — say a frontend, an API and a
+          worker — to see them in one overview and share environment variables
+          between them. Services keep deploying independently.
+        </DialogDescription>
+      </DialogHeader>
 
-          <div className="space-y-2">
-            <Label htmlFor="group-name">Name</Label>
-            <Input
-              id="group-name"
-              placeholder="e.g. Acme Shop"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              autoFocus
-            />
-          </div>
+      <div className="space-y-2">
+        <Label htmlFor="group-name">Name</Label>
+        <Input
+          id="group-name"
+          placeholder="e.g. Acme Shop"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          autoFocus
+        />
+      </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="group-description">
-              Description{' '}
-              <span className="text-muted-foreground">(optional)</span>
-            </Label>
-            <Textarea
-              id="group-description"
-              rows={2}
-              placeholder="What these services do together"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </div>
+      <div className="space-y-2">
+        <Label htmlFor="group-description">
+          Description <span className="text-muted-foreground">(optional)</span>
+        </Label>
+        <Textarea
+          id="group-description"
+          rows={2}
+          placeholder="What these services do together"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+        />
+      </div>
 
-          <div className="space-y-2">
-            <Label>Services</Label>
-            <ServicePicker
-              enabled={open}
-              selected={selected}
-              onChange={setSelected}
-              emptyMessage="No services yet. You can create the project now and add services later."
-            />
-          </div>
+      <div className="space-y-2">
+        <Label>Services</Label>
+        <ServicePicker
+          enabled={open}
+          selected={selected}
+          onChange={setSelected}
+          emptyMessage="No services yet. You can create the project now and add services later."
+        />
+      </div>
 
-          {error && (
-            <p role="alert" className="text-sm font-medium text-destructive">
-              {error}
-            </p>
-          )}
+      {error && (
+        <p role="alert" className="text-sm font-medium text-destructive">
+          {error}
+        </p>
+      )}
 
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={create.isPending}>
-              {create.isPending
-                ? 'Creating…'
-                : selected.length > 0
-                  ? `Create with ${selected.length} ${selected.length === 1 ? 'service' : 'services'}`
-                  : 'Create project'}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => onOpenChange(false)}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={create.isPending}>
+          {create.isPending
+            ? 'Creating…'
+            : selected.length > 0
+              ? `Create with ${selected.length} ${selected.length === 1 ? 'service' : 'services'}`
+              : 'Create project'}
+        </Button>
+      </DialogFooter>
+    </form>
   )
 }

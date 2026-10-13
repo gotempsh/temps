@@ -116,15 +116,15 @@ export function GroupRoutesSettings({
     <div className="space-y-3">
       <div>
         <p className="text-sm text-muted-foreground">
-          Serve a path of one service's domains from another service, e.g.{' '}
-          <code>/api</code> on the frontend's domain from the API. Each
-          environment goes to the other service's environment of the same name
-          (previews: same branch). Services keep their own domains too.
+          Serve a path of one service&apos;s domains from another service, e.g.{' '}
+          <code>/api</code> on the frontend&apos;s domain from the API. Each
+          environment goes to the other service&apos;s environment of the same
+          name (previews: same branch). Services keep their own domains too.
         </p>
         <p className="mt-1 text-sm text-muted-foreground">
-          Routed requests get the serving service's protections (password,
-          attack mode, limits), not this service's: protect the API itself if it
-          needs it.
+          Routed requests get the serving service&apos;s protections (password,
+          attack mode, limits), not this service&apos;s: protect the API itself
+          if it needs it.
         </p>
       </div>
 

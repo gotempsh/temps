@@ -65,6 +65,56 @@ interface ActiveImport {
   states: ImportRowState[]
 }
 
+const keyOf = (app: ProjectPresetResponse) =>
+  `${app.preset}::${normalizeDirectory(app.path)}`
+
+/** The names, checked rows and row states a freshly scanned list starts with. */
+function seedRows({
+  apps,
+  allDirs,
+  repoName,
+  serviceNames,
+  usedDirectories,
+  unfinished,
+}: {
+  apps: ProjectPresetResponse[]
+  allDirs: string[]
+  repoName: string
+  serviceNames: string[]
+  usedDirectories: Map<string, string>
+  unfinished: ActiveImport | null
+}): {
+  names: Record<string, string>
+  selected: Set<string>
+  status: Record<string, ImportRowState>
+} {
+  const taken = new Set(serviceNames.map((name) => name.toLowerCase()))
+  const preselected = defaultSelection(allDirs, new Set(usedDirectories.keys()))
+  const names: Record<string, string> = {}
+  const selected = new Set<string>()
+  for (const app of apps) {
+    const key = keyOf(app)
+    const name = suggestServiceName(app.path, repoName, taken)
+    taken.add(name)
+    names[key] = name
+    if (preselected.has(normalizeDirectory(app.path))) selected.add(key)
+  }
+  // An import left half-done keeps its rows checked, so finishing it is
+  // one click instead of a service stranded outside the project.
+  const status: Record<string, ImportRowState> = {}
+  if (unfinished) {
+    unfinished.keys.forEach((key, i) => {
+      names[key] = unfinished.names[i]
+      selected.add(key)
+      status[key] = unfinished.states[i] ?? {
+        state: 'failed',
+        message: 'Not added yet. Retry to continue.',
+      }
+    })
+  }
+  return { names, selected, status }
+}
+
 /**
  * Scans the project's repository and turns the apps it finds into services
  * of this project, each following the project's repository and branch.
@@ -135,14 +185,11 @@ export function ImportServicesDialog({
   const [running, setRunning] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
   // Kept across retries and reopening the dialog, unlike `status`.
-  const active = useRef<ActiveImport | null>(null)
+  const [active, setActive] = useState<ActiveImport | null>(null)
   // Stops following when the dialog closes or unmounts; the server keeps
   // running the import either way.
   const following = useRef<AbortController | null>(null)
   useEffect(() => () => following.current?.abort(), [])
-
-  const keyOf = (app: ProjectPresetResponse) =>
-    `${app.preset}::${normalizeDirectory(app.path)}`
 
   const allDirs = useMemo(
     () => apps.map((a) => normalizeDirectory(a.path)),
@@ -150,42 +197,31 @@ export function ImportServicesDialog({
   )
 
   // Suggest a name for every app; check the ones worth adding by default.
-  useEffect(() => {
-    if (!open || !repo || apps.length === 0) return
-    const taken = new Set(services.map((s) => s.name.toLowerCase()))
-    const preselected = defaultSelection(
-      allDirs,
-      new Set(usedDirectories.keys())
-    )
-    const nextNames: Record<string, string> = {}
-    const nextSelected = new Set<string>()
-    for (const app of apps) {
-      const key = keyOf(app)
-      const name = suggestServiceName(app.path, repo.repo_name, taken)
-      taken.add(name)
-      nextNames[key] = name
-      if (preselected.has(normalizeDirectory(app.path))) nextSelected.add(key)
-    }
-    // An import left half-done keeps its rows checked, so finishing it is
-    // one click instead of a service stranded outside the project.
-    const unfinished: Record<string, ImportRowState> = {}
-    const pendingImport = active.current
-    if (pendingImport) {
-      pendingImport.keys.forEach((key, i) => {
-        nextNames[key] = pendingImport.names[i]
-        nextSelected.add(key)
-        unfinished[key] = pendingImport.states[i] ?? {
-          state: 'failed',
-          message: 'Not added yet. Retry to continue.',
-        }
+  // Recomputed when the scan result or dialog changes, not on every edit, by
+  // comparing the inputs while rendering rather than in an effect.
+  const seedInputs = [
+    open,
+    apps,
+    repo?.repository_id,
+    repo?.public_provider,
+  ] as const
+  const [seededFrom, setSeededFrom] = useState<typeof seedInputs | null>(null)
+  if (!seededFrom || seedInputs.some((v, i) => v !== seededFrom[i])) {
+    setSeededFrom(seedInputs)
+    if (open && repo && apps.length > 0) {
+      const seeded = seedRows({
+        apps,
+        allDirs,
+        repoName: repo.repo_name,
+        serviceNames: services.map((s) => s.name),
+        usedDirectories,
+        unfinished: active,
       })
+      setNames(seeded.names)
+      setSelected(seeded.selected)
+      setStatus(seeded.status)
     }
-    setNames(nextNames)
-    setSelected(nextSelected)
-    setStatus(unfinished)
-    // Recompute when the scan result or dialog changes, not on every edit.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, apps, repo?.repository_id, repo?.public_provider])
+  }
 
   const toggle = (key: string) =>
     setSelected((prev) => {
@@ -209,11 +245,14 @@ export function ImportServicesDialog({
         (await getInstantiation({ path: { id }, signal, throwOnError: true }))
           .data,
       onUpdate: (data) => {
-        current.states = importRowStates(data)
+        const states = importRowStates(data)
+        setActive((prev) =>
+          prev?.id === current.id ? { ...prev, states } : prev
+        )
         setStatus((prev) => {
           const next = { ...prev }
           current.keys.forEach((key, i) => {
-            const state = current.states[i]
+            const state = states[i]
             if (state) next[key] = state
           })
           return next
@@ -227,7 +266,7 @@ export function ImportServicesDialog({
     following.current?.abort()
     // The project overview tracks it from here (UnfinishedImportsNotice);
     // reopening the dialog starts a fresh selection.
-    active.current = null
+    setActive(null)
     setRunning(false)
     onOpenChange(false)
     toast.info(
@@ -239,9 +278,9 @@ export function ImportServicesDialog({
     if (!repo) return
     setRunning(true)
     setImportError(null)
-    let startedId: number | null = active.current?.id ?? null
+    let startedId: number | null = active?.id ?? null
     try {
-      let current = active.current
+      let current = active
       if (current) {
         await retryInstantiation({
           path: { id: current.id },
@@ -282,7 +321,7 @@ export function ImportServicesDialog({
           names: chosen.map((app) => names[keyOf(app)].trim()),
           states: importRowStates(data),
         }
-        active.current = current
+        setActive(current)
         startedId = current.id
       }
       const outcome = await follow(current)
@@ -295,7 +334,7 @@ export function ImportServicesDialog({
       }
       const result = outcome.instantiation
       if (result.status === 'succeeded') {
-        active.current = null
+        setActive(null)
         const added = result.services.length
         toast.success(
           `Added ${added} ${added === 1 ? 'service' : 'services'} to ${group.name}`
@@ -323,7 +362,7 @@ export function ImportServicesDialog({
 
   // Closing is only held back between the click and the server accepting
   // the import; once it has an id it can keep running without the dialog.
-  const canClose = !running || active.current !== null
+  const canClose = !running || active !== null
 
   const pending = apps.filter(
     (app) => selected.has(keyOf(app)) && status[keyOf(app)]?.state !== 'done'
@@ -422,7 +461,7 @@ export function ImportServicesDialog({
             const existing = usedDirectories.get(dir)
             const rowStatus = status[key]
             const done = rowStatus?.state === 'done'
-            const created = active.current?.keys.includes(key) ?? false
+            const created = active?.keys.includes(key) ?? false
             return (
               <li key={key} className="space-y-1 px-3 py-2">
                 <div className="flex items-center gap-3">
@@ -484,7 +523,7 @@ export function ImportServicesDialog({
       open={open}
       onOpenChange={(v) => {
         if (v) return onOpenChange(true)
-        if (running && active.current) keepInBackground()
+        if (running && active) keepInBackground()
         else if (canClose) onOpenChange(false)
       }}
     >
@@ -528,7 +567,7 @@ export function ImportServicesDialog({
               Scan again
             </Button>
           )}
-          {running && active.current ? (
+          {running && active ? (
             <Button variant="outline" onClick={keepInBackground}>
               Keep running in background
             </Button>
@@ -544,13 +583,13 @@ export function ImportServicesDialog({
           {!allDone && (
             <Button
               onClick={() => void importSelected()}
-              disabled={running || (pending === 0 && !active.current)}
+              disabled={running || (pending === 0 && !active)}
             >
               {running ? (
                 <>
                   <Loader2 className="size-4 animate-spin" /> Adding…
                 </>
-              ) : active.current ? (
+              ) : active ? (
                 'Retry'
               ) : (
                 `Add ${pending} ${pending === 1 ? 'service' : 'services'}`

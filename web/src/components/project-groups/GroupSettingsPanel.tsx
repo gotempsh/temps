@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -87,11 +87,21 @@ export function GroupSettingsPanel({
   )
   const [confirmDelete, setConfirmDelete] = useState(false)
 
-  useEffect(() => {
+  // Follow the server's values (a save, another tab, a refetch), discarding
+  // unsaved edits as soon as they change. Adjusted while rendering, so the
+  // form never paints the stale values.
+  const serverValues = [
+    group.name,
+    group.slug,
+    group.description ?? '',
+  ] as const
+  const [syncedValues, setSyncedValues] = useState(serverValues)
+  if (syncedValues.some((value, i) => value !== serverValues[i])) {
+    setSyncedValues(serverValues)
     setName(group.name)
     setSlug(group.slug)
     setDescription(group.description ?? '')
-  }, [group.name, group.slug, group.description])
+  }
 
   const vars = useQuery({
     ...listGroupEnvVarsOptions({ path: { group_id: group.id } }),
@@ -164,8 +174,8 @@ export function GroupSettingsPanel({
   const identity = (
     <form onSubmit={save} className="max-w-2xl space-y-4">
       <p className="text-sm text-muted-foreground">
-        Renaming changes this project's address; its services keep their own
-        names and URLs.
+        Renaming changes this project&apos;s address; its services keep their
+        own names and URLs.
       </p>
       <div className="space-y-2">
         <Label htmlFor="group-settings-name">Name</Label>
@@ -227,7 +237,7 @@ export function GroupSettingsPanel({
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
         Removing a service makes it standalone. It keeps running, and stops
-        receiving this project's shared variables on its next deployment.
+        receiving this project&apos;s shared variables on its next deployment.
       </p>
       {group.projects.length === 0 ? (
         <p className="text-sm text-muted-foreground">
@@ -328,8 +338,8 @@ export function GroupSettingsPanel({
               Remove {removing?.name} from {group.name}?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              It becomes a standalone service and stops receiving this project's
-              shared variables on its next deployment.
+              It becomes a standalone service and stops receiving this
+              project&apos;s shared variables on its next deployment.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

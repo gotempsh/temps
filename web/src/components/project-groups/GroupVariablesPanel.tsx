@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { KeyRound, Lock, MoreHorizontal, Plus, RefreshCw } from 'lucide-react'
@@ -54,6 +54,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { getErrorMessage } from '@/utils/errorHandling'
+import { useOpenSession } from './useOpenSession'
 import { useInvalidateGroups } from './useProjectGroups'
 
 const ALL_ENVIRONMENTS = '__all__'
@@ -148,9 +149,9 @@ export function GroupVariablesPanel({
           </h2>
           <p className="max-w-2xl text-sm text-muted-foreground">
             Every service in {group.name} receives these on its next deployment.
-            A service's own variable with the same name always wins, so use this
-            for values that are genuinely shared, like an API base URL or a log
-            level.
+            A service&apos;s own variable with the same name always wins, so use
+            this for values that are genuinely shared, like an API base URL or a
+            log level.
           </p>
         </div>
         <Button onClick={() => setEditing('new')} className="shrink-0">
@@ -342,42 +343,57 @@ function VariableDialog({
   environmentSlugs,
   onClose,
 }: VariableDialogProps) {
-  const invalidate = useInvalidateGroups()
   // The last variable opened, kept while the dialog animates closed so its
   // title does not flash "Change undefined".
   const [shown, setShown] = useState<GroupEnvVarResponse | 'new' | null>(
     variable
   )
   if (variable && variable !== shown) setShown(variable)
-  const isNew = shown === 'new'
-  const existing = shown && shown !== 'new' ? shown : null
+  // Each opening, and each different variable, remounts the form so it
+  // starts from that variable's values.
+  const session = useOpenSession(variable)
+  return (
+    <Dialog
+      open={Boolean(variable)}
+      onOpenChange={(open) => !open && onClose()}
+    >
+      <DialogContent className="sm:max-w-lg">
+        <VariableForm
+          key={session}
+          groupId={groupId}
+          variable={shown}
+          environmentSlugs={environmentSlugs}
+          onClose={onClose}
+        />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function VariableForm({
+  groupId,
+  variable,
+  environmentSlugs,
+  onClose,
+}: VariableDialogProps) {
+  const invalidate = useInvalidateGroups()
+  const isNew = variable === 'new'
+  const existing = variable && variable !== 'new' ? variable : null
   // A secret's value cannot be read back: empty means "keep it".
   const keepsSecret = Boolean(existing?.is_secret)
-  const [key, setKey] = useState('')
-  const [value, setValue] = useState('')
-  const [scope, setScope] = useState(ALL_ENVIRONMENTS)
-  const [isSecret, setIsSecret] = useState(false)
+  const [key, setKey] = useState(existing?.key ?? '')
+  const [value, setValue] = useState(
+    existing && !existing.is_secret ? (existing.value ?? '') : ''
+  )
+  const [scope, setScope] = useState(
+    existing?.environment_slug ?? ALL_ENVIRONMENTS
+  )
+  const [isSecret, setIsSecret] = useState(existing?.is_secret ?? false)
   // Previews are opt-in, as for a service's own variables.
-  const [includeInPreview, setIncludeInPreview] = useState(false)
+  const [includeInPreview, setIncludeInPreview] = useState(
+    existing?.include_in_preview ?? false
+  )
   const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (!variable) return
-    setError(null)
-    if (variable === 'new') {
-      setKey('')
-      setValue('')
-      setScope(ALL_ENVIRONMENTS)
-      setIsSecret(false)
-      setIncludeInPreview(false)
-    } else {
-      setKey(variable.key)
-      setValue(variable.is_secret ? '' : (variable.value ?? ''))
-      setScope(variable.environment_slug ?? ALL_ENVIRONMENTS)
-      setIsSecret(variable.is_secret)
-      setIncludeInPreview(variable.include_in_preview)
-    }
-  }, [variable])
 
   const create = useMutation({ ...createGroupEnvVarMutation() })
   const update = useMutation({ ...updateGroupEnvVarMutation() })
@@ -424,124 +440,115 @@ function VariableDialog({
   }
 
   return (
-    <Dialog
-      open={Boolean(variable)}
-      onOpenChange={(open) => !open && onClose()}
-    >
-      <DialogContent className="sm:max-w-lg">
-        <form onSubmit={submit} className="space-y-4">
-          <DialogHeader>
-            <DialogTitle>
-              {isNew ? 'Add shared variable' : `Change ${existing?.key}`}
-            </DialogTitle>
-            <DialogDescription>
-              Applies to each service's next deployment. A service that sets the
-              same name itself keeps its own value.
-            </DialogDescription>
-          </DialogHeader>
+    <form onSubmit={submit} className="space-y-4">
+      <DialogHeader>
+        <DialogTitle>
+          {isNew ? 'Add shared variable' : `Change ${existing?.key}`}
+        </DialogTitle>
+        <DialogDescription>
+          Applies to each service&apos;s next deployment. A service that sets
+          the same name itself keeps its own value.
+        </DialogDescription>
+      </DialogHeader>
 
-          <div className="space-y-2">
-            <Label htmlFor="group-var-key">Name</Label>
-            <Input
-              id="group-var-key"
-              className="font-mono"
-              placeholder="API_BASE_URL"
-              value={key}
-              disabled={!isNew}
-              onChange={(e) => setKey(e.target.value.toUpperCase())}
-              autoFocus={isNew}
-            />
-          </div>
+      <div className="space-y-2">
+        <Label htmlFor="group-var-key">Name</Label>
+        <Input
+          id="group-var-key"
+          className="font-mono"
+          placeholder="API_BASE_URL"
+          value={key}
+          disabled={!isNew}
+          onChange={(e) => setKey(e.target.value.toUpperCase())}
+          autoFocus={isNew}
+        />
+      </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="group-var-value">Value</Label>
-            <Textarea
-              id="group-var-value"
-              className="font-mono"
-              rows={2}
-              placeholder={
-                keepsSecret
-                  ? 'Leave empty to keep the current secret'
-                  : 'https://api.example.com'
-              }
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-              autoFocus={!isNew}
-            />
-          </div>
+      <div className="space-y-2">
+        <Label htmlFor="group-var-value">Value</Label>
+        <Textarea
+          id="group-var-value"
+          className="font-mono"
+          rows={2}
+          placeholder={
+            keepsSecret
+              ? 'Leave empty to keep the current secret'
+              : 'https://api.example.com'
+          }
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          autoFocus={!isNew}
+        />
+      </div>
 
-          <div className="space-y-2">
-            <Label>Environments</Label>
-            <Select value={scope} onValueChange={setScope} disabled={!isNew}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL_ENVIRONMENTS}>
-                  All environments
-                </SelectItem>
-                {environmentSlugs.map((slug) => (
-                  <SelectItem key={slug} value={slug}>
-                    Only {slug}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {!isNew && (
-              <p className="text-xs text-muted-foreground">
-                To change where it applies, remove it and add it again.
-              </p>
-            )}
-          </div>
+      <div className="space-y-2">
+        <Label>Environments</Label>
+        <Select value={scope} onValueChange={setScope} disabled={!isNew}>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_ENVIRONMENTS}>All environments</SelectItem>
+            {environmentSlugs.map((slug) => (
+              <SelectItem key={slug} value={slug}>
+                Only {slug}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {!isNew && (
+          <p className="text-xs text-muted-foreground">
+            To change where it applies, remove it and add it again.
+          </p>
+        )}
+      </div>
 
-          {scope === ALL_ENVIRONMENTS && (
-            <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
-              <div>
-                <Label htmlFor="group-var-preview">Include in previews</Label>
-                <p className="text-xs text-muted-foreground">
-                  Preview deployments of pull requests also receive it.
-                </p>
-              </div>
-              <Switch
-                id="group-var-preview"
-                checked={includeInPreview}
-                onCheckedChange={setIncludeInPreview}
-              />
-            </div>
-          )}
-
-          <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
-            <div>
-              <Label htmlFor="group-var-secret">Secret</Label>
-              <p className="text-xs text-muted-foreground">
-                Write-only: nobody can read the value back, including you.
-              </p>
-            </div>
-            <Switch
-              id="group-var-secret"
-              checked={isSecret}
-              onCheckedChange={setIsSecret}
-              disabled={keepsSecret && value === ''}
-            />
-          </div>
-
-          {error && (
-            <p role="alert" className="text-sm font-medium text-destructive">
-              {error}
+      {scope === ALL_ENVIRONMENTS && (
+        <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
+          <div>
+            <Label htmlFor="group-var-preview">Include in previews</Label>
+            <p className="text-xs text-muted-foreground">
+              Preview deployments of pull requests also receive it.
             </p>
-          )}
+          </div>
+          <Switch
+            id="group-var-preview"
+            checked={includeInPreview}
+            onCheckedChange={setIncludeInPreview}
+          />
+        </div>
+      )}
 
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={pending || (isNew && !key.trim())}>
-              {pending ? 'Saving…' : isNew ? 'Add variable' : 'Save'}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+      <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
+        <div>
+          <Label htmlFor="group-var-secret">Secret</Label>
+          <p className="text-xs text-muted-foreground">
+            Write-only: nobody can read the value back, including you.
+          </p>
+        </div>
+        <Switch
+          id="group-var-secret"
+          checked={isSecret}
+          onCheckedChange={setIsSecret}
+          disabled={keepsSecret && value === ''}
+        />
+      </div>
+
+      {error && (
+        <p role="alert" className="text-sm font-medium text-destructive">
+          {error}
+        </p>
+      )}
+
+      <DialogFooter>
+        <Button type="button" variant="outline" onClick={onClose}>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={pending || (isNew && !key.trim())}>
+          {pending ? 'Saving…' : isNew ? 'Add variable' : 'Save'}
+        </Button>
+      </DialogFooter>
+    </form>
   )
 }
 

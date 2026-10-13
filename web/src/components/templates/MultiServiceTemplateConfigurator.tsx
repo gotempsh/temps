@@ -514,6 +514,13 @@ export function MultiServiceTemplateConfigurator({
     instantiate.mutate(buildInstantiateRequest(values, idempotencyKey.current))
   }
 
+  // Built when the form is submitted, not while rendering: `handleSubmit`
+  // reads the idempotency-key ref, which must not happen during render.
+  const submitForm = (event: React.BaseSyntheticEvent) =>
+    form.handleSubmit(handleSubmit, () =>
+      toast.error('Review the highlighted fields before creating the services.')
+    )(event)
+
   const keepInBackground = () => {
     following.current?.abort()
     toast.info(
@@ -559,14 +566,7 @@ export function MultiServiceTemplateConfigurator({
       {header}
 
       <Form {...form}>
-        <form
-          onSubmit={form.handleSubmit(handleSubmit, () =>
-            toast.error(
-              'Review the highlighted fields before creating the services.'
-            )
-          )}
-          className="space-y-6"
-        >
+        <form onSubmit={submitForm} className="space-y-6">
           {/* Target project */}
           <Card>
             <CardHeader>

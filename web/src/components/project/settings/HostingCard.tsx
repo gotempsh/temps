@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { Check, Globe, Loader2, Server } from 'lucide-react'
@@ -51,10 +51,13 @@ export function HostingCard({
   const [selected, setSelected] = useState<Hosting>(current)
   const [saving, setSaving] = useState(false)
   // Follow changes made elsewhere (the analytics page's "Mark as External",
-  // another tab, a refetch after saving).
-  useEffect(() => {
+  // another tab, a refetch after saving). Adjusted while rendering, so the
+  // card never paints the stale choice.
+  const [syncedCurrent, setSyncedCurrent] = useState(current)
+  if (syncedCurrent !== current) {
+    setSyncedCurrent(current)
     setSelected(current)
-  }, [current])
+  }
 
   const save = async () => {
     setSaving(true)

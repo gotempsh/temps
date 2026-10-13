@@ -40,7 +40,7 @@ export function GroupRoutesSummary({ group }: { group: ProjectGroupResponse }) {
             Path routes
           </h2>
           <p className="text-sm text-muted-foreground">
-            Paths of one service's domains served by another service.
+            Paths of one service&apos;s domains served by another service.
           </p>
         </div>
         <Button variant="ghost" size="sm" asChild>

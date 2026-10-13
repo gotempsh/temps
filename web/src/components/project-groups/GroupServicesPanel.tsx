@@ -296,7 +296,7 @@ function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
         </h2>
         <p className="text-sm text-muted-foreground">
           Linked to at least one service in this project. Link or create
-          databases from a service's Databases tab.
+          databases from a service&apos;s Databases tab.
         </p>
       </div>
       {loading ? (
