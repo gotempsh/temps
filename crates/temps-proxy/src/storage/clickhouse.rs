@@ -2869,6 +2869,31 @@ mod tests {
     }
 
     #[test]
+    fn configured_compression_reaches_the_proxy_log_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let store = ClickHouseProxyLogStore::new(
+                ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "pw")
+                    .with_compression(mode),
+                Arc::new(temps_core::FixedRetentionResolver),
+            );
+            format!("{:?}", store.client())
+        };
+
+        let lz4 = build(ClickHouseCompression::Lz4);
+        assert!(lz4.contains("compression: Lz4"), "{lz4}");
+        assert!(
+            lz4.contains("\"network_compression_method\": \"lz4\""),
+            "{lz4}"
+        );
+
+        let none = build(ClickHouseCompression::None);
+        assert!(none.contains("compression: None"), "{none}");
+        assert!(!none.contains("network_compression_method"), "{none}");
+    }
+
+    #[test]
     fn escape_like_pattern_escapes_metacharacters() {
         assert_eq!(escape_like_pattern("a%b"), "a\\%b");
         assert_eq!(escape_like_pattern("a_b"), "a\\_b");

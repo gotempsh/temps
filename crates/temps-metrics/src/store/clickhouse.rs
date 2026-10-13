@@ -947,6 +947,30 @@ mod tests {
     }
 
     #[test]
+    fn configured_compression_reaches_the_metrics_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let store = ClickhouseMetricsStore::new(
+                ClickHouseMetricsConfig::new("http://127.0.0.1:1", "otel", "temps", "pw")
+                    .with_compression(mode),
+            );
+            format!("{:?}", store.client())
+        };
+
+        let lz4 = build(ClickHouseCompression::Lz4);
+        assert!(lz4.contains("compression: Lz4"), "{lz4}");
+        assert!(
+            lz4.contains("\"network_compression_method\": \"lz4\""),
+            "{lz4}"
+        );
+
+        let none = build(ClickHouseCompression::None);
+        assert!(none.contains("compression: None"), "{none}");
+        assert!(!none.contains("network_compression_method"), "{none}");
+    }
+
+    #[test]
     fn metric_kind_to_str_maps_both() {
         assert_eq!(metric_kind_to_str(&MetricKind::Gauge), "gauge");
         assert_eq!(metric_kind_to_str(&MetricKind::Counter), "counter");

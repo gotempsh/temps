@@ -4337,6 +4337,49 @@ mod tests {
         assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
     }
 
+    // ── Wire compression ────────────────────────────────────────────────────
+
+    /// The configured mode must land on every client the OTel backend builds:
+    /// the storage's write client, and the standalone client used by the
+    /// backfill commands.
+    #[test]
+    fn configured_compression_reaches_every_otel_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let config = ClickHouseOtelConfig::new("http://127.0.0.1:1", "otel", "default", "")
+                .with_compression(mode);
+            let storage = ClickHouseOtelStorage::new(
+                config.clone(),
+                Arc::new(TimescaleDbStorage::new(
+                    Arc::new(sea_orm::DatabaseConnection::Disconnected),
+                    None,
+                )),
+                Arc::new(temps_core::FixedRetentionResolver),
+                None,
+            );
+            (
+                format!("{:?}", storage.ch_client()),
+                format!("{:?}", ClickHouseOtelClient::new(config).client()),
+            )
+        };
+
+        let (storage_lz4, client_lz4) = build(ClickHouseCompression::Lz4);
+        for debug in [&storage_lz4, &client_lz4] {
+            assert!(debug.contains("compression: Lz4"), "{debug}");
+            assert!(
+                debug.contains("\"network_compression_method\": \"lz4\""),
+                "{debug}"
+            );
+        }
+
+        let (storage_none, client_none) = build(ClickHouseCompression::None);
+        for debug in [&storage_none, &client_none] {
+            assert!(debug.contains("compression: None"), "{debug}");
+            assert!(!debug.contains("network_compression_method"), "{debug}");
+        }
+    }
+
     // ── Migration write hold ────────────────────────────────────────────────
 
     /// A store pointed at a port nothing listens on: a write that gets past

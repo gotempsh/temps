@@ -21,13 +21,53 @@ use crate::{server_version, ClickHouseConfig, ClickHouseError, ServerVersion};
 /// How long the startup probe waits for `SELECT version()`.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What to do about a decode failure, worded for an operator reading a log
-/// line or the settings page. Names both fixes; Temps never switches modes on
-/// its own.
+/// What to do about a decode failure when the codec the server used is not
+/// known (a failure that reached us only as a string, or a raw probe that
+/// could not observe one). Names both fixes; Temps never switches modes on its
+/// own. See [`remedy_for`] for the text matched to what was actually seen.
 pub const COMPRESSION_REMEDY: &str = "Retrying cannot fix this. Either set the ClickHouse \
 server's `network_compression_method` to `lz4` (for example in a `users.d` profile), or set \
-Temps' ClickHouse compression to `none` (Settings > Monitoring, or PUT /settings with \
-{\"clickhouse\":{\"compression\":\"none\"}}) and restart Temps.";
+Temps' ClickHouse compression to `none` (PUT /settings with \
+{\"clickhouse\":{\"compression\":\"none\"}}, or the ClickHouse section of Settings > Monitoring) \
+and restart Temps.";
+
+const REMEDY_ALTERED_LZ4: &str = "The server answered with LZ4 as requested, so its codec is \
+not the problem: the response was altered or cut short on the way (a proxy or load balancer \
+in front of ClickHouse re-encoding bodies, or a dropped connection). If it persists, set \
+Temps' ClickHouse compression to `none` (PUT /settings with \
+{\"clickhouse\":{\"compression\":\"none\"}}, or the ClickHouse section of Settings > Monitoring) \
+and restart Temps; the failure is re-checked periodically, so a transient one clears by itself.";
+
+const REMEDY_NOT_A_BLOCK: &str = "The response was not a ClickHouse compressed block (no \
+recognisable compression header). Check that the configured URL is ClickHouse's HTTP port and \
+that nothing in front of it rewrites response bodies; setting Temps' ClickHouse compression to \
+`none` (PUT /settings with {\"clickhouse\":{\"compression\":\"none\"}}, or the ClickHouse section \
+of Settings > Monitoring) removes the block framing altogether. Restart Temps to apply it.";
+
+const REMEDY_UNDECODABLE_UNCOMPRESSED: &str = "Temps asked for uncompressed responses and still \
+received a body it could not decode, so something between Temps and ClickHouse is compressing or \
+rewriting it. Check the configured URL and any proxy or load balancer in front of ClickHouse.";
+
+/// The advice that matches a decode failure, from the configured `mode` and
+/// the compression method actually seen on the wire.
+///
+/// In `lz4` mode every request already pins `network_compression_method=lz4`,
+/// so "change the server default" is only the right advice when the server
+/// answered with a *different* codec anyway; an LZ4 answer that still fails
+/// points at the path between Temps and the server instead.
+pub fn remedy_for(
+    mode: ClickHouseCompression,
+    observed: Option<CompressionMethod>,
+) -> &'static str {
+    match (mode, observed) {
+        (ClickHouseCompression::None, _) => REMEDY_UNDECODABLE_UNCOMPRESSED,
+        (ClickHouseCompression::Lz4, Some(CompressionMethod::Lz4)) => REMEDY_ALTERED_LZ4,
+        (ClickHouseCompression::Lz4, Some(CompressionMethod::Zstd))
+        | (ClickHouseCompression::Lz4, Some(CompressionMethod::Other(_))) => COMPRESSION_REMEDY,
+        (ClickHouseCompression::Lz4, Some(CompressionMethod::None))
+        | (ClickHouseCompression::Lz4, None) => REMEDY_NOT_A_BLOCK,
+    }
+}
 
 /// The codec a ClickHouse compressed block says it was written with: the byte
 /// right after the 16-byte checksum of every block on the wire.
@@ -335,6 +375,38 @@ mod tests {
             "clickhouse.internal"
         );
         assert_eq!(host_for_logs("not a url"), "<invalid url>");
+    }
+
+    #[test]
+    fn remedy_matches_what_was_seen_on_the_wire() {
+        use ClickHouseCompression::{Lz4, None as Uncompressed};
+
+        // A different codec despite the pin: the server default is the cause.
+        for observed in [CompressionMethod::Zstd, CompressionMethod::Other(0x91)] {
+            let remedy = remedy_for(Lz4, Some(observed));
+            assert!(remedy.contains("network_compression_method"), "{remedy}");
+        }
+        // LZ4 as asked, yet undecodable: the server default cannot be the cause.
+        let altered = remedy_for(Lz4, Some(CompressionMethod::Lz4));
+        assert!(
+            !altered.contains("`network_compression_method` to"),
+            "{altered}"
+        );
+        assert!(altered.contains("altered or cut short"), "{altered}");
+        // Not a block at all.
+        for observed in [Some(CompressionMethod::None), None] {
+            let remedy = remedy_for(Lz4, observed);
+            assert!(
+                remedy.contains("not a ClickHouse compressed block"),
+                "{remedy}"
+            );
+        }
+        // Uncompressed mode never involves a codec.
+        let uncompressed = remedy_for(Uncompressed, None);
+        assert!(
+            uncompressed.contains("proxy or load balancer"),
+            "{uncompressed}"
+        );
     }
 
     #[test]

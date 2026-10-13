@@ -784,14 +784,13 @@ impl ClickHouseConnectionStatus {
                 kind,
                 message,
                 observed_method,
+                remedy,
             } => {
                 status.state = ClickHouseConnectionState::Failing;
                 status.failure_kind = Some(kind.into());
                 status.detail = Some(message);
                 status.observed_compression_method = observed_method.map(|m| m.to_string());
-                if kind == temps_clickhouse::FailureKind::Decode {
-                    status.remedy = Some(temps_clickhouse::COMPRESSION_REMEDY.to_string());
-                }
+                status.remedy = remedy.map(str::to_string);
             }
         }
         status
@@ -6247,6 +6246,7 @@ mod tests {
                         kind: temps_clickhouse::FailureKind::Decode,
                         message: "decompression error: incorrect magic number".to_string(),
                         observed_method: Some(temps_clickhouse::CompressionMethod::Zstd),
+                        remedy: Some(temps_clickhouse::COMPRESSION_REMEDY),
                     },
                 )),
             );
@@ -6278,6 +6278,7 @@ mod tests {
                         kind: temps_clickhouse::FailureKind::Unreachable,
                         message: "network error: connection refused".to_string(),
                         observed_method: None,
+                        remedy: None,
                     },
                 )),
             );

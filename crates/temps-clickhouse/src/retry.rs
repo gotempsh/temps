@@ -34,7 +34,9 @@ pub struct MigrationRetryPolicy {
     /// Backoff for failures that waiting can fix. `compute_delay(n)` is the
     /// delay after the `n+1`-th failed attempt.
     pub transient: RetryConfig,
-    /// Fixed interval between attempts while the failure is a decode failure.
+    /// Fixed interval between attempts while the failure is a decode failure
+    /// (slow next to the 5-60 s backoff, yet short enough that a transient
+    /// truncated block clears within a couple of minutes).
     pub decode_interval: Duration,
     /// Each delay is stretched by up to this many percent so several
     /// subsystems that failed together do not retry in lockstep.
@@ -47,7 +49,7 @@ impl Default for MigrationRetryPolicy {
             transient: RetryConfig::new(u32::MAX)
                 .with_base_delay(Duration::from_secs(5))
                 .with_max_delay(Duration::from_secs(60)),
-            decode_interval: Duration::from_secs(300),
+            decode_interval: Duration::from_secs(120),
             jitter_percent: 20,
         }
     }
@@ -254,7 +256,7 @@ mod tests {
         for failures in [1, 2, 50] {
             assert_eq!(
                 policy.base_delay(failures, FailureKind::Decode),
-                Duration::from_secs(300)
+                Duration::from_secs(120)
             );
         }
     }
@@ -328,8 +330,8 @@ mod tests {
         assert_eq!(applied, ());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_secs(600), "{waited:?}");
-        assert!(waited <= Duration::from_secs(720), "{waited:?}");
+        assert!(waited >= Duration::from_secs(240), "{waited:?}");
+        assert!(waited <= Duration::from_secs(288), "{waited:?}");
     }
 
     #[tokio::test(start_paused = true)]

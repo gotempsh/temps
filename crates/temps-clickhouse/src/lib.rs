@@ -53,7 +53,8 @@ pub mod retry;
 
 pub use client::{build_client, ClientWireSettings, NETWORK_COMPRESSION_METHOD_SETTING};
 pub use diagnostics::{
-    classify_error, classify_message, preflight, CompressionMethod, FailureKind, COMPRESSION_REMEDY,
+    classify_error, classify_message, preflight, remedy_for, CompressionMethod, FailureKind,
+    COMPRESSION_REMEDY,
 };
 pub use health::{ClickHouseHealth, ConnectionState, HealthSnapshot};
 pub use retry::{retry_until_applied, spawn_retrying, MigrationRetryPolicy};
@@ -167,7 +168,7 @@ pub enum ClickHouseError {
          decoded in '{mode}' compression mode (compression method byte observed on the wire: \
          {}): {source}. {}",
         .observed.map_or_else(|| "unknown".to_string(), |m| m.to_string()),
-        COMPRESSION_REMEDY
+        remedy_for(*.mode, *.observed)
     )]
     ResponseDecode {
         host: String,

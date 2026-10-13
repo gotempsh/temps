@@ -2387,8 +2387,18 @@ impl AppSettings {
                 Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
                 Some(_) => Some(false),
             };
+            // Same for the ClickHouse wire-compression mode: resetting a saved
+            // `none` to the LZ4 default would silently re-break a deployment
+            // whose proxy corrupts LZ4 framing, over an unrelated bad section.
+            let clickhouse = value
+                .get("clickhouse")
+                .and_then(|section| {
+                    serde_json::from_value::<ClickHouseSettings>(section.clone()).ok()
+                })
+                .unwrap_or_default();
             Self {
                 anonymous_telemetry_enabled,
+                clickhouse,
                 ..Self::default()
             }
         })
@@ -3173,6 +3183,18 @@ mod tests {
         assert_eq!(json["clickhouse"]["compression"], "none");
 
         let parsed = AppSettings::from_json(json);
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::None);
+    }
+
+    #[test]
+    fn clickhouse_compression_survives_an_unrelated_malformed_section() {
+        // `monitoring` is the wrong type, so the whole document fails to
+        // decode; the saved ClickHouse mode must not fall back to the default.
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "monitoring": "not an object",
+            "clickhouse": { "compression": "none" }
+        }));
+
         assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::None);
     }
 

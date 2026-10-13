@@ -19,7 +19,9 @@ use chrono::{DateTime, Utc};
 use temps_core::ClickHouseCompression;
 use tracing::{debug, error, info, warn};
 
-use crate::diagnostics::{classify_error, CompressionMethod, FailureKind, COMPRESSION_REMEDY};
+use crate::diagnostics::{
+    classify_error, remedy_for, CompressionMethod, FailureKind, COMPRESSION_REMEDY,
+};
 use crate::{preflight, ClickHouseConfig, ClickHouseError, ServerVersion};
 
 /// How often a failing connection is re-probed.
@@ -41,6 +43,9 @@ pub enum ConnectionState {
         message: String,
         /// The compression method byte seen on the wire, for decode failures.
         observed_method: Option<CompressionMethod>,
+        /// What to do about it, when there is a known remedy (decode
+        /// failures); matched to the configured mode and the codec seen.
+        remedy: Option<&'static str>,
     },
 }
 
@@ -116,6 +121,12 @@ impl ClickHouseHealth {
                     ClickHouseError::ResponseDecode { observed, .. } => *observed,
                     _ => None,
                 },
+                remedy: match error {
+                    ClickHouseError::ResponseDecode { mode, observed, .. } => {
+                        Some(remedy_for(*mode, *observed))
+                    }
+                    _ => None,
+                },
             },
         };
 
@@ -151,6 +162,7 @@ impl ClickHouseHealth {
                     kind: FailureKind::Decode,
                     observed_method,
                     message,
+                    remedy,
                 },
             ) => error!(
                 host = %self.host,
@@ -159,7 +171,7 @@ impl ClickHouseHealth {
                 observed_method = observed_method
                     .map_or_else(|| "unknown".to_string(), |m| m.to_string()),
                 failure_kind = FailureKind::Decode.as_str(),
-                remedy = COMPRESSION_REMEDY,
+                remedy = remedy.unwrap_or(COMPRESSION_REMEDY),
                 "ClickHouse preflight failed: the server's responses cannot be decoded in the \
                  configured compression mode, so no ClickHouse-backed feature can work. {message}"
             ),
@@ -269,8 +281,12 @@ mod tests {
                 kind,
                 observed_method,
                 message,
+                remedy,
             } => {
                 assert_eq!(kind, FailureKind::Decode);
+                assert!(remedy
+                    .expect("decode failures carry a remedy")
+                    .contains("network_compression_method"));
                 assert_eq!(observed_method, Some(CompressionMethod::Zstd));
                 assert!(message.contains("network_compression_method"), "{message}");
             }
@@ -308,10 +324,12 @@ mod tests {
             ConnectionState::Failing {
                 kind,
                 observed_method,
+                remedy,
                 ..
             } => {
                 assert_eq!(kind, FailureKind::Unreachable);
                 assert_eq!(observed_method, None);
+                assert_eq!(remedy, None);
             }
             other => panic!("expected a failing state, got {other:?}"),
         }
