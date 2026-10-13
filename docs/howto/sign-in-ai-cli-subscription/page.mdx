@@ -62,7 +62,7 @@ The command prints the link to open and, for Claude Code, asks for the code (the
 
 ## What Temps stores {{ anchor: true, id: 'what-temps-stores' }}
 
-- The provider CLI owns the sign-in. Temps never reads token files while the flow runs, and never logs or saves what the CLI prints or the code you paste.
+- The provider CLI owns the sign-in. While the flow runs Temps does not read token files, and it never logs or saves what the CLI prints or the code you paste. Once the CLI reports success and the sign-in is confirmed, Temps reads the credential file once to take the access-token snapshot described below; that read does not follow symlinks and the refresh token is discarded.
 - The refresh token stays in the CLI's own directory on the Temps host. Subscription refresh tokens rotate, so copying one into several sandboxes would let the copies invalidate each other; Temps never does.
 - Settings (encrypted) and sandboxes receive only a short-lived **access token**. When it is close to expiring, the host CLI refreshes itself and Temps re-reads the result.
 - Sign-in links are only shown when they point at the provider's own domains.
