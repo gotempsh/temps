@@ -50,6 +50,12 @@ export interface LoginFlowOptions {
   pollIntervalMs?: number
   /** Called once with a function that cancels the sign-in, e.g. on Ctrl-C. */
   onCancelable?: (cancel: () => Promise<void>) => void
+  /**
+   * True when the user asked to stop before the server answered `start`. The
+   * sign-in is then cancelled as soon as it exists instead of being left
+   * running (and blocking a retry) until its server-side timeout.
+   */
+  shouldAbort?: () => boolean
 }
 
 const TERMINAL: ReadonlySet<LoginPhase> = new Set([
@@ -87,6 +93,10 @@ export async function runProviderLogin(
   options.onCancelable?.(async () => {
     await api.cancel(providerId)
   })
+  if (options.shouldAbort?.()) {
+    await api.cancel(providerId).catch(() => undefined)
+    throw new LoginFlowError('Sign-in cancelled.', 'cancelled')
+  }
 
   let announcedLink = false
   let submitted = false

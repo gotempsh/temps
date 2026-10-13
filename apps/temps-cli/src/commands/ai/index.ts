@@ -169,7 +169,11 @@ async function providerLogin(
     if (interrupted) process.exit(130)
     interrupted = true
     console.log(colors.warning('\nCancelling the sign-in…'))
-    void (cancelSignIn?.() ?? Promise.resolve()).finally(() => process.exit(130))
+    if (cancelSignIn) {
+      void cancelSignIn().finally(() => process.exit(130))
+    }
+    // Otherwise the start request is still in flight: the flow cancels the
+    // sign-in the moment it exists (see `shouldAbort`), then exits below.
   }
   process.on('SIGINT', onInterrupt)
 
@@ -186,13 +190,14 @@ async function providerLogin(
         onCancelable: (cancel) => {
           cancelSignIn = cancel
         },
+        shouldAbort: () => interrupted,
       }
     )
     if (options.json) jsonOutput(session)
   } catch (error) {
     if (error instanceof LoginFlowError) {
       console.error(colors.error(`${icons.error} ${error.message}`))
-      process.exitCode = 1
+      process.exitCode = interrupted ? 130 : 1
       return
     }
     throw error

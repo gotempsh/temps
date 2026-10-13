@@ -164,4 +164,23 @@ describe('runProviderLogin', () => {
 
     expect(calls).toContain('cancel')
   })
+
+  test('cancels a sign-in that was interrupted while it was being started', async () => {
+    const { api, calls, submitted } = fakeApi([
+      session('starting'),
+      session('waiting', { verification_url: LINK }),
+    ])
+    const { io, prompts } = fakeIo()
+
+    await expect(
+      runProviderLogin(api, io, 'claude_cli', {
+        pollIntervalMs: 0,
+        shouldAbort: () => true,
+      })
+    ).rejects.toMatchObject({ name: 'LoginFlowError', phase: 'cancelled' })
+
+    expect(calls).toEqual(['start', 'cancel'])
+    expect(prompts).toHaveLength(0)
+    expect(submitted).toHaveLength(0)
+  })
 })
