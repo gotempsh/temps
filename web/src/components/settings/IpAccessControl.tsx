@@ -68,15 +68,19 @@ export function IpAccessControl() {
     useState<IpAccessControlResponse | null>(null)
 
   const {
-    data: rules = [],
+    data: cachedRules,
     isLoading,
     isFetching,
     error: readError,
     refetch,
   } = useQuery(listIpAccessControlOptions())
+  const rules = cachedRules ?? []
   // A refused or failed read is not an empty rule list: the zero-rule view
-  // would invite an Add IP Rule that the server also refuses.
+  // would invite an Add IP Rule that the server also refuses. A failed
+  // *refresh* (e.g. the refetch after a mutation) keeps the last-known rules
+  // on screen with the failure beside them instead of replacing them.
   const readFailed = readError != null
+  const showFailureOnly = readFailed && cachedRules === undefined
 
   const createMutation = useMutation({
     ...createIpAccessControlMutation(),
@@ -220,20 +224,21 @@ export function IpAccessControl() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
-        <div className="flex justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={readFailed}
-            onClick={() => handleCreateDialogOpen(true)}
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            Add IP Rule
-          </Button>
-        </div>
+        {!showFailureOnly && (
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => handleCreateDialogOpen(true)}
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              Add IP Rule
+            </Button>
+          </div>
+        )}
 
-        {readFailed ? (
+        {showFailureOnly ? (
           <ReadFailure
             resource="IP access control rules"
             error={readError}
@@ -249,6 +254,18 @@ export function IpAccessControl() {
           </div>
         ) : (
           <div className="space-y-6">
+            {readFailed && (
+              <ReadFailure
+                resource="IP access control rules"
+                error={readError}
+                cached
+                onRetry={
+                  isForbiddenRead(readError) ? undefined : () => void refetch()
+                }
+                retrying={isFetching}
+                embedded
+              />
+            )}
             {/* Blocked IPs Section */}
             <div>
               <div className="flex items-center gap-2 mb-3">

@@ -57,28 +57,23 @@ const refused = {
   detail: 'This operation requires the users:read permission',
 }
 
-test('a non-admin cannot start adding a user and is told why', () => {
+test('a non-admin is offered no Add User action and is told why', () => {
   const html = render('user', refused)
-  const tags = buttonTags(html, 'Add User')
-  expect(tags.length).toBeGreaterThan(0)
-  for (const tag of tags) expect(tag).toContain('disabled=""')
+  expect(buttonTags(html, 'Add User')).toHaveLength(0)
   expect(html).toContain('Only administrators can add, edit or remove users')
   expect(html).toContain('Users: access denied')
   expect(html).not.toContain('Retry')
 })
 
-test('a non-admin with a verified-empty list still cannot add users', () => {
+test('a non-admin with a verified-empty list is still offered no Add User action', () => {
   const html = render('user')
-  for (const tag of buttonTags(html, 'Add User')) {
-    expect(tag).toContain('disabled=""')
-  }
+  expect(buttonTags(html, 'Add User')).toHaveLength(0)
   expect(html).toContain('data-admin-only-note')
 })
 
-test('an administrator keeps every Add User control enabled', () => {
+test('an administrator keeps every Add User control', () => {
   const html = render('admin')
   const tags = buttonTags(html, 'Add User')
   expect(tags.length).toBeGreaterThan(0)
-  for (const tag of tags) expect(tag).not.toContain('disabled=""')
   expect(html).not.toContain('data-admin-only-note')
 })

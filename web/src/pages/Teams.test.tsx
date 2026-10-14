@@ -106,22 +106,22 @@ test('a failed teams read is not an empty team list', () => {
 
 const noTeams = { teams: [], total: 0, page: 1, page_size: 100 }
 
-test('a non-admin sees Create team disabled with the reason spelled out', () => {
+test('a non-admin is offered no Create team action and is told why', () => {
   const client = createClient()
   client.setQueryData(teamsKey, noTeams)
   const html = render(client, 'user')
-  expect(buttonTag(html, 'Create team')).toContain('disabled=""')
+  expect(buttonTag(html, 'Create team')).toBeUndefined()
   expect(html).toContain('data-admin-only-note')
   expect(html).toContain('Only administrators can create or delete teams')
   expect(html).toContain('Your role is &quot;user&quot;')
   client.clear()
 })
 
-test('an administrator keeps Create team enabled and sees no restriction note', () => {
+test('an administrator keeps the Create team action and sees no restriction note', () => {
   const client = createClient()
   client.setQueryData(teamsKey, noTeams)
   const html = render(client, 'admin')
-  expect(buttonTag(html, 'Create team')).not.toContain('disabled=""')
+  expect(buttonTag(html, 'Create team')).toBeDefined()
   expect(html).not.toContain('data-admin-only-note')
   client.clear()
 })

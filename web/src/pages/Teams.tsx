@@ -289,12 +289,13 @@ export function Teams() {
             reach. Services with no grants stay open to everyone.
           </p>
         </div>
-        <CreateActionButton
-          onClick={() => setCreateOpen(true)}
-          label="Create team"
-          className="self-start"
-          disabled={!canManageTeams}
-        />
+        {canManageTeams && (
+          <CreateActionButton
+            onClick={() => setCreateOpen(true)}
+            label="Create team"
+            className="self-start"
+          />
+        )}
       </div>
 
       {!canManageTeams && (
@@ -321,13 +322,12 @@ export function Teams() {
               title="No teams yet"
               description="Create a team, add members, then grant it access to a service from that service's Access tab."
               action={
-                <Button
-                  disabled={!canManageTeams}
-                  onClick={() => setCreateOpen(true)}
-                >
-                  <Plus className="mr-2 h-4 w-4" />
-                  Create team
-                </Button>
+                canManageTeams ? (
+                  <Button onClick={() => setCreateOpen(true)}>
+                    <Plus className="mr-2 h-4 w-4" />
+                    Create team
+                  </Button>
+                ) : undefined
               }
             />
           ) : (
@@ -368,7 +368,6 @@ export function Teams() {
                           variant="ghost"
                           size="sm"
                           aria-label={`Delete team ${team.name}`}
-                          disabled={!canManageTeams}
                           onClick={(e) => {
                             // Don't trigger the row's navigate.
                             e.stopPropagation()

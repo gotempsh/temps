@@ -229,12 +229,15 @@ export function UsersManagement({
         title="Users"
         description="Manage user access and roles"
         actions={
-          <CreateActionButton
-            onClick={() => navigate('/settings/users/new')}
-            label="Add User"
-            icon={<UserPlus className="h-4 w-4" />}
-            disabled={!canAddUsers}
-          />
+          // Not rendered at all for a role that cannot use it: a disabled
+          // administrative action only invites the question why.
+          canAddUsers ? (
+            <CreateActionButton
+              onClick={() => navigate('/settings/users/new')}
+              label="Add User"
+              icon={<UserPlus className="h-4 w-4" />}
+            />
+          ) : undefined
         }
       />
 
@@ -416,13 +419,12 @@ export function UsersManagement({
           title="No users found"
           description="Get started by creating a new user."
           action={
-            <Button
-              disabled={!canAddUsers}
-              onClick={() => navigate('/settings/users/new')}
-            >
-              <Plus className="mr-2 h-4 w-4" />
-              Add User
-            </Button>
+            canAddUsers ? (
+              <Button onClick={() => navigate('/settings/users/new')}>
+                <Plus className="mr-2 h-4 w-4" />
+                Add User
+              </Button>
+            ) : undefined
           }
         />
       ) : (

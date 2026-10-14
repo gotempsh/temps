@@ -132,25 +132,22 @@ test('a real HTTP 403 reaches the page as access denied with the server reason',
   client_.clear()
 })
 
-test('a non-admin sees the add-provider action disabled with the reason spelled out', () => {
+test('a non-admin is offered no add-provider action and is told why', () => {
   const client = createClient()
   client.setQueryData(providersKey, [])
   const html = render(client, 'user')
   expect(html).toContain('data-admin-only-note')
   expect(html).toContain('Only administrators can add, test or delete')
-  // The empty-state action is the only Add control with no providers listed.
-  const tag = /<button[^>]*>(?:(?!<\/button>).)*Add DNS Provider/s.exec(html)
-  expect(tag?.[0]).toContain('disabled=""')
+  expect(html).not.toContain('Add DNS Provider')
   client.clear()
 })
 
-test('an administrator gets an enabled add-provider action and no note', () => {
+test('an administrator gets the add-provider action and no note', () => {
   const client = createClient()
   client.setQueryData(providersKey, [])
   const html = render(client, 'admin')
   expect(html).not.toContain('data-admin-only-note')
-  const tag = /<button[^>]*>(?:(?!<\/button>).)*Add DNS Provider/s.exec(html)
-  expect(tag?.[0]).not.toContain('disabled=""')
+  expect(html).toContain('Add DNS Provider')
   client.clear()
 })
 

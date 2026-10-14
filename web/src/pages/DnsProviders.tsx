@@ -173,14 +173,15 @@ export function DnsProviders() {
             >
               <RefreshCw className="h-4 w-4" />
             </Button>
-            {!isLoading && Boolean(dnsProviders?.length) && (
-              <CreateActionButton
-                size="sm"
-                onClick={() => navigate('/dns-providers/add')}
-                label="Add DNS Provider"
-                disabled={!canManageProviders}
-              />
-            )}
+            {!isLoading &&
+              canManageProviders &&
+              Boolean(dnsProviders?.length) && (
+                <CreateActionButton
+                  size="sm"
+                  onClick={() => navigate('/dns-providers/add')}
+                  label="Add DNS Provider"
+                />
+              )}
           </div>
         </div>
 
@@ -219,13 +220,12 @@ export function DnsProviders() {
             title="No DNS providers found"
             description="Get started by adding a DNS provider like Cloudflare or Namecheap to enable automatic DNS record management"
           >
-            <Button
-              disabled={!canManageProviders}
-              onClick={() => navigate('/dns-providers/add')}
-            >
-              <Plus className="mr-2 h-4 w-4" />
-              Add DNS Provider
-            </Button>
+            {canManageProviders && (
+              <Button onClick={() => navigate('/dns-providers/add')}>
+                <Plus className="mr-2 h-4 w-4" />
+                Add DNS Provider
+              </Button>
+            )}
           </EmptyPlaceholder>
         ) : (
           <div className="overflow-hidden rounded-lg border">
@@ -296,9 +296,7 @@ export function DnsProviders() {
                       variant="outline"
                       size="sm"
                       onClick={() => handleTestConnection(provider)}
-                      disabled={
-                        testConnectionMut.isPending || !canManageProviders
-                      }
+                      disabled={testConnectionMut.isPending}
                       className="hidden gap-2 sm:inline-flex"
                     >
                       {testConnectionMut.isPending ? (
@@ -328,7 +326,6 @@ export function DnsProviders() {
                           View Details
                         </DropdownMenuItem>
                         <DropdownMenuItem
-                          disabled={!canManageProviders}
                           onClick={() => handleTestConnection(provider)}
                         >
                           <TestTube2 className="h-4 w-4 mr-2" />
@@ -337,7 +334,6 @@ export function DnsProviders() {
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           className="text-destructive cursor-pointer"
-                          disabled={!canManageProviders}
                           onSelect={(e) => {
                             e.preventDefault()
                             setProviderToDelete(provider)
