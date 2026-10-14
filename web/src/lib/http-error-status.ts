@@ -23,6 +23,26 @@ export function httpStatusOf(error: unknown): number | undefined {
 }
 
 /**
+ * An `Error` for a failed API call that keeps what the client knew about it.
+ *
+ * Fetchers that unwrap `{ data, error }` into a thrown `Error` lose the HTTP
+ * status unless it is copied across, and without it the retry policy cannot
+ * tell a refused read from a flaky one, nor can `ReadFailure` explain it.
+ * The server's `title` and `detail` ride along for the same reason.
+ */
+export function errorWithStatus(message: string, source: unknown): Error {
+  const error = new Error(message)
+  const status = httpStatusOf(source)
+  if (status === undefined) return error
+  const title = (source as { title?: unknown }).title
+  return Object.assign(error, {
+    status,
+    detail: message,
+    ...(typeof title === 'string' ? { title } : {}),
+  })
+}
+
+/**
  * Error interceptor for the generated API client: record the response's HTTP
  * status on the thrown error.
  *

@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { attachHttpStatus, httpStatusOf } from './http-error-status'
+import {
+  attachHttpStatus,
+  errorWithStatus,
+  httpStatusOf,
+} from './http-error-status'
 import { shouldRetryQuery } from './query-retry'
 import { isVerifiedNotFound, readFailureKind } from './read-failure'
 
@@ -115,5 +119,26 @@ describe('httpStatusOf', () => {
     expect(httpStatusOf({ status: 'error' })).toBeUndefined()
     expect(httpStatusOf(null)).toBeUndefined()
     expect(httpStatusOf('Not Found')).toBeUndefined()
+  })
+})
+
+describe('errorWithStatus', () => {
+  test('keeps the status and the server reason so a refusal is not retried', () => {
+    const source = attachHttpStatus(
+      { title: 'Forbidden', detail: 'Requires settings:read' },
+      failed(403)
+    )
+    const error = errorWithStatus('Requires settings:read', source)
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toBe('Requires settings:read')
+    expect(httpStatusOf(error)).toBe(403)
+    expect(readFailureKind(error)).toBe('forbidden')
+    expect(shouldRetryQuery(0, error)).toBe(false)
+  })
+
+  test('a failure without an HTTP status stays a plain error and is retried', () => {
+    const error = errorWithStatus('The network dropped', new TypeError('x'))
+    expect(httpStatusOf(error)).toBeUndefined()
+    expect(shouldRetryQuery(0, error)).toBe(true)
   })
 })

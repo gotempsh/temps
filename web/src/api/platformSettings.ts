@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getSettings, updateSettings } from '@/api/client'
+import { errorWithStatus } from '@/lib/http-error-status'
 import type {
   AppSettings,
   AppSettingsResponse,
@@ -273,7 +274,15 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
   const response = await getSettings()
 
   if (!response.data) {
-    throw new Error('Settings endpoint returned no data')
+    // Keep the HTTP status and the server's reason: a refused read must not
+    // look like an empty answer, nor be retried as one.
+    const detail = (response.error as { detail?: unknown } | undefined)?.detail
+    throw errorWithStatus(
+      typeof detail === 'string' && detail
+        ? detail
+        : 'Settings endpoint returned no data',
+      response.error
+    )
   }
 
   // OpenAPI represents Rust `Option<T>` response fields as optional, while the

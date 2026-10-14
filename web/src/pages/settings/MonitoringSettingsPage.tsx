@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -15,7 +17,7 @@ import {
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import type {
   AnalyticsRetentionSettings,
   ContainerLogSettings,
@@ -261,7 +263,7 @@ function AnalyticsRetentionFieldCard({
 
 export function MonitoringSettingsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -382,11 +384,10 @@ export function MonitoringSettingsPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 

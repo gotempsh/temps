@@ -1,21 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Button } from '@temps-sdk/ds'
 import { PageHeader, SettingsGroup, SettingsSection } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import { Switch } from '@/components/ui/switch'
 import type {
   RequestTimeoutSettings,
   ConnectionLimitSettings,
   TenantResourceCeilings,
 } from '@/api/client/types.gen'
-import { AlertCircle, Loader2, Save, ShieldCheck } from 'lucide-react'
+import { Loader2, Save, ShieldCheck } from 'lucide-react'
 import { Controller } from 'react-hook-form'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
@@ -61,7 +62,7 @@ const CEILING_DEFAULTS: TenantResourceCeilings = {
  */
 export function RequestTimeoutsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -119,11 +120,10 @@ export function RequestTimeoutsPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
