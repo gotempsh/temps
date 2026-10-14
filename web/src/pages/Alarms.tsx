@@ -30,6 +30,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -312,9 +313,13 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const [confirmAction, setConfirmAction] =
     useState<BulkAlarmActionRequest | null>(null)
 
-  const { data: projectsData, isLoading: projectsLoading } = useQuery(
-    getProjectsOptions({ query: { per_page: 100 } })
-  )
+  const {
+    data: projectsData,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+    isFetching: projectsFetching,
+  } = useQuery(getProjectsOptions({ query: { per_page: 100 } }))
   const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
   const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
   const effectiveProject = projects.find(
@@ -815,17 +820,28 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               {!hasProject && !projectsLoading ? (
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={7} className="p-0">
-                    <EmptyState
-                      size="compact"
-                      icon={AlarmClock}
-                      title="No services yet"
-                      description="Alarms are raised per service. Deploy a service and its alarm history appears here."
-                      action={
-                        <Button asChild>
-                          <Link to="/projects/new">Deploy a service</Link>
-                        </Button>
-                      }
-                    />
+                    {projectsError ? (
+                      <div className="p-4">
+                        <ReadFailure
+                          resource="Services"
+                          error={projectsError}
+                          onRetry={() => void refetchProjects()}
+                          retrying={projectsFetching}
+                        />
+                      </div>
+                    ) : (
+                      <EmptyState
+                        size="compact"
+                        icon={AlarmClock}
+                        title="No services yet"
+                        description="Alarms are raised per service. Deploy a service and its alarm history appears here."
+                        action={
+                          <Button asChild>
+                            <Link to="/projects/new">Deploy a service</Link>
+                          </Button>
+                        }
+                      />
+                    )}
                   </TableCell>
                 </TableRow>
               ) : alarmsLoading || (projectsLoading && !hasProject) ? (

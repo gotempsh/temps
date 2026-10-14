@@ -3291,7 +3291,12 @@ function TraceDetailView({
 // ── AgentActivity ───────────────────────────────────────────────────
 
 export function AgentActivity() {
-  const { projects, isLoading: projectsLoading } = useProjects()
+  const {
+    projects,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useProjects()
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
@@ -3416,6 +3421,12 @@ export function AgentActivity() {
           <Skeleton className="h-16 w-full" />
           <Skeleton className="h-16 w-full" />
         </div>
+      ) : !projectId && projectsError ? (
+        <ReadFailure
+          resource="Services"
+          error={projectsError}
+          onRetry={refetchProjects}
+        />
       ) : !projectId ? (
         <EmptyState
           icon={Bot}
