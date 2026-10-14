@@ -60,9 +60,15 @@ fn resolve_independent_proxy_gates(
         Some(build) => Some(build(db.clone(), runtime).map_err(|error| {
             anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
         })?),
-        None if use_independent_proxy_gates => {
-            Some(Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>)
-        }
+        // OSS default: the built-in per-project / per-environment allow and
+        // deny lists. Hydrated here so a load failure aborts startup instead
+        // of serving a protected project through an open gate.
+        None if use_independent_proxy_gates => Some(
+            temps_proxy::ip_access::ProjectIpAccessGate::start_blocking(db.clone(), runtime)
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+                })? as Arc<dyn temps_core::ProjectIpGate>,
+        ),
         None => None,
     };
     let request_policy_gate = match request_policy_gate_builder {
@@ -1170,10 +1176,10 @@ impl ServeCommand {
                 request_policy_gate_builder,
             )?;
         if use_independent_proxy_gates {
-            if has_ip_gate_builder {
-                if let Some(gate) = independent_project_ip_gate.as_ref() {
-                    let _ = project_ip_gate_slot.set(Arc::clone(gate));
-                }
+            // Always `Some` in independent mode: either the caller's gate or
+            // the built-in project IP access gate.
+            if let Some(gate) = independent_project_ip_gate.as_ref() {
+                let _ = project_ip_gate_slot.set(Arc::clone(gate));
             } else {
                 project_ip_gate_slot.finish_registration();
             }
@@ -1421,6 +1427,19 @@ mod serve_profile_tests {
         );
     }
 
+    /// Database for tests that resolve the built-in project IP gate: it
+    /// hydrates from `project_ip_access_rules` at startup, and an empty
+    /// table means no project has a policy.
+    fn db_with_no_ip_rules() -> Arc<temps_database::DbConnection> {
+        Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(
+                    [Vec::<temps_entities::project_ip_access_rules::Model>::new()],
+                )
+                .into_connection(),
+        )
+    }
+
     #[test]
     fn independent_gate_builder_failure_aborts_before_console_startup() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
@@ -1454,7 +1473,7 @@ mod serve_profile_tests {
     #[test]
     fn request_policy_builder_failure_aborts_before_console_startup() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = db_with_no_ip_rules();
         let error = resolve_independent_proxy_gates(
             db,
             runtime.handle(),
@@ -1475,7 +1494,7 @@ mod serve_profile_tests {
     #[test]
     fn oss_proxy_gates_are_ready_without_console_initialization() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = db_with_no_ip_rules();
         let (ip_gate, request_gate) =
             resolve_independent_proxy_gates(db, runtime.handle(), true, None, None)
                 .expect("OSS gates should resolve synchronously");
@@ -1519,7 +1538,7 @@ mod serve_profile_tests {
     #[test]
     fn custom_request_policy_remains_enforced_without_console_initialization() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = db_with_no_ip_rules();
         let (_, request_gate) = resolve_independent_proxy_gates(
             db,
             runtime.handle(),

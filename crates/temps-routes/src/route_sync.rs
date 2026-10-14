@@ -470,7 +470,7 @@ async fn build_snapshot(
     }
     let public_ingress = if node.public_ingress_enabled {
         use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
-        use temps_entities::{ip_access_control, settings};
+        use temps_entities::{ip_access_control, project_ip_access_rules, settings};
         let app_settings = settings::Entity::find()
             .one(state.db.as_ref())
             .await
@@ -487,6 +487,18 @@ async fn build_snapshot(
             .map_err(|source| SnapshotBuildError::Database {
                 node_id: node.id,
                 operation: "inspect public-ingress IP policy",
+                source,
+            })?;
+        // Per-project / per-environment allow and deny lists are enforced by
+        // the control-plane proxy only; a worker ingress node has no copy of
+        // them, so serving those hosts there would bypass the list.
+        let project_ip_rule_count = project_ip_access_rules::Entity::find()
+            .filter(project_ip_access_rules::Column::Mode.ne("disabled"))
+            .count(state.db.as_ref())
+            .await
+            .map_err(|source| SnapshotBuildError::Database {
+                node_id: node.id,
+                operation: "inspect public-ingress project IP access rules",
                 source,
             })?;
         let project_rate_limit_count = count_project_rate_limit_policies(state.db.as_ref())
@@ -514,6 +526,7 @@ async fn build_snapshot(
         let policy_requires_control_plane = app_settings.rate_limiting.enabled
             || app_settings.security_headers.enabled
             || ip_policy_count > 0
+            || project_ip_rule_count > 0
             || project_rate_limit_count > 0
             || custom_request_policy;
         let public_route_count = state.peer_table.worker_public_route_count();
@@ -551,6 +564,9 @@ async fn build_snapshot(
         }
         if ip_policy_count > 0 {
             unsupported_reasons.push("IP access-control rules are configured".to_string());
+        }
+        if project_ip_rule_count > 0 {
+            unsupported_reasons.push("project IP access rules are configured".to_string());
         }
         if custom_request_policy {
             unsupported_reasons.push(
@@ -1012,6 +1028,65 @@ mod tests {
             .unsupported_reasons
             .iter()
             .any(|reason| reason == "project rate limits are configured"));
+
+        // Per-project IP allow/deny lists likewise stay on the control plane,
+        // but a `disabled` row must not.
+        {
+            use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+            test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE projects SET deployment_config = '{}'::jsonb WHERE id = $1",
+                    [project_id.into()],
+                ))
+                .await?;
+            test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO project_ip_access_rules (project_id, mode, cidrs) \
+                     VALUES ($1, 'disabled', '[]'::jsonb)",
+                    [project_id.into()],
+                ))
+                .await?;
+        }
+        let build_with_open_gate = || async {
+            let open_gate = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+            assert!(open_gate.set(Arc::new(temps_core::OpenRequestPolicyGate)));
+            build_snapshot(
+                &RouteSyncAppState {
+                    db: test_db.db.clone(),
+                    peer_table: Arc::clone(&peer_table),
+                    encryption_service: Arc::clone(&encryption_service),
+                    request_policy_gate: open_gate,
+                },
+                &node,
+                1,
+            )
+            .await
+        };
+        let disabled_snapshot = build_with_open_gate().await?;
+        assert_eq!(disabled_snapshot.public_ingress.routes.len(), 1);
+        {
+            use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+            test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE project_ip_access_rules SET mode = 'allow', \
+                     cidrs = '[{\"cidr\": \"100.64.0.0/10\"}]'::jsonb WHERE project_id = $1",
+                    [project_id.into()],
+                ))
+                .await?;
+        }
+        let guarded_snapshot = build_with_open_gate().await?;
+        assert!(guarded_snapshot.public_ingress.routes.is_empty());
+        assert!(guarded_snapshot
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == "project IP access rules are configured"));
 
         test_db.cleanup().await?;
         Ok(())
