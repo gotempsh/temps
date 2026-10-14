@@ -29,6 +29,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, FromQueryResult, Statement,
+    TransactionTrait,
 };
 use temps_core::AnalyticsRetentionSettings;
 use thiserror::Error;
@@ -318,29 +319,29 @@ impl AnalyticsRetentionService {
 
     /// Delete visitors last seen before `cutoff`, at most
     /// `BATCH_SIZE * MAX_BATCHES_PER_RUN` per call. Returns the rows deleted.
+    ///
+    /// Each batch is one transaction. Two things about it are deliberate:
+    ///
+    /// - The outer `DELETE` repeats the age test. The candidate subquery sees
+    ///   the snapshot the statement started with, so a visitor that returned
+    ///   (ingestion advanced `last_seen`) while the batch was running would
+    ///   otherwise still be in the candidate set; PostgreSQL re-evaluates the
+    ///   *target* row's predicate after waiting for the concurrent update, so
+    ///   with it the refreshed visitor is kept.
+    /// - Deleting a visitor rewrites every `error_events`/`events`/`proxy_logs`
+    ///   row that points at it (`ON DELETE SET NULL`). Those hypertables are
+    ///   compressed, and TimescaleDB aborts a statement that has to
+    ///   decompress more than `max_tuples_decompressed_per_dml_transaction`
+    ///   tuples (100 000 by default) -- which would fail this batch, and the
+    ///   same oldest batch on every later pass. The limit is lifted for this
+    ///   transaction only; the work stays bounded by `BATCH_SIZE` parents.
     pub async fn purge_visitors(
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<u64, AnalyticsRetentionError> {
         let mut total = 0u64;
         for batch in 0..MAX_BATCHES_PER_RUN {
-            let result = self
-                .db
-                .execute(Statement::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    "DELETE FROM visitor WHERE id IN ( \
-                         SELECT id FROM visitor WHERE last_seen < $1 \
-                         ORDER BY last_seen ASC LIMIT $2)",
-                    [cutoff.into(), BATCH_SIZE.into()],
-                ))
-                .await
-                .map_err(|source| {
-                    AnalyticsRetentionError::database(
-                        format!("delete visitors last seen before {cutoff}"),
-                        source,
-                    )
-                })?;
-            let deleted = result.rows_affected();
+            let deleted = self.purge_visitor_batch(cutoff).await?;
             total += deleted;
             if deleted < BATCH_SIZE as u64 {
                 break;
@@ -350,6 +351,45 @@ impl AnalyticsRetentionService {
             }
         }
         Ok(total)
+    }
+
+    async fn purge_visitor_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, AnalyticsRetentionError> {
+        let operation = || format!("delete visitors last seen before {cutoff}");
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+
+        // `set_config(.., true)` is `SET LOCAL`. Guarded by `pg_settings` so
+        // that a server without the setting (older TimescaleDB, or none) is
+        // left alone instead of failing on an unknown parameter.
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT set_config('timescaledb.max_tuples_decompressed_per_dml_transaction', '0', true) \
+             WHERE EXISTS (SELECT 1 FROM pg_settings \
+                           WHERE name = 'timescaledb.max_tuples_decompressed_per_dml_transaction')",
+        ))
+        .await
+        .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+
+        let result = txn
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM visitor WHERE last_seen < $1 AND id IN ( \
+                     SELECT id FROM visitor WHERE last_seen < $1 \
+                     ORDER BY last_seen ASC LIMIT $2)",
+                [cutoff.into(), BATCH_SIZE.into()],
+            ))
+            .await
+            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+        txn.commit()
+            .await
+            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+        Ok(result.rows_affected())
     }
 
     /// Delete stored IP addresses that nothing references and that were last
@@ -366,7 +406,8 @@ impl AnalyticsRetentionService {
             let window = IpWindowRow::find_by_statement(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT id, updated_at FROM ip_geolocations \
-                 WHERE updated_at < $1 AND (updated_at, id) > ($2, $3) \
+                 WHERE updated_at < $1 AND COALESCE(last_used_at, updated_at) < $1 \
+                   AND (updated_at, id) > ($2, $3) \
                  ORDER BY updated_at ASC, id ASC LIMIT $4",
                 [
                     cutoff.into(),
@@ -398,9 +439,10 @@ impl AnalyticsRetentionService {
 
             let deleted = self
                 .db
-                .query_all(Statement::from_string(
+                .query_all(Statement::from_sql_and_values(
                     DatabaseBackend::Postgres,
                     delete_unreferenced_sql(&ids, &references),
+                    [cutoff.into()],
                 ))
                 .await
                 .map_err(|source| {
@@ -465,8 +507,14 @@ impl AnalyticsRetentionService {
     }
 }
 
-/// `DELETE` of the candidate ids that no referencing column points at,
-/// returning the ids actually removed.
+/// `DELETE` of the candidate ids that no referencing column points at and
+/// that no writer has resolved since `$1` (the cutoff), returning the ids
+/// actually removed.
+///
+/// The cutoff is tested again on the target row, not only when the candidates
+/// were listed: `IpAddressService` advances `last_used_at` when it hands an id
+/// to a writer, and the re-check is what makes a delete that races that
+/// update lose to it.
 ///
 /// The ids are `i32`s read from the database a moment earlier and the table
 /// and column names are constants, so the statement is built directly: there
@@ -484,7 +532,8 @@ fn delete_unreferenced_sql(ids: &[i32], references: &[(&str, &str)]) -> String {
         })
         .collect();
     format!(
-        "DELETE FROM ip_geolocations g WHERE g.id IN ({id_list}){not_referenced} RETURNING g.id"
+        "DELETE FROM ip_geolocations g WHERE g.id IN ({id_list}) \
+         AND COALESCE(g.last_used_at, g.updated_at) < $1{not_referenced} RETURNING g.id"
     )
 }
 
@@ -552,6 +601,10 @@ mod tests {
         );
         assert!(sql.starts_with("DELETE FROM ip_geolocations g WHERE g.id IN (3, 5)"));
         assert!(
+            sql.contains("COALESCE(g.last_used_at, g.updated_at) < $1"),
+            "the target row is re-checked against the cutoff: {sql}"
+        );
+        assert!(
             sql.contains("NOT EXISTS (SELECT 1 FROM events r WHERE r.ip_geolocation_id = g.id)")
         );
         assert!(sql.contains("NOT EXISTS (SELECT 1 FROM visitor r WHERE r.ip_address_id = g.id)"));
@@ -578,10 +631,16 @@ mod tests {
     #[tokio::test]
     async fn purge_visitors_stops_after_a_short_batch() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results([MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 7,
-            }])
+            .append_exec_results([
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                },
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 7,
+                },
+            ])
             .into_connection();
         let service = mock_service(db);
 
@@ -598,10 +657,16 @@ mod tests {
         let cutoff = Utc::now() - chrono::Duration::days(425);
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                }])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                ])
                 .into_connection(),
         );
         let service = AnalyticsRetentionService::new(db.clone());
@@ -611,18 +676,26 @@ mod tests {
         let log = Arc::try_unwrap(db)
             .unwrap_or_else(|_| panic!("service dropped, connection is unshared"))
             .into_transaction_log();
-        assert_eq!(log.len(), 1, "one bounded DELETE per batch");
+        assert_eq!(log.len(), 1, "one transaction per batch");
         let rendered = format!("{log:?}");
         assert!(
-            rendered.contains("DELETE FROM visitor WHERE id IN"),
-            "{rendered}"
+            rendered.contains("DELETE FROM visitor WHERE last_seen < $1 AND id IN"),
+            "the target row repeats the age test: {rendered}"
         );
         assert!(rendered.contains("LIMIT $2"), "{rendered}");
+        assert!(
+            rendered.contains("max_tuples_decompressed_per_dml_transaction"),
+            "the decompression limit is lifted for the batch: {rendered}"
+        );
     }
 
     #[tokio::test]
     async fn purge_visitors_reports_the_failed_operation() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
             .append_exec_errors([DbErr::Custom("deadlock detected".into())])
             .into_connection();
         let service = mock_service(db);
@@ -665,7 +738,7 @@ mod integration_tests {
 
     use super::*;
     use crate::testing::test_utils::TestDatabase;
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{audit_logs, environments, ip_geolocations, projects, visitor};
 
@@ -814,6 +887,81 @@ mod integration_tests {
         assert!(
             ip_exists(db, used_by_audit).await,
             "audit log still uses it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_resolved_recently_is_kept_even_when_unreferenced() {
+        let Some(test_db) = database("retention_ip_in_use").await else {
+            return;
+        };
+        let db = test_db.db.as_ref();
+
+        // Verified long ago (`updated_at`), but a writer resolved it an hour
+        // ago and may be about to store, or already caches, its id.
+        let in_use = insert_ip(db, "198.51.100.20", 400).await;
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE ip_geolocations SET last_used_at = now() - interval '1 hour' WHERE id = $1",
+            [in_use.into()],
+        ))
+        .await
+        .expect("record the lookup");
+        let idle = insert_ip(db, "198.51.100.21", 400).await;
+
+        let service = AnalyticsRetentionService::new(test_db.db.clone());
+        let deleted = service
+            .purge_unreferenced_ips(Utc::now() - chrono::Duration::days(30))
+            .await
+            .expect("purge runs");
+
+        assert_eq!(deleted, 1);
+        assert!(ip_exists(db, in_use).await, "a recently resolved id stays");
+        assert!(!ip_exists(db, idle).await, "an idle one is removed");
+    }
+
+    #[tokio::test]
+    async fn a_visitor_that_returns_mid_sweep_is_not_deleted() {
+        let Some(test_db) = database("retention_visitor_race").await else {
+            return;
+        };
+        let db = test_db.db.clone();
+        let ids = seed_environment(db.as_ref()).await;
+        insert_visitor(db.as_ref(), ids, "returning", 480, None).await;
+
+        // Ingestion refreshes the visitor in a transaction that is still
+        // open when the sweep starts, so the sweep's candidate list was read
+        // from the old row version.
+        let refresh = db.begin().await.expect("begin");
+        refresh
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "UPDATE visitor SET last_seen = now() WHERE visitor_id = 'returning'",
+            ))
+            .await
+            .expect("refresh the visitor");
+
+        let service = Arc::new(AnalyticsRetentionService::new(db.clone()));
+        let sweep = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .purge_visitors(Utc::now() - chrono::Duration::days(425))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        refresh.commit().await.expect("commit the refresh");
+
+        let deleted = sweep.await.expect("join").expect("purge runs");
+        assert_eq!(deleted, 0, "the refreshed visitor must survive");
+        assert_eq!(
+            visitor::Entity::find()
+                .all(db.as_ref())
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 

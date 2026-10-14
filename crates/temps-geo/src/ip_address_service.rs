@@ -19,6 +19,18 @@ const GEO_CACHE_MAX_ENTRIES: u64 = 100_000;
 /// How long a cached IP -> geolocation mapping stays valid. Geolocation is stable,
 /// so a long TTL collapses repeated lookups for the same IP into a single DB hit.
 const GEO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// How stale `last_used_at` may get before a lookup advances it.
+///
+/// The retention cleanup deletes an address only when `last_used_at` is older
+/// than its window (at least a day). A lookup that skips the write because
+/// the stored value is younger than this can therefore still count on the row
+/// surviving for at least `window - LAST_USED_REFRESH`, which must outlast
+/// the cache entry that lookup is about to create. Checked at compile time.
+const LAST_USED_REFRESH: Duration = Duration::from_secs(60 * 60);
+const _: () = assert!(
+    GEO_CACHE_TTL.as_secs() + LAST_USED_REFRESH.as_secs() < 24 * 60 * 60,
+    "a cached IP id must not outlive the shortest retention window"
+);
 
 /// Whether the GeoIP database is currently failing lookups it should be able
 /// to answer (a corrupt or truncated `.mmdb`, an undecodable record).
@@ -193,7 +205,17 @@ impl IpAddressService {
             .one(self.db.as_ref())
             .await?
         {
+            let id = existing_ip.id;
+            let needs_touch = last_used_needs_refresh(existing_ip.last_used_at, now);
             let info = self.refresh_if_stale(existing_ip, now).await;
+            // Tell the retention cleanup this address is in use. Without it
+            // the cleanup could delete the row between this lookup and the
+            // insert that stores the id, or while the id sits in the cache.
+            // A failed write leaves the id unprotected, so it is not cached:
+            // the next lookup tries again.
+            if needs_touch && !self.record_last_used(id, now).await {
+                return Ok(info);
+            }
             self.cache
                 .insert(ip_address_str.to_string(), info.clone())
                 .await;
@@ -242,6 +264,7 @@ impl IpAddressService {
             is_hosting_provider: Set(geo_data.as_ref().and_then(|d| d.is_hosting_provider)),
             created_at: Set(now),
             updated_at: Set(now),
+            last_used_at: Set(Some(now)),
             ..Default::default()
         };
 
@@ -259,6 +282,31 @@ impl IpAddressService {
             .insert(ip_address_str.to_string(), info.clone())
             .await;
         Ok(info)
+    }
+
+    /// Advance `last_used_at` without touching `updated_at`, which is the
+    /// geolocation's verification clock. Returns whether the write landed.
+    async fn record_last_used(&self, id: i32, now: UtcDateTime) -> bool {
+        match ip_geolocations::Entity::update_many()
+            .col_expr(
+                ip_geolocations::Column::LastUsedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(ip_geolocations::Column::Id.eq(id))
+            .exec(self.db.as_ref())
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(
+                    ip_geolocation_id = id,
+                    error = %e,
+                    "could not record that a stored IP address is in use; it is served \
+                     uncached so the next lookup retries"
+                );
+                false
+            }
+        }
     }
 
     /// Re-resolve a stored row whose geolocation has outlived the configured
@@ -427,6 +475,17 @@ fn apply_geolocation(
 /// `country` is stored NOT NULL with `""` for "unknown", so the comparison
 /// normalizes the resolved side the same way [`apply_geolocation`] stores it --
 /// otherwise every row with an unknown country would look changed forever.
+/// Whether `last_used_at` is missing or old enough to be worth rewriting.
+fn last_used_needs_refresh(last_used_at: Option<UtcDateTime>, now: UtcDateTime) -> bool {
+    match last_used_at {
+        None => true,
+        Some(at) => {
+            now.signed_duration_since(at)
+                >= chrono::Duration::from_std(LAST_USED_REFRESH).unwrap_or(chrono::Duration::MAX)
+        }
+    }
+}
+
 fn geolocation_differs(stored: &ip_geolocations::Model, resolved: &GeoLocation) -> bool {
     stored.country != resolved.country.clone().unwrap_or_default()
         || stored.country_code != resolved.country_code
@@ -477,6 +536,7 @@ mod tests {
             is_hosting_provider: Some(false),
             created_at: now,
             updated_at: now,
+            last_used_at: None,
         }
     }
 
@@ -493,6 +553,20 @@ mod tests {
             asn_org: row.asn_org.clone(),
             is_hosting_provider: row.is_hosting_provider,
         }
+    }
+
+    #[test]
+    fn last_used_is_rewritten_only_when_missing_or_an_hour_old() {
+        let now = Utc::now();
+        assert!(last_used_needs_refresh(None, now));
+        assert!(!last_used_needs_refresh(
+            Some(now - chrono::Duration::minutes(59)),
+            now
+        ));
+        assert!(last_used_needs_refresh(
+            Some(now - chrono::Duration::minutes(61)),
+            now
+        ));
     }
 
     #[test]
@@ -615,6 +689,7 @@ mod tests {
             is_hosting_provider: None,
             created_at: now - chrono::Duration::days(400),
             updated_at: now - chrono::Duration::days(400),
+            last_used_at: None,
         };
         let touched = ip_geolocations::Model {
             updated_at: now,
