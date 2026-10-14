@@ -1849,7 +1849,10 @@ pub struct AnalyticsRetentionSettings {
 
     /// Delete a stored client IP address (and its derived location) once
     /// nothing references it and it has not been looked up for this many
-    /// days. `null` keeps every address ever seen.
+    /// days. Never applied sooner than the proxy-log retention
+    /// (`observability_retention.proxy_logs_days`): request logs kept outside
+    /// PostgreSQL still point at the address. `null` keeps every address ever
+    /// seen.
     #[schema(minimum = 1, maximum = 3650, nullable = true, example = 30)]
     pub unreferenced_ip_days: Option<u32>,
 }

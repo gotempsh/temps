@@ -53,7 +53,7 @@ export const ANALYTICS_RETENTION_FIELDS: AnalyticsRetentionField[] = [
     label: 'Stored IP addresses',
     stores: 'ip_geolocations',
     description:
-      'A stored address is deleted once no event, visitor, log or audit entry uses it any more and it has not been looked up for this long.',
+      'A stored address is deleted once no event, visitor, log or audit entry uses it any more and it has not been looked up for this long. It is never deleted sooner than the proxy log retention, because request logs kept outside PostgreSQL still point at it.',
     optional: true,
   },
 ]

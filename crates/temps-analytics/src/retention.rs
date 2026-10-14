@@ -669,6 +669,26 @@ fn delete_unreferenced_sql(ids: &[i32], references: &[(&str, &str)]) -> String {
     )
 }
 
+/// The windows to enforce, given the proxy-log retention in force.
+///
+/// Request logs may be stored outside PostgreSQL (ClickHouse), where they carry
+/// an `ip_geolocation_id` that [`IP_REFERENCES`] cannot see. `last_used_at`
+/// advances whenever such a log is written, so keeping an address for at least
+/// the proxy-log window after its last lookup keeps it for as long as any of
+/// those logs can still point at it. The floor is the same whichever store is
+/// in use, so it needs no knowledge of which one that is.
+pub fn effective_windows(
+    analytics: &AnalyticsRetentionSettings,
+    proxy_logs_days: u32,
+) -> AnalyticsRetentionSettings {
+    AnalyticsRetentionSettings {
+        unreferenced_ip_days: analytics
+            .unreferenced_ip_days
+            .map(|days| days.max(proxy_logs_days)),
+        ..analytics.clone()
+    }
+}
+
 /// Spawn the hourly enforcement loop. The settings are re-read every pass, so
 /// a change in the console applies within [`RETENTION_INTERVAL`].
 pub fn spawn_retention_job(
@@ -683,7 +703,11 @@ pub fn spawn_retention_job(
             interval.tick().await;
             match config.get_settings().await {
                 Ok(settings) => {
-                    service.enforce(&settings.analytics_retention).await;
+                    let windows = effective_windows(
+                        &settings.analytics_retention,
+                        settings.observability_retention.proxy_logs_days,
+                    );
+                    service.enforce(&windows).await;
                 }
                 Err(error) => {
                     let error = AnalyticsRetentionError::Settings {
@@ -703,6 +727,38 @@ mod tests {
 
     fn mock_service(db: DatabaseConnection) -> AnalyticsRetentionService {
         AnalyticsRetentionService::new(Arc::new(db))
+    }
+
+    #[test]
+    fn ip_window_is_never_shorter_than_the_proxy_log_window() {
+        let settings = AnalyticsRetentionSettings {
+            unreferenced_ip_days: Some(30),
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        assert_eq!(
+            effective_windows(&settings, 90).unreferenced_ip_days,
+            Some(90),
+            "logs kept for 90 days can still point at the address"
+        );
+        assert_eq!(
+            effective_windows(&settings, 7).unreferenced_ip_days,
+            Some(30),
+            "a longer IP window is left alone"
+        );
+    }
+
+    #[test]
+    fn keeping_ip_addresses_forever_stays_forever() {
+        let settings = AnalyticsRetentionSettings {
+            unreferenced_ip_days: None,
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        let windows = effective_windows(&settings, 90);
+
+        assert_eq!(windows.unreferenced_ip_days, None);
+        assert_eq!(windows.events_days, settings.events_days);
     }
 
     #[test]

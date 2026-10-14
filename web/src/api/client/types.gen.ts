@@ -1334,7 +1334,10 @@ export type AnalyticsRetentionSettings = {
     /**
      * Delete a stored client IP address (and its derived location) once
      * nothing references it and it has not been looked up for this many
-     * days. `null` keeps every address ever seen.
+     * days. Never applied sooner than the proxy-log retention
+     * (`observability_retention.proxy_logs_days`): request logs kept outside
+     * PostgreSQL still point at the address. `null` keeps every address ever
+     * seen.
      */
     unreferenced_ip_days?: number | null;
     /**

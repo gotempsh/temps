@@ -2960,7 +2960,7 @@
           },
           "unreferenced_ip_days": {
             "default": 30,
-            "description": "Delete a stored client IP address (and its derived location) once\nnothing references it and it has not been looked up for this many\ndays. `null` keeps every address ever seen.",
+            "description": "Delete a stored client IP address (and its derived location) once\nnothing references it and it has not been looked up for this many\ndays. Never applied sooner than the proxy-log retention\n(`observability_retention.proxy_logs_days`): request logs kept outside\nPostgreSQL still point at the address. `null` keeps every address ever\nseen.",
             "example": 30,
             "format": "int32",
             "maximum": 3650,
