@@ -192,6 +192,15 @@ export function useUrlBoundText(
 }
 
 /**
+ * The part of a `useUrlState<K>()` result that `useUrlSearchText` needs. Typed
+ * with `never` parameters so any page's key union is accepted.
+ */
+export type UrlStateHandle = {
+  get: (key: never) => string | null
+  patch: (values: never, options?: { replace?: boolean }) => void
+}
+
+/**
  * `useUrlBoundText` for the common case: one search box backed by one query
  * parameter (`q` by default). Typed text stays local, the URL is written with
  * `replace`, and `resetKeys` (usually `['page']`) are cleared in the same
@@ -207,10 +216,22 @@ export function useUrlSearchText(
   {
     resetKeys = [],
     settleMs,
-  }: { resetKeys?: readonly string[]; settleMs?: number } = {}
+    urlState,
+  }: {
+    resetKeys?: readonly string[]
+    settleMs?: number
+    /**
+     * The page's own `useUrlState()` when other controls patch the same query
+     * string. Updates compose through one pending snapshot per hook instance,
+     * so a search edit and a tab/filter click in the same tick only both land
+     * when they go through the same instance.
+     */
+    urlState?: UrlStateHandle
+  } = {}
 ): [string, (value: string) => void, string] {
-  const { get, patch } = useUrlState<string>()
-  const committed = get(key) ?? ''
+  const own = useUrlState<string>()
+  const { get, patch } = urlState ?? own
+  const committed = get(key as never) ?? ''
   const resets = resetKeys.join('\u0000')
   const commit = useCallback(
     (value: string) => {
@@ -220,7 +241,7 @@ export function useUrlSearchText(
       for (const reset of resets ? resets.split('\u0000') : []) {
         values[reset] = undefined
       }
-      patch(values)
+      patch(values as never)
     },
     [key, resets, patch]
   )

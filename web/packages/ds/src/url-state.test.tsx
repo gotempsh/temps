@@ -323,3 +323,41 @@ test('useUrlSearchText clearing the box removes the key from the URL', async () 
   })
   view.unmount()
 })
+
+test('useUrlSearchText with a shared urlState composes with a sibling patch in the same tick', async () => {
+  function Shared() {
+    const urlState = useUrlState<'q' | 'types'>()
+    const [text, setText] = useUrlSearchText('q', { urlState })
+    const location = useLocation()
+    return (
+      <div>
+        <input
+          aria-label="search"
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+        />
+        <button onClick={() => urlState.patch({ types: 'npm' })}>npm</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/scan']}>
+      <Shared />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  // Type, then click a filter before the router has committed the search.
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'openssl' } })
+    fireEvent.click(view.getByText('npm'))
+  })
+  await settle(1200)
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('openssl')
+  expect(params.get('types')).toBe('npm')
+  expect(input.value).toBe('openssl')
+  view.unmount()
+})

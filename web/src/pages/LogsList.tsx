@@ -78,9 +78,10 @@ function severityBadge(severity: LogSeverity, text?: string) {
 
 export default function LogsList({ project }: LogsListProps) {
   const navigate = useNavigate()
-  const { state, patch } = useUrlState<
+  const urlState = useUrlState<
     'range' | 'severity' | 'service' | 'q' | 'trace'
   >()
+  const { state, patch } = urlState
   const { setBreadcrumbs } = useBreadcrumbs()
   usePageTitle(`Logs - ${project.name}`)
 
@@ -93,8 +94,8 @@ export default function LogsList({ project }: LogsListProps) {
   const severity = state.severity || ALL
   const setSeverity = (value: string) =>
     patch({ severity: value === ALL ? undefined : value })
-  const [service, setService] = useUrlSearchText('service')
-  const [search, setSearch] = useUrlSearchText('q')
+  const [service, setService] = useUrlSearchText('service', { urlState })
+  const [search, setSearch] = useUrlSearchText('q', { urlState })
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
   const traceId = state.trace || ''
   const [page, setPage] = useState(1)

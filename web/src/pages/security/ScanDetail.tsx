@@ -350,10 +350,12 @@ function scanFacts(
 
 function ScanDetailContent() {
   const { slug, scanId } = useParams<{ slug: string; scanId: string }>()
-  const { get, patch } = useUrlState<'q' | 'types' | 'tab'>()
+  const urlState = useUrlState<'q' | 'types' | 'tab'>()
+  const { get, patch } = urlState
   // Typed text stays local so the box never drops keystrokes while the URL
-  // catches up; `q` is the shareable, reload-safe copy.
-  const [searchQuery, setSearchQuery] = useUrlSearchText('q')
+  // catches up; `q` is the shareable, reload-safe copy. It shares this page's
+  // URL state so a type/tab click right after typing cannot drop the search.
+  const [searchQuery, setSearchQuery] = useUrlSearchText('q', { urlState })
   const selectedTypesParam = get('types') ?? ''
   const selectedTypes = useMemo(
     () => new Set(selectedTypesParam ? selectedTypesParam.split(',') : []),

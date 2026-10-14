@@ -117,6 +117,7 @@ import { toast } from 'sonner'
 import { setProjectHosting } from '@/api/client/sdk.gen'
 import { getErrorMessage } from '@/utils/errorHandling'
 import {
+  dateFilterFromParams,
   getDateRangeFromFilter,
   QUICK_FILTERS,
   type QuickFilter,
@@ -337,22 +338,15 @@ function PagesTab({ project }: PagesTabProps) {
   const selectedPagePath = searchParams.get('path')
 
   // Restore date filter from URL search params (preserves context from overview)
-  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-
-    if (filter === 'custom' && from && to) {
-      return {
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
-      }
-    }
-    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      return { quickFilter: filter, dateRange: undefined }
-    }
-    return { quickFilter: '24hours', dateRange: undefined }
-  }, [searchParams])
+  // Keyed on the three date parameters only: unrelated query parameters (the
+  // section page finder's `find`) must not recompute the rolling window.
+  const filterParam = searchParams.get('filter')
+  const fromParam = searchParams.get('from')
+  const toParam = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(
+    () => dateFilterFromParams(filterParam, fromParam, toParam),
+    [filterParam, fromParam, toParam]
+  )
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -1258,22 +1252,15 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const [searchParams, setSearchParams] = useSearchParams()
 
   // Restore date filter from URL search params (enables browser back/forward)
-  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-
-    if (filter === 'custom' && from && to) {
-      return {
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
-      }
-    }
-    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      return { quickFilter: filter, dateRange: undefined }
-    }
-    return { quickFilter: '24hours', dateRange: undefined }
-  }, [searchParams])
+  // Keyed on the three date parameters only: unrelated query parameters (the
+  // section page finder's `find`) must not recompute the rolling window.
+  const filterParam = searchParams.get('filter')
+  const fromParam = searchParams.get('from')
+  const toParam = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(
+    () => dateFilterFromParams(filterParam, fromParam, toParam),
+    [filterParam, fromParam, toParam]
+  )
   const [pendingChartRange, setPendingChartRange] =
     React.useState<ChartDateRange | null>(null)
 

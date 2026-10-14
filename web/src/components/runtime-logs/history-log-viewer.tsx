@@ -12,7 +12,7 @@ import {
   getProjectDeploymentsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { LogLevelBadge, useUrlSearchText } from '@temps-sdk/ds'
+import { LogLevelBadge, useUrlSearchText, useUrlState } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -46,7 +46,6 @@ import {
 } from '@/hooks/useLogHistory'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useSearchParams } from 'react-router'
 import AnsiToHtml from 'ansi-to-html'
 import { RuntimeLogRowLayout } from './runtime-log-row-layout'
 import {
@@ -362,7 +361,10 @@ export default function HistoryLogViewer({
   project: ProjectResponse
 }) {
   'use no memo'
-  const [searchParams, setSearchParams] = useSearchParams()
+  // One URL-state instance for `q` and `deploy_id`, so writes to either compose
+  // instead of one overwriting the other from stale rendered params.
+  const urlState = useUrlState<'q' | 'deploy_id'>()
+  const { get: getParam, patch: patchParams } = urlState
   const [selectedEnv, setSelectedEnv] = useState<string | undefined>()
   const [selectedService, setSelectedService] = useState<string | undefined>()
   // Container / node sub-filters. A project's history spans many containers
@@ -377,7 +379,7 @@ export default function HistoryLogViewer({
   // by the effect below.
   const [selectedDeploy, setSelectedDeploy] = useState<number | undefined>(
     () => {
-      const raw = searchParams.get('deploy_id')
+      const raw = getParam('deploy_id')
       if (!raw) return undefined
       const n = Number.parseInt(raw, 10)
       return Number.isFinite(n) ? n : undefined
@@ -385,7 +387,7 @@ export default function HistoryLogViewer({
   )
   const [selectedLevels, setSelectedLevels] = useState<LogLevel[]>([])
   // Search text lives in `?q=` so reload, back/forward and shared links keep it.
-  const [searchText, setSearchText] = useUrlSearchText('q')
+  const [searchText, setSearchText] = useUrlSearchText('q', { urlState })
   const [debouncedText, setDebouncedText] = useState('')
   const [timeRange, setTimeRange] = useState('24h')
   // Custom range, only meaningful when timeRange === CUSTOM_RANGE_VALUE.
@@ -542,17 +544,11 @@ export default function HistoryLogViewer({
   // Keep ?deploy_id= in the URL in sync with the selection so the view is
   // shareable / refresh-stable. Uses replace so it doesn't pollute history.
   useEffect(() => {
-    const current = searchParams.get('deploy_id')
+    const current = getParam('deploy_id')
     const next = selectedDeploy != null ? String(selectedDeploy) : null
     if (current === next) return
-    const params = new URLSearchParams(searchParams)
-    if (next === null) {
-      params.delete('deploy_id')
-    } else {
-      params.set('deploy_id', next)
-    }
-    setSearchParams(params, { replace: true })
-  }, [selectedDeploy, searchParams, setSearchParams])
+    patchParams({ deploy_id: next })
+  }, [selectedDeploy, getParam, patchParams])
 
   // When the user picks a deployment, default the time window to that
   // deployment's lifespan so they don't have to guess timestamps. Only fires on
