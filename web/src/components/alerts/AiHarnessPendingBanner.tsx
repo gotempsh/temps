@@ -20,6 +20,7 @@ export function AiHarnessPendingBanner() {
     retry: false,
     // An optional setup banner on every page: roles without API-key access
     // are refused here, and that is not a failure of the page they are on.
+    // `useActivationSignals` observes the same entry and must opt out too.
     meta: { routeFailure: ROUTE_FAILURE_IGNORE },
     refetchInterval: (query) =>
       getAiHarnessStatus(query.state.data?.api_keys) === 'waiting'

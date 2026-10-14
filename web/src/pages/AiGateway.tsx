@@ -3429,6 +3429,7 @@ export function AgentActivity() {
         />
       ) : !projectId ? (
         <EmptyState
+          size="compact"
           icon={Bot}
           title="No services yet"
           description="AI activity is recorded per service. Deploy a service that calls an AI provider and its traces appear here."

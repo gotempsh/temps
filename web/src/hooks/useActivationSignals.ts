@@ -20,6 +20,7 @@ import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
 import { hasCompletedDeployment } from '@/lib/first-deploy'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 export interface ActivationSignals {
   /** Dedicated active admin key has authenticated an external AI harness */
@@ -138,6 +139,10 @@ export function useActivationSignals(): ActivationSignals {
   const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
     ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
     retry: false,
+    // Shares its cache entry with the AI-harness setup banner, and each
+    // observer's `meta` replaces the other's: both must opt out. Roles without
+    // API-key access are refused here, which is not a failure of the page.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
   })
 
   // TEMP: pretend nothing is set up yet, for building the first-run
