@@ -103651,7 +103651,7 @@
             "description": "Project group not found, or a route that would be deleted involves a service the caller cannot see"
           },
           "409": {
-            "description": "A route appeared in the group while the request was being authorized; retry"
+            "description": "A route appeared in the group, or a project joined it, while the request was being authorized; retry"
           }
         },
         "security": [
@@ -103751,7 +103751,7 @@
             "description": "Project group not found"
           },
           "409": {
-            "description": "Slug already taken"
+            "description": "Slug already taken, or a project joined the group while the request was being authorized; retry"
           }
         },
         "security": [
@@ -103856,7 +103856,7 @@
             "description": "Project group not found"
           },
           "409": {
-            "description": "Variable already exists for that scope"
+            "description": "Variable already exists for that scope, or a project joined the group while the request was being authorized; retry"
           }
         },
         "security": [
@@ -103904,6 +103904,9 @@
           },
           "404": {
             "description": "Project group or variable not found"
+          },
+          "409": {
+            "description": "A project joined the group while the request was being authorized, so it was not checked; nothing was changed. Retry the request"
           }
         },
         "security": [
@@ -103969,6 +103972,9 @@
           },
           "404": {
             "description": "Project group or variable not found"
+          },
+          "409": {
+            "description": "A project joined the group while the request was being authorized, so it was not checked; nothing was changed. Retry the request"
           }
         },
         "security": [
@@ -104145,7 +104151,7 @@
             "description": "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"
           },
           "409": {
-            "description": "A route involving the project appeared, or the project changed group, while the request was being authorized; retry"
+            "description": "A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry"
           }
         },
         "security": [
@@ -104215,7 +104221,7 @@
             "description": "Project group not found, or the project is not in it"
           },
           "409": {
-            "description": "The group has no repository yet"
+            "description": "The group has no repository yet, or its repository changed while the project was being pointed at it; retry the request"
           }
         },
         "security": [
@@ -104260,6 +104266,9 @@
           },
           "404": {
             "description": "Project group not found"
+          },
+          "409": {
+            "description": "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"
           }
         },
         "security": [
@@ -104354,6 +104363,9 @@
           },
           "404": {
             "description": "Project group not found"
+          },
+          "409": {
+            "description": "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"
           }
         },
         "security": [

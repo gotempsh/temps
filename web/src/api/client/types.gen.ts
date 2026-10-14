@@ -53901,7 +53901,7 @@ export type DeleteProjectGroupErrors = {
      */
     404: unknown;
     /**
-     * A route appeared in the group while the request was being authorized; retry
+     * A route appeared in the group, or a project joined it, while the request was being authorized; retry
      */
     409: unknown;
 };
@@ -53973,7 +53973,7 @@ export type UpdateProjectGroupErrors = {
      */
     404: unknown;
     /**
-     * Slug already taken
+     * Slug already taken, or a project joined the group while the request was being authorized; retry
      */
     409: unknown;
 };
@@ -54045,7 +54045,7 @@ export type CreateGroupEnvVarErrors = {
      */
     404: unknown;
     /**
-     * Variable already exists for that scope
+     * Variable already exists for that scope, or a project joined the group while the request was being authorized; retry
      */
     409: unknown;
 };
@@ -54084,6 +54084,10 @@ export type DeleteGroupEnvVarErrors = {
      * Project group or variable not found
      */
     404: unknown;
+    /**
+     * A project joined the group while the request was being authorized, so it was not checked; nothing was changed. Retry the request
+     */
+    409: unknown;
 };
 
 export type DeleteGroupEnvVarResponses = {
@@ -54124,6 +54128,10 @@ export type UpdateGroupEnvVarErrors = {
      * Project group or variable not found
      */
     404: unknown;
+    /**
+     * A project joined the group while the request was being authorized, so it was not checked; nothing was changed. Retry the request
+     */
+    409: unknown;
 };
 
 export type UpdateGroupEnvVarResponses = {
@@ -54245,7 +54253,7 @@ export type AddProjectToGroupErrors = {
      */
     404: unknown;
     /**
-     * A route involving the project appeared, or the project changed group, while the request was being authorized; retry
+     * A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry
      */
     409: unknown;
 };
@@ -54289,7 +54297,7 @@ export type SetRepositoryInheritanceErrors = {
      */
     404: unknown;
     /**
-     * The group has no repository yet
+     * The group has no repository yet, or its repository changed while the project was being pointed at it; retry the request
      */
     409: unknown;
 };
@@ -54324,6 +54332,10 @@ export type ClearGroupRepositoryErrors = {
      * Project group not found
      */
     404: unknown;
+    /**
+     * A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request
+     */
+    409: unknown;
 };
 
 export type ClearGroupRepositoryResponses = {
@@ -54388,6 +54400,10 @@ export type SetGroupRepositoryErrors = {
      * Project group not found
      */
     404: unknown;
+    /**
+     * A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request
+     */
+    409: unknown;
 };
 
 export type SetGroupRepositoryResponses = {
