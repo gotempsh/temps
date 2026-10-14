@@ -54333,7 +54333,7 @@ export type ClearGroupRepositoryErrors = {
      */
     404: unknown;
     /**
-     * A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request
+     * A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request
      */
     409: unknown;
 };
@@ -54401,9 +54401,13 @@ export type SetGroupRepositoryErrors = {
      */
     404: unknown;
     /**
-     * A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request
+     * A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request
      */
     409: unknown;
+    /**
+     * Too many repository changes are being written through at once on this server; nothing was changed. Retry shortly
+     */
+    429: unknown;
 };
 
 export type SetGroupRepositoryResponses = {

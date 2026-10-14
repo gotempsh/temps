@@ -104268,7 +104268,7 @@
             "description": "Project group not found"
           },
           "409": {
-            "description": "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"
+            "description": "A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request"
           }
         },
         "security": [
@@ -104365,7 +104365,10 @@
             "description": "Project group not found"
           },
           "409": {
-            "description": "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"
+            "description": "A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request"
+          },
+          "429": {
+            "description": "Too many repository changes are being written through at once on this server; nothing was changed. Retry shortly"
           }
         },
         "security": [
