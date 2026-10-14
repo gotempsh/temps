@@ -177,6 +177,10 @@ impl TempsPlugin for AnalyticsPlugin {
                         Arc::new(crate::retention::AnalyticsRetentionService::new(db)),
                         config,
                         context.require_service::<dyn temps_core::AuditLogger>(),
+                        // Present only when a plugin supplies its own
+                        // per-project retention: its windows decide how long
+                        // proxy logs keep pointing at a stored address.
+                        context.get_service::<dyn temps_core::RetentionResolver>(),
                     );
                 }
                 None => tracing::warn!(

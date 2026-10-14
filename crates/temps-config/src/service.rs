@@ -46,8 +46,9 @@ const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
-    AgentSandboxSettings, AppSettings, BlobSettings, ClickHouseCompression, GeoLicenseKeyIntent,
-    KvSettings, PreviewGatewaySettings, PublicHostnameStrategy,
+    AgentSandboxSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
+    ClickHouseCompression, GeoLicenseKeyIntent, KvSettings, ObservabilityRetentionSettings,
+    PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
 /// Whether a settings write explicitly changes outbound private-network trust.
@@ -895,6 +896,16 @@ struct SettingsCacheState {
     generation: u64,
 }
 
+/// What the analytics retention sweep needs from the settings row; see
+/// [`ConfigService::get_retention_policy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub analytics: AnalyticsRetentionSettings,
+    /// `observability_retention.proxy_logs_days`, the instance-wide window the
+    /// stored-IP floor is derived from.
+    pub proxy_logs_days: u32,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -1443,6 +1454,52 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         };
         serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
             section: "agent_sandbox",
+        })
+    }
+
+    /// Load only the retention inputs the analytics sweep deletes by, straight
+    /// from the authoritative settings row.
+    ///
+    /// The sweep removes data permanently, so it must never run on a policy
+    /// that was invented rather than read. [`Self::get_settings`] returns the
+    /// whole default document when any field fails to decode, which would
+    /// replace a saved 365-day policy with the 90-day default (and a saved
+    /// "keep addresses" with the 30-day one) over an unrelated bad section.
+    /// Here an unrelated malformed section is ignored, while a missing section
+    /// is the default and a malformed retention section is an error, so the
+    /// caller skips the pass instead of acting.
+    pub async fn get_retention_policy(&self) -> Result<RetentionPolicy, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(data) = record.map(|row| row.data) else {
+            // No row yet: a fresh install running on defaults.
+            return Ok(RetentionPolicy {
+                analytics: AnalyticsRetentionSettings::default(),
+                proxy_logs_days: ObservabilityRetentionSettings::default().proxy_logs_days,
+            });
+        };
+        let section = |name: &'static str| data.get(name).filter(|value| !value.is_null()).cloned();
+        let analytics = match section("analytics_retention") {
+            None => AnalyticsRetentionSettings::default(),
+            Some(value) => serde_json::from_value(value).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "analytics_retention",
+                }
+            })?,
+        };
+        let observability: ObservabilityRetentionSettings = match section("observability_retention")
+        {
+            None => ObservabilityRetentionSettings::default(),
+            Some(value) => serde_json::from_value(value).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "observability_retention",
+                }
+            })?,
+        };
+        Ok(RetentionPolicy {
+            analytics,
+            proxy_logs_days: observability.proxy_logs_days,
         })
     }
 
@@ -4527,6 +4584,86 @@ mod tests {
             .find(|s| s.starts_with("UPDATE "))
             .expect("settings update");
         assert!(update.contains(r#""allowed_node_ids":[0,3]"#), "{update}");
+    }
+
+    fn retention_row(data: serde_json::Value) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_policy_survives_an_unrelated_malformed_section() {
+        // `preview_domain: 42` makes the whole document undecodable, which
+        // `get_settings` turns into the defaults. The sweep must still see the
+        // 365-day events window and "keep addresses" that were saved.
+        let row = retention_row(serde_json::json!({
+            "preview_domain": 42,
+            "analytics_retention": {
+                "events_days": 365,
+                "unreferenced_ip_days": null,
+            },
+            "observability_retention": { "proxy_logs_days": 90 },
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let policy = service.get_retention_policy().await.expect("policy");
+
+        assert_eq!(policy.analytics.events_days, 365);
+        assert_eq!(policy.analytics.unreferenced_ip_days, None);
+        assert_eq!(policy.proxy_logs_days, 90);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_retention_section_is_an_error_not_a_default() {
+        let row = retention_row(serde_json::json!({
+            "analytics_retention": { "events_days": "forever" },
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = service
+            .get_retention_policy()
+            .await
+            .expect_err("the pass must be skipped");
+
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "analytics_retention"
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_policy_defaults_apply_only_when_nothing_was_saved() {
+        let empty = retention_row(serde_json::json!({}));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![empty], Vec::<settings::Model>::new()])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let sections_absent = service.get_retention_policy().await.expect("policy");
+        let no_row = service.get_retention_policy().await.expect("policy");
+
+        for policy in [sections_absent, no_row] {
+            assert_eq!(policy.analytics, AnalyticsRetentionSettings::default());
+            assert_eq!(
+                policy.proxy_logs_days,
+                ObservabilityRetentionSettings::default().proxy_logs_days
+            );
+        }
     }
 
     #[tokio::test]

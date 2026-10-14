@@ -33,7 +33,8 @@ use sea_orm::{
 };
 use serde::Serialize;
 use temps_core::{
-    AnalyticsRetentionSettings, AuditLogger, AuditOperation, IP_REFERENCE_SLACK_DAYS,
+    AnalyticsRetentionSettings, AuditLogger, AuditOperation, RetentionResolver, RetentionTable,
+    IP_REFERENCE_SLACK_DAYS,
 };
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -727,18 +728,49 @@ fn delete_unreferenced_sql(ids: &[i32], references: &[(&str, &str)]) -> String {
 pub fn effective_windows(
     analytics: &AnalyticsRetentionSettings,
     proxy_logs_days: u32,
+    plugin_bound: ResolverBound,
     now: DateTime<Utc>,
 ) -> AnalyticsRetentionSettings {
     let held = analytics.ip_hold_until.is_some_and(|until| until > now);
+    let log_days = match plugin_bound {
+        ResolverBound::Instance => Some(proxy_logs_days),
+        ResolverBound::AtMost(days) => Some(proxy_logs_days.max(days)),
+        // A plugin stamps its own windows and has not said how long: no
+        // address can be shown to be unreferenced, so none is deleted.
+        ResolverBound::Unknown => None,
+    };
     AnalyticsRetentionSettings {
-        unreferenced_ip_days: if held {
-            None
-        } else {
-            analytics
+        unreferenced_ip_days: match (held, log_days) {
+            (false, Some(log_days)) => analytics
                 .unreferenced_ip_days
-                .map(|days| days.max(proxy_logs_days.saturating_add(IP_REFERENCE_SLACK_DAYS)))
+                .map(|days| days.max(log_days.saturating_add(IP_REFERENCE_SLACK_DAYS))),
+            _ => None,
         },
         ..analytics.clone()
+    }
+}
+
+/// What is known about the longest window a plugin-provided
+/// [`RetentionResolver`] stamps on proxy logs, beyond the instance setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolverBound {
+    /// No plugin resolver: rows follow `observability_retention`.
+    Instance,
+    /// The plugin declared an upper bound, in days.
+    AtMost(u32),
+    /// A plugin resolver is installed and declared nothing.
+    Unknown,
+}
+
+impl ResolverBound {
+    /// Read the bound from the installed plugin resolver, if there is one.
+    pub fn of(resolver: Option<&Arc<dyn RetentionResolver>>) -> Self {
+        match resolver {
+            None => Self::Instance,
+            Some(resolver) => resolver
+                .max_retention_days(RetentionTable::ProxyLogs)
+                .map_or(Self::Unknown, |days| Self::AtMost(u32::from(days))),
+        }
     }
 }
 
@@ -818,6 +850,7 @@ pub fn spawn_retention_job(
     service: Arc<AnalyticsRetentionService>,
     config: Arc<temps_config::ConfigService>,
     audit: Arc<dyn AuditLogger>,
+    plugin_resolver: Option<Arc<dyn RetentionResolver>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::time::sleep(RETENTION_STARTUP_DELAY).await;
@@ -825,11 +858,15 @@ pub fn spawn_retention_job(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match config.get_settings().await {
-                Ok(settings) => {
+            // Read from the settings row itself, not through the cached,
+            // default-on-error whole-document load: this pass deletes data,
+            // so a policy that could not be read skips the pass.
+            match config.get_retention_policy().await {
+                Ok(policy) => {
                     let windows = effective_windows(
-                        &settings.analytics_retention,
-                        settings.observability_retention.proxy_logs_days,
+                        &policy.analytics,
+                        policy.proxy_logs_days,
+                        ResolverBound::of(plugin_resolver.as_ref()),
                         Utc::now(),
                     );
                     let report = service.enforce(&windows).await;
@@ -869,15 +906,80 @@ mod tests {
         };
 
         assert_eq!(
-            effective_windows(&settings, 90, Utc::now()).unreferenced_ip_days,
+            effective_windows(&settings, 90, ResolverBound::Instance, Utc::now())
+                .unreferenced_ip_days,
             Some(90 + IP_REFERENCE_SLACK_DAYS),
             "logs kept for 90 days can still point at the address, and last_used_at \
              can trail the newest of them by up to a day"
         );
         assert_eq!(
-            effective_windows(&settings, 7, Utc::now()).unreferenced_ip_days,
+            effective_windows(&settings, 7, ResolverBound::Instance, Utc::now())
+                .unreferenced_ip_days,
             Some(30),
             "a longer IP window is left alone"
+        );
+    }
+
+    #[test]
+    fn a_plugin_resolver_that_retains_longer_raises_the_ip_floor() {
+        let settings = AnalyticsRetentionSettings {
+            unreferenced_ip_days: Some(30),
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        // Instance proxy_logs_days is 30 but a plugin keeps logs for 90.
+        let windows = effective_windows(&settings, 30, ResolverBound::AtMost(90), Utc::now());
+
+        assert_eq!(
+            windows.unreferenced_ip_days,
+            Some(90 + IP_REFERENCE_SLACK_DAYS),
+            "logs kept 90 days by the plugin still point at the address"
+        );
+        let shorter = effective_windows(&settings, 30, ResolverBound::AtMost(7), Utc::now());
+        assert_eq!(
+            shorter.unreferenced_ip_days,
+            Some(30 + IP_REFERENCE_SLACK_DAYS),
+            "the instance window still applies when it is the longer one"
+        );
+    }
+
+    #[test]
+    fn a_plugin_resolver_with_no_declared_bound_suspends_ip_deletion() {
+        let settings = AnalyticsRetentionSettings::default();
+
+        let windows = effective_windows(&settings, 30, ResolverBound::Unknown, Utc::now());
+
+        assert_eq!(windows.unreferenced_ip_days, None);
+        assert_eq!(windows.events_days, settings.events_days);
+    }
+
+    struct Undeclared;
+    impl RetentionResolver for Undeclared {
+        fn resolve(&self, _project_id: i32, _table: RetentionTable) -> u16 {
+            365
+        }
+    }
+
+    struct Declared;
+    impl RetentionResolver for Declared {
+        fn resolve(&self, _project_id: i32, _table: RetentionTable) -> u16 {
+            90
+        }
+        fn max_retention_days(&self, _table: RetentionTable) -> Option<u16> {
+            Some(120)
+        }
+    }
+
+    #[test]
+    fn the_bound_is_read_from_the_installed_resolver() {
+        let none: Option<Arc<dyn RetentionResolver>> = None;
+        assert_eq!(ResolverBound::of(none.as_ref()), ResolverBound::Instance);
+        let undeclared: Arc<dyn RetentionResolver> = Arc::new(Undeclared);
+        assert_eq!(ResolverBound::of(Some(&undeclared)), ResolverBound::Unknown);
+        let declared: Arc<dyn RetentionResolver> = Arc::new(Declared);
+        assert_eq!(
+            ResolverBound::of(Some(&declared)),
+            ResolverBound::AtMost(120)
         );
     }
 
@@ -891,12 +993,18 @@ mod tests {
         };
 
         assert_eq!(
-            effective_windows(&settings, 7, now).unreferenced_ip_days,
+            effective_windows(&settings, 7, ResolverBound::Instance, now).unreferenced_ip_days,
             None,
             "logs written under the old window can still point at the address"
         );
         assert_eq!(
-            effective_windows(&settings, 7, now + chrono::Duration::days(81)).unreferenced_ip_days,
+            effective_windows(
+                &settings,
+                7,
+                ResolverBound::Instance,
+                now + chrono::Duration::days(81)
+            )
+            .unreferenced_ip_days,
             Some(30),
             "the sweep resumes once the hold has passed"
         );
@@ -944,7 +1052,7 @@ mod tests {
             ..AnalyticsRetentionSettings::default()
         };
 
-        let windows = effective_windows(&settings, 90, Utc::now());
+        let windows = effective_windows(&settings, 90, ResolverBound::Instance, Utc::now());
 
         assert_eq!(windows.unreferenced_ip_days, None);
         assert_eq!(windows.events_days, settings.events_days);

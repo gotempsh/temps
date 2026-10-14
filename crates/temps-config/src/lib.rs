@@ -27,5 +27,6 @@ pub use service::{
     anonymous_telemetry_preference, installation_mode, stateless_instance_id,
     stateless_telemetry_anonymous_id, stored_clickhouse_compression, ClusterCaRotationResult,
     ClusterNetworkState, ConfigService, ConfigServiceError, EffectiveTelemetryPolicies,
-    InstallationMode, ServerConfig, SettingsUpdateResult, TrustedPrivateNetworksIntent,
+    InstallationMode, RetentionPolicy, ServerConfig, SettingsUpdateResult,
+    TrustedPrivateNetworksIntent,
 };
