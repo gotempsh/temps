@@ -170,6 +170,16 @@ pub enum ProjectGroupError {
     )]
     RepositoryChangeInProgress { group_id: i32 },
 
+    /// Too many repository changes (across groups) are being written through
+    /// at once on this server. Each holds a database connection for its whole
+    /// duration; letting them all take one would leave the pool with none for
+    /// the writes. Nothing was changed; retry shortly.
+    #[error(
+        "Too many repository changes are in progress ({limit} at once); the repository of \
+         project group {group_id} was not changed, retry shortly"
+    )]
+    TooManyRepositoryChanges { group_id: i32, limit: usize },
+
     #[error("{source_name} already sends {path_prefix} to another service")]
     RouteConflict {
         source_name: String,
@@ -280,6 +290,12 @@ impl From<ProjectGroupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectGroupError::TooManyRepositoryChanges { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Too Many Repository Changes")
+                    .with_detail(error.to_string())
+            }
+
             ProjectGroupError::EnvVarConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Variable Already Exists")
                 .with_detail(error.to_string()),
@@ -357,5 +373,22 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("project group 7"), "got {message}");
         assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn too_many_repository_changes_is_a_retryable_429_naming_the_group_and_limit() {
+        let error = ProjectGroupError::TooManyRepositoryChanges {
+            group_id: 7,
+            limit: 2,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("project group 7") && message.contains("2 at once"),
+            "got {message}"
+        );
+        assert_eq!(
+            Problem::from(error).status_code,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 }

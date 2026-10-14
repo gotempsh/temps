@@ -32,6 +32,7 @@ use temps_git::services::public_repo::{
 };
 use temps_git::GitProviderManager;
 use temps_projects::ProjectService;
+use tokio::sync::{Semaphore, TryAcquireError};
 use utoipa::ToSchema;
 
 use crate::error::ProjectGroupError;
@@ -111,6 +112,37 @@ pub struct GroupRepositoryService {
     db: Arc<DatabaseConnection>,
     projects: Arc<ProjectService>,
     git: Arc<GitProviderManager>,
+    /// One permit per repository change that may hold a write lease (a pooled
+    /// connection) while it takes more connections for its own writes. See
+    /// [`lease_capacity_for`].
+    lease_permits: Arc<Semaphore>,
+    lease_capacity: usize,
+}
+
+/// How many repository changes may hold a write lease at once, for a pool of
+/// `max_connections`.
+///
+/// A change holds one connection for its lease for the whole call and needs a
+/// second one at a time for its own transactions and member writes. Letting
+/// leases take more than half the pool would let concurrent changes to
+/// different groups fill it with leases and starve each other (and every
+/// other user of the pool) until the acquire timeout. At most half the pool
+/// is therefore ever leased, never fewer than one.
+fn lease_capacity_for(max_connections: u32) -> usize {
+    ((max_connections / 2) as usize).max(1)
+}
+
+/// The lease capacity of `db`'s pool; one for a connection that is not a
+/// Postgres pool (it cannot hold a lease anyway).
+fn lease_capacity_of(db: &DatabaseConnection) -> usize {
+    match db {
+        DatabaseConnection::SqlxPostgresPoolConnection(_) => lease_capacity_for(
+            db.get_postgres_connection_pool()
+                .options()
+                .get_max_connections(),
+        ),
+        _ => 1,
+    }
 }
 
 /// Whether `project` already points at the group's repository and branch.
@@ -391,7 +423,22 @@ impl GroupRepositoryService {
         projects: Arc<ProjectService>,
         git: Arc<GitProviderManager>,
     ) -> Self {
-        Self { db, projects, git }
+        let lease_capacity = lease_capacity_of(&db);
+        Self {
+            db,
+            projects,
+            git,
+            lease_permits: Arc::new(Semaphore::new(lease_capacity)),
+            lease_capacity,
+        }
+    }
+
+    /// Overrides how many repository changes may hold a write lease at once.
+    #[cfg(test)]
+    pub(crate) fn with_lease_capacity(mut self, capacity: usize) -> Self {
+        self.lease_permits = Arc::new(Semaphore::new(capacity));
+        self.lease_capacity = capacity;
+        self
     }
 
     async fn find_group(&self, group_id: i32) -> Result<project_groups::Model, ProjectGroupError> {
@@ -635,6 +682,12 @@ impl GroupRepositoryService {
     /// ([`Self::lease_repository_writes`]). A concurrent change to the same
     /// group's repository is refused with
     /// [`ProjectGroupError::RepositoryChangeInProgress`] and changes nothing.
+    ///
+    /// The lease holds a pooled connection for the whole call, so the number
+    /// of changes holding one is bounded (see [`lease_capacity_for`]); past
+    /// the bound the change is refused with
+    /// [`ProjectGroupError::TooManyRepositoryChanges`] before it takes any
+    /// connection.
     async fn apply_repository(
         &self,
         group_id: i32,
@@ -642,6 +695,25 @@ impl GroupRepositoryService {
         authorized_follower_ids: &HashSet<i32>,
         caller: DeployCaller,
     ) -> Result<(project_groups::Model, Vec<MemberSyncResult>), ProjectGroupError> {
+        // Never wait for a permit: waiting would pin a request (and, once it
+        // holds a connection, the pool) behind other groups' provider round
+        // trips. The permit is taken before any connection and dropped when
+        // this call ends, on every path.
+        let _permit =
+            self.lease_permits
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    TryAcquireError::NoPermits => ProjectGroupError::TooManyRepositoryChanges {
+                        group_id,
+                        limit: self.lease_capacity,
+                    },
+                    TryAcquireError::Closed => ProjectGroupError::Internal {
+                        message: format!(
+                            "the repository change limiter of project group {group_id} is closed"
+                        ),
+                    },
+                })?;
         let lease = self.lease_repository_writes(group_id).await?;
         let outcome = self
             .apply_repository_leased(group_id, repo, authorized_follower_ids, caller)
@@ -2260,6 +2332,127 @@ pub(crate) mod tests {
             .clear_repository(group.id, &authorized)
             .await
             .expect("and by the change that followed it");
+    }
+
+    #[test]
+    fn at_most_half_the_pool_is_ever_leased_and_never_fewer_than_one() {
+        assert_eq!(lease_capacity_for(0), 1);
+        assert_eq!(lease_capacity_for(1), 1);
+        assert_eq!(lease_capacity_for(2), 1);
+        assert_eq!(lease_capacity_for(5), 2);
+        assert_eq!(lease_capacity_for(100), 50);
+    }
+
+    /// Changes to different groups each hold a pooled connection for their
+    /// lease while taking another for their writes. Past the cap the next
+    /// change is refused at once, before it takes any connection, instead of
+    /// queueing for one; nothing deadlocks, and the permits come back after
+    /// both a success and a failure.
+    #[tokio::test]
+    async fn changes_past_the_lease_cap_are_refused_immediately_and_release_their_permits() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        // The test pool has 5 connections: the cap derived from it is 2.
+        assert_eq!(repos.lease_capacity, 2);
+        let repos = Arc::new(repos.with_lease_capacity(2));
+        let first = group_with_followers(&conn, "Cap first", &[9481], &[9481]).await;
+        let second = group_with_followers(&conn, "Cap second", &[9482], &[9482]).await;
+        let third = group_with_followers(&conn, "Cap third", &[9483], &[9483]).await;
+        let caller = DeployCaller::from_instance_admin(false);
+
+        // Stalls every member write, so both changes keep their permit.
+        let hold = conn.begin().await.unwrap();
+        hold.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "LOCK TABLE projects IN SHARE MODE",
+        ))
+        .await
+        .unwrap();
+        let spawn_change = |group_id: i32, follower: i32| {
+            let repos = repos.clone();
+            let authorized: HashSet<i32> = [follower].into_iter().collect();
+            tokio::spawn(async move {
+                repos
+                    .apply_repository(group_id, &public_branch("release-a"), &authorized, caller)
+                    .await
+            })
+        };
+        let a = spawn_change(first.id, 9481);
+        let b = spawn_change(second.id, 9482);
+        let mut waited = Duration::ZERO;
+        while repos.lease_permits.available_permits() > 0 {
+            assert!(
+                waited < Duration::from_secs(20),
+                "the changes never took their permits"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        }
+        // Let both reach their stalled member write.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!a.is_finished() && !b.is_finished());
+
+        let authorized: HashSet<i32> = [9483].into_iter().collect();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            repos.apply_repository(third.id, &public_branch("release-a"), &authorized, caller),
+        )
+        .await
+        .expect("a change past the cap must be refused at once, not wait")
+        .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                ProjectGroupError::TooManyRepositoryChanges { group_id, limit }
+                    if *group_id == third.id && *limit == 2
+            ),
+            "got {refused:?}"
+        );
+        assert_eq!(
+            repos.lease_permits.available_permits(),
+            0,
+            "a refused change takes no permit"
+        );
+
+        hold.commit().await.unwrap();
+        for handle in [a, b] {
+            let (_, results) = done(handle).await.expect("the leased change finishes");
+            assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+        }
+        assert_eq!(repos.lease_permits.available_permits(), 2);
+        assert_eq!(project_branch(&conn, 9481).await, "release-a");
+        assert_eq!(project_branch(&conn, 9482).await, "release-a");
+        assert_eq!(project_branch(&conn, 9483).await, "main");
+
+        // After success the refused change goes through; after a failure
+        // (nobody authorized the follower) its permit is back as well.
+        let err = repos
+            .apply_repository(
+                third.id,
+                &public_branch("release-a"),
+                &HashSet::new(),
+                caller,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::RepositoryFollowersChanged { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(repos.lease_permits.available_permits(), 2);
+        repos
+            .apply_repository(third.id, &public_branch("release-a"), &authorized, caller)
+            .await
+            .expect("the retried change goes through");
+        assert_eq!(repos.lease_permits.available_permits(), 2);
+        assert_eq!(project_branch(&conn, 9483).await, "release-a");
     }
 
     #[test]

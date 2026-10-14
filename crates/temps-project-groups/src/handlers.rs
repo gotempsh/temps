@@ -1536,6 +1536,7 @@ pub async fn get_group_repository(
         (status = 403, description = "Insufficient permissions, or no access to every project in the group"),
         (status = 404, description = "Project group not found"),
         (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request"),
+        (status = 429, description = "Too many repository changes are being written through at once on this server; nothing was changed. Retry shortly"),
     ),
     security(("bearer_auth" = []))
 )]
