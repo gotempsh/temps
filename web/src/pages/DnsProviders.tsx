@@ -3,7 +3,6 @@
 
 import {
   deleteDnsProvider as deleteProvider,
-  listDnsProviders as listProviders,
   testProviderConnection,
   type DnsProviderResponse,
 } from '@/api/client'
@@ -32,6 +31,10 @@ import {
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  DNS_PROVIDERS_QUERY_KEY,
+  dnsProvidersQueryOptions,
+} from '@/lib/dns-providers-query'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -91,20 +94,13 @@ export function DnsProviders() {
     error,
     refetch,
     isFetching,
-  } = useQuery({
-    queryKey: ['dnsProviders'],
-    queryFn: async () => {
-      const response = await listProviders()
-      return response.data
-    },
-    retry: false,
-  })
+  } = useQuery(dnsProvidersQueryOptions())
 
   const deleteProviderMut = useMutation({
     mutationFn: (id: number) => deleteProvider({ path: { id } }),
     onSuccess: () => {
       toast.success('DNS provider deleted successfully')
-      queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
+      queryClient.invalidateQueries({ queryKey: DNS_PROVIDERS_QUERY_KEY })
       setProviderToDelete(null)
     },
     onError: (error: Error) => {
