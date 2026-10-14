@@ -77,7 +77,7 @@ pub struct BinarySelfUpdater {
     binary_path: PathBuf,
     /// Directory holding the update journal.
     data_dir: PathBuf,
-    /// `temps serve --disable-self-update`. A hard, API-proof off switch: unlike
+    /// `temps serve --disable-self-update` or `TEMPS_DISABLE_SELF_UPDATE`. A hard, API-proof off switch: unlike
     /// the settings toggle, nothing reachable over HTTP can clear it.
     disabled_by_flag: bool,
     supervisor: SupervisorKind,
@@ -90,7 +90,9 @@ pub struct BinarySelfUpdater {
     /// Database URL passed explicitly to the migrate child process so it works
     /// even when the parent was started with `--database-url` (not the env var).
     database_url: String,
-    /// `temps serve --pre-migration-backup`, forwarded to the migrate child.
+    /// `temps serve --pre-migration-backup` or `TEMPS_PRE_MIGRATION_BACKUP`,
+    /// forwarded to the migrate child as the flag (so it does not depend on the
+    /// child inheriting the environment).
     pre_migration_backup: bool,
 }
 
@@ -272,7 +274,7 @@ impl BinarySelfUpdater {
 
     /// First blocker that applies, or `None` when an update can run.
     ///
-    /// Order is deliberate: an explicit operator decision (`--disable-self-update`,
+    /// Order is deliberate: an explicit operator decision (`--disable-self-update`/`TEMPS_DISABLE_SELF_UPDATE`,
     /// then the settings toggle) is reported before any environmental problem,
     /// because "you turned this off" is the honest answer even on a host that
     /// also happens to be unsupervised.
@@ -280,8 +282,9 @@ impl BinarySelfUpdater {
         if self.disabled_by_flag {
             return Some((
                 SelfUpdateBlocker::DisabledByFlag,
-                "The server was started with --disable-self-update. Restart it without that flag \
-                 to allow updates from the console; this cannot be re-enabled from the UI."
+                "The server was started with --disable-self-update (or TEMPS_DISABLE_SELF_UPDATE). \
+                 Restart it without that flag and variable to allow updates from the console; \
+                 this cannot be re-enabled from the UI."
                     .to_string(),
             ));
         }

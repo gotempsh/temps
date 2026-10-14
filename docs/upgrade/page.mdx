@@ -26,7 +26,7 @@ Read the [release notes](https://github.com/gotempsh/temps/releases) for every v
 
 ### What Temps can back up for you
 
-Start the new binary with `--pre-migration-backup` and, when it finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. The backup is off by default. See [Pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate, so the flag can stay in your service unit.
+Start the new binary with `--pre-migration-backup` and, when it finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. The backup is off by default. See [Pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate, so the flag can stay in your service unit. Where you can only set environment variables (a container launched through an API, for example), set `TEMPS_PRE_MIGRATION_BACKUP=true` instead; it is the same switch.
 
 ### Stateless installations
 
@@ -70,7 +70,7 @@ temps upgrade --path /opt/temps/bin/temps
 
 ### From the console
 
-When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup`), and restarts. Start the server with `--disable-self-update` to forbid this path.
+When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup` or `TEMPS_PRE_MIGRATION_BACKUP=true`), and restarts. Start the server with `--disable-self-update`, or set `TEMPS_DISABLE_SELF_UPDATE=true`, to forbid this path. Unlike the toggle in **Settings → Platform**, this cannot be undone from the console: it lasts for the lifetime of the process.
 
 ### Upgrade script (`deploy.sh` installs)
 
@@ -279,6 +279,8 @@ The log line `Pre-migration database backup written to …` gives the exact path
 ```bash
 temps serve --pre-migration-backup ...     # or: temps migrate --pre-migration-backup
 ```
+
+Both commands also read `TEMPS_PRE_MIGRATION_BACKUP`. It accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, case-insensitive); an empty value means `false`, and anything else makes the command exit with an error rather than guess. `--pre-migration-backup` on the command line always turns it on.
 
 **If the backup fails, nothing is migrated** and Temps exits with the reason (for example, no suitable `pg_dump` and no reachable Docker daemon). Fix the cause and start again, or take your own backup and start without the flag.
 
