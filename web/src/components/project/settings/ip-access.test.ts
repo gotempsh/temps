@@ -135,6 +135,21 @@ describe('scope modes', () => {
     )
   })
 
+  test('inherit ignores half-typed rows in the hidden editor', () => {
+    const result = ipAccessFormSchema.safeParse({
+      mode: 'inherit',
+      cidrs: [{ cidr: '' }, { cidr: '10.0.0.999' }, { cidr: '' }],
+    })
+    expect(result.success).toBe(true)
+    // The same rows block a save once the mode keeps a list.
+    expect(
+      ipAccessFormSchema.safeParse({
+        mode: 'deny',
+        cidrs: [{ cidr: '' }, { cidr: '10.0.0.999' }],
+      }).success
+    ).toBe(false)
+  })
+
   test('inherit is a valid form value with no entries and hides the editor', () => {
     expect(
       ipAccessFormSchema.safeParse({ mode: 'inherit', cidrs: [] }).success

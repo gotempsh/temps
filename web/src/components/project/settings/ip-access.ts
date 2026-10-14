@@ -74,24 +74,30 @@ export function cidrSyntaxError(raw: string): string | null {
 }
 
 const entrySchema = z.object({
-  cidr: z.string().superRefine((value, ctx) => {
-    const message = cidrSyntaxError(value)
-    if (message) ctx.addIssue({ code: 'custom', message })
-  }),
-  description: z
-    .string()
-    .max(MAX_DESCRIPTION_LENGTH, `At most ${MAX_DESCRIPTION_LENGTH} characters`)
-    .optional(),
+  cidr: z.string(),
+  description: z.string().optional(),
 })
 
+/**
+ * Entries are validated only for modes that keep a list. `inherit` removes the
+ * stored row, so rows the user left half-typed in the (hidden) editor must not
+ * block that save.
+ */
 export const ipAccessFormSchema = z
   .object({
     mode: z.enum(['inherit', 'disabled', 'allow', 'deny']),
-    cidrs: z
-      .array(entrySchema)
-      .max(MAX_CIDRS, `At most ${MAX_CIDRS} entries are allowed`),
+    cidrs: z.array(entrySchema),
   })
   .superRefine((value, ctx) => {
+    if (value.mode === 'inherit') return
+
+    if (value.cidrs.length > MAX_CIDRS) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['cidrs'],
+        message: `At most ${MAX_CIDRS} entries are allowed`,
+      })
+    }
     if (value.mode === 'allow' && value.cidrs.length === 0) {
       ctx.addIssue({
         code: 'custom',
@@ -100,8 +106,24 @@ export const ipAccessFormSchema = z
           'An allow list needs at least one entry, otherwise nobody could reach the project',
       })
     }
+
     const seen = new Set<string>()
     value.cidrs.forEach((entry, index) => {
+      const syntax = cidrSyntaxError(entry.cidr)
+      if (syntax) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['cidrs', index, 'cidr'],
+          message: syntax,
+        })
+      }
+      if ((entry.description ?? '').length > MAX_DESCRIPTION_LENGTH) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['cidrs', index, 'description'],
+          message: `At most ${MAX_DESCRIPTION_LENGTH} characters`,
+        })
+      }
       const key = entry.cidr.trim().toLowerCase()
       if (key && seen.has(key)) {
         ctx.addIssue({
