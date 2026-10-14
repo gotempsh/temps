@@ -15,9 +15,15 @@ import { httpStatusOf } from './http-error-status'
  */
 export type ReadFailureKind = 'not-found' | 'forbidden' | 'failed'
 
-/** Only a numeric HTTP 404 establishes that a record is missing. */
+/**
+ * Only a numeric HTTP 404 establishes that a record is missing. The status
+ * may sit on a problem document or on an `Error` a fetcher built from one
+ * (`errorWithStatus`), which has no `title` to be recognised as a problem.
+ */
 export function isVerifiedNotFound(error: unknown): boolean {
-  return extractProblemDetails(error)?.status === 404
+  return (
+    extractProblemDetails(error)?.status === 404 || httpStatusOf(error) === 404
+  )
 }
 
 export function isForbiddenRead(error: unknown): boolean {

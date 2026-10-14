@@ -61,6 +61,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 
 const createUserSchema = z.object({
   name: z.string().min(3, 'Name must be at least 3 characters'),
@@ -205,15 +206,23 @@ export function CreateUser() {
     pendingTeamAssignment.current = data.teamId
       ? { teamId: Number(data.teamId), role: data.teamRole }
       : null
-    await createUser.mutateAsync({
-      body: {
-        username: data.name,
-        email: data.email,
-        password: data.password,
-        roles: [data.role],
-        must_change_password: data.mustChangePassword,
-      },
-    })
+    try {
+      await createUser.mutateAsync({
+        body: {
+          username: data.name,
+          email: data.email,
+          password: data.password,
+          roles: [data.role],
+          must_change_password: data.mustChangePassword,
+        },
+      })
+    } catch (error) {
+      // The mutation's error handler already shows the failure toast with the
+      // server's reason. Letting the rejection reach react-hook-form's submit
+      // handler would also surface it as an unhandled rejection, thrown as a
+      // bare object with no message or stack.
+      reportSubmitFailure(error)
+    }
   }
 
   const retryTeamAssignment = async () => {

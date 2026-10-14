@@ -22,6 +22,8 @@ import {
   useLogHistoryInfinite,
 } from '@/hooks/useLogHistory'
 import { serviceLogAvailability } from '@/lib/service-log-availability'
+import { isVerifiedNotFound } from '@/lib/read-failure'
+import { PageState } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -99,10 +101,18 @@ export function ServiceLogs() {
   const { id } = useParams<{ id: string }>()
   const serviceId = id ? parseInt(id, 10) : NaN
 
-  const { data: service, isLoading: serviceLoading } = useQuery({
+  const {
+    data: service,
+    isLoading: serviceLoading,
+    error: serviceError,
+  } = useQuery({
     ...getServiceOptions({ path: { id: serviceId } }),
     enabled: !Number.isNaN(serviceId),
   })
+  // Only a verified 404 proves the service is gone; the log search is not
+  // sent for it, and the page says so instead of waiting on logs that
+  // cannot exist.
+  const serviceMissing = isVerifiedNotFound(serviceError)
 
   const {
     data: linkedProjects,
@@ -182,6 +192,7 @@ export function ServiceLogs() {
       refreshKey,
     },
     !Number.isNaN(serviceId) &&
+      !serviceMissing &&
       startTime !== undefined &&
       logAvailability === 'available'
   )
@@ -271,6 +282,22 @@ export function ServiceLogs() {
         : customRange?.from
           ? `From ${customRange.from.toLocaleDateString()}`
           : 'Custom range'
+
+  if (serviceMissing) {
+    return (
+      <PageState
+        variant="empty"
+        icon={ScrollText}
+        title="Service not found"
+        description={`No storage service has ID ${id ?? ''}, so there are no logs to show. It may have been deleted.`}
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
+      />
+    )
+  }
 
   return (
     <div className="flex-1 overflow-auto">

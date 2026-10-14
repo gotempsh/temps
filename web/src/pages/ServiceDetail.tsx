@@ -153,6 +153,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
 
@@ -689,6 +690,22 @@ export function ServiceDetail() {
           </>
         }
         aside={<Skeleton className="h-48 w-full rounded-lg" />}
+      />
+    )
+  }
+
+  if (queryError && isVerifiedNotFound(queryError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={AlertCircle}
+        title="Service not found"
+        description="This storage service does not exist, or it has been deleted."
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
       />
     )
   }

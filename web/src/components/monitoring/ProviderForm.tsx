@@ -29,6 +29,7 @@ import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { InputHTMLAttributes, useEffect, useRef, useState } from 'react'
 import { UseFormReturn } from 'react-hook-form'
 import { toast } from 'sonner'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 import { ProviderFormData } from './schemas'
 
 interface ProviderFormProps {
@@ -156,6 +157,16 @@ export function ProviderForm({
   const providerType = form.watch('provider_type')
   const tlsMode = form.watch('config.tls_mode')
 
+  // The page's mutation reports a failed save with the server's reason; a
+  // rejection left to react-hook-form would escape as an unhandled one.
+  const submitProvider = async (data: ProviderFormData) => {
+    try {
+      await onSubmit(data)
+    } catch (error) {
+      reportSubmitFailure(error)
+    }
+  }
+
   // Suggest port based on TLS mode
   const getSuggestedPort = () => {
     switch (tlsMode) {
@@ -173,7 +184,7 @@ export function ProviderForm({
     <Form {...form}>
       <form
         id={formId}
-        onSubmit={form.handleSubmit(onSubmit, showToastFormError)}
+        onSubmit={form.handleSubmit(submitProvider, showToastFormError)}
         className="space-y-4 py-4"
       >
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

@@ -818,8 +818,13 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     <EmptyState
                       size="compact"
                       icon={AlarmClock}
-                      title="No service selected"
-                      description="Select a service to view its alarm history."
+                      title="No services yet"
+                      description="Alarms are raised per service. Deploy a service and its alarm history appears here."
+                      action={
+                        <Button asChild>
+                          <Link to="/projects/new">Deploy a service</Link>
+                        </Button>
+                      }
                     />
                   </TableCell>
                 </TableRow>

@@ -3291,7 +3291,7 @@ function TraceDetailView({
 // ── AgentActivity ───────────────────────────────────────────────────
 
 export function AgentActivity() {
-  const { projects } = useProjects()
+  const { projects, isLoading: projectsLoading } = useProjects()
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
@@ -3411,11 +3411,26 @@ export function AgentActivity() {
       )}
 
       {/* Traces list */}
-      {!projectId ? (
+      {!projectId && projectsLoading ? (
+        <div className="space-y-2">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      ) : !projectId ? (
         <EmptyState
           icon={Bot}
-          title="No service selected"
-          description="Select a service to view AI agent activity traces."
+          title="No services yet"
+          description="AI activity is recorded per service. Deploy a service that calls an AI provider and its traces appear here."
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button asChild>
+                <Link to="/projects/new">Deploy a service</Link>
+              </Button>
+              <Button asChild variant="outline">
+                <Link to="/ai-gateway/setup">Set up the AI gateway</Link>
+              </Button>
+            </div>
+          }
         />
       ) : tracesLoading ? (
         <div className="space-y-2">

@@ -66,6 +66,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { errorWithStatus } from '@/lib/http-error-status'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { cn } from '@/lib/utils'
 import {
   Button,
@@ -84,6 +86,7 @@ import {
   AlertCircle,
   ArrowLeft,
   CheckCircle2,
+  Globe,
   KeyRound,
   Loader2,
   Plus,
@@ -101,7 +104,12 @@ import { problemMessage } from '@/components/email/sharedUtils'
 async function fetchDomain(id: number): Promise<EmailDomainWithDnsResponse> {
   const response = await getDomain({ path: { id } })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email domain'))
+    // Keep the HTTP status on the error: a 404 is an answer the page shows
+    // at once, not a failure the retry policy repeats three times.
+    throw errorWithStatus(
+      problemMessage(response.error, 'Failed to fetch email domain'),
+      response.error
+    )
   }
   return response.data
 }
@@ -109,7 +117,7 @@ async function fetchDomain(id: number): Promise<EmailDomainWithDnsResponse> {
 async function fetchProviders(): Promise<EmailProviderResponse[]> {
   const response = await listEmailProviders()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email providers'))
+    throw errorWithStatus(problemMessage(response.error, 'Failed to fetch email providers'), response.error)
   }
   return response.data ?? []
 }
@@ -117,7 +125,7 @@ async function fetchProviders(): Promise<EmailProviderResponse[]> {
 async function fetchStoredDomains(): Promise<EmailDomainResponse[]> {
   const response = await listEmailDomains()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email domains'))
+    throw errorWithStatus(problemMessage(response.error, 'Failed to fetch email domains'), response.error)
   }
   return response.data ?? []
 }
@@ -125,7 +133,7 @@ async function fetchStoredDomains(): Promise<EmailDomainResponse[]> {
 async function fetchDnsProviders(): Promise<DnsProviderResponse[]> {
   const response = await listDnsProviders()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch DNS providers'))
+    throw errorWithStatus(problemMessage(response.error, 'Failed to fetch DNS providers'), response.error)
   }
   return response.data ?? []
 }
@@ -138,7 +146,7 @@ async function fetchDnsProviders(): Promise<DnsProviderResponse[]> {
 async function fetchEmailStats(domainId: number): Promise<EmailStatsResponse> {
   const response = await getEmailStats({ query: { domain_id: domainId } })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email stats'))
+    throw errorWithStatus(problemMessage(response.error, 'Failed to fetch email stats'), response.error)
   }
   return response.data
 }
@@ -146,7 +154,7 @@ async function fetchEmailStats(domainId: number): Promise<EmailStatsResponse> {
 async function fetchAuthorizedProjects(domainId: number): Promise<AuthorizedEmailDomainProjectResponse[]> {
   const response = await listEmailDomainProjects({ path: { id: domainId } })
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch authorized services'))
+    throw errorWithStatus(problemMessage(response.error, 'Failed to fetch authorized services'), response.error)
   }
   return response.data ?? []
 }
@@ -560,6 +568,18 @@ export function EmailDomainDetail() {
 
   if (isLoading || isLoadingProviders || (isSmtp && isLoadingStoredDomains)) {
     return <EmailDomainDetailSkeleton backAction={backAction} />
+  }
+
+  if (fetchError && isVerifiedNotFound(fetchError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={Globe}
+        title="Domain not found"
+        description={`No email domain has ID ${idParam ?? ''}. It may have been deleted.`}
+        action={backAction}
+      />
+    )
   }
 
   if (fetchError || !domain) {

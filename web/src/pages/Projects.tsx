@@ -137,8 +137,11 @@ export function Projects() {
     }),
     // Which list to ask for depends on the groups: wait for them rather than
     // render one layout and swap it for another. If they fail, every
-    // service is listed, with the failure said above it.
-    enabled: !groupsQuery.isLoading,
+    // service is listed, with the failure said above it. Once they have
+    // failed a first time they are being retried, so the list is asked for
+    // alongside the retries instead of after them: the two outages are one
+    // wait, not two.
+    enabled: !groupsQuery.isLoading || groupsQuery.failureCount > 0,
   })
 
   // TEMP: force an empty (brand-new install) dashboard while iterating on the

@@ -7,6 +7,7 @@ import {
   CompactErrorFallback,
   ErrorBoundary,
   ErrorFallback,
+  RouteQueryFailureBanner,
 } from '@/components/error'
 import { ThemeProvider } from '@/components/providers/ThemeProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
@@ -44,6 +45,10 @@ import {
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
 import { attachHttpStatus } from './lib/http-error-status'
+import {
+  installUnhandledRejectionReporter,
+  markErrorReported,
+} from './lib/unhandled-rejections'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
@@ -635,6 +640,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
+                  <RouteQueryFailureBanner />
                   <Routes>
                     {extraRoutes?.map((r) => (
                       <Route key={r.path} path={r.path} element={r.element} />
@@ -1227,6 +1233,10 @@ const queryClient = new QueryClient({
     },
     mutations: {
       onError: (error: unknown, _variables, context) => {
+        // Whatever happens below, the user hears about this failure here (or
+        // in the step-up dialog). A handler that also awaits the mutation
+        // without a catch must not announce it a second time.
+        markErrorReported(error)
         const problemDetails = error as ProblemDetails
 
         // Sensitive mutations own this response: they open a step-up dialog
@@ -1324,6 +1334,16 @@ export const TempsConsole = ({
   useEffect(() => {
     if (!document.documentElement.lang) document.documentElement.lang = 'en'
   }, [])
+
+  // An API failure nobody awaited with a `catch` would otherwise end as an
+  // "uncaught exception: Object" with nothing on screen.
+  useEffect(
+    () =>
+      installUnhandledRejectionReporter((notice) =>
+        toast.error(notice.title, { description: notice.description })
+      ),
+    []
+  )
 
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">

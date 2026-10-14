@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
+import { useEffect } from 'react'
 import { Alert, AlertDescription, AlertTitle } from './alert'
 import { Button } from './button'
 import {
@@ -9,6 +10,7 @@ import {
   readFailureExplanation,
   readFailureServerDetail,
 } from '@/lib/read-failure'
+import { markReadFailureHandled } from '@/lib/route-query-failures'
 
 /**
  * Inline read recovery. Retry only replays a query, never a mutation.
@@ -24,6 +26,7 @@ export function ReadFailure({
   onRetry,
   retrying = false,
   embedded = false,
+  routeLevel = false,
 }: {
   resource: string
   error: unknown
@@ -32,7 +35,16 @@ export function ReadFailure({
   onRetry?: () => void
   retrying?: boolean
   embedded?: boolean
+  /**
+   * Set by the route-level report itself. Every other use is the page
+   * explaining its own failure, which tells the route-level report there is
+   * nothing left to add.
+   */
+  routeLevel?: boolean
 }) {
+  useEffect(() => {
+    if (!routeLevel) markReadFailureHandled(error)
+  }, [error, routeLevel])
   const forbidden = isForbiddenRead(error)
   const serverDetail = readFailureServerDetail(error)
   const Icon = forbidden ? ShieldAlert : AlertTriangle

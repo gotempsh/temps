@@ -95,6 +95,7 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { refetchUnlessRefused } from '@/lib/query-retry'
 import { Input } from '@/components/ui/input'
 import {
@@ -932,7 +933,13 @@ function NodeDetail({
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
-  const { data: node, isLoading: nodeLoading } = useQuery({
+  const {
+    data: node,
+    isLoading: nodeLoading,
+    error: nodeError,
+    refetch: refetchNode,
+    isFetching: nodeFetching,
+  } = useQuery({
     ...adminGetNodeOptions({ path: { node_id: nodeId } }),
     refetchInterval: 15_000,
   })
@@ -1139,12 +1146,30 @@ function NodeDetail({
   }
 
   if (!node) {
+    // Only a verified 404 says the node is gone; any other failed read is
+    // reported as what it is, with a way to replay it.
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Node not found.</AlertDescription>
-      </Alert>
+      <div className="space-y-4">
+        {nodeError && !isVerifiedNotFound(nodeError) ? (
+          <ReadFailure
+            resource="Node"
+            error={nodeError}
+            onRetry={() => void refetchNode()}
+            retrying={nodeFetching}
+          />
+        ) : (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Node not found</AlertTitle>
+            <AlertDescription>
+              No worker node has ID {nodeId}. It may have been removed.
+            </AlertDescription>
+          </Alert>
+        )}
+        <Button variant="outline" size="sm" onClick={onBack}>
+          Back to worker nodes
+        </Button>
+      </div>
     )
   }
 

@@ -19,6 +19,19 @@ describe('readFailureKind', () => {
     expect(isVerifiedNotFound({ title: 'Not Found' })).toBe(false)
   })
 
+  test('an Error that kept the response status is a verified 404', () => {
+    // What a fetcher throws after unwrapping `{ error }`: no problem title,
+    // but the status line survives, which is all a 404 needs.
+    const kept = Object.assign(new Error('Schedule run 7 not found'), {
+      status: 404,
+    })
+    expect(isVerifiedNotFound(kept)).toBe(true)
+    expect(isVerifiedNotFound(new Error('Not found'))).toBe(false)
+    expect(
+      isVerifiedNotFound(Object.assign(new Error('boom'), { status: 500 }))
+    ).toBe(false)
+  })
+
   test('401 and 403 are a permission gap, not a missing record', () => {
     expect(readFailureKind({ title: 'Forbidden', status: 403 })).toBe(
       'forbidden'
