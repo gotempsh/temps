@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import { Command } from 'commander'
-import { buildCidrList, parseId, parseMode, registerProjectIpAccessCommands } from './project.js'
+import { buildCidrList, parseId, parseMode, registerProjectIpAccessCommands, resolveSetInput } from './project.js'
 
 describe('parseMode', () => {
   test('accepts the three modes', () => {
@@ -51,6 +51,33 @@ describe('buildCidrList', () => {
 
   test('is empty when nothing is given', () => {
     expect(buildCidrList([], false)).toEqual([])
+  })
+})
+
+describe('resolveSetInput', () => {
+  test('returns the mode and list for valid input', () => {
+    const input = resolveSetInput({ project: '1', mode: 'deny', cidr: ['203.0.113.0/24'] } as never)
+    expect(input.mode).toBe('deny')
+    expect(input.cidrs.map((e) => e.cidr)).toEqual(['203.0.113.0/24'])
+  })
+
+  test('throws on an unknown mode instead of returning quietly', () => {
+    expect(() => resolveSetInput({ project: '1', mode: 'block', cidr: ['203.0.113.0/24'] } as never)).toThrow(
+      'Invalid mode: block'
+    )
+  })
+
+  test('throws on an allow list with no entries', () => {
+    expect(() => resolveSetInput({ project: '1', mode: 'allow' } as never)).toThrow('at least one --cidr')
+  })
+
+  test('accepts an allow list made of the Tailscale ranges alone', () => {
+    expect(resolveSetInput({ project: '1', mode: 'allow', tailscale: true } as never).cidrs).toHaveLength(2)
+  })
+
+  test('accepts an empty deny or disabled list', () => {
+    expect(resolveSetInput({ project: '1', mode: 'deny' } as never).cidrs).toEqual([])
+    expect(resolveSetInput({ project: '1', mode: 'disabled' } as never).mode).toBe('disabled')
   })
 })
 

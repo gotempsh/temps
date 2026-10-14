@@ -194,6 +194,50 @@ export function probeScope(
   return isEnvironment && mode === 'inherit' ? 'project' : 'scope'
 }
 
+/** What "Try an address" evaluates for the form as it currently stands. */
+export type ProbeDraft =
+  | { kind: 'saved' }
+  | {
+      kind: 'draft'
+      mode: IpAccessMode
+      cidrs: { cidr: string; description: string | null }[]
+    }
+  | { kind: 'invalid'; message: string }
+
+/**
+ * Decide what a probe tests. A scope set to follow the project has no draft
+ * of its own (the stored list answers); a valid draft is previewed as shown;
+ * an invalid one is reported instead of silently testing the saved list,
+ * which would answer a question nobody asked. An empty allow list is the one
+ * invalid-to-save draft that is still previewed: the server answers it with
+ * "everything blocked", which is exactly what the operator is about to cause.
+ */
+export function probeDraft(values: IpAccessFormValues): ProbeDraft {
+  if (values.mode === 'inherit') return { kind: 'saved' }
+  const toEntries = (cidrs: IpAccessFormValues['cidrs']) =>
+    cidrs.map((entry) => ({
+      cidr: entry.cidr.trim(),
+      description: entry.description?.trim() || null,
+    }))
+  if (values.mode === 'allow' && values.cidrs.length === 0) {
+    return { kind: 'draft', mode: 'allow', cidrs: [] }
+  }
+  const parsed = ipAccessFormSchema.safeParse(values)
+  if (!parsed.success) {
+    return {
+      kind: 'invalid',
+      message:
+        parsed.error.issues[0]?.message ??
+        'The list has entries that are not valid',
+    }
+  }
+  return {
+    kind: 'draft',
+    mode: values.mode as IpAccessMode,
+    cidrs: toEntries(values.cidrs),
+  }
+}
+
 /** Single host form of an address, for the "add my IP" button. */
 export function hostCidr(ip: string): string {
   return ip.includes(':') ? `${ip}/128` : `${ip}/32`

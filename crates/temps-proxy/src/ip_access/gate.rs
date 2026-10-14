@@ -97,9 +97,13 @@ struct ProjectPolicies {
 }
 
 impl ProjectPolicies {
-    /// Nothing here enforces anything, so the project need not be tracked.
+    /// No scope is recorded, so the project need not be tracked.
+    ///
+    /// An environment override that enforces nothing (`disabled`) is still a
+    /// record: it exempts the environment from a project-wide list that may be
+    /// saved later, so a project holding one is not inert.
     fn is_inert(&self) -> bool {
-        self.project.is_none() && self.environments.iter().all(|(_, policy)| policy.is_none())
+        self.project.is_none() && self.environments.is_empty()
     }
 
     fn set_scope(&mut self, environment_id: Option<i32>, policy: Option<Arc<Policy>>) {
@@ -809,6 +813,48 @@ mod tests {
         assert!(removed.projects.is_empty());
         let disabled = before.patched(&[], &[row(1, 7, None, "disabled", &[])]);
         assert!(disabled.projects.is_empty());
+    }
+
+    #[test]
+    fn a_disabled_environment_override_survives_a_later_project_list() {
+        // The environment was exempted while the project had no list; saving a
+        // project-wide allow list afterwards must not pull it back in.
+        let exempt = Snapshot::default().patched(&[], &[row(1, 7, Some(70), "disabled", &[])]);
+        let with_list = exempt.patched(&[], &[row(2, 7, None, "allow", &["10.0.0.0/8"])]);
+        assert!(
+            with_list.effective(7, 70).is_none(),
+            "the exempted environment stays unrestricted"
+        );
+        assert!(
+            with_list.effective(7, 71).is_some(),
+            "other environments follow the project list"
+        );
+    }
+
+    #[test]
+    fn a_full_load_does_not_depend_on_row_order() {
+        let env_row = row(1, 7, Some(70), "disabled", &[]);
+        let project_row = row(2, 7, None, "allow", &["10.0.0.0/8"]);
+        let env_first = Snapshot::default().patched(&[], &[env_row.clone(), project_row.clone()]);
+        let project_first = Snapshot::default().patched(&[], &[project_row, env_row]);
+        for snapshot in [env_first, project_first] {
+            assert!(snapshot.effective(7, 70).is_none());
+            assert!(snapshot.effective(7, 71).is_some());
+        }
+    }
+
+    #[test]
+    fn removing_the_last_override_drops_the_project() {
+        let before = Snapshot::default().patched(&[], &[row(1, 7, Some(70), "disabled", &[])]);
+        assert!(!before.projects.is_empty());
+        let after = before.patched(
+            &[RemovedScope {
+                project_id: 7,
+                environment_id: Some(70),
+            }],
+            &[],
+        );
+        assert!(after.projects.is_empty());
     }
 
     #[test]

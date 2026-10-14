@@ -17,7 +17,7 @@ import {
 import type { IpAccessCidrEntry } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
-import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, success, info, keyValue } from '../../ui/output.js'
 
 const MODES = ['disabled', 'allow', 'deny'] as const
 type Mode = (typeof MODES)[number]
@@ -68,7 +68,7 @@ interface ShowOptions extends ScopeOptions {
   json?: boolean
 }
 
-interface SetOptions extends ScopeOptions {
+export interface SetOptions extends ScopeOptions {
   mode?: string
   cidr?: string[]
   tailscale?: boolean
@@ -172,21 +172,32 @@ async function showAction(options: ShowOptions): Promise<void> {
   newline()
 }
 
+/**
+ * The mode and CIDR list a `set` invocation asks for. Throws (so the process
+ * exits non-zero, which scripts rely on) for input the server would only
+ * reject later or, worse for an allow list, accept as "block everyone".
+ */
+export function resolveSetInput(options: SetOptions): {
+  mode: Mode
+  cidrs: ReturnType<typeof buildCidrList>
+} {
+  const mode = parseMode(options.mode ?? '')
+  if (mode === undefined) {
+    throw new Error(`Invalid mode: ${options.mode}. Available: ${MODES.join(', ')}`)
+  }
+  const cidrs = buildCidrList(options.cidr ?? [], options.tailscale === true)
+  if (mode === 'allow' && cidrs.length === 0) {
+    throw new Error('An allow list needs at least one --cidr (or --tailscale); otherwise nobody could reach it')
+  }
+  return { mode, cidrs }
+}
+
 async function setAction(options: SetOptions): Promise<void> {
   await requireAuth()
   await setupClient()
   const scope = scopeOf(options)
 
-  const mode = parseMode(options.mode ?? '')
-  if (mode === undefined) {
-    warning(`Invalid mode: ${options.mode}. Available: ${MODES.join(', ')}`)
-    return
-  }
-  const cidrs = buildCidrList(options.cidr ?? [], options.tailscale === true)
-  if (mode === 'allow' && cidrs.length === 0) {
-    warning('An allow list needs at least one --cidr (or --tailscale); otherwise nobody could reach it')
-    return
-  }
+  const { mode, cidrs } = resolveSetInput(options)
 
   const saved = await withSpinner(`Saving IP access list for ${scopeLabel(scope)}...`, async () => {
     const body = { mode, cidrs, acknowledge_lockout: options.acknowledgeLockout === true }
@@ -245,8 +256,7 @@ async function testAction(options: TestOptions): Promise<void> {
   const scope = scopeOf(options)
   const ip = (options.ip ?? '').trim()
   if (ip.length === 0) {
-    warning('--ip is required')
-    return
+    throw new Error('--ip is required')
   }
 
   const result = await withSpinner(`Evaluating ${ip}...`, async () => {

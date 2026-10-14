@@ -12,6 +12,7 @@ import {
   ipAccessFormSchema,
   missingPresets,
   presetsFit,
+  probeDraft,
   probeScope,
   showsEntries,
   policySummary,
@@ -163,6 +164,43 @@ describe('probe scope', () => {
     expect(probeScope(true, 'disabled')).toBe('scope')
     expect(probeScope(false, 'allow')).toBe('scope')
     expect(probeScope(false, 'disabled')).toBe('scope')
+  })
+})
+
+describe('probeDraft', () => {
+  test('a scope that follows the project tests the stored list', () => {
+    expect(probeDraft({ mode: 'inherit', cidrs: [] })).toEqual({
+      kind: 'saved',
+    })
+  })
+
+  test('a valid draft is previewed as shown, trimmed', () => {
+    expect(
+      probeDraft({
+        mode: 'deny',
+        cidrs: [{ cidr: ' 203.0.113.0/24 ', description: ' office ' }],
+      })
+    ).toEqual({
+      kind: 'draft',
+      mode: 'deny',
+      cidrs: [{ cidr: '203.0.113.0/24', description: 'office' }],
+    })
+  })
+
+  test('an invalid draft is reported, never swapped for the saved list', () => {
+    const draft = probeDraft({
+      mode: 'allow',
+      cidrs: [{ cidr: 'not-a-cidr', description: '' }],
+    })
+    expect(draft.kind).toBe('invalid')
+  })
+
+  test('an empty allow draft is still previewed so it shows everything blocked', () => {
+    expect(probeDraft({ mode: 'allow', cidrs: [] })).toEqual({
+      kind: 'draft',
+      mode: 'allow',
+      cidrs: [],
+    })
   })
 })
 

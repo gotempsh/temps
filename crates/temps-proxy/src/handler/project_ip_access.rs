@@ -58,7 +58,8 @@ impl From<ProjectIpAccessError> for Problem {
             | ProjectIpAccessError::TooManyCidrs { .. }
             | ProjectIpAccessError::DescriptionTooLong { .. }
             | ProjectIpAccessError::EmptyAllowList { .. }
-            | ProjectIpAccessError::InvalidIpAddress { .. } => {
+            | ProjectIpAccessError::InvalidIpAddress { .. }
+            | ProjectIpAccessError::IncompleteDraft { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid IP Access Policy")
                     .with_detail(error.to_string())

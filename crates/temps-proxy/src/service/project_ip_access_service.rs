@@ -91,6 +91,15 @@ pub enum ProjectIpAccessError {
     InvalidIpAddress { input: String },
 
     #[error(
+        "A draft to test against {scope} needs both 'mode' and 'cidrs'; '{missing}' was not \
+         supplied. Send both to preview a draft, or neither to test the saved policy"
+    )]
+    IncompleteDraft {
+        scope: String,
+        missing: &'static str,
+    },
+
+    #[error(
         "The IP access policy for {scope} was changed by another request at the same time; \
          reload it and try again"
     )]
@@ -588,6 +597,9 @@ impl ProjectIpAccessService {
 
         self.ensure_scope_exists(project_id, environment_id).await?;
 
+        // `fail_closed` explains a saved policy the proxy cannot read: the
+        // proxy then refuses every address, so the preview must too.
+        let mut fail_closed: Option<String> = None;
         let (source, mode, entries, networks) = match (request.mode, request.cidrs) {
             (Some(mode), Some(cidrs)) => {
                 // A draft may be an empty allow list while being edited; the
@@ -603,7 +615,19 @@ impl ProjectIpAccessService {
                 };
                 (PolicySource::Draft, mode, policy.entries, policy.networks)
             }
-            _ => {
+            (Some(_), None) => {
+                return Err(ProjectIpAccessError::IncompleteDraft {
+                    scope,
+                    missing: "cidrs",
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ProjectIpAccessError::IncompleteDraft {
+                    scope,
+                    missing: "mode",
+                });
+            }
+            (None, None) => {
                 let own = match environment_id {
                     Some(_) => self.find_row(project_id, environment_id).await?,
                     None => None,
@@ -617,9 +641,33 @@ impl ProjectIpAccessService {
                 };
                 match row {
                     Some(row) => {
-                        let mode = IpAccessMode::parse(&row.mode).unwrap_or(IpAccessMode::Allow);
+                        let stored_mode = IpAccessMode::parse(&row.mode);
+                        let total = row.cidrs.0.len();
                         let (entries, networks) = aligned_policy(row.cidrs.0);
-                        (source, mode, entries, networks)
+                        let unreadable = total - entries.len();
+                        match stored_mode {
+                            // Same rules as the proxy's compile step: an
+                            // unknown mode, or a deny list with an entry that
+                            // no longer parses, refuses everyone.
+                            None => {
+                                fail_closed = Some(format!(
+                                    "Blocked: the stored mode '{}' is not recognised, so every \
+                                     address is refused until the policy is saved again.",
+                                    row.mode
+                                ));
+                                (source, IpAccessMode::Allow, Vec::new(), Vec::new())
+                            }
+                            Some(IpAccessMode::Deny) if unreadable > 0 => {
+                                fail_closed = Some(format!(
+                                    "Blocked: the stored deny list has {unreadable} unreadable \
+                                     entr{}, so every address is refused until the policy is \
+                                     saved again.",
+                                    if unreadable == 1 { "y" } else { "ies" }
+                                ));
+                                (source, IpAccessMode::Allow, Vec::new(), Vec::new())
+                            }
+                            Some(mode) => (source, mode, entries, networks),
+                        }
                     }
                     None => (
                         PolicySource::None,
@@ -644,6 +692,7 @@ impl ProjectIpAccessService {
 
         let (allowed, matched_cidr) = evaluate(mode, &entries, &networks, ip);
         let reason = match (mode, &matched_cidr) {
+            (IpAccessMode::Allow, _) if fail_closed.is_some() => fail_closed.unwrap_or_default(),
             (IpAccessMode::Disabled, _) => {
                 "No IP restriction applies, so every address is allowed.".to_string()
             }
@@ -1286,5 +1335,130 @@ mod tests {
             .expect("test succeeds");
         assert!(response.allowed);
         assert_eq!(response.source, PolicySource::None);
+    }
+
+    fn probe(ip: &str) -> TestProjectIpAccessRequest {
+        TestProjectIpAccessRequest {
+            ip: ip.into(),
+            mode: None,
+            cidrs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_only_a_mode_is_rejected_not_answered_from_the_saved_list() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let err = service
+            .test(
+                5,
+                None,
+                TestProjectIpAccessRequest {
+                    mode: Some(IpAccessMode::Deny),
+                    ..probe("8.8.8.8")
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectIpAccessError::IncompleteDraft {
+                missing: "cidrs",
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("project 5"));
+    }
+
+    #[tokio::test]
+    async fn test_with_only_cidrs_is_rejected_not_answered_from_the_saved_list() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let err = service
+            .test(
+                5,
+                None,
+                TestProjectIpAccessRequest {
+                    cidrs: Some(vec![entry("10.0.0.0/8")]),
+                    ..probe("8.8.8.8")
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectIpAccessError::IncompleteDraft {
+                missing: "mode",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_a_saved_deny_list_with_an_unreadable_entry_refuses_everyone_like_the_proxy() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![rule_row(
+                5,
+                None,
+                "deny",
+                &["10.0.0.0/8", "not-a-cidr"],
+            )]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let response = service
+            .test(5, None, probe("8.8.8.8"))
+            .await
+            .expect("test succeeds");
+        assert!(!response.allowed);
+        assert_eq!(response.source, PolicySource::Project);
+        assert!(
+            response.reason.contains("unreadable"),
+            "{}",
+            response.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_saved_deny_list_of_only_unreadable_entries_refuses_everyone() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![rule_row(5, None, "deny", &["not-a-cidr"])]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let response = service
+            .test(5, None, probe("8.8.8.8"))
+            .await
+            .expect("test succeeds");
+        assert!(!response.allowed);
+    }
+
+    #[tokio::test]
+    async fn test_a_saved_allow_list_still_skips_an_unreadable_entry() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![rule_row(
+                5,
+                None,
+                "allow",
+                &["not-a-cidr", "10.0.0.0/8"],
+            )]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let response = service
+            .test(5, None, probe("10.1.2.3"))
+            .await
+            .expect("test succeeds");
+        assert!(response.allowed);
+        assert_eq!(response.matched_cidr.as_deref(), Some("10.0.0.0/8"));
     }
 }

@@ -72,6 +72,7 @@ import {
   missingPresets,
   policySummary,
   presetsFit,
+  probeDraft,
   probeScope,
   showsEntries,
   type IpAccessFormValues,
@@ -170,7 +171,10 @@ export function ProjectIpAccessCard({
   // remove reset the form explicitly instead.
   const isDirty = form.formState.isDirty
   const dirtyRef = useRef(isDirty)
-  dirtyRef.current = isDirty
+  // Declared before the load effect below so the ref is current when it runs.
+  useEffect(() => {
+    dirtyRef.current = isDirty
+  }, [isDirty])
   const loadedScopeRef = useRef<string | null>(null)
   const [changedElsewhere, setChangedElsewhere] = useState(false)
   const savedAt = policy?.updated_at ?? null
@@ -202,6 +206,7 @@ export function ProjectIpAccessCard({
   const [probe, setProbe] = useState('')
   const [probeResult, setProbeResult] =
     useState<TestProjectIpAccessResponse | null>(null)
+  const [probeDraftError, setProbeDraftError] = useState<string | null>(null)
 
   const save = useMutation({
     mutationFn: async (body: SetProjectIpAccessRequest) => {
@@ -287,17 +292,18 @@ export function ProjectIpAccessCard({
       }
       viaProject: boolean
     }) => {
-      const result = isEnvironment && !viaProject
-        ? await testEnvironmentIpAccess({
-            path: { project_id: projectId, environment_id: environmentId },
-            body,
-            throwOnError: true,
-          })
-        : await testProjectIpAccess({
-            path: { project_id: projectId },
-            body,
-            throwOnError: true,
-          })
+      const result =
+        isEnvironment && !viaProject
+          ? await testEnvironmentIpAccess({
+              path: { project_id: projectId, environment_id: environmentId },
+              body,
+              throwOnError: true,
+            })
+          : await testProjectIpAccess({
+              path: { project_id: projectId },
+              body,
+              throwOnError: true,
+            })
       return result.data
     },
     onSuccess: setProbeResult,
@@ -332,25 +338,24 @@ export function ProjectIpAccessCard({
     const address = probe.trim()
     if (!address) return
     const values = form.getValues()
-    // Evaluate the draft as shown so the answer matches what Save would do;
-    // an invalid draft falls back to the stored policy.
-    const draft = ipAccessFormSchema.safeParse(values)
+    // Evaluate the draft as shown so the answer matches what Save would do.
+    // A draft that cannot be evaluated is reported, never swapped for the
+    // saved list.
+    const draft = probeDraft(values)
+    if (draft.kind === 'invalid') {
+      setProbeResult(null)
+      setProbeDraftError(draft.message)
+      return
+    }
+    setProbeDraftError(null)
     probeMutation.mutate({
       // An environment set to follow the project is governed by the project's
       // stored list, whatever override it holds today.
       viaProject: probeScope(isEnvironment, values.mode) === 'project',
-      body: {
-        ip: address,
-        ...(draft.success && draft.data.mode !== 'inherit'
-          ? {
-              mode: draft.data.mode as IpAccessMode,
-              cidrs: draft.data.cidrs.map((entry) => ({
-                cidr: entry.cidr.trim(),
-                description: entry.description?.trim() || null,
-              })),
-            }
-          : {}),
-      },
+      body:
+        draft.kind === 'draft'
+          ? { ip: address, mode: draft.mode, cidrs: draft.cidrs }
+          : { ip: address },
     })
   }
 
@@ -648,6 +653,11 @@ export function ProjectIpAccessCard({
             {probeMutation.isPending ? 'Checking…' : 'Check'}
           </Button>
         </div>
+        {probeDraftError && (
+          <p className="text-sm text-destructive" role="alert">
+            Fix the list before trying an address: {probeDraftError}
+          </p>
+        )}
         {probeResult && (
           <p
             className={

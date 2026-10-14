@@ -81,9 +81,7 @@ test('an environment set to follow the project is tested against the project lis
   })
 
   // The environment holds an override, but the operator picks "follow".
-  fireEvent.click(
-    view.getByRole('radio', { name: /Follow the project list/ })
-  )
+  fireEvent.click(view.getByRole('radio', { name: /Follow the project list/ }))
   fireEvent.change(view.getByLabelText('Try an address'), {
     target: { value: '198.51.100.7' },
   })
@@ -91,9 +89,9 @@ test('an environment set to follow the project is tested against the project lis
 
   expect(await view.findByText(/Blocked/)).toBeTruthy()
   expect(api.called('POST', '/projects/2/ip-access/test')).toBe(true)
-  expect(
-    api.called('POST', '/projects/2/environments/7/ip-access/test')
-  ).toBe(false)
+  expect(api.called('POST', '/projects/2/environments/7/ip-access/test')).toBe(
+    false
+  )
   api.restore()
 })
 
@@ -118,6 +116,35 @@ test('an environment with its own mode is still tested against itself', async ()
   fireEvent.click(view.getByRole('button', { name: 'Check' }))
 
   expect(await view.findByText(/Allowed/)).toBeTruthy()
+  expect(api.called('POST', '/projects/2/ip-access/test')).toBe(false)
+  api.restore()
+})
+
+test('an invalid draft is reported instead of silently testing the saved list', async () => {
+  const api = mockApi({
+    'POST /projects/2/ip-access/test': () =>
+      jsonResponse({
+        ip: '10.1.1.1',
+        allowed: true,
+        reason: 'matches 10.0.0.0/8',
+        mode: 'allow',
+        matched_cidr: '10.0.0.0/8',
+      }),
+  })
+  const { view } = mount({ data: base })
+
+  fireEvent.click(view.getByRole('button', { name: /Add range/ }))
+  fireEvent.change(view.getByLabelText('Address or range 2'), {
+    target: { value: 'not-a-cidr' },
+  })
+  fireEvent.change(view.getByLabelText('Try an address'), {
+    target: { value: '10.1.1.1' },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Check' }))
+
+  expect(
+    await view.findByText(/Fix the list before trying an address/)
+  ).toBeTruthy()
   expect(api.called('POST', '/projects/2/ip-access/test')).toBe(false)
   api.restore()
 })
