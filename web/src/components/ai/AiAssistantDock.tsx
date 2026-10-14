@@ -86,6 +86,15 @@ const CONTEXT_META: Record<string, { label: string; Icon: typeof GitBranch }> =
     project: { label: 'Service', Icon: FolderGit2 },
   }
 
+/** True below Tailwind's `md` breakpoint, where the chat list cannot sit beside the conversation. */
+function isNarrowViewport(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(max-width: 767px)').matches
+  )
+}
+
 function metaFor(contextType: string) {
   return (
     CONTEXT_META[contextType] ?? { label: contextType, Icon: MessageSquare }
@@ -321,7 +330,11 @@ export function DockBody({
   // When true, the body shows the project picker for starting a fresh
   // project-scoped chat (a new thread, not tied to a deployment/alert).
   const [picking, setPicking] = useState(false)
-  const [railOpen, setRailOpen] = useState(true)
+  // The chat list sits beside the conversation from `md` up. Below that it
+  // would take 320px of a 390px phone and push the conversation (and its
+  // header controls) off-screen, so it starts closed and, when opened, replaces
+  // the conversation until a chat is picked or it is hidden again.
+  const [railOpen, setRailOpen] = useState(() => !isNarrowViewport())
 
   // Unified list across every project.
   const loadList = useCallback(() => {
@@ -375,6 +388,7 @@ export function DockBody({
     // conversation for an unsaved draft.
     setActivePublicId(c.public_id)
     setPicking(false)
+    if (isNarrowViewport()) setRailOpen(false)
     setActive({
       projectId: c.project_id,
       projectSlug: c.project_slug ?? undefined,
@@ -571,11 +585,22 @@ export function DockBody({
   // column (header included) so the list lines up with the top of the page
   // instead of starting under the conversation title.
   const rail = isPage && railOpen && (
-    <aside className="flex h-full w-80 shrink-0 flex-col border-r">
+    <aside className="flex h-full w-full shrink-0 flex-col border-r md:w-80">
       <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
         <h2 className="text-sm font-medium text-muted-foreground">Chats</h2>
-        <span className="text-xs tabular-nums text-muted-foreground">
-          {conversations.length}
+        <span className="flex items-center gap-2">
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {conversations.length}
+          </span>
+          <button
+            type="button"
+            onClick={() => setRailOpen(false)}
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:hidden"
+            aria-label="Close chat list"
+            title="Close chat list"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </span>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
@@ -613,6 +638,7 @@ export function DockBody({
       <div
         className={cn(
           isPage && 'flex h-full min-w-0 flex-1 flex-col gap-3 p-4',
+          isPage && railOpen && 'max-md:hidden',
           !isPage && 'contents'
         )}
       >

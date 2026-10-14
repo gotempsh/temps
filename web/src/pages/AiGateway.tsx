@@ -3364,7 +3364,7 @@ export function AgentActivity() {
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Agent Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
               value={projectId?.toString() ?? ''}
@@ -3691,7 +3691,7 @@ export function ProjectAgentActivity({
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">AI Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
             onValueChange={(value) =>
