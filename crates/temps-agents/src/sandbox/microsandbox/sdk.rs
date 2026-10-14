@@ -14,7 +14,7 @@ use ::microsandbox::sandbox::{
     DeploymentProfile, FsEntryKind, FsSetAttrs, RlimitResource, SandboxHandle as MsbSandboxHandle,
     SandboxStatus, SecurityProfile,
 };
-use ::microsandbox::setup::{InstallOptions, ResolvedRuntime};
+use ::microsandbox::setup::{InstallOptions, ResolvedRuntime, RuntimeOrigin};
 use ::microsandbox::{
     ExecEvent, LocalBackend, MicrosandboxError, NetworkPolicy, NetworkProfile, Sandbox,
 };
@@ -439,27 +439,64 @@ impl MicrosandboxSandboxProvider {
     /// Install the pinned runtime pair (`msb` + `libkrunfw`) into this
     /// provider's home. Downloads the official release archive for this
     /// platform and verifies the installed pair. Idempotent: an existing
-    /// complete installation is kept.
+    /// pair of the pinned version is kept; one of any other version (left by
+    /// an older Temps) is replaced, since the SDK refuses to launch with a
+    /// runtime that is not exactly its own version.
     pub async fn install_runtime(&self) -> Result<ResolvedRuntime, AgentError> {
         let home = self.config.home();
         std::fs::create_dir_all(&home)?;
         set_dir_private(&home);
         let local = self.local()?;
-        let options = InstallOptions {
+        let mut options = InstallOptions {
             version: MICROSANDBOX_VERSION.to_string(),
             ..InstallOptions::default()
         };
+
+        let install_error = |e: MicrosandboxError| AgentError::SandboxProviderUnavailable {
+            provider: PROVIDER_NAME.to_string(),
+            reason: format!(
+                "installing microsandbox runtime v{} into {} failed: {}",
+                MICROSANDBOX_VERSION,
+                home.display(),
+                e
+            ),
+        };
+
+        if let Ok(existing) = ::microsandbox::setup::resolve_runtime(local.config()) {
+            if let Err(mismatch) = check_runtime_version(&existing) {
+                // Only the copy under this home is ours to replace. A runtime
+                // chosen through MSB_PATH or the SDK config would keep winning
+                // over whatever is installed here, so replacing the home
+                // copy would not fix anything — say so instead.
+                if existing.origin != RuntimeOrigin::Home {
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: PROVIDER_NAME.to_string(),
+                        reason: format!(
+                            "{mismatch}; it was selected through {:?} rather than the Temps \
+                             runtime home {}, so it was left untouched — point it at a \
+                             v{} runtime or remove the override",
+                            existing.origin,
+                            home.display(),
+                            MICROSANDBOX_VERSION
+                        ),
+                    });
+                }
+                tracing::info!(
+                    msb_path = %existing.msb_path.display(),
+                    expected = MICROSANDBOX_VERSION,
+                    "replacing microsandbox runtime that does not match this build: {}",
+                    mismatch
+                );
+                options.force = true;
+                return ::microsandbox::setup::install_runtime(local.config(), options)
+                    .await
+                    .map_err(install_error);
+            }
+        }
+
         ::microsandbox::setup::ensure_runtime(local.config(), options)
             .await
-            .map_err(|e| AgentError::SandboxProviderUnavailable {
-                provider: PROVIDER_NAME.to_string(),
-                reason: format!(
-                    "installing microsandbox runtime v{} into {} failed: {}",
-                    MICROSANDBOX_VERSION,
-                    home.display(),
-                    e
-                ),
-            })
+            .map_err(install_error)
     }
 
     fn resolve_name(&self, config: &SandboxCreateConfig) -> String {
@@ -1958,11 +1995,45 @@ fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBacken
         })
 }
 
+/// Compare the installed `msb` with the version this build pins.
+///
+/// The SDK launches only a runtime whose embedded version equals its own
+/// crate version, and otherwise fails every sandbox create with an opaque
+/// "no tested sandbox launch contract" error. Checking here — by reading the
+/// binary's embedded version, never executing it — turns that into an
+/// up-front, actionable readiness failure.
+fn check_runtime_version(runtime: &ResolvedRuntime) -> Result<(), MicrosandboxUnavailable> {
+    let found = ::microsandbox::setup::resolve_runtime_version(&runtime.msb_path)
+        .map(|version| version.map(|v| v.to_string()))
+        .map_err(|e| e.to_string());
+    classify_runtime_version(&runtime.msb_path, found)
+}
+
+/// Pure half of [`check_runtime_version`], unit-tested below.
+fn classify_runtime_version(
+    msb_path: &Path,
+    found: Result<Option<String>, String>,
+) -> Result<(), MicrosandboxUnavailable> {
+    let mismatch = |installed: String| MicrosandboxUnavailable::RuntimeVersionMismatch {
+        msb_path: msb_path.display().to_string(),
+        installed,
+        expected: MICROSANDBOX_VERSION.to_string(),
+    };
+    match found {
+        Ok(Some(version)) if version == MICROSANDBOX_VERSION => Ok(()),
+        Ok(Some(version)) => Err(mismatch(format!("v{version}"))),
+        Ok(None) => Err(mismatch(
+            "an unversioned build (no embedded version)".to_string(),
+        )),
+        Err(detail) => Err(mismatch(format!("unreadable ({detail})"))),
+    }
+}
+
 fn resolve_runtime(
     local: &LocalBackend,
     home: &Path,
 ) -> Result<ResolvedRuntime, MicrosandboxUnavailable> {
-    ::microsandbox::setup::resolve_runtime(local.config()).map_err(|e| match e {
+    let runtime = ::microsandbox::setup::resolve_runtime(local.config()).map_err(|e| match e {
         MicrosandboxError::RuntimeNotInstalled(detail) => {
             MicrosandboxUnavailable::RuntimeNotInstalled {
                 home: home.display().to_string(),
@@ -1975,7 +2046,9 @@ fn resolve_runtime(
             version: MICROSANDBOX_VERSION.to_string(),
             detail: other.to_string(),
         },
-    })
+    })?;
+    check_runtime_version(&runtime)?;
+    Ok(runtime)
 }
 
 /// The SDK reserves the `MSB_` environment prefix for its own runtime
@@ -2066,6 +2139,50 @@ fn workspace_has_entries(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_runtime_version_matches_the_sdk_this_build_links() {
+        // The SDK launches only a runtime equal to its own version, and
+        // `install_runtime` downloads `MICROSANDBOX_VERSION`. If a dependency
+        // bump moves the crate without moving the constant, setup installs a
+        // runtime the SDK then rejects at every sandbox create.
+        assert_eq!(
+            MICROSANDBOX_VERSION,
+            InstallOptions::default().version,
+            "MICROSANDBOX_VERSION must equal the pinned microsandbox crate version"
+        );
+    }
+
+    #[test]
+    fn runtime_version_check_accepts_only_the_pinned_version() {
+        let msb = Path::new("/h/microsandbox/bin/msb");
+        assert!(classify_runtime_version(msb, Ok(Some(MICROSANDBOX_VERSION.into()))).is_ok());
+
+        let older = classify_runtime_version(msb, Ok(Some("0.7.7".into()))).unwrap_err();
+        match &older {
+            MicrosandboxUnavailable::RuntimeVersionMismatch {
+                msb_path,
+                installed,
+                expected,
+            } => {
+                assert_eq!(msb_path, "/h/microsandbox/bin/msb");
+                assert_eq!(installed, "v0.7.7");
+                assert_eq!(expected, MICROSANDBOX_VERSION);
+            }
+            other => panic!("expected RuntimeVersionMismatch, got {other:?}"),
+        }
+
+        for found in [Ok(None), Err("bad ELF header".to_string())] {
+            assert!(
+                matches!(
+                    classify_runtime_version(msb, found),
+                    Err(MicrosandboxUnavailable::RuntimeVersionMismatch { .. })
+                ),
+                "an unversioned or unreadable msb must not be reported as ready"
+            );
+        }
+    }
+
     use crate::sandbox::microsandbox::host_data_dir;
 
     fn create_config() -> SandboxCreateConfig {

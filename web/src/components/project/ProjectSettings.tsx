@@ -8,6 +8,7 @@ import { CronJobDetail } from './settings/CronJobDetail'
 import { LegacyProjectRouteRedirect } from './LegacyProjectRouteRedirect'
 import { CombinedProjectSettings } from './settings/CombinedProjectSettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
+import { ProjectIpAccessCard } from './settings/ProjectIpAccessCard'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { SecretPage } from './settings/SecretPage'
 import { TelemetrySettings } from './settings/TelemetrySettings'
@@ -106,7 +107,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         <Route
           path="security"
           element={
-            <ProjectSecuritySettings project={project} refetch={refetch} />
+            <div className="space-y-6">
+              <ProjectSecuritySettings project={project} refetch={refetch} />
+              <ProjectIpAccessCard projectId={project.id} />
+            </div>
           }
         />
         <Route

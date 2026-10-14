@@ -72,7 +72,10 @@ pub enum FirecrackerSubcommand {
 
 #[derive(Args)]
 pub struct FirecrackerSetupCommand {
-    /// Data directory for storing configuration and runtime files
+    /// Data directory for storing configuration and runtime files. Must be
+    /// the directory the server runs with (its `TEMPS_DATA_DIR`); when
+    /// omitted, `~/.temps` is used, or `~/.temps/data` on installs that keep
+    /// their keys there.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
@@ -241,7 +244,8 @@ impl FirecrackerSetupCommand {
     }
 
     async fn run(self) -> anyhow::Result<()> {
-        let data_dir = resolve_data_dir(&self.data_dir);
+        let resolved = resolve_data_dir(&self.data_dir);
+        let data_dir = resolved.dir.clone();
         let dirs = Dirs::new(&data_dir);
 
         if self.uninstall {
@@ -256,7 +260,35 @@ impl FirecrackerSetupCommand {
         };
         println!("{}", title.bright_white().bold());
         println!("{}", "  ===================================".bright_cyan());
-        info("Data directory", dirs.root.display().to_string());
+        info(
+            "Data directory",
+            format!("{} ({})", dirs.root.display(), resolved.source.describe()),
+        );
+        for warning in &resolved.warnings {
+            warn("Data directory", warning);
+        }
+        // The server reads this backend from *its* data directory. State
+        // under another candidate directory means setup went somewhere the
+        // server never looks.
+        if let Some(home) = dirs::home_dir() {
+            for other in super::doctor::other_data_dirs_with(
+                &data_dir,
+                &home,
+                std::path::Path::new("firecracker/state.json"),
+            ) {
+                warn(
+                    "Data directory",
+                    format!(
+                        "Firecracker is also provisioned under {}. A server started with \
+                         TEMPS_DATA_DIR={} uses that one, not this one; re-run with \
+                         `--data-dir {}` if that is the server's directory",
+                        other.join("firecracker").display(),
+                        other.display(),
+                        other.display()
+                    ),
+                );
+            }
+        }
 
         if self.network_only {
             let failures = self.stage_network(&dirs, false)?;
@@ -1312,16 +1344,11 @@ async fn build_smoke_rootfs(smoke_dir: &Path) -> anyhow::Result<PathBuf> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn resolve_data_dir(flag: &Option<PathBuf>) -> PathBuf {
-    if let Some(d) = flag {
-        d.clone()
-    } else if let Ok(d) = std::env::var("TEMPS_DATA_DIR") {
-        PathBuf::from(d)
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".temps")
-    }
+fn resolve_data_dir(flag: &Option<PathBuf>) -> super::data_dir_discovery::ResolvedDataDir {
+    let explicit = flag
+        .clone()
+        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from));
+    super::data_dir_discovery::resolve(explicit.as_deref(), dirs::home_dir().as_deref())
 }
 
 fn fc_arch() -> anyhow::Result<&'static str> {

@@ -332,6 +332,7 @@ mod m20261013_000001_webhook_delivery_identity;
 mod m20261013_000002_add_kind_to_ai_conversations;
 mod m20261013_000003_allow_source_built_service_release;
 mod m20261014_000001_add_instantiation_claim_token;
+mod m20261014_000002_create_project_ip_access_rules;
 mod m20261014_000002_index_ip_geolocation_references;
 mod m20261014_000003_ip_geolocation_last_used_at;
 
@@ -743,6 +744,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261013_000003_allow_source_built_service_release::Migration),
             // Each claim of a template instantiation gets an ownership token.
             Box::new(m20261014_000001_add_instantiation_claim_token::Migration),
+            // Per-project / per-environment IP allow and deny lists.
+            Box::new(m20261014_000002_create_project_ip_access_rules::Migration),
             // Partial indexes on the columns that reference stored IP addresses.
             Box::new(m20261014_000002_index_ip_geolocation_references::Migration),
             Box::new(m20261014_000003_ip_geolocation_last_used_at::Migration),

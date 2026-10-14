@@ -14357,6 +14357,20 @@ export type IntegrationResponse = {
 };
 
 /**
+ * One CIDR in a policy, in canonical form (network address, explicit prefix).
+ */
+export type IpAccessCidrEntry = {
+    /**
+     * Canonical CIDR, e.g. `10.0.0.0/8` or `fd7a:115c:a1e0::/48`.
+     */
+    cidr: string;
+    /**
+     * Optional human label, e.g. `Office`.
+     */
+    description?: string | null;
+};
+
+/**
  * Query parameters for listing IP access control rules
  */
 export type IpAccessControlQuery = {
@@ -14378,6 +14392,11 @@ export type IpAccessControlResponse = {
     reason?: string | null;
     updated_at: string;
 };
+
+/**
+ * How a scope's CIDR list is applied.
+ */
+export type IpAccessMode = 'disabled' | 'allow' | 'deny';
 
 /**
  * Snapshot of a background job. `status` is one of "running" | "exited"
@@ -18937,6 +18956,11 @@ export type PluginStatusResponse = {
 };
 
 /**
+ * Which policy decided a test.
+ */
+export type PolicySource = 'draft' | 'environment' | 'project' | 'none';
+
+/**
  * Port mapping
  */
 export type PortMapping = {
@@ -19624,6 +19648,42 @@ export type ProjectInfo = {
     created_at: string;
     id: number;
     slug: string;
+};
+
+/**
+ * A stored policy plus the address the console saw for the caller, so the
+ * UI can offer "add my IP" and warn before a lock-out.
+ */
+export type ProjectIpAccessDetail = ProjectIpAccessResponse & {
+    /**
+     * The address this request arrived from, as the console resolved it.
+     * It is the address the project will see only if the console and the
+     * project are reached over the same network path.
+     */
+    your_ip?: string | null;
+};
+
+/**
+ * One scope's stored policy.
+ */
+export type ProjectIpAccessResponse = {
+    cidrs: Array<IpAccessCidrEntry>;
+    /**
+     * `false` when nothing is stored for this scope. For an environment that
+     * means it inherits the project-wide policy.
+     */
+    configured: boolean;
+    /**
+     * `null` for the project-wide policy.
+     */
+    environment_id?: number | null;
+    /**
+     * Maximum number of CIDRs a policy may hold.
+     */
+    max_cidrs: number;
+    mode: IpAccessMode;
+    project_id: number;
+    updated_at?: string | null;
 };
 
 /**
@@ -24502,6 +24562,27 @@ export type SetProjectHostingRequest = {
     hosting: Hosting;
 };
 
+/**
+ * Request body for `PUT`: the complete policy for one scope.
+ */
+export type SetProjectIpAccessRequest = {
+    /**
+     * Apply an allow list that excludes (or a deny list that includes) the
+     * address this request came from. Without it such a save is refused
+     * with 409 so an operator cannot lock themselves out by accident.
+     */
+    acknowledge_lockout?: boolean;
+    /**
+     * CIDRs (IPv4 or IPv6). A bare address is a single host. At most 256.
+     */
+    cidrs: Array<IpAccessCidrEntry>;
+    /**
+     * `disabled` keeps the list but enforces nothing; `allow` admits only
+     * listed clients; `deny` blocks listed clients.
+     */
+    mode: IpAccessMode;
+};
+
 export type SetRepositoryInheritanceRequest = {
     /**
      * True: the project follows the group's repository and branch (and is
@@ -26646,6 +26727,36 @@ export type TestEmailResponse = {
      * Whether the test email was sent successfully
      */
     success: boolean;
+};
+
+/**
+ * Request body for the "try an address against the rules" endpoint.
+ */
+export type TestProjectIpAccessRequest = {
+    cidrs?: Array<IpAccessCidrEntry> | null;
+    /**
+     * Address to evaluate.
+     */
+    ip: string;
+    mode?: IpAccessMode | null;
+};
+
+export type TestProjectIpAccessResponse = {
+    allowed: boolean;
+    /**
+     * The address as evaluated (IPv4-mapped IPv6 is shown as IPv4).
+     */
+    ip: string;
+    /**
+     * The listed CIDR the address fell inside, when one did.
+     */
+    matched_cidr?: string | null;
+    mode: IpAccessMode;
+    /**
+     * One-sentence explanation suitable for display.
+     */
+    reason: string;
+    source: PolicySource;
 };
 
 export type TestProviderKeyRequest = {
@@ -61481,6 +61592,202 @@ export type DeployFromStaticResponses = {
 
 export type DeployFromStaticResponse = DeployFromStaticResponses[keyof DeployFromStaticResponses];
 
+export type DeleteEnvironmentIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access';
+};
+
+export type DeleteEnvironmentIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment or policy not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteEnvironmentIpAccessError = DeleteEnvironmentIpAccessErrors[keyof DeleteEnvironmentIpAccessErrors];
+
+export type DeleteEnvironmentIpAccessResponses = {
+    /**
+     * Policy removed
+     */
+    204: void;
+};
+
+export type DeleteEnvironmentIpAccessResponse = DeleteEnvironmentIpAccessResponses[keyof DeleteEnvironmentIpAccessResponses];
+
+export type GetEnvironmentIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access';
+};
+
+export type GetEnvironmentIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEnvironmentIpAccessError = GetEnvironmentIpAccessErrors[keyof GetEnvironmentIpAccessErrors];
+
+export type GetEnvironmentIpAccessResponses = {
+    /**
+     * The environment's own IP access policy
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type GetEnvironmentIpAccessResponse = GetEnvironmentIpAccessResponses[keyof GetEnvironmentIpAccessResponses];
+
+export type PutEnvironmentIpAccessData = {
+    body: SetProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access';
+};
+
+export type PutEnvironmentIpAccessErrors = {
+    /**
+     * Invalid policy
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy would lock out the caller
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PutEnvironmentIpAccessError = PutEnvironmentIpAccessErrors[keyof PutEnvironmentIpAccessErrors];
+
+export type PutEnvironmentIpAccessResponses = {
+    /**
+     * Policy saved
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type PutEnvironmentIpAccessResponse = PutEnvironmentIpAccessResponses[keyof PutEnvironmentIpAccessResponses];
+
+export type TestEnvironmentIpAccessData = {
+    body: TestProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access/test';
+};
+
+export type TestEnvironmentIpAccessErrors = {
+    /**
+     * Invalid address or draft
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TestEnvironmentIpAccessError = TestEnvironmentIpAccessErrors[keyof TestEnvironmentIpAccessErrors];
+
+export type TestEnvironmentIpAccessResponses = {
+    /**
+     * Evaluation result
+     */
+    200: TestProjectIpAccessResponse;
+};
+
+export type TestEnvironmentIpAccessResponse = TestEnvironmentIpAccessResponses[keyof TestEnvironmentIpAccessResponses];
+
 export type ListAlertRulesData = {
     body?: never;
     path: {
@@ -63987,6 +64294,186 @@ export type GetInheritedEnvVarsResponses = {
 };
 
 export type GetInheritedEnvVarsResponse = GetInheritedEnvVarsResponses[keyof GetInheritedEnvVarsResponses];
+
+export type DeleteProjectIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access';
+};
+
+export type DeleteProjectIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or policy not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteProjectIpAccessError = DeleteProjectIpAccessErrors[keyof DeleteProjectIpAccessErrors];
+
+export type DeleteProjectIpAccessResponses = {
+    /**
+     * Policy removed
+     */
+    204: void;
+};
+
+export type DeleteProjectIpAccessResponse = DeleteProjectIpAccessResponses[keyof DeleteProjectIpAccessResponses];
+
+export type GetProjectIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access';
+};
+
+export type GetProjectIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectIpAccessError = GetProjectIpAccessErrors[keyof GetProjectIpAccessErrors];
+
+export type GetProjectIpAccessResponses = {
+    /**
+     * The project-wide IP access policy
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type GetProjectIpAccessResponse = GetProjectIpAccessResponses[keyof GetProjectIpAccessResponses];
+
+export type PutProjectIpAccessData = {
+    body: SetProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access';
+};
+
+export type PutProjectIpAccessErrors = {
+    /**
+     * Invalid policy
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy would lock out the caller
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PutProjectIpAccessError = PutProjectIpAccessErrors[keyof PutProjectIpAccessErrors];
+
+export type PutProjectIpAccessResponses = {
+    /**
+     * Policy saved
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type PutProjectIpAccessResponse = PutProjectIpAccessResponses[keyof PutProjectIpAccessResponses];
+
+export type TestProjectIpAccessData = {
+    body: TestProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access/test';
+};
+
+export type TestProjectIpAccessErrors = {
+    /**
+     * Invalid address or draft
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TestProjectIpAccessError = TestProjectIpAccessErrors[keyof TestProjectIpAccessErrors];
+
+export type TestProjectIpAccessResponses = {
+    /**
+     * Evaluation result
+     */
+    200: TestProjectIpAccessResponse;
+};
+
+export type TestProjectIpAccessResponse2 = TestProjectIpAccessResponses[keyof TestProjectIpAccessResponses];
 
 export type PurgeProjectLogsData = {
     body: PurgeLogsRequest;

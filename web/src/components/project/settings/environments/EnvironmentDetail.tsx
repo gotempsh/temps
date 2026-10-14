@@ -30,6 +30,7 @@ import { useState } from 'react'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
+import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 interface EnvironmentDetailProps {
@@ -337,6 +338,12 @@ export function EnvironmentDetail({
         onUpdate={() => {
           queryClient.invalidateQueries({ queryKey: ['environment'] })
         }}
+      />
+
+      <ProjectIpAccessCard
+        key={`ip-access:${environment.id}`}
+        projectId={project.id}
+        environmentId={environment.id}
       />
 
       <SubdomainCard

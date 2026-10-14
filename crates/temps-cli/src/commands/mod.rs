@@ -10,6 +10,7 @@ pub mod backup;
 pub mod build;
 pub mod ch_backfill_domains;
 pub mod cloud_telemetry_backfill;
+pub mod data_dir_discovery;
 pub mod deploy;
 pub mod doctor;
 pub mod domain;

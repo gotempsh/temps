@@ -5170,11 +5170,21 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                 &temps_agents::sandbox::microsandbox::host_data_dir(),
             );
             match capability.reason {
-                Some(reason) => format!(
-                    "backend 'microsandbox' is not available on this host: {} (see {})",
-                    reason,
-                    temps_agents::sandbox::microsandbox::SETUP_PATH
-                ),
+                Some(reason) => {
+                    // Name the command with the server's own data directory:
+                    // a bare `temps microsandbox setup` from another shell
+                    // can install the runtime somewhere the server never reads.
+                    let fix = capability
+                        .setup_command
+                        .map(|command| format!("; to fix, run `{command}` on the server host"))
+                        .unwrap_or_default();
+                    format!(
+                        "backend 'microsandbox' is not available on this host: {}{} (see {})",
+                        reason,
+                        fix,
+                        temps_agents::sandbox::microsandbox::SETUP_PATH
+                    )
+                }
                 // Ready now but not registered: the server started before
                 // the runtime was installed.
                 None => "backend 'microsandbox' is not available on this host: the runtime \
@@ -5182,8 +5192,25 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                     .to_string(),
             }
         }
+        temps_agents::sandbox::SandboxBackend::Firecracker => {
+            // Registration is decided once, at startup, from the server's own
+            // data directory. Name that directory and the command that
+            // provisions it: a bare `temps firecracker setup` from a shell
+            // without the server's TEMPS_DATA_DIR provisions a different one.
+            let data_dir = temps_agents::sandbox::microsandbox::host_data_dir();
+            let command = temps_agents::sandbox::microsandbox::command_with_data_dir(
+                "temps firecracker setup",
+                &data_dir,
+            );
+            format!(
+                "backend 'firecracker' is not available on this host: it is not provisioned \
+                 under {} (or the server has not been restarted since setup); run `{}` on \
+                 the server host, then restart temps",
+                data_dir.join("firecracker").display(),
+                command
+            )
+        }
         temps_agents::sandbox::SandboxBackend::Docker
-        | temps_agents::sandbox::SandboxBackend::Firecracker
         | temps_agents::sandbox::SandboxBackend::Local => {
             format!("backend '{}' is not available on this host", backend)
         }
@@ -5565,9 +5592,20 @@ pub(crate) mod tests {
             message.starts_with("backend 'microsandbox' is not available on this host: "),
             "{message}"
         );
+        let firecracker =
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker);
+        assert!(
+            firecracker.starts_with("backend 'firecracker' is not available on this host: "),
+            "{firecracker}"
+        );
+        assert!(
+            firecracker.contains("temps firecracker setup"),
+            "{firecracker}"
+        );
+        assert!(firecracker.contains("restart temps"), "{firecracker}");
         assert_eq!(
-            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker),
-            "backend 'firecracker' is not available on this host"
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Docker),
+            "backend 'docker' is not available on this host"
         );
     }
 
