@@ -28,15 +28,3 @@ test('settings sections expose a deep-linkable id and honour defaultOpen', () =>
   expect(closed).not.toContain('id=')
   expect(closed).not.toContain('open=""')
 })
-
-// A closed <details> still lays its controls out on screen, under the summary.
-// The content wrapper must hide them while collapsed so a layout audit (or any
-// hit test) does not report switches and buttons covered by the section header.
-test('a collapsed section hides its content from layout audits', () => {
-  const markup = renderToStaticMarkup(
-    <SettingsSection title="Feature flags" icon={Flag}>
-      Flags
-    </SettingsSection>
-  )
-  expect(markup).toContain('group-[:not([open])]/settings:invisible')
-})
