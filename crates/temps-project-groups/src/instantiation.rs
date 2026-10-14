@@ -13,11 +13,16 @@
 //! a duplicate created by trying again.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::AuthContext;
@@ -33,6 +38,7 @@ use temps_projects::template_creation::{
     EnvVarInput, RepositoryTarget, TemplateCreationCaller, TemplateRuntimeOverrides,
     TemplateServiceCreator, TemplateServiceRequest,
 };
+use thiserror::Error;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
@@ -45,6 +51,208 @@ use crate::repository::{
 };
 use crate::routes::{CreateGroupRouteRequest, GroupRouteService};
 use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Why planning or running an instantiation failed.
+///
+/// The text of a variant is what a step records on the instantiation and
+/// what the caller reads, so each one says what was being done and to what.
+/// Callers that need to tell failures apart match on the variant; nothing
+/// should parse the message.
+#[derive(Error, Debug)]
+pub enum InstantiationError {
+    /// The request or the template cannot be turned into a plan.
+    #[error("{message}")]
+    Validation { message: String },
+
+    /// A database operation of the engine failed. `operation` names what was
+    /// being done and the instantiation it was done for.
+    #[error("{operation}: {source}")]
+    Database {
+        operation: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    /// Another runner owns the instantiation now (its claim was taken over
+    /// after this runner stopped renewing the lease), or the lease could not
+    /// be renewed for so long that it may have been. The runner stops
+    /// without writing anything more: what it did not store, the new owner
+    /// redoes or adopts.
+    #[error(
+        "Instantiation {instantiation_id} is no longer owned by this runner; it stopped without \
+         recording anything further"
+    )]
+    ClaimLost { instantiation_id: i32 },
+
+    #[error("the stored plan is invalid: {reason}")]
+    InvalidPlan { reason: String },
+
+    #[error("the plan could not be serialized: {reason}")]
+    PlanNotSerializable { reason: String },
+
+    #[error("stored variable values could not be read: {reason}")]
+    SecretsUnreadable { reason: String },
+
+    #[error("stored variable values are invalid: {reason}")]
+    SecretsInvalid { reason: String },
+
+    #[error("unknown step '{key}'")]
+    UnknownStep { key: String },
+
+    #[error("the template has no service '{service}'")]
+    TemplateServiceMissing { service: String },
+
+    #[error("the plan has no service '{service}'")]
+    PlannedServiceMissing { service: String },
+
+    #[error("the plan has no {database_type} database")]
+    PlannedDatabaseMissing { database_type: String },
+
+    #[error("the project was not created")]
+    ProjectNotCreated,
+
+    #[error("service '{service}' was not created")]
+    ServiceNotCreated { service: String },
+
+    #[error("Projects named {slug} through {slug}-100 already exist; rename the project")]
+    SlugsExhausted { slug: String },
+
+    #[error(
+        "A managed database named '{name}' already exists; choose another name or link it instead"
+    )]
+    DatabaseNameTaken { name: String },
+
+    #[error(
+        "Service '{service}' of instantiation {instantiation_id} was created as project \
+         {project_id} ('{slug}') and has since been deleted; start a new instantiation"
+    )]
+    ServiceProjectDeleted {
+        instantiation_id: i32,
+        service: String,
+        project_id: i32,
+        slug: String,
+    },
+
+    #[error(
+        "Service '{service}' of instantiation {instantiation_id} was created as project \
+         {project_id} ('{slug}') but has no environment, so it was not fully initialized; delete \
+         that project and start a new instantiation"
+    )]
+    ServiceProjectUninitialized {
+        instantiation_id: i32,
+        service: String,
+        project_id: i32,
+        slug: String,
+    },
+
+    #[error(
+        "discarding project {project_id} ('{slug}'), which a previous run created for service \
+         '{service}' of instantiation {instantiation_id} and did not finish: {source}"
+    )]
+    DiscardFailed {
+        instantiation_id: i32,
+        service: String,
+        project_id: i32,
+        slug: String,
+        #[source]
+        source: Box<temps_projects::services::types::ProjectError>,
+    },
+
+    #[error("{prefix} on the source service already goes to {target}")]
+    RouteTaken { prefix: String, target: String },
+
+    /// A service the engine called (project creation, deployment queueing,
+    /// the git provider) refused with this HTTP status. `message` is the
+    /// title and detail of its problem.
+    #[error("{message}")]
+    Upstream { status: StatusCode, message: String },
+
+    #[error(transparent)]
+    Group(Box<ProjectGroupError>),
+
+    #[error(transparent)]
+    ExternalService(Box<temps_providers::ExternalServiceError>),
+
+    #[error(transparent)]
+    Project(Box<temps_projects::services::types::ProjectError>),
+
+    #[error(transparent)]
+    Variables(#[from] temps_projects::template_creation::TemplateEnvironmentError),
+
+    /// The progress note that creation of a service is about to begin could
+    /// not be stored, so it did not begin.
+    #[error("recording that service '{service}' is about to be created: {source}")]
+    CreationNotRecorded {
+        service: String,
+        #[source]
+        source: Box<InstantiationError>,
+    },
+
+    /// A step failed. Displays as the failure itself: that text is what the
+    /// step and the instantiation record.
+    #[error("{source}")]
+    StepFailed {
+        step: String,
+        #[source]
+        source: Box<InstantiationError>,
+    },
+}
+
+// The wrapped errors are large; boxing keeps every `Result` of the engine small.
+impl From<ProjectGroupError> for InstantiationError {
+    fn from(error: ProjectGroupError) -> Self {
+        InstantiationError::Group(Box::new(error))
+    }
+}
+
+impl From<temps_providers::ExternalServiceError> for InstantiationError {
+    fn from(error: temps_providers::ExternalServiceError) -> Self {
+        InstantiationError::ExternalService(Box::new(error))
+    }
+}
+
+impl From<temps_projects::services::types::ProjectError> for InstantiationError {
+    fn from(error: temps_projects::services::types::ProjectError) -> Self {
+        InstantiationError::Project(Box::new(error))
+    }
+}
+
+impl InstantiationError {
+    /// A rejected request or template.
+    pub fn validation(message: impl Into<String>) -> Self {
+        InstantiationError::Validation {
+            message: message.into(),
+        }
+    }
+
+    /// A failure of the call a step made, from the problem it returned.
+    fn from_problem(problem: Problem) -> Self {
+        let status = problem.status_code;
+        InstantiationError::Upstream {
+            status,
+            message: problem_message(problem),
+        }
+    }
+
+    fn database(operation: impl Into<String>) -> impl FnOnce(sea_orm::DbErr) -> Self {
+        let operation = operation.into();
+        move |source| InstantiationError::Database { operation, source }
+    }
+
+    /// Whether the runner lost its claim, in which case it must not write.
+    pub fn is_claim_lost(&self) -> bool {
+        match self {
+            InstantiationError::ClaimLost { .. } => true,
+            InstantiationError::CreationNotRecorded { source, .. }
+            | InstantiationError::StepFailed { source, .. } => source.is_claim_lost(),
+            _ => false,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -390,6 +598,14 @@ pub fn ensure_secrets_available(
     })
 }
 
+/// What one heartbeat tells its loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Beat {
+    Continue,
+    /// The claim is gone: there is nothing left to renew.
+    Stop,
+}
+
 /// Aborts the heartbeat task when dropped, so the lease stops being renewed
 /// on every way out of a run, including an early `?` return and a panic. A
 /// dropped `JoinHandle` only detaches the task: it would keep refreshing the
@@ -400,18 +616,21 @@ struct HeartbeatGuard {
 }
 
 impl HeartbeatGuard {
-    /// Run `beat` every `interval` until the guard is dropped.
-    fn start<F, Fut>(interval: std::time::Duration, beat: F) -> Self
+    /// Run `beat` every `interval` until the guard is dropped or `beat`
+    /// answers [`Beat::Stop`].
+    fn start<F, Fut>(interval: Duration, beat: F) -> Self
     where
         F: Fn() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = Beat> + Send + 'static,
     {
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the first immediate tick
             loop {
                 ticker.tick().await;
-                beat().await;
+                if beat().await == Beat::Stop {
+                    break;
+                }
             }
         });
         Self { handle }
@@ -421,6 +640,377 @@ impl HeartbeatGuard {
 impl Drop for HeartbeatGuard {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// Raised when the runner can no longer be sure that it owns the
+/// instantiation. The run races every step against it and checks it before
+/// writing, so a runner that lost its claim stops mid-step instead of
+/// carrying on until its next database write is refused.
+#[derive(Clone)]
+struct ClaimSignal {
+    lost: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl ClaimSignal {
+    fn new() -> Self {
+        Self {
+            lost: Arc::new(tokio::sync::watch::Sender::new(false)),
+        }
+    }
+
+    fn lose(&self) {
+        self.lost.send_replace(true);
+    }
+
+    fn is_lost(&self) -> bool {
+        *self.lost.borrow()
+    }
+
+    /// Completes once the claim is lost; never completes otherwise.
+    async fn lost(&self) {
+        let mut receiver = self.lost.subscribe();
+        if receiver.wait_for(|lost| *lost).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// How a claim stopped being the runner's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseLoss {
+    /// The row no longer carries the runner's token: another process claimed
+    /// the instantiation (or it was finished) while this one was away.
+    TakenOver,
+    /// The lease could not be renewed for this long, so another process may
+    /// claim the instantiation at any moment, whether or not it has.
+    NotRenewed { for_: Duration },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renewal {
+    Held,
+    Lost(LeaseLoss),
+}
+
+/// The runner's hold on one instantiation: renews the lease with a write
+/// that only succeeds while the row still carries the runner's token.
+struct ClaimLease {
+    db: Arc<DatabaseConnection>,
+    id: i32,
+    token: String,
+    started: Instant,
+    /// Milliseconds after `started` of the last confirmed renewal (or of the
+    /// claim itself, which is one).
+    renewed_ms: AtomicU64,
+    /// How long without a confirmed renewal before the runner gives up the
+    /// claim. Shorter than the lease other processes wait for.
+    give_up_after: Duration,
+    /// Bound on one renewal, so an unreachable database counts as a failed
+    /// renewal instead of stalling the loop.
+    call_timeout: Duration,
+}
+
+impl ClaimLease {
+    fn new(
+        db: Arc<DatabaseConnection>,
+        id: i32,
+        token: String,
+        give_up_after: Duration,
+        call_timeout: Duration,
+    ) -> Self {
+        Self {
+            db,
+            id,
+            token,
+            started: Instant::now(),
+            renewed_ms: AtomicU64::new(0),
+            give_up_after,
+            call_timeout,
+        }
+    }
+
+    fn since_renewal(&self) -> Duration {
+        let renewed = Duration::from_millis(self.renewed_ms.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(renewed)
+    }
+
+    async fn renew(&self) -> Renewal {
+        let write = template_instantiations::Entity::update_many()
+            .col_expr(
+                template_instantiations::Column::HeartbeatAt,
+                Expr::cust("NOW()"),
+            )
+            .col_expr(
+                template_instantiations::Column::UpdatedAt,
+                Expr::cust("NOW()"),
+            )
+            .filter(template_instantiations::Column::Id.eq(self.id))
+            .filter(template_instantiations::Column::ClaimToken.eq(self.token.as_str()))
+            .filter(template_instantiations::Column::Status.eq("running"))
+            .exec(self.db.as_ref());
+        match tokio::time::timeout(self.call_timeout, write).await {
+            Ok(Ok(result)) if result.rows_affected > 0 => {
+                let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.renewed_ms.store(now, Ordering::Relaxed);
+                Renewal::Held
+            }
+            Ok(Ok(_)) => Renewal::Lost(LeaseLoss::TakenOver),
+            failure => {
+                let since = self.since_renewal();
+                match failure {
+                    Ok(Err(error)) => warn!(
+                        instantiation_id = self.id,
+                        %error,
+                        since_renewal_secs = since.as_secs(),
+                        "Could not renew the lease of an instantiation"
+                    ),
+                    _ => warn!(
+                        instantiation_id = self.id,
+                        since_renewal_secs = since.as_secs(),
+                        "Renewing the lease of an instantiation timed out"
+                    ),
+                }
+                if since >= self.give_up_after {
+                    Renewal::Lost(LeaseLoss::NotRenewed { for_: since })
+                } else {
+                    Renewal::Held
+                }
+            }
+        }
+    }
+}
+
+/// One heartbeat: renew the lease, and raise `signal` when it is gone.
+async fn renew_or_signal(lease: &ClaimLease, signal: &ClaimSignal) -> Beat {
+    match lease.renew().await {
+        Renewal::Held => Beat::Continue,
+        Renewal::Lost(loss) => {
+            warn!(
+                instantiation_id = lease.id,
+                ?loss,
+                "Instantiation claim lost; stopping the run"
+            );
+            signal.lose();
+            Beat::Stop
+        }
+    }
+}
+
+/// Run `work` for the claim `signal` watches. Nothing starts once the claim
+/// is gone, and work that is running when it goes is dropped where it
+/// stands: the steps are written to be resumed after exactly that (a
+/// crash), by whoever owns the instantiation now. Work that finished in the
+/// same instant its claim went counts as lost too, since its result cannot
+/// be recorded.
+async fn until_claim_lost<T>(
+    signal: &ClaimSignal,
+    instantiation_id: i32,
+    work: impl std::future::Future<Output = Result<T, InstantiationError>>,
+) -> Result<T, InstantiationError> {
+    let lost = || InstantiationError::ClaimLost { instantiation_id };
+    if signal.is_lost() {
+        return Err(lost());
+    }
+    let outcome = tokio::select! {
+        biased;
+        () = signal.lost() => return Err(lost()),
+        outcome = work => outcome,
+    };
+    if signal.is_lost() {
+        return Err(lost());
+    }
+    outcome
+}
+
+/// The rows of `template_instantiations`, written only under a claim.
+///
+/// Every write is conditional on the claim token the runner was handed when
+/// it claimed the row, and writing nothing means the claim is gone
+/// ([`InstantiationError::ClaimLost`]): a runner that was paused or cut off
+/// past its lease cannot overwrite the progress, or the final result, of the
+/// one that took over.
+#[derive(Clone)]
+struct Ledger {
+    db: Arc<DatabaseConnection>,
+}
+
+impl Ledger {
+    fn new(db: Arc<DatabaseConnection>) -> Self {
+        Self { db }
+    }
+
+    /// Atomically claim `id` with a new token.
+    ///
+    /// Sets `status='running'`, `claimed_at`, `heartbeat_at` and a fresh
+    /// `claim_token` only if the row is in a claimable state: `pending`,
+    /// `failed`, or `running` with a stale heartbeat (the previous runner
+    /// died or lost its lease). A takeover therefore always rotates the
+    /// token, which is what fences the previous runner out. Returns the
+    /// updated row (token included), or `None` when another process owns it.
+    async fn claim(
+        &self,
+        id: i32,
+        lease_secs: i64,
+    ) -> Result<Option<template_instantiations::Model>, InstantiationError> {
+        use sea_orm::ConnectionTrait;
+        let row = self
+            .db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE template_instantiations \
+                 SET status = 'running', \
+                     claimed_at = NOW(), \
+                     heartbeat_at = NOW(), \
+                     updated_at = NOW(), \
+                     claim_token = gen_random_uuid()::text \
+                 WHERE id = $1 \
+                   AND (status IN ('pending', 'failed') \
+                        OR (status = 'running' \
+                            AND (heartbeat_at IS NULL \
+                                 OR heartbeat_at < NOW() - ($2::BIGINT * INTERVAL '1 second')))) \
+                 RETURNING id, user_id, idempotency_key, kind, template_slug, name, \
+                           group_id, status, plan, secrets, error, \
+                           created_at, updated_at, finished_at, claimed_at, heartbeat_at, \
+                           claim_token",
+                [id.into(), lease_secs.into()],
+            ))
+            .await
+            .map_err(InstantiationError::database(format!(
+                "claiming instantiation {id}"
+            )))?;
+        row.map(|row| template_instantiations::Model::from_query_result(&row, ""))
+            .transpose()
+            .map_err(InstantiationError::database(format!(
+                "reading the claimed instantiation {id}"
+            )))
+    }
+
+    /// An update of the row `model` was claimed as. Fails when `model`
+    /// carries no token, which only a row that was never claimed does.
+    fn owned_update(
+        model: &template_instantiations::Model,
+    ) -> Result<sea_orm::UpdateMany<template_instantiations::Entity>, InstantiationError> {
+        let token = model
+            .claim_token
+            .as_deref()
+            .ok_or(InstantiationError::ClaimLost {
+                instantiation_id: model.id,
+            })?;
+        Ok(template_instantiations::Entity::update_many()
+            .filter(template_instantiations::Column::Id.eq(model.id))
+            .filter(template_instantiations::Column::ClaimToken.eq(token)))
+    }
+
+    /// Store the plan and status of an instantiation the caller still owns.
+    async fn save(
+        &self,
+        model: &template_instantiations::Model,
+        plan: &InstantiationPlan,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<(), InstantiationError> {
+        let plan_json = serde_json::to_value(plan).map_err(|error| {
+            InstantiationError::PlanNotSerializable {
+                reason: error.to_string(),
+            }
+        })?;
+        let result = Self::owned_update(model)?
+            .col_expr(
+                template_instantiations::Column::Plan,
+                Expr::value(plan_json),
+            )
+            .col_expr(
+                template_instantiations::Column::GroupId,
+                Expr::value(plan.group_id),
+            )
+            .col_expr(
+                template_instantiations::Column::Status,
+                Expr::value(status.to_string()),
+            )
+            .col_expr(template_instantiations::Column::Error, Expr::value(error))
+            .col_expr(
+                template_instantiations::Column::UpdatedAt,
+                Expr::value(Utc::now()),
+            )
+            .exec(self.db.as_ref())
+            .await
+            .map_err(InstantiationError::database(format!(
+                "saving instantiation {}",
+                model.id
+            )))?;
+        if result.rows_affected == 0 {
+            return Err(InstantiationError::ClaimLost {
+                instantiation_id: model.id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Record how the run ended and release the claim. The token is cleared,
+    /// so nothing the runner still holds can write to the row afterwards.
+    async fn finish(
+        &self,
+        model: &template_instantiations::Model,
+        plan: &InstantiationPlan,
+        outcome: Result<(), &InstantiationError>,
+    ) -> Result<(), InstantiationError> {
+        let now = Utc::now();
+        let mut update = Self::owned_update(model)?
+            .col_expr(
+                template_instantiations::Column::GroupId,
+                Expr::value(plan.group_id),
+            )
+            .col_expr(template_instantiations::Column::UpdatedAt, Expr::value(now))
+            .col_expr(
+                template_instantiations::Column::FinishedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(
+                template_instantiations::Column::ClaimToken,
+                Expr::value(Option::<String>::None),
+            );
+        // A plan that cannot be serialized leaves the stored one in place.
+        if let Ok(value) = serde_json::to_value(plan) {
+            update = update.col_expr(template_instantiations::Column::Plan, Expr::value(value));
+        }
+        update = match outcome {
+            Ok(()) => update
+                .col_expr(
+                    template_instantiations::Column::Status,
+                    Expr::value("succeeded".to_string()),
+                )
+                .col_expr(
+                    template_instantiations::Column::Error,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    template_instantiations::Column::Secrets,
+                    Expr::value(Option::<String>::None),
+                ),
+            Err(error) => update
+                .col_expr(
+                    template_instantiations::Column::Status,
+                    Expr::value("failed".to_string()),
+                )
+                .col_expr(
+                    template_instantiations::Column::Error,
+                    Expr::value(Some(error.to_string())),
+                ),
+        };
+        let result = update
+            .exec(self.db.as_ref())
+            .await
+            .map_err(InstantiationError::database(format!(
+                "recording the outcome of instantiation {}",
+                model.id
+            )))?;
+        if result.rows_affected == 0 {
+            return Err(InstantiationError::ClaimLost {
+                instantiation_id: model.id,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -522,7 +1112,7 @@ fn display_git_url(url: &str) -> String {
 fn assign_variables(
     template: &ProjectTemplate,
     variables: &[TemplateVariableInput],
-) -> Result<PlanSecrets, String> {
+) -> Result<PlanSecrets, InstantiationError> {
     let mut secrets = PlanSecrets::default();
     let shared_names: HashSet<&str> = template
         .shared_env_vars
@@ -538,10 +1128,12 @@ fn assign_variables(
         let owner = match variable.service.as_deref() {
             Some(service) => {
                 if template.service(service).is_none() {
-                    return Err(format!(
+                    return Err(InstantiationError::Validation {
+ message: format!(
                         "Variable '{}' is for service '{service}', which the template does not have",
                         variable.name
-                    ));
+                    ),
+ });
                 }
                 Some(service.to_string())
             }
@@ -561,16 +1153,20 @@ fn assign_variables(
                     [service] => Some(service.name.clone()),
                     [] if !template.is_multi_service() => Some(template.primary().name.clone()),
                     [] => {
-                        return Err(format!(
+                        return Err(InstantiationError::Validation {
+ message: format!(
                             "Variable '{}' is not declared by the template; say which service it is for",
                             variable.name
-                        ))
+                        ),
+ })
                     }
                     _ => {
-                        return Err(format!(
+                        return Err(InstantiationError::Validation {
+ message: format!(
                             "Variable '{}' is declared by several services; say which one it is for",
                             variable.name
-                        ))
+                        ),
+ })
                     }
                 }
             }
@@ -589,7 +1185,7 @@ fn assign_variables(
 fn resolve_shared_variables(
     variables: &[EnvVarTemplate],
     supplied: &[EnvVarInput],
-) -> Result<Vec<EnvVarInput>, String> {
+) -> Result<Vec<EnvVarInput>, InstantiationError> {
     let mut resolved = Vec::new();
     for variable in variables {
         let supplied_value = supplied
@@ -605,13 +1201,15 @@ fn resolve_shared_variables(
                         &variable.name,
                         generator,
                     )
-                    .map_err(|error| error.to_string())?,
+                    ?,
                 ),
                 (_, Some(generator)) => {
-                    return Err(format!(
+                    return Err(InstantiationError::Validation {
+ message: format!(
                         "Shared variable '{}' uses generator '{generator}', which only works for a single service",
                         variable.name
-                    ))
+                    ),
+ })
                 }
                 _ => None,
             },
@@ -624,20 +1222,21 @@ fn resolve_shared_variables(
                     || supplied_value.is_some_and(|input| input.is_secret),
             }),
             None if variable.required => {
-                return Err(format!(
-                    "Required shared variable '{}' has no value",
-                    variable.name
-                ))
+                return Err(InstantiationError::Validation {
+                    message: format!("Required shared variable '{}' has no value", variable.name),
+                })
             }
             None => {}
         }
     }
     for input in supplied {
         if !variables.iter().any(|variable| variable.name == input.name) {
-            return Err(format!(
-                "Variable '{}' is not a shared variable of the template",
-                input.name
-            ));
+            return Err(InstantiationError::Validation {
+                message: format!(
+                    "Variable '{}' is not a shared variable of the template",
+                    input.name
+                ),
+            });
         }
     }
     Ok(resolved)
@@ -668,7 +1267,7 @@ pub fn import_template(
     repository_url: String,
     branch: String,
     apps: &[ImportedApp],
-) -> Result<ProjectTemplate, String> {
+) -> Result<ProjectTemplate, InstantiationError> {
     let mut services = Vec::with_capacity(apps.len());
     let mut names = HashSet::new();
     for app in apps {
@@ -690,7 +1289,9 @@ pub fn import_template(
         });
     }
     if services.is_empty() {
-        return Err("Choose at least one app to add".to_string());
+        return Err(InstantiationError::Validation {
+            message: "Choose at least one app to add".to_string(),
+        });
     }
     Ok(ProjectTemplate {
         slug: format!("import-{}", group.slug),
@@ -734,16 +1335,20 @@ pub struct PlanInput<'a> {
     pub variables: &'a [TemplateVariableInput],
 }
 
-pub fn build_plan(input: PlanInput<'_>) -> Result<(InstantiationPlan, PlanSecrets), String> {
+pub fn build_plan(
+    input: PlanInput<'_>,
+) -> Result<(InstantiationPlan, PlanSecrets), InstantiationError> {
     let template = input.template;
     let mut secrets = assign_variables(&template, input.variables)?;
     if matches!(input.target, PlannedTarget::NoProject) {
         if template.is_multi_service() {
-            return Err(format!(
+            return Err(InstantiationError::Validation {
+                message: format!(
                 "'{}' has {} services, which go into a project; choose a new or existing project",
                 template.name,
                 template.services.len()
-            ));
+            ),
+            });
         }
         // A service without a project keeps the shared variables itself.
         let primary = template.primary().name.clone();
@@ -762,11 +1367,11 @@ pub fn build_plan(input: PlanInput<'_>) -> Result<(InstantiationPlan, PlanSecret
                 temps_core::templates::managed_service_types_compatible(requested, database_type)
             })
             .map(|(_, choice)| choice.clone())
-            .ok_or_else(|| {
-                format!(
+            .ok_or_else(|| InstantiationError::Validation {
+                message: format!(
                     "'{}' needs a {database_type} database: link one or ask for a new one",
                     template.name
-                )
+                ),
             })?;
         let service_id = match choice {
             DatabaseChoice::Existing { service_id } => Some(service_id),
@@ -782,10 +1387,9 @@ pub fn build_plan(input: PlanInput<'_>) -> Result<(InstantiationPlan, PlanSecret
         if !template.databases.iter().any(|database| {
             temps_core::templates::managed_service_types_compatible(requested, database)
         }) {
-            return Err(format!(
-                "'{}' does not use a {requested} database",
-                template.name
-            ));
+            return Err(InstantiationError::Validation {
+                message: format!("'{}' does not use a {requested} database", template.name),
+            });
         }
     }
 
@@ -884,6 +1488,8 @@ pub struct InstantiationEngine {
     /// Instantiations running in this process. A stored `running` status
     /// that is not in here was interrupted by a restart.
     running: Arc<Mutex<HashSet<i32>>>,
+    /// The instantiation rows, written under the runner's claim token.
+    ledger: Ledger,
 }
 
 /// The request metadata recorded in audit events of created services.
@@ -912,6 +1518,7 @@ impl InstantiationEngine {
         audit: Arc<dyn temps_core::AuditLogger>,
     ) -> Self {
         Self {
+            ledger: Ledger::new(db.clone()),
             db,
             encryption,
             groups,
@@ -930,7 +1537,12 @@ impl InstantiationEngine {
     /// Lease duration in seconds: a heartbeat older than this is considered stale.
     const HEARTBEAT_LEASE_SECS: i64 = 120;
     /// How often the engine writes a heartbeat while running.
-    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+    /// How long a runner may go without a confirmed renewal before it stops:
+    /// one heartbeat short of the lease, so it has stopped (at the latest at
+    /// the first heartbeat after this) before another process may take the
+    /// instantiation over.
+    const LEASE_GIVE_UP: Duration = Duration::from_secs(Self::HEARTBEAT_LEASE_SECS as u64 - 30);
 
     /// Whether `id` is running in this process.
     pub fn is_active(&self, id: i32) -> bool {
@@ -938,85 +1550,6 @@ impl InstantiationEngine {
             .lock()
             .map(|running| running.contains(&id))
             .unwrap_or(false)
-    }
-
-    /// Atomically claim `id` in the database.
-    ///
-    /// Sets `status='running'`, `claimed_at=now()`, `heartbeat_at=now()` only
-    /// if the row is currently in a claimable state: `pending`, `failed`, or
-    /// `running` with a stale heartbeat (the previous runner died). Returns
-    /// the updated row, or `None` when another process owns it.
-    async fn claim_in_db(&self, id: i32) -> Result<Option<template_instantiations::Model>, String> {
-        use sea_orm::ConnectionTrait;
-        let lease_secs = Self::HEARTBEAT_LEASE_SECS;
-        let row = self
-            .db
-            .query_one(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE template_instantiations \
-                 SET status = 'running', \
-                     claimed_at = NOW(), \
-                     heartbeat_at = NOW(), \
-                     updated_at = NOW() \
-                 WHERE id = $1 \
-                   AND (status IN ('pending', 'failed') \
-                        OR (status = 'running' \
-                            AND (heartbeat_at IS NULL \
-                                 OR heartbeat_at < NOW() - ($2::BIGINT * INTERVAL '1 second')))) \
-                 RETURNING id, user_id, idempotency_key, kind, template_slug, name, \
-                           group_id, status, plan, secrets, error, \
-                           created_at, updated_at, finished_at, claimed_at, heartbeat_at",
-                [id.into(), lease_secs.into()],
-            ))
-            .await
-            .map_err(|error| format!("claiming instantiation {id}: {error}"))?;
-
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let model = template_instantiations::Model {
-                    id: row.try_get("", "id").map_err(|e| e.to_string())?,
-                    user_id: row.try_get("", "user_id").map_err(|e| e.to_string())?,
-                    idempotency_key: row
-                        .try_get("", "idempotency_key")
-                        .map_err(|e| e.to_string())?,
-                    kind: row.try_get("", "kind").map_err(|e| e.to_string())?,
-                    template_slug: row
-                        .try_get("", "template_slug")
-                        .map_err(|e| e.to_string())?,
-                    name: row.try_get("", "name").map_err(|e| e.to_string())?,
-                    group_id: row.try_get("", "group_id").map_err(|e| e.to_string())?,
-                    status: row.try_get("", "status").map_err(|e| e.to_string())?,
-                    plan: row.try_get("", "plan").map_err(|e| e.to_string())?,
-                    secrets: row.try_get("", "secrets").map_err(|e| e.to_string())?,
-                    error: row.try_get("", "error").map_err(|e| e.to_string())?,
-                    created_at: row.try_get("", "created_at").map_err(|e| e.to_string())?,
-                    updated_at: row.try_get("", "updated_at").map_err(|e| e.to_string())?,
-                    finished_at: row.try_get("", "finished_at").map_err(|e| e.to_string())?,
-                    claimed_at: row.try_get("", "claimed_at").map_err(|e| e.to_string())?,
-                    heartbeat_at: row.try_get("", "heartbeat_at").map_err(|e| e.to_string())?,
-                };
-                Ok(Some(model))
-            }
-        }
-    }
-
-    /// Write a heartbeat for `id` to keep the lease alive.
-    async fn heartbeat(&self, id: i32) {
-        use sea_orm::ConnectionTrait;
-        if let Err(error) = self
-            .db
-            .execute(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE template_instantiations \
-                 SET heartbeat_at = NOW(), updated_at = NOW() \
-                 WHERE id = $1 AND status = 'running'",
-                [id.into()],
-            ))
-            .await
-        {
-            warn!(instantiation_id = id, %error, "Could not write heartbeat");
-        }
     }
 
     /// Mark `id` as running in-process; `false` if it is already claimed here.
@@ -1138,15 +1671,18 @@ impl InstantiationEngine {
             })
     }
 
-    fn open(&self, sealed: Option<&str>) -> Result<PlanSecrets, String> {
+    fn open(&self, sealed: Option<&str>) -> Result<PlanSecrets, InstantiationError> {
         match sealed {
             None => Ok(PlanSecrets::default()),
             Some(sealed) => {
                 let json = self.encryption.decrypt_string(sealed).map_err(|error| {
-                    format!("stored variable values could not be read: {error}")
+                    InstantiationError::SecretsUnreadable {
+                        reason: error.to_string(),
+                    }
                 })?;
-                serde_json::from_str(&json)
-                    .map_err(|error| format!("stored variable values are invalid: {error}"))
+                serde_json::from_str(&json).map_err(|error| InstantiationError::SecretsInvalid {
+                    reason: error.to_string(),
+                })
             }
         }
     }
@@ -1224,18 +1760,28 @@ impl InstantiationEngine {
                 engine: engine.clone(),
                 id,
             };
-            if let Err(error) = engine.run(id, &auth, &origin).await {
-                error!(instantiation_id = id, %error, "Instantiation stopped");
+            match engine.run(id, &auth, &origin).await {
+                Ok(()) => {}
+                // Not a fault of this process: another one owns the run now.
+                Err(error) if error.is_claim_lost() => {
+                    warn!(instantiation_id = id, %error, "Instantiation stopped");
+                }
+                Err(error) => error!(instantiation_id = id, %error, "Instantiation stopped"),
             }
         });
         true
     }
 
-    async fn run(&self, id: i32, auth: &AuthContext, origin: &RequestOrigin) -> Result<(), String> {
+    async fn run(
+        &self,
+        id: i32,
+        auth: &AuthContext,
+        origin: &RequestOrigin,
+    ) -> Result<(), InstantiationError> {
         // Atomically claim the row in the DB. This prevents two processes from
         // running the same instantiation concurrently: if another process holds
         // a fresh heartbeat, we skip.
-        let model = match self.claim_in_db(id).await? {
+        let model = match self.ledger.claim(id, Self::HEARTBEAT_LEASE_SECS).await? {
             Some(model) => model,
             None => {
                 // Another process owns it and is alive; nothing to do.
@@ -1246,8 +1792,44 @@ impl InstantiationEngine {
                 return Ok(());
             }
         };
-        let mut plan = serde_json::from_value::<InstantiationPlan>(model.plan.clone())
-            .map_err(|error| format!("the stored plan is invalid: {error}"))?;
+        let token = model
+            .claim_token
+            .clone()
+            .ok_or(InstantiationError::ClaimLost {
+                instantiation_id: id,
+            })?;
+
+        // Heartbeat task: renews the lease every HEARTBEAT_INTERVAL, with a
+        // write that only lands while the row still carries this runner's
+        // token, so other processes (and the `describe` method) can tell the
+        // run is alive and this runner learns when it is not the owner any
+        // more. It raises `signal` then, or when it cannot renew for so long
+        // that another process may have taken over; the run races every step
+        // against it. The guard aborts the task when `run` returns by any
+        // path.
+        let signal = ClaimSignal::new();
+        let lease = Arc::new(ClaimLease::new(
+            self.db.clone(),
+            id,
+            token,
+            Self::LEASE_GIVE_UP,
+            Self::HEARTBEAT_INTERVAL,
+        ));
+        let heartbeat = {
+            let signal = signal.clone();
+            HeartbeatGuard::start(Self::HEARTBEAT_INTERVAL, move || {
+                let lease = lease.clone();
+                let signal = signal.clone();
+                async move { renew_or_signal(&lease, &signal).await }
+            })
+        };
+
+        let mut plan =
+            serde_json::from_value::<InstantiationPlan>(model.plan.clone()).map_err(|error| {
+                InstantiationError::InvalidPlan {
+                    reason: error.to_string(),
+                }
+            })?;
         let origin = &RequestOrigin {
             instantiation_id: Some(id),
             ..origin.clone()
@@ -1255,29 +1837,18 @@ impl InstantiationEngine {
         // The retention cleanup clears the secrets of a failed run. Going on
         // without them would skip the shared variables and report success.
         if let Err(error) = ensure_secrets_available(id, model.secrets.is_some(), &plan) {
-            let message = error.to_string();
-            self.finish(&model, &plan, Err(message.clone())).await;
-            return Err(message);
+            let error = InstantiationError::from(error);
+            self.record_outcome(&model, &plan, Err(&error)).await?;
+            return Err(error);
         }
         let secrets = match self.open(model.secrets.as_deref()) {
             Ok(secrets) => secrets,
-            Err(message) => {
-                self.finish(&model, &plan, Err(message.clone())).await;
-                return Err(message);
+            Err(error) => {
+                self.record_outcome(&model, &plan, Err(&error)).await?;
+                return Err(error);
             }
         };
         info!(instantiation_id = id, template = %plan.template.slug, "Running instantiation");
-
-        // Heartbeat task: writes heartbeat_at every HEARTBEAT_INTERVAL so that
-        // other processes (and the `describe` method) can tell this run is
-        // still alive. The guard aborts it when `run` returns by any path.
-        let heartbeat = {
-            let engine = self.clone();
-            HeartbeatGuard::start(Self::HEARTBEAT_INTERVAL, move || {
-                let engine = engine.clone();
-                async move { engine.heartbeat(id).await }
-            })
-        };
 
         // Emit STARTED on first run (status transitions from pending to running).
         // On a resume from failure the row was already running once, so we
@@ -1311,93 +1882,92 @@ impl InstantiationEngine {
             .map(|step| step.key.clone())
             .collect();
         for key in keys {
-            let outcome = self
-                .run_step(&key, &mut plan, &secrets, &model, auth, origin)
-                .await;
-            let failed = outcome.as_ref().err().cloned();
+            // Nothing starts once the claim is gone, and a step that is
+            // running when it goes is dropped where it stands: the steps are
+            // written to be resumed after exactly that (a crash), by whoever
+            // owns the instantiation now.
+            let outcome = until_claim_lost(
+                &signal,
+                id,
+                self.run_step(&key, &mut plan, &secrets, &model, auth, origin),
+            )
+            .await;
+            let failure = match outcome {
+                Ok(()) => None,
+                // Its own write was refused: the claim is gone, there is
+                // no result to record.
+                Err(error) if error.is_claim_lost() => return Err(error),
+                Err(error) => Some(InstantiationError::StepFailed {
+                    step: key.clone(),
+                    source: Box::new(error),
+                }),
+            };
             if let Some(step) = plan.step_mut(&key) {
-                match &outcome {
-                    Ok(()) => {
+                match &failure {
+                    None => {
                         step.status = StepStatus::Done;
                         step.error = None;
                     }
-                    Err(message) => {
+                    Some(error) => {
                         step.status = StepStatus::Failed;
-                        step.error = Some(message.clone());
+                        step.error = Some(error.to_string());
                     }
                 }
             }
-            if let Some(message) = failed {
-                warn!(instantiation_id = id, step = %key, %message, "Instantiation step failed");
+            if let Some(error) = failure {
+                warn!(instantiation_id = id, step = %key, %error, "Instantiation step failed");
                 drop(heartbeat);
-                self.finish(&model, &plan, Err(message)).await;
+                self.record_outcome(&model, &plan, Err(&error)).await?;
                 return Ok(());
             }
-            if let Err(message) = self.save(&model, &plan, "running", None).await {
+            if let Err(error) = self.ledger.save(&model, &plan, "running", None).await {
+                if error.is_claim_lost() {
+                    return Err(error);
+                }
                 // The step ran but its result could not be stored. Stop
                 // renewing the lease and try to mark the run failed with the
                 // plan as it is now, so a retry resumes after this step. If
                 // the database is still unreachable the row is left running
                 // with a lease that expires, which reads as interrupted.
-                error!(instantiation_id = id, step = %key, %message, "Could not store the progress of an instantiation");
+                error!(instantiation_id = id, step = %key, %error, "Could not store the progress of an instantiation");
                 drop(heartbeat);
-                self.finish(&model, &plan, Err(message.clone())).await;
-                return Err(message);
+                self.record_outcome(&model, &plan, Err(&error)).await?;
+                return Err(error);
             }
         }
         drop(heartbeat);
-        self.finish(&model, &plan, Ok(())).await;
-        Ok(())
+        self.record_outcome(&model, &plan, Ok(())).await
     }
 
+    /// Record how a run ended. A failure to record it is logged and the run
+    /// still ends normally, as the row is left to read as interrupted; losing
+    /// the claim is reported, because there is then no outcome of this
+    /// runner's to record.
+    async fn record_outcome(
+        &self,
+        model: &template_instantiations::Model,
+        plan: &InstantiationPlan,
+        outcome: Result<(), &InstantiationError>,
+    ) -> Result<(), InstantiationError> {
+        match self.ledger.finish(model, plan, outcome).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_claim_lost() => Err(error),
+            Err(error) => {
+                error!(instantiation_id = model.id, %error, "Could not record the outcome of an instantiation");
+                Ok(())
+            }
+        }
+    }
+
+    /// Store progress of the instantiation `model` was claimed as.
     async fn save(
         &self,
         model: &template_instantiations::Model,
         plan: &InstantiationPlan,
         status: &str,
         error: Option<String>,
-    ) -> Result<(), String> {
-        let mut active: template_instantiations::ActiveModel = model.clone().into();
-        active.plan = Set(serde_json::to_value(plan).map_err(|error| error.to_string())?);
-        active.group_id = Set(plan.group_id);
-        active.status = Set(status.to_string());
-        active.error = Set(error);
-        active.updated_at = Set(Utc::now());
-        active
-            .update(self.db.as_ref())
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("saving instantiation {}: {error}", model.id))
-    }
-
-    async fn finish(
-        &self,
-        model: &template_instantiations::Model,
-        plan: &InstantiationPlan,
-        outcome: Result<(), String>,
-    ) {
-        let mut active: template_instantiations::ActiveModel = model.clone().into();
-        if let Ok(value) = serde_json::to_value(plan) {
-            active.plan = Set(value);
-        }
-        active.group_id = Set(plan.group_id);
-        active.updated_at = Set(Utc::now());
-        match outcome {
-            Ok(()) => {
-                active.status = Set("succeeded".to_string());
-                active.error = Set(None);
-                active.secrets = Set(None);
-                active.finished_at = Set(Some(Utc::now()));
-            }
-            Err(message) => {
-                active.status = Set("failed".to_string());
-                active.error = Set(Some(message));
-                active.finished_at = Set(Some(Utc::now()));
-            }
-        }
-        if let Err(error) = active.update(self.db.as_ref()).await {
-            error!(instantiation_id = model.id, %error, "Could not record the outcome of an instantiation");
-        }
+    ) -> Result<(), InstantiationError> {
+        self.ledger.save(model, plan, status, error).await
     }
 
     async fn run_step(
@@ -1408,7 +1978,7 @@ impl InstantiationEngine {
         model: &template_instantiations::Model,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstantiationError> {
         let (kind, subject) = key.split_once(':').unwrap_or((key, ""));
         match kind {
             "project" => self.step_project(plan, auth, origin).await,
@@ -1425,23 +1995,25 @@ impl InstantiationEngine {
             "variables" => self.step_variables(plan, secrets, auth, origin).await,
             "routes" => self.step_routes(plan, auth, origin).await,
             "deploy" => self.step_deploy(plan, subject, auth).await,
-            other => Err(format!("unknown step '{other}'")),
+            other => Err(InstantiationError::UnknownStep {
+                key: other.to_string(),
+            }),
         }
     }
 
     /// `slug`, or `slug-2`, `slug-3`, … when it is taken.
-    async fn free_group_slug(&self, slug: &str) -> Result<String, String> {
+    async fn free_group_slug(&self, slug: &str) -> Result<String, InstantiationError> {
         let mut candidate = slug.to_string();
         for suffix in 2..=100 {
             match self.groups.get_group_by_slug(&candidate).await {
                 Err(ProjectGroupError::SlugNotFound { .. }) => return Ok(candidate),
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.into()),
                 Ok(_) => candidate = format!("{slug}-{suffix}"),
             }
         }
-        Err(format!(
-            "Projects named {slug} through {slug}-100 already exist; rename the project"
-        ))
+        Err(InstantiationError::SlugsExhausted {
+            slug: slug.to_string(),
+        })
     }
 
     async fn step_project(
@@ -1449,7 +2021,7 @@ impl InstantiationEngine {
         plan: &mut InstantiationPlan,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstantiationError> {
         if plan.group_id.is_some() {
             return Ok(());
         }
@@ -1473,8 +2045,7 @@ impl InstantiationEngine {
                 description: plan.template.description.clone(),
                 project_ids: Vec::new(),
             })
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         plan.group_id = Some(group.group.id);
         self.audit(
             "PROJECT_GROUP_CREATED",
@@ -1495,7 +2066,7 @@ impl InstantiationEngine {
         model: &template_instantiations::Model,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstantiationError> {
         if plan.repository.is_none() {
             let target = match plan.fork.clone() {
                 Some(fork) => {
@@ -1504,7 +2075,8 @@ impl InstantiationEngine {
                     // values every service will be created with are checked
                     // first (the request handler did this already; this
                     // covers a plan stored by an earlier build).
-                    validate_plan_variables(plan, secrets).map_err(problem_message)?;
+                    validate_plan_variables(plan, secrets)
+                        .map_err(InstantiationError::from_problem)?;
                     // A template with several services keeps its layout: the
                     // services build from their directories of the fork. A
                     // single service's directory becomes the fork's root.
@@ -1579,7 +2151,9 @@ impl InstantiationEngine {
                                 path.as_deref(),
                             )
                             .await
-                            .map_err(|error| problem_message(Problem::from(error)))?
+                            .map_err(|error| {
+                                InstantiationError::from_problem(Problem::from(error))
+                            })?
                     };
                     RepositoryTarget {
                         repo_owner: repo.owner,
@@ -1605,16 +2179,8 @@ impl InstantiationEngine {
         let (Some(group_id), Some(target)) = (plan.group_id, plan.repository.clone()) else {
             return Ok(());
         };
-        let group = self
-            .groups
-            .get_group(group_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let current = self
-            .repository
-            .repository_of(&group.group)
-            .await
-            .map_err(|error| error.to_string())?;
+        let group = self.groups.get_group(group_id).await?;
+        let current = self.repository.repository_of(&group.group).await?;
         match current {
             Some(current) => {
                 plan.follow_repository = target_follows_group_repository(&current, &target);
@@ -1644,8 +2210,7 @@ impl InstantiationEngine {
                                 auth.is_instance_admin(),
                             ),
                         )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await?;
                     plan.follow_repository = true;
                     let repo_label = format!(
                         "{}/{}@{}",
@@ -1675,14 +2240,16 @@ impl InstantiationEngine {
         database_type: &str,
         model: &template_instantiations::Model,
         auth: &AuthContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstantiationError> {
         let group_slug = self.group_slug(plan).await;
         let Some(database) = plan
             .databases
             .iter_mut()
             .find(|database| database.database_type == database_type)
         else {
-            return Err(format!("the plan has no {database_type} database"));
+            return Err(InstantiationError::PlannedDatabaseMissing {
+                database_type: database_type.to_string(),
+            });
         };
         if database.service_id.is_some() {
             return Ok(());
@@ -1691,7 +2258,9 @@ impl InstantiationEngine {
             return Ok(());
         };
         let service_type = temps_providers::externalsvc::ServiceType::from_str(database_type)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| InstantiationError::Validation {
+                message: error.to_string(),
+            })?;
         let name = name.clone().unwrap_or_else(|| {
             format!(
                 "{}-{database_type}",
@@ -1713,9 +2282,7 @@ impl InstantiationEngine {
                 plan.storage_claim_ids.push(existing.id);
                 return Ok(());
             }
-            return Err(format!(
-                "A managed database named '{name}' already exists; choose another name or link it instead"
-            ));
+            return Err(InstantiationError::DatabaseNameTaken { name });
         }
         let created = self
             .external_services
@@ -1731,8 +2298,7 @@ impl InstantiationEngine {
                 },
                 auth.user_id(),
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         database.service_id = Some(created.id);
         // The caller created it, so linking it rests on that claim.
         plan.storage_claim_ids.push(created.id);
@@ -1781,18 +2347,22 @@ impl InstantiationEngine {
         model: &template_instantiations::Model,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstantiationError> {
         let spec = plan
             .template
             .service(template_service)
             .cloned()
-            .ok_or_else(|| format!("the template has no service '{template_service}'"))?;
+            .ok_or_else(|| InstantiationError::TemplateServiceMissing {
+                service: template_service.to_string(),
+            })?;
         let planned = plan
             .services
             .iter()
             .find(|service| service.template_service == template_service)
             .cloned()
-            .ok_or_else(|| format!("the plan has no service '{template_service}'"))?;
+            .ok_or_else(|| InstantiationError::PlannedServiceMissing {
+                service: template_service.to_string(),
+            })?;
         if planned.project_id.is_some() {
             return Ok(());
         }
@@ -1826,11 +2396,12 @@ impl InstantiationEngine {
         .await?
         {
             if owned.is_deleted {
-                return Err(format!(
-                    "Service '{template_service}' of instantiation {} was created as project {} \
-                     ('{}') and has since been deleted; start a new instantiation",
-                    model.id, owned.id, owned.slug
-                ));
+                return Err(InstantiationError::ServiceProjectDeleted {
+                    instantiation_id: model.id,
+                    service: template_service.to_string(),
+                    project_id: owned.id,
+                    slug: owned.slug,
+                });
             }
             info!(
                 instantiation_id = model.id,
@@ -1867,8 +2438,7 @@ impl InstantiationEngine {
                 self.creator
                     .project_service
                     .plan_project_slug(&planned.name)
-                    .await
-                    .map_err(|error| error.to_string())?
+                    .await?
             }
             Err(_) => planned.slug.clone(),
         };
@@ -1881,10 +2451,13 @@ impl InstantiationEngine {
         }
         self.save(model, plan, "running", None)
             .await
-            .map_err(|error| {
-                format!(
-                    "recording that service '{template_service}' is about to be created: {error}"
-                )
+            .map_err(|error| match error {
+                // Not a failure to record: the claim is gone.
+                error if error.is_claim_lost() => error,
+                error => InstantiationError::CreationNotRecorded {
+                    service: template_service.to_string(),
+                    source: Box::new(error),
+                },
             })?;
 
         let storage_service_ids: Vec<i32> = plan
@@ -1970,7 +2543,7 @@ impl InstantiationEngine {
                 &caller,
             )
             .await
-            .map_err(problem_message)?;
+            .map_err(InstantiationError::from_problem)?;
         if let Some(service) = plan.service_mut(template_service) {
             service.project_id = Some(created.project.id);
         }
@@ -1983,25 +2556,24 @@ impl InstantiationEngine {
         template_service: &str,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
-        let group_id = plan
-            .group_id
-            .ok_or_else(|| "the project was not created".to_string())?;
+    ) -> Result<(), InstantiationError> {
+        let group_id = plan.group_id.ok_or(InstantiationError::ProjectNotCreated)?;
         let spec = plan
             .template
             .service(template_service)
             .cloned()
-            .ok_or_else(|| format!("the template has no service '{template_service}'"))?;
+            .ok_or_else(|| InstantiationError::TemplateServiceMissing {
+                service: template_service.to_string(),
+            })?;
         let project_id = plan
             .services
             .iter()
             .find(|service| service.template_service == template_service)
             .and_then(|service| service.project_id)
-            .ok_or_else(|| format!("service '{template_service}' was not created"))?;
-        self.groups
-            .add_project(group_id, project_id)
-            .await
-            .map_err(|error| error.to_string())?;
+            .ok_or_else(|| InstantiationError::ServiceNotCreated {
+                service: template_service.to_string(),
+            })?;
+        self.groups.add_project(group_id, project_id).await?;
         let builds_from_project_repository = !spec.is_image() && spec.git.is_none();
         if plan.follow_repository && builds_from_project_repository {
             self.repository
@@ -2013,8 +2585,7 @@ impl InstantiationEngine {
                         auth.is_instance_admin(),
                     ),
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
         }
         let group_slug = self.group_slug(plan).await.unwrap_or_default();
         self.audit(
@@ -2037,15 +2608,12 @@ impl InstantiationEngine {
         secrets: &PlanSecrets,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
-        let group_id = plan
-            .group_id
-            .ok_or_else(|| "the project was not created".to_string())?;
+    ) -> Result<(), InstantiationError> {
+        let group_id = plan.group_id.ok_or(InstantiationError::ProjectNotCreated)?;
         let existing: HashSet<String> = self
             .env_vars
             .list(group_id)
-            .await
-            .map_err(|error| error.to_string())?
+            .await?
             .into_iter()
             .filter(|variable| variable.environment_slug.is_none())
             .map(|variable| variable.key)
@@ -2072,8 +2640,7 @@ impl InstantiationEngine {
                         include_in_preview: false,
                     },
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
             let key = variable.name.clone();
             self.audit(
                 "PROJECT_GROUP_ENV_VAR_CREATED",
@@ -2095,33 +2662,25 @@ impl InstantiationEngine {
         plan: &mut InstantiationPlan,
         auth: &AuthContext,
         origin: &RequestOrigin,
-    ) -> Result<(), String> {
-        let group_id = plan
-            .group_id
-            .ok_or_else(|| "the project was not created".to_string())?;
-        let group = self
-            .groups
-            .get_group(group_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let existing = self
-            .routes
-            .list(&group)
-            .await
-            .map_err(|error| error.to_string())?;
+    ) -> Result<(), InstantiationError> {
+        let group_id = plan.group_id.ok_or(InstantiationError::ProjectNotCreated)?;
+        let group = self.groups.get_group(group_id).await?;
+        let existing = self.routes.list(&group).await?;
         let project_of = |template_service: &str| {
             plan.services
                 .iter()
                 .find(|service| service.template_service == template_service)
                 .and_then(|service| service.project_id)
-                .ok_or_else(|| format!("service '{template_service}' was not created"))
+                .ok_or_else(|| InstantiationError::ServiceNotCreated {
+                    service: template_service.to_string(),
+                })
         };
         let group_slug = self.group_slug(plan).await.unwrap_or_default();
         for route in &plan.template.routes {
             let source = project_of(&route.source)?;
             let target = project_of(&route.target)?;
-            let prefix =
-                temps_entities::project_group_routes::normalize_path_prefix(&route.prefix)?;
+            let prefix = temps_entities::project_group_routes::normalize_path_prefix(&route.prefix)
+                .map_err(|message| InstantiationError::Validation { message })?;
             if let Some(found) = existing
                 .iter()
                 .find(|found| found.source_project_id == source && found.path_prefix == prefix)
@@ -2129,10 +2688,10 @@ impl InstantiationEngine {
                 if found.target_project_id == target {
                     continue;
                 }
-                return Err(format!(
-                    "{prefix} on the source service already goes to {}",
-                    found.target_project_name
-                ));
+                return Err(InstantiationError::RouteTaken {
+                    prefix,
+                    target: found.target_project_name.clone(),
+                });
             }
             self.routes
                 .create(
@@ -2144,8 +2703,7 @@ impl InstantiationEngine {
                         strip_prefix: route.strip_prefix,
                     },
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?;
             let path_route = format!("{source} {prefix} → {target}");
             self.audit(
                 "PROJECT_GROUP_ROUTE_ADDED",
@@ -2168,7 +2726,7 @@ impl InstantiationEngine {
         plan: &mut InstantiationPlan,
         template_service: &str,
         auth: &AuthContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstantiationError> {
         use sea_orm::PaginatorTrait;
         use temps_entities::deployments;
         let project_id = plan
@@ -2176,7 +2734,9 @@ impl InstantiationEngine {
             .iter()
             .find(|service| service.template_service == template_service)
             .and_then(|service| service.project_id)
-            .ok_or_else(|| format!("service '{template_service}' was not created"))?;
+            .ok_or_else(|| InstantiationError::ServiceNotCreated {
+                service: template_service.to_string(),
+            })?;
         // Deploy dedupe: the service was created with `defer_initial_deployment:
         // true`, so no deployment exists until this step runs it. If a
         // deployment already exists for this project when we arrive here, a
@@ -2199,7 +2759,7 @@ impl InstantiationEngine {
         self.creator
             .queue_first_deployment(project_id, auth.is_instance_admin())
             .await
-            .map_err(problem_message)
+            .map_err(InstantiationError::from_problem)
     }
 }
 
@@ -2215,7 +2775,7 @@ async fn owned_project_for_service(
     project_service: &temps_projects::ProjectService,
     instantiation_id: i32,
     template_service: &str,
-) -> Result<Option<projects::Model>, String> {
+) -> Result<Option<projects::Model>, InstantiationError> {
     if let Some(unfinished) =
         unfinished_project_for_service(db, instantiation_id, template_service).await?
     {
@@ -2232,13 +2792,12 @@ async fn owned_project_for_service(
         project_service
             .discard_unfinished_instantiation_project(unfinished.id, &pending)
             .await
-            .map_err(|error| {
-                format!(
-                    "discarding project {} ('{}'), which a previous run created for service \
-                     '{template_service}' of instantiation {instantiation_id} and did not \
-                     finish: {error}",
-                    unfinished.id, unfinished.slug
-                )
+            .map_err(|source| InstantiationError::DiscardFailed {
+                instantiation_id,
+                service: template_service.to_string(),
+                project_id: unfinished.id,
+                slug: unfinished.slug.clone(),
+                source: Box::new(source),
             })?;
     }
     let Some(owned) = project_created_for_service(db, instantiation_id, template_service).await?
@@ -2249,12 +2808,12 @@ async fn owned_project_for_service(
     // environment exists, so a project without one was not made by this code
     // path. Never hand it on to be deployed.
     if !owned.is_deleted && !project_has_environment(db, owned.id).await? {
-        return Err(format!(
-            "Service '{template_service}' of instantiation {instantiation_id} was created as \
-             project {} ('{}') but has no environment, so it was not fully initialized; delete \
-             that project and start a new instantiation",
-            owned.id, owned.slug
-        ));
+        return Err(InstantiationError::ServiceProjectUninitialized {
+            instantiation_id,
+            service: template_service.to_string(),
+            project_id: owned.id,
+            slug: owned.slug,
+        });
     }
     Ok(Some(owned))
 }
@@ -2274,7 +2833,7 @@ async fn project_created_for_service(
     db: &DatabaseConnection,
     instantiation_id: i32,
     template_service: &str,
-) -> Result<Option<projects::Model>, String> {
+) -> Result<Option<projects::Model>, InstantiationError> {
     let token = temps_entities::projects::instantiation_token(instantiation_id, template_service);
     project_holding_token(db, instantiation_id, template_service, &token).await
 }
@@ -2287,7 +2846,7 @@ async fn unfinished_project_for_service(
     db: &DatabaseConnection,
     instantiation_id: i32,
     template_service: &str,
-) -> Result<Option<projects::Model>, String> {
+) -> Result<Option<projects::Model>, InstantiationError> {
     let token = temps_entities::projects::pending_instantiation_token(
         &temps_entities::projects::instantiation_token(instantiation_id, template_service),
     );
@@ -2296,14 +2855,19 @@ async fn unfinished_project_for_service(
 
 /// Whether `project_id` has at least one environment (deleted or not: this
 /// asks whether initialization ever ran, not whether it is still deployable).
-async fn project_has_environment(db: &DatabaseConnection, project_id: i32) -> Result<bool, String> {
+async fn project_has_environment(
+    db: &DatabaseConnection,
+    project_id: i32,
+) -> Result<bool, InstantiationError> {
     use sea_orm::PaginatorTrait;
     temps_entities::environments::Entity::find()
         .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
         .count(db)
         .await
         .map(|count| count > 0)
-        .map_err(|error| format!("looking up the environments of project {project_id}: {error}"))
+        .map_err(InstantiationError::database(format!(
+            "looking up the environments of project {project_id}"
+        )))
 }
 
 async fn project_holding_token(
@@ -2311,17 +2875,15 @@ async fn project_holding_token(
     instantiation_id: i32,
     template_service: &str,
     token: &str,
-) -> Result<Option<projects::Model>, String> {
+) -> Result<Option<projects::Model>, InstantiationError> {
     projects::Entity::find()
         .filter(projects::Column::InstantiationToken.eq(token))
         .one(db)
         .await
-        .map_err(|error| {
-            format!(
-                "looking up the project created for service '{template_service}' of \
-                 instantiation {instantiation_id}: {error}"
-            )
-        })
+        .map_err(InstantiationError::database(format!(
+            "looking up the project created for service '{template_service}' of \
+             instantiation {instantiation_id}"
+        )))
 }
 
 /// Where a service that builds from source reads its code.
@@ -2550,7 +3112,7 @@ routes:
     fn a_template_with_several_services_needs_a_project() {
         let error = build_plan(input(template(), PlannedTarget::NoProject, &[]))
             .expect_err("several services need a project");
-        assert!(error.contains("go into a project"));
+        assert!(error.to_string().contains("go into a project"));
     }
 
     #[test]
@@ -2562,7 +3124,7 @@ routes:
         );
         plan_input.databases.clear();
         let error = build_plan(plan_input).expect_err("postgres needs a choice");
-        assert!(error.contains("needs a postgres database"));
+        assert!(error.to_string().contains("needs a postgres database"));
 
         let mut plan_input = input(
             template(),
@@ -2574,7 +3136,7 @@ routes:
             DatabaseChoice::Existing { service_id: 9 },
         );
         let error = build_plan(plan_input).expect_err("redis is not used");
-        assert!(error.contains("does not use a redis database"));
+        assert!(error.to_string().contains("does not use a redis database"));
     }
 
     #[test]
@@ -2585,7 +3147,7 @@ routes:
             &[variable("UNDECLARED", "x", None)],
         ))
         .expect_err("undeclared variable of a multi-service template");
-        assert!(error.contains("say which service"));
+        assert!(error.to_string().contains("say which service"));
 
         let (_, secrets) = build_plan(input(
             template(),
@@ -2797,6 +3359,7 @@ routes:
             let beats = beats.clone();
             async move {
                 beats.fetch_add(1, Ordering::SeqCst);
+                Beat::Continue
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
@@ -2815,6 +3378,7 @@ routes:
             let beats = beats.clone();
             async move {
                 beats.fetch_add(1, Ordering::SeqCst);
+                Beat::Continue
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -2841,6 +3405,7 @@ routes:
                     let beats = beats.clone();
                     async move {
                         beats.fetch_add(1, Ordering::SeqCst);
+                        Beat::Continue
                     }
                 });
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -3510,7 +4075,10 @@ routes:
             .await
             .expect_err("a project without an environment is refused");
         assert!(
-            error.contains(&bare.id.to_string()) && error.contains("no environment"),
+            {
+                let error = error.to_string();
+                error.contains(&bare.id.to_string()) && error.contains("no environment")
+            },
             "{error}"
         );
         assert!(
@@ -3708,6 +4276,14 @@ services:
         .insert(conn.as_ref())
         .await
         .expect("the instantiation is stored");
+        // Every write of the engine is conditional on the claim token, so the
+        // step runs against the row as a runner holds it.
+        let model = engine
+            .ledger
+            .claim(model.id, InstantiationEngine::HEARTBEAT_LEASE_SECS)
+            .await
+            .expect("the claim query runs")
+            .expect("a running row without a heartbeat is claimable");
         let secrets = PlanSecrets::default();
         let origin = RequestOrigin::default();
 
@@ -3867,5 +4443,388 @@ services:
             Some("gitlab")
         );
         assert_eq!(public_provider(Some("https://git.example.test/a/b")), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Claim ownership: the token fences a runner that lost its lease
+    // -----------------------------------------------------------------
+
+    fn exec_result(rows_affected: u64) -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected,
+        }
+    }
+
+    fn lease_over(db: sea_orm::DatabaseConnection, give_up_after: Duration) -> ClaimLease {
+        ClaimLease::new(
+            Arc::new(db),
+            7,
+            "token-a".to_string(),
+            give_up_after,
+            Duration::from_secs(5),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_lands_keeps_the_lease() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([exec_result(1)])
+            .into_connection();
+        let lease = lease_over(db, Duration::from_secs(90));
+        assert_eq!(lease.renew().await, Renewal::Held);
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_matches_no_row_means_another_runner_took_over() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([exec_result(0)])
+            .into_connection();
+        let lease = lease_over(db, Duration::from_secs(90));
+        assert_eq!(lease.renew().await, Renewal::Lost(LeaseLoss::TakenOver));
+    }
+
+    #[tokio::test]
+    async fn failed_renewals_are_tolerated_until_the_give_up_point() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_errors([sea_orm::DbErr::Custom("connection closed".into())])
+            .into_connection();
+        let tolerant = lease_over(db, Duration::from_secs(3600));
+        assert_eq!(tolerant.renew().await, Renewal::Held);
+
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_errors([sea_orm::DbErr::Custom("connection closed".into())])
+            .into_connection();
+        let strict = lease_over(db, Duration::ZERO);
+        assert!(matches!(
+            strict.renew().await,
+            Renewal::Lost(LeaseLoss::NotRenewed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_claim_signal_reports_and_wakes_on_loss() {
+        let signal = ClaimSignal::new();
+        assert!(!signal.is_lost());
+        let waiter = {
+            let signal = signal.clone();
+            tokio::spawn(async move { signal.lost().await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished(), "lost() completed before the loss");
+        signal.lose();
+        assert!(signal.is_lost());
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("lost() completes once the claim is lost")
+            .expect("the waiter task finishes");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_that_cannot_renew_cancels_the_run_in_flight() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_errors([sea_orm::DbErr::Custom("connection closed".into())])
+            .into_connection();
+        let lease = Arc::new(lease_over(db, Duration::ZERO));
+        let signal = ClaimSignal::new();
+        let _heartbeat = {
+            let (lease, signal) = (lease.clone(), signal.clone());
+            HeartbeatGuard::start(Duration::from_millis(5), move || {
+                let (lease, signal) = (lease.clone(), signal.clone());
+                async move { renew_or_signal(&lease, &signal).await }
+            })
+        };
+
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work = {
+            let finished = finished.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                finished.store(true, Ordering::SeqCst);
+                Ok::<(), InstantiationError>(())
+            }
+        };
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), until_claim_lost(&signal, 7, work))
+                .await
+                .expect("the run stops as soon as the heartbeat gives up the claim");
+        assert!(matches!(
+            outcome,
+            Err(InstantiationError::ClaimLost {
+                instantiation_id: 7
+            })
+        ));
+        assert!(!finished.load(Ordering::SeqCst), "the step kept running");
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_once_the_claim_is_lost() {
+        let signal = ClaimSignal::new();
+        signal.lose();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work = {
+            let started = started.clone();
+            async move {
+                started.store(true, Ordering::SeqCst);
+                Ok::<(), InstantiationError>(())
+            }
+        };
+        let outcome = until_claim_lost(&signal, 3, work).await;
+        assert!(matches!(
+            outcome,
+            Err(InstantiationError::ClaimLost {
+                instantiation_id: 3
+            })
+        ));
+        assert!(!started.load(Ordering::SeqCst));
+
+        let held = ClaimSignal::new();
+        let outcome = until_claim_lost(&held, 3, async { Ok::<_, InstantiationError>(5) })
+            .await
+            .expect("work under a held claim runs");
+        assert_eq!(outcome, 5);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stops_beating_once_it_answers_stop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let beats = counter.clone();
+        let _guard = HeartbeatGuard::start(Duration::from_millis(5), move || {
+            let beats = beats.clone();
+            async move {
+                if beats.fetch_add(1, Ordering::SeqCst) + 1 >= 3 {
+                    Beat::Stop
+                } else {
+                    Beat::Continue
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_lost_claim_is_recognised_through_its_wrappers() {
+        let lost = || InstantiationError::ClaimLost {
+            instantiation_id: 4,
+        };
+        assert!(lost().is_claim_lost());
+        assert!(InstantiationError::StepFailed {
+            step: "service:api".into(),
+            source: Box::new(InstantiationError::CreationNotRecorded {
+                service: "api".into(),
+                source: Box::new(lost()),
+            }),
+        }
+        .is_claim_lost());
+        assert!(!InstantiationError::UnknownStep { key: "x".into() }.is_claim_lost());
+    }
+
+    #[test]
+    fn errors_read_as_the_messages_recorded_on_the_row_before() {
+        let wrapped = InstantiationError::StepFailed {
+            step: "database:postgres".into(),
+            source: Box::new(InstantiationError::DatabaseNameTaken {
+                name: "orders".into(),
+            }),
+        };
+        assert_eq!(
+            wrapped.to_string(),
+            "A managed database named 'orders' already exists; choose another name or link it instead"
+        );
+        let not_recorded = InstantiationError::CreationNotRecorded {
+            service: "api".into(),
+            source: Box::new(InstantiationError::Database {
+                operation: "saving instantiation 9".into(),
+                source: sea_orm::DbErr::Custom("connection closed".into()),
+            }),
+        };
+        let text = not_recorded.to_string();
+        assert!(text.starts_with("recording that service 'api' is about to be created: "));
+        assert!(text.contains("saving instantiation 9"));
+    }
+
+    /// Everything the ledger tests need: a user and an instantiation row.
+    async fn insert_instantiation(
+        db: &DatabaseConnection,
+        id: i32,
+        status: &str,
+    ) -> InstantiationPlan {
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Ledger Owner".to_string()),
+            email: Set(format!("ledger-owner-{id}@example.com")),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("the owning user is inserted");
+        let template = template();
+        let services = planned(&template);
+        let plan = InstantiationPlan {
+            template,
+            carries_release: false,
+            provenance: None,
+            target: PlannedTarget::NoProject,
+            fork: None,
+            repository: None,
+            follow_repository: false,
+            databases: Vec::new(),
+            services,
+            storage_claim_ids: Vec::new(),
+            group_id: None,
+            steps: Vec::new(),
+        };
+        let now = Utc::now();
+        template_instantiations::ActiveModel {
+            id: Set(id),
+            user_id: Set(user.id),
+            idempotency_key: Set(format!("ledger-{id}")),
+            kind: Set("template".to_string()),
+            template_slug: Set(Some(plan.template.slug.clone())),
+            name: Set("Ledger".to_string()),
+            status: Set(status.to_string()),
+            plan: Set(serde_json::to_value(&plan).expect("plan")),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("the instantiation is stored");
+        plan
+    }
+
+    async fn stored_instantiation(
+        db: &DatabaseConnection,
+        id: i32,
+    ) -> template_instantiations::Model {
+        template_instantiations::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .expect("lookup")
+            .expect("the instantiation exists")
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_was_taken_over_cannot_write_and_the_new_one_can() {
+        use sea_orm::ConnectionTrait;
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping ledger fencing test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let mut plan = insert_instantiation(conn.as_ref(), 31, "pending").await;
+        let ledger = Ledger::new(conn.clone());
+
+        let stale = ledger
+            .claim(31, 120)
+            .await
+            .expect("claim runs")
+            .expect("a pending row is claimable");
+        let stale_token = stale.claim_token.clone().expect("a claim carries a token");
+        assert!(
+            ledger.claim(31, 120).await.expect("claim runs").is_none(),
+            "a live claim is not taken over"
+        );
+
+        // The first runner stalls past its lease.
+        conn.execute_unprepared(
+            "UPDATE template_instantiations SET heartbeat_at = NOW() - INTERVAL '1 hour' WHERE id = 31",
+        )
+        .await
+        .expect("age the heartbeat");
+        let current = ledger
+            .claim(31, 120)
+            .await
+            .expect("claim runs")
+            .expect("a stale claim is taken over");
+        assert_ne!(
+            current.claim_token.as_deref(),
+            Some(stale_token.as_str()),
+            "a takeover rotates the token"
+        );
+
+        // The stalled runner wakes up: nothing it writes lands.
+        plan.steps.push(step("project", "Stale step"));
+        let saved = ledger.save(&stale, &plan, "running", None).await;
+        assert!(
+            matches!(
+                saved,
+                Err(InstantiationError::ClaimLost {
+                    instantiation_id: 31
+                })
+            ),
+            "{saved:?}"
+        );
+        let failure = InstantiationError::UnknownStep { key: "x".into() };
+        let finished = ledger.finish(&stale, &plan, Err(&failure)).await;
+        assert!(
+            matches!(
+                finished,
+                Err(InstantiationError::ClaimLost {
+                    instantiation_id: 31
+                })
+            ),
+            "{finished:?}"
+        );
+        let row = stored_instantiation(conn.as_ref(), 31).await;
+        assert_eq!(row.status, "running");
+        assert!(row.error.is_none());
+        assert!(row.finished_at.is_none());
+        assert_eq!(row.claim_token, current.claim_token);
+        let stored_plan: InstantiationPlan = serde_json::from_value(row.plan).expect("stored plan");
+        assert!(stored_plan.steps.is_empty(), "the stale save did not land");
+
+        // The new owner proceeds normally and ends the run.
+        let mut fresh_plan = plan.clone();
+        fresh_plan.steps = vec![step("project", "Fresh step")];
+        ledger
+            .save(&current, &fresh_plan, "running", None)
+            .await
+            .expect("the owner saves progress");
+        ledger
+            .finish(&current, &fresh_plan, Ok(()))
+            .await
+            .expect("the owner records the outcome");
+        let row = stored_instantiation(conn.as_ref(), 31).await;
+        assert_eq!(row.status, "succeeded");
+        assert!(row.claim_token.is_none(), "finishing releases the token");
+        assert!(row.finished_at.is_some());
+
+        // A finished row accepts nothing more from anyone.
+        let late = ledger.save(&current, &plan, "running", None).await;
+        assert!(
+            matches!(late, Err(InstantiationError::ClaimLost { .. })),
+            "{late:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_was_never_claimed_cannot_write() {
+        use temps_database::test_utils::TestDatabase;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping ledger fencing test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let plan = insert_instantiation(conn.as_ref(), 32, "pending").await;
+        let unclaimed = stored_instantiation(conn.as_ref(), 32).await;
+        assert!(unclaimed.claim_token.is_none());
+        let ledger = Ledger::new(conn.clone());
+        let saved = ledger.save(&unclaimed, &plan, "running", None).await;
+        assert!(
+            matches!(
+                saved,
+                Err(InstantiationError::ClaimLost {
+                    instantiation_id: 32
+                })
+            ),
+            "{saved:?}"
+        );
+        assert_eq!(
+            stored_instantiation(conn.as_ref(), 32).await.status,
+            "pending"
+        );
     }
 }

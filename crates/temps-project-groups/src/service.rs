@@ -120,7 +120,8 @@ struct LeavingState {
 ///    deployments, take `KEY SHARE` and are not blocked.) The route trigger
 ///    takes the same rows `FOR SHARE`.
 /// 2. The destination `project_groups` row, `FOR KEY SHARE` when placing into
-///    it, `FOR UPDATE` when deleting it, `FOR NO KEY UPDATE` when its
+///    it, `FOR UPDATE` when deleting it or when a write must keep the member
+///    set it authorized fixed ([`Self::lock_group_members`]), `FOR NO KEY UPDATE` when its
 ///    repository changes ([`Self::lock_repository_followers`]).
 /// 3. `project_group_members` rows, `FOR UPDATE`, in ascending project id.
 /// 4. `project_group_routes` rows (read after 3, deleted by the membership
@@ -571,6 +572,30 @@ impl ProjectGroupService {
         group_id: i32,
         req: UpdateProjectGroupRequest,
     ) -> Result<ProjectGroupWithMembers, ProjectGroupError> {
+        self.apply_group_update(group_id, req, None).await
+    }
+
+    /// [`Self::update_group`] for a caller that checked its access on exactly
+    /// `authorized_member_ids` (the group's members when it looked). The
+    /// group row is locked and its members read again inside the
+    /// transaction; one that joined since fails with
+    /// [`ProjectGroupError::MembersChanged`] and nothing is changed.
+    pub async fn update_group_checked(
+        &self,
+        group_id: i32,
+        req: UpdateProjectGroupRequest,
+        authorized_member_ids: &HashSet<i32>,
+    ) -> Result<ProjectGroupWithMembers, ProjectGroupError> {
+        self.apply_group_update(group_id, req, Some(authorized_member_ids))
+            .await
+    }
+
+    async fn apply_group_update(
+        &self,
+        group_id: i32,
+        req: UpdateProjectGroupRequest,
+        authorized_member_ids: Option<&HashSet<i32>>,
+    ) -> Result<ProjectGroupWithMembers, ProjectGroupError> {
         let group = self.find_group(group_id).await?;
         let mut active: project_groups::ActiveModel = group.clone().into();
         let mut slug_for_errors = group.slug.clone();
@@ -591,13 +616,29 @@ impl ProjectGroupService {
         }
         active.updated_at = Set(Utc::now());
 
-        let updated = active
-            .update(self.db.as_ref())
-            .await
-            .map_err(Self::map_write_error(
-                &slug_for_errors,
-                &format!("updating project group {group_id}"),
-            ))?;
+        let write_error = Self::map_write_error(
+            &slug_for_errors,
+            &format!("updating project group {group_id}"),
+        );
+        let updated = match authorized_member_ids {
+            None => active.update(self.db.as_ref()).await.map_err(write_error)?,
+            Some(authorized) => {
+                let txn = self
+                    .db
+                    .begin()
+                    .await
+                    .map_err(ProjectGroupError::db(format!(
+                        "starting transaction to update project group {group_id}"
+                    )))?;
+                let result = async {
+                    Self::lock_group_members(&txn, group_id, authorized, None).await?;
+                    active.update(&txn).await.map_err(write_error)
+                }
+                .await;
+                Self::end_transaction(txn, result, format!("update of project group {group_id}"))
+                    .await?
+            }
+        };
         self.with_members(updated).await
     }
 
@@ -611,7 +652,7 @@ impl ProjectGroupService {
         &self,
         group_id: i32,
     ) -> Result<(project_groups::Model, Vec<i32>), ProjectGroupError> {
-        let deletion = self.remove_group(group_id, None).await?;
+        let deletion = self.remove_group(group_id, None, None).await?;
         Ok((deletion.group, deletion.released_project_ids))
     }
 
@@ -621,19 +662,30 @@ impl ProjectGroupService {
     /// a route created after the caller checked fails with
     /// [`ProjectGroupError::RouteSetChanged`] and nothing is deleted, rather
     /// than being dropped unauthorized. Returns the routes that were dropped.
+    ///
+    /// `authorized_member_ids` are the members the caller checked its access
+    /// on. Deleting the group removes its shared variables from every
+    /// member, so a member that joined since fails with
+    /// [`ProjectGroupError::MembersChanged`] and nothing is deleted.
     pub async fn delete_group_checked(
         &self,
         group_id: i32,
         authorized_route_ids: &HashSet<i32>,
+        authorized_member_ids: &HashSet<i32>,
     ) -> Result<GroupDeletion, ProjectGroupError> {
-        self.remove_group(group_id, Some(authorized_route_ids))
-            .await
+        self.remove_group(
+            group_id,
+            Some(authorized_route_ids),
+            Some(authorized_member_ids),
+        )
+        .await
     }
 
     async fn remove_group(
         &self,
         group_id: i32,
         authorized_route_ids: Option<&HashSet<i32>>,
+        authorized_member_ids: Option<&HashSet<i32>>,
     ) -> Result<GroupDeletion, ProjectGroupError> {
         let txn = self
             .db
@@ -704,10 +756,22 @@ impl ProjectGroupService {
                     .into_iter()
                     .collect()
             };
-            let released_project_ids = member_ids
+            let released_project_ids: Vec<i32> = member_ids
                 .into_iter()
                 .filter(|id| live.contains(id))
                 .collect();
+            // The group row is locked `FOR UPDATE`, so nobody can join until
+            // this transaction ends: these are the members the deletion
+            // reaches. Checked after the routes so a caller that raced both
+            // gets the same answer as before.
+            if let Some(authorized) = authorized_member_ids {
+                Self::ensure_members_authorized(
+                    group_id,
+                    released_project_ids.iter().copied(),
+                    authorized,
+                    None,
+                )?;
+            }
 
             project_groups::Entity::delete_by_id(group_id)
                 .exec(&txn)
@@ -737,7 +801,7 @@ impl ProjectGroupService {
     /// membership trigger, delete that group's routes) that the caller did
     /// not authorize. Under the lock protocol this cannot happen; it is the
     /// last line of defence against a writer that skipped it.
-    async fn place_membership<C: ConnectionTrait>(
+    pub(crate) async fn place_membership<C: ConnectionTrait>(
         conn: &C,
         group_id: i32,
         project_id: i32,
@@ -793,6 +857,95 @@ impl ProjectGroupService {
             });
         }
         Ok(())
+    }
+
+    /// Fails with [`ProjectGroupError::MembersChanged`] when `current` holds a
+    /// member that is not in `authorized_member_ids`: it joined the group
+    /// after the caller's access to the group's members was checked.
+    /// `joining_project_id` is a project the caller authorized separately
+    /// (the one being placed), so it is never reported. A member that left
+    /// since the check is fine: nothing about it is written.
+    fn ensure_members_authorized(
+        group_id: i32,
+        current: impl IntoIterator<Item = i32>,
+        authorized_member_ids: &HashSet<i32>,
+        joining_project_id: Option<i32>,
+    ) -> Result<(), ProjectGroupError> {
+        let mut unauthorized: Vec<i32> = current
+            .into_iter()
+            .filter(|id| !authorized_member_ids.contains(id) && Some(*id) != joining_project_id)
+            .collect();
+        if unauthorized.is_empty() {
+            return Ok(());
+        }
+        unauthorized.sort_unstable();
+        unauthorized.dedup();
+        tracing::warn!(
+            group_id,
+            project_ids = ?unauthorized,
+            "project groups: projects joined the group after the caller's access to its members \
+             was checked; refusing the change"
+        );
+        Err(ProjectGroupError::MembersChanged {
+            group_id,
+            project_ids: unauthorized,
+        })
+    }
+
+    /// The ids of the live (not soft-deleted) members of `group_id`.
+    async fn live_member_ids<C: ConnectionTrait>(
+        conn: &C,
+        group_id: i32,
+    ) -> Result<Vec<i32>, ProjectGroupError> {
+        Ok(project_group_members::Entity::find()
+            .filter(project_group_members::Column::GroupId.eq(group_id))
+            .find_also_related(projects::Entity)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .all(conn)
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "loading members of project group {group_id}"
+            )))?
+            .into_iter()
+            .filter_map(|(membership, project)| project.map(|_| membership.project_id))
+            .collect())
+    }
+
+    /// Step 2 of the lock order, for a write whose authorization depends on
+    /// who is in the group (a shared variable, a rename, a placement).
+    ///
+    /// Locks `group_id` `FOR UPDATE`: a membership insert key-share-locks the
+    /// group row, so from here until the transaction ends nobody can join the
+    /// group, and the members read next are the members the write reaches.
+    /// The caller checked its access on exactly `authorized_member_ids`; a
+    /// member that is not in the set joined after the check, so nothing is
+    /// written and [`ProjectGroupError::MembersChanged`] is returned.
+    ///
+    /// Takes no project or membership row locks, so it can follow step 1 of
+    /// a transaction that took it (the placement) or stand alone (the
+    /// writers that do not move projects); either way the order holds.
+    pub(crate) async fn lock_group_members<C: ConnectionTrait>(
+        conn: &C,
+        group_id: i32,
+        authorized_member_ids: &HashSet<i32>,
+        joining_project_id: Option<i32>,
+    ) -> Result<project_groups::Model, ProjectGroupError> {
+        let group = project_groups::Entity::find_by_id(group_id)
+            .lock_exclusive()
+            .one(conn)
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "locking project group {group_id}"
+            )))?
+            .ok_or(ProjectGroupError::NotFound { group_id })?;
+        let members = Self::live_member_ids(conn, group_id).await?;
+        Self::ensure_members_authorized(
+            group_id,
+            members,
+            authorized_member_ids,
+            joining_project_id,
+        )?;
+        Ok(group)
     }
 
     /// Step 1 of the lock order: locks the rows of `projects` for the whole
@@ -927,7 +1080,7 @@ impl ProjectGroupService {
         project_id: i32,
     ) -> Result<Option<i32>, ProjectGroupError> {
         Ok(self
-            .place_project(group_id, project_id, None)
+            .place_project(group_id, project_id, None, None)
             .await?
             .previous_group_id)
     }
@@ -937,14 +1090,27 @@ impl ProjectGroupService {
     /// The routes the move drops are read again under a row lock on the
     /// membership; if one is not in the set, nothing changes and
     /// [`ProjectGroupError::RouteSetChanged`] is returned.
+    ///
+    /// `authorized_member_ids` are the members of the destination group the
+    /// caller checked its access on: joining hands the project the group's
+    /// shared variables, which takes managing them. The destination is
+    /// locked `FOR UPDATE` and its members read again; one that joined
+    /// since (other than `project_id`, authorized separately) fails with
+    /// [`ProjectGroupError::MembersChanged`] and nothing changes.
     pub async fn add_project_checked(
         &self,
         group_id: i32,
         project_id: i32,
         authorized_route_ids: &HashSet<i32>,
+        authorized_member_ids: &HashSet<i32>,
     ) -> Result<ProjectPlacement, ProjectGroupError> {
-        self.place_project(group_id, project_id, Some(authorized_route_ids))
-            .await
+        self.place_project(
+            group_id,
+            project_id,
+            Some(authorized_route_ids),
+            Some(authorized_member_ids),
+        )
+        .await
     }
 
     async fn place_project(
@@ -952,6 +1118,7 @@ impl ProjectGroupService {
         group_id: i32,
         project_id: i32,
         authorized_route_ids: Option<&HashSet<i32>>,
+        authorized_member_ids: Option<&HashSet<i32>>,
     ) -> Result<ProjectPlacement, ProjectGroupError> {
         let txn = self
             .db
@@ -967,20 +1134,30 @@ impl ProjectGroupService {
             // is no membership row yet to lock.
             let locked = Self::lock_projects(&txn, &[project_id]).await?;
             // Step 2: the destination group cannot be deleted while we place into
-            // it.
-            let group_exists = project_groups::Entity::find_by_id(group_id)
-                .select_only()
-                .column(project_groups::Column::Id)
-                .lock(LockType::KeyShare)
-                .into_tuple::<i32>()
-                .one(&txn)
-                .await
-                .map_err(ProjectGroupError::db(format!(
-                    "locking project group {group_id}"
-                )))?
-                .is_some();
-            if !group_exists {
-                return Err(ProjectGroupError::NotFound { group_id });
+            // it. A caller that authorized the group's members takes it
+            // `FOR UPDATE` instead, which also keeps anyone else from joining
+            // until this transaction ends, so those members are the ones the
+            // placement reaches.
+            match authorized_member_ids {
+                Some(authorized) => {
+                    Self::lock_group_members(&txn, group_id, authorized, Some(project_id)).await?;
+                }
+                None => {
+                    let group_exists = project_groups::Entity::find_by_id(group_id)
+                        .select_only()
+                        .column(project_groups::Column::Id)
+                        .lock(LockType::KeyShare)
+                        .into_tuple::<i32>()
+                        .one(&txn)
+                        .await
+                        .map_err(ProjectGroupError::db(format!(
+                            "locking project group {group_id}"
+                        )))?
+                        .is_some();
+                    if !group_exists {
+                        return Err(ProjectGroupError::NotFound { group_id });
+                    }
+                }
             }
             if locked.get(&project_id) != Some(&false) {
                 return Err(ProjectGroupError::ProjectNotFound { project_id });
@@ -1956,7 +2133,7 @@ mod tests {
         let dest = svc.create_group(create_req("Dest", vec![])).await.unwrap();
 
         let err = svc
-            .add_project_checked(dest.group.id, a, &HashSet::new())
+            .add_project_checked(dest.group.id, a, &HashSet::new(), &HashSet::new())
             .await
             .unwrap_err();
         assert!(matches!(err, ProjectGroupError::RouteSetChanged { .. }));
@@ -1968,7 +2145,7 @@ mod tests {
 
         let authorized: HashSet<i32> = [ab, ca].into_iter().collect();
         let placement = svc
-            .add_project_checked(dest.group.id, a, &authorized)
+            .add_project_checked(dest.group.id, a, &authorized, &HashSet::new())
             .await
             .unwrap();
         assert_eq!(placement.previous_group_id, Some(old));
@@ -1992,9 +2169,10 @@ mod tests {
         let Some(db) = try_test_db().await else {
             return;
         };
-        let (svc, conn, old, [a, _b, _c], [ab, ca]) = grouped_with_routes(&db, 9741).await;
+        let (svc, conn, old, [a, b, c], [ab, ca]) = grouped_with_routes(&db, 9741).await;
+        let members: HashSet<i32> = [a, b, c].into_iter().collect();
         let placement = svc
-            .add_project_checked(old, a, &HashSet::new())
+            .add_project_checked(old, a, &HashSet::new(), &members)
             .await
             .unwrap();
         assert_eq!(placement.previous_group_id, Some(old));
@@ -2012,8 +2190,9 @@ mod tests {
         // The caller only authorized A->B; C->A appeared (or was not
         // inspected), so the deletion must be refused whole.
         let authorized: HashSet<i32> = [ab].into_iter().collect();
+        let members: HashSet<i32> = [a, b, c].into_iter().collect();
         let err = svc
-            .delete_group_checked(old, &authorized)
+            .delete_group_checked(old, &authorized, &members)
             .await
             .unwrap_err();
         assert!(
@@ -2036,7 +2215,7 @@ mod tests {
 
         // A missing group keeps its error, even with an empty authorized set.
         let err = svc
-            .delete_group_checked(999_999, &HashSet::new())
+            .delete_group_checked(999_999, &HashSet::new(), &HashSet::new())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2061,7 +2240,11 @@ mod tests {
         let listed = svc.routes_of_group(old).await.unwrap();
         let authorized: HashSet<i32> = listed.iter().map(|r| r.id).collect();
         assert_eq!(authorized, [ab, ca].into_iter().collect());
-        let deletion = svc.delete_group_checked(old, &authorized).await.unwrap();
+        let members: HashSet<i32> = [a, b, c].into_iter().collect();
+        let deletion = svc
+            .delete_group_checked(old, &authorized, &members)
+            .await
+            .unwrap();
         assert_eq!(deletion.group.id, old);
         assert_eq!(deletion.released_project_ids, vec![a, b]);
         assert_eq!(
@@ -2078,6 +2261,201 @@ mod tests {
             ProjectGroupError::NotFound { .. }
         ));
         assert!(svc.group_for_project(a).await.unwrap().is_none());
+    }
+
+    // A member that joined after the caller's access to the group's members
+    // was checked must stop the write: nothing is changed, and the same
+    // request with the member set it now has goes through.
+
+    #[test]
+    fn members_authorized_ignores_leavers_and_the_joining_project() {
+        let authorized: HashSet<i32> = [1, 2].into_iter().collect();
+        // 2 may have left; 3 is the project being placed.
+        assert!(
+            ProjectGroupService::ensure_members_authorized(7, [1, 3], &authorized, Some(3)).is_ok()
+        );
+        let err =
+            ProjectGroupService::ensure_members_authorized(7, [1, 9, 8, 9], &authorized, None)
+                .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { group_id: 7, ref project_ids } if *project_ids == vec![8, 9]),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_with_a_member_that_joined_after_authorization_changes_nothing() {
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let (svc, conn, old, [a, b, c], [ab, ca]) = grouped_with_routes(&db, 9771).await;
+        let routes: HashSet<i32> = [ab, ca].into_iter().collect();
+        let checked: HashSet<i32> = [a, b, c].into_iter().collect();
+        // A restricted project joins after the caller's members were checked.
+        let late = 9774;
+        insert_project(conn.as_ref(), late, "late").await;
+        svc.add_project(old, late).await.unwrap();
+
+        let err = svc
+            .delete_group_checked(old, &routes, &checked)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { group_id, ref project_ids } if group_id == old && *project_ids == vec![late]),
+            "got {err:?}"
+        );
+        assert!(svc.get_group(old).await.is_ok(), "the group must survive");
+        assert_eq!(route_ids_in(conn.as_ref(), old).await, vec![ab, ca]);
+        assert_eq!(
+            svc.group_for_project(late).await.unwrap().unwrap().group.id,
+            old
+        );
+
+        // Authorized again with the members it has now, the deletion goes through.
+        let checked: HashSet<i32> = [a, b, c, late].into_iter().collect();
+        let deletion = svc
+            .delete_group_checked(old, &routes, &checked)
+            .await
+            .unwrap();
+        assert_eq!(deletion.released_project_ids.len(), 4);
+        assert!(svc.group_for_project(late).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn updating_with_a_member_that_joined_after_authorization_changes_nothing() {
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let (svc, conn, old, [a, b, c], _) = grouped_with_routes(&db, 9781).await;
+        let checked: HashSet<i32> = [a, b, c].into_iter().collect();
+        let late = 9784;
+        insert_project(conn.as_ref(), late, "late").await;
+        svc.add_project(old, late).await.unwrap();
+
+        let rename = || UpdateProjectGroupRequest {
+            name: Some("Renamed".into()),
+            slug: None,
+            description: None,
+        };
+        let err = svc
+            .update_group_checked(old, rename(), &checked)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { ref project_ids, .. } if *project_ids == vec![late]),
+            "got {err:?}"
+        );
+        assert_ne!(svc.get_group(old).await.unwrap().group.name, "Renamed");
+
+        let checked: HashSet<i32> = [a, b, c, late].into_iter().collect();
+        let updated = svc
+            .update_group_checked(old, rename(), &checked)
+            .await
+            .unwrap();
+        assert_eq!(updated.group.name, "Renamed");
+
+        // A missing group keeps its error.
+        let err = svc
+            .update_group_checked(999_999, rename(), &HashSet::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectGroupError::NotFound { group_id: 999_999 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn joining_a_group_whose_members_changed_after_authorization_changes_nothing() {
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        let (joiner, member, late) = (9791, 9792, 9793);
+        for (id, name) in [(joiner, "joiner"), (member, "member"), (late, "late")] {
+            insert_project(conn.as_ref(), id, name).await;
+        }
+        let svc = ProjectGroupService::new(conn.clone());
+        let group = svc
+            .create_group(create_req("Dest 9791", vec![member]))
+            .await
+            .unwrap()
+            .group
+            .id;
+        svc.add_project(group, late).await.unwrap();
+        let checked: HashSet<i32> = [member].into_iter().collect();
+
+        let err = svc
+            .add_project_checked(group, joiner, &HashSet::new(), &checked)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { ref project_ids, .. } if *project_ids == vec![late]),
+            "got {err:?}"
+        );
+        assert!(svc.group_for_project(joiner).await.unwrap().is_none());
+
+        let checked: HashSet<i32> = [member, late].into_iter().collect();
+        svc.add_project_checked(group, joiner, &HashSet::new(), &checked)
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.group_for_project(joiner)
+                .await
+                .unwrap()
+                .unwrap()
+                .group
+                .id,
+            group
+        );
+    }
+
+    /// The member joins in a transaction that has not committed when the
+    /// deletion starts: the deletion waits for it, then sees the member.
+    #[tokio::test]
+    async fn deleting_waits_for_a_member_that_is_joining_and_then_refuses() {
+        use sea_orm::TransactionTrait;
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        let (member, late) = (9801 + 100, 9802 + 100);
+        insert_project(conn.as_ref(), member, "member").await;
+        insert_project(conn.as_ref(), late, "late").await;
+        let svc = Arc::new(ProjectGroupService::new(conn.clone()));
+        let group = svc
+            .create_group(create_req("Race members", vec![member]))
+            .await
+            .unwrap()
+            .group
+            .id;
+
+        let b = conn.begin().await.unwrap();
+        ProjectGroupService::lock_projects(&b, &[late])
+            .await
+            .unwrap();
+        ProjectGroupService::place_membership(&b, group, late, None, None)
+            .await
+            .unwrap();
+
+        let a = {
+            let svc = svc.clone();
+            let checked: HashSet<i32> = [member].into_iter().collect();
+            spawn_expecting_block("deleting a group while a member joins", async move {
+                svc.delete_group_checked(group, &HashSet::new(), &checked)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+        };
+        b.commit().await.unwrap();
+
+        let err = finished(a).await.unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { ref project_ids, .. } if *project_ids == vec![late]),
+            "got {err:?}"
+        );
+        assert!(svc.get_group(group).await.is_ok());
     }
 
     #[tokio::test]
@@ -2207,7 +2585,8 @@ mod tests {
         let a = {
             let svc = svc.clone();
             spawn_expecting_block("moving an ungrouped project", async move {
-                svc.add_project_checked(target, p, &HashSet::new()).await
+                svc.add_project_checked(target, p, &HashSet::new(), &HashSet::new())
+                    .await
             })
             .await
         };
@@ -2317,6 +2696,7 @@ mod tests {
             let a = {
                 let svc = svc.clone();
                 let nothing = HashSet::new();
+                let members: HashSet<i32> = [p, q].into_iter().collect();
                 spawn_expecting_block(change, async move {
                     match change {
                         "remove" => svc
@@ -2324,10 +2704,13 @@ mod tests {
                             .await
                             .map(|_| ()),
                         "move" => svc
-                            .add_project_checked(other, p, &nothing)
+                            .add_project_checked(other, p, &nothing, &HashSet::new())
                             .await
                             .map(|_| ()),
-                        _ => svc.delete_group_checked(group, &nothing).await.map(|_| ()),
+                        _ => svc
+                            .delete_group_checked(group, &nothing, &members)
+                            .await
+                            .map(|_| ()),
                     }
                 })
                 .await

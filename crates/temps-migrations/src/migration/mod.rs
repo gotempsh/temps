@@ -331,6 +331,7 @@ mod m20261012_000003_managed_daemon_beta_images;
 mod m20261013_000001_webhook_delivery_identity;
 mod m20261013_000002_add_kind_to_ai_conversations;
 mod m20261013_000003_allow_source_built_service_release;
+mod m20261014_000001_add_instantiation_claim_token;
 
 pub struct Migrator;
 
@@ -738,6 +739,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260930_000001_add_project_instantiation_token::Migration),
             // Source-built services of an app template keep their release.
             Box::new(m20261013_000003_allow_source_built_service_release::Migration),
+            // Each claim of a template instantiation gets an ownership token.
+            Box::new(m20261014_000001_add_instantiation_claim_token::Migration),
         ]
     }
 }
@@ -796,6 +799,14 @@ mod registry_tests {
             (
                 "m20260903_000001_add_service_project_identity",
                 "m20261013_000003_allow_source_built_service_release",
+            ),
+            (
+                "m20261013_000003_allow_source_built_service_release",
+                "m20261014_000001_add_instantiation_claim_token",
+            ),
+            (
+                "m20260929_000001_create_template_instantiations",
+                "m20261014_000001_add_instantiation_claim_token",
             ),
             (
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",

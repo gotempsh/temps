@@ -43,6 +43,12 @@ pub struct Model {
     /// `status = 'running'` and this is more than 2 minutes old the
     /// instantiation is reported as `interrupted`.
     pub heartbeat_at: Option<DateTime<Utc>>,
+    /// Random value written by every claim of this instantiation, takeovers
+    /// included. A runner's writes are conditional on the token it was
+    /// given, so one that lost its claim cannot change the row (see
+    /// `temps-project-groups`). Never exposed.
+    #[serde(skip_serializing)]
+    pub claim_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -834,7 +834,7 @@ pub async fn get_project_group_by_slug(
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions or no access to a member project"),
         (status = 404, description = "Project group not found"),
-        (status = 409, description = "Slug already taken"),
+        (status = 409, description = "Slug already taken, or a project joined the group while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -854,8 +854,14 @@ pub async fn update_project_group(
         ProjectGroupError::NotFound { group_id },
     )?;
     require_access_to_all_members(&current, &hidden)?;
+    // Written under a lock that re-reads the members: one that joined after
+    // the check above (and may be hidden from the caller) fails with 409.
+    let authorized_members: HashSet<i32> = current.members.iter().map(|p| p.id).collect();
 
-    let updated = state.service.update_group(group_id, req).await?;
+    let updated = state
+        .service
+        .update_group_checked(group_id, req, &authorized_members)
+        .await?;
     ProjectGroupAudit::new(
         "PROJECT_GROUP_UPDATED",
         &auth,
@@ -878,7 +884,7 @@ pub async fn update_project_group(
         (status = 204, description = "Project group deleted; its projects are now ungrouped and otherwise unchanged"),
         (status = 403, description = "Insufficient permissions, no access to a member project, or no ProjectsWrite on a service whose route in the group is deleted with it"),
         (status = 404, description = "Project group not found, or a route that would be deleted involves a service the caller cannot see"),
-        (status = 409, description = "A route appeared in the group while the request was being authorized; retry"),
+        (status = 409, description = "A route appeared in the group, or a project joined it, while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -893,13 +899,15 @@ pub async fn delete_project_group(
     // Deleting a group also removes its shared secrets from every member's
     // environment, so the caller must hold EnvironmentsWrite on every member —
     // the same gate as editing a group variable.
-    authorize_group_env(&state, &auth, group_id, true).await?;
+    let group = authorize_group_env(&state, &auth, group_id, true).await?;
+    let authorized_members: HashSet<i32> = group.members.iter().map(|p| p.id).collect();
 
     // The database deletes the group's routes with it. That rewrites traffic
     // between its services, so it takes what deleting each route directly
     // takes: both endpoints visible and project-scoped ProjectsWrite on both.
     // The deletion re-reads the routes under lock and refuses (409) any that
-    // appeared after this check.
+    // appeared after this check, and so does a member that joined after the
+    // access check above.
     let hidden = hidden_projects(&state, &auth).await?;
     let dropping = state.service.routes_of_group(group_id).await?;
     let authorized =
@@ -907,7 +915,7 @@ pub async fn delete_project_group(
 
     let deletion = state
         .service
-        .delete_group_checked(group_id, &authorized)
+        .delete_group_checked(group_id, &authorized, &authorized_members)
         .await?;
     let group = deletion.group;
 
@@ -947,7 +955,7 @@ pub async fn delete_project_group(
         (status = 200, description = "Project placed in the group (moved out of any other group)", body = ProjectGroupResponse),
         (status = 403, description = "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group"),
         (status = 404, description = "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"),
-        (status = 409, description = "A route involving the project appeared, or the project changed group, while the request was being authorized; retry"),
+        (status = 409, description = "A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -976,7 +984,8 @@ pub async fn add_project_to_group(
         project_id,
         state.project_access_checker
     );
-    authorize_group_env(&state, &auth, group_id, true).await?;
+    let group = authorize_group_env(&state, &auth, group_id, true).await?;
+    let authorized_members: HashSet<i32> = group.members.iter().map(|p| p.id).collect();
     let hidden = hidden_projects(&state, &auth).await?;
 
     // Moving out of another group drops that group's routes involving the
@@ -990,7 +999,7 @@ pub async fn add_project_to_group(
 
     let placement = state
         .service
-        .add_project_checked(group_id, project_id, &authorized)
+        .add_project_checked(group_id, project_id, &authorized, &authorized_members)
         .await?;
     let previous = placement.previous_group_id;
     let group = state.service.get_group(group_id).await?;
@@ -1257,7 +1266,7 @@ pub async fn list_group_env_vars(
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions on a member project"),
         (status = 404, description = "Project group not found"),
-        (status = 409, description = "Variable already exists for that scope"),
+        (status = 409, description = "Variable already exists for that scope, or a project joined the group while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1270,8 +1279,12 @@ pub async fn create_group_env_var(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     let group = authorize_group_env(&state, &auth, group_id, true).await?;
+    let authorized_members: HashSet<i32> = group.members.iter().map(|p| p.id).collect();
     let plaintext = req.value.clone();
-    let created = state.env_vars.create(group_id, req).await?;
+    let created = state
+        .env_vars
+        .create_checked(group_id, &authorized_members, req)
+        .await?;
 
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_ENV_VAR_CREATED",
@@ -1303,6 +1316,7 @@ pub async fn create_group_env_var(
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions on a member project"),
         (status = 404, description = "Project group or variable not found"),
+        (status = 409, description = "A project joined the group while the request was being authorized, so it was not checked; nothing was changed. Retry the request"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1315,8 +1329,12 @@ pub async fn update_group_env_var(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     let group = authorize_group_env(&state, &auth, group_id, true).await?;
+    let authorized_members: HashSet<i32> = group.members.iter().map(|p| p.id).collect();
     let plaintext = req.value.clone();
-    let updated = state.env_vars.update(group_id, var_id, req).await?;
+    let updated = state
+        .env_vars
+        .update_checked(group_id, var_id, &authorized_members, req)
+        .await?;
 
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_ENV_VAR_UPDATED",
@@ -1343,6 +1361,7 @@ pub async fn update_group_env_var(
         (status = 204, description = "Variable deleted; projects stop receiving it on their next deployment"),
         (status = 403, description = "Insufficient permissions on a member project"),
         (status = 404, description = "Project group or variable not found"),
+        (status = 409, description = "A project joined the group while the request was being authorized, so it was not checked; nothing was changed. Retry the request"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1354,7 +1373,11 @@ pub async fn delete_group_env_var(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     let group = authorize_group_env(&state, &auth, group_id, true).await?;
-    let deleted = state.env_vars.delete(group_id, var_id).await?;
+    let authorized_members: HashSet<i32> = group.members.iter().map(|p| p.id).collect();
+    let deleted = state
+        .env_vars
+        .delete_checked(group_id, var_id, &authorized_members)
+        .await?;
 
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_ENV_VAR_DELETED",

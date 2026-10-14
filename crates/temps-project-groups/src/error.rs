@@ -136,6 +136,21 @@ pub enum ProjectGroupError {
         project_ids: Vec<i32>,
     },
 
+    /// Projects joined the group after the caller's access to its members was
+    /// checked, so the change would have been made to (or have reached)
+    /// projects the caller was never authorized on. Nothing was changed. The
+    /// ids are kept for logs; the message gives only the count, because the
+    /// caller may not be allowed to see those projects.
+    #[error(
+        "{} project(s) joined project group {group_id} while this request was being \
+         authorized; retry the request",
+        .project_ids.len()
+    )]
+    MembersChanged {
+        group_id: i32,
+        project_ids: Vec<i32>,
+    },
+
     /// The group's repository was changed while a project was being pointed
     /// at the one it had when the request started, so the project would have
     /// been left following a repository the group no longer has.
@@ -233,6 +248,10 @@ impl From<ProjectGroupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectGroupError::MembersChanged { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Group Members Changed")
+                .with_detail(error.to_string()),
+
             ProjectGroupError::RepositoryFollowersChanged { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Repository Followers Changed")
@@ -286,6 +305,20 @@ mod tests {
         assert!(!message.contains("41") && !message.contains("42"));
         let problem = Problem::from(error);
         assert_eq!(problem.status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn members_that_joined_during_authorization_are_a_conflict_that_counts_but_does_not_name_them()
+    {
+        let error = ProjectGroupError::MembersChanged {
+            group_id: 7,
+            project_ids: vec![41, 42],
+        };
+        let message = error.to_string();
+        assert!(message.contains("2 project(s)"), "got {message}");
+        assert!(message.contains("project group 7"), "got {message}");
+        assert!(!message.contains("41") && !message.contains("42"));
+        assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
     }
 
     #[test]

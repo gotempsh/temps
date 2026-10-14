@@ -29,11 +29,13 @@ use temps_core::templates::{
 };
 use temps_core::RequestMetadata;
 use temps_projects::services::types::SlugClaimCaller;
+use temps_projects::template_creation::TemplateEnvironmentError;
 use temps_projects::template_creation::{
     authorize_storage_services, missing_required_template_configuration,
     require_template_creation_permissions, resolve_image_template_runtime, RepositoryTarget,
 };
 use temps_projects::ProjectService;
+use tracing::error;
 use utoipa::{IntoParams, OpenApi};
 
 use crate::error::ProjectGroupError;
@@ -41,6 +43,7 @@ use crate::handlers::{
     authorize_group_env, hidden_projects, reject_deployment_token, visible_or_not_found,
     ProjectGroupAudit, ProjectGroupsAppState,
 };
+use crate::instantiation::InstantiationError;
 use crate::instantiation::{
     build_plan, ensure_secrets_available, import_template, validate_plan_variables, DatabaseChoice,
     ForkRequest, ImportServicesRequest, ImportedApp, InstantiateTemplateRequest,
@@ -114,6 +117,103 @@ fn bad_request(title: &str, detail: impl Into<String>) -> Problem {
         .title(title)
         .detail(detail.into())
         .build()
+}
+
+/// A planning failure as a response: a rejected request keeps the title of the
+/// endpoint that planned it, anything else is classified by its variant.
+fn planning_problem(title: &str, error: InstantiationError) -> Problem {
+    match error {
+        InstantiationError::Validation { message } => bad_request(title, message),
+        other => Problem::from(other),
+    }
+}
+
+fn instantiation_problem(status: StatusCode, title: &str, error: &InstantiationError) -> Problem {
+    ErrorBuilder::new(status)
+        .title(title)
+        .detail(error.to_string())
+        .build()
+}
+
+impl From<InstantiationError> for Problem {
+    fn from(error: InstantiationError) -> Self {
+        match &error {
+            InstantiationError::Validation { .. } => {
+                instantiation_problem(StatusCode::BAD_REQUEST, "Invalid Request", &error)
+            }
+            InstantiationError::ClaimLost { .. } => instantiation_problem(
+                StatusCode::CONFLICT,
+                "Instantiation Owned Elsewhere",
+                &error,
+            ),
+            InstantiationError::SlugsExhausted { .. }
+            | InstantiationError::DatabaseNameTaken { .. }
+            | InstantiationError::RouteTaken { .. } => {
+                instantiation_problem(StatusCode::CONFLICT, "Name Already In Use", &error)
+            }
+            InstantiationError::ServiceProjectDeleted { .. }
+            | InstantiationError::ServiceProjectUninitialized { .. } => {
+                instantiation_problem(StatusCode::CONFLICT, "Instantiation Cannot Resume", &error)
+            }
+            InstantiationError::Database { .. } => {
+                error!(%error, "Instantiation database operation failed");
+                instantiation_problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &error,
+                )
+            }
+            InstantiationError::InvalidPlan { .. }
+            | InstantiationError::PlanNotSerializable { .. }
+            | InstantiationError::SecretsUnreadable { .. }
+            | InstantiationError::SecretsInvalid { .. }
+            | InstantiationError::UnknownStep { .. }
+            | InstantiationError::TemplateServiceMissing { .. }
+            | InstantiationError::PlannedServiceMissing { .. }
+            | InstantiationError::PlannedDatabaseMissing { .. }
+            | InstantiationError::ProjectNotCreated
+            | InstantiationError::ServiceNotCreated { .. }
+            | InstantiationError::DiscardFailed { .. }
+            | InstantiationError::CreationNotRecorded { .. }
+            | InstantiationError::ExternalService(_) => instantiation_problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Instantiation Failed",
+                &error,
+            ),
+            InstantiationError::Upstream { status, .. } => {
+                instantiation_problem(*status, "Instantiation Step Failed", &error)
+            }
+            InstantiationError::Variables(source) => match source {
+                TemplateEnvironmentError::SecureGeneration { .. } => instantiation_problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Variable Generation Failed",
+                    &error,
+                ),
+                TemplateEnvironmentError::Duplicate { .. }
+                | TemplateEnvironmentError::MissingRequired { .. }
+                | TemplateEnvironmentError::UnsupportedGenerator { .. }
+                | TemplateEnvironmentError::AlreadyConfigured { .. }
+                | TemplateEnvironmentError::Unknown { .. } => {
+                    instantiation_problem(StatusCode::BAD_REQUEST, "Invalid Variables", &error)
+                }
+            },
+            InstantiationError::Group(_)
+            | InstantiationError::Project(_)
+            | InstantiationError::StepFailed { .. } => match error {
+                InstantiationError::Group(source) => Problem::from(*source),
+                InstantiationError::Project(source) => Problem::from(*source),
+                InstantiationError::StepFailed { source, .. } => Problem::from(*source),
+                other => {
+                    error!(%other, "Instantiation error reached the wrong conversion arm");
+                    instantiation_problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Instantiation Failed",
+                        &other,
+                    )
+                }
+            },
+        }
+    }
 }
 
 fn validate_idempotency_key(key: &str) -> Result<(), Problem> {
@@ -550,7 +650,7 @@ pub async fn instantiate_template(
         group_id,
         variables: &request.environment_variables,
     })
-    .map_err(|message| bad_request("Invalid Template Request", message))?;
+    .map_err(|error| planning_problem("Invalid Template Request", error))?;
 
     // Required values must be known now, not discovered halfway through.
     for service in &template.services {
@@ -695,7 +795,7 @@ pub async fn import_project_services(
         repository.main_branch.clone(),
         &request.apps,
     )
-    .map_err(|message| bad_request("Invalid Import", message))?;
+    .map_err(|error| planning_problem("Invalid Import", error))?;
     let problems = TemplateService::validate_template(&template);
     if !problems.is_empty() {
         return Err(bad_request("Invalid Import", problems.join("; ")));
@@ -727,7 +827,7 @@ pub async fn import_project_services(
         group_id: Some(group_id),
         variables: &[],
     })
-    .map_err(|message| bad_request("Invalid Import", message))?;
+    .map_err(|error| planning_problem("Invalid Import", error))?;
     plan.template.name = format!("Import into {}", group.group.name);
 
     let key = request.idempotency_key.trim();
@@ -996,4 +1096,66 @@ pub async fn retry_instantiation(
     response.status = InstantiationStatus::Running;
     response.error = None;
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rejected_request_is_a_400_with_the_endpoint_title() {
+        let problem = planning_problem(
+            "Invalid Import",
+            InstantiationError::Validation {
+                message: "app 'web' has no path".into(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.body["title"], "Invalid Import");
+        assert_eq!(problem.body["detail"], "app 'web' has no path");
+    }
+
+    #[test]
+    fn a_lost_claim_is_a_conflict_naming_the_instantiation() {
+        let problem = Problem::from(InstantiationError::ClaimLost {
+            instantiation_id: 42,
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert!(problem.body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("42"));
+    }
+
+    #[test]
+    fn a_step_failure_is_classified_by_its_cause() {
+        let problem = Problem::from(InstantiationError::StepFailed {
+            step: "database".into(),
+            source: Box::new(InstantiationError::DatabaseNameTaken {
+                name: "orders".into(),
+            }),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn an_upstream_refusal_keeps_its_status() {
+        let problem = Problem::from(InstantiationError::Upstream {
+            status: StatusCode::FORBIDDEN,
+            message: "Forbidden: missing permission".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn corrupt_state_is_a_500_and_variables_are_a_400() {
+        let corrupt = Problem::from(InstantiationError::UnknownStep { key: "x".into() });
+        assert_eq!(corrupt.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let variables = Problem::from(InstantiationError::Variables(
+            TemplateEnvironmentError::MissingRequired {
+                name: "TOKEN".into(),
+            },
+        ));
+        assert_eq!(variables.status_code, StatusCode::BAD_REQUEST);
+    }
 }

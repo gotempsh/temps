@@ -417,14 +417,11 @@ async fn test_source_built_service_release_migration_relaxes_identity_constraint
     .await?;
     let target = "m20261013_000003_allow_source_built_service_release";
     let migrations = Migrator::migrations();
-    let target_position = migrations
-        .iter()
-        .position(|migration| migration.name() == target)
-        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
-    assert_eq!(
-        target_position,
-        migrations.len() - 1,
-        "this test reverts the target with `down(1)`, so it must be the last migration"
+    assert!(
+        migrations
+            .iter()
+            .any(|migration| migration.name() == target),
+        "migration {target} not found in Migrator"
     );
     Migrator::up(&db, None).await?;
 
@@ -495,8 +492,9 @@ async fn test_source_built_service_release_migration_relaxes_identity_constraint
     );
 
     // Down restores the original rule and clears the snapshots it forbids,
-    // keeping the services themselves and their provenance.
-    Migrator::down(&db, Some(1)).await?;
+    // keeping the services themselves and their provenance. Everything
+    // registered after the target is reverted with it.
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
     let rows = db
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -549,9 +547,110 @@ async fn test_source_built_service_release_migration_relaxes_identity_constraint
     );
 
     // And it can be applied again on the reverted schema.
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, None).await?;
     db.execute_unprepared(&insert("rebuilt", "server", "'{}'::jsonb", "'infra-app'"))
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_instantiation_claim_token_migration_is_nullable_and_reversible() -> anyhow::Result<()>
+{
+    if external_db_configured() {
+        println!("Skipping claim token migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping claim token migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261014_000001_add_instantiation_claim_token";
+    let steps = steps_back_to(target);
+
+    // Apply everything before the target and store a row, as an upgrade
+    // from a database that predates the column would have.
+    Migrator::up(&db, Some(Migrator::migrations().len() as u32 - steps)).await?;
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, created_at, updated_at) \
+             VALUES ('Claim token user', 'claim-token@example.test', now(), now()) \
+             RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted user row");
+    let user_id: i32 = user.try_get("", "id")?;
+    db.execute_unprepared(&format!(
+        "INSERT INTO template_instantiations (user_id, idempotency_key, kind, name, plan) \
+         VALUES ({user_id}, 'before', 'template', 'Before', '{{}}'::jsonb)"
+    ))
+    .await?;
+
+    let claim_token_column = || {
+        db.query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_name = 'template_instantiations' AND column_name = 'claim_token'"
+                .to_string(),
+        ))
+    };
+    assert!(claim_token_column().await?.is_empty());
+
+    Migrator::up(&db, Some(1)).await?;
+    let columns = claim_token_column().await?;
+    assert_eq!(columns.len(), 1, "the column must exist after up");
+    assert_eq!(columns[0].try_get::<String>("", "is_nullable")?, "YES");
+    // The row stored before the column exists carries no token.
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT claim_token FROM template_instantiations WHERE idempotency_key = 'before'"
+                .to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].try_get::<Option<String>>("", "claim_token")?, None);
+
+    Migrator::down(&db, Some(steps)).await?;
+    assert!(
+        claim_token_column().await?.is_empty(),
+        "the column must be gone after down"
+    );
+    // The stored row survives the round trip.
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM template_instantiations WHERE idempotency_key = 'before'".to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 1);
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(claim_token_column().await?.len(), 1);
     Ok(())
 }
 

@@ -8,13 +8,13 @@
 //! group variables, the project's own variables, platform-owned variables.
 //! A project can therefore always override what its group provides.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
-    SqlErr,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, Set, SqlErr, TransactionTrait,
 };
 use serde::Deserialize;
 use temps_core::EncryptionService;
@@ -22,6 +22,7 @@ use temps_entities::{environments, project_group_env_vars};
 use utoipa::ToSchema;
 
 use crate::error::ProjectGroupError;
+use crate::service::ProjectGroupService;
 
 const MAX_KEY_LEN: usize = 255;
 
@@ -161,8 +162,73 @@ impl GroupEnvVarService {
             })
     }
 
+    /// Creates a variable in a group the caller owns outright (a group the
+    /// instantiation engine is assembling). Handlers that authorize the
+    /// caller against the group's members use [`Self::create_checked`].
     pub async fn create(
         &self,
+        group_id: i32,
+        req: CreateGroupEnvVarRequest,
+    ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
+        self.insert(self.db.as_ref(), group_id, req).await
+    }
+
+    /// Creates a variable that reaches every member of the group, for a
+    /// caller whose access was checked on exactly `authorized_member_ids`.
+    /// The group is locked and its members read again inside the
+    /// transaction that writes; one that joined since fails with
+    /// [`ProjectGroupError::MembersChanged`] and nothing is written.
+    pub async fn create_checked(
+        &self,
+        group_id: i32,
+        authorized_member_ids: &HashSet<i32>,
+        req: CreateGroupEnvVarRequest,
+    ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
+        let txn = self.begin_locked(group_id, authorized_member_ids).await?;
+        let result = self.insert(&txn, group_id, req).await;
+        ProjectGroupService::end_transaction(
+            txn,
+            result,
+            format!("creation of a variable in project group {group_id}"),
+        )
+        .await
+    }
+
+    /// Starts a transaction that holds the group locked and has verified that
+    /// its members are all in `authorized_member_ids`. The transaction is
+    /// rolled back (releasing the lock) when that is not so.
+    async fn begin_locked(
+        &self,
+        group_id: i32,
+        authorized_member_ids: &HashSet<i32>,
+    ) -> Result<sea_orm::DatabaseTransaction, ProjectGroupError> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "starting transaction to change the variables of project group {group_id}"
+            )))?;
+        match ProjectGroupService::lock_group_members(&txn, group_id, authorized_member_ids, None)
+            .await
+        {
+            Ok(_) => Ok(txn),
+            Err(error) => {
+                if let Err(rollback) = txn.rollback().await {
+                    tracing::warn!(
+                        group_id,
+                        error = %rollback,
+                        "project groups: rollback failed after {error}"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn insert<C: ConnectionTrait>(
+        &self,
+        conn: &C,
         group_id: i32,
         req: CreateGroupEnvVarRequest,
     ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
@@ -184,7 +250,7 @@ impl GroupEnvVarService {
             updated_at: Set(now),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(conn)
         .await
         .map_err(|err| match err.sql_err() {
             Some(SqlErr::UniqueConstraintViolation(_)) => ProjectGroupError::EnvVarConflict {
@@ -199,14 +265,15 @@ impl GroupEnvVarService {
         })
     }
 
-    async fn find(
+    async fn find<C: ConnectionTrait>(
         &self,
+        conn: &C,
         group_id: i32,
         var_id: i32,
     ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
         project_group_env_vars::Entity::find_by_id(var_id)
             .filter(project_group_env_vars::Column::GroupId.eq(group_id))
-            .one(self.db.as_ref())
+            .one(conn)
             .await
             .map_err(ProjectGroupError::db(format!(
                 "loading variable {var_id} of project group {group_id}"
@@ -214,13 +281,33 @@ impl GroupEnvVarService {
             .ok_or(ProjectGroupError::EnvVarNotFound { group_id, var_id })
     }
 
-    pub async fn update(
+    /// Updates a variable, for a caller whose access was checked on exactly
+    /// `authorized_member_ids` (see [`Self::create_checked`]).
+    pub async fn update_checked(
         &self,
+        group_id: i32,
+        var_id: i32,
+        authorized_member_ids: &HashSet<i32>,
+        req: UpdateGroupEnvVarRequest,
+    ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
+        let txn = self.begin_locked(group_id, authorized_member_ids).await?;
+        let result = self.apply_update(&txn, group_id, var_id, req).await;
+        ProjectGroupService::end_transaction(
+            txn,
+            result,
+            format!("update of variable {var_id} of project group {group_id}"),
+        )
+        .await
+    }
+
+    async fn apply_update<C: ConnectionTrait>(
+        &self,
+        conn: &C,
         group_id: i32,
         var_id: i32,
         req: UpdateGroupEnvVarRequest,
     ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
-        let current = self.find(group_id, var_id).await?;
+        let current = self.find(conn, group_id, var_id).await?;
         if current.is_secret && req.is_secret == Some(false) && req.value.is_none() {
             return Err(ProjectGroupError::Validation {
                 message: format!(
@@ -241,7 +328,7 @@ impl GroupEnvVarService {
         }
         active.updated_at = Set(Utc::now());
         active
-            .update(self.db.as_ref())
+            .update(conn)
             .await
             .map_err(ProjectGroupError::db(format!(
                 "updating variable {var_id} of project group {group_id}"
@@ -268,19 +355,32 @@ impl GroupEnvVarService {
         Ok(keys.into_iter().collect())
     }
 
-    pub async fn delete(
+    /// Deletes a variable, for a caller whose access was checked on exactly
+    /// `authorized_member_ids` (see [`Self::create_checked`]).
+    pub async fn delete_checked(
         &self,
         group_id: i32,
         var_id: i32,
+        authorized_member_ids: &HashSet<i32>,
     ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
-        let current = self.find(group_id, var_id).await?;
-        project_group_env_vars::Entity::delete_by_id(var_id)
-            .exec(self.db.as_ref())
-            .await
-            .map_err(ProjectGroupError::db(format!(
-                "deleting variable {var_id} of project group {group_id}"
-            )))?;
-        Ok(current)
+        let txn = self.begin_locked(group_id, authorized_member_ids).await?;
+        let result = async {
+            let current = self.find(&txn, group_id, var_id).await?;
+            project_group_env_vars::Entity::delete_by_id(var_id)
+                .exec(&txn)
+                .await
+                .map_err(ProjectGroupError::db(format!(
+                    "deleting variable {var_id} of project group {group_id}"
+                )))?;
+            Ok::<_, ProjectGroupError>(current)
+        }
+        .await;
+        ProjectGroupService::end_transaction(
+            txn,
+            result,
+            format!("deletion of variable {var_id} of project group {group_id}"),
+        )
+        .await
     }
 }
 
@@ -484,6 +584,205 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn test_encryption() -> Arc<EncryptionService> {
+        Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        )
+    }
+
+    fn plain(key: &str, value: &str) -> CreateGroupEnvVarRequest {
+        CreateGroupEnvVarRequest {
+            key: key.into(),
+            value: value.into(),
+            is_secret: false,
+            environment_slug: None,
+            include_in_preview: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_writes_refuse_a_member_that_joined_after_authorization() {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Docker/TimescaleDB unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let conn = db.connection_arc();
+        for id in [9711, 9712, 9713] {
+            insert_project_with_env(conn.as_ref(), id, "production", false).await;
+        }
+        let groups = ProjectGroupService::new(conn.clone());
+        let group = groups
+            .create_group(CreateProjectGroupRequest {
+                name: "Checked".into(),
+                slug: None,
+                description: None,
+                project_ids: vec![9711, 9712],
+            })
+            .await
+            .unwrap()
+            .group
+            .id;
+        let svc = GroupEnvVarService::new(conn.clone(), test_encryption());
+        let checked: HashSet<i32> = [9711, 9712].into_iter().collect();
+
+        // Unchanged members: every write goes through.
+        let created = svc
+            .create_checked(group, &checked, plain("FIRST", "one"))
+            .await
+            .unwrap();
+        let updated = svc
+            .update_checked(
+                group,
+                created.id,
+                &checked,
+                UpdateGroupEnvVarRequest {
+                    value: Some("two".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(updated.value, created.value);
+
+        // A restricted project joins after the caller's access was checked.
+        groups.add_project(group, 9713).await.unwrap();
+        let before = svc.list(group).await.unwrap();
+
+        let err = svc
+            .create_checked(group, &checked, plain("SECOND", "x"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { group_id, ref project_ids } if group_id == group && *project_ids == vec![9713]),
+            "got {err:?}"
+        );
+        let err = svc
+            .update_checked(
+                group,
+                created.id,
+                &checked,
+                UpdateGroupEnvVarRequest {
+                    value: Some("three".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProjectGroupError::MembersChanged { .. }));
+        let err = svc
+            .delete_checked(group, created.id, &checked)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProjectGroupError::MembersChanged { .. }));
+
+        // Nothing was written.
+        let after = svc.list(group).await.unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before[0].value, after[0].value);
+        assert_eq!(before[0].updated_at, after[0].updated_at);
+
+        // Authorized on the members it has now, the same writes succeed.
+        let checked: HashSet<i32> = [9711, 9712, 9713].into_iter().collect();
+        svc.create_checked(group, &checked, plain("SECOND", "x"))
+            .await
+            .unwrap();
+        let deleted = svc
+            .delete_checked(group, created.id, &checked)
+            .await
+            .unwrap();
+        assert_eq!(deleted.key, "FIRST");
+        assert_eq!(svc.list(group).await.unwrap().len(), 1);
+
+        // The error kinds the handlers relied on are unchanged.
+        let err = svc
+            .delete_checked(group, 424242, &checked)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectGroupError::EnvVarNotFound { var_id: 424242, .. }
+        ));
+        let err = svc
+            .create_checked(999_999, &HashSet::new(), plain("X", "y"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectGroupError::NotFound { group_id: 999_999 }
+        ));
+    }
+
+    /// The member is joining in a transaction that has not committed when the
+    /// write starts: the write waits for it, then sees the member and refuses.
+    #[tokio::test]
+    async fn checked_create_waits_for_a_member_that_is_joining() {
+        use sea_orm::TransactionTrait;
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Docker/TimescaleDB unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let conn = db.connection_arc();
+        for id in [9721, 9722] {
+            insert_project_with_env(conn.as_ref(), id, "production", false).await;
+        }
+        let groups = ProjectGroupService::new(conn.clone());
+        let group = groups
+            .create_group(CreateProjectGroupRequest {
+                name: "Racing".into(),
+                slug: None,
+                description: None,
+                project_ids: vec![9721],
+            })
+            .await
+            .unwrap()
+            .group
+            .id;
+        let svc = Arc::new(GroupEnvVarService::new(conn.clone(), test_encryption()));
+
+        let joining = conn.begin().await.unwrap();
+        ProjectGroupService::lock_projects(&joining, &[9722])
+            .await
+            .unwrap();
+        ProjectGroupService::place_membership(&joining, group, 9722, None, None)
+            .await
+            .unwrap();
+
+        let write = {
+            let svc = svc.clone();
+            let checked: HashSet<i32> = [9721].into_iter().collect();
+            tokio::spawn(async move {
+                svc.create_checked(group, &checked, plain("LATE", "x"))
+                    .await
+                    .map(|v| v.id)
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !write.is_finished(),
+            "the write must wait for the join instead of reading around it"
+        );
+        joining.commit().await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), write)
+            .await
+            .expect("write still blocked after the join committed")
+            .unwrap();
+        assert!(
+            matches!(result, Err(ProjectGroupError::MembersChanged { ref project_ids, .. }) if *project_ids == vec![9722]),
+            "got {result:?}"
+        );
+        assert!(svc.list(group).await.unwrap().is_empty());
     }
 
     // ── include_in_preview default-false (item R2.1) ────────────────────────
