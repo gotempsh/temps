@@ -51,9 +51,12 @@ const BATCH_PAUSE: Duration = Duration::from_millis(200);
 /// batch of visitors can own; "unlimited" (0) would let one batch decompress
 /// whatever the oldest chunks hold. At most a few hundred MB of tuples.
 const DECOMPRESSION_LIMIT: i64 = 500_000;
-/// Visitors skipped for exceeding [`DECOMPRESSION_LIMIT`] on their own before
-/// the pass gives up, so a systemic misconfiguration cannot run all pass.
-const MAX_OVERSIZED_VISITORS: usize = 20;
+/// Visitors remembered as exceeding [`DECOMPRESSION_LIMIT`] on their own. The
+/// list is bound into every scan, so it is capped; reaching it ends the pass
+/// with a message naming the setting to raise.
+const MAX_OVERSIZED_VISITORS: usize = 1000;
+/// Passes (hours) between retries of the visitors that were skipped.
+const OVERSIZED_RETRY_EVERY_PASSES: u32 = 24;
 
 /// Tables whose retention is a TimescaleDB policy managed here.
 const EVENTS_TABLE: &str = "events";
@@ -175,6 +178,14 @@ fn is_decompression_limit(error: &DbErr) -> bool {
         .contains("tuple decompression limit exceeded")
 }
 
+/// What the visitor sweep carries from one pass to the next.
+#[derive(Debug, Default)]
+struct VisitorSweepState {
+    /// Visitors that exceeded the decompression limit on their own.
+    skipped: Vec<i32>,
+    passes: u32,
+}
+
 #[derive(Debug, FromQueryResult)]
 struct ColumnRow {
     table_name: String,
@@ -194,6 +205,7 @@ struct PresenceRow {
 pub struct AnalyticsRetentionService {
     db: Arc<DatabaseConnection>,
     ip_cursor: tokio::sync::Mutex<IpCursor>,
+    visitor_sweep: tokio::sync::Mutex<VisitorSweepState>,
 }
 
 impl AnalyticsRetentionService {
@@ -201,6 +213,7 @@ impl AnalyticsRetentionService {
         Self {
             db,
             ip_cursor: tokio::sync::Mutex::new(IpCursor::START),
+            visitor_sweep: tokio::sync::Mutex::new(VisitorSweepState::default()),
         }
     }
 
@@ -368,22 +381,29 @@ impl AnalyticsRetentionService {
     ///   on every later pass. The limit is raised to [`DECOMPRESSION_LIMIT`]
     ///   for this transaction only, never removed, so memory stays bounded.
     /// - A batch that still hits the limit is retried at half the size. A
-    ///   single visitor that exceeds it on its own is left in place for this
-    ///   pass (and logged) instead of failing the pass or being retried
-    ///   forever in front of everything behind it.
+    ///   single visitor that exceeds it on its own is left in place and
+    ///   remembered across passes (retried daily), so it neither fails the
+    ///   pass nor sits in front of everything behind it forever.
     pub async fn purge_visitors(
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<u64, AnalyticsRetentionError> {
         let mut total = 0u64;
         let mut batch_size = BATCH_SIZE;
-        // Visitors whose own child rows exceed the decompression limit. Local
-        // to the pass, so a later pass (or a raised server limit) retries them.
-        let mut oversized: Vec<i32> = Vec::new();
+        // Held for the whole pass, like the IP cursor: only one pass runs.
+        let mut state = self.visitor_sweep.lock().await;
+        // Oversized visitors would otherwise sit at the front of the oldest-
+        // first scan on every pass and starve everything behind them. They are
+        // remembered between passes and retried now and then, in case the
+        // server limit was raised or the rows they own have been removed.
+        state.passes = state.passes.wrapping_add(1);
+        if state.passes % OVERSIZED_RETRY_EVERY_PASSES == 0 {
+            state.skipped.clear();
+        }
 
         for statement in 0..MAX_BATCHES_PER_RUN {
             match self
-                .purge_visitor_batch(cutoff, batch_size, &oversized)
+                .purge_visitor_batch(cutoff, batch_size, &state.skipped)
                 .await?
             {
                 VisitorBatch::Deleted {
@@ -394,18 +414,22 @@ impl AnalyticsRetentionService {
                     if (candidates as i64) < batch_size {
                         break;
                     }
+                    // A full batch went through: grow back toward the normal size.
+                    batch_size = (batch_size * 2).min(BATCH_SIZE);
                 }
                 VisitorBatch::OverLimit { ids } if ids.len() == 1 => {
                     warn!(
                         visitor_id = ids[0],
                         limit = DECOMPRESSION_LIMIT,
-                        "visitor has more related rows than the decompression limit allows                          in one transaction; leaving it in place for this pass"
+                        "visitor has more related rows than the decompression limit allows \
+                         in one transaction; leaving it in place and moving on"
                     );
-                    oversized.extend(ids);
-                    if oversized.len() >= MAX_OVERSIZED_VISITORS {
+                    state.skipped.extend(ids);
+                    if state.skipped.len() >= MAX_OVERSIZED_VISITORS {
                         warn!(
-                            skipped = oversized.len(),
-                            "ending the visitor retention pass: too many visitors exceed the                              decompression limit; raise \
+                            skipped = state.skipped.len(),
+                            "ending the visitor retention pass: too many visitors exceed the \
+                             decompression limit; raise \
                              timescaledb.max_tuples_decompressed_per_dml_transaction"
                         );
                         break;
@@ -865,6 +889,60 @@ mod tests {
             .expect("an oversized visitor must not fail the pass");
 
         assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_visitor_is_remembered_so_the_next_pass_moves_past_it() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // Pass 1: visitor 5 is refused alone, then nothing is left.
+                // Pass 2: the scan runs again and must exclude visitor 5.
+                .append_query_results([id_rows([5]), id_rows([]), id_rows([])])
+                .append_exec_results([exec_ok(0)])
+                .append_exec_errors([decompression_limit_error()])
+                .append_exec_results([exec_ok(0), exec_ok(0)])
+                .into_connection(),
+        );
+        let service = AnalyticsRetentionService::new(db.clone());
+        service.purge_visitors(Utc::now()).await.expect("pass 1");
+        service.purge_visitors(Utc::now()).await.expect("pass 2");
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("service dropped, connection is unshared"))
+            .into_transaction_log();
+        let rendered: Vec<String> = log.iter().map(|t| format!("{t:?}")).collect();
+        let last = rendered.last().expect("a second pass ran");
+        assert!(
+            last.contains("id <> ALL") && last.contains("Some([Int(Some(5))])"),
+            "the second pass excludes the oversized visitor: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn many_oversized_visitors_do_not_end_the_pass_before_later_ones() {
+        // More than the old per-pass limit of skipped visitors, followed by one
+        // that deletes normally. The pass must reach it.
+        let oversized = 21;
+        let mut db = MockDatabase::new(DatabaseBackend::Postgres);
+        for id in 1..=oversized {
+            db = db
+                .append_query_results([id_rows([id])])
+                .append_exec_results([exec_ok(0)])
+                .append_exec_errors([decompression_limit_error()]);
+        }
+        let db = db
+            .append_query_results([id_rows([900])])
+            .append_exec_results([exec_ok(0), exec_ok(1)])
+            .into_connection();
+        let service = mock_service(db);
+
+        let deleted = service
+            .purge_visitors(Utc::now())
+            .await
+            .expect("oversized visitors do not fail the pass");
+
+        assert_eq!(deleted, 1);
     }
 
     #[test]
