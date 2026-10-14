@@ -403,3 +403,33 @@ test('separate useUrlState instances compose a search edit and a sibling write i
   expect(input.value).toBe('oom')
   view.unmount()
 })
+
+test('independent routers do not share pending writes', async () => {
+  function Writer({ name }: { name: string }) {
+    const { patch } = useUrlState<string>()
+    const location = useLocation()
+    return (
+      <div>
+        <button onClick={() => patch({ [name]: name })}>{name}</button>
+        <output data-testid={`${name}-search`}>{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <div>
+      <MemoryRouter initialEntries={['/one']}>
+        <Writer name="first" />
+      </MemoryRouter>
+      <MemoryRouter initialEntries={['/two']}>
+        <Writer name="second" />
+      </MemoryRouter>
+    </div>
+  )
+  await act(async () => {
+    fireEvent.click(view.getByText('first'))
+    fireEvent.click(view.getByText('second'))
+  })
+  expect(view.getByTestId('first-search').textContent).toBe('?first=first')
+  expect(view.getByTestId('second-search').textContent).toBe('?second=second')
+  view.unmount()
+})

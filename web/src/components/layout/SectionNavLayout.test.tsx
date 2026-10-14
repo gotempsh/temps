@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { MemoryRouter, useLocation } from 'react-router'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
 import { Activity } from 'lucide-react'
 import { SectionNavLayout, type SectionNavLink } from './SectionNavLayout'
 
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
 
 installBrowserWindow()
@@ -32,8 +38,11 @@ const links: SectionNavLink[] = titles.map((title) => ({
 
 function Harness() {
   const location = useLocation()
+  const navigate = useNavigate()
   return (
     <div>
+      <button onClick={() => navigate(-1)}>back</button>
+      <output data-testid="path">{location.pathname}</output>
       <SectionNavLayout title="Analytics" links={links}>
         <p>content</p>
       </SectionNavLayout>
@@ -79,5 +88,26 @@ test('the page finder is restored from the URL and filters the links', () => {
   expect(finder(view).value).toBe('fun')
   expect(view.getAllByText('Funnels').length).toBeGreaterThan(0)
   expect(view.queryAllByText('Replays')).toHaveLength(0)
+  view.unmount()
+})
+
+test('following a link and pressing Back restores the page finder', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/analytics/pages?find=fun']}>
+      <Harness />
+    </MemoryRouter>
+  )
+  expect(finder(view).value).toBe('fun')
+  await act(async () => {
+    fireEvent.click(view.getAllByText('Funnels')[0])
+  })
+  expect(view.getByTestId('path').textContent).toBe('/analytics/funnels')
+  expect(view.getByTestId('search').textContent).toBe('')
+  await act(async () => {
+    fireEvent.click(view.getByText('back'))
+  })
+  expect(view.getByTestId('path').textContent).toBe('/analytics/pages')
+  expect(view.getByTestId('search').textContent).toBe('?find=fun')
+  expect(finder(view).value).toBe('fun')
   view.unmount()
 })

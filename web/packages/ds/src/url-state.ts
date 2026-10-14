@@ -1,25 +1,37 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useSearchParams } from 'react-router'
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {
+  UNSAFE_NavigationContext,
+  useLocation,
+  useSearchParams,
+} from 'react-router'
 
 export type UrlStateValue = string | number | boolean | undefined | null
 
 /**
- * The most recent update that the router has not rendered yet, shared by every
- * `useComposedSearchParams` instance. Instances must share it: a search box, a
- * tab strip and a date picker on one page each own a hook, and an edit in one
- * followed by a click in another before the router commits must build on the
- * first, not on the stale rendered params. It is only honoured for the location
- * (`key`) and rendered query (`base`) it was created against, and it is dropped
- * whenever any instance renders a new location or query.
+ * The most recent update each router has not rendered yet, shared by every
+ * `useComposedSearchParams` instance under that router. Instances must share
+ * it: a search box, a tab strip and a date picker on one page each own a hook,
+ * and an edit in one followed by a click in another before the router commits
+ * must build on the first, not on the stale rendered params. It is keyed by the
+ * router's navigator (so independent routers never see each other's writes),
+ * only honoured for the location (`key`) and rendered query (`base`) it was
+ * created against, and dropped whenever an instance renders a new location or
+ * query.
  */
-let sharedPending: {
-  key: string
-  base: string
-  next: URLSearchParams
-} | null = null
+const pendingByRouter = new WeakMap<
+  object,
+  { key: string; base: string; next: URLSearchParams }
+>()
 
 /**
  * `useSearchParams` whose updater composes across calls.
@@ -28,13 +40,14 @@ let sharedPending: {
  * created `setParams`, not the latest navigation. Two updates in one event
  * (`q` then `page`, or an event handler plus a canonicalising effect) would
  * both start from the same stale params and the second would overwrite the
- * first. `sharedPending` holds the result of the most recent update until the
+ * first. `pendingByRouter` holds the result of the most recent update until the
  * router renders it, so consecutive updates -- from this instance or any other
  * on the page -- build on each other instead.
  */
 export function useComposedSearchParams() {
   const [params, setParams] = useSearchParams()
   const { key } = useLocation()
+  const { navigator } = useContext(UNSAFE_NavigationContext)
   const keyRef = useRef(key)
   // Cleared on any new location, not only a new query: a navigation that
   // supersedes our update and lands on the query already rendered keeps the
@@ -42,8 +55,8 @@ export function useComposedSearchParams() {
   // resurrected by the next update.
   useEffect(() => {
     keyRef.current = key
-    sharedPending = null
-  }, [params, key])
+    pendingByRouter.delete(navigator)
+  }, [params, key, navigator])
 
   const update = useCallback(
     (
@@ -53,20 +66,23 @@ export function useComposedSearchParams() {
       setParams(
         (current) => {
           const base = current.toString()
+          const pending = pendingByRouter.get(navigator)
           const start =
-            sharedPending &&
-            sharedPending.key === keyRef.current &&
-            sharedPending.base === base
-              ? sharedPending.next
+            pending && pending.key === keyRef.current && pending.base === base
+              ? pending.next
               : current
           const next = transform(new URLSearchParams(start))
-          sharedPending = { key: keyRef.current, base, next }
+          pendingByRouter.set(navigator, {
+            key: keyRef.current,
+            base,
+            next,
+          })
           return next
         },
         { replace: options?.replace ?? true }
       )
     },
-    [setParams]
+    [setParams, navigator]
   )
 
   return [params, update] as const

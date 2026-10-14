@@ -69,8 +69,10 @@ export function SectionNavLayout({
             to={to}
             aria-current={active ? 'page' : undefined}
             onClick={() => {
+              // The destination URL carries no `find`, so the finder clears by
+              // navigating. Writing it here would replace the source history
+              // entry and Back would return to a page without the search.
               setOpen(false)
-              setSearch('')
             }}
             className={cn(
               'flex items-center gap-2 rounded-md px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring',
