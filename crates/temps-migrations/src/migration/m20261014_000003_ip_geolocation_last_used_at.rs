@@ -9,13 +9,19 @@
 //! most once every twelve hours, and the cleanup only deletes addresses it has not
 //! advanced within the retention window.
 //!
-//! The column is nullable with no default, so the `ALTER` is catalog-only. Rows
-//! that already exist are then stamped with the migration time: `updated_at`
-//! only advances every `geo.stale_lookup_days`, so it says nothing about when
-//! an address was last handed to a proxy log that may still be retained
-//! outside PostgreSQL. Treating it as the last use would let the first sweep
-//! delete addresses that logs written days ago still point at. Stamping gives
-//! every existing address one full retention window to be seen again.
+//! The column is added with `DEFAULT now()`. A constant-per-statement default
+//! is applied by PostgreSQL 11+ as a catalog-only change: no table rewrite and
+//! no per-row work, so the migration holds its lock for an instant and never
+//! queues address lookups behind a long `UPDATE`. Every row that already
+//! exists reads as last used at the migration time, which is what is wanted:
+//! `updated_at` only advances every `geo.stale_lookup_days`, so it says nothing
+//! about when an address was last handed to a proxy log that may still be
+//! retained outside PostgreSQL, and treating it as the last use would let the
+//! first sweep delete addresses that logs written days ago still point at.
+//! Stamping gives every existing address one full retention window to be seen
+//! again. A column that already exists without the default (a development
+//! database) keeps its NULLs, which the cleanup reads through
+//! `COALESCE(last_used_at, updated_at)`.
 
 use sea_orm_migration::prelude::*;
 
@@ -33,9 +39,7 @@ impl MigrationTrait for Migration {
                               WHERE table_schema = current_schema() \
                                 AND table_name = 'ip_geolocations') THEN \
                      ALTER TABLE ip_geolocations \
-                       ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ; \
-                     UPDATE ip_geolocations SET last_used_at = NOW() \
-                       WHERE last_used_at IS NULL; \
+                       ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ DEFAULT now(); \
                    END IF; \
                  END $$",
             )
