@@ -8,6 +8,7 @@ import {
   listConnectionsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateProjectLists } from '@/lib/project-list-cache'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -98,8 +99,7 @@ export function ImportProject() {
       toast.success('Service created')
       await finish(data, `/projects/${data.slug}?new=true`)
       // Invalidate services queries to refresh the command palette
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
+      await invalidateProjectLists(queryClient)
     },
   })
 

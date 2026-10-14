@@ -3,6 +3,7 @@
 
 import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import { createProjectMutation } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateProjectLists } from '@/lib/project-list-cache'
 import { deployFromImage, getEnvironments } from '@/api/client'
 import type {
   CreatableServiceTypeRoute,
@@ -275,8 +276,7 @@ export function ManualProjectConfigurator({
       errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
+      await invalidateProjectLists(queryClient)
       toast.success('Service created')
 
       const imageRef = form.getValues('imageUrl')?.trim()
