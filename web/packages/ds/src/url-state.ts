@@ -190,3 +190,40 @@ export function useUrlBoundText(
 
   return [text, update]
 }
+
+/**
+ * `useUrlBoundText` for the common case: one search box backed by one query
+ * parameter (`q` by default). Typed text stays local, the URL is written with
+ * `replace`, and `resetKeys` (usually `['page']`) are cleared in the same
+ * navigation so a new term never leaves the list on a page that no longer
+ * exists. Returns `[text, setText, committed]`; `committed` is the value
+ * currently in the URL, for callers that need to key a request on it.
+ *
+ * Use this for every list/search box rather than `useState`, so reload,
+ * back/forward and a shared link keep the filter.
+ */
+export function useUrlSearchText(
+  key = 'q',
+  {
+    resetKeys = [],
+    settleMs,
+  }: { resetKeys?: readonly string[]; settleMs?: number } = {}
+): [string, (value: string) => void, string] {
+  const { get, patch } = useUrlState<string>()
+  const committed = get(key) ?? ''
+  const resets = resetKeys.join('\u0000')
+  const commit = useCallback(
+    (value: string) => {
+      const values: Record<string, UrlStateValue> = {
+        [key]: value || undefined,
+      }
+      for (const reset of resets ? resets.split('\u0000') : []) {
+        values[reset] = undefined
+      }
+      patch(values)
+    },
+    [key, resets, patch]
+  )
+  const [text, setText] = useUrlBoundText(committed, commit, { settleMs })
+  return [text, setText, committed]
+}

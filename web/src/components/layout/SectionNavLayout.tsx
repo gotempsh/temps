@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
 import { projectSectionLinkMatches } from '@/lib/project-section-search'
+import { useUrlSearchText } from '@temps-sdk/ds'
 
 export interface SectionNavLink {
   key: string
@@ -40,7 +41,8 @@ export function SectionNavLayout({
   links: SectionNavLink[]
   children: ReactNode
 }) {
-  const [search, setSearch] = useState('')
+  // `find` keeps the page finder across reload, back/forward and shared links.
+  const [search, setSearch] = useUrlSearchText('find')
   const [open, setOpen] = useState(false)
   const visible = links.filter((link) =>
     projectSectionLinkMatches(

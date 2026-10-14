@@ -35,6 +35,7 @@ import {
 import type { DateRange } from 'react-day-picker'
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
+import { useUrlSearchText } from '@temps-sdk/ds'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
 const LEVEL_CLASS: Record<LogLevel, string> = {
@@ -119,7 +120,7 @@ export function ServiceLogs() {
     linkedProjectCount: linkedProjects?.length,
   })
 
-  const [text, setText] = useState('')
+  const [text, setText] = useUrlSearchText('q')
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)

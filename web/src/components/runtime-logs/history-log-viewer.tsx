@@ -12,7 +12,7 @@ import {
   getProjectDeploymentsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { LogLevelBadge } from '@temps-sdk/ds'
+import { LogLevelBadge, useUrlSearchText } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -384,7 +384,8 @@ export default function HistoryLogViewer({
     }
   )
   const [selectedLevels, setSelectedLevels] = useState<LogLevel[]>([])
-  const [searchText, setSearchText] = useState('')
+  // Search text lives in `?q=` so reload, back/forward and shared links keep it.
+  const [searchText, setSearchText] = useUrlSearchText('q')
   const [debouncedText, setDebouncedText] = useState('')
   const [timeRange, setTimeRange] = useState('24h')
   // Custom range, only meaningful when timeRange === CUSTOM_RANGE_VALUE.
@@ -616,7 +617,7 @@ export default function HistoryLogViewer({
     if (fulltextDisabled && searchText.length > 0) {
       setSearchText('')
     }
-  }, [fulltextDisabled, searchText])
+  }, [fulltextDisabled, searchText, setSearchText])
 
   const { data, isLoading, isFetching, error } = useLogHistory(
     {

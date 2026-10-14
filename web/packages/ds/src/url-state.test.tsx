@@ -3,7 +3,7 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { MemoryRouter, useLocation, useNavigate } from 'react-router'
-import { useUrlBoundText, useUrlState } from './url-state'
+import { useUrlBoundText, useUrlSearchText, useUrlState } from './url-state'
 
 import {
   act,
@@ -242,5 +242,84 @@ test('a navigation that lands on the query already shown discards a cancelled pa
   )
   expect(params.get('q')).toBe('abc')
   expect(params.get('page')).toBe('2')
+  view.unmount()
+})
+
+function SearchTextBox({ paramKey }: { paramKey?: string }) {
+  const [text, setText, committed] = useUrlSearchText(paramKey, {
+    resetKeys: ['page'],
+  })
+  const location = useLocation()
+  return (
+    <div>
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+      <output data-testid="search">{location.search}</output>
+      <output data-testid="committed">{committed}</output>
+    </div>
+  )
+}
+
+const typeFast = (input: HTMLInputElement, value: string) => {
+  let typed = ''
+  for (const char of value) {
+    typed += char
+    fireEvent.change(input, { target: { value: typed } })
+  }
+}
+
+test('useUrlSearchText keeps fast typing, writes the key and resets page', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?page=4&tab=a']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  typeFast(input, 'qa-ui-qj14a')
+  expect(input.value).toBe('qa-ui-qj14a')
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('search').textContent ?? ''
+    )
+    expect(params.get('q')).toBe('qa-ui-qj14a')
+    expect(params.has('page')).toBe(false)
+    expect(params.get('tab')).toBe('a')
+  })
+  expect(view.getByTestId('committed').textContent).toBe('qa-ui-qj14a')
+  expect(input.value).toBe('qa-ui-qj14a')
+  view.unmount()
+})
+
+test('useUrlSearchText restores the text from the URL on a fresh mount', () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?find=pages']}>
+      <SearchTextBox paramKey="find" />
+    </MemoryRouter>
+  )
+  expect((view.getByLabelText('search') as HTMLInputElement).value).toBe(
+    'pages'
+  )
+  view.unmount()
+})
+
+test('useUrlSearchText clearing the box removes the key from the URL', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?q=abc&tab=a']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  fireEvent.change(input, { target: { value: '' } })
+  expect(input.value).toBe('')
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('search').textContent ?? ''
+    )
+    expect(params.has('q')).toBe(false)
+    expect(params.get('tab')).toBe('a')
+  })
   view.unmount()
 })
