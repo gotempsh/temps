@@ -36,7 +36,9 @@
 //! writer that has drawn a revision but not committed yet is picked up by a
 //! later poll instead of being skipped. A rolled-back writer leaves a gap in
 //! the sequence; the poll then costs two empty indexed reads until the next
-//! write, which is still independent of the number of rules.
+//! write, which is still independent of the number of rules. The deletions
+//! and the changed rows are read inside one repeatable-read transaction, so a
+//! deletion can never fall between the two reads and be skipped by the cursor.
 //!
 //! A full reload (O(rules)) is not part of the steady state. It runs at
 //! startup, when the sequence head is *behind* the cursor (the database was
@@ -57,8 +59,8 @@ use super::cidr_set::{parse_cidr, CidrSet};
 use super::IpAccessMode;
 use arc_swap::ArcSwap;
 use sea_orm::{
-    ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, Statement,
+    AccessMode, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult,
+    IsolationLevel, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -355,6 +357,61 @@ impl ProjectIpAccessGate {
         Ok(row.map_or(0, |row| row.revision))
     }
 
+    /// The deletions and the changed rows above `applied`, read from one
+    /// database snapshot.
+    ///
+    /// Two separate reads could straddle a commit: a deletion that lands
+    /// after the tombstone read, followed by another write that lands before
+    /// the row read, would move the cursor past a removal that was never
+    /// seen. A repeatable-read transaction makes both reads see the same
+    /// committed state.
+    async fn read_delta(
+        &self,
+        applied: i64,
+    ) -> Result<(Vec<TombstoneRow>, Vec<project_ip_access_rules::Model>), IpAccessGateError> {
+        let txn = self
+            .db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await
+            .map_err(|source| IpAccessGateError::Database {
+                operation: "open a snapshot to read the changes to",
+                source,
+            })?;
+        let tombstones = TombstoneRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT revision, project_id, environment_id \
+             FROM project_ip_access_rule_tombstones \
+             WHERE revision > $1 ORDER BY revision",
+            [applied.into()],
+        ))
+        .all(&txn)
+        .await
+        .map_err(|source| IpAccessGateError::Database {
+            operation: "read the deletions of",
+            source,
+        })?;
+        let changed = project_ip_access_rules::Entity::find()
+            .filter(project_ip_access_rules::Column::Revision.gt(applied))
+            .order_by_asc(project_ip_access_rules::Column::Revision)
+            .all(&txn)
+            .await
+            .map_err(|source| IpAccessGateError::Database {
+                operation: "read the changes to",
+                source,
+            })?;
+        // Read-only: the commit only releases the snapshot.
+        txn.commit()
+            .await
+            .map_err(|source| IpAccessGateError::Database {
+                operation: "close the snapshot that read the changes to",
+                source,
+            })?;
+        Ok((tombstones, changed))
+    }
+
     /// Bring the snapshot up to date. A full reload when `force_full`, when
     /// nothing has been loaded yet, or when the database's sequence is behind
     /// what was applied (a restore); otherwise a delta that costs one sequence
@@ -393,28 +450,7 @@ impl ProjectIpAccessGate {
             return Ok(Refresh::Unchanged);
         }
 
-        let tombstones = TombstoneRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT revision, project_id, environment_id \
-             FROM project_ip_access_rule_tombstones \
-             WHERE revision > $1 ORDER BY revision",
-            [applied.into()],
-        ))
-        .all(self.db.as_ref())
-        .await
-        .map_err(|source| IpAccessGateError::Database {
-            operation: "read the deletions of",
-            source,
-        })?;
-        let changed = project_ip_access_rules::Entity::find()
-            .filter(project_ip_access_rules::Column::Revision.gt(applied))
-            .order_by_asc(project_ip_access_rules::Column::Revision)
-            .all(self.db.as_ref())
-            .await
-            .map_err(|source| IpAccessGateError::Database {
-                operation: "read the changes to",
-                source,
-            })?;
+        let (tombstones, changed) = self.read_delta(applied).await?;
 
         let newest = changed
             .iter()
@@ -955,6 +991,55 @@ mod tests {
             3,
             "head + rows at startup, head only on the poll"
         );
+    }
+
+    #[tokio::test]
+    async fn deletions_and_changed_rows_are_read_inside_one_transaction() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![revision_row(1)]])
+                .append_query_results(vec![vec![row(1, 7, None, "allow", &["10.0.0.0/8"])]])
+                .append_query_results(vec![vec![revision_row(3)]])
+                .append_query_results(vec![vec![removed_row(3, 7, Some(70))]])
+                .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+                .into_connection(),
+        );
+        let gate = ProjectIpAccessGate::new(Arc::clone(&db));
+        gate.hydrate().await.expect("hydrate succeeds");
+        gate.refresh(false).await.expect("poll succeeds");
+        drop(gate);
+
+        let log = Arc::try_unwrap(db)
+            .map_err(|_| "the gate still holds the database handle")
+            .expect("gate dropped its handle")
+            .into_transaction_log();
+        let statements: Vec<String> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.to_uppercase())
+            .collect();
+        let begin = statements
+            .iter()
+            .rposition(|sql| sql == "BEGIN")
+            .unwrap_or_else(|| panic!("no BEGIN in {statements:#?}"));
+        let tombstones = statements
+            .iter()
+            .position(|sql| sql.contains("PROJECT_IP_ACCESS_RULE_TOMBSTONES"))
+            .expect("tombstones are read");
+        let rules = statements
+            .iter()
+            .rposition(|sql| {
+                sql.contains("FROM \"PROJECT_IP_ACCESS_RULES\"") && sql.contains("REVISION\" >")
+            })
+            .expect("changed rows are read");
+        let commit = statements
+            .iter()
+            .rposition(|sql| sql == "COMMIT")
+            .expect("the snapshot is closed");
+        // Both reads sit between BEGIN and COMMIT. The mock does not record
+        // the isolation level; the sqlx backend applies the
+        // `REPEATABLE READ` / `READ ONLY` the delta asks for.
+        assert!(begin < tombstones && tombstones < rules && rules < commit);
     }
 
     #[tokio::test]
