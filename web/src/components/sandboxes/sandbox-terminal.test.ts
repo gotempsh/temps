@@ -3,7 +3,9 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  TERMINAL_INPUT_FRAME_BYTES,
   TERMINAL_REFUSED_HINT,
+  chunkTerminalInput,
   computeTerminalSize,
   openTerminalSession,
   parseTerminalEvent,
@@ -236,5 +238,42 @@ describe('openTerminalSession', () => {
       'connecting',
       'connected',
     ])
+  })
+})
+
+describe('chunkTerminalInput', () => {
+  test('keeps small input in one frame and drops empty input', () => {
+    const small = new Uint8Array([1, 2, 3])
+    expect(chunkTerminalInput(small)).toEqual([small])
+    expect(chunkTerminalInput(new Uint8Array())).toEqual([])
+  })
+
+  test('splits a large paste in order, none over the frame size', () => {
+    const bytes = new Uint8Array(TERMINAL_INPUT_FRAME_BYTES * 2 + 5).map(
+      (_, index) => index % 251
+    )
+    const frames = chunkTerminalInput(bytes)
+    expect(frames.length).toBe(3)
+    expect(frames.every((f) => f.length <= TERMINAL_INPUT_FRAME_BYTES)).toBe(
+      true
+    )
+    const joined = new Uint8Array(frames.reduce((n, f) => n + f.length, 0))
+    let at = 0
+    for (const frame of frames) {
+      joined.set(frame, at)
+      at += frame.length
+    }
+    expect(joined).toEqual(bytes)
+  })
+
+  test('sends a large paste as several binary frames', () => {
+    const { socket, session } = start()
+    socket.open()
+    session.send('a'.repeat(TERMINAL_INPUT_FRAME_BYTES + 10))
+    expect(socket.sent.length).toBe(2)
+    expect((socket.sent[0] as Uint8Array).length).toBe(
+      TERMINAL_INPUT_FRAME_BYTES
+    )
+    expect((socket.sent[1] as Uint8Array).length).toBe(10)
   })
 })

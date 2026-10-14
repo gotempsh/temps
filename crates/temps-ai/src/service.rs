@@ -374,6 +374,34 @@ pub trait AiService: Send + Sync {
         })
     }
 
+    /// Report whether the provider's harness CLI inside the caller's
+    /// persistent workspace is behind the latest release. Reads are cached;
+    /// `refresh` forces a new look inside the workspace.
+    async fn workspace_harness_update_status(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+        _refresh: bool,
+    ) -> Result<crate::HarnessUpdateStatus, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        })
+    }
+
+    /// Update the provider's harness CLI inside the caller's persistent
+    /// workspace to the latest release and return its new status.
+    async fn update_workspace_harness(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+    ) -> Result<crate::HarnessUpdateStatus, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        })
+    }
+
     /// Invalidate account-scoped capability state after credentials change.
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
 

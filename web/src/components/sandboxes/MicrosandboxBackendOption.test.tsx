@@ -15,6 +15,7 @@ const missingRuntime: MicrosandboxCapability = {
   setup_path: '/agent-sandbox/sandbox',
   setup_command: 'temps microsandbox setup',
   runtime_version: '0.7.7',
+  terminal: { supported: true, reason: null, setup_command: null },
 }
 
 function render(capability: MicrosandboxCapability | undefined) {
@@ -58,6 +59,25 @@ describe('MicrosandboxBackendOption', () => {
     })
     expect(html).not.toContain('Not available')
     expect(html).not.toContain('disabled=""')
+  })
+
+  test('says terminals are unavailable on a ready backend that lacks the agent', () => {
+    const html = render({
+      ...missingRuntime,
+      configured: true,
+      reason: null,
+      setup_command: null,
+      setup_path: null,
+      terminal: {
+        supported: false,
+        reason: 'the guest terminal agent (temps-pty-agent) is not staged',
+        setup_command: 'temps microsandbox setup',
+      },
+    })
+    // Still selectable: terminals are an add-on, not a gate on the backend.
+    expect(html).not.toContain('disabled=""')
+    expect(html).toContain('Terminals unavailable')
+    expect(html).toContain('temps microsandbox setup')
   })
 
   test('does not claim unavailability while status is loading', () => {

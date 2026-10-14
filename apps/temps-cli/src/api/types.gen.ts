@@ -982,6 +982,12 @@ export type AiPageBreakdownRow = {
 };
 
 /**
+ * Response wrapper kept separate from the service view so the wire shape is
+ * owned by the handler layer.
+ */
+export type AiProviderLoginResponse = LoginSessionView;
+
+/**
  * Current API-gateway availability for this instance.
  *
  * The `configured` field drives the UI onboarding state: when `false` the UI
@@ -5302,6 +5308,11 @@ export type ConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * `ai` (a conversation with an AI harness) or `terminal` (an interactive
+     * shell in the workspace sandbox). Fixed at creation.
+     */
+    kind: string;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -5501,9 +5512,14 @@ export type CreateApiKeyResponse = {
 export type CreateApplicationConversationRequest = {
     /**
      * A registered development harness (for example `claude_cli`).
-     * Application threads never inherit an API-gateway provider.
+     * Application threads never inherit an API-gateway provider. Ignored for
+     * terminal threads, which have no harness.
      */
     ai_provider?: string | null;
+    /**
+     * `ai` (default) or `terminal`.
+     */
+    kind?: string | null;
 };
 
 export type CreateApplicationPreviewLinkRequest = {
@@ -5947,6 +5963,11 @@ export type CreateGlobalConversationRequest = {
      */
     ai_provider?: string | null;
     ai_thinking_level?: string | null;
+    /**
+     * `ai` (default) or `terminal`. A terminal thread has no harness, model
+     * or turns.
+     */
+    kind?: string | null;
 };
 
 export type CreateGroupEnvVarRequest = {
@@ -12353,6 +12374,10 @@ export type GlobalConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * `"ai"` for an agent conversation, `"terminal"` for a shell thread.
+     */
+    kind: string;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -12915,6 +12940,41 @@ export type HarnessSmokeRequest = {
      * Optional catalog model identifier. It is validated by the provider adapter.
      */
     model?: string | null;
+};
+
+/**
+ * Installed and latest version of a provider's harness CLI inside the
+ * caller's persistent workspace.
+ *
+ * A harness that is behind the latest release cannot offer models released
+ * after it, so the console shows this and lets the operator update it.
+ */
+export type HarnessUpdateStatus = {
+    /**
+     * When the versions were last read from the workspace (RFC 3339).
+     */
+    checked_at?: string | null;
+    /**
+     * Why the versions could not be determined, when they could not.
+     */
+    detail?: string | null;
+    /**
+     * Version reported by the CLI in the workspace, when it could be read.
+     */
+    installed_version?: string | null;
+    /**
+     * Latest version published for the CLI, when it could be looked up.
+     */
+    latest_version?: string | null;
+    provider_id: string;
+    /**
+     * True only when both versions are known and `latest_version` is newer.
+     */
+    update_available: boolean;
+    /**
+     * An update is running right now.
+     */
+    updating: boolean;
 };
 
 export type HasAnalyticsEventsResponse = {
@@ -15039,9 +15099,41 @@ export type LogSourceKind = 'collected' | 'application' | 'service';
  */
 export type LogStream = 'stdout' | 'stderr';
 
+export type LoginPhase = 'starting' | 'waiting' | 'verifying' | 'succeeded' | 'failed' | 'cancelled';
+
 export type LoginRequest = {
     email: string;
     password: string;
+};
+
+/**
+ * Snapshot of one sign-in, safe to return to a browser: it carries the link
+ * and device code the operator needs and no credential material.
+ */
+export type LoginSessionView = {
+    /**
+     * Human-readable status of the current phase, or why it ended.
+     */
+    detail: string;
+    elapsed_seconds: number;
+    finished_at?: string | null;
+    phase: LoginPhase;
+    provider_id: string;
+    /**
+     * True when the operator must paste a code back into Temps.
+     */
+    requires_code: boolean;
+    session_id: string;
+    started_at: string;
+    timeout_seconds: number;
+    /**
+     * Device code to enter on that page, for device-code providers.
+     */
+    user_code?: string | null;
+    /**
+     * Page the operator opens in their browser. Present from `waiting`.
+     */
+    verification_url?: string | null;
 };
 
 export type LogsQuery = {
@@ -15552,6 +15644,12 @@ export type MicrosandboxCapability = {
      * Console path that shows status and setup instructions.
      */
     setup_path?: string | null;
+    /**
+     * Whether `temps sandbox shell` / the terminal endpoint can attach to
+     * microsandbox sandboxes. Independent of `configured`: the guest
+     * terminal agent is a separate artifact staged on the host.
+     */
+    terminal: TerminalCapability;
 };
 
 /**
@@ -19755,6 +19853,18 @@ export type ProviderCatalogDto = {
     install_command: string;
     local_credential?: LocalCredentialDto | null;
     /**
+     * True when this provider's CLI can sign in to a subscription from the
+     * console ("Sign in with Claude"). The UI shows the control whenever this
+     * is true, even if `login_unavailable_reason` says it cannot run yet.
+     */
+    login_supported: boolean;
+    /**
+     * Why signing in cannot start right now (CLI not installed on this
+     * server, data directory unavailable) or why the provider has no
+     * console sign-in. `None` when the sign-in can be started.
+     */
+    login_unavailable_reason?: string | null;
+    /**
      * Default max turns for the autofixer analysis phase. `None` = built-in
      * default (10). Only enforced for CLIs with a turn flag (Claude Code).
      */
@@ -22188,6 +22298,12 @@ export type SandboxStatusResponse = {
     docker_available: boolean;
     error?: string | null;
     firecracker_available: boolean;
+    /**
+     * Whether Firecracker sandboxes can open interactive terminals (the
+     * guest terminal agent must be staged). Always present, with the reason
+     * and fix when not, so clients never have to infer it from a 409.
+     */
+    firecracker_terminal: TerminalCapability;
     image_name: string;
     image_ready: boolean;
     /**
@@ -25353,6 +25469,17 @@ export type StripeConfig = {
 };
 
 /**
+ * Body for `POST /settings/ai-providers/{provider_id}/login/code`.
+ */
+export type SubmitLoginCodeRequest = {
+    /**
+     * The authorization code shown by the provider after approving access.
+     * Never logged and never echoed back.
+     */
+    code: string;
+};
+
+/**
  * What (if anything) will restart the process after it exits.
  */
 export type SupervisorKind = 'systemd' | 'launchd' | 'container' | 'none';
@@ -26003,6 +26130,29 @@ export type TenantResourceCeilings = {
      * host, not merely a large number.
      */
     max_memory_limit_mb?: number;
+};
+
+/**
+ * Whether interactive terminals (`SandboxProvider::attach_pty`) can be
+ * opened on a backend right now, and if not, what to do about it.
+ *
+ * Reported next to each backend's availability so the console and CLI can
+ * say "terminals need X" up front instead of discovering it as a bare 409
+ * when someone opens one.
+ */
+export type TerminalCapability = {
+    /**
+     * Why not, when `supported` is false.
+     */
+    reason?: string | null;
+    /**
+     * Shell command that fixes it, when running one is the fix.
+     */
+    setup_command?: string | null;
+    /**
+     * Whether a terminal can be attached to a sandbox on this backend.
+     */
+    supported: boolean;
 };
 
 /**
@@ -31086,6 +31236,43 @@ export type UploadApplicationWorkspaceFilesResponses = {
 
 export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
 
+export type AttachApplicationWorkspaceTerminalData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        /**
+         * Public id of the terminal thread to attach to.
+         */
+        thread: string;
+        /**
+         * Initial terminal width in columns (default 80).
+         */
+        cols?: number | null;
+        /**
+         * Initial terminal height in rows (default 24).
+         */
+        rows?: number | null;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/terminal';
+};
+
+export type AttachApplicationWorkspaceTerminalErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    /**
+     * The workspace sandbox cannot be attached to right now
+     */
+    409: unknown;
+    /**
+     * Too many concurrent terminals
+     */
+    429: unknown;
+    503: unknown;
+};
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -32976,6 +33163,40 @@ export type CreateGlobalWorkspacePreviewLinkResponses = {
 };
 
 export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
+
+export type AttachGlobalWorkspaceTerminalData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Public id of the terminal thread to attach to.
+         */
+        thread: string;
+        /**
+         * Initial terminal width in columns (default 80).
+         */
+        cols?: number | null;
+        /**
+         * Initial terminal height in rows (default 24).
+         */
+        rows?: number | null;
+    };
+    url: '/ai/workspace/terminal';
+};
+
+export type AttachGlobalWorkspaceTerminalErrors = {
+    401: unknown;
+    403: unknown;
+    /**
+     * The workspace sandbox cannot be attached to right now
+     */
+    409: unknown;
+    /**
+     * Too many concurrent terminals
+     */
+    429: unknown;
+    503: unknown;
+};
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;
@@ -68056,6 +68277,259 @@ export type VerifySavedAiProviderCredentialResponses = {
 
 export type VerifySavedAiProviderCredentialResponse = VerifySavedAiProviderCredentialResponses[keyof VerifySavedAiProviderCredentialResponses];
 
+export type GetAiProviderHarnessUpdateData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: {
+        /**
+         * Look inside the workspace again instead of returning the cached check.
+         */
+        refresh?: boolean;
+    };
+    url: '/settings/ai-providers/{provider_id}/harness-update';
+};
+
+export type GetAiProviderHarnessUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown provider
+     */
+    404: unknown;
+    /**
+     * The workspace could not be inspected
+     */
+    503: unknown;
+};
+
+export type GetAiProviderHarnessUpdateResponses = {
+    /**
+     * Harness version status
+     */
+    200: HarnessUpdateStatus;
+};
+
+export type GetAiProviderHarnessUpdateResponse = GetAiProviderHarnessUpdateResponses[keyof GetAiProviderHarnessUpdateResponses];
+
+export type UpdateAiProviderHarnessData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/harness-update';
+};
+
+export type UpdateAiProviderHarnessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown provider
+     */
+    404: unknown;
+    /**
+     * The workspace is busy or already updating
+     */
+    409: unknown;
+    /**
+     * The update could not run
+     */
+    503: unknown;
+};
+
+export type UpdateAiProviderHarnessResponses = {
+    /**
+     * Harness updated
+     */
+    200: HarnessUpdateStatus;
+};
+
+export type UpdateAiProviderHarnessResponse = UpdateAiProviderHarnessResponses[keyof UpdateAiProviderHarnessResponses];
+
+export type GetAiProviderLoginData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login';
+};
+
+export type GetAiProviderLoginErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No sign-in has been started
+     */
+    404: unknown;
+};
+
+export type GetAiProviderLoginResponses = {
+    /**
+     * Sign-in state
+     */
+    200: AiProviderLoginResponse;
+};
+
+export type GetAiProviderLoginResponse = GetAiProviderLoginResponses[keyof GetAiProviderLoginResponses];
+
+export type StartAiProviderLoginData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login';
+};
+
+export type StartAiProviderLoginErrors = {
+    /**
+     * Provider has no console sign-in
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown provider
+     */
+    404: unknown;
+    /**
+     * A sign-in is already in progress
+     */
+    409: unknown;
+    /**
+     * Too many sign-ins running
+     */
+    429: unknown;
+};
+
+export type StartAiProviderLoginResponses = {
+    /**
+     * Sign-in started
+     */
+    202: AiProviderLoginResponse;
+};
+
+export type StartAiProviderLoginResponse = StartAiProviderLoginResponses[keyof StartAiProviderLoginResponses];
+
+export type CancelAiProviderLoginData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login/cancel';
+};
+
+export type CancelAiProviderLoginErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No sign-in has been started
+     */
+    404: unknown;
+};
+
+export type CancelAiProviderLoginResponses = {
+    /**
+     * Sign-in cancelled
+     */
+    200: AiProviderLoginResponse;
+};
+
+export type CancelAiProviderLoginResponse = CancelAiProviderLoginResponses[keyof CancelAiProviderLoginResponses];
+
+export type SubmitAiProviderLoginCodeData = {
+    body: SubmitLoginCodeRequest;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/login/code';
+};
+
+export type SubmitAiProviderLoginCodeErrors = {
+    /**
+     * Invalid code
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No sign-in in progress
+     */
+    404: unknown;
+    /**
+     * Sign-in is not waiting for a code
+     */
+    409: unknown;
+};
+
+export type SubmitAiProviderLoginCodeResponses = {
+    /**
+     * Code submitted
+     */
+    200: AiProviderLoginResponse;
+};
+
+export type SubmitAiProviderLoginCodeResponse = SubmitAiProviderLoginCodeResponses[keyof SubmitAiProviderLoginCodeResponses];
+
 export type RefreshAiProviderModelsData = {
     body?: never;
     path: {
@@ -72622,9 +73096,17 @@ export type TerminalErrors = {
      */
     404: unknown;
     /**
-     * Sandbox is not in a state that can be attached to
+     * Terminal unavailable: the sandbox is not running, or its backend's guest terminal agent is missing (the problem detail names the fix)
      */
     409: unknown;
+    /**
+     * Too many concurrent terminals for this instance or account
+     */
+    429: unknown;
+    /**
+     * The sandbox's guest did not accept a terminal in time
+     */
+    504: unknown;
 };
 
 export type CmdKillData = {

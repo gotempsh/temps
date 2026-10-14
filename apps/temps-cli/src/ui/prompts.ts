@@ -24,6 +24,8 @@ export interface PasswordPromptOptions {
   message: string
   mask?: string
   validate?: (value: string) => boolean | string | Promise<boolean | string>
+  /** Render the prompt on stderr so stdout stays machine-readable (`--json`). */
+  toStderr?: boolean
 }
 
 export interface ConfirmPromptOptions {
@@ -66,14 +68,17 @@ export async function promptText(options: TextPromptOptions): Promise<string> {
 }
 
 export async function promptPassword(options: PasswordPromptOptions): Promise<string> {
-  const result = await password({
-    message: options.message,
-    mask: options.mask ?? '*',
-    validate: options.validate,
-    theme: {
-      prefix: colors.primary('?'),
+  const result = await password(
+    {
+      message: options.message,
+      mask: options.mask ?? '*',
+      validate: options.validate,
+      theme: {
+        prefix: colors.primary('?'),
+      },
     },
-  })
+    options.toStderr ? { output: process.stderr } : undefined
+  )
   return result
 }
 

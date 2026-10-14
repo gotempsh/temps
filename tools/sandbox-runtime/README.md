@@ -21,8 +21,13 @@ cargo test --locked --manifest-path tools/sandbox-runtime/Cargo.toml
 python3 tools/sandbox-runtime/test_build_inputs.py
 ```
 
-Node.js includes Node, Bun and the Claude/Codex/OpenCode CLIs. Python adds
-Python, pip and venv. All adds build-essential and Debian's Go/Rust toolchains.
+Node.js includes Node, Bun and the Claude/Codex/OpenCode CLIs. The CLIs are
+installed under `/opt/temps-cli`, owned by the sandbox user and linked into
+`/usr/local/bin`, so `claude update` and `npm install -g <cli>@latest` work
+without root (`sudo` cannot elevate under `no-new-privileges`). Updates last
+until the container is replaced; **Update runtime** returns to the pinned
+versions. Keep `/usr/local/bin` root-owned: the host root-execs the daemon from
+it. Python adds Python, pip and venv. All adds build-essential and Debian's Go/Rust toolchains.
 The latter are distribution versions, not promises of the latest toolchains.
 
 Release builds pin the images in their release manifest. A build without a

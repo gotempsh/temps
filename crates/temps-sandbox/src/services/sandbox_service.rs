@@ -1137,6 +1137,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
 // both repository metadata and commits live on the same durable bind mount as
 // the files the development harness edits.
 const APPLICATION_GIT_BOOTSTRAP: &str = r#"set -eu
+# The workspace is a bind mount whose owner can differ from the sandbox user
+# (rootless/remote Docker, macOS VMs). Git then refuses the repository as
+# "dubious ownership": `rev-parse` fails, `git init` only re-initializes, and
+# `git config --local` dies with "--local can only be used inside a git
+# repository". Trust this directory once, in the user's persistent config.
+git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$PWD" \
+  || git config --global --add safe.directory "$PWD"
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git init --initial-branch=main . >/dev/null
 fi
@@ -6856,6 +6863,20 @@ mod storage_cleanup_tests {
             vec!["configure"]
         );
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn git_bootstrap_trusts_the_workspace_before_probing_the_repository() {
+        let trust = APPLICATION_GIT_BOOTSTRAP
+            .find("git config --global --add safe.directory")
+            .expect("bootstrap must trust the workspace directory");
+        let probe = APPLICATION_GIT_BOOTSTRAP
+            .find("if ! git rev-parse")
+            .expect("bootstrap probes for an existing repository");
+        assert!(
+            trust < probe,
+            "an unowned bind mount must be trusted before git inspects it"
+        );
     }
 
     #[tokio::test]

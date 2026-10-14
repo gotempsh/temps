@@ -62,6 +62,15 @@ docker exec "$container" codex --version
 docker exec "$container" claude --version
 docker exec "$container" opencode --version
 docker exec "$container" bun --version
+# The AI CLIs must be updatable by the sandbox user without root, since sudo
+# cannot elevate under no-new-privileges. The directory holding the daemon the
+# host root-execs must stay root-owned. This container's rootfs is read-only,
+# so check ownership and resolution instead of attempting a write.
+docker exec "$container" sh -lc 'test "$(npm config get prefix)" = /opt/temps-cli'
+docker exec "$container" sh -lc 'test "$(stat -c %U /opt/temps-cli/lib/node_modules)" = temps'
+docker exec "$container" sh -lc 'test "$(stat -c %U /usr/local/bin)" = root'
+docker exec "$container" sh -lc 'test "$(stat -c %U /usr/local/bin/temps-sandbox-runtime)" = root'
+docker exec "$container" sh -lc 'for cli in claude codex opencode; do case "$(readlink -f "$(command -v "$cli")")" in /opt/temps-cli/*) ;; *) echo "$cli does not resolve into /opt/temps-cli"; exit 1;; esac; done'
 docker exec "$container" sh -c 'command -v pgrep; command -v pkill; command -v ps; command -v ss'
 docker exec "$container" temps-sandbox-runtime exec timeout 5 node -e 'require("fs").readFileSync(0);console.log("stdin-eof-ok")'
 docker exec "$container" temps-sandbox-runtime exec node -e 'const fs=require("fs");if(!fs.readFileSync("/proc/"+process.ppid+"/cmdline","utf8").includes("temps-sandbox-runtime"))process.exit(1);console.log("daemon-exec-ok")'

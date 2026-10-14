@@ -458,6 +458,10 @@ pub struct SandboxStatusResponse {
     /// Experimental microsandbox microVM backend (ADR-050). Always present:
     /// when not configured it carries the reason and where to set it up.
     pub microsandbox: crate::sandbox::microsandbox::MicrosandboxCapability,
+    /// Whether Firecracker sandboxes can open interactive terminals (the
+    /// guest terminal agent must be staged). Always present, with the reason
+    /// and fix when not, so clients never have to infer it from a 409.
+    pub firecracker_terminal: crate::sandbox::TerminalCapability,
 }
 
 #[utoipa::path(
@@ -511,6 +515,9 @@ pub async fn get_sandbox_status(
         microsandbox: crate::sandbox::microsandbox::microsandbox_capability(
             &crate::sandbox::microsandbox::host_data_dir(),
         ),
+        firecracker_terminal: crate::sandbox::firecracker::firecracker_terminal_capability(
+            &crate::sandbox::microsandbox::host_data_dir(),
+        ),
     }))
 }
 
@@ -556,6 +563,8 @@ pub async fn get_global_sandbox_status(
     let firecracker_available =
         crate::sandbox::firecracker::is_firecracker_available(&data_dir).await;
     let microsandbox = crate::sandbox::microsandbox::microsandbox_capability(&data_dir);
+    let firecracker_terminal =
+        crate::sandbox::firecracker::firecracker_terminal_capability(&data_dir);
 
     Ok(Json(SandboxStatusResponse {
         docker_available,
@@ -564,6 +573,7 @@ pub async fn get_global_sandbox_status(
         error,
         firecracker_available,
         microsandbox,
+        firecracker_terminal,
     }))
 }
 
@@ -792,8 +802,31 @@ pub async fn smoke_test_agent(
                         test_env.insert(auth_flavor.env_var.to_string(), plain);
                     }
                     CredentialFormat::OauthToken if target_provider_id == "claude_cli" => {
-                        // Legacy env var still recognized by the Claude CLI.
-                        test_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), plain);
+                        // Legacy env var still recognized by the Claude CLI. A
+                        // console sign-in is stored as a snapshot, so resolve
+                        // it to the bearer rather than exporting the JSON.
+                        match crate::ai_cli::credential_snapshot::resolve_claude_oauth(
+                            &plain,
+                            std::time::Duration::from_secs(300),
+                        )
+                        .await
+                        {
+                            Ok(resolved) => {
+                                test_env.insert(
+                                    "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                                    resolved.access_token,
+                                );
+                            }
+                            Err(error) => {
+                                // Leave the variable unset so the check reports
+                                // "not authenticated" instead of exporting JSON.
+                                tracing::warn!(
+                                    provider_id = %target_provider_id,
+                                    %error,
+                                    "saved Claude sign-in could not be resolved for the smoke test"
+                                );
+                            }
+                        }
                     }
                     _ => {
                         // ConfigFile flavors (opencode, codex subscription): the

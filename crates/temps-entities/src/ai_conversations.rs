@@ -30,6 +30,11 @@ pub struct Model {
     pub title: Option<String>,
     /// `"active" | "archived"`.
     pub status: String,
+    /// What this thread is: `"ai"` (an AI harness conversation) or
+    /// `"terminal"` (an interactive shell in the workspace sandbox). Fixed at
+    /// creation. Defaults to `"ai"` in the database, so inserts that do not
+    /// set it keep producing AI threads.
+    pub kind: String,
     /// The user who owns this private conversation.
     pub created_by: i32,
     /// Seed refs (log_ids, deployment state) + e.g. autofixer_run_id on hand-off.

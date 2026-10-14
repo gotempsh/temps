@@ -415,7 +415,7 @@ async fn test_source_built_service_release_migration_relaxes_identity_constraint
         "postgresql://postgres:postgres@localhost:{port}/postgres"
     ))
     .await?;
-    let target = "m20261013_000002_allow_source_built_service_release";
+    let target = "m20261013_000003_allow_source_built_service_release";
     let migrations = Migrator::migrations();
     let target_position = migrations
         .iter()

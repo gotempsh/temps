@@ -31,7 +31,14 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { harnessSetupHref } from '@/pages/agent-sandbox/harness-onboarding'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
@@ -41,6 +48,14 @@ import {
   type ChatRuntimeSelection,
 } from '@/components/ai/chat-runtime-options'
 import { WorkspaceHarnessSetup } from './WorkspaceHarnessSetup'
+import { WorkspaceTerminalPanel } from './WorkspaceTerminalPanel'
+import {
+  THREAD_KINDS,
+  isTerminalThread,
+  terminalThreadSubtitle,
+  type ThreadKind,
+} from './thread-kind'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
 import { workspaceFirstTask } from './workspace-first-task'
 import { Textarea } from '@/components/ui/textarea'
@@ -159,6 +174,7 @@ import {
   threadTitleFromLiveEvent,
   workspacePageTitle,
 } from './thread-title-event'
+import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
@@ -338,6 +354,9 @@ function PersistentAiFirstWorkspace() {
   const [threadDialogOpen, setThreadDialogOpen] = useState(false)
   const [globalStartOpen, setGlobalStartOpen] = useState(false)
   const [rightView, setRightView] = useState<RightView>('generated')
+  // Read the context directly: this screen is also rendered without an auth
+  // provider in tests, and a missing role only means "let the server decide".
+  const userRole = useContext(AuthContext)?.user?.role
   const [rightPanelOpen, setRightPanelOpen] = useState(false)
   const [leftPanelOpen, setLeftPanelOpen] = useState(false)
   const leftNavigationRef = useRef<HTMLElement | null>(null)
@@ -1042,6 +1061,49 @@ function PersistentAiFirstWorkspace() {
     refetchGlobalWorkspace,
   ])
 
+  // The Terminal view's Wake button. Same `resume` action the automatic wake
+  // uses, but user-initiated, so a failure is reported rather than retried.
+  const handleWakeWorkspace = useCallback(async () => {
+    if (
+      !activeApplicationId ||
+      workspaceWakeInFlight.current === activeApplicationId
+    ) {
+      return
+    }
+    workspaceWakeAttempted.current = activeApplicationId
+    workspaceWakeInFlight.current = activeApplicationId
+    setActiveWorkspaceWaking(true)
+    try {
+      const { data: resumed } = await controlApplicationWorkspace({
+        path: { application_public_id: activeApplicationId },
+        body: { action: 'resume' },
+        throwOnError: true,
+      })
+      queryClient.setQueryData<ApplicationWorkspaceResponse>(
+        applicationWorkspaceOptions.queryKey,
+        resumed
+      )
+    } catch (cause) {
+      toast.error('Could not wake the workspace', {
+        description: problemDetail(
+          cause,
+          'The workspace sandbox did not start. Open Workspace settings for details.'
+        ),
+      })
+      await refetchApplicationWorkspace()
+    } finally {
+      if (workspaceWakeInFlight.current === activeApplicationId) {
+        workspaceWakeInFlight.current = null
+        setActiveWorkspaceWaking(false)
+      }
+    }
+  }, [
+    activeApplicationId,
+    applicationWorkspaceOptions.queryKey,
+    queryClient,
+    refetchApplicationWorkspace,
+  ])
+
   const queriedWorkspace = activeApplicationId
     ? applicationWorkspaceQuery.data
     : globalWorkspaceQuery.data
@@ -1444,6 +1506,7 @@ function PersistentAiFirstWorkspace() {
       context_id: conversation.context_id,
       context_type: conversation.context_type,
       created_at: conversation.created_at,
+      kind: conversation.kind,
       last_activity_at: conversation.last_activity_at,
       project_id: null,
       project_name: null,
@@ -1663,6 +1726,27 @@ function PersistentAiFirstWorkspace() {
       setThreadActionPending(null)
     }
   }
+
+  // A terminal thread shows its shell where an AI thread shows its chat.
+  const renderTerminalThread = (conversation: ConversationResponse) => (
+    <div className="h-full p-3 sm:p-4">
+      <WorkspaceTerminalPanel
+        applicationPublicId={activeApplication?.public_id ?? null}
+        archived={threadListMode === 'archived'}
+        key={conversation.public_id}
+        loading={activeWorkspaceStatusLoading}
+        onOpenWorkspaceSettings={() => {
+          setRightView('workspace')
+          if (window.innerWidth < 1280) setRightPanelOpen(true)
+        }}
+        onWake={() => void handleWakeWorkspace()}
+        role={userRole}
+        threadPublicId={conversation.public_id}
+        waking={activeWorkspaceWaking}
+        workspace={activeWorkspaceStatus}
+      />
+    </div>
+  )
 
   return (
     <div className="fixed inset-0 z-40 overflow-hidden bg-background text-foreground antialiased">
@@ -2063,24 +2147,36 @@ function PersistentAiFirstWorkspace() {
                       <span className="truncate text-xs">
                         {conversation.title ?? 'Workspace thread'}
                       </span>
-                      {threadListMode === 'active' && (
-                        <ThreadStatusIndicator
-                          status={threadDisplayStatus(
-                            conversation.turn_status,
-                            conversation.last_activity_at !==
-                              conversation.created_at
-                          )}
-                        />
-                      )}
+                      {threadListMode === 'active' &&
+                        !isTerminalThread(conversation) && (
+                          <ThreadStatusIndicator
+                            status={threadDisplayStatus(
+                              conversation.turn_status,
+                              conversation.last_activity_at !==
+                                conversation.created_at
+                            )}
+                          />
+                        )}
                     </span>
                     <span className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px]">
-                      <AiHarnessLogo
-                        providerId={conversation.ai_provider}
-                        size={16}
-                      />
-                      <span className="truncate">
-                        {threadRuntimeLabel(conversation, harnesses)}
-                      </span>
+                      {isTerminalThread(conversation) ? (
+                        <>
+                          <TerminalSquare className="size-4 shrink-0" />
+                          <span className="truncate">
+                            {terminalThreadSubtitle(false)}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <AiHarnessLogo
+                            providerId={conversation.ai_provider}
+                            size={16}
+                          />
+                          <span className="truncate">
+                            {threadRuntimeLabel(conversation, harnesses)}
+                          </span>
+                        </>
+                      )}
                     </span>
                   </button>
                   <button
@@ -2175,23 +2271,34 @@ function PersistentAiFirstWorkspace() {
                 </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   All accessible services ·{' '}
-                  {threadRuntimeLabel(activeGlobalConversation, harnesses)} ·
-                  user-owned · current-role authorization
+                  {isTerminalThread(activeGlobalConversation)
+                    ? terminalThreadSubtitle(threadListMode === 'archived')
+                    : threadRuntimeLabel(
+                        activeGlobalConversation,
+                        harnesses
+                      )}{' '}
+                  · user-owned · current-role authorization
                 </p>
               </div>
               <div className="min-h-0 flex-1">
-                <DebugChatPanel
-                  key={activeGlobalConversation.public_id}
-                  conversationPublicId={activeGlobalConversation.public_id}
-                  userScoped
-                  contextType="global"
-                  contextId={activeGlobalConversation.context_id}
-                  emptyHint="Ask about any service or platform resource you can access. Temps will gather evidence before proposing changes."
-                  placeholder="Ask Temps to inspect or operate your workspace…"
-                  onLiveEvent={handleChatLiveEvent}
-                  onConversationStatusInvalidated={refreshVisibleConversations}
-                  readOnly={threadListMode === 'archived'}
-                />
+                {isTerminalThread(activeGlobalConversation) ? (
+                  renderTerminalThread(activeGlobalConversation)
+                ) : (
+                  <DebugChatPanel
+                    key={activeGlobalConversation.public_id}
+                    conversationPublicId={activeGlobalConversation.public_id}
+                    userScoped
+                    contextType="global"
+                    contextId={activeGlobalConversation.context_id}
+                    emptyHint="Ask about any project or platform resource you can access. Temps will gather evidence before proposing changes."
+                    placeholder="Ask Temps to inspect or operate your workspace…"
+                    onLiveEvent={handleChatLiveEvent}
+                    onConversationStatusInvalidated={
+                      refreshVisibleConversations
+                    }
+                    readOnly={threadListMode === 'archived'}
+                  />
+                )}
               </div>
             </div>
           ) : globalScopeFromUrl ? (
@@ -2226,45 +2333,54 @@ function PersistentAiFirstWorkspace() {
                 </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   {activeApplication.projects.length} linked services ·{' '}
-                  {threadRuntimeLabel(activeConversation, harnesses)} ·
-                  user-owned · current-role authorization
+                  {isTerminalThread(activeConversation)
+                    ? terminalThreadSubtitle(threadListMode === 'archived')
+                    : threadRuntimeLabel(activeConversation, harnesses)}{' '}
+                  · user-owned · current-role authorization
                 </p>
               </div>
               <div className="min-h-0 flex-1">
-                <DebugChatPanel
-                  key={activeConversation.public_id}
-                  conversationPublicId={activeConversation.public_id}
-                  userScoped
-                  contextType="application"
-                  contextId={activeConversation.context_id}
-                  runtimeUpdateRequired={
-                    activeWorkspaceStatus?.runtime_compatible === false
-                  }
-                  emptyHint="Describe what you want to build or operate from this workspace."
-                  placeholder="Tell Temps what you want to ship…"
-                  onLiveEvent={handleChatLiveEvent}
-                  onConversationStatusInvalidated={refreshVisibleConversations}
-                  readOnly={threadListMode === 'archived'}
-                />
+                {isTerminalThread(activeConversation) ? (
+                  renderTerminalThread(activeConversation)
+                ) : (
+                  <DebugChatPanel
+                    key={activeConversation.public_id}
+                    conversationPublicId={activeConversation.public_id}
+                    userScoped
+                    contextType="application"
+                    contextId={activeConversation.context_id}
+                    runtimeUpdateRequired={
+                      activeWorkspaceStatus?.runtime_compatible === false
+                    }
+                    emptyHint="Describe what you want to build or operate from this workspace."
+                    placeholder="Tell Temps what you want to ship…"
+                    onLiveEvent={handleChatLiveEvent}
+                    onConversationStatusInvalidated={
+                      refreshVisibleConversations
+                    }
+                    readOnly={threadListMode === 'archived'}
+                  />
+                )}
               </div>
-              {activeWorkspaceStatus?.runtime_compatible === false && (
-                <div
-                  role="alert"
-                  className="shrink-0 border-t border-amber-500/30 bg-amber-500/5 px-5 py-3 text-sm"
-                >
-                  Runtime update required. Your messages and workspace files are
-                  preserved.
-                  <Button
-                    variant="link"
-                    onClick={() => {
-                      setRightView('workspace')
-                      if (window.innerWidth < 1280) setRightPanelOpen(true)
-                    }}
+              {activeWorkspaceStatus?.runtime_compatible === false &&
+                !isTerminalThread(activeConversation) && (
+                  <div
+                    role="alert"
+                    className="shrink-0 border-t border-amber-500/30 bg-amber-500/5 px-5 py-3 text-sm"
                   >
-                    Open Workspace settings
-                  </Button>
-                </div>
-              )}
+                    Runtime update required. Your messages and workspace files
+                    are preserved.
+                    <Button
+                      variant="link"
+                      onClick={() => {
+                        setRightView('workspace')
+                        if (window.innerWidth < 1280) setRightPanelOpen(true)
+                      }}
+                    >
+                      Open Workspace settings
+                    </Button>
+                  </div>
+                )}
             </div>
           )}
         </main>
@@ -2856,17 +2972,21 @@ function GlobalChatStartScreen({
   harnessesLoading: boolean
 }) {
   const [harnessId, setHarnessId] = useState<string | null>(null)
+  const [kind, setKind] = useState<ThreadKind>('ai')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const selectedHarnessId = harnessId ?? defaultHarnessId(harnesses)
 
   const submit = async () => {
-    if (!selectedHarnessId) return
+    if (kind === 'ai' && !selectedHarnessId) return
     setSaving(true)
     setError(null)
     try {
       const { data } = await createGlobalConversation({
-        body: { ai_provider: selectedHarnessId },
+        body:
+          kind === 'terminal'
+            ? { kind: 'terminal' }
+            : { kind: 'ai', ai_provider: selectedHarnessId },
         throwOnError: true,
       })
       onCreated(data)
@@ -2898,13 +3018,16 @@ function GlobalChatStartScreen({
             Cancel
           </Button>
         </div>
-        <div className="mt-6">
-          <HarnessPicker
-            harnesses={harnesses}
-            loading={harnessesLoading}
-            selectedId={selectedHarnessId}
-            onSelect={setHarnessId}
-          />
+        <div className="mt-6 space-y-4">
+          <ThreadKindPicker onChange={setKind} value={kind} />
+          {kind === 'ai' && (
+            <HarnessPicker
+              harnesses={harnesses}
+              loading={harnessesLoading}
+              selectedId={selectedHarnessId}
+              onSelect={setHarnessId}
+            />
+          )}
           {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
         </div>
         <div className="mt-6 flex justify-end gap-3 border-t border-border pt-5">
@@ -2912,11 +3035,11 @@ function GlobalChatStartScreen({
             Cancel
           </Button>
           <Button
-            disabled={saving || !selectedHarnessId}
+            disabled={saving || (kind === 'ai' && !selectedHarnessId)}
             onClick={() => void submit()}
           >
             {saving && <Loader2 className="mr-1.5 size-4 animate-spin" />}
-            Start workspace chat
+            {kind === 'terminal' ? 'Open terminal' : 'Start workspace chat'}
           </Button>
         </div>
       </section>
@@ -4237,6 +4360,50 @@ export function HarnessPicker({
   )
 }
 
+function ThreadKindPicker({
+  value,
+  onChange,
+}: {
+  value: ThreadKind
+  onChange: (kind: ThreadKind) => void
+}) {
+  return (
+    <div
+      aria-label="Thread kind"
+      className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+      role="radiogroup"
+    >
+      {THREAD_KINDS.map((entry) => {
+        const Icon = entry.kind === 'terminal' ? TerminalSquare : Sparkles
+        const selected = entry.kind === value
+        return (
+          <button
+            aria-checked={selected}
+            className={cn(
+              'rounded-lg border p-3 text-left transition-colors',
+              selected
+                ? 'border-foreground bg-accent'
+                : 'border-border hover:bg-accent/50'
+            )}
+            key={entry.kind}
+            onClick={() => onChange(entry.kind)}
+            role="radio"
+            type="button"
+          >
+            <span className="flex items-center gap-2 text-sm font-medium">
+              <Icon className="size-4" />
+              {entry.label}
+            </span>
+            <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+              {entry.description}
+            </span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 function CreateThreadDialog({
   application,
   harnesses,
@@ -4253,6 +4420,7 @@ function CreateThreadDialog({
   onCreated: (conversation: ConversationResponse) => void
 }) {
   const [harnessId, setHarnessId] = useState<string | null>(null)
+  const [kind, setKind] = useState<ThreadKind>('ai')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const selectedHarnessId = harnessId ?? defaultHarnessId(harnesses)
@@ -4265,7 +4433,7 @@ function CreateThreadDialog({
   }, [harnessId, harnesses])
 
   const submit = async () => {
-    if (!selectedHarnessId) {
+    if (kind === 'ai' && !selectedHarnessId) {
       setError('Choose an authenticated development harness first.')
       return
     }
@@ -4274,9 +4442,10 @@ function CreateThreadDialog({
     try {
       const { data } = await createApplicationConversation({
         path: { application_public_id: application.public_id },
-        body: {
-          ai_provider: selectedHarnessId,
-        },
+        body:
+          kind === 'terminal'
+            ? { kind: 'terminal' }
+            : { kind: 'ai', ai_provider: selectedHarnessId },
         throwOnError: true,
       })
       onCreated(data)
@@ -4295,25 +4464,39 @@ function CreateThreadDialog({
         <DialogHeader>
           <DialogTitle>New workspace thread</DialogTitle>
           <DialogDescription>
-            Choose the development harness that can use Temps tools and the
-            shared workspace. The harness is pinned to this thread.
+            {kind === 'terminal'
+              ? 'A shell in the workspace sandbox. It keeps running when you close the tab, and reconnecting resumes it.'
+              : 'Choose the development harness that can use Temps tools and the shared workspace. The harness is pinned to this thread.'}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
-          <HarnessPicker
-            harnesses={harnesses}
-            loading={harnessesLoading}
-            selectedId={selectedHarnessId}
-            onSelect={setHarnessId}
-          />
-          <p className="rounded-md border border-border bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
-            The harness chooses its own model and runs inside a persistent Temps
-            sandbox mounted on this workspace. It can change project files.
-            OpenCode local login uses a private runtime credential file that
-            harness-user code can access; use it only in trusted workspaces.
-            Platform actions remain explicitly approval-gated.
-          </p>
-          {harnesses.length === 0 && (
+          <ThreadKindPicker onChange={setKind} value={kind} />
+          {kind === 'ai' && (
+            <HarnessPicker
+              harnesses={harnesses}
+              loading={harnessesLoading}
+              selectedId={selectedHarnessId}
+              onSelect={setHarnessId}
+            />
+          )}
+          {kind === 'ai' && (
+            <p className="rounded-md border border-border bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
+              The harness chooses its own model and runs inside a persistent
+              Temps sandbox mounted on this workspace. It can change project
+              files. OpenCode local login uses a private runtime credential file
+              that harness-user code can access; use it only in trusted
+              workspaces. Platform actions remain explicitly approval-gated.
+            </p>
+          )}
+          {kind === 'terminal' && (
+            <p className="rounded-md border border-border bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
+              The shell runs as the sandbox user inside the same persistent
+              sandbox as your AI threads, so it sees and can change the same
+              project files. Creating and using it needs the sandboxes:exec
+              permission.
+            </p>
+          )}
+          {kind === 'ai' && harnesses.length === 0 && (
             <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-600">
               No development harness is ready. Authenticate Claude Code, Codex,
               or OpenCode in Agent Sandbox settings.
@@ -4326,11 +4509,11 @@ function CreateThreadDialog({
             Cancel
           </Button>
           <Button
-            disabled={saving || !selectedHarnessId}
+            disabled={saving || (kind === 'ai' && !selectedHarnessId)}
             onClick={() => void submit()}
           >
             {saving && <Loader2 className="mr-1.5 size-4 animate-spin" />}{' '}
-            Create thread
+            {kind === 'terminal' ? 'Create terminal' : 'Create thread'}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -149,6 +149,27 @@ export interface TerminalSession {
 
 const WS_OPEN = 1
 
+/**
+ * Largest input frame sent to the PTY. The endpoint closes the connection on
+ * any message over 64 KiB, so a big paste is split rather than allowed to
+ * kill the session. The PTY reassembles the byte stream, so a split inside a
+ * multi-byte character is harmless.
+ */
+export const TERMINAL_INPUT_FRAME_BYTES = 16 * 1024
+
+/** Split `bytes` into frames of at most `size` bytes, in order. */
+export function chunkTerminalInput(
+  bytes: Uint8Array,
+  size: number = TERMINAL_INPUT_FRAME_BYTES
+): Uint8Array[] {
+  if (bytes.length <= size) return bytes.length === 0 ? [] : [bytes]
+  const chunks: Uint8Array[] = []
+  for (let offset = 0; offset < bytes.length; offset += size) {
+    chunks.push(bytes.subarray(offset, offset + size))
+  }
+  return chunks
+}
+
 export function openTerminalSession(
   options: TerminalSessionOptions
 ): TerminalSession {
@@ -214,7 +235,10 @@ export function openTerminalSession(
 
   return {
     send(data) {
-      if (socket.readyState === WS_OPEN) socket.send(encoder.encode(data))
+      if (socket.readyState !== WS_OPEN) return
+      for (const frame of chunkTerminalInput(encoder.encode(data))) {
+        socket.send(frame)
+      }
     },
     resize(cols, rows) {
       if (socket.readyState === WS_OPEN) {

@@ -49,6 +49,11 @@ pub const BUNDLE: &[BundleFile] = &[
         mode: 0o644,
     },
     BundleFile {
+        path: "pty-agent/src/relay.rs",
+        contents: include_bytes!("../../../temps-pty-agent/src/relay.rs"),
+        mode: 0o644,
+    },
+    BundleFile {
         path: "pty-agent/src/server.rs",
         contents: include_bytes!("../../../temps-pty-agent/src/server.rs"),
         mode: 0o644,
