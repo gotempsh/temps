@@ -895,7 +895,9 @@ struct ReferenceIndex {
     partial: bool,
     /// TimescaleDB does not support `CREATE INDEX CONCURRENTLY` on a
     /// hypertable; it builds one chunk per transaction instead, so a write is
-    /// only ever blocked behind a single chunk's build.
+    /// only ever blocked behind a single chunk's build. Must match the
+    /// migrations: `error_events` and `proxy_logs` are hypertables
+    /// (`m20250101_000001_initial_schema`), the other tables are not.
     hypertable: bool,
 }
 
@@ -912,7 +914,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         table: "error_events",
         column: "ip_geolocation_id",
         partial: true,
-        hypertable: false,
+        hypertable: true,
     },
     ReferenceIndex {
         name: "idx_proxy_logs_ip_geolocation",
@@ -1658,26 +1660,33 @@ mod tests {
     /// TimescaleDB rejects `CREATE INDEX CONCURRENTLY` on a hypertable.
     #[test]
     fn hypertable_reference_indexes_build_one_chunk_per_transaction() {
-        let proxy_logs = REFERENCE_INDEXES
+        // TimescaleDB rejects CREATE INDEX CONCURRENTLY on these; this list is
+        // the hypertables among the indexed tables (see the migrations).
+        let mut hypertables: Vec<_> = REFERENCE_INDEXES
             .iter()
-            .find(|i| i.table == "proxy_logs")
-            .expect("proxy_logs is indexed");
-        assert!(proxy_logs.hypertable);
-        let sql = proxy_logs.create_sql();
-        assert!(!sql.contains("CONCURRENTLY"), "{sql}");
-        assert!(
-            sql.contains("WITH (timescaledb.transaction_per_chunk)"),
-            "{sql}"
-        );
-        // `WITH` must come before `WHERE` in the CREATE INDEX grammar.
-        assert!(
-            sql.find("WITH (").expect("with") < sql.find("WHERE").expect("where"),
-            "{sql}"
-        );
-        assert_eq!(
-            proxy_logs.drop_invalid_sql(),
-            "DROP INDEX IF EXISTS idx_proxy_logs_ip_geolocation"
-        );
+            .filter(|i| i.hypertable)
+            .map(|i| i.table)
+            .collect();
+        hypertables.sort_unstable();
+        assert_eq!(hypertables, ["error_events", "proxy_logs"]);
+
+        for index in REFERENCE_INDEXES.iter().filter(|i| i.hypertable) {
+            let sql = index.create_sql();
+            assert!(!sql.contains("CONCURRENTLY"), "{sql}");
+            assert!(
+                sql.contains("WITH (timescaledb.transaction_per_chunk)"),
+                "{sql}"
+            );
+            // `WITH` must come before `WHERE` in the CREATE INDEX grammar.
+            assert!(
+                sql.find("WITH (").expect("with") < sql.find("WHERE").expect("where"),
+                "{sql}"
+            );
+            assert_eq!(
+                index.drop_invalid_sql(),
+                format!("DROP INDEX IF EXISTS {}", index.name)
+            );
+        }
     }
 
     #[test]
