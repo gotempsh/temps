@@ -65,6 +65,7 @@ import {
   WithCode,
 } from '@/components/nodes/mesh-ui'
 import { problemDetail } from '@/lib/api-problem'
+import { httpStatusOf } from '@/lib/http-error-status'
 import {
   defaultInternetMethod,
   defaultJoinPath,
@@ -94,8 +95,12 @@ const WITHOUT_SYSTEMD = (
 export function useWireguardMesh() {
   return useQuery({
     ...wireguardMeshStatusGetOptions(),
-    refetchInterval: (query) =>
-      query.state.data?.state === 'starting' ? 5_000 : 30_000,
+    refetchInterval: (query) => {
+      // A refused read (a role without settings:read) is not asked again.
+      const status = httpStatusOf(query.state.error)
+      if (status === 401 || status === 403) return false
+      return query.state.data?.state === 'starting' ? 5_000 : 30_000
+    },
   })
 }
 

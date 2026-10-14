@@ -8,7 +8,6 @@ import {
   type DnsProviderResponse,
 } from '@/api/client'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,6 +19,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -90,6 +90,7 @@ export function DnsProviders() {
     isLoading,
     error,
     refetch,
+    isFetching,
   } = useQuery({
     queryKey: ['dnsProviders'],
     queryFn: async () => {
@@ -188,14 +189,12 @@ export function DnsProviders() {
         </div>
 
         {error ? (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Error</AlertTitle>
-            <AlertDescription>
-              Failed to load DNS providers. Please try again later or contact
-              support if the issue persists.
-            </AlertDescription>
-          </Alert>
+          <ReadFailure
+            resource="DNS providers"
+            error={error}
+            onRetry={() => void refetch()}
+            retrying={isFetching}
+          />
         ) : isLoading ? (
           <div className="divide-y rounded-lg border">
             {Array.from({ length: 3 }).map((_, i) => (

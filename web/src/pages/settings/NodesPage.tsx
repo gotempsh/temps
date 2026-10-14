@@ -94,6 +94,8 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { refetchUnlessRefused } from '@/lib/query-retry'
 import { Input } from '@/components/ui/input'
 import {
   AlertDialog,
@@ -1756,9 +1758,16 @@ function ClusterTrustCard() {
 
 export function NodesPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data, isLoading, error } = useQuery({
+  const {
+    data,
+    isLoading,
+    error,
+    refetch: refetchNodes,
+    isFetching: nodesFetching,
+  } = useQuery({
     ...adminListNodesOptions(),
-    refetchInterval: 30_000,
+    // A refused read (a role without settings:read) is not asked again.
+    refetchInterval: refetchUnlessRefused(30_000),
   })
   const { data: capability } = useNodeCapability()
   const {
@@ -1802,11 +1811,24 @@ export function NodesPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load worker nodes.</AlertDescription>
-      </Alert>
+      <div className="space-y-6">
+        <Card>
+          <CardHeader>
+            <CardTitle>Worker Nodes</CardTitle>
+            <CardDescription>
+              Distribute container deployments across multiple servers.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ReadFailure
+              resource="Worker nodes"
+              error={error}
+              onRetry={() => void refetchNodes()}
+              retrying={nodesFetching}
+            />
+          </CardContent>
+        </Card>
+      </div>
     )
   }
 

@@ -40,6 +40,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -252,7 +253,7 @@ export function Teams() {
     setSearchParams(next, { replace: !open })
   }
 
-  const { data, isLoading, isError, error } = useQuery(
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery(
     listTeamsOptions({ query: { page: 1, page_size: 100 } })
   )
 
@@ -301,14 +302,12 @@ export function Teams() {
           {isLoading ? (
             <TeamsTableSkeleton />
           ) : isError ? (
-            <EmptyState
-              icon={Users}
-              title="Couldn't load teams"
-              description={
-                error instanceof Error
-                  ? error.message
-                  : 'The teams API did not respond.'
-              }
+            <ReadFailure
+              resource="Teams"
+              error={error}
+              onRetry={() => void refetch()}
+              retrying={isFetching}
+              embedded
             />
           ) : teams.length === 0 ? (
             <EmptyState
