@@ -66,12 +66,14 @@ describe('attachHttpStatus', () => {
   })
 
   test('shows short plain text as the reason and never markup', () => {
-    expect(attachHttpStatus('Not Found', failed(404))).toEqual({
+    expect(attachHttpStatus('Not Found', failed(404)) as unknown).toEqual({
       status: 404,
       title: 'Not Found',
       detail: 'Not Found',
     })
-    expect(attachHttpStatus('<html>nginx</html>', failed(404))).toEqual({
+    expect(
+      attachHttpStatus('<html>nginx</html>', failed(404)) as unknown
+    ).toEqual({
       status: 404,
       title: 'Not Found',
     })
