@@ -15,6 +15,7 @@ import { listDirOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { DirectoryEntry } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
 import {
@@ -25,6 +26,11 @@ import {
 
 /** Entries requested per page; the server's largest page. */
 const LIST_PAGE_SIZE = 100
+
+/** Pages needed for `total` entries; at least one, even for an empty directory. */
+function pageCount(total: number, pageSize: number): number {
+  return Math.max(1, Math.ceil(total / Math.max(1, pageSize)))
+}
 
 interface SandboxDirectoryBrowserProps {
   sandboxId: string
@@ -136,7 +142,8 @@ interface DirectoryBodyProps {
         exists: boolean
         is_dir: boolean
         entries: DirectoryEntry[]
-        has_more: boolean
+        page_size: number
+        total: number
       }
     | undefined
   page: number
@@ -215,6 +222,22 @@ function DirectoryBody({
       <p className="text-xs text-muted-foreground">This directory is empty.</p>
     )
   }
+  if (listing.entries.length === 0) {
+    // Entries were removed after this page was chosen.
+    return (
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <span>This page is past the end of the directory.</span>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => onPage(1)}
+        >
+          Go to first page
+        </Button>
+      </div>
+    )
+  }
   return (
     <div className="space-y-2">
       <ul className="max-h-64 divide-y overflow-y-auto rounded-md border">
@@ -231,28 +254,15 @@ function DirectoryBody({
           </li>
         ))}
       </ul>
-      {(page > 1 || listing.has_more) && (
-        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={page <= 1}
-            onClick={() => onPage(page - 1)}
-          >
-            Previous page
-          </Button>
-          <span>Page {page}</span>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={!listing.has_more}
-            onClick={() => onPage(page + 1)}
-          >
-            Next page
-          </Button>
-        </div>
+      {pageCount(listing.total, listing.page_size) > 1 && (
+        <ResponsivePagination
+          page={page}
+          pageSize={listing.page_size}
+          total={listing.total}
+          totalPages={pageCount(listing.total, listing.page_size)}
+          onPageChange={onPage}
+          ariaLabel="Directory pages"
+        />
       )}
     </div>
   )

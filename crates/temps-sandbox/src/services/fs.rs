@@ -75,6 +75,8 @@ pub struct DirListing {
     /// 1-based page these entries are.
     pub page: usize,
     pub page_size: usize,
+    /// Entries in the whole directory, not just this page.
+    pub total: usize,
     /// Entries exist after this page.
     pub has_more: bool,
 }
@@ -432,17 +434,25 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
 /// anything under a locked parent, so either would be reported as empty or
 /// missing.
 ///
+/// A `total <n>` line follows `ok`: the number of entries in the whole
+/// directory, so the console can show "page 3 of 12". It costs one more pass
+/// over names the glob has already expanded, with no per-entry output.
+///
 /// Only one page leaves the sandbox: the first `skip` entries are counted and
 /// dropped, and the scan stops after `want` (one more than the page, so the
 /// caller can tell "exactly a page" from "more than a page"). Directories are
 /// emitted first, in a second pass the rest, so the order is the same for
-/// every page of the same directory. `LC_ALL=C` makes the glob order bytewise
-/// instead of locale dependent.
+/// every page of the same directory. The names of the three glob groups
+/// (`.x`, `..x`, everything else) are merged and sorted as one list under
+/// `LC_ALL=C`, so the order is bytewise and not "dotfiles first, then the
+/// rest"; where `sort` is missing the glob order is used, which is still the
+/// same on every page.
 ///
 /// Written for busybox `sh`: no `find -printf`, no arrays. Names are expanded
 /// by the shell's own globbing relative to the directory, so none of them is
-/// ever re-parsed as part of a command line. A name containing a newline would
-/// break the line framing and is skipped.
+/// ever re-parsed as part of a command line (word splitting is limited to
+/// newlines and globbing is off while the sorted list is walked). A name
+/// containing a newline would break the line framing and is skipped.
 fn list_script(path: &str, skip: usize, page_size: usize) -> String {
     format!(
         "LC_ALL=C; export LC_ALL\n\
@@ -460,12 +470,21 @@ fn list_script(path: &str, skip: usize, page_size: usize) -> String {
          if [ ! -r \"$d\" ] || [ ! -x \"$d\" ]; then echo denied; exit 0; fi\n\
          cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
          echo ok\n\
+         if command -v sort >/dev/null 2>&1; then s=sort; else s=cat; fi\n\
+         L=$(for f in .[!.]* ..?* *; do\n\
+           if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi\n\
+           case \"$f\" in (*'\n'*) continue;; esac\n\
+           printf '%s\\n' \"$f\"\n\
+         done | $s)\n\
+         IFS='\n'\n\
+         set -f\n\
+         t=0\n\
+         for f in $L; do t=$((t+1)); done\n\
+         echo \"total $t\"\n\
          seen=0\n\
          n=0\n\
          for pass in d o; do\n\
-           for f in .[!.]* ..?* *; do\n\
-             if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi\n\
-             case \"$f\" in *'\n'*) continue;; esac\n\
+           for f in $L; do\n\
              if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; elif [ -f \"$f\" ]; then k=f; else k=o; fi\n\
              if [ \"$pass\" = d ]; then\n\
                if [ \"$k\" != d ]; then continue; fi\n\
@@ -504,6 +523,7 @@ fn parse_list_output(
         entries: Vec::new(),
         page,
         page_size,
+        total: 0,
         has_more: false,
     };
     match status {
@@ -513,9 +533,14 @@ fn parse_list_output(
         _ => {}
     }
 
+    let mut total = None;
     let mut entries: Vec<DirEntry> = lines
         .filter_map(|line| {
             let (kind, name) = line.split_once(' ')?;
+            if kind == "total" {
+                total = name.trim().parse::<usize>().ok();
+                return None;
+            }
             if name.is_empty() {
                 return None;
             }
@@ -535,8 +560,14 @@ fn parse_list_output(
 
     let has_more = entries.len() > page_size;
     entries.truncate(page_size);
+    // A script that did not report a total (or one that is inconsistent with
+    // the page it returned) still yields a count that is never smaller than
+    // what has been seen, so the page controls cannot point past the end.
+    let seen = page.saturating_sub(1) * page_size + entries.len() + usize::from(has_more);
+    let total = total.unwrap_or(seen).max(seen);
     Some(DirListing {
         entries,
+        total,
         has_more,
         ..listing(true, true)
     })
@@ -688,6 +719,69 @@ mod tests {
         assert!(script.contains("LC_ALL=C"), "{script}");
     }
 
+    /// Runs the real script under each POSIX shell present (`sh`, and `dash`,
+    /// which behaves like the busybox `ash` sandboxes ship) against a directory with names
+    /// that sort on both sides of a dot, so the documented order is checked,
+    /// not just the text of the script.
+    #[cfg(unix)]
+    #[test]
+    fn list_script_orders_names_bytewise_and_pages_consistently() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in [
+            " space", "-dash", ".env", ".git", "..hidden", "b.txt", "A.txt",
+        ] {
+            std::fs::write(dir.path().join(name), "").expect("file");
+        }
+        std::fs::create_dir(dir.path().join("src")).expect("dir");
+        std::fs::create_dir(dir.path().join(".cache")).expect("dir");
+        let path = dir.path().to_str().expect("utf-8 path").to_string();
+        for shell in ["/bin/sh", "/bin/dash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            check_listing_under(shell, &path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_listing_under(shell: &str, path: &str) {
+        let run = |skip: usize, page_size: usize| -> DirListing {
+            let output = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(list_script(path, skip, page_size))
+                .output()
+                .expect("runs sh");
+            let stdout = String::from_utf8(output.stdout).expect("utf-8");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let page = skip / page_size + 1;
+            parse_list_output(path, &stdout, page, page_size).expect("a listing")
+        };
+
+        let all = run(0, 100);
+        let names: Vec<_> = all.entries.iter().map(|e| e.name.as_str()).collect();
+        // Directories first, then files, each group in plain byte order: a
+        // space and `-` sort before `.`, which sorts before letters.
+        assert_eq!(
+            names,
+            [".cache", "src", " space", "-dash", "..hidden", ".env", ".git", "A.txt", "b.txt"]
+        );
+        assert_eq!(all.total, 9);
+        assert!(!all.has_more);
+
+        let mut paged = Vec::new();
+        for page_index in 0..3 {
+            let page = run(page_index * 4, 4);
+            assert_eq!(page.total, 9);
+            assert_eq!(page.has_more, page_index < 2, "page {page_index}");
+            paged.extend(page.entries.into_iter().map(|e| e.name));
+        }
+        assert_eq!(paged, names, "pages concatenate to the whole listing");
+    }
+
     #[test]
     fn page_bounds_default_and_clamp() {
         assert_eq!(list_page_bounds(None, None), (1, DEFAULT_LIST_PAGE_SIZE));
@@ -765,6 +859,7 @@ mod tests {
         );
         assert_eq!(listing.entries[3].kind, DirEntryKind::Symlink);
         assert!(!listing.has_more);
+        assert_eq!(listing.total, 6, "no total line: what was seen");
         assert!(listing.exists && listing.is_dir);
     }
 
@@ -790,5 +885,33 @@ mod tests {
 
         let exact = parse_list_output("/big", "ok\nf a\nf b\nf c\n", 1, 3).expect("a listing");
         assert!(!exact.has_more, "exactly a page is not followed by more");
+    }
+
+    #[test]
+    fn parse_list_reports_the_total_of_the_whole_directory() {
+        let listing = parse_list_output("/big", "ok\ntotal 250\nf a\nf b\nf c\nf d\n", 2, 3)
+            .expect("a listing");
+        assert_eq!(listing.total, 250);
+        assert_eq!(listing.entries.len(), 3);
+
+        let empty = parse_list_output("/empty", "ok\ntotal 0\n", 1, 20).expect("a listing");
+        assert_eq!(empty.total, 0);
+        assert!(empty.entries.is_empty() && !empty.has_more);
+    }
+
+    #[test]
+    fn parse_list_never_reports_a_total_below_what_it_has_seen() {
+        // A directory that changed between the count and the page.
+        let listing =
+            parse_list_output("/busy", "ok\ntotal 1\nf a\nf b\nf c\n", 1, 20).expect("a listing");
+        assert_eq!(listing.total, 3);
+    }
+
+    #[test]
+    fn list_script_counts_the_whole_directory_before_paging() {
+        let script = list_script("/work", 0, 20);
+        let counted = script.find("echo \"total $t\"").expect("prints a total");
+        let paged = script.find("seen=0").expect("pages afterwards");
+        assert!(counted < paged, "{script}");
     }
 }

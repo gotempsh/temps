@@ -8241,6 +8241,11 @@ export type DirectoryListingResponse = {
      */
     page_size: number;
     path: string;
+    /**
+     * Entries in the whole directory, so `ceil(total / page_size)` is the
+     * number of pages.
+     */
+    total: number;
 };
 
 /**

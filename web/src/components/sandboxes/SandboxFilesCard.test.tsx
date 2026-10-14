@@ -771,16 +771,20 @@ const WORK_DIR = '/home/temps/workspace'
 function listing(
   path: string,
   entries: { name: string; kind: string }[],
-  paging: { page?: number; has_more?: boolean } = {}
+  paging: { page?: number; total?: number; pageSize?: number } = {}
 ) {
+  const pageSize = paging.pageSize ?? 100
+  const page = paging.page ?? 1
+  const total = paging.total ?? (page - 1) * pageSize + entries.length
   return jsonResponse({
     path,
     exists: true,
     is_dir: true,
     entries,
-    page: paging.page ?? 1,
-    page_size: 100,
-    has_more: paging.has_more ?? false,
+    page,
+    page_size: pageSize,
+    total,
+    has_more: page * pageSize < total,
   })
 }
 
@@ -881,14 +885,21 @@ test('a long directory is read one page at a time', async () => {
       return page === 1
         ? listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
             page: 1,
-            has_more: true,
+            pageSize: 1,
+            total: 2,
           })
-        : listing(WORK_DIR, [{ name: 'b.txt', kind: 'file' }], { page: 2 })
+        : listing(WORK_DIR, [{ name: 'b.txt', kind: 'file' }], {
+            page: 2,
+            pageSize: 1,
+            total: 2,
+          })
     },
   })
   const view = renderCard()
 
   await view.findByRole('button', { name: /a\.txt/ })
+  // The shared pagination states where the user is in the whole directory.
+  expect(view.getByText('Showing 1–1 of 2')).toBeTruthy()
   const previous = view.getByRole('button', {
     name: 'Previous page',
   }) as HTMLButtonElement
@@ -904,6 +915,30 @@ test('a long directory is read one page at a time', async () => {
   api.restore()
 })
 
+test('a page the directory has shrunk past offers the first page', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) => {
+      const page = Number(new URL(request.url).searchParams.get('page') ?? '1')
+      return page === 1
+        ? listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
+            page: 1,
+            pageSize: 1,
+            total: 2,
+          })
+        : listing(WORK_DIR, [], { page, pageSize: 1, total: 1 })
+    },
+  })
+  const view = renderCard()
+
+  await view.findByRole('button', { name: /a\.txt/ })
+  fireEvent.click(view.getByRole('button', { name: 'Next page' }))
+
+  expect(await view.findByText(/past the end of the directory/)).toBeTruthy()
+  fireEvent.click(view.getByRole('button', { name: 'Go to first page' }))
+  await view.findByRole('button', { name: /a\.txt/ })
+  api.restore()
+})
+
 test('entering a directory starts again from its first page', async () => {
   const pages: Record<string, string[]> = {}
   const api = mockApi({
@@ -916,9 +951,14 @@ test('entering a directory starts again from its first page', async () => {
         return page === '1'
           ? listing(WORK_DIR, [{ name: 'src', kind: 'directory' }], {
               page: 1,
-              has_more: true,
+              pageSize: 1,
+              total: 2,
             })
-          : listing(WORK_DIR, [{ name: 'z', kind: 'directory' }], { page: 2 })
+          : listing(WORK_DIR, [{ name: 'z', kind: 'directory' }], {
+              page: 2,
+              pageSize: 1,
+              total: 2,
+            })
       }
       return listing(path, [{ name: 'main.ts', kind: 'file' }])
     },

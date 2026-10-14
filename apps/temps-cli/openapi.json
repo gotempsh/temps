@@ -17137,6 +17137,11 @@
           },
           "path": {
             "type": "string"
+          },
+          "total": {
+            "description": "Entries in the whole directory, so `ceil(total / page_size)` is the\nnumber of pages.",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -17146,6 +17151,7 @@
           "entries",
           "page",
           "page_size",
+          "total",
           "has_more"
         ],
         "type": "object"
