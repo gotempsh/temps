@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -67,6 +67,16 @@ const UNNAMED = 'this item'
  */
 export function ConfirmDeleteDialog(props: ConfirmDeleteDialogProps) {
   const { open, onOpenChange, isPending } = props
+  // Callers open this from a plain button rather than an AlertDialogTrigger,
+  // so Radix has no trigger to hand focus back to on close. Remember what had
+  // focus before the dialog took it (layout effects run before Radix's focus
+  // scope moves focus) and restore it, so keyboard users keep their place.
+  const opener = useRef<HTMLElement | null>(null)
+  useLayoutEffect(() => {
+    if (open && document.activeElement instanceof HTMLElement) {
+      opener.current = document.activeElement
+    }
+  }, [open])
   return (
     <AlertDialog
       open={open}
@@ -75,7 +85,12 @@ export function ConfirmDeleteDialog(props: ConfirmDeleteDialogProps) {
         onOpenChange(next)
       }}
     >
-      <AlertDialogContent>
+      <AlertDialogContent
+        onCloseAutoFocus={(event) => {
+          event.preventDefault()
+          if (opener.current?.isConnected) opener.current.focus()
+        }}
+      >
         <ConfirmDeleteBody {...props} />
       </AlertDialogContent>
     </AlertDialog>
@@ -119,7 +134,9 @@ function ConfirmDeleteBody({
               </span>
               .
             </p>
-            {consequences ? <p>{consequences}</p> : null}
+            {consequences ? (
+              <p className="max-h-48 overflow-y-auto">{consequences}</p>
+            ) : null}
             {irreversible ? <p>This cannot be undone.</p> : null}
           </div>
         </AlertDialogDescription>

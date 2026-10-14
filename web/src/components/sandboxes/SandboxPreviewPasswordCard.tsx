@@ -107,10 +107,10 @@ export function SandboxPreviewPasswordCard({
     meta: { errorTitle: 'Failed to clear preview password' },
     onSuccess: () => {
       invalidate()
-      setConfirmingClear(false)
       toast.success('Preview password removed')
     },
-    onError: () => setConfirmingClear(false),
+    // Not onError: a local onError replaces the app-wide error toast.
+    onSettled: () => setConfirmingClear(false),
   })
 
   const trimmed = value

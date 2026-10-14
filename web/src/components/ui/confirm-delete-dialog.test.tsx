@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, mock, test } from 'bun:test'
-import { act, cleanup, fireEvent, render } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
+import { useState } from 'react'
 import { installBrowserWindow } from '@/test/dom'
 import { ConfirmDeleteDialog } from './confirm-delete-dialog'
 
@@ -119,4 +126,32 @@ test('while pending the button and cancel are disabled so it cannot fire twice',
   )
   expect(button('Cancel').disabled).toBe(true)
   expect(button('Working').disabled).toBe(true)
+})
+
+test('closing hands focus back to the control that opened it', async () => {
+  function Harness() {
+    const [open, setOpen] = useState(false)
+    return (
+      <>
+        <button onClick={() => setOpen(true)}>Open</button>
+        <ConfirmDeleteDialog
+          open={open}
+          onOpenChange={setOpen}
+          resourceType="secret"
+          resourceName="API_KEY"
+          onConfirm={() => {}}
+        />
+      </>
+    )
+  }
+  const view = render(<Harness />)
+  const opener = view.getByText('Open')
+  opener.focus()
+  await act(async () => {
+    fireEvent.click(opener)
+  })
+  await act(async () => {
+    fireEvent.click(button('Cancel'))
+  })
+  await waitFor(() => expect(document.activeElement).toBe(opener))
 })
