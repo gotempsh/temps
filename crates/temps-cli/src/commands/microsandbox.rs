@@ -350,7 +350,6 @@ fn ok(message: &str) {
     println!("  {} {}", "✓".green().bold(), message);
 }
 
-#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 fn warn(message: &str) {
     println!("  {} {}", "!".yellow().bold(), message);
 }
