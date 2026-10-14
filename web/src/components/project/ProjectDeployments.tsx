@@ -66,6 +66,7 @@ import {
   Globe,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import { projectDeploymentsRefetchInterval } from '@/lib/recent-deployments'
 import {
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
@@ -121,6 +122,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     }),
     retry: false,
     refetchOnWindowFocus: true,
+    // A deployment started in the background (webhook, CLI, another tab)
+    // must show up without a reload, and a running one must progress.
+    refetchInterval: (query) =>
+      projectDeploymentsRefetchInterval(query.state.data?.deployments),
   })
 
   const totalPages = deploymentsData

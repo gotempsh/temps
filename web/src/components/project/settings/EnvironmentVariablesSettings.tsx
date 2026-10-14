@@ -44,6 +44,7 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
+import { IDLE_LIST_POLL_MS } from '@/lib/live-refetch'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -1374,6 +1375,9 @@ export function EnvironmentVariablesSettings({
         project_id: project.id,
       },
     }),
+    // Variables are also written through the API and CLI; keep the list in
+    // step with them while it is on screen (paused when the tab is hidden).
+    refetchInterval: IDLE_LIST_POLL_MS,
   })
 
   const {
@@ -1385,6 +1389,7 @@ export function EnvironmentVariablesSettings({
     queryKey: ['resolved-env-vars', project.id, selectedEnvId],
     queryFn: () => getResolvedEnvVars(project.id, selectedEnvId ?? undefined),
     staleTime: 15_000,
+    refetchInterval: IDLE_LIST_POLL_MS,
     enabled: Boolean(projectEnvironments) && !environmentsFailed,
   })
 

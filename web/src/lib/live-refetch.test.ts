@@ -1,0 +1,69 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { describe, expect, test } from 'bun:test'
+
+import {
+  ACTIVE_LIST_POLL_MS,
+  FOCUS_REFETCH_MIN_AGE_MS,
+  IDLE_LIST_POLL_MS,
+  liveListInterval,
+  refetchOnFocusWhenStale,
+  sourceBackupsRefetchInterval,
+} from './live-refetch'
+
+describe('liveListInterval', () => {
+  test('polls fast while rows are in progress', () => {
+    expect(liveListInterval(true)).toBe(ACTIVE_LIST_POLL_MS)
+  })
+
+  test('keeps a slower cadence when idle so background changes still appear', () => {
+    expect(liveListInterval(false)).toBe(IDLE_LIST_POLL_MS)
+    expect(IDLE_LIST_POLL_MS).toBeGreaterThan(ACTIVE_LIST_POLL_MS)
+  })
+})
+
+describe('sourceBackupsRefetchInterval', () => {
+  test('polls fast while a backup is pending or running', () => {
+    expect(
+      sourceBackupsRefetchInterval([
+        { state: 'completed' },
+        { state: 'running' },
+      ])
+    ).toBe(ACTIVE_LIST_POLL_MS)
+    expect(sourceBackupsRefetchInterval([{ state: 'pending' }])).toBe(
+      ACTIVE_LIST_POLL_MS
+    )
+  })
+
+  test('keeps the idle cadence once every backup is final or none exist', () => {
+    expect(
+      sourceBackupsRefetchInterval([
+        { state: 'completed' },
+        { state: 'failed' },
+      ])
+    ).toBe(IDLE_LIST_POLL_MS)
+    expect(sourceBackupsRefetchInterval([])).toBe(IDLE_LIST_POLL_MS)
+    expect(sourceBackupsRefetchInterval(undefined)).toBe(IDLE_LIST_POLL_MS)
+  })
+})
+
+describe('refetchOnFocusWhenStale', () => {
+  const now = 1_000_000
+
+  test('refetches data older than the minimum age', () => {
+    const query = { state: { dataUpdatedAt: now - FOCUS_REFETCH_MIN_AGE_MS } }
+    expect(refetchOnFocusWhenStale(query, now)).toBe(true)
+  })
+
+  test('skips data fetched moments ago', () => {
+    const query = { state: { dataUpdatedAt: now - 1_000 } }
+    expect(refetchOnFocusWhenStale(query, now)).toBe(false)
+  })
+
+  test('leaves a query that never fetched to its own mount fetch', () => {
+    expect(refetchOnFocusWhenStale({ state: { dataUpdatedAt: 0 } }, now)).toBe(
+      false
+    )
+  })
+})

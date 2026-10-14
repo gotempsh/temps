@@ -92,6 +92,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { sourceBackupsRefetchInterval } from '@/lib/live-refetch'
 
 /** Format a wall-clock timeout from seconds into a human-readable string.
  * Mirrors the helper in `BackupDetail.tsx`; if this gets copied a third
@@ -152,6 +153,10 @@ export function S3SourceDetail() {
       path: { id: sourceId! },
     }),
     enabled: !!sourceId,
+    // A backup started by a schedule, the CLI or another operator must show
+    // up in Recent Backups, and a running one must reach its final state.
+    refetchInterval: (query) =>
+      sourceBackupsRefetchInterval(query.state.data?.backups),
   })
 
   const {
@@ -227,7 +232,8 @@ export function S3SourceDetail() {
       )
       // Refresh the normal listing so newly discovered entries appear.
       void queryClient.invalidateQueries({
-        queryKey: ['backups', 's3-source', sourceId],
+        queryKey: listSourceBackupsOptions({ path: { id: sourceId! } })
+          .queryKey,
       })
     },
     onError: (err: unknown) => {
