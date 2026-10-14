@@ -176,6 +176,7 @@ impl TempsPlugin for AnalyticsPlugin {
                     crate::retention::spawn_retention_job(
                         Arc::new(crate::retention::AnalyticsRetentionService::new(db)),
                         config,
+                        context.require_service::<dyn temps_core::AuditLogger>(),
                     );
                 }
                 None => tracing::warn!(

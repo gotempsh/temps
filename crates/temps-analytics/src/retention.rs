@@ -31,7 +31,8 @@ use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, FromQueryResult, Statement,
     TransactionTrait,
 };
-use temps_core::AnalyticsRetentionSettings;
+use serde::Serialize;
+use temps_core::{AnalyticsRetentionSettings, AuditLogger, AuditOperation};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -677,15 +678,95 @@ fn delete_unreferenced_sql(ids: &[i32], references: &[(&str, &str)]) -> String {
 /// the proxy-log window after its last lookup keeps it for as long as any of
 /// those logs can still point at it. The floor is the same whichever store is
 /// in use, so it needs no knowledge of which one that is.
+///
+/// Logs keep the window they were written with, so after the window is lowered
+/// the older logs outlive the new floor: while `ip_hold_until` is in the
+/// future no address is deleted at all.
 pub fn effective_windows(
     analytics: &AnalyticsRetentionSettings,
     proxy_logs_days: u32,
+    now: DateTime<Utc>,
 ) -> AnalyticsRetentionSettings {
+    let held = analytics.ip_hold_until.is_some_and(|until| until > now);
     AnalyticsRetentionSettings {
-        unreferenced_ip_days: analytics
-            .unreferenced_ip_days
-            .map(|days| days.max(proxy_logs_days)),
+        unreferenced_ip_days: if held {
+            None
+        } else {
+            analytics
+                .unreferenced_ip_days
+                .map(|days| days.max(proxy_logs_days))
+        },
         ..analytics.clone()
+    }
+}
+
+/// Audit record of one retention pass that changed something. The actor is the
+/// system, not a user, so no user id is recorded. One entry per pass, never one
+/// per row: the counts and windows are what an operator needs to answer "what
+/// deleted my data, and under which setting".
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionSweepAudit {
+    pub events_policy: Option<String>,
+    pub error_events_policy: Option<String>,
+    pub visitor_days: Option<u32>,
+    pub visitors_deleted: u64,
+    pub unreferenced_ip_days: Option<u32>,
+    pub ip_addresses_deleted: u64,
+}
+
+impl RetentionSweepAudit {
+    /// `None` when the pass changed nothing, so an idle hour writes no entry.
+    pub fn from_report(
+        report: &RetentionReport,
+        windows: &AnalyticsRetentionSettings,
+    ) -> Option<Self> {
+        let changed =
+            |action: Option<PolicyAction>| action.filter(|action| *action != PolicyAction::Keep);
+        let events_policy = changed(report.events_policy);
+        let error_events_policy = changed(report.error_events_policy);
+        if events_policy.is_none()
+            && error_events_policy.is_none()
+            && report.visitors_deleted == 0
+            && report.ip_addresses_deleted == 0
+        {
+            return None;
+        }
+        Some(Self {
+            events_policy: events_policy.map(|action| format!("{action:?}")),
+            error_events_policy: error_events_policy.map(|action| format!("{action:?}")),
+            visitor_days: windows.visitor_days,
+            visitors_deleted: report.visitors_deleted,
+            unreferenced_ip_days: windows.unreferenced_ip_days,
+            ip_addresses_deleted: report.ip_addresses_deleted,
+        })
+    }
+}
+
+impl AuditOperation for RetentionSweepAudit {
+    fn operation_type(&self) -> String {
+        "ANALYTICS_RETENTION_APPLIED".to_string()
+    }
+
+    /// The sweep runs as the system: there is no user account to attribute it to.
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+
+    fn user_agent(&self) -> &str {
+        "temps-analytics-retention"
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to serialize ANALYTICS_RETENTION_APPLIED audit: {}",
+                e
+            )
+        })
     }
 }
 
@@ -694,6 +775,7 @@ pub fn effective_windows(
 pub fn spawn_retention_job(
     service: Arc<AnalyticsRetentionService>,
     config: Arc<temps_config::ConfigService>,
+    audit: Arc<dyn AuditLogger>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::time::sleep(RETENTION_STARTUP_DELAY).await;
@@ -706,8 +788,16 @@ pub fn spawn_retention_job(
                     let windows = effective_windows(
                         &settings.analytics_retention,
                         settings.observability_retention.proxy_logs_days,
+                        Utc::now(),
                     );
-                    service.enforce(&windows).await;
+                    let report = service.enforce(&windows).await;
+                    if let Some(entry) = RetentionSweepAudit::from_report(&report, &windows) {
+                        // The data is already gone; a failed audit write is
+                        // logged, not retried, and does not stop the job.
+                        if let Err(error) = audit.create_audit_log(&entry).await {
+                            warn!(%error, "failed to audit the analytics retention pass");
+                        }
+                    }
                 }
                 Err(error) => {
                     let error = AnalyticsRetentionError::Settings {
@@ -737,15 +827,71 @@ mod tests {
         };
 
         assert_eq!(
-            effective_windows(&settings, 90).unreferenced_ip_days,
+            effective_windows(&settings, 90, Utc::now()).unreferenced_ip_days,
             Some(90),
             "logs kept for 90 days can still point at the address"
         );
         assert_eq!(
-            effective_windows(&settings, 7).unreferenced_ip_days,
+            effective_windows(&settings, 7, Utc::now()).unreferenced_ip_days,
             Some(30),
             "a longer IP window is left alone"
         );
+    }
+
+    #[test]
+    fn a_hold_after_lowering_the_proxy_log_window_pauses_the_ip_sweep() {
+        let now = Utc::now();
+        let settings = AnalyticsRetentionSettings {
+            unreferenced_ip_days: Some(30),
+            ip_hold_until: Some(now + chrono::Duration::days(80)),
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        assert_eq!(
+            effective_windows(&settings, 7, now).unreferenced_ip_days,
+            None,
+            "logs written under the old window can still point at the address"
+        );
+        assert_eq!(
+            effective_windows(&settings, 7, now + chrono::Duration::days(81)).unreferenced_ip_days,
+            Some(30),
+            "the sweep resumes once the hold has passed"
+        );
+    }
+
+    #[test]
+    fn an_idle_pass_writes_no_audit_entry() {
+        let windows = AnalyticsRetentionSettings::default();
+
+        assert!(RetentionSweepAudit::from_report(&RetentionReport::default(), &windows).is_none());
+        let kept = RetentionReport {
+            events_policy: Some(PolicyAction::Keep),
+            ..RetentionReport::default()
+        };
+        assert!(RetentionSweepAudit::from_report(&kept, &windows).is_none());
+    }
+
+    #[test]
+    fn a_pass_that_deleted_rows_is_audited_with_its_windows_and_counts() {
+        let windows = AnalyticsRetentionSettings {
+            visitor_days: Some(425),
+            ..AnalyticsRetentionSettings::default()
+        };
+        let report = RetentionReport {
+            events_policy: Some(PolicyAction::Set(90)),
+            visitors_deleted: 12,
+            ip_addresses_deleted: 3,
+            ..RetentionReport::default()
+        };
+
+        let entry = RetentionSweepAudit::from_report(&report, &windows).expect("audited");
+
+        assert_eq!(entry.user_id(), None);
+        assert_eq!(entry.operation_type(), "ANALYTICS_RETENTION_APPLIED");
+        let json = AuditOperation::serialize(&entry).expect("serializes");
+        assert!(json.contains("\"visitors_deleted\":12"), "{json}");
+        assert!(json.contains("\"visitor_days\":425"), "{json}");
+        assert!(json.contains("Set(90)"), "{json}");
     }
 
     #[test]
@@ -755,7 +901,7 @@ mod tests {
             ..AnalyticsRetentionSettings::default()
         };
 
-        let windows = effective_windows(&settings, 90);
+        let windows = effective_windows(&settings, 90, Utc::now());
 
         assert_eq!(windows.unreferenced_ip_days, None);
         assert_eq!(windows.events_days, settings.events_days);
@@ -1038,13 +1184,22 @@ mod integration_tests {
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{audit_logs, environments, ip_geolocations, projects, visitor};
 
+    /// Only an unreachable Docker daemon skips a test. Once Docker answers, a
+    /// failure to start the container or to run the migrations is a broken
+    /// setup and fails the test: skipping it would leave every integration
+    /// test passing without checking anything.
     async fn database(name: &str) -> Option<TestDatabase> {
+        let docker_answers = match bollard::Docker::connect_with_defaults() {
+            Ok(docker) => docker.ping().await.is_ok(),
+            Err(_) => false,
+        };
+        if !docker_answers {
+            println!("Docker not available, skipping");
+            return None;
+        }
         match TestDatabase::new(name).await {
             Ok(db) => Some(db),
-            Err(error) => {
-                println!("Docker/TimescaleDB not available, skipping: {error}");
-                None
-            }
+            Err(error) => panic!("test database setup failed with Docker available: {error:#}"),
         }
     }
 
@@ -1278,6 +1433,7 @@ mod integration_tests {
                 error_events_days: None,
                 visitor_days: Some(425),
                 unreferenced_ip_days: Some(30),
+                ip_hold_until: None,
             })
             .await;
 

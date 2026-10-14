@@ -1855,6 +1855,15 @@ pub struct AnalyticsRetentionSettings {
     /// seen.
     #[schema(minimum = 1, maximum = 3650, nullable = true, example = 30)]
     pub unreferenced_ip_days: Option<u32>,
+
+    /// Server-managed; a value sent by a client is replaced on save. Set when
+    /// `observability_retention.proxy_logs_days` is lowered: request logs
+    /// stored outside PostgreSQL keep the window they were written with, so
+    /// they can still point at an address for the previous window. Stored IP
+    /// addresses are not deleted until this moment has passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    pub ip_hold_until: Option<DateTime<Utc>>,
 }
 
 impl Default for AnalyticsRetentionSettings {
@@ -1864,11 +1873,36 @@ impl Default for AnalyticsRetentionSettings {
             error_events_days: None,
             visitor_days: None,
             unreferenced_ip_days: Some(DEFAULT_UNREFERENCED_IP_RETENTION_DAYS),
+            ip_hold_until: None,
         }
     }
 }
 
 impl AnalyticsRetentionSettings {
+    /// Recompute [`Self::ip_hold_until`] for a save that moves the proxy-log
+    /// retention from `previous_days` to `next_days`, starting from the value
+    /// that was stored (a client-supplied one is never trusted).
+    ///
+    /// Lowering the window means logs already written still live for up to
+    /// `previous_days`, so addresses are held until then; a later lowering can
+    /// only extend the hold. Raising or keeping it changes nothing, and a hold
+    /// that has passed is dropped.
+    pub fn with_ip_hold(
+        mut self,
+        stored_hold: Option<DateTime<Utc>>,
+        previous_days: u32,
+        next_days: u32,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut hold = stored_hold.filter(|until| *until > now);
+        if next_days < previous_days {
+            let until = now + chrono::Duration::days(i64::from(previous_days));
+            hold = Some(hold.map_or(until, |existing| existing.max(until)));
+        }
+        self.ip_hold_until = hold;
+        self
+    }
+
     /// The first window outside `1..=3650`, as `(field, value)`.
     pub fn out_of_range(&self) -> Option<(&'static str, u32)> {
         let windows = [
@@ -2614,6 +2648,57 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lowering_proxy_log_retention_holds_addresses_for_the_old_window() {
+        let now = Utc::now();
+        let settings = AnalyticsRetentionSettings::default().with_ip_hold(None, 90, 7, now);
+
+        assert_eq!(
+            settings.ip_hold_until,
+            Some(now + chrono::Duration::days(90)),
+            "logs written under the 90-day window can outlive the new 7-day one"
+        );
+    }
+
+    #[test]
+    fn a_client_supplied_hold_is_not_trusted() {
+        let now = Utc::now();
+        let forged = AnalyticsRetentionSettings {
+            ip_hold_until: Some(now + chrono::Duration::days(3000)),
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        let settings = forged.with_ip_hold(None, 30, 30, now);
+
+        assert_eq!(settings.ip_hold_until, None);
+    }
+
+    #[test]
+    fn raising_the_window_keeps_a_hold_and_a_second_lowering_only_extends_it() {
+        let now = Utc::now();
+        let later = now + chrono::Duration::days(60);
+
+        let kept = AnalyticsRetentionSettings::default().with_ip_hold(Some(later), 7, 30, now);
+        assert_eq!(kept.ip_hold_until, Some(later));
+
+        let extended = AnalyticsRetentionSettings::default().with_ip_hold(Some(later), 30, 7, now);
+        assert_eq!(
+            extended.ip_hold_until,
+            Some(later),
+            "a shorter hold never replaces a longer one"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_has_passed_is_dropped() {
+        let now = Utc::now();
+        let past = now - chrono::Duration::days(1);
+
+        let settings = AnalyticsRetentionSettings::default().with_ip_hold(Some(past), 30, 30, now);
+
+        assert_eq!(settings.ip_hold_until, None);
+    }
+
     use super::*;
 
     #[test]
