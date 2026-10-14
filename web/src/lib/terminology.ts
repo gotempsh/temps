@@ -25,3 +25,21 @@ export function serviceCount(n: number): string {
 export function groupHref(slug: string): string {
   return `/p/${slug}`
 }
+
+/** Search parameter of the connect-repository page naming a follow-up step. */
+export const THEN_PARAM = 'then'
+/** `?then=import`: continue into importing services once connected. */
+export const IMPORT_AFTER_CONNECT = 'import'
+/** Search parameter of a project's overview that opens "From the repository". */
+export const IMPORT_PARAM = 'import'
+
+/** Console route for connecting (or changing) a project's repository. */
+export function groupConnectRepositoryHref(
+  slug: string,
+  options: { thenImport?: boolean } = {}
+): string {
+  const base = `${groupHref(slug)}/repository`
+  return options.thenImport
+    ? `${base}?${THEN_PARAM}=${IMPORT_AFTER_CONNECT}`
+    : base
+}

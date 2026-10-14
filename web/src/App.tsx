@@ -88,6 +88,11 @@ const PlatformTools = lazy(() =>
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
+const ConnectGroupRepository = lazy(() =>
+  import('./pages/ConnectGroupRepository').then((m) => ({
+    default: m.ConnectGroupRepository,
+  }))
+)
 const ProjectGroupDetail = lazy(() =>
   import('./pages/ProjectGroupDetail').then((m) => ({
     default: m.ProjectGroupDetail,
@@ -649,6 +654,10 @@ const FullAppRoutes = () => {
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
                     <Route path="/p/:slug" element={<ProjectGroupDetail />} />
+                    <Route
+                      path="/p/:slug/repository"
+                      element={<ConnectGroupRepository />}
+                    />
                     <Route
                       path="/drop"
                       element={
