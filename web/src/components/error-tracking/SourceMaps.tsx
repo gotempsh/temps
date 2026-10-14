@@ -131,6 +131,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
     onError: () => {
       toast.error('Failed to delete source maps')
     },
+    // The dialog stays open (and locked) until the request settles, so the
+    // same target cannot be confirmed twice while the first delete is running.
+    onSettled: () => setDeleteConfirm(null),
   })
 
   // Delete single source map mutation
@@ -150,6 +153,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
     onError: () => {
       toast.error('Failed to delete source map')
     },
+    onSettled: () => setDeleteConfirm(null),
   })
 
   const releases = releasesData?.releases ?? []
@@ -164,8 +168,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
       deleteFileMutation.mutate({
         path: { project_id: project.id, source_map_id: deleteConfirm.fileId },
       })
+    } else {
+      setDeleteConfirm(null)
     }
-    setDeleteConfirm(null)
   }
 
   return (
@@ -296,6 +301,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
           deleteConfirm?.type === 'release'
             ? 'Every source map uploaded for this release is removed, so its stack traces are no longer symbolicated.'
             : 'Stack traces that reference this file are no longer symbolicated.'
+        }
+        isPending={
+          deleteReleaseMutation.isPending || deleteFileMutation.isPending
         }
         onConfirm={handleConfirmDelete}
       />

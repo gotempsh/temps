@@ -173,3 +173,24 @@ test('long consequences sit in a keyboard-focusable scroll region', () => {
   expect(region?.getAttribute('tabindex')).toBe('0')
   expect(region?.className).toContain('overflow-y-auto')
 })
+
+test('a long unbroken name cannot widen the dialog past its own width', () => {
+  const url = `https://hooks.example.test/${'a'.repeat(200)}`
+  render(
+    <ConfirmDeleteDialog
+      open
+      onOpenChange={() => {}}
+      resourceType="webhook"
+      resourceName={url}
+      onConfirm={() => {}}
+    />
+  )
+  // Layout is not computed under happy-dom, so assert the rules that keep the
+  // grid track at the dialog width and let the title wrap.
+  expect(dialog().className).toContain('grid-cols-[minmax(0,1fr)]')
+  const title = Array.from(dialog().querySelectorAll('h2')).find(
+    (el) => el.textContent === `Delete webhook ${url}?`
+  )
+  expect(title?.className).toContain('[overflow-wrap:anywhere]')
+  expect(button('Delete')).toBeTruthy()
+})

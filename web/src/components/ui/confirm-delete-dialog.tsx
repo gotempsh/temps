@@ -86,6 +86,11 @@ export function ConfirmDeleteDialog(props: ConfirmDeleteDialogProps) {
       }}
     >
       <AlertDialogContent
+        // The dialog is a one-column grid whose track defaults to min-content,
+        // so a long unbroken name (a webhook URL) would widen it past the
+        // viewport and push the buttons off-screen. Pin the track to the
+        // dialog width and let names wrap instead.
+        className="grid-cols-[minmax(0,1fr)]"
         onCloseAutoFocus={(event) => {
           event.preventDefault()
           if (opener.current?.isConnected) opener.current.focus()
@@ -122,7 +127,7 @@ function ConfirmDeleteBody({
   return (
     <>
       <AlertDialogHeader>
-        <AlertDialogTitle>
+        <AlertDialogTitle className="[overflow-wrap:anywhere]">
           {`${verb} ${resourceType} ${named ? name : UNNAMED}?`}
         </AlertDialogTitle>
         <AlertDialogDescription asChild>
