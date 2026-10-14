@@ -482,20 +482,36 @@ fn list_script(path: &str, skip: usize, page_size: usize) -> String {
          if [ ! -d \"$d\" ]; then echo notdir; exit 0; fi\n\
          if [ ! -r \"$d\" ] || [ ! -x \"$d\" ]; then echo denied; exit 0; fi\n\
          cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
-         if ! command -v find >/dev/null 2>&1; then echo 'list failed: find is not available'; exit 3; fi\n\
+         for u in find head; do\n\
+           if ! command -v \"$u\" >/dev/null 2>&1; then echo \"list failed: $u is not available\"; exit 3; fi\n\
+         done\n\
          if command -v sort >/dev/null 2>&1; then s=sort; else s=cat; fi\n\
-         L=$(find . -mindepth 1 -maxdepth 1 ! -name '*\n*' 2>/dev/null | head -n {scan_plus_one} | sed 's|^\\./||' | $s) || {{ echo 'list failed: sorting the names failed'; exit 3; }}\n\
-         echo ok\n\
+         L=$({{ find . -mindepth 1 -maxdepth 1 ! -name '*\n*' 2>/dev/null; echo \"status:$?\"; }} | head -n {scan_plus_one} | $s) || {{ echo 'list failed: sorting the names failed'; exit 3; }}\n\
          IFS='\n'\n\
          set -f\n\
          t=0\n\
-         for f in $L; do t=$((t+1)); done\n\
-         if [ \"$t\" -gt {scan} ]; then echo 'truncated 1'; t={scan}; fi\n\
+         st=\n\
+         for f in $L; do\n\
+           case \"$f\" in\n\
+             status:*) st=${{f#status:}};;\n\
+             *) t=$((t+1));;\n\
+           esac\n\
+         done\n\
+         cut=0\n\
+         if [ \"$t\" -gt {scan} ]; then\n\
+           cut=1\n\
+           t={scan}\n\
+         elif [ \"$st\" != 0 ]; then\n\
+           echo \"list failed: reading the directory failed (status ${{st:-missing}})\"; exit 3\n\
+         fi\n\
+         echo ok\n\
+         if [ \"$cut\" = 1 ]; then echo 'truncated 1'; fi\n\
          echo \"total $t\"\n\
          seen=0\n\
          n=0\n\
          for pass in d o; do\n\
            for f in $L; do\n\
+             case \"$f\" in status:*) continue;; esac\n\
              if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; elif [ -f \"$f\" ]; then k=f; else k=o; fi\n\
              if [ \"$pass\" = d ]; then\n\
                if [ \"$k\" != d ]; then continue; fi\n\
@@ -503,7 +519,7 @@ fn list_script(path: &str, skip: usize, page_size: usize) -> String {
              seen=$((seen+1))\n\
              if [ \"$seen\" -gt {scan} ]; then break 2; fi\n\
              if [ \"$seen\" -le {skip} ]; then continue; fi\n\
-             printf '%s %s\\n' \"$k\" \"$f\"\n\
+             printf '%s %s\\n' \"$k\" \"${{f#./}}\"\n\
              n=$((n+1))\n\
              if [ \"$n\" -gt {page_size} ]; then break 2; fi\n\
            done\n\
@@ -876,6 +892,27 @@ mod tests {
         let bin = tempfile::tempdir().expect("bin dir");
         let fake = bin.path().join("sort");
         std::fs::write(&fake, "#!/bin/sh\ncat >/dev/null\nexit 1\n").expect("fake sort");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let script = list_script(dir.path().to_str().expect("utf-8"), 0, 20);
+        let (ok, stdout) = run_script_with_path(&script, Some(bin.path()));
+
+        assert!(!ok, "the script must fail: {stdout}");
+        assert!(stdout.contains("list failed"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "ok"), "{stdout}");
+    }
+
+    /// `find` (or any command before `sort`) failing must not be hidden by a
+    /// `sort` that then succeeds on the empty input.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_find_is_an_error_not_an_empty_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("kept.txt"), "").expect("file");
+        let bin = tempfile::tempdir().expect("bin dir");
+        let fake = bin.path().join("find");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").expect("fake find");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let script = list_script(dir.path().to_str().expect("utf-8"), 0, 20);
