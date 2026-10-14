@@ -8,6 +8,7 @@ import {
   FOCUS_REFETCH_MIN_AGE_MS,
   IDLE_LIST_POLL_MS,
   UNBOUNDED_LIST_IDLE_POLL_MS,
+  UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS,
   liveListInterval,
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
@@ -49,6 +50,17 @@ describe('sourceBackupsRefetchInterval', () => {
       UNBOUNDED_LIST_IDLE_POLL_MS
     )
     expect(UNBOUNDED_LIST_IDLE_POLL_MS).toBeGreaterThan(IDLE_LIST_POLL_MS)
+  })
+
+  test('stops idle polling a heavy history but still follows running work', () => {
+    const heavy = Array.from(
+      { length: UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS + 1 },
+      () => ({ state: 'completed' })
+    )
+    expect(sourceBackupsRefetchInterval(heavy)).toBe(false)
+    expect(sourceBackupsRefetchInterval([...heavy, { state: 'running' }])).toBe(
+      ACTIVE_LIST_POLL_MS
+    )
   })
 })
 

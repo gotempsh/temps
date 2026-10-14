@@ -50,7 +50,6 @@ import {
   installUnhandledRejectionReporter,
   markErrorReported,
 } from './lib/unhandled-rejections'
-import { refetchOnFocusWhenStale } from './lib/live-refetch'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
@@ -1234,11 +1233,7 @@ const queryClient = new QueryClient({
   }),
   defaultOptions: {
     queries: {
-      // Coming back to the tab refreshes what is on screen, so a change made
-      // elsewhere (CLI, API, another operator, a webhook-triggered deploy)
-      // shows up without a manual reload. Gated on data age so a quick
-      // alt-tab or a burst of focus events does not fan out into requests.
-      refetchOnWindowFocus: refetchOnFocusWhenStale,
+      refetchOnWindowFocus: false,
       // A 4xx is deterministic: retrying a 404 or 403 three times only
       // delays the message by ~7s and repeats requests that cannot succeed.
       // Network failures and 5xx keep their retries.

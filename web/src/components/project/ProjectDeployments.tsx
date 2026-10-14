@@ -106,6 +106,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     setSelectedDeployment(null)
     setIsRedeployModalOpen(true)
   }, [])
+  const anyDialogOpen =
+    isRedeployModalOpen ||
+    promoteDeploymentId !== null ||
+    staticDialogOpen ||
+    imageDialogOpen
   const {
     data: deploymentsData,
     isLoading,
@@ -124,8 +129,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     refetchOnWindowFocus: true,
     // A deployment started in the background (webhook, CLI, another tab)
     // must show up without a reload, and a running one must progress.
+    // Paused while a dialog is open: the dialogs resolve their target row from
+    // this page, and a newer deployment would shift it off the page and strip
+    // the dialog of its commit and environment.
     refetchInterval: (query) =>
-      projectDeploymentsRefetchInterval(query.state.data?.deployments),
+      anyDialogOpen
+        ? false
+        : projectDeploymentsRefetchInterval(query.state.data?.deployments),
   })
 
   const totalPages = deploymentsData

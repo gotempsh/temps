@@ -92,7 +92,10 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
-import { sourceBackupsRefetchInterval } from '@/lib/live-refetch'
+import {
+  refetchOnFocusWhenStale,
+  sourceBackupsRefetchInterval,
+} from '@/lib/live-refetch'
 
 /** Format a wall-clock timeout from seconds into a human-readable string.
  * Mirrors the helper in `BackupDetail.tsx`; if this gets copied a third
@@ -153,6 +156,7 @@ export function S3SourceDetail() {
       path: { id: sourceId! },
     }),
     enabled: !!sourceId,
+    refetchOnWindowFocus: refetchOnFocusWhenStale,
     // A backup started by a schedule, the CLI or another operator must show
     // up in Recent Backups, and a running one must reach its final state.
     refetchInterval: (query) =>
