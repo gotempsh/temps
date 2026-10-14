@@ -30,6 +30,9 @@ use temps_agents::sandbox::microsandbox::{
 };
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use temps_agents::sandbox::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
+
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+use super::upgrade::{fetch_guest_agents_from_release, ReleaseGuestAgents};
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use {
     std::collections::HashMap,
@@ -201,7 +204,15 @@ impl MicrosandboxSetupCommand {
         ));
 
         // Stage 3: guest terminal agent.
-        stage_pty_agent(&pty_agent_dest, self.pty_agent_bin.as_deref())?;
+        let released =
+            fetch_missing_pty_agent(&pty_agent_dest, self.pty_agent_bin.as_deref()).await;
+        stage_pty_agent(
+            &pty_agent_dest,
+            self.pty_agent_bin.as_deref(),
+            released
+                .as_ref()
+                .and_then(|r| r.path(PTY_AGENT_BINARY_NAME)),
+        )?;
 
         // Stage 4: boot a real VM through the server's provider.
         if self.skip_smoke {
@@ -271,6 +282,41 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
     Ok(())
 }
 
+/// Fetch `temps-pty-agent` from the release matching this binary when no
+/// flag, no sibling file and no earlier staging provides it. Announced, and a
+/// failure only leaves the existing "not found" warning in place.
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+async fn fetch_missing_pty_agent(
+    dest: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+) -> Option<ReleaseGuestAgents> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+        .is_some_and(|p| p.exists());
+    if explicit.is_some() || beside || dest.exists() {
+        return None;
+    }
+    println!("  fetching temps-pty-agent from the release that matches this binary (checksum-verified)...");
+    match fetch_guest_agents_from_release(&[PTY_AGENT_BINARY_NAME]).await {
+        Ok(agents) if agents.path(PTY_AGENT_BINARY_NAME).is_some() => Some(agents),
+        Ok(agents) => {
+            warn(&format!(
+                "release {} does not ship temps-pty-agent; upgrade to a release that does, \
+                 or pass --pty-agent-bin <path>",
+                agents.tag()
+            ));
+            None
+        }
+        Err(e) => {
+            warn(&format!(
+                "could not fetch temps-pty-agent from the release: {e}"
+            ));
+            None
+        }
+    }
+}
+
 /// Install the guest terminal agent at `dest` from `explicit` or, failing
 /// that, a `temps-pty-agent` file next to the running executable (release
 /// archives ship it there).
@@ -283,13 +329,17 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
 fn stage_pty_agent(
     dest: &std::path::Path,
     explicit: Option<&std::path::Path>,
+    released: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let source = explicit.map(PathBuf::from).or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
-            .filter(|p| p.exists())
-    });
+    let source = explicit
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+                .filter(|p| p.exists())
+        })
+        .or(released);
     let Some(source) = source else {
         if dest.exists() {
             ok(&format!(

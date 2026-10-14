@@ -1766,6 +1766,100 @@ const PTY_AGENT_MANUAL_INSTALL_HINT: &str = "To refresh it, extract temps-pty-ag
      `temps firecracker setup --pty-agent-bin <path>` and \
      `temps microsandbox setup --pty-agent-bin <path>`.";
 
+/// Guest agents pulled out of the release that matches the running binary,
+/// held in a scratch directory that is removed when this value is dropped.
+#[derive(Debug)]
+pub(crate) struct ReleaseGuestAgents {
+    dir: tempfile::TempDir,
+    tag: String,
+}
+
+impl ReleaseGuestAgents {
+    /// The extracted agent called `name`, if the release shipped it.
+    pub(crate) fn path(&self, name: &str) -> Option<PathBuf> {
+        let path = self.dir.path().join(name);
+        path.is_file().then_some(path)
+    }
+
+    /// Tag of the release the agents came from, for messages.
+    pub(crate) fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+/// Download the release tarball that matches this binary and extract the
+/// named guest agents (`temps-vm-agent`, `temps-pty-agent`) from it.
+///
+/// This is what `temps firecracker setup` / `temps microsandbox setup` fall
+/// back to when no agent sits beside the executable and none was passed, so a
+/// fresh install does not depend on the operator unpacking an archive by hand.
+/// It goes through the same pipeline as `temps upgrade`: the tarball streams
+/// to disk, and nothing is unpacked unless the release publishes a checksum
+/// that matches. The version is the running binary's own, because the VM
+/// agent has to agree with the host on the wire protocol.
+///
+/// An agent the release does not ship is simply absent from the result
+/// (older releases and macOS tarballs carry none); the caller reports it.
+pub(crate) async fn fetch_guest_agents_from_release(
+    names: &[&str],
+) -> anyhow::Result<ReleaseGuestAgents> {
+    let target = platform_target()?;
+    let tag = current_version_tag();
+    let release = fetch_specific_release(&tag).await?;
+    let tarball_name = format!("temps-{}.tar.gz", target);
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == tarball_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "release {} has no {} asset to take the guest agents from",
+                release.tag_name,
+                tarball_name
+            )
+        })?;
+
+    let dir = tempfile::tempdir()
+        .map_err(|e| anyhow::anyhow!("Failed to create a scratch directory: {}", e))?;
+    let tarball_path = dir.path().join(&tarball_name);
+    let mut tarball = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tarball_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tarball_path.display(), e))?;
+
+    let computed =
+        download_asset_to_file(&asset.browser_download_url, &mut tarball, &tarball_path).await?;
+    let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
+    verify_computed_checksum(&computed, &checksum_text)?;
+
+    for name in names {
+        let out_path = dir.path().join(name);
+        let mut out = fs::File::create(&out_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", out_path.display(), e))?;
+        let extracted = extract_entry_from_tarball_file(
+            &mut tarball,
+            &tarball_path,
+            &mut out,
+            &out_path,
+            name,
+        )?;
+        drop(out);
+        if extracted.is_none() {
+            let _ = fs::remove_file(&out_path);
+        }
+    }
+    // The ~110 MB archive is not needed once the entries are out.
+    drop(tarball);
+    let _ = fs::remove_file(&tarball_path);
+
+    Ok(ReleaseGuestAgents {
+        dir,
+        tag: release.tag_name,
+    })
+}
+
 /// A guest-side binary shipped beside `temps` in the Linux release tarballs.
 struct ShippedAgent {
     /// Entry name in the tarball and file name beside the host binary.
@@ -3089,6 +3183,22 @@ mod tests {
     }
 
     /// Build a gzipped tarball of regular files, in the given order.
+    #[test]
+    fn release_guest_agents_report_only_the_entries_that_were_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(VM_AGENT_BINARY_NAME), b"agent").unwrap();
+        let agents = ReleaseGuestAgents {
+            dir,
+            tag: "v0.0.0-test".to_string(),
+        };
+        assert!(agents.path(VM_AGENT_BINARY_NAME).is_some());
+        assert!(
+            agents.path(PTY_AGENT_BINARY_NAME).is_none(),
+            "an agent the release did not ship must read as absent, not as an empty path"
+        );
+        assert_eq!(agents.tag(), "v0.0.0-test");
+    }
+
     fn tarball_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         use flate2::write::GzEncoder;
         use flate2::Compression;

@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 use temps_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
 
+use super::upgrade::{fetch_guest_agents_from_release, ReleaseGuestAgents};
+
 use super::upgrade::{download_asset, download_asset_text, verify_checksum};
 
 /// Supported Firecracker release. Pinned deliberately (snapshot format and
@@ -343,8 +345,9 @@ impl FirecrackerSetupCommand {
 
         section("Firecracker binaries");
         self.stage_binaries(&dirs).await?;
-        self.stage_vm_agent(&dirs)?;
-        self.stage_pty_agent(&dirs)?;
+        let released = self.fetch_missing_guest_agents(&dirs).await;
+        self.stage_vm_agent(&dirs, released.as_ref())?;
+        self.stage_pty_agent(&dirs, released.as_ref())?;
 
         section("Guest kernel");
         self.stage_kernel(&dirs).await?;
@@ -681,17 +684,84 @@ impl FirecrackerSetupCommand {
         Ok(())
     }
 
+    /// Fetch the guest agents from the release matching this binary when
+    /// neither a flag, the executable's directory nor an earlier setup
+    /// provides them. Announced, bounded to what is actually missing, and a
+    /// failure only produces the same warnings as before -- never a failed
+    /// setup.
+    async fn fetch_missing_guest_agents(&self, dirs: &Dirs) -> Option<ReleaseGuestAgents> {
+        let beside = |name: &str| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join(name)))
+                .is_some_and(|p| p.exists())
+        };
+        let mut missing: Vec<&str> = Vec::new();
+        if self.vm_agent_bin.is_none()
+            && !beside("temps-vm-agent")
+            && !dirs.bin.join("temps-vm-agent").exists()
+        {
+            missing.push("temps-vm-agent");
+        }
+        if self.pty_agent_bin.is_none()
+            && !beside(PTY_AGENT_BINARY_NAME)
+            && !dirs.pty_agent_bin().exists()
+        {
+            missing.push(PTY_AGENT_BINARY_NAME);
+        }
+        if missing.is_empty() {
+            return None;
+        }
+        println!(
+            "  Fetching {} from the release that matches this binary (checksum-verified)...",
+            missing.join(" and ")
+        );
+        match fetch_guest_agents_from_release(&missing).await {
+            Ok(agents) => {
+                for name in &missing {
+                    if agents.path(name).is_none() {
+                        warn(
+                            "Guest agent",
+                            format!(
+                                "release {} does not ship {}; upgrade with `temps upgrade` \
+                                 to a release that does, or pass its path explicitly",
+                                agents.tag(),
+                                name
+                            ),
+                        );
+                    }
+                }
+                Some(agents)
+            }
+            Err(e) => {
+                warn(
+                    "Guest agent",
+                    format!("could not fetch the guest agents from the release: {e}"),
+                );
+                None
+            }
+        }
+    }
+
     /// Install the static musl guest agent — the only transport into a VM,
     /// injected into every rootfs by the provider. Sourced from `--vm-agent-bin`
     /// or a `temps-vm-agent` file next to the running executable (release
     /// tarballs ship it there; CI publishes it alongside the temps binary).
-    fn stage_vm_agent(&self, dirs: &Dirs) -> anyhow::Result<()> {
-        let source = self.vm_agent_bin.clone().or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|d| d.join("temps-vm-agent")))
-                .filter(|p| p.exists())
-        });
+    fn stage_vm_agent(
+        &self,
+        dirs: &Dirs,
+        released: Option<&ReleaseGuestAgents>,
+    ) -> anyhow::Result<()> {
+        let source = self
+            .vm_agent_bin
+            .clone()
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.join("temps-vm-agent")))
+                    .filter(|p| p.exists())
+            })
+            .or_else(|| released.and_then(|r| r.path("temps-vm-agent")));
         let dest = dirs.bin.join("temps-vm-agent");
         match source {
             Some(src) if src.exists() => {
@@ -726,13 +796,21 @@ impl FirecrackerSetupCommand {
     /// Optional by design: without it sandboxes still create and run
     /// commands, they just cannot open terminals — so a missing binary is a
     /// warning that says exactly how to fix it, never a failed setup.
-    fn stage_pty_agent(&self, dirs: &Dirs) -> anyhow::Result<()> {
-        let source = self.pty_agent_bin.clone().or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
-                .filter(|p| p.exists())
-        });
+    fn stage_pty_agent(
+        &self,
+        dirs: &Dirs,
+        released: Option<&ReleaseGuestAgents>,
+    ) -> anyhow::Result<()> {
+        let source = self
+            .pty_agent_bin
+            .clone()
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+                    .filter(|p| p.exists())
+            })
+            .or_else(|| released.and_then(|r| r.path(PTY_AGENT_BINARY_NAME)));
         let dest = dirs.pty_agent_bin();
         match source {
             Some(src) if src.exists() => {
