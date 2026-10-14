@@ -332,6 +332,25 @@ export function DockBody({
   const [mobileRailOpen, setMobileRailOpen] = useState(false)
   const railOpen = isMobile ? mobileRailOpen : desktopRailOpen
   const setRailOpen = isMobile ? setMobileRailOpen : setDesktopRailOpen
+  // On phones the list and the conversation swap in place, so the control that
+  // was pressed disappears. Hand focus to its counterpart instead of letting it
+  // fall to <body>.
+  const railToggleRef = useRef<HTMLButtonElement | null>(null)
+  const railCloseRef = useRef<HTMLButtonElement | null>(null)
+  const restoreToggleFocusRef = useRef(false)
+  const closeMobileRail = () => {
+    restoreToggleFocusRef.current = true
+    setMobileRailOpen(false)
+  }
+  useEffect(() => {
+    if (!isMobile) return
+    if (mobileRailOpen) {
+      railCloseRef.current?.focus()
+    } else if (restoreToggleFocusRef.current) {
+      restoreToggleFocusRef.current = false
+      railToggleRef.current?.focus()
+    }
+  }, [isMobile, mobileRailOpen])
 
   // Unified list across every project.
   const loadList = useCallback(() => {
@@ -593,7 +612,8 @@ export function DockBody({
           </span>
           <button
             type="button"
-            onClick={() => setRailOpen(false)}
+            ref={railCloseRef}
+            onClick={closeMobileRail}
             className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:hidden"
             aria-label="Close chat list"
             title="Close chat list"
@@ -647,7 +667,9 @@ export function DockBody({
               {isPage ? (
                 <button
                   type="button"
+                  ref={railToggleRef}
                   onClick={() => setRailOpen((v) => !v)}
+                  aria-expanded={railOpen}
                   className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                   aria-label={railOpen ? 'Hide chat list' : 'Show chat list'}
                   title={railOpen ? 'Hide chat list' : 'Show chat list'}
