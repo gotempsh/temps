@@ -144,6 +144,7 @@ interface DirectoryBodyProps {
         entries: DirectoryEntry[]
         page_size: number
         total: number
+        truncated: boolean
       }
     | undefined
   page: number
@@ -181,16 +182,52 @@ function DirectoryBody({
       </div>
     )
   }
-  if (error) {
-    return (
-      <Alert variant="destructive">
-        <AlertDescription>
-          Could not list {directory}: {problemDetail(error, 'request failed.')}
-        </AlertDescription>
-      </Alert>
-    )
-  }
+  const failure = error ? (
+    <Alert variant="destructive">
+      <AlertDescription>
+        Could not list {directory}: {problemDetail(error, 'request failed.')}
+      </AlertDescription>
+    </Alert>
+  ) : null
+  if (failure && !listing) return failure
   if (!listing) return null
+  // A refresh that failed keeps the last listing on screen under the error:
+  // the user can still open what they were looking at.
+  return (
+    <div className="space-y-2">
+      {failure}
+      <ListingView
+        directory={directory}
+        listing={listing}
+        page={page}
+        onPage={onPage}
+        onEnter={onEnter}
+        onOpenFile={onOpenFile}
+        onUp={onUp}
+      />
+    </div>
+  )
+}
+
+interface ListingViewProps {
+  directory: string
+  listing: NonNullable<DirectoryBodyProps['listing']>
+  page: number
+  onPage: (page: number) => void
+  onEnter: (path: string) => void
+  onOpenFile: (path: string) => void
+  onUp: () => void
+}
+
+function ListingView({
+  directory,
+  listing,
+  page,
+  onPage,
+  onEnter,
+  onOpenFile,
+  onUp,
+}: ListingViewProps) {
   if (!listing.exists) {
     return (
       <p className="text-xs text-muted-foreground">
@@ -254,6 +291,12 @@ function DirectoryBody({
           </li>
         ))}
       </ul>
+      {listing.truncated && (
+        <p className="text-xs text-muted-foreground">
+          This directory has more than {listing.total.toLocaleString()} entries;
+          only the first {listing.total.toLocaleString()} are listed.
+        </p>
+      )}
       {pageCount(listing.total, listing.page_size) > 1 && (
         <ResponsivePagination
           page={page}

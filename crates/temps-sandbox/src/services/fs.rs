@@ -36,11 +36,19 @@ pub const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 /// time: a page is held in memory on the control plane and rendered by a
 /// browser, so no request can make either side hold the whole directory.
 pub const MAX_LIST_PAGE_SIZE: usize = 100;
+/// Most names the listing script reads from one directory. The sandbox shell
+/// holds the names it is paging over, so a directory of millions of entries
+/// could exhaust a small sandbox's memory; past this many the listing is
+/// marked `truncated` and covers the first `MAX_LIST_SCAN` names the
+/// filesystem returns.
+pub const MAX_LIST_SCAN: usize = 10_000;
 
-/// Clamp a requested page and page size to what the endpoint serves.
+/// Clamp a requested page and page size to what the endpoint serves. No page
+/// past [`MAX_LIST_SCAN`] can hold an entry (a page is at least one entry), so
+/// the page number is capped there and the skip count stays bounded.
 pub fn list_page_bounds(page: Option<usize>, page_size: Option<usize>) -> (usize, usize) {
     (
-        page.unwrap_or(1).max(1),
+        page.unwrap_or(1).clamp(1, MAX_LIST_SCAN),
         page_size
             .unwrap_or(DEFAULT_LIST_PAGE_SIZE)
             .clamp(1, MAX_LIST_PAGE_SIZE),
@@ -75,8 +83,12 @@ pub struct DirListing {
     /// 1-based page these entries are.
     pub page: usize,
     pub page_size: usize,
-    /// Entries in the whole directory, not just this page.
+    /// Entries in the whole directory, not just this page. At most
+    /// [`MAX_LIST_SCAN`]: see `truncated`.
     pub total: usize,
+    /// The directory has more than [`MAX_LIST_SCAN`] entries, so `total` and
+    /// the pages cover only the first `MAX_LIST_SCAN` names it returned.
+    pub truncated: bool,
     /// Entries exist after this page.
     pub has_more: bool,
 }
@@ -430,29 +442,30 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
 ///
 /// `denied` covers a directory the sandbox user cannot both read and search,
 /// and a path hidden behind an ancestor it cannot search: without read
-/// permission the globs below match nothing, and `[ -e ]` is false for
+/// permission the listing below sees nothing, and `[ -e ]` is false for
 /// anything under a locked parent, so either would be reported as empty or
 /// missing.
 ///
-/// A `total <n>` line follows `ok`: the number of entries in the whole
-/// directory, so the console can show "page 3 of 12". It costs one more pass
-/// over names the glob has already expanded, with no per-entry output.
+/// A `total <n>` line follows `ok`: the number of entries the page numbers are
+/// computed from, so the console can show "page 3 of 12". A directory with more
+/// than [`MAX_LIST_SCAN`] entries is cut there and a `truncated 1` line says so.
 ///
 /// Only one page leaves the sandbox: the first `skip` entries are counted and
 /// dropped, and the scan stops after `want` (one more than the page, so the
 /// caller can tell "exactly a page" from "more than a page"). Directories are
 /// emitted first, in a second pass the rest, so the order is the same for
-/// every page of the same directory. The names of the three glob groups
-/// (`.x`, `..x`, everything else) are merged and sorted as one list under
-/// `LC_ALL=C`, so the order is bytewise and not "dotfiles first, then the
-/// rest"; where `sort` is missing the glob order is used, which is still the
-/// same on every page.
+/// every page of the same directory. At most `MAX_LIST_SCAN + 1` names are
+/// read (`find | head`, so the pipe closes on the rest) and then sorted as one
+/// list under `LC_ALL=C`, so the order is bytewise and not "dotfiles first,
+/// then the rest"; where `sort` is missing the filesystem order is used, which
+/// is still the same on every page. A `sort` that fails is an error, not an
+/// empty directory.
 ///
-/// Written for busybox `sh`: no `find -printf`, no arrays. Names are expanded
-/// by the shell's own globbing relative to the directory, so none of them is
-/// ever re-parsed as part of a command line (word splitting is limited to
-/// newlines and globbing is off while the sorted list is walked). A name
-/// containing a newline would break the line framing and is skipped.
+/// Written for busybox `sh`: no `find -printf`, no arrays. Names are read as
+/// lines, relative to the directory, so none of them is ever re-parsed as part
+/// of a command line (word splitting is limited to newlines and globbing is
+/// off while the sorted list is walked). A name containing a newline would
+/// break the line framing and is skipped.
 fn list_script(path: &str, skip: usize, page_size: usize) -> String {
     format!(
         "LC_ALL=C; export LC_ALL\n\
@@ -469,17 +482,15 @@ fn list_script(path: &str, skip: usize, page_size: usize) -> String {
          if [ ! -d \"$d\" ]; then echo notdir; exit 0; fi\n\
          if [ ! -r \"$d\" ] || [ ! -x \"$d\" ]; then echo denied; exit 0; fi\n\
          cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
-         echo ok\n\
+         if ! command -v find >/dev/null 2>&1; then echo 'list failed: find is not available'; exit 3; fi\n\
          if command -v sort >/dev/null 2>&1; then s=sort; else s=cat; fi\n\
-         L=$(for f in .[!.]* ..?* *; do\n\
-           if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi\n\
-           case \"$f\" in (*'\n'*) continue;; esac\n\
-           printf '%s\\n' \"$f\"\n\
-         done | $s)\n\
+         L=$(find . -mindepth 1 -maxdepth 1 ! -name '*\n*' 2>/dev/null | head -n {scan_plus_one} | sed 's|^\\./||' | $s) || {{ echo 'list failed: sorting the names failed'; exit 3; }}\n\
+         echo ok\n\
          IFS='\n'\n\
          set -f\n\
          t=0\n\
          for f in $L; do t=$((t+1)); done\n\
+         if [ \"$t\" -gt {scan} ]; then echo 'truncated 1'; t={scan}; fi\n\
          echo \"total $t\"\n\
          seen=0\n\
          n=0\n\
@@ -490,6 +501,7 @@ fn list_script(path: &str, skip: usize, page_size: usize) -> String {
                if [ \"$k\" != d ]; then continue; fi\n\
              elif [ \"$k\" = d ]; then continue; fi\n\
              seen=$((seen+1))\n\
+             if [ \"$seen\" -gt {scan} ]; then break 2; fi\n\
              if [ \"$seen\" -le {skip} ]; then continue; fi\n\
              printf '%s %s\\n' \"$k\" \"$f\"\n\
              n=$((n+1))\n\
@@ -499,6 +511,8 @@ fn list_script(path: &str, skip: usize, page_size: usize) -> String {
         p = shell_quote(path),
         skip = skip,
         page_size = page_size,
+        scan = MAX_LIST_SCAN,
+        scan_plus_one = MAX_LIST_SCAN + 1,
     )
 }
 
@@ -524,6 +538,7 @@ fn parse_list_output(
         page,
         page_size,
         total: 0,
+        truncated: false,
         has_more: false,
     };
     match status {
@@ -534,11 +549,16 @@ fn parse_list_output(
     }
 
     let mut total = None;
+    let mut truncated = false;
     let mut entries: Vec<DirEntry> = lines
         .filter_map(|line| {
             let (kind, name) = line.split_once(' ')?;
             if kind == "total" {
                 total = name.trim().parse::<usize>().ok();
+                return None;
+            }
+            if kind == "truncated" {
+                truncated = true;
                 return None;
             }
             if name.is_empty() {
@@ -562,12 +582,22 @@ fn parse_list_output(
     entries.truncate(page_size);
     // A script that did not report a total (or one that is inconsistent with
     // the page it returned) still yields a count that is never smaller than
-    // what has been seen, so the page controls cannot point past the end.
-    let seen = page.saturating_sub(1) * page_size + entries.len() + usize::from(has_more);
-    let total = total.unwrap_or(seen).max(seen);
+    // what has been seen, so the page controls cannot point past the end. An
+    // empty page proves nothing about the entries before it (the directory may
+    // simply be shorter than the page asked for), so it contributes no floor.
+    let seen = if entries.is_empty() {
+        0
+    } else {
+        page.saturating_sub(1)
+            .saturating_mul(page_size)
+            .saturating_add(entries.len())
+            .saturating_add(usize::from(has_more))
+    };
+    let total = total.map_or(seen, |reported| reported.max(seen));
     Some(DirListing {
         entries,
         total,
+        truncated,
         has_more,
         ..listing(true, true)
     })
@@ -789,6 +819,97 @@ mod tests {
         assert_eq!(
             list_page_bounds(Some(3), Some(100_000)),
             (3, MAX_LIST_PAGE_SIZE)
+        );
+        assert_eq!(
+            list_page_bounds(Some(usize::MAX), Some(100)),
+            (MAX_LIST_SCAN, 100),
+            "a page past the scan cap cannot hold an entry; the skip count stays bounded"
+        );
+    }
+
+    #[test]
+    fn an_empty_page_past_the_end_does_not_inflate_the_total() {
+        let listing = parse_list_output("/small", "ok\ntotal 3\n", 51, 20).expect("a listing");
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.total, 3, "the directory's own count, not 50 pages");
+
+        let huge = parse_list_output("/small", "ok\n", usize::MAX, usize::MAX).expect("a listing");
+        assert_eq!(huge.total, 0, "no overflow, no invented entries");
+    }
+
+    #[test]
+    fn parse_list_reports_a_truncated_directory() {
+        let listing = parse_list_output("/huge", "ok\ntruncated 1\ntotal 10000\nf a\n", 1, 20)
+            .expect("a listing");
+        assert!(listing.truncated);
+        assert_eq!(listing.total, MAX_LIST_SCAN);
+
+        let whole = parse_list_output("/small", "ok\ntotal 1\nf a\n", 1, 20).expect("a listing");
+        assert!(!whole.truncated);
+    }
+
+    #[cfg(unix)]
+    fn run_script_with_path(script: &str, path_prefix: Option<&std::path::Path>) -> (bool, String) {
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        if let Some(prefix) = path_prefix {
+            path = format!("{}:{path}", prefix.display());
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .output()
+            .expect("runs sh");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+
+    /// A `sort` that dies must not turn into "this directory is empty".
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_sort_is_an_error_not_an_empty_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("kept.txt"), "").expect("file");
+        let bin = tempfile::tempdir().expect("bin dir");
+        let fake = bin.path().join("sort");
+        std::fs::write(&fake, "#!/bin/sh\ncat >/dev/null\nexit 1\n").expect("fake sort");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let script = list_script(dir.path().to_str().expect("utf-8"), 0, 20);
+        let (ok, stdout) = run_script_with_path(&script, Some(bin.path()));
+
+        assert!(!ok, "the script must fail: {stdout}");
+        assert!(stdout.contains("list failed"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "ok"), "{stdout}");
+    }
+
+    /// Past `MAX_LIST_SCAN` names the script stops reading and says so, and a
+    /// name containing a newline is left out instead of splitting in two.
+    #[cfg(unix)]
+    #[test]
+    fn a_huge_directory_is_cut_at_the_scan_cap_and_marked_truncated() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for i in 0..MAX_LIST_SCAN + 5 {
+            std::fs::write(dir.path().join(format!("f{i:05}")), "").expect("file");
+        }
+        std::fs::write(dir.path().join("two\nlines"), "").expect("newline name");
+        let path = dir.path().to_str().expect("utf-8").to_string();
+
+        let script = list_script(&path, 0, MAX_LIST_PAGE_SIZE);
+        let (ok, stdout) = run_script_with_path(&script, None);
+        assert!(ok, "{stdout}");
+        let listing = parse_list_output(&path, &stdout, 1, MAX_LIST_PAGE_SIZE).expect("a listing");
+
+        assert!(listing.truncated);
+        assert_eq!(listing.total, MAX_LIST_SCAN);
+        assert_eq!(listing.entries.len(), MAX_LIST_PAGE_SIZE);
+        assert!(listing.has_more);
+        assert!(
+            listing.entries.iter().all(|e| !e.name.contains('\n')),
+            "a newline name never reaches the listing"
         );
     }
 

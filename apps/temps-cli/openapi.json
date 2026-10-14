@@ -17139,9 +17139,13 @@
             "type": "string"
           },
           "total": {
-            "description": "Entries in the whole directory, so `ceil(total / page_size)` is the\nnumber of pages.",
+            "description": "Entries in the whole directory, so `ceil(total / page_size)` is the\nnumber of pages. At most 10000: see `truncated`.",
             "minimum": 0,
             "type": "integer"
+          },
+          "truncated": {
+            "description": "The directory has more entries than the listing reads (10000), so\n`total` and the pages cover only the first 10000 names the filesystem\nreturned.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -17152,6 +17156,7 @@
           "page",
           "page_size",
           "total",
+          "truncated",
           "has_more"
         ],
         "type": "object"

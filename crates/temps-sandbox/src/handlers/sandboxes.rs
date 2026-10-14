@@ -1075,8 +1075,12 @@ pub struct DirectoryListingResponse {
     /// Entries per page that was applied (default 20, at most 100).
     pub page_size: usize,
     /// Entries in the whole directory, so `ceil(total / page_size)` is the
-    /// number of pages.
+    /// number of pages. At most 10000: see `truncated`.
     pub total: usize,
+    /// The directory has more entries than the listing reads (10000), so
+    /// `total` and the pages cover only the first 10000 names the filesystem
+    /// returned.
+    pub truncated: bool,
     /// More entries exist after this page.
     pub has_more: bool,
 }
@@ -1104,6 +1108,7 @@ impl From<crate::services::fs::DirListing> for DirectoryListingResponse {
             page: listing.page,
             page_size: listing.page_size,
             total: listing.total,
+            truncated: listing.truncated,
             has_more: listing.has_more,
         }
     }
@@ -3373,6 +3378,7 @@ mod tests {
             page: 2,
             page_size: 20,
             total: 45,
+            truncated: false,
             has_more: true,
         });
         let json = serde_json::to_value(&response).expect("serializes");
@@ -3381,6 +3387,7 @@ mod tests {
         assert_eq!(json["page"], 2);
         assert_eq!(json["page_size"], 20);
         assert_eq!(json["total"], 45);
+        assert_eq!(json["truncated"], false);
         assert_eq!(json["has_more"], true);
     }
 

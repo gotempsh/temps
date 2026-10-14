@@ -771,7 +771,12 @@ const WORK_DIR = '/home/temps/workspace'
 function listing(
   path: string,
   entries: { name: string; kind: string }[],
-  paging: { page?: number; total?: number; pageSize?: number } = {}
+  paging: {
+    page?: number
+    total?: number
+    pageSize?: number
+    truncated?: boolean
+  } = {}
 ) {
   const pageSize = paging.pageSize ?? 100
   const page = paging.page ?? 1
@@ -784,6 +789,7 @@ function listing(
     page,
     page_size: pageSize,
     total,
+    truncated: paging.truncated ?? false,
     has_more: page * pageSize < total,
   })
 }
@@ -912,6 +918,39 @@ test('a long directory is read one page at a time', async () => {
     (view.getByRole('button', { name: 'Next page' }) as HTMLButtonElement)
       .disabled
   ).toBe(true)
+  api.restore()
+})
+
+test('a refresh that fails keeps the listing on screen under the error', async () => {
+  let failing = false
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      failing
+        ? jsonResponse({ title: 'File Operation Failed', detail: 'boom' }, 500)
+        : listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }]),
+  })
+  const view = renderCard()
+  await view.findByRole('button', { name: /a\.txt/ })
+
+  failing = true
+  fireEvent.click(view.getByRole('button', { name: 'Refresh directory' }))
+
+  await view.findByText(/Could not list \/home\/temps\/workspace/)
+  expect(view.getByRole('button', { name: /a\.txt/ })).toBeTruthy()
+  api.restore()
+})
+
+test('a directory cut at the scan cap says only part of it is listed', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
+        total: 10000,
+        truncated: true,
+      }),
+  })
+  const view = renderCard()
+
+  await view.findByText(/only the first 10,000 are listed/)
   api.restore()
 })
 

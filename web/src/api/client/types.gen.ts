@@ -8243,9 +8243,15 @@ export type DirectoryListingResponse = {
     path: string;
     /**
      * Entries in the whole directory, so `ceil(total / page_size)` is the
-     * number of pages.
+     * number of pages. At most 10000: see `truncated`.
      */
     total: number;
+    /**
+     * The directory has more entries than the listing reads (10000), so
+     * `total` and the pages cover only the first 10000 names the filesystem
+     * returned.
+     */
+    truncated: boolean;
 };
 
 /**
