@@ -48,6 +48,7 @@ function panel(
   props: {
     group?: ProjectGroupResponse
     onConnected?: () => void
+    onCancel?: () => void
     client?: QueryClient
   } = {}
 ) {
@@ -60,7 +61,9 @@ function panel(
         <MemoryRouter>
           <ConnectRepositoryPanel
             group={props.group ?? GROUP}
-            cancelHref="/p/shop"
+            title="Connect a repository"
+            description="Connect once."
+            onCancel={props.onCancel ?? (() => {})}
             onConnected={props.onConnected ?? (() => {})}
           />
         </MemoryRouter>
@@ -70,11 +73,9 @@ function panel(
 }
 
 function urlInput(): HTMLInputElement {
-  const input = document.body.querySelector<HTMLInputElement>(
-    '#public-repository-url'
-  )
-  if (!input) throw new Error('the repository URL field is not shown')
-  return input
+  return within(document.body).getByLabelText(
+    'Repository URL'
+  ) as HTMLInputElement
 }
 
 async function typeUrl(value: string) {
@@ -92,6 +93,11 @@ function saveButton() {
   }) as HTMLButtonElement
 }
 
+/** The template marks a not-yet-savable button `aria-disabled`, never `disabled`. */
+function saveDisabled() {
+  return saveButton().getAttribute('aria-disabled') === 'true'
+}
+
 async function settle() {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 30))
@@ -104,7 +110,7 @@ test('with no git connection the public tab is shown and starts empty', async ()
   await settle()
 
   expect(urlInput().value).toBe('')
-  expect(saveButton().disabled).toBe(true)
+  expect(saveDisabled()).toBe(true)
   api.restore()
 })
 
@@ -115,12 +121,13 @@ test('a malformed URL is explained as it is typed', async () => {
 
   await typeUrl('definitely not a url')
 
+  // Inline on the field and in the template's summary above the save bar.
   expect(
-    within(document.body).getByText(
+    within(document.body).getAllByText(
       'Enter a repository URL like https://github.com/owner/repo'
-    )
-  ).toBeTruthy()
-  expect(saveButton().disabled).toBe(true)
+    ).length
+  ).toBe(2)
+  expect(saveDisabled()).toBe(true)
   api.restore()
 })
 
@@ -132,9 +139,10 @@ test('a repository outside github.com and gitlab.com is refused', async () => {
   await typeUrl('https://git.example.test/team/app')
 
   expect(
-    within(document.body).getByText(/Only public repositories on github.com/)
-  ).toBeTruthy()
-  expect(saveButton().disabled).toBe(true)
+    within(document.body).getAllByText(/Only public repositories on github.com/)
+      .length
+  ).toBe(2)
+  expect(saveDisabled()).toBe(true)
   api.restore()
 })
 
@@ -160,7 +168,7 @@ test('saves a looked-up public repository on its default branch', async () => {
   await settle()
 
   await typeUrl('https://github.com/acme/shop')
-  expect(saveButton().disabled).toBe(false)
+  expect(saveDisabled()).toBe(false)
 
   await act(async () => {
     fireEvent.click(saveButton())
@@ -243,17 +251,24 @@ test('shows skeletons while the git connections load', async () => {
   expect(
     document.body.querySelector('[aria-label="Loading repositories"]')
   ).toBeTruthy()
-  expect(saveButton().disabled).toBe(true)
+  expect(saveDisabled()).toBe(true)
   api.restore()
 })
 
-test('cancel returns to the project', async () => {
+test('cancel leaves without saving', async () => {
   const api = mockApi(NO_CONNECTIONS)
-  render(panel())
+  let cancelled = 0
+  render(panel({ onCancel: () => (cancelled += 1) }))
   await settle()
 
-  const cancel = within(document.body).getByRole('link', { name: 'Cancel' })
-  expect(cancel.getAttribute('href')).toBe('/p/shop')
+  await act(async () => {
+    fireEvent.click(
+      within(document.body).getByRole('button', { name: 'Cancel' })
+    )
+  })
+
+  expect(cancelled).toBe(1)
+  expect(api.called('PUT', '/project-groups/7/repository')).toBe(false)
   api.restore()
 })
 
@@ -316,7 +331,7 @@ test('lists the connection repositories with their full names', async () => {
   await waitFor(() => expect(body.getByText('storefront')).toBeTruthy())
   expect(body.getByText('admin-console')).toBeTruthy()
   expect(body.getByRole('combobox', { name: 'Git connection' })).toBeTruthy()
-  expect(saveButton().disabled).toBe(true)
+  expect(saveDisabled()).toBe(true)
   api.restore()
 })
 
@@ -339,7 +354,7 @@ test('saves the picked repository on its default branch', async () => {
     )
   })
   await settle()
-  expect(saveButton().disabled).toBe(false)
+  expect(saveDisabled()).toBe(false)
 
   await act(async () => {
     fireEvent.click(saveButton())
@@ -455,7 +470,7 @@ test('a pick is dropped when its connection stops being the active one', async (
     fireEvent.click(body.getByText('admin-console').closest('button')!)
   })
   await settle()
-  expect(saveButton().disabled).toBe(false)
+  expect(saveDisabled()).toBe(false)
 
   // The connection is deactivated elsewhere; the list refreshes.
   connectionList = [second]
@@ -464,6 +479,34 @@ test('a pick is dropped when its connection stops being the active one', async (
   })
   await settle()
 
-  expect(saveButton().disabled).toBe(true)
+  expect(saveDisabled()).toBe(true)
+  api.restore()
+})
+
+test('Enter in a field never saves the repository', async () => {
+  const api = mockApi({
+    ...NO_CONNECTIONS,
+    'GET /git/public/github/acme/shop': () =>
+      jsonResponse({
+        default_branch: 'main',
+        forks: 0,
+        full_name: 'acme/shop',
+        name: 'shop',
+        owner: 'acme',
+      }),
+  })
+  render(panel())
+  await settle()
+  await typeUrl('https://github.com/acme/shop')
+  expect(saveDisabled()).toBe(false)
+
+  let allowed = true
+  await act(async () => {
+    allowed = fireEvent.keyDown(urlInput(), { key: 'Enter' })
+  })
+  await settle()
+
+  expect(allowed).toBe(false)
+  expect(api.called('PUT', '/project-groups/7/repository')).toBe(false)
   api.restore()
 })

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
@@ -25,17 +25,10 @@ import { RepositoryAvatar } from '@/components/repositories/RepositoryAvatar'
 import { COMPACT_GRID_CLASS } from '@/components/repositories/RepositoryList'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Field, Settings } from '@temps-sdk/ds'
 import { Card, CardContent } from '@/components/ui/card'
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
+import { Form, FormField } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -46,8 +39,12 @@ import { useInvalidateGroups } from './useProjectGroups'
 
 interface ConnectRepositoryPanelProps {
   group: ProjectGroupResponse
-  /** Where "Cancel" goes: the project the repository is connected to. */
-  cancelHref: string
+  title: ReactNode
+  description: ReactNode
+  /** Rendered first in the form body, e.g. a link back to the project. */
+  backLink?: ReactNode
+  /** "Cancel": leave without saving. */
+  onCancel: () => void
   /** Called once the repository was saved and every service followed it. */
   onConnected: () => void
 }
@@ -69,7 +66,10 @@ const PUBLIC_HOSTS = { github: 'github.com', gitlab: 'gitlab.com' } as const
  */
 export function ConnectRepositoryPanel({
   group,
-  cancelHref,
+  title,
+  description,
+  backLink,
+  onCancel,
   onConnected,
 }: ConnectRepositoryPanelProps) {
   const invalidate = useInvalidateGroups()
@@ -223,16 +223,63 @@ export function ConnectRepositoryPanel({
     }
   }
 
+  // Enter in a search box must filter, never save: only the Save button does.
+  const keepEnterFromSaving = (event: React.KeyboardEvent) => {
+    if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
+      event.preventDefault()
+    }
+  }
+
   return (
     <Form {...form}>
-      <form
-        // Saving is only ever the Save button: Enter in a search box or any
-        // picker control must never save the repository.
-        onSubmit={(event) => event.preventDefault()}
-        className="space-y-6"
+      <Settings
+        title={title}
+        description={description}
+        errors={publicUrlProblem ? { 'Repository URL': publicUrlProblem } : {}}
+        onSubmit={(event) => {
+          event.preventDefault()
+          void form.handleSubmit(submit)()
+        }}
+        saving={save.isPending}
+        dirty={canSave}
+        saveLabel={failures.length > 0 ? 'Retry' : 'Save repository'}
+        onCancel={onCancel}
       >
+        {backLink}
+
+        <SelectionSummary
+          mode={mode}
+          repository={repository}
+          publicName={publicInfo.data?.full_name ?? null}
+          target={target}
+          branchSelector={
+            target ? (
+              <BranchSelector
+                repoOwner={target.owner}
+                repoName={target.name}
+                connectionId={
+                  mode === 'connection'
+                    ? (connectionId ?? undefined)
+                    : undefined
+                }
+                gitUrl={mode === 'public' ? publicUrl : undefined}
+                defaultBranch={
+                  mode === 'public'
+                    ? publicInfo.data?.default_branch
+                    : repository?.default_branch
+                }
+                value={branch}
+                onChange={pickBranch}
+              />
+            ) : null
+          }
+        />
+
         <Card>
-          <CardContent className="space-y-4 pt-6">
+          <CardContent
+            className="space-y-4 pt-6"
+            onKeyDown={keepEnterFromSaving}
+          >
             <Tabs
               value={mode}
               onValueChange={(v) => {
@@ -250,7 +297,6 @@ export function ConnectRepositoryPanel({
             {mode === 'public' ? (
               <PublicRepositoryFields
                 form={form}
-                publicUrl={publicUrl}
                 publicTarget={publicTarget}
                 publicInfo={publicInfo}
                 problem={publicUrlProblem}
@@ -327,56 +373,7 @@ export function ConnectRepositoryPanel({
             </p>
           </div>
         )}
-
-        <SelectionBar
-          mode={mode}
-          repository={repository}
-          publicName={publicInfo.data?.full_name ?? null}
-          target={target}
-          branchSelector={
-            target ? (
-              <BranchSelector
-                repoOwner={target.owner}
-                repoName={target.name}
-                connectionId={
-                  mode === 'connection'
-                    ? (connectionId ?? undefined)
-                    : undefined
-                }
-                gitUrl={mode === 'public' ? publicUrl : undefined}
-                defaultBranch={
-                  mode === 'public'
-                    ? publicInfo.data?.default_branch
-                    : repository?.default_branch
-                }
-                value={branch}
-                onChange={pickBranch}
-              />
-            ) : null
-          }
-          actions={
-            <>
-              <Button type="button" variant="outline" asChild>
-                <Link to={cancelHref}>
-                  {failures.length > 0 ? 'Close' : 'Cancel'}
-                </Link>
-              </Button>
-              <Button
-                type="button"
-                disabled={!canSave}
-                onClick={() => void form.handleSubmit(submit)()}
-              >
-                {save.isPending && <Loader2 className="size-4 animate-spin" />}
-                {save.isPending
-                  ? 'Saving…'
-                  : failures.length > 0
-                    ? 'Retry'
-                    : 'Save repository'}
-              </Button>
-            </>
-          }
-        />
-      </form>
+      </Settings>
     </Form>
   )
 }
@@ -516,7 +513,6 @@ function NoConnectionsOnboarding({ onUsePublic }: { onUsePublic: () => void }) {
 
 interface PublicRepositoryFieldsProps {
   form: ReturnType<typeof useForm<ConnectRepositoryValues>>
-  publicUrl: string
   publicTarget: ReturnType<typeof publicTargetOf>
   publicInfo: {
     isFetching: boolean
@@ -541,26 +537,29 @@ function PublicRepositoryFields({
         control={form.control}
         name="publicUrl"
         render={({ field }) => (
-          <FormItem className="space-y-2">
-            <FormLabel htmlFor="public-repository-url">
-              Repository URL
-            </FormLabel>
-            <FormControl>
-              <Input
-                {...field}
-                id="public-repository-url"
-                placeholder="https://github.com/owner/repository"
-                onChange={(e) => {
-                  field.onChange(e)
-                  // A different repository starts on its own branch.
-                  onUrlChanged()
-                }}
-                autoFocus
-              />
-            </FormControl>
-            {problem ? (
-              <FormMessage className="text-xs font-normal" />
-            ) : publicTarget && publicInfo.isFetching ? (
+          <div className="space-y-2">
+            <Field
+              label="Repository URL"
+              error={problem ?? undefined}
+              description={
+                'A public repository on GitHub or GitLab; no git connection needed.'
+              }
+            >
+              {(fieldProps) => (
+                <Input
+                  {...field}
+                  {...fieldProps}
+                  placeholder="https://github.com/owner/repository"
+                  onChange={(e) => {
+                    field.onChange(e)
+                    // A different repository starts on its own branch.
+                    onUrlChanged()
+                  }}
+                  autoFocus
+                />
+              )}
+            </Field>
+            {problem ? null : publicTarget && publicInfo.isFetching ? (
               <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Loader2 className="size-3 animate-spin" /> Looking up the
                 repository…
@@ -582,13 +581,8 @@ function PublicRepositoryFields({
                   ? ` · ${publicInfo.data.description}`
                   : ''}
               </p>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                A public repository on GitHub or GitLab; no git connection
-                needed.
-              </p>
-            )}
-          </FormItem>
+            ) : null}
+          </div>
         )}
       />
 
@@ -608,30 +602,28 @@ function PublicRepositoryFields({
   )
 }
 
-interface SelectionBarProps {
+interface SelectionSummaryProps {
   mode: Mode
   repository: RepositoryResponse | null
   publicName: string | null
   target: { owner: string; name: string } | null
-  branchSelector: React.ReactNode
-  actions: React.ReactNode
+  branchSelector: ReactNode
 }
 
 /**
- * What will be saved, kept in view while the repository list scrolls: the
- * chosen repository, its branch, and the save action.
+ * What will be saved: the chosen repository and the branch services follow.
+ * Always rendered, so choosing a repository never shifts the page.
  */
-function SelectionBar({
+function SelectionSummary({
   mode,
   repository,
   publicName,
   target,
   branchSelector,
-  actions,
-}: SelectionBarProps) {
+}: SelectionSummaryProps) {
   return (
-    <div className="sticky bottom-4 z-10 flex flex-col gap-4 rounded-lg border bg-card p-4 shadow-lg lg:flex-row lg:items-center lg:justify-between">
-      <div className="flex min-w-0 flex-1 flex-col gap-3 sm:flex-row sm:items-center">
+    <Card>
+      <CardContent className="flex flex-col gap-4 pt-6 sm:flex-row sm:items-end sm:justify-between">
         <div className="flex min-w-0 items-center gap-3">
           {mode === 'connection' && repository && (
             <RepositoryAvatar repository={repository} />
@@ -652,22 +644,22 @@ function SelectionBar({
             ) : (
               <p className="text-sm text-muted-foreground">
                 {mode === 'public'
-                  ? 'Enter a public repository URL'
-                  : 'Choose a repository from the list'}
+                  ? 'Enter a public repository URL below'
+                  : 'Choose a repository from the list below'}
               </p>
             )}
           </div>
         </div>
         {target && (
-          <div className="min-w-0 sm:w-64">
-            <Label className="sr-only">Branch</Label>
-            {branchSelector}
-          </div>
+          <Field
+            label="Branch"
+            description="Pushes to this branch deploy the project's services."
+            className="min-w-0 sm:w-72"
+          >
+            {() => branchSelector}
+          </Field>
         )}
-      </div>
-      <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-        {actions}
-      </div>
-    </div>
+      </CardContent>
+    </Card>
   )
 }

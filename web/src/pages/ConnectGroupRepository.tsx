@@ -8,7 +8,7 @@ import { ChevronLeft, RefreshCw } from 'lucide-react'
 import { getProjectGroupBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+import { PageContainer } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -125,27 +125,23 @@ export function ConnectGroupRepository() {
   }
 
   return (
-    <PageContainer>
-      {back}
-      <PageHeader
-        title={title}
-        description={
-          <>
-            Connect the repository once, then add each app in it (say{' '}
-            <code>apps/web</code> and <code>apps/api</code>) as a service.
-            Services follow {group.name}&apos;s branch and each keeps its own
-            directory.
-          </>
-        }
-      />
-      <ConnectRepositoryPanel
-        key={group.id}
-        group={group}
-        cancelHref={backHref}
-        onConnected={() =>
-          navigate(importAfter ? `${backHref}?${IMPORT_PARAM}=1` : backHref)
-        }
-      />
-    </PageContainer>
+    <ConnectRepositoryPanel
+      key={group.id}
+      group={group}
+      title={title}
+      description={
+        <>
+          Connect the repository once, then add each app in it (say{' '}
+          <code>apps/web</code> and <code>apps/api</code>) as a service.
+          Services follow {group.name}&apos;s branch and each keeps its own
+          directory.
+        </>
+      }
+      backLink={back}
+      onCancel={() => navigate(backHref)}
+      onConnected={() =>
+        navigate(importAfter ? `${backHref}?${IMPORT_PARAM}=1` : backHref)
+      }
+    />
   )
 }
