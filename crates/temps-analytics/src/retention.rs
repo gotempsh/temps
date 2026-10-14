@@ -1417,6 +1417,9 @@ mod integration_tests {
             is_eu: Set(false),
             created_at: Set(at),
             updated_at: Set(at),
+            // The column defaults to now(); an address that has not been
+            // handed out since `at` needs the age stated.
+            last_used_at: Set(Some(at)),
             ..Default::default()
         }
         .insert(db)
