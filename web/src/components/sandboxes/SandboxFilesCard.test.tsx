@@ -882,3 +882,31 @@ test('a truncated listing tells the operator the rest is not shown', async () =>
   await view.findByText(/Only the first 1 entries are shown/)
   api.restore()
 })
+
+test('saving a new file adds it to the listing of its directory', async () => {
+  let written = false
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      listing(WORK_DIR, written ? [{ name: 'notes.txt', kind: 'file' }] : []),
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: written,
+        is_file: written,
+        is_dir: false,
+        size: written ? 5 : 0,
+      }),
+    'POST /v1/sandboxes/sbx_1/fs/write': () => {
+      written = true
+      return new Response(null, { status: 204 })
+    },
+  })
+  const view = renderCard()
+  await view.findByText('This directory is empty.')
+
+  await openAndSave(view, PATH, 'hello')
+
+  await view.findByRole('button', { name: /notes\.txt/ })
+  expect(view.queryByText('This directory is empty.')).toBeNull()
+  api.restore()
+})

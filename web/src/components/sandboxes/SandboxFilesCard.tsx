@@ -459,10 +459,17 @@ function FileEditor({
           properties
         )
       )
+      // A write can create the file, so any listing of its directory is now
+      // out of date; the browser would keep saying "This directory is empty."
       void queryClient.invalidateQueries({
-        predicate: (query) =>
-          (query.queryKey[0] as { _id?: string } | undefined)?._id ===
-          'statPath',
+        predicate: (query) => {
+          const key = query.queryKey[0] as
+            { _id?: string; path?: { id?: string } } | undefined
+          return (
+            key?._id === 'statPath' ||
+            (key?._id === 'listDir' && key.path?.id === sandboxId)
+          )
+        },
       })
     },
   })
