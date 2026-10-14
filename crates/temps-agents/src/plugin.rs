@@ -157,6 +157,7 @@ async fn build_sandbox_provider(
     use crate::sandbox::SandboxBackend;
 
     let data_dir = crate::sandbox::microsandbox::host_data_dir();
+    refresh_staged_pty_agents(&data_dir);
     let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
         std::collections::HashMap::new();
 
@@ -188,6 +189,74 @@ async fn build_sandbox_provider(
         default
     );
     Arc::new(RoutingSandboxProvider::new(backends, default))
+}
+
+/// Keep the guest terminal agent each microVM backend injects in step with
+/// the `temps-pty-agent` shipped beside this executable (release archive,
+/// installer and `temps upgrade` all place it there).
+///
+/// Only backends an operator has already set up are touched -- their state
+/// directory exists -- so a host that never opted into microVMs gets no new
+/// directories. Failures are logged and otherwise ignored: a stale agent
+/// degrades terminals (reported by the capability status) but must never stop
+/// the server from starting.
+fn refresh_staged_pty_agents(data_dir: &std::path::Path) {
+    use crate::sandbox::firecracker::FirecrackerSandboxConfig;
+    use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
+    use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
+
+    let Some(source) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(PTY_AGENT_BINARY_NAME)))
+    else {
+        return;
+    };
+    if !source.is_file() {
+        tracing::debug!(
+            "no {} beside the temps executable ({}); guest terminal agents are not refreshed",
+            PTY_AGENT_BINARY_NAME,
+            source.display()
+        );
+        return;
+    }
+
+    let microsandbox = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    let firecracker = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    let targets = [
+        (
+            "microsandbox",
+            microsandbox.home(),
+            microsandbox.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            firecracker.pty_agent_bin(),
+        ),
+    ];
+    for (backend, state_dir, staged) in targets {
+        if !state_dir.is_dir() {
+            continue;
+        }
+        match sync_pty_agent_binary(&source, &staged) {
+            Ok(PtyAgentSync::AlreadyCurrent) => tracing::debug!(
+                backend,
+                staged = %staged.display(),
+                "guest terminal agent is current"
+            ),
+            Ok(PtyAgentSync::Staged) => tracing::info!(
+                backend,
+                staged = %staged.display(),
+                source = %source.display(),
+                "updated the staged guest terminal agent to the one shipped with this temps"
+            ),
+            Err(error) => tracing::warn!(
+                backend,
+                "could not refresh the staged guest terminal agent: {}",
+                error
+            ),
+        }
+    }
 }
 
 /// The host-default backend from the platform setting. Docker unless the

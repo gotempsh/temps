@@ -682,6 +682,67 @@ pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgent
     Ok(())
 }
 
+/// What [`sync_pty_agent_binary`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyAgentSync {
+    /// The staged copy already matched the shipped one.
+    AlreadyCurrent,
+    /// The staged copy was missing or different and has been replaced.
+    Staged,
+}
+
+/// Bring the agent staged at `dest` in line with the one shipped at `source`.
+///
+/// `temps upgrade` and the installer replace the `temps-pty-agent` that sits
+/// beside the `temps` executable; the copy each microVM backend injects into
+/// guests lives in the data directory and would otherwise only change when
+/// someone re-ran a `setup` command. The server calls this at startup so a new
+/// release's agent is the one guests get, with no operator step.
+///
+/// Compares content rather than timestamps (a rollback to an older release
+/// must also replace a newer staged copy) and reuses
+/// [`stage_pty_agent_binary`], so an unusable source is rejected and the
+/// replacement is atomic.
+pub fn sync_pty_agent_binary(
+    source: &Path,
+    dest: &Path,
+) -> Result<PtyAgentSync, PtyAgentStagingError> {
+    if files_have_same_content(source, dest) {
+        return Ok(PtyAgentSync::AlreadyCurrent);
+    }
+    stage_pty_agent_binary(source, dest)?;
+    Ok(PtyAgentSync::Staged)
+}
+
+/// Whether both files exist and hold identical bytes. Any read failure counts
+/// as "different" so the caller falls through to staging, which reports the
+/// real error with the paths attached.
+fn files_have_same_content(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    match (fa.metadata(), fb.metadata()) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {}
+        _ => return false,
+    }
+    let mut buf_a = [0u8; 64 * 1024];
+    let mut buf_b = [0u8; 64 * 1024];
+    loop {
+        let Ok(n) = fa.read(&mut buf_a) else {
+            return false;
+        };
+        if n == 0 {
+            // Equal lengths were checked above, so `a` ending means `b` ends.
+            return true;
+        }
+        if fb.read_exact(&mut buf_b[..n]).is_err() || buf_a[..n] != buf_b[..n] {
+            return false;
+        }
+    }
+}
+
 /// Whether `header` (a file's leading bytes) starts an ELF image. The guests
 /// are Linux, so an ELF header is the cheapest check that a staged agent is
 /// not, say, a Mach-O build for the developer's laptop.
@@ -1657,6 +1718,68 @@ mod tests {
         // No temporary left behind, and re-staging over an existing file works.
         assert!(!dest.with_extension("staging").exists());
         stage_pty_agent_binary(&elf, &dest).unwrap();
+    }
+
+    #[test]
+    fn sync_replaces_a_stale_agent_and_leaves_a_current_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shipped");
+        let dest = dir.path().join("guest").join(PTY_AGENT_BINARY_NAME);
+
+        std::fs::write(&source, test_elf::static_for_host(b"v1")).unwrap();
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::Staged,
+            "a missing staged copy is created"
+        );
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::AlreadyCurrent
+        );
+
+        // Same length, different bytes: a release that only changed content.
+        std::fs::write(&source, test_elf::static_for_host(b"v2")).unwrap();
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::Staged
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            test_elf::static_for_host(b"v2")
+        );
+
+        // Different length, e.g. a downgrade to a smaller build.
+        std::fs::write(&source, test_elf::static_for_host(b"v3-longer")).unwrap();
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::Staged
+        );
+        assert!(!dest.with_extension("staging").exists());
+    }
+
+    #[test]
+    fn sync_never_replaces_a_working_agent_with_an_unusable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good");
+        let dest = dir.path().join(PTY_AGENT_BINARY_NAME);
+        let good_bytes = test_elf::static_for_host(b"good");
+        std::fs::write(&good, &good_bytes).unwrap();
+        sync_pty_agent_binary(&good, &dest).unwrap();
+
+        // The macOS build next to a development `temps`.
+        let foreign = dir.path().join("foreign");
+        std::fs::write(&foreign, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            sync_pty_agent_binary(&foreign, &dest).unwrap_err(),
+            PtyAgentStagingError::Rejected { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), good_bytes);
+
+        assert!(matches!(
+            sync_pty_agent_binary(&dir.path().join("absent"), &dest).unwrap_err(),
+            PtyAgentStagingError::Missing { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), good_bytes);
     }
 
     #[test]

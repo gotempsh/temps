@@ -227,7 +227,7 @@ impl FirecrackerSandboxConfig {
         }
     }
 
-    fn fc_root(&self) -> PathBuf {
+    pub(crate) fn fc_root(&self) -> PathBuf {
         self.data_dir.join("firecracker")
     }
     fn firecracker_bin(&self) -> PathBuf {
@@ -239,7 +239,7 @@ impl FirecrackerSandboxConfig {
     /// Static musl `temps-pty-agent`, injected next to the VM agent so the
     /// guest can serve interactive terminals. Optional: a host without it
     /// still creates sandboxes, just without terminals.
-    fn pty_agent_bin(&self) -> PathBuf {
+    pub(crate) fn pty_agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-pty-agent")
     }
     fn kernel_glob_dir(&self) -> PathBuf {
