@@ -20,16 +20,7 @@ import type {
   GroupRouteResponse,
   ProjectGroupResponse,
 } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -206,37 +197,23 @@ export function GroupRoutesSettings({
         </div>
       ) : null}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={confirming !== null}
-        onOpenChange={(open) => !open && setConfirming(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Remove the {confirming?.path_prefix} route?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              Requests to {confirming?.path_prefix} on{' '}
-              {confirming?.source_project_name}&apos;s domains stop going to{' '}
-              {confirming?.target_project_name} right away and are answered by{' '}
-              {confirming?.source_project_name} itself. Clients that call that
-              path may start failing.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                const route = confirming
-                setConfirming(null)
-                if (route) void removeRoute(route)
-              }}
-            >
-              Remove route
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setConfirming(null)
+        }}
+        resourceType="route"
+        resourceName={confirming?.path_prefix ?? ''}
+        verb="Remove"
+        confirmLabel="Remove route"
+        consequences={`Requests to ${confirming?.path_prefix ?? ''} on ${confirming?.source_project_name ?? ''}'s domains stop going to ${confirming?.target_project_name ?? ''} right away and are answered by ${confirming?.source_project_name ?? ''} itself. Clients that call that path may start failing.`}
+        irreversible={false}
+        onConfirm={() => {
+          const route = confirming
+          setConfirming(null)
+          if (route) void removeRoute(route)
+        }}
+      />
 
       {services.length < 2 ? (
         <p className="rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">

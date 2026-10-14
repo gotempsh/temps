@@ -37,6 +37,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -84,6 +85,11 @@ interface ProjectIpAccessCardProps {
   projectId: number
   /** Set to manage one environment's list instead of the project-wide one. */
   environmentId?: number
+  /**
+   * Name of the project (or environment) this list belongs to, shown when
+   * removing it is confirmed. Falls back to the numeric id.
+   */
+  scopeName?: string
 }
 
 const INHERIT_MODE: { value: IpAccessFormMode; hint: string } = {
@@ -113,6 +119,7 @@ function isLockoutError(error: unknown): boolean {
 export function ProjectIpAccessCard({
   projectId,
   environmentId,
+  scopeName,
 }: ProjectIpAccessCardProps) {
   const queryClient = useQueryClient()
   const isEnvironment = environmentId !== undefined
@@ -336,8 +343,9 @@ export function ProjectIpAccessCard({
 
   const onSubmit = form.handleSubmit((values) => {
     if (values.mode === 'inherit') {
-      // "Follow the project list" is the absence of a row, not a mode.
-      remove_.mutate()
+      // "Follow the project list" is the absence of a row, not a mode, so
+      // saving it deletes the list: confirm like the Remove button does.
+      setConfirmRemove(true)
       return
     }
     save.mutate(toRequest({ ...values, mode: values.mode }, false))
@@ -743,26 +751,23 @@ export function ProjectIpAccessCard({
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog open={confirmRemove} onOpenChange={setConfirmRemove}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {isEnvironment ? 'Use the project list?' : 'Remove this list?'}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {isEnvironment
-                ? 'This environment will follow the project-wide list again.'
-                : 'Every environment of this project will be open to all addresses again.'}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => remove_.mutate()}>
-              {isEnvironment ? 'Use project list' : 'Remove list'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={confirmRemove}
+        onOpenChange={setConfirmRemove}
+        verb="Remove"
+        confirmLabel={isEnvironment ? 'Use project list' : 'Remove list'}
+        resourceType={`IP access list of ${scopeNoun}`}
+        resourceName={
+          scopeName ?? (isEnvironment ? `#${environmentId}` : `#${projectId}`)
+        }
+        consequences={
+          isEnvironment
+            ? 'This environment will follow the project-wide list again.'
+            : 'Every environment of this project will be open to all addresses again.'
+        }
+        isPending={remove_.isPending}
+        onConfirm={() => remove_.mutate()}
+      />
     </SettingsSection>
   )
 }

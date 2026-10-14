@@ -19,6 +19,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -823,32 +824,20 @@ export function BackupDetail() {
         }
       />
 
-      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this backup permanently?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This removes the backup data from object storage and deletes its
-              history record. This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Keep backup
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(event) => {
-                event.preventDefault()
-                deleteMutation.mutate()
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete permanently'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        resourceType="backup"
+        resourceName={shortBackupLabel}
+        confirmLabel="Delete permanently"
+        consequences={
+          backup?.external_service
+            ? `This removes the backup data of ${backup.external_service.name} from object storage and deletes its history record. It can no longer be restored.`
+            : 'This removes the backup data from object storage and deletes its history record. It can no longer be restored.'
+        }
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate()}
+      />
 
       {/* Cancel-confirm dialog. Open via the header "Cancel" button. */}
       <AlertDialog

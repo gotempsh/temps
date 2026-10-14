@@ -18,18 +18,9 @@ import {
   updateTeamMemberRoleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamMemberResponse, TeamRole } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -629,44 +620,32 @@ export function TeamDetail() {
         onOpenChange={setAddOpen}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={memberToRemove !== null}
         onOpenChange={(open) => {
           if (!open) setMemberToRemove(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove member?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {memberToRemove?.user_name ?? 'This user'} loses access to every
-              service they could only reach through this team. This takes effect
-              immediately.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={removeMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                if (memberToRemove) {
-                  removeMutation.mutate({
-                    path: {
-                      team_id: teamId,
-                      user_id: memberToRemove.user_id,
-                    },
-                  })
-                }
-              }}
-              disabled={removeMutation.isPending}
-            >
-              {removeMutation.isPending ? 'Removing…' : 'Remove'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="team member"
+        resourceName={
+          memberToRemove?.user_name ||
+          memberToRemove?.user_email ||
+          (memberToRemove ? `user #${memberToRemove.user_id}` : '')
+        }
+        verb="Remove"
+        consequences={`They lose access to every service they could only reach through ${team?.name ?? 'this team'}. This takes effect immediately.`}
+        irreversible={false}
+        isPending={removeMutation.isPending}
+        onConfirm={() => {
+          if (memberToRemove) {
+            removeMutation.mutate({
+              path: {
+                team_id: teamId,
+                user_id: memberToRemove.user_id,
+              },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

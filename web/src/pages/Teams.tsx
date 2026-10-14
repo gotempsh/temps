@@ -18,18 +18,9 @@ import {
   listTeamsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamResponse } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
@@ -382,43 +373,24 @@ export function Teams() {
 
       {verificationDialog}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={teamToDelete !== null}
         onOpenChange={(open) => {
           if (!open) setTeamToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete team?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This permanently deletes the team
-              {teamToDelete ? ` "${teamToDelete.name}"` : ''} along with its
-              memberships and service-access grants. Members lose access to
-              every service they could only reach through this team. This cannot
-              be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                if (teamToDelete) {
-                  deleteMutation.mutate({
-                    path: { team_id: teamToDelete.id },
-                  })
-                }
-              }}
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete team'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="team"
+        resourceName={teamToDelete?.name ?? ''}
+        consequences="Its memberships and service-access grants are deleted with it. Members lose access to every service they could only reach through this team."
+        confirmLabel="Delete team"
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (teamToDelete) {
+            deleteMutation.mutate({
+              path: { team_id: teamToDelete.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

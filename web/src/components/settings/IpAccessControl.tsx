@@ -17,16 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -71,7 +62,8 @@ export function IpAccessControl() {
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [editingRule, setEditingRule] =
     useState<IpAccessControlResponse | null>(null)
-  const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [deletingRule, setDeletingRule] =
+    useState<IpAccessControlResponse | null>(null)
 
   const {
     data: rules = [],
@@ -109,6 +101,7 @@ export function IpAccessControl() {
     onSuccess: async () => {
       await refetch()
       toast.success('IP access control rule deleted successfully')
+      setDeletingRule(null)
     },
     onError: (error: any) => {
       toast.error(error?.message || 'Failed to delete IP access control rule')
@@ -175,14 +168,13 @@ export function IpAccessControl() {
     setIsEditDialogOpen(true)
   }
 
-  const handleDelete = (id: number) => {
-    setDeletingId(id)
+  const handleDelete = (rule: IpAccessControlResponse) => {
+    setDeletingRule(rule)
   }
 
   const confirmDelete = () => {
-    if (deletingId === null) return
-    deleteMutation.mutate({ path: { id: deletingId } })
-    setDeletingId(null)
+    if (deletingRule === null) return
+    deleteMutation.mutate({ path: { id: deletingRule.id } })
   }
 
   const handleCreateDialogOpen = (open: boolean) => {
@@ -286,7 +278,7 @@ export function IpAccessControl() {
                           type="button"
                           variant="ghost"
                           size="icon"
-                          onClick={() => handleDelete(rule.id)}
+                          onClick={() => handleDelete(rule)}
                           disabled={deleteMutation.isPending}
                         >
                           <Trash2 className="h-4 w-4" />
@@ -346,7 +338,7 @@ export function IpAccessControl() {
                           type="button"
                           variant="ghost"
                           size="icon"
-                          onClick={() => handleDelete(rule.id)}
+                          onClick={() => handleDelete(rule)}
                           disabled={deleteMutation.isPending}
                         >
                           <Trash2 className="h-4 w-4" />
@@ -553,30 +545,23 @@ export function IpAccessControl() {
           </DialogContent>
         </Dialog>
 
-        <AlertDialog
-          open={deletingId !== null}
+        <ConfirmDeleteDialog
+          open={deletingRule !== null}
           onOpenChange={(open) => {
-            if (!open) setDeletingId(null)
+            if (!open) setDeletingRule(null)
           }}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>
-                Delete IP access control rule?
-              </AlertDialogTitle>
-              <AlertDialogDescription>
-                This action cannot be undone. The rule will no longer be
-                enforced at the proxy.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction onClick={confirmDelete}>
-                Delete
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+          resourceType={
+            deletingRule?.action === 'allow' ? 'IP allow rule' : 'IP block rule'
+          }
+          resourceName={deletingRule?.ip_address ?? ''}
+          consequences={
+            deletingRule?.action === 'allow'
+              ? 'The rule will no longer be enforced at the proxy; this address is no longer explicitly allowed.'
+              : 'The rule will no longer be enforced at the proxy; this address will no longer be blocked.'
+          }
+          isPending={deleteMutation.isPending}
+          onConfirm={confirmDelete}
+        />
       </CardContent>
     </Card>
   )

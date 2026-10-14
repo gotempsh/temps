@@ -31,7 +31,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -521,11 +521,14 @@ export function ProvidersManagement({
         </DialogContent>
       </Dialog>
 
-      <ConfirmDialog
+      <ConfirmDeleteDialog
         open={providerToDelete !== null}
-        onOpenChange={(open) => !open && setProviderToDelete(null)}
-        title={`Delete ${providerToDelete?.name ?? 'provider'}?`}
-        description="This permanently deletes the notification provider. Notification routes that use it will stop delivering to it. This cannot be undone."
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="notification provider"
+        resourceName={providerToDelete?.name ?? ''}
+        consequences="Notification routes that use it will stop delivering to it."
         onConfirm={handleConfirmDelete}
       />
     </div>

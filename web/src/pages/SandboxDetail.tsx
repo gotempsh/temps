@@ -60,6 +60,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   execMutation,
   extendTimeoutMutation,
@@ -1176,29 +1177,15 @@ export default function SandboxDetail() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Delete dialog */}
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete sandbox?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This tears down the container for{' '}
-              <span className="font-mono">{sandbox.id}</span>. The row is kept
-              for audit but cannot be restarted.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => deleteMutation.mutate({ path: { id: sandboxId } })}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        resourceType="sandbox"
+        resourceName={sandbox.name || sandbox.id}
+        consequences={`This tears down the container for ${sandbox.id}. The row is kept for audit but cannot be restarted.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate({ path: { id: sandboxId } })}
+      />
     </>
   )
 }

@@ -9,15 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -189,9 +181,11 @@ function SubdomainCard({
 function PurgeAssetCacheCard({
   projectId,
   environmentId,
+  environmentName,
 }: {
   projectId: number
   environmentId: number
+  environmentName: string
 }) {
   const [isPurging, setIsPurging] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
@@ -220,28 +214,21 @@ function PurgeAssetCacheCard({
       icon={HardDrive}
       description="Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback. Purge if you need to force-clear cached assets for this environment."
     >
-      <AlertDialog open={showConfirm} onOpenChange={setShowConfirm}>
-        <AlertDialogTrigger asChild>
-          <Button variant="outline" size="sm">
-            <RefreshCw className="h-4 w-4 mr-2" />
-            Purge Asset Cache
-          </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogTitle>Purge Asset Cache</AlertDialogTitle>
-          <AlertDialogDescription>
-            This will delete all cached static assets for this environment.
-            In-flight users with old HTML may see broken pages until they
-            refresh. Orphaned blobs are cleaned up automatically overnight.
-          </AlertDialogDescription>
-          <div className="flex justify-end gap-3 mt-4">
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handlePurge} disabled={isPurging}>
-              {isPurging ? 'Purging...' : 'Purge Cache'}
-            </AlertDialogAction>
-          </div>
-        </AlertDialogContent>
-      </AlertDialog>
+      <Button variant="outline" size="sm" onClick={() => setShowConfirm(true)}>
+        <RefreshCw className="h-4 w-4 mr-2" />
+        Purge Asset Cache
+      </Button>
+      <ConfirmDeleteDialog
+        open={showConfirm}
+        onOpenChange={setShowConfirm}
+        verb="Purge"
+        confirmLabel="Purge Cache"
+        resourceType="asset cache of environment"
+        resourceName={environmentName}
+        consequences="All cached static assets for this environment are deleted. In-flight users with old HTML may see broken pages until they refresh. Orphaned blobs are cleaned up automatically overnight."
+        isPending={isPurging}
+        onConfirm={() => void handlePurge()}
+      />
     </SettingsSection>
   )
 }
@@ -344,6 +331,7 @@ export function EnvironmentDetail({
         key={`ip-access:${environment.id}`}
         projectId={project.id}
         environmentId={environment.id}
+        scopeName={environment.name}
       />
 
       <SubdomainCard
@@ -362,6 +350,7 @@ export function EnvironmentDetail({
       <PurgeAssetCacheCard
         projectId={project.id}
         environmentId={environmentId}
+        environmentName={environment.name}
       />
 
       <SettingsSection
@@ -382,47 +371,32 @@ export function EnvironmentDetail({
               accidental data loss.
             </p>
           )}
-          <AlertDialog
+          <Button
+            variant="destructive"
+            disabled={isProduction}
+            className="w-full sm:w-auto"
+            onClick={() => setShowDeleteConfirm(true)}
+          >
+            <Trash2 className="h-4 w-4 mr-2" />
+            Delete Environment
+          </Button>
+          <ConfirmDeleteDialog
             open={showDeleteConfirm}
             onOpenChange={setShowDeleteConfirm}
-          >
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="destructive"
-                disabled={isProduction}
-                className="w-full sm:w-auto"
-              >
-                <Trash2 className="h-4 w-4 mr-2" />
-                Delete Environment
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogTitle>Delete Environment</AlertDialogTitle>
-              <AlertDialogDescription>
-                Are you sure you want to delete the &quot;{environment.name}
-                &quot; environment? This action cannot be undone.
-              </AlertDialogDescription>
-              <div className="flex justify-end gap-3 mt-6">
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  onClick={async () => {
-                    await removeEnvironmentMutation.mutateAsync({
-                      path: {
-                        project_id: project.id || 0,
-                        env_id: Number(environmentId),
-                      },
-                    })
-                  }}
-                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  disabled={removeEnvironmentMutation.isPending}
-                >
-                  {removeEnvironmentMutation.isPending
-                    ? 'Deleting...'
-                    : 'Delete Environment'}
-                </AlertDialogAction>
-              </div>
-            </AlertDialogContent>
-          </AlertDialog>
+            confirmLabel="Delete Environment"
+            resourceType="environment"
+            resourceName={environment.name}
+            consequences="All configurations, deployments, and data associated with it are removed."
+            isPending={removeEnvironmentMutation.isPending}
+            onConfirm={() =>
+              removeEnvironmentMutation.mutate({
+                path: {
+                  project_id: project.id || 0,
+                  env_id: Number(environmentId),
+                },
+              })
+            }
+          />
         </div>
       </SettingsSection>
     </div>

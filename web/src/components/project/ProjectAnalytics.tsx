@@ -88,6 +88,7 @@ import { useInvalidateGroups } from '@/components/project-groups/useProjectGroup
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -1801,6 +1802,8 @@ function analyticsIngestBaseUrl(
 
 function IngestKeySetup({ project }: ProjectAnalyticsProps) {
   const queryClient = useQueryClient()
+  const [revokeTarget, setRevokeTarget] =
+    React.useState<AnalyticsIngestKey | null>(null)
   const { data: settings } = useSettings()
   const baseUrl = analyticsIngestBaseUrl(settings?.external_url)
 
@@ -1978,48 +1981,40 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             </div>
           )}
 
-          {/* Always mounted for the same reason as the Rotate dialog above —
-              only the trigger's visibility depends on `primaryKey`. */}
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="ghost"
-                size="sm"
-                className={primaryKey ? 'text-muted-foreground' : 'hidden'}
-                disabled={revokeKey.isPending}
-              >
-                <Ban className="h-4 w-4 mr-2" />
-                Revoke key
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  Analytics from apps using this key stop being recorded
-                  immediately. The key stays listed here, marked revoked, so you
-                  can still tell which key ingested past data.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  disabled={revokeKey.isPending}
-                  onClick={() =>
-                    primaryKey &&
-                    revokeKey.mutate({
-                      path: {
-                        project_id: project.id,
-                        key_id: primaryKey.id,
-                      },
-                    })
-                  }
-                >
-                  {revokeKey.isPending ? 'Revoking…' : 'Revoke key'}
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={primaryKey ? 'text-muted-foreground' : 'hidden'}
+            disabled={revokeKey.isPending}
+            onClick={() => primaryKey && setRevokeTarget(primaryKey)}
+          >
+            <Ban className="h-4 w-4 mr-2" />
+            Revoke key
+          </Button>
+          <ConfirmDeleteDialog
+            open={revokeTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) setRevokeTarget(null)
+            }}
+            verb="Revoke"
+            confirmLabel="Revoke key"
+            resourceType="analytics ingest key"
+            resourceName={revokeTarget?.public_key ?? ''}
+            consequences="Analytics from apps using this key stop being recorded immediately. The key stays listed here, marked revoked, so you can still tell which key ingested past data."
+            isPending={revokeKey.isPending}
+            onConfirm={() => {
+              if (!revokeTarget) return
+              revokeKey.mutate(
+                {
+                  path: {
+                    project_id: project.id,
+                    key_id: revokeTarget.id,
+                  },
+                },
+                { onSettled: () => setRevokeTarget(null) }
+              )
+            }}
+          />
         </CardContent>
       </Card>
 

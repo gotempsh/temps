@@ -11,20 +11,11 @@ import {
   removeRoleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { RouteUserWithRoles } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
@@ -94,7 +85,9 @@ export function UsersManagement({
   reloadUsers,
   onEditUser,
 }: UsersManagementProps) {
-  const [userToDelete, setUserToDelete] = useState<number | null>(null)
+  const [userToDelete, setUserToDelete] = useState<RouteUserWithRoles | null>(
+    null
+  )
   const [userToManageRoles, setUserToManageRoles] =
     useState<RouteUserWithRoles | null>(null)
   const [userToResetPassword, setUserToResetPassword] =
@@ -181,14 +174,6 @@ export function UsersManagement({
     },
   })
 
-  const handleDeleteUser = async (userId: number) => {
-    await deleteUser.mutateAsync({
-      path: {
-        user_id: userId,
-      },
-    })
-  }
-
   const handleRoleChange = async (
     userId: number,
     roleType: string,
@@ -245,30 +230,29 @@ export function UsersManagement({
         }
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={userToDelete !== null}
-        onOpenChange={(open) => !open && setUserToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              user and remove their access to the platform.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => userToDelete && handleDeleteUser(userToDelete)}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteUser.isPending}
-            >
-              {deleteUser.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setUserToDelete(null)
+        }}
+        resourceType="user"
+        resourceName={
+          userToDelete?.user.name ||
+          userToDelete?.user.username ||
+          userToDelete?.user.email ||
+          `#${userToDelete?.user.id ?? ''}`
+        }
+        consequences={
+          userToDelete?.user.email
+            ? `${userToDelete.user.email} will lose access to the platform and its sessions will end.`
+            : 'This user will lose access to the platform and its sessions will end.'
+        }
+        isPending={deleteUser.isPending}
+        onConfirm={() => {
+          if (userToDelete)
+            deleteUser.mutate({ path: { user_id: userToDelete.user.id } })
+        }}
+      />
 
       <Dialog
         open={!!userToManageRoles}
@@ -526,7 +510,7 @@ export function UsersManagement({
                       )}
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
-                        onClick={() => setUserToDelete(user.user.id)}
+                        onClick={() => setUserToDelete(user)}
                         className="text-destructive"
                       >
                         <Trash2 className="mr-2 h-4 w-4" />

@@ -14,7 +14,10 @@ import {
   listScheduleServicesOptions,
   listScheduleServicesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { BackupScheduleResponse } from '@/api/client/types.gen'
+import {
+  BackupScheduleResponse,
+  ExternalServiceSummary,
+} from '@/api/client/types.gen'
 import { ScheduleServicesSelector } from '@/components/backups/ScheduleServicesSelector'
 import {
   Dialog,
@@ -24,17 +27,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -234,6 +228,9 @@ export function ScheduleDetail() {
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showCleanupDialog, setShowCleanupDialog] = useState(false)
+  const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false)
+  const [detachTarget, setDetachTarget] =
+    useState<ExternalServiceSummary | null>(null)
   const [cleanupReport, setCleanupReport] =
     useState<RetentionCleanupReport | null>(null)
   const [showAttachDialog, setShowAttachDialog] = useState(false)
@@ -379,7 +376,9 @@ export function ScheduleDetail() {
   const detachMutation = useMutation({
     ...detachScheduleServiceMutation(),
     meta: { errorTitle: 'Failed to detach service' },
+    onError: () => setDetachTarget(null),
     onSuccess: () => {
+      setDetachTarget(null)
       toast.success('Service detached')
       void queryClient.invalidateQueries({
         queryKey: listScheduleServicesQueryKey({
@@ -850,14 +849,7 @@ export function ScheduleDetail() {
                               size="icon"
                               className="h-7 w-7 text-muted-foreground hover:text-destructive"
                               disabled={detachMutation.isPending}
-                              onClick={() =>
-                                detachMutation.mutate({
-                                  path: {
-                                    id: scheduleId!,
-                                    service_id: svc.id,
-                                  },
-                                })
-                              }
+                              onClick={() => setDetachTarget(svc)}
                               aria-label={`Detach ${svc.name}`}
                             >
                               <X className="h-4 w-4" />
@@ -1007,11 +999,7 @@ export function ScheduleDetail() {
             {cleanupReport?.dry_run && cleanupReport.expired > 0 && (
               <Button
                 variant="destructive"
-                onClick={() =>
-                  cleanupExecuteMutation.mutate(
-                    cleanupReport.candidate_backup_ids
-                  )
-                }
+                onClick={() => setConfirmCleanupOpen(true)}
                 disabled={cleanupExecuteMutation.isPending}
               >
                 {cleanupExecuteMutation.isPending ? (
@@ -1027,34 +1015,50 @@ export function ScheduleDetail() {
         </DialogContent>
       </Dialog>
 
-      {/* ── Delete confirmation dialog ── */}
-      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete schedule?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete &ldquo;{schedule.name}&rdquo;.
-              Existing backup records are not deleted, but no new backups will
-              be scheduled.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() =>
-                deleteMutation.mutate({ path: { id: schedule.id } })
-              }
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : null}
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      {/* ── Delete confirmation dialogs ── */}
+      <ConfirmDeleteDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        resourceType="backup schedule"
+        resourceName={schedule.name}
+        consequences="Existing backup records are not deleted, but no new backups will be scheduled."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate({ path: { id: schedule.id } })}
+      />
+      <ConfirmDeleteDialog
+        open={detachTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDetachTarget(null)
+        }}
+        resourceType="service"
+        resourceName={detachTarget?.name ?? ''}
+        verb="Detach"
+        confirmLabel="Detach service"
+        irreversible={false}
+        consequences={`It is no longer backed up by schedule ${schedule.name}. Existing backups are kept, and you can attach it again later.`}
+        isPending={detachMutation.isPending}
+        onConfirm={() => {
+          if (detachTarget)
+            detachMutation.mutate({
+              path: { id: scheduleId!, service_id: detachTarget.id },
+            })
+        }}
+      />
+      <ConfirmDeleteDialog
+        open={confirmCleanupOpen}
+        onOpenChange={setConfirmCleanupOpen}
+        resourceType="expired backups of"
+        resourceName={schedule.name}
+        confirmLabel={`Delete ${cleanupReport?.candidate_backup_ids.length ?? 0} backups`}
+        consequences={`Permanently removes ${cleanupReport?.candidate_backup_ids.length ?? 0} backup(s) older than ${schedule.retention_period} days, with their stored data and history records.`}
+        isPending={cleanupExecuteMutation.isPending}
+        onConfirm={() => {
+          if (cleanupReport)
+            cleanupExecuteMutation.mutate(cleanupReport.candidate_backup_ids, {
+              onSettled: () => setConfirmCleanupOpen(false),
+            })
+        }}
+      />
     </TooltipProvider>
   )
 }

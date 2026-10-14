@@ -7,17 +7,8 @@ import {
   type DnsProviderResponse,
 } from '@/api/client'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -139,7 +130,7 @@ export function DnsProviders() {
 
   usePageTitle('DNS Providers')
 
-  const handleDeleteProvider = async () => {
+  const handleDeleteProvider = () => {
     if (!providerToDelete) return
     deleteProviderMut.mutate(providerToDelete.id)
   }
@@ -344,40 +335,18 @@ export function DnsProviders() {
       </div>
 
       {/* Delete Confirmation Dialog */}
-      <AlertDialog
-        open={!!providerToDelete}
-        onOpenChange={(open) => !open && setProviderToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete DNS Provider</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete &quot;{providerToDelete?.name}
-              &quot;? This action cannot be undone and will remove all
-              associated managed domains.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => setProviderToDelete(null)}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProviderMut.isPending}
-              onClick={handleDeleteProvider}
-            >
-              {deleteProviderMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete Provider'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={providerToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="DNS provider"
+        resourceName={providerToDelete?.name ?? ''}
+        confirmLabel="Delete Provider"
+        consequences="All managed domains associated with this provider are removed, and DNS records for them will no longer be automatically managed."
+        isPending={deleteProviderMut.isPending}
+        onConfirm={handleDeleteProvider}
+      />
     </div>
   )
 }

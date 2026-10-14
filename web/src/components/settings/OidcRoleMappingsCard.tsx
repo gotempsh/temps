@@ -16,6 +16,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
 import {
@@ -61,6 +62,8 @@ export function OidcRoleMappingsCard({
   const [draftRole, setDraftRole] = useState<'admin' | 'user'>('user')
   // Empty while editing; an empty priority means "use the suggested one".
   const [draftPriority, setDraftPriority] = useState<number | undefined>(100)
+  const [mappingToRemove, setMappingToRemove] =
+    useState<OidcRoleMappingResponse | null>(null)
 
   const suggestedPriority = useMemo(
     () => nextDefaultPriority(mappings),
@@ -101,6 +104,7 @@ export function OidcRoleMappingsCard({
         error instanceof Error ? error.message : 'Failed to delete rule'
       )
     },
+    onSettled: () => setMappingToRemove(null),
   })
 
   const handleAdd = () => {
@@ -168,18 +172,7 @@ export function OidcRoleMappingsCard({
                     variant="ghost"
                     size="sm"
                     disabled={readOnly || deleteMapping.isPending}
-                    onClick={() => {
-                      if (
-                        !confirm(
-                          `Remove rule "${mapping.idp_group} → ${mapping.role}"?`
-                        )
-                      ) {
-                        return
-                      }
-                      deleteMapping.mutate({
-                        path: { mapping_id: mapping.id },
-                      })
-                    }}
+                    onClick={() => setMappingToRemove(mapping)}
                   >
                     <Trash2 className="h-4 w-4 text-destructive" />
                   </Button>
@@ -242,6 +235,27 @@ export function OidcRoleMappingsCard({
           </div>
         </CardContent>
       </Card>
+      <ConfirmDeleteDialog
+        open={mappingToRemove !== null}
+        onOpenChange={(open) => {
+          if (!open) setMappingToRemove(null)
+        }}
+        resourceType="role mapping rule"
+        resourceName={
+          mappingToRemove
+            ? `${mappingToRemove.idp_group} → ${mappingToRemove.role}`
+            : ''
+        }
+        verb="Remove"
+        consequences={`Users in the IdP group "${mappingToRemove?.idp_group ?? ''}" will no longer be granted the ${mappingToRemove?.role ?? ''} role by this rule; their role is re-evaluated on next sign-in against the remaining rules and the provider default (${defaultRole}).`}
+        isPending={deleteMapping.isPending}
+        onConfirm={() => {
+          if (mappingToRemove)
+            deleteMapping.mutate({
+              path: { mapping_id: mappingToRemove.id },
+            })
+        }}
+      />
     </>
   )
 }

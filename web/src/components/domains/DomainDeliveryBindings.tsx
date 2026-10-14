@@ -16,14 +16,7 @@ import { fmtDateTime } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { toast } from 'sonner'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Link } from 'react-router'
 import { deliveryError, requireDeliveryData } from './delivery-errors'
 import { deliveryPageCount } from './delivery-queries'
@@ -54,6 +47,9 @@ export function DomainDeliveryBindings({
     onSuccess: () => {
       setRemoving(null)
       toast.success('Managed DNS removed. The domain route is preserved.')
+    },
+    onError: (error) => {
+      toast.error(`Could not remove managed DNS: ${deliveryError(error)}`)
     },
     onSettled: () =>
       client.invalidateQueries({ queryKey: ['delivery-bindings', projectId] }),
@@ -209,58 +205,34 @@ export function DomainDeliveryBindings({
           ariaLabel="Managed delivery pagination"
         />
       )}
-      <Dialog
-        open={!!removing}
+      <ConfirmDeleteDialog
+        open={removing !== null}
         onOpenChange={(open) => {
-          if (!open && !remove.isPending) setRemoving(null)
+          if (!open) setRemoving(null)
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Remove managed DNS?</DialogTitle>
-            <DialogDescription>
-              This removes the owned DNS record for {removing?.hostname} and can
-              interrupt traffic. The domain route and certificate stay in Temps.
-              You can delete the domain route afterward.
-              {removing?.provider_kind === 'bunny' &&
-                (removing.bunny_hostname_owned ? (
-                  <span className="mt-2 block">
-                    Temps added {removing.hostname} to your Bunny Pull Zone, so
-                    it is also detached from the Pull Zone, together with its
-                    edge certificate.
-                  </span>
-                ) : (
-                  <span className="mt-2 block">
-                    {removing.hostname} was on your Bunny Pull Zone before Temps
-                    set up delivery, so it stays there with its edge
-                    certificate. Remove it in Bunny if you no longer need it.
-                  </span>
-                ))}
-            </DialogDescription>
-          </DialogHeader>
-          {remove.isError && (
-            <Alert variant="destructive">
-              <AlertDescription>{deliveryError(remove.error)}</AlertDescription>
-            </Alert>
-          )}
-          <DialogFooter>
-            <Button
-              variant="outline"
-              disabled={remove.isPending}
-              onClick={() => setRemoving(null)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={remove.isPending}
-              onClick={() => removing && remove.mutate(removing.id)}
-            >
-              {remove.isPending ? 'Removing…' : 'Remove managed DNS'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        resourceType="managed DNS for"
+        resourceName={removing?.hostname ?? ''}
+        verb="Remove"
+        confirmLabel="Remove managed DNS"
+        consequences={removeConsequences(removing)}
+        irreversible={false}
+        isPending={remove.isPending}
+        onConfirm={() => {
+          if (removing) remove.mutate(removing.id)
+        }}
+      />
     </section>
   )
+}
+
+function removeConsequences(
+  binding: DomainDeliveryBindingResponse | null
+): string {
+  const base =
+    'This removes the owned DNS record and can interrupt traffic. The domain route and certificate stay in Temps. You can delete the domain route afterward.'
+  if (binding?.provider_kind !== 'bunny') return base
+  if (binding.bunny_hostname_owned) {
+    return `${base} Temps added ${binding.hostname} to your Bunny Pull Zone, so it is also detached from the Pull Zone, together with its edge certificate.`
+  }
+  return `${base} ${binding.hostname} was on your Bunny Pull Zone before Temps set up delivery, so it stays there with its edge certificate. Remove it in Bunny if you no longer need it.`
 }

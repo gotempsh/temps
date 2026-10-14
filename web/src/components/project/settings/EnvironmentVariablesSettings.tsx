@@ -40,17 +40,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
@@ -168,6 +158,21 @@ interface EnvironmentVariableRowProps {
   previewIds: ReadonlySet<number>
   allEnvironments: EnvironmentResponse[]
   environmentChoicesAvailable: boolean
+}
+
+/** What deleting a variable affects, naming the environments it is active on. */
+function deleteConsequences(environments: { name: string }[]): string {
+  const where =
+    environments.length > 0
+      ? `It is active on ${environments.map((env) => env.name).join(', ')}. `
+      : ''
+  return `${where}Running deployments keep the old value until they are redeployed.`
+}
+
+/** The first few keys of a bulk selection, so the user can verify it. */
+function summarizeKeys(keys: string[], shown = 3): string {
+  if (keys.length <= shown) return keys.join(', ')
+  return `${keys.slice(0, shown).join(', ')} and ${keys.length - shown} more`
 }
 
 function EnvironmentVariableRow({
@@ -313,13 +318,18 @@ function EnvironmentVariableRow({
     },
   })
 
-  const handleDelete = async () => {
-    await deleteMutation.mutateAsync({
-      path: {
-        project_id: project.id,
-        var_id: variable.id,
+  const [isDeleteOpen, setIsDeleteOpen] = useState(false)
+
+  const handleDelete = () => {
+    deleteMutation.mutate(
+      {
+        path: {
+          project_id: project.id,
+          var_id: variable.id,
+        },
       },
-    })
+      { onSettled: () => setIsDeleteOpen(false) }
+    )
   }
 
   const [isEditModalOpen, setIsEditModalOpen] = useState(false)
@@ -515,58 +525,24 @@ function EnvironmentVariableRow({
             >
               Edit
             </Button>
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button
-                  variant="ghost"
-                  className="text-muted-foreground hover:text-destructive"
-                  size="sm"
-                  disabled={
-                    deleteMutation.isPending || updateMutation.isPending
-                  }
-                >
-                  Delete
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>
-                    Delete environment variable
-                  </AlertDialogTitle>
-                  <AlertDialogDescription className="space-y-3">
-                    <p>
-                      Are you sure you want to delete{' '}
-                      <span className="font-medium">{variable.key}</span>? This
-                      action cannot be undone.
-                    </p>
-                    {variable.environments &&
-                      variable.environments.length > 0 && (
-                        <div className="space-y-2">
-                          <p className="text-sm font-medium text-foreground">
-                            This variable is active on:
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            {variable.environments.map((env) => (
-                              <span
-                                key={env.name}
-                                className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-                              >
-                                {env.name}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction onClick={handleDelete}>
-                    Delete
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
+            <Button
+              variant="ghost"
+              className="text-muted-foreground hover:text-destructive"
+              size="sm"
+              disabled={deleteMutation.isPending || updateMutation.isPending}
+              onClick={() => setIsDeleteOpen(true)}
+            >
+              Delete
+            </Button>
+            <ConfirmDeleteDialog
+              open={isDeleteOpen}
+              onOpenChange={setIsDeleteOpen}
+              resourceType="environment variable"
+              resourceName={variable.key}
+              consequences={deleteConsequences(variable.environments)}
+              isPending={deleteMutation.isPending}
+              onConfirm={handleDelete}
+            />
           </div>
         </TableCell>
       </TableRow>
@@ -1724,6 +1700,10 @@ export function EnvironmentVariablesSettings({
     }
   }
 
+  const selectedKeys = (envVariables ?? [])
+    .filter((v) => visibleSelectedIds.has(v.id))
+    .map((v) => v.key)
+
   const handleBulkDelete = async () => {
     let successCount = 0
     let errorCount = 0
@@ -2293,64 +2273,14 @@ export function EnvironmentVariablesSettings({
         }
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={isBulkDeleteDialogOpen}
         onOpenChange={setIsBulkDeleteDialogOpen}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete Multiple Variables</AlertDialogTitle>
-            <AlertDialogDescription className="space-y-3">
-              <p>
-                Are you sure you want to delete {selectedCount} environment
-                variable{selectedCount !== 1 ? 's' : ''}? This action cannot be
-                undone.
-              </p>
-              {selectedCount > 0 && (
-                <div className="space-y-2">
-                  <p className="text-sm font-medium text-foreground">
-                    Variables to be deleted:
-                  </p>
-                  <div
-                    tabIndex={0}
-                    className="max-h-[200px] overflow-auto border rounded-md p-3 space-y-1"
-                  >
-                    {(envVariables ?? [])
-                      .filter((v) => visibleSelectedIds.has(v.id))
-                      .map((v) => (
-                        <div
-                          key={v.id}
-                          className="text-sm font-mono flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between"
-                        >
-                          <span className="break-all">{v.key}</span>
-                          <div className="flex flex-wrap gap-1">
-                            {v.environments.map((env) => (
-                              <span
-                                key={env.name}
-                                className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-secondary text-secondary-foreground"
-                              >
-                                {env.name}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                  </div>
-                </div>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleBulkDelete}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete {selectedCount} Variable{selectedCount !== 1 ? 's' : ''}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="environment variables"
+        resourceName={summarizeKeys(selectedKeys)}
+        consequences={`${selectedKeys.length} variable${selectedKeys.length !== 1 ? 's are' : ' is'} removed from every environment ${selectedKeys.length !== 1 ? 'they apply' : 'it applies'} to. Running deployments keep the old values until they are redeployed.`}
+        onConfirm={() => void handleBulkDelete()}
+      />
     </div>
   )
 }

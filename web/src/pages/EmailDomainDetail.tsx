@@ -39,6 +39,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -48,7 +49,6 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import {
   EmailProviderLogo,
@@ -332,6 +332,7 @@ export function EmailDomainDetail() {
   const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<number | null>(null)
   const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(null)
   const [projectToRevoke, setProjectToRevoke] = useState<AuthorizedEmailDomainProjectResponse | null>(null)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [projectToAuthorize, setProjectToAuthorize] = useState<number | null>(null)
   const [projectPickerOpen, setProjectPickerOpen] = useState(false)
 
@@ -609,33 +610,14 @@ export function EmailDomainDetail() {
                 Verify DNS
               </Button>
             )}
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button variant="outline" className="text-destructive hover:text-destructive">
-                  <Trash2 className="mr-2 size-4" />
-                  Delete
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete {domain.domain}?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    This will permanently delete the domain and its DNS configuration
-                    from Temps. The DNS records in your registrar are not removed.
-                    Applications using this domain will no longer be able to send email.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={() => deleteMutation.mutate()}
-                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  >
-                    Delete domain
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
+            <Button
+              variant="outline"
+              className="text-destructive hover:text-destructive"
+              onClick={() => setConfirmingDelete(true)}
+            >
+              <Trash2 className="mr-2 size-4" />
+              Delete
+            </Button>
           </>
         }
         facts={domainFacts(domain, provider, verifiedCount, totalCount, isSmtp)}
@@ -1006,43 +988,35 @@ export function EmailDomainDetail() {
         }
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
+        open={confirmingDelete}
+        onOpenChange={setConfirmingDelete}
+        resourceType="email domain"
+        resourceName={domain.domain}
+        confirmLabel="Delete domain"
+        consequences="Its DNS configuration is removed from Temps (the DNS records in your registrar are not removed). Applications using this domain will no longer be able to send email."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate()}
+      />
+
+      <ConfirmDeleteDialog
         open={projectToRevoke !== null}
         onOpenChange={(open) => {
-          if (!open && !revokeProjectMutation.isPending) {
-            setProjectToRevoke(null)
+          if (!open) setProjectToRevoke(null)
+        }}
+        resourceType="sender access for service"
+        resourceName={projectToRevoke?.name ?? ''}
+        verb="Revoke"
+        confirmLabel="Revoke access"
+        irreversible={false}
+        consequences={`It will no longer be able to send email from ${domain.domain}. Existing deployments using this sender may begin failing immediately.`}
+        isPending={revokeProjectMutation.isPending}
+        onConfirm={() => {
+          if (projectToRevoke) {
+            revokeProjectMutation.mutate(projectToRevoke.id)
           }
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Revoke service access?</AlertDialogTitle>
-            <AlertDialogDescription>
-              <span className="font-medium text-foreground">{projectToRevoke?.name}</span>
-              {' '}will no longer be able to send email from{' '}
-              <span className="font-medium text-foreground">{domain.domain}</span>.
-              Existing deployments using this sender may begin failing immediately.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={revokeProjectMutation.isPending}>
-              Keep access
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={revokeProjectMutation.isPending || projectToRevoke === null}
-              onClick={(event) => {
-                event.preventDefault()
-                if (projectToRevoke) {
-                  revokeProjectMutation.mutate(projectToRevoke.id)
-                }
-              }}
-            >
-              {revokeProjectMutation.isPending ? 'Revoking...' : 'Revoke access'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      />
 
       <AlertDialog
         open={projectToAuthorize !== null}

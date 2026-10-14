@@ -31,6 +31,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
@@ -330,6 +331,8 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   // The last link change, until the operator redeploys or dismisses it: the
   // running app only sees the new variables after its next deployment.
   const [linkChange, setLinkChange] = useState<ServiceLinkChange | null>(null)
+  const [serviceToUnlink, setServiceToUnlink] =
+    useState<ExternalServiceInfo | null>(null)
   const providers = useQuery({ ...getProvidersMetadataOptions(), retry: false })
 
   useEffect(() => {
@@ -396,37 +399,44 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     await refetchServicesLinked()
   }
 
-  const handleServiceToggle = async (serviceId: number) => {
-    const isLinked = servicesLinked?.some((s) => s.service.id === serviceId)
+  const unlinkService = async (serviceId: number) => {
+    const promise = unlinkServiceMutation.mutateAsync({
+      path: { id: serviceId, project_id: project.id },
+    })
+    toast.promise(promise, {
+      loading: 'Unlinking service...',
+      success: 'Service unlinked',
+      error: 'Failed to unlink service',
+    })
+    await promise.then(
+      () =>
+        setLinkChange({
+          kind: 'unlinked',
+          serviceName: serviceName(serviceId),
+        }),
+      () => {}
+    )
+    await refetchServicesLinked()
+  }
 
-    if (isLinked) {
-      const promise = unlinkServiceMutation.mutateAsync({
-        path: { id: serviceId, project_id: project.id },
-      })
-      toast.promise(promise, {
-        loading: 'Unlinking service...',
-        success: 'Service unlinked',
-        error: 'Failed to unlink service',
-      })
-      await promise.then(
-        () =>
-          setLinkChange({
-            kind: 'unlinked',
-            serviceName: serviceName(serviceId),
-          }),
-        () => {}
-      )
-    } else {
-      const service = services?.find((item) => item.id === serviceId)
-      if (
-        service &&
-        ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
-      ) {
-        setServicePendingLink(service)
-        return
-      }
-      await linkService(serviceId).catch(() => {})
+  const handleServiceToggle = async (serviceId: number) => {
+    const linked = servicesLinked?.find((s) => s.service.id === serviceId)
+
+    if (linked) {
+      // Unlinking is confirmed first; the request is sent from the dialog.
+      setServiceToUnlink(linked.service)
+      return
     }
+
+    const service = services?.find((item) => item.id === serviceId)
+    if (
+      service &&
+      ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
+    ) {
+      setServicePendingLink(service)
+      return
+    }
+    await linkService(serviceId).catch(() => {})
 
     await refetchServicesLinked()
   }
@@ -701,6 +711,20 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           </p>
         )}
         {databaseTypes}
+        <ConfirmDeleteDialog
+          open={serviceToUnlink !== null}
+          onOpenChange={(open) => {
+            if (!open) setServiceToUnlink(null)
+          }}
+          verb="Unlink"
+          resourceType="database service"
+          resourceName={serviceToUnlink?.name ?? ''}
+          consequences={`${project.slug} stops receiving its connection variables, and the running app loses access after its next deployment. The service itself and its data are kept.`}
+          irreversible={false}
+          onConfirm={() => {
+            if (serviceToUnlink) void unlinkService(serviceToUnlink.id)
+          }}
+        />
         {servicePendingLink && (
           <DatabaseProvisioningDialog
             key={servicePendingLink.id}

@@ -15,16 +15,6 @@ import {
   BackupScheduleResponse,
   S3SourceResponse,
 } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -40,6 +30,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -973,50 +964,18 @@ export function S3SourceDetail() {
   return (
     <>
       {detail}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={scheduleToDelete !== null}
-
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) {
-            setScheduleToDelete(null)
-          }
+          if (!open) setScheduleToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete backup schedule?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete the schedule
-              {scheduleToDelete ? (
-                <>
-                  {' '}
-                  <span className="font-medium text-foreground">
-                    {scheduleToDelete.name}
-                  </span>
-                </>
-              ) : null}
-              . Existing backups created by this schedule will not be removed,
-              but no new backups will run on this schedule. This action cannot
-              be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                confirmDeleteSchedule()
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete schedule'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="backup schedule"
+        resourceName={scheduleToDelete?.name ?? ''}
+        consequences="Existing backups created by this schedule will not be removed, but no new backups will run on this schedule."
+        confirmLabel="Delete schedule"
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDeleteSchedule}
+      />
     </>
   )
 }

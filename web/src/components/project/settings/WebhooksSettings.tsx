@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ProjectResponse } from '@/api/client'
+import { ProjectResponse, WebhookResponse } from '@/api/client'
 import {
   deleteWebhookMutation,
   listWebhooksOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -35,7 +35,7 @@ import {
   Webhook,
   XCircle,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
@@ -45,7 +45,8 @@ interface WebhooksSettingsProps {
 
 export function WebhooksSettings({ project }: WebhooksSettingsProps) {
   const navigate = useNavigate()
-  const [webhookToDelete, setWebhookToDelete] = useState<number | null>(null)
+  const [webhookToDelete, setWebhookToDelete] =
+    useState<WebhookResponse | null>(null)
 
   const {
     data: webhooks,
@@ -80,11 +81,6 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
       },
     })
   }
-
-  const deleteDialogOpen = useMemo(
-    () => webhookToDelete !== null,
-    [webhookToDelete]
-  )
 
   return (
     <div>
@@ -245,7 +241,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => setWebhookToDelete(webhook.id)}
+                        onClick={() => setWebhookToDelete(webhook)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -288,13 +284,17 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
         </Card>
       ) : null}
 
-      <ConfirmDialog
-        open={deleteDialogOpen}
-        onOpenChange={(open) => !open && setWebhookToDelete(null)}
-        title="Delete webhook?"
-        description="This action cannot be undone. This will permanently delete the webhook and stop all event notifications to this endpoint."
+      <ConfirmDeleteDialog
+        open={webhookToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setWebhookToDelete(null)
+        }}
+        resourceType="webhook"
+        resourceName={webhookToDelete?.url ?? ''}
+        consequences="Event notifications to this endpoint stop immediately."
+        isPending={deleteWebhook.isPending}
         onConfirm={() => {
-          if (webhookToDelete !== null) handleDelete(webhookToDelete)
+          if (webhookToDelete) handleDelete(webhookToDelete.id)
         }}
       />
     </div>

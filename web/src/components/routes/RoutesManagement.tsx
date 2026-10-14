@@ -9,16 +9,7 @@ import {
   RouteResponse,
   updateRoute,
 } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -371,33 +362,19 @@ export function RoutesManagement({
         </DialogContent>
       </Dialog>
 
-      {/* Delete Confirmation Dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={routeToDelete !== null}
-        onOpenChange={(open) => !open && setRouteToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              route configuration.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                routeToDelete && deleteRouteMutation.mutate(routeToDelete)
-              }
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteRouteMutation.isPending}
-            >
-              {deleteRouteMutation.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setRouteToDelete(null)
+        }}
+        resourceType="route"
+        resourceName={routeToDelete ?? ''}
+        consequences="Requests to this domain stop being routed by this configuration."
+        isPending={deleteRouteMutation.isPending}
+        onConfirm={() => {
+          if (routeToDelete) deleteRouteMutation.mutate(routeToDelete)
+        }}
+      />
     </div>
   )
 }

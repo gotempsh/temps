@@ -34,6 +34,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -57,6 +58,9 @@ export function ApplicationDataServicesPanel({ application }: Props) {
     defaultProjectId
   )
   const [serviceId, setServiceId] = useState<number | null>(null)
+  const [unlinkTarget, setUnlinkTarget] = useState<ExternalServiceInfo | null>(
+    null
+  )
   const projectId = application.projects.some(
     (project) => project.id === requestedProjectId
   )
@@ -138,6 +142,8 @@ export function ApplicationDataServicesPanel({ application }: Props) {
       toast.success('Database unlinked from the service and sandbox')
     } catch (cause) {
       toast.error(errorMessage(cause, 'Could not unlink the database.'))
+    } finally {
+      setUnlinkTarget(null)
     }
   }
 
@@ -239,7 +245,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
                     aria-label={`Unlink ${service.name}`}
                     className="relative shrink-0"
                     disabled={busy}
-                    onClick={() => void unlinkService(service.id)}
+                    onClick={() => setUnlinkTarget(service)}
                     size="icon"
                     title={`Unlink ${service.name}`}
                     type="button"
@@ -322,6 +328,22 @@ export function ApplicationDataServicesPanel({ application }: Props) {
           reusable platform token, and unrelated databases stay isolated.
         </p>
       </div>
+
+      <ConfirmDeleteDialog
+        open={unlinkTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setUnlinkTarget(null)
+        }}
+        resourceType="database"
+        resourceName={unlinkTarget?.name ?? ''}
+        verb="Unlink"
+        consequences={`It is removed from the private sandbox network of ${selectedProject?.name ?? 'this service'}. The database and its data are kept and can be linked again.`}
+        irreversible={false}
+        isPending={unlinkMutation.isPending}
+        onConfirm={() => {
+          if (unlinkTarget) void unlinkService(unlinkTarget.id)
+        }}
+      />
     </section>
   )
 }

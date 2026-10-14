@@ -12,7 +12,7 @@ import type { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { BellRing, Pencil, Plus, Trash2 } from 'lucide-react'
@@ -199,11 +199,14 @@ export function NotificationRoutesManagement({
           ))}
         </div>
       )}
-      <ConfirmDialog
+      <ConfirmDeleteDialog
         open={routeToDelete !== null}
-        onOpenChange={(open) => !open && setRouteToDelete(null)}
-        title={`Delete ${routeToDelete?.name ?? 'notification route'}?`}
-        description="This permanently deletes the notification route. Alerts matching it will no longer be delivered through it. This cannot be undone."
+        onOpenChange={(open) => {
+          if (!open) setRouteToDelete(null)
+        }}
+        resourceType="notification route"
+        resourceName={routeToDelete?.name ?? ''}
+        consequences="Alerts matching it will no longer be delivered through it."
         onConfirm={handleConfirmDelete}
       />
     </div>

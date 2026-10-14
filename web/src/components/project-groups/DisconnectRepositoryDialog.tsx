@@ -5,16 +5,7 @@ import { useMutation } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { clearGroupRepositoryMutation } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectGroupResponse } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useInvalidateGroups } from './useProjectGroups'
 
@@ -52,26 +43,16 @@ export function DisconnectRepositoryDialog({
   }
 
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Disconnect {repoLabel}?</AlertDialogTitle>
-          <AlertDialogDescription>
-            Services keep deploying from their current repository, branch and
-            directory; they just stop following the project, so changing the
-            branch here no longer changes theirs. Nothing is redeployed.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            onClick={() => void disconnect()}
-            disabled={clear.isPending}
-          >
-            Disconnect
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDeleteDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      verb="Disconnect"
+      resourceType="repository"
+      resourceName={repoLabel}
+      irreversible={false}
+      consequences="Services keep deploying from their current repository, branch and directory; they just stop following the project, so changing the branch here no longer changes theirs. Nothing is redeployed."
+      isPending={clear.isPending}
+      onConfirm={() => void disconnect()}
+    />
   )
 }

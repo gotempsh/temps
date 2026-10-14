@@ -45,6 +45,7 @@ import { Input } from '@/components/ui/input'
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -460,6 +461,10 @@ function ProviderKeyModelDetail({
   const queryClient = useQueryClient()
   const [modelId, setModelId] = useState('')
   const [modelFilter, setModelFilter] = useState('')
+  const [modelToDelete, setModelToDelete] = useState<{
+    id: number
+    model_id: string
+  } | null>(null)
   const queryKey = ['providerModelInventory', providerKey.id]
   const detailQuery = useQuery({
     queryKey,
@@ -543,6 +548,7 @@ function ProviderKeyModelDetail({
       toast.error('Could not delete model', {
         description: apiErrorMessage(error),
       }),
+    onSettled: () => setModelToDelete(null),
   })
 
   const models = useMemo(
@@ -696,7 +702,12 @@ function ProviderKeyModelDetail({
                           variant="ghost"
                           size="icon"
                           className="h-8 w-8"
-                          onClick={() => deleteMutation.mutate(model.id)}
+                          onClick={() =>
+                            setModelToDelete({
+                              id: model.id,
+                              model_id: model.model_id,
+                            })
+                          }
                           title="Delete manual model"
                         >
                           <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -731,6 +742,19 @@ function ProviderKeyModelDetail({
           Add model
         </Button>
       </form>
+      <ConfirmDeleteDialog
+        open={modelToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setModelToDelete(null)
+        }}
+        resourceType="manual model"
+        resourceName={modelToDelete?.model_id ?? ''}
+        consequences={`It is removed from ${providerKey.display_name}; requests for it are no longer routed through this key until it is added again.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (modelToDelete) deleteMutation.mutate(modelToDelete.id)
+        }}
+      />
     </div>
   )
 }
@@ -3897,47 +3921,6 @@ export function ProjectAgentActivity({
   )
 }
 
-function DeleteConfirmDialog({
-  open,
-  onOpenChange,
-  providerKey,
-  onConfirm,
-  isPending,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  providerKey: ProviderKeyResponse | null
-  onConfirm: (id: number) => void
-  isPending: boolean
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete Provider Key</DialogTitle>
-          <DialogDescription>
-            Are you sure you want to delete &quot;{providerKey?.display_name}
-            &quot;? This will stop routing requests through this provider key.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => providerKey && onConfirm(providerKey.id)}
-            disabled={isPending}
-          >
-            {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 export function AiGatewayPage() {
   const queryClient = useQueryClient()
   const { data: settings } = useSettings()
@@ -4868,16 +4851,19 @@ console.log(response.choices[0].message.content);`,
         </DialogContent>
       </Dialog>
 
-      {/* Delete Confirmation Dialog */}
-      <DeleteConfirmDialog
+      <ConfirmDeleteDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {
           setDeleteDialogOpen(open)
           if (!open) setSelectedKey(null)
         }}
-        providerKey={selectedKey}
-        onConfirm={(id) => deleteMutation.mutate(id)}
+        resourceType="provider key"
+        resourceName={selectedKey?.display_name ?? ''}
+        consequences="Requests will no longer be routed through this provider key."
         isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (selectedKey) deleteMutation.mutate(selectedKey.id)
+        }}
       />
     </div>
   )

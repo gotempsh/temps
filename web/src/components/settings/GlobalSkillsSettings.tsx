@@ -1,18 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
@@ -57,7 +48,9 @@ export function GlobalSkillsSettings() {
   usePageTitle('Skills')
   const navigate = useNavigate()
 
-  const [skillToDelete, setSkillToDelete] = useState<string | null>(null)
+  const [skillToDelete, setSkillToDelete] = useState<SkillDefinition | null>(
+    null
+  )
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingSkill, setEditingSkill] = useState<SkillDefinition | null>(null)
 
@@ -164,32 +157,25 @@ export function GlobalSkillsSettings() {
         }}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={skillToDelete !== null}
-        onOpenChange={() => setSkillToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete global skill?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this skill. All services that
-              reference it will lose access.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (skillToDelete)
-                  deleteMutation.mutate({ path: { slug: skillToDelete } })
-              }}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setSkillToDelete(null)
+        }}
+        resourceType="global skill"
+        resourceName={skillToDelete?.name ?? ''}
+        consequences={
+          <>
+            Every service that references <code>{skillToDelete?.slug}</code>{' '}
+            will lose access to it.
+          </>
+        }
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (skillToDelete)
+            deleteMutation.mutate({ path: { slug: skillToDelete.slug } })
+        }}
+      />
     </div>
   )
 }
@@ -259,7 +245,7 @@ interface SkillsListProps {
   skills: SkillDefinition[]
   onOpen: (slug: string) => void
   onEdit: (skill: SkillDefinition) => void
-  onDelete: (slug: string) => void
+  onDelete: (skill: SkillDefinition) => void
 }
 
 function SkillsCompactRows({
@@ -307,7 +293,7 @@ function SkillsCompactRows({
               skill={skill}
               onView={() => onOpen(skill.slug)}
               onEdit={() => onEdit(skill)}
-              onDelete={() => onDelete(skill.slug)}
+              onDelete={() => onDelete(skill)}
             />
             <ChevronRight className="size-4 shrink-0 text-muted-foreground/50" />
           </li>

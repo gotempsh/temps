@@ -13,16 +13,7 @@ import type {
   StatusPageDomainResponse,
   StatusPageResponse,
 } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -325,27 +316,16 @@ function DomainRow({
         </div>
       )}
 
-      <AlertDialog open={confirmRemove} onOpenChange={setConfirmRemove}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove {domain.hostname}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              The hostname stops serving the page immediately and its
-              certificate is deleted. It keeps answering “not found” until it is
-              used again.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive hover:bg-destructive/90"
-              onClick={() => remove.mutate(path)}
-            >
-              {remove.isPending ? 'Removing...' : 'Remove'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={confirmRemove}
+        onOpenChange={setConfirmRemove}
+        verb="Remove"
+        resourceType="status page domain"
+        resourceName={domain.hostname}
+        consequences="The hostname stops serving the page immediately and its certificate is deleted. It keeps answering “not found” until it is used again."
+        isPending={remove.isPending}
+        onConfirm={() => remove.mutate(path)}
+      />
     </div>
   )
 }

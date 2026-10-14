@@ -109,7 +109,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           element={
             <div className="space-y-6">
               <ProjectSecuritySettings project={project} refetch={refetch} />
-              <ProjectIpAccessCard projectId={project.id} />
+              <ProjectIpAccessCard
+                projectId={project.id}
+                scopeName={project.name}
+              />
             </div>
           }
         />

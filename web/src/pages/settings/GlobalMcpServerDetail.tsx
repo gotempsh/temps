@@ -2,20 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -103,7 +94,10 @@ export function GlobalMcpServerDetail() {
       queryClient.invalidateQueries({ queryKey: listGlobalMcpsQueryKey() })
       navigate('/mcp-servers')
     },
-    onError: () => toast.error('Failed to delete MCP server'),
+    onError: () => {
+      setConfirmDelete(false)
+      toast.error('Failed to delete MCP server')
+    },
   })
 
   const configSummary = useMemo(() => {
@@ -375,26 +369,15 @@ export function GlobalMcpServerDetail() {
         </Card>
       </div>
 
-      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete global MCP server?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this MCP server. All services that
-              reference it will lose access.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => deleteMutation.mutate({ path: { slug: slug! } })}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        resourceType="global MCP server"
+        resourceName={mcp?.name ?? slug ?? ''}
+        consequences="All services that reference it will lose access."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate({ path: { slug: slug! } })}
+      />
     </div>
   )
 }

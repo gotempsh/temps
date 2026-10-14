@@ -25,6 +25,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -474,26 +475,15 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete “{page.title}”?</AlertDialogTitle>
-            <AlertDialogDescription>
-              The public link stops working immediately. Monitors and incidents
-              are not affected.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive hover:bg-destructive/90"
-              onClick={() => remove.mutate(path)}
-            >
-              {remove.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        resourceType="status page"
+        resourceName={page.title}
+        consequences="The public link stops working immediately. Monitors and incidents are not affected."
+        isPending={remove.isPending}
+        onConfirm={() => remove.mutate(path)}
+      />
     </div>
   )
 }

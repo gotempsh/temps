@@ -9,18 +9,9 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OidcProviderResponse } from '@/api/client/types.gen'
 import { problemMessage } from '@/components/settings/oidc-provider-constants'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Card,
@@ -141,6 +132,7 @@ export function AuthSettingsPage() {
       })
     },
     onError: (error) => {
+      setDeleteTarget(null)
       toast.error(problemMessage(error, 'Failed to delete SSO provider'))
     },
   })
@@ -369,40 +361,24 @@ export function AuthSettingsPage() {
         </div>
       )}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteTarget !== null}
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete SSO provider?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Users that signed in via{' '}
-              <span className="font-medium">{deleteTarget?.name}</span> will no
-              longer be able to use SSO. Their Temps accounts stay intact and
-              can fall back to password login.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProvider.isPending}
-              onClick={() => {
-                if (deleteTarget) {
-                  deleteProvider.mutate({
-                    path: { provider_id: deleteTarget.id },
-                  })
-                }
-              }}
-            >
-              {deleteProvider.isPending ? 'Deleting…' : 'Delete provider'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="SSO provider"
+        resourceName={deleteTarget?.name ?? ''}
+        consequences="Users that signed in through it will no longer be able to use SSO. Their Temps accounts stay intact and can fall back to password login."
+        confirmLabel="Delete provider"
+        isPending={deleteProvider.isPending}
+        onConfirm={() => {
+          if (deleteTarget) {
+            deleteProvider.mutate({
+              path: { provider_id: deleteTarget.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

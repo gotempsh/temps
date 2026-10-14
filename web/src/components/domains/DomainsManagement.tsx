@@ -11,16 +11,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -322,32 +313,19 @@ export function DomainsManagement({
 
       {verificationDialog}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={domainToDelete !== null}
-        onOpenChange={(open) => !open && setDomainToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              domain and remove all associated TLS certificates.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                domainToDelete && handleDeleteDomain(domainToDelete.domain)
-              }
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteDomain.isPending}
-            >
-              {deleteDomain.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences="All TLS certificates issued for this domain are removed with it."
+        isPending={deleteDomain.isPending}
+        onConfirm={() => {
+          if (domainToDelete) handleDeleteDomain(domainToDelete.domain)
+        }}
+      />
 
       {isError ? (
         <EmptyState

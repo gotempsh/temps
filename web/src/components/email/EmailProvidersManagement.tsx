@@ -41,7 +41,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -252,11 +252,10 @@ function ProviderCard({
   onEditClick,
 }: {
   provider: EmailProvider
-  onDelete: (id: number) => void
+  onDelete: (provider: EmailProvider) => void
   onTestClick: (id: number) => void
   onEditClick: (provider: EmailProvider) => void
 }) {
-  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const navigate = useNavigate()
 
   return (
@@ -305,21 +304,12 @@ function ProviderCard({
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-destructive"
-                onClick={() => setConfirmingDelete(true)}
+                onClick={() => onDelete(provider)}
               >
                 Delete
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          {/* Inside the stopPropagation wrapper so clicks in the dialog (a
-              React portal child of this card) don't navigate to the detail. */}
-          <ConfirmDialog
-            open={confirmingDelete}
-            onOpenChange={setConfirmingDelete}
-            title={`Delete ${provider.name}?`}
-            description="This permanently deletes the email provider. Domains and sending that rely on it will stop working. This cannot be undone."
-            onConfirm={() => onDelete(provider.id)}
-          />
         </div>
       </CardHeader>
       <CardContent>
@@ -934,6 +924,8 @@ export function EmailProvidersManagement() {
   const [editingProvider, setEditingProvider] = useState<EmailProvider | null>(
     null
   )
+  const [providerToDelete, setProviderToDelete] =
+    useState<EmailProvider | null>(null)
   const queryClient = useQueryClient()
 
   const { data: providers, isLoading } = useQuery({
@@ -952,11 +944,8 @@ export function EmailProvidersManagement() {
         description: error.message,
       })
     },
+    onSettled: () => setProviderToDelete(null),
   })
-
-  const handleDelete = (id: number) => {
-    deleteMutation.mutate(id)
-  }
 
   const handleTestClick = (id: number) => {
     setTestingProviderId(id)
@@ -1011,7 +1000,7 @@ export function EmailProvidersManagement() {
             <ProviderCard
               key={provider.id}
               provider={provider}
-              onDelete={handleDelete}
+              onDelete={setProviderToDelete}
               onTestClick={handleTestClick}
               onEditClick={handleEditClick}
             />
@@ -1034,6 +1023,20 @@ export function EmailProvidersManagement() {
         provider={editingProvider}
         onSuccess={() => {
           queryClient.invalidateQueries({ queryKey: ['email-providers'] })
+        }}
+      />
+
+      <ConfirmDeleteDialog
+        open={providerToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="email provider"
+        resourceName={providerToDelete?.name ?? ''}
+        consequences="Domains and sending that rely on it will stop working."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (providerToDelete) deleteMutation.mutate(providerToDelete.id)
         }}
       />
     </div>
