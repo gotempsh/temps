@@ -1818,7 +1818,6 @@ export function EnvironmentVariablesSettings({
                 onClick={() => setFiltersOpen((open) => !open)}
                 aria-expanded={filtersOpen}
                 aria-controls="variable-filters"
-                aria-label="Filters"
               >
                 <ChevronDown
                   className={cn(

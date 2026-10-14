@@ -210,7 +210,7 @@ const getEventIcon = (event: SessionEventDto) => {
 const getEventColor = (event: SessionEventDto) => {
   const eventInfo =
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
-  return eventInfo?.color || 'text-gray-600 dark:text-gray-500'
+  return eventInfo?.color || 'text-gray-600 dark:text-gray-400'
 }
 
 export function SessionReplayDetail({ project }: { project: ProjectResponse }) {

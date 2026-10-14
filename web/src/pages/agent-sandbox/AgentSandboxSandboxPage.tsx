@@ -328,11 +328,15 @@ export function AgentSandboxSandboxPage() {
                   size="sm"
                   onClick={() => void fetchSandboxStatus()}
                   disabled={statusLoading}
+                  aria-label="Refresh Docker status"
                 >
                   {statusLoading ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <Loader2
+                      className="h-3.5 w-3.5 animate-spin"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <RefreshCw className="h-3.5 w-3.5" />
+                    <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                   )}
                 </Button>
               </div>

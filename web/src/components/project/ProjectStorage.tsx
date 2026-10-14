@@ -488,7 +488,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
             <Link
               key={provider.service_type}
               to={serviceCreateHref(provider.service_type, project.id)}
-              aria-label={`Create ${provider.display_name}`}
               className="group flex min-w-0 flex-col items-start rounded-lg border bg-background p-5 transition-colors hover:border-foreground/30 hover:bg-muted/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
             >
               <div className="mb-4 flex size-10 items-center justify-center">

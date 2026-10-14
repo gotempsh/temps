@@ -334,7 +334,7 @@ function ContainerSwitcher({
               }`}
             >
               {f.label}
-              <span className="ml-1 text-neutral-600 dark:text-neutral-500 tabular-nums">
+              <span className="ml-1 text-neutral-600 dark:text-neutral-400 tabular-nums">
                 {f.count}
               </span>
             </button>
