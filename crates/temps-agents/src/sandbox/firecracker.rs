@@ -97,7 +97,10 @@ fn snapshot_export_failure_message(status: std::process::ExitStatus, stderr: &st
     } else {
         format!("it said: {stderr}")
     };
-    let hint = if stderr.contains("No permissions to create new namespace") {
+    let hint = if stderr.contains("Unexpected capabilities but not setuid") {
+        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
+         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
+    } else if stderr.contains("No permissions to create new namespace") {
         "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
          sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
          AppArmor profile, or set that sysctl to 0"
@@ -1491,8 +1494,42 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// Run the child without ambient capabilities.
+    ///
+    /// Unprivileged bubblewrap exits 1 with "Unexpected capabilities but not
+    /// setuid, old file caps config?" when it starts with any capability set.
+    /// A server started by systemd with `AmbientCapabilities=` (the standard
+    /// way to let a non-root `temps serve` bind port 80/443) passes that
+    /// capability to every child, so the snapshot export failed on exactly the
+    /// hosts that follow the install guide. The extractor needs no capability,
+    /// so the ambient set is cleared in the child before `exec`; the server
+    /// itself keeps its own.
+    #[cfg(target_os = "linux")]
+    fn without_ambient_capabilities(command: &mut tokio::process::Command) {
+        // SAFETY: the closure runs between fork and exec and calls only
+        // `prctl`, which is async-signal-safe. A kernel without ambient
+        // capabilities (< 4.3) answers EINVAL, which is ignored: such a
+        // child has none to clear.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn without_ambient_capabilities(_command: &mut tokio::process::Command) {}
+
     fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new("bwrap");
+        Self::without_ambient_capabilities(&mut command);
         command
             .args([
                 "--unshare-all",
@@ -3331,6 +3368,28 @@ mod tests {
         assert_eq!(output.status.code(), Some(3));
         assert!(output.stderr.starts_with("first-line"), "{}", output.stderr);
         assert!(output.stderr.len() <= SNAPSHOT_EXTRACTOR_STDERR_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn extractor_children_start_without_ambient_capabilities() {
+        // The hook must not break exec, and the child must report an empty
+        // ambient set. (The set is already empty under test; the systemd
+        // case is covered by the hook being applied to the bwrap command.)
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("grep -q '^CapAmb:[[:space:]]*0*$' /proc/self/status");
+        FirecrackerSandboxProvider::without_ambient_capabilities(&mut command);
+
+        let output = FirecrackerSandboxProvider::run_snapshot_extractor(
+            &mut command,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success(), "{:?}", output);
     }
 
     #[tokio::test]
