@@ -58,6 +58,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { isDomainDetailQuery } from '@/pages/domain-detail-queries'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import {
@@ -299,17 +300,7 @@ export function DomainDetail() {
     !orderReadFailed
 
   const fetchingCount = useIsFetching({
-    predicate: (q) => {
-      const k = q.queryKey?.[0]
-      if (typeof k !== 'string') return false
-      return (
-        k.includes('getDomainById') ||
-        k.includes('getDomainOrder') ||
-        k.includes('getHttpChallengeDebug') ||
-        k.includes('getPublicIp') ||
-        k.includes('listProviders')
-      )
-    },
+    predicate: (q) => isDomainDetailQuery(q.queryKey),
   })
   const isRefreshing = fetchingCount > 0
 
@@ -317,23 +308,12 @@ export function DomainDetail() {
     if (opts?.clearOrder) {
       queryClient.removeQueries({ queryKey: orderQueryKey })
     }
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: domainQueryKey }),
-      queryClient.invalidateQueries({ queryKey: orderQueryKey }),
-      queryClient.invalidateQueries({
-        predicate: (q) => {
-          const key = q.queryKey?.[0]
-          return (
-            typeof key === 'object' &&
-            key !== null &&
-            '_id' in key &&
-            (key._id === 'getHttpChallengeDebug' ||
-              key._id === 'getPublicIp' ||
-              key._id === 'listDnsProviders')
-          )
-        },
-      }),
-    ])
+    // One predicate covers the domain, order, challenge debug, public IP,
+    // DNS providers and renewal history, so the timeline never lags a
+    // provisioning action.
+    await queryClient.invalidateQueries({
+      predicate: (q) => isDomainDetailQuery(q.queryKey),
+    })
   }
 
   useEffect(() => {
