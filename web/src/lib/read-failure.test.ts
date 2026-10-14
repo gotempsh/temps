@@ -46,6 +46,15 @@ describe('readFailureExplanation', () => {
       'Could not contact Temps'
     )
   })
+
+  test('a 4xx that is not 404/403 is an answer, not a lost connection', () => {
+    const text = readFailureExplanation({
+      title: 'Payload Too Large',
+      status: 413,
+    })
+    expect(text).toContain('HTTP 413')
+    expect(text).not.toContain('Could not contact Temps')
+  })
 })
 
 describe('readFailureServerDetail', () => {
