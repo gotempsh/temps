@@ -1908,14 +1908,18 @@ WHERE project_id = $1
     }
 
     /// Write the refreshed visitor row for an event, returning its id, or
-    /// `None` when the row can no longer be updated.
+    /// `None` when the row is gone.
     ///
     /// The retention sweep can delete a visitor between the read in
-    /// `record_event` and this write. Updating a row that is gone fails, and
-    /// the event must not then be inserted under the stale id: its foreign key
-    /// would reject the insert and the event would be lost. `None` makes the
-    /// caller resolve the visitor again through the same upsert a lookup miss
-    /// uses, which re-creates the row or bumps `last_seen` if it is back.
+    /// `record_event` and this write. Updating a row that is gone reports
+    /// `RecordNotUpdated`, and the event must not then be inserted under the
+    /// stale id: its foreign key would reject the insert and the event would be
+    /// lost. `None` makes the caller resolve the visitor again through the same
+    /// upsert a lookup miss uses, which re-creates the row.
+    ///
+    /// Any other failure (a timeout, a dropped connection) says nothing about
+    /// the row, which still exists: it keeps its id rather than being sent
+    /// through the new-visitor limit and possibly stored without a visitor.
     async fn touch_visitor(
         &self,
         active_visitor: temps_entities::visitor::ActiveModel,
@@ -1927,16 +1931,25 @@ WHERE project_id = $1
 
         match active_visitor.update(self.db.as_ref()).await {
             Ok(_) => Some(row_id),
+            Err(sea_orm::DbErr::RecordNotUpdated) => {
+                tracing::warn!(
+                    visitor_id = %visitor_id,
+                    project_id,
+                    visitor_row_id = row_id,
+                    "Visitor row was removed (retention) before the event could refresh it; \
+                     resolving it again"
+                );
+                None
+            }
             Err(e) => {
                 tracing::warn!(
                     visitor_id = %visitor_id,
                     project_id,
                     visitor_row_id = row_id,
                     error = %e,
-                    "Could not refresh an existing visitor row (it may have just been \
-                     removed by retention); resolving it again"
+                    "Could not refresh an existing visitor row; recording the event against it"
                 );
-                None
+                Some(row_id)
             }
         }
     }
@@ -2405,6 +2418,29 @@ mod tests {
             .await;
 
         assert_eq!(id, None, "a row that is gone must be resolved again");
+    }
+
+    /// A transient failure says nothing about the row: it must keep its id and
+    /// not be sent through the new-visitor limit.
+    #[tokio::test]
+    async fn a_failed_touch_that_is_not_a_missing_row_keeps_the_id() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let row = visitor_row(31);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, Some(31));
     }
 
     #[tokio::test]
