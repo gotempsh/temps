@@ -13,7 +13,7 @@ pub use geoip_service::{
     MockGeoIpService,
 };
 pub use handlers::AppState;
-pub use ip_address_service::{IpAddressInfo, IpAddressService};
+pub use ip_address_service::{IpAddressError, IpAddressInfo, IpAddressService};
 pub use plugin::GeoPlugin;
 pub use refresh::{
     city_db_path, ensure_mmdb_present, fetch_latest_mmdb_bytes, geo_db_source_url,

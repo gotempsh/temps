@@ -26,11 +26,32 @@ const GEO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// the stored value is younger than this can therefore still count on the row
 /// surviving for at least `window - LAST_USED_REFRESH`, which must outlast
 /// the cache entry that lookup is about to create. Checked at compile time.
-const LAST_USED_REFRESH: Duration = Duration::from_secs(60 * 60);
+///
+/// This is also what bounds the write on the lookup path: an address costs at
+/// most one single-row `UPDATE` per interval, and only on a cache miss, so the
+/// write load is O(distinct addresses per interval) rather than O(events).
+const LAST_USED_REFRESH: Duration = Duration::from_secs(12 * 60 * 60);
 const _: () = assert!(
     GEO_CACHE_TTL.as_secs() + LAST_USED_REFRESH.as_secs() < 24 * 60 * 60,
     "a cached IP id must not outlive the shortest retention window"
 );
+
+/// Why an address lookup could not return an id that is safe to store.
+#[derive(Debug, thiserror::Error)]
+pub enum IpAddressError {
+    /// The write that tells the retention cleanup this address is in use
+    /// failed, so the id is not protected from deletion.
+    #[error(
+        "Could not mark IP address record {ip_geolocation_id} ('{ip_address}') as in use, so \
+         its id is not returned: {source}"
+    )]
+    LastUsedWrite {
+        ip_geolocation_id: i32,
+        ip_address: String,
+        #[source]
+        source: DbErr,
+    },
+}
 
 /// Whether the GeoIP database is currently failing lookups it should be able
 /// to answer (a corrupt or truncated `.mmdb`, an undecodable record).
@@ -211,7 +232,24 @@ impl IpAddressService {
             // delete the row between this lookup and the insert that stores
             // the id, or while the id sits in the cache.
             let touch = if last_used_needs_refresh(existing_ip.last_used_at, now) {
-                self.record_last_used(id, now).await
+                self.record_last_used(id, now).await.map_err(|source| {
+                    warn!(
+                        ip_geolocation_id = id,
+                        error = %source,
+                        "could not record that a stored IP address is in use; its id is \
+                         not handed out, so the next lookup retries"
+                    );
+                    // A failed write leaves the id unprotected: the cleanup
+                    // could delete the row before the caller stores the id,
+                    // and the insert would then fail its foreign key. Callers
+                    // already treat a failed lookup as "no geolocation" for
+                    // that one event, which is cheaper than losing it.
+                    IpAddressError::LastUsedWrite {
+                        ip_geolocation_id: id,
+                        ip_address: ip_address_str.to_string(),
+                        source,
+                    }
+                })?
             } else {
                 LastUsedWrite::NotNeeded
             };
@@ -225,20 +263,6 @@ impl IpAddressService {
                         ip_address = ip_address_str,
                         "stored IP address was removed while being looked up; re-creating it"
                     );
-                }
-                // A failed write leaves the id unprotected: the cleanup could
-                // delete the row before the caller stores the id, and the
-                // insert would then fail its foreign key. Callers already
-                // treat a failed lookup as "no geolocation" for that one
-                // event, which is cheaper than losing the event, so the
-                // failure is reported instead of returning the id.
-                LastUsedWrite::Failed => {
-                    return Err(anyhow::anyhow!(
-                        "Could not mark IP address record {} ('{}') as in use; not returning \
-                         an id the retention cleanup may delete",
-                        id,
-                        ip_address_str
-                    ));
                 }
                 LastUsedWrite::Recorded | LastUsedWrite::NotNeeded => {
                     let info = self.refresh_if_stale(existing_ip, now).await;
@@ -314,28 +338,20 @@ impl IpAddressService {
 
     /// Advance `last_used_at` without touching `updated_at`, which is the
     /// geolocation's verification clock.
-    async fn record_last_used(&self, id: i32, now: UtcDateTime) -> LastUsedWrite {
-        match ip_geolocations::Entity::update_many()
+    async fn record_last_used(&self, id: i32, now: UtcDateTime) -> Result<LastUsedWrite, DbErr> {
+        let result = ip_geolocations::Entity::update_many()
             .col_expr(
                 ip_geolocations::Column::LastUsedAt,
                 sea_orm::sea_query::Expr::value(now),
             )
             .filter(ip_geolocations::Column::Id.eq(id))
             .exec(self.db.as_ref())
-            .await
-        {
-            Ok(result) if result.rows_affected == 0 => LastUsedWrite::RowGone,
-            Ok(_) => LastUsedWrite::Recorded,
-            Err(e) => {
-                warn!(
-                    ip_geolocation_id = id,
-                    error = %e,
-                    "could not record that a stored IP address is in use; it is served \
-                     not handed out, so the next lookup retries"
-                );
-                LastUsedWrite::Failed
-            }
-        }
+            .await?;
+        Ok(if result.rows_affected == 0 {
+            LastUsedWrite::RowGone
+        } else {
+            LastUsedWrite::Recorded
+        })
     }
 
     /// Re-resolve a stored row whose geolocation has outlived the configured
@@ -507,7 +523,6 @@ enum LastUsedWrite {
     Recorded,
     /// The statement ran but matched no row: the retention cleanup deleted it.
     RowGone,
-    Failed,
 }
 
 /// Whether `last_used_at` is missing or old enough to be worth rewriting.
@@ -596,15 +611,15 @@ mod tests {
     }
 
     #[test]
-    fn last_used_is_rewritten_only_when_missing_or_an_hour_old() {
+    fn last_used_is_rewritten_only_when_missing_or_half_a_day_old() {
         let now = Utc::now();
         assert!(last_used_needs_refresh(None, now));
         assert!(!last_used_needs_refresh(
-            Some(now - chrono::Duration::minutes(59)),
+            Some(now - chrono::Duration::hours(11)),
             now
         ));
         assert!(last_used_needs_refresh(
-            Some(now - chrono::Duration::minutes(61)),
+            Some(now - chrono::Duration::hours(13)),
             now
         ));
     }
@@ -846,7 +861,17 @@ mod tests {
             .await
             .expect_err("an unprotected id must not be returned");
 
-        assert!(error.to_string().contains("51"), "{error}");
+        match error.downcast_ref::<IpAddressError>() {
+            Some(IpAddressError::LastUsedWrite {
+                ip_geolocation_id,
+                source,
+                ..
+            }) => {
+                assert_eq!(*ip_geolocation_id, 51);
+                assert!(source.to_string().contains("connection reset"), "{source}");
+            }
+            None => panic!("expected a typed IpAddressError, got: {error}"),
+        }
         assert!(service.cache.get("203.0.113.30").await.is_none());
     }
 }
