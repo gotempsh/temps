@@ -81,9 +81,13 @@ export function installUnhandledRejectionReporter(
     const reason: unknown = event.reason
     if (reason instanceof Error) return
     if (reason === null || typeof reason !== 'object') return
+    // Only cancel the browser's own report for rejections that are explained
+    // to the user: an object nobody can read stays visible in devtools.
+    const alreadyReported = wasErrorReported(reason)
+    const notice = rejectionNotice(reason)
+    if (!notice && !alreadyReported) return
     event.preventDefault()
     console.error('[console] unhandled API rejection', reason)
-    const notice = rejectionNotice(reason)
     if (notice) {
       markErrorReported(reason)
       notify(notice)

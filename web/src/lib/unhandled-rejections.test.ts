@@ -93,6 +93,13 @@ describe('installUnhandledRejectionReporter', () => {
     expect(notices).toEqual([])
   })
 
+  test('keeps the browser report for an object it cannot explain', () => {
+    const { fake, notices } = install()
+    expect(fake.reject({ message: 'Save failed' })).toBe(false)
+    expect(fake.reject({})).toBe(false)
+    expect(notices).toEqual([])
+  })
+
   test('leaves real errors to the browser', () => {
     const { fake, notices } = install()
     expect(fake.reject(new TypeError('x is undefined'))).toBe(false)

@@ -10,6 +10,7 @@ import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
+import { markReadFailureHandled } from '@/lib/route-query-failures'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
@@ -124,6 +125,7 @@ export function Projects() {
     data: rawProjectsData,
     isLoading: servicesLoading,
     isError,
+    error: servicesError,
     isFetching,
     refetch,
   } = useQuery({
@@ -180,6 +182,17 @@ export function Projects() {
   useEffect(() => {
     if (isPageOutOfRange) setPagination(totalPages, pageSize, true)
   }, [isPageOutOfRange, pageSize, setPagination, totalPages])
+
+  // Both lists explain their own failure below, with their own Retry, so the
+  // route-level report has nothing to add.
+  const groupsError = groupsQuery.isError ? groupsQuery.error : null
+  useEffect(() => {
+    markReadFailureHandled(groupsError)
+  }, [groupsError])
+  const servicesFailure = isError ? servicesError : null
+  useEffect(() => {
+    markReadFailureHandled(servicesFailure)
+  }, [servicesFailure])
 
   // The server filters services; projects are filtered here by their own
   // name or any of their services' names.
