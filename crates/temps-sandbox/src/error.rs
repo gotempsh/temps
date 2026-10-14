@@ -39,8 +39,12 @@ pub enum SandboxSnapshotError {
         target_backend: String,
     },
 
-    /// The backend does not support snapshots (for example, Local).
-    #[error("Snapshot is not supported by backend '{backend}'")]
+    /// The backend does not support snapshots (for example, Local or
+    /// microsandbox).
+    #[error(
+        "Snapshot is not supported by backend '{backend}'; \
+         use a 'firecracker' or 'docker' sandbox to take snapshots"
+    )]
     NotSupported { backend: String },
 
     /// Snapshots are not available yet for sandboxes on worker nodes
@@ -98,9 +102,11 @@ pub enum SandboxSnapshotError {
     #[error("Snapshot {snapshot_id} uses an unsupported legacy artifact format: {reason}")]
     LegacyArtifactUnsupported { snapshot_id: String, reason: String },
 
-    /// The source sandbox doesn't exist or was already destroyed.
-    #[error("Sandbox {sandbox_id} not found")]
-    SandboxNotFound { sandbox_id: String },
+    /// The source sandbox doesn't exist, was already destroyed, or its
+    /// provider handle could not be recovered (for example the VM is not
+    /// running). `reason` carries the registry's own explanation.
+    #[error("Sandbox {sandbox_id} not found: {reason}")]
+    SandboxNotFound { sandbox_id: String, reason: String },
 
     /// The sandbox is not running — snapshots require a live container.
     ///

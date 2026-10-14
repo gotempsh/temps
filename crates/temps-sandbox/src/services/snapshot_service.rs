@@ -87,6 +87,24 @@ fn artifact_metadata(
 }
 
 /// Service for snapshot CRUD and lifecycle management.
+/// Refuse a snapshot for a backend that has no snapshot format, before
+/// anything is scrubbed or stopped. Only Docker and Firecracker override
+/// `SandboxProvider::take_snapshot`; microsandbox and the local backend would
+/// otherwise stop the sandbox only to fail with a provider error.
+///
+/// An unrecognised backend name is allowed through so the provider decides.
+fn ensure_backend_can_snapshot(backend: &str) -> Result<(), SandboxSnapshotError> {
+    use temps_agents::sandbox::SandboxBackend;
+    match backend.parse::<SandboxBackend>() {
+        Ok(SandboxBackend::Microsandbox) | Ok(SandboxBackend::Local) => {
+            Err(SandboxSnapshotError::NotSupported {
+                backend: backend.to_string(),
+            })
+        }
+        Ok(SandboxBackend::Docker) | Ok(SandboxBackend::Firecracker) | Err(_) => Ok(()),
+    }
+}
+
 pub struct SnapshotService {
     db: Arc<DatabaseConnection>,
     registry: Arc<StandaloneSandboxRegistry>,
@@ -156,14 +174,17 @@ impl SnapshotService {
         label: Option<String>,
     ) -> Result<sandbox_snapshots::Model, SandboxSnapshotError> {
         // Refuse before anything else, in particular before the flow scrubs
-        // credentials and stops the sandbox: worker nodes cannot take
-        // snapshots yet (ADR-048 phase 2).
-        let node_id = sandboxes::Entity::find_by_id(sandbox_internal_id)
+        // credentials and stops the sandbox: a backend without a snapshot
+        // format must not have its sandbox stopped just to learn that, and
+        // worker nodes cannot take snapshots yet (ADR-048 phase 2).
+        let sandbox_row = sandboxes::Entity::find_by_id(sandbox_internal_id)
             .one(self.db.as_ref())
             .await
-            .map_err(SandboxSnapshotError::Database)?
-            .and_then(|row| row.node_id);
-        if let Some(node_id) = node_id {
+            .map_err(SandboxSnapshotError::Database)?;
+        if let Some(backend) = sandbox_row.as_ref().and_then(|row| row.backend.as_deref()) {
+            ensure_backend_can_snapshot(backend)?;
+        }
+        if let Some(node_id) = sandbox_row.and_then(|row| row.node_id) {
             let node = crate::services::placement::node_names(self.db.as_ref(), [node_id])
                 .await
                 .ok()
@@ -260,9 +281,16 @@ impl SnapshotService {
             Ok(handle) => handle,
             Err(error) => {
                 let reason = format!("sandbox registry lookup failed: {}", error);
+                tracing::warn!(
+                    sandbox_id = %sandbox_public_id,
+                    internal_id = sandbox_internal_id,
+                    error = %error,
+                    "snapshot: cannot reach the sandbox's provider handle"
+                );
                 let _ = self.mark_failed(row.id, &reason).await;
                 return Err(SandboxSnapshotError::SandboxNotFound {
                     sandbox_id: sandbox_public_id.to_string(),
+                    reason: error.to_string(),
                 });
             }
         };
@@ -280,6 +308,7 @@ impl SnapshotService {
                     let _ = self.mark_failed(row.id, reason).await;
                     return Err(SandboxSnapshotError::SandboxNotFound {
                         sandbox_id: sandbox_public_id.to_string(),
+                        reason: reason.to_string(),
                     });
                 }
                 Err(error) => {
@@ -2895,5 +2924,33 @@ mod tests {
         )
         .await
         .expect("artifact lifecycle lock should become available after release");
+    }
+
+    #[test]
+    fn backends_without_a_snapshot_format_are_refused_up_front() {
+        for backend in ["microsandbox", "local"] {
+            match ensure_backend_can_snapshot(backend) {
+                Err(SandboxSnapshotError::NotSupported { backend: named }) => {
+                    assert_eq!(named, backend)
+                }
+                other => panic!("{backend} must be refused, got {other:?}"),
+            }
+        }
+        for backend in ["docker", "firecracker", "some-future-backend"] {
+            assert!(
+                ensure_backend_can_snapshot(backend).is_ok(),
+                "{backend} must be left to the provider"
+            );
+        }
+    }
+
+    #[test]
+    fn not_supported_error_names_the_backends_that_can_snapshot() {
+        let message = SandboxSnapshotError::NotSupported {
+            backend: "microsandbox".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("microsandbox"), "{message}");
+        assert!(message.contains("firecracker"), "{message}");
     }
 }

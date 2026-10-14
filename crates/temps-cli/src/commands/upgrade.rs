@@ -432,11 +432,14 @@ impl UpgradeCommand {
         // swap it in right after the host binary. A miss is only a warning.
         let staged_agent =
             stage_vm_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
+        let staged_pty_agent =
+            stage_pty_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
 
         // Replace the binary atomically
         println!("  Replacing binary at {}...", binary_path.display());
         finalize_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
+        install_pty_agent_reporting(staged_pty_agent);
 
         println!();
         println!(
@@ -605,10 +608,13 @@ impl UpgradeCommand {
         // Same guest-agent handling as the OSS path: see `run_oss`.
         let staged_agent =
             stage_vm_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
+        let staged_pty_agent =
+            stage_pty_agent_reporting(download_file.as_file_mut(), &download_path, &binary_path);
 
         println!("  Replacing binary at {}...", binary_path.display());
         finalize_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
+        install_pty_agent_reporting(staged_pty_agent);
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
@@ -1748,6 +1754,45 @@ impl StagedVmAgent {
     }
 }
 
+/// File name of the sandbox terminal agent that the Linux release tarballs
+/// carry beside `temps`. `temps firecracker setup` and `temps microsandbox
+/// setup` stage it from the directory of the running executable, so an
+/// upgrade refreshes it with the host binary; a missing one only costs
+/// `temps sandbox shell`, never the sandbox itself.
+pub(crate) const PTY_AGENT_BINARY_NAME: &str = temps_agents::sandbox::PTY_AGENT_BINARY_NAME;
+
+const PTY_AGENT_MANUAL_INSTALL_HINT: &str = "To refresh it, extract temps-pty-agent from this \
+     release's temps-linux-<arch>.tar.gz and pass it to \
+     `temps firecracker setup --pty-agent-bin <path>` and \
+     `temps microsandbox setup --pty-agent-bin <path>`.";
+
+/// A guest-side binary shipped beside `temps` in the Linux release tarballs.
+struct ShippedAgent {
+    /// Entry name in the tarball and file name beside the host binary.
+    binary_name: &'static str,
+    /// What to call it in upgrade output.
+    label: &'static str,
+    /// What to tell the operator when it could not be refreshed.
+    manual_hint: &'static str,
+    /// What to tell the operator after it was refreshed.
+    refreshed_hint: &'static str,
+}
+
+const VM_AGENT: ShippedAgent = ShippedAgent {
+    binary_name: VM_AGENT_BINARY_NAME,
+    label: "Firecracker guest agent",
+    manual_hint: VM_AGENT_MANUAL_INSTALL_HINT,
+    refreshed_hint: "Re-run `temps firecracker setup` to give new sandboxes the updated agent.",
+};
+
+const PTY_AGENT: ShippedAgent = ShippedAgent {
+    binary_name: PTY_AGENT_BINARY_NAME,
+    label: "sandbox terminal agent",
+    manual_hint: PTY_AGENT_MANUAL_INSTALL_HINT,
+    refreshed_hint: "Re-run `temps firecracker setup` / `temps microsandbox setup` to stage it; \
+         sandboxes keep the terminal agent they were created with, so recreate one to pick it up.",
+};
+
 /// Pull `temps-vm-agent` out of the downloaded tarball into a sealed staging
 /// file beside `binary_path`.
 ///
@@ -1762,14 +1807,35 @@ pub(crate) fn stage_vm_agent_from_tarball(
     tarball_path: &Path,
     binary_path: &Path,
 ) -> anyhow::Result<Option<StagedVmAgent>> {
+    stage_agent_from_tarball(&VM_AGENT, tarball, tarball_path, binary_path)
+}
+
+/// [`stage_vm_agent_from_tarball`] for `temps-pty-agent`, with the same
+/// contract: `Ok(None)` when the release does not ship one. The upgrade
+/// flow goes through `stage_pty_agent_reporting`; this is the testable seam.
+#[cfg(test)]
+pub(crate) fn stage_pty_agent_from_tarball(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    binary_path: &Path,
+) -> anyhow::Result<Option<StagedVmAgent>> {
+    stage_agent_from_tarball(&PTY_AGENT, tarball, tarball_path, binary_path)
+}
+
+fn stage_agent_from_tarball(
+    agent: &ShippedAgent,
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    binary_path: &Path,
+) -> anyhow::Result<Option<StagedVmAgent>> {
     let parent = binary_path.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "Cannot determine the directory of {} to place {} in",
             binary_path.display(),
-            VM_AGENT_BINARY_NAME
+            agent.binary_name
         )
     })?;
-    let dest = parent.join(VM_AGENT_BINARY_NAME);
+    let dest = parent.join(agent.binary_name);
 
     let mut staged_file = create_upgrade_temp_file(parent, ".temps-upgrade-agent.")?;
     let staged_path = staged_file.path().to_path_buf();
@@ -1778,7 +1844,7 @@ pub(crate) fn stage_vm_agent_from_tarball(
         tarball_path,
         staged_file.as_file_mut(),
         &staged_path,
-        VM_AGENT_BINARY_NAME,
+        agent.binary_name,
     )?;
     if extracted.is_none() {
         // Dropping the NamedTempFile removes the scratch file.
@@ -1789,54 +1855,79 @@ pub(crate) fn stage_vm_agent_from_tarball(
     Ok(Some(StagedVmAgent { staged, dest }))
 }
 
-/// `temps upgrade` wrapper over [`stage_vm_agent_from_tarball`]: a failure is
-/// printed as a warning and the upgrade carries on without refreshing the
-/// agent.
-fn stage_vm_agent_reporting(
+/// `temps upgrade` wrapper over the staging helpers: a failure is printed as
+/// a warning and the upgrade carries on without refreshing the agent.
+fn stage_agent_reporting(
+    agent: &ShippedAgent,
     tarball: &mut fs::File,
     tarball_path: &Path,
     binary_path: &Path,
 ) -> Option<StagedVmAgent> {
-    match stage_vm_agent_from_tarball(tarball, tarball_path, binary_path) {
+    match stage_agent_from_tarball(agent, tarball, tarball_path, binary_path) {
         Ok(staged) => staged,
         Err(e) => {
             println!(
                 "  Warning: could not stage {} from the release: {}",
-                VM_AGENT_BINARY_NAME, e
+                agent.binary_name, e
             );
             println!(
-                "  The existing guest agent (if any) was left untouched. {}",
-                VM_AGENT_MANUAL_INSTALL_HINT
+                "  The existing {} (if any) was left untouched. {}",
+                agent.label, agent.manual_hint
             );
             None
         }
     }
 }
 
-/// Install a staged guest agent after the host binary has been replaced, and
-/// say what happened. Never fails the upgrade: `temps` is already on disk.
-fn install_vm_agent_reporting(staged: Option<StagedVmAgent>) {
+fn stage_vm_agent_reporting(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    binary_path: &Path,
+) -> Option<StagedVmAgent> {
+    stage_agent_reporting(&VM_AGENT, tarball, tarball_path, binary_path)
+}
+
+fn stage_pty_agent_reporting(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    binary_path: &Path,
+) -> Option<StagedVmAgent> {
+    stage_agent_reporting(&PTY_AGENT, tarball, tarball_path, binary_path)
+}
+
+/// Install a staged agent after the host binary has been replaced, and say
+/// what happened. Never fails the upgrade: `temps` is already on disk.
+fn install_agent_reporting(agent: &ShippedAgent, staged: Option<StagedVmAgent>) {
     let Some(staged) = staged else {
         return;
     };
     let dest = staged.dest().to_path_buf();
     match staged.install() {
         Ok(path) => {
-            println!("  Updated Firecracker guest agent at {}", path.display());
-            println!("  Re-run `temps firecracker setup` to give new sandboxes the updated agent.");
+            println!("  Updated {} at {}", agent.label, path.display());
+            println!("  {}", agent.refreshed_hint);
         }
         Err(e) => {
             println!(
-                "  Warning: could not update the Firecracker guest agent at {}: {}",
+                "  Warning: could not update the {} at {}: {}",
+                agent.label,
                 dest.display(),
                 e
             );
             println!(
-                "  The host is upgraded but the guest agent is the previous version. {}",
-                VM_AGENT_MANUAL_INSTALL_HINT
+                "  The host is upgraded but the {} is the previous version. {}",
+                agent.label, agent.manual_hint
             );
         }
     }
+}
+
+fn install_vm_agent_reporting(staged: Option<StagedVmAgent>) {
+    install_agent_reporting(&VM_AGENT, staged);
+}
+
+fn install_pty_agent_reporting(staged: Option<StagedVmAgent>) {
+    install_agent_reporting(&PTY_AGENT, staged);
 }
 
 /// Securely create an upgrade scratch file beside the target binary.
@@ -3059,6 +3150,89 @@ mod tests {
         assert_eq!(std::fs::read(&binary).unwrap(), b"old-host");
         drop(tarball);
         assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_pty_agent_installs_beside_binary_and_leaves_vm_agent_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let vm_agent = dir.path().join(VM_AGENT_BINARY_NAME);
+        let pty_agent = dir.path().join(PTY_AGENT_BINARY_NAME);
+        std::fs::write(&binary, b"old-host").unwrap();
+        std::fs::write(&pty_agent, b"old-pty").unwrap();
+
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[
+                ("temps", b"new-host"),
+                ("temps-vm-agent", b"new-vm"),
+                ("temps-pty-agent", b"new-pty"),
+            ]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged = stage_pty_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap()
+            .expect("tarball carries the terminal agent");
+        // Staging alone touches nothing live.
+        assert_eq!(std::fs::read(&pty_agent).unwrap(), b"old-pty");
+        assert_eq!(staged.dest(), pty_agent.as_path());
+
+        staged.install().unwrap();
+        assert_eq!(std::fs::read(&pty_agent).unwrap(), b"new-pty");
+        // The VM agent is a different entry: staging the terminal agent
+        // must neither create nor overwrite it.
+        assert!(!vm_agent.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&pty_agent).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "agent must be executable");
+        }
+        drop(tarball);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_pty_agent_returns_none_when_release_does_not_ship_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let pty_agent = dir.path().join(PTY_AGENT_BINARY_NAME);
+        std::fs::write(&pty_agent, b"existing-pty").unwrap();
+
+        // A release that ships only the VM agent (older Linux tarballs).
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-vm-agent", b"new-vm")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let staged =
+            stage_pty_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary).unwrap();
+        assert!(staged.is_none());
+        assert_eq!(std::fs::read(&pty_agent).unwrap(), b"existing-pty");
+        drop(tarball);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_stage_pty_agent_rejects_empty_entry_and_keeps_existing_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("temps");
+        let pty_agent = dir.path().join(PTY_AGENT_BINARY_NAME);
+        std::fs::write(&pty_agent, b"existing-pty").unwrap();
+
+        let mut tarball = downloaded_tarball(
+            dir.path(),
+            &tarball_with_entries(&[("temps", b"new-host"), ("temps-pty-agent", b"")]),
+        );
+        let tarball_path = tarball.path().to_path_buf();
+
+        let err = stage_pty_agent_from_tarball(tarball.as_file_mut(), &tarball_path, &binary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("temps-pty-agent"), "error was: {err}");
+        assert_eq!(std::fs::read(&pty_agent).unwrap(), b"existing-pty");
     }
 
     #[test]

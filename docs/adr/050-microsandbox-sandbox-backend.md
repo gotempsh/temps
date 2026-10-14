@@ -47,7 +47,7 @@ Two options were evaluated: (a) link the `microsandbox` crate, (b) drive the `ms
 
 The spike (adding the crate to `temps-agents` and running `cargo check`):
 
-- **Feature set:** `default-features = false, features = ["local", "net"]`, pinned `=0.7.7`. Defaults are off because `download-binaries` downloads the runtime from the network *inside `build.rs`*, and `cloud`/`keyring` are unused.
+- **Feature set:** `default-features = false, features = ["local", "net"]`, pinned `=0.7.8`. Defaults are off because `download-binaries` downloads the runtime from the network *inside `build.rs`*, and `cloud`/`keyring` are unused.
 - **ORM duplication — accepted, no conflict.** The crate depends on `sea-orm 2.0.4` / `sqlx 0.9.0` (SQLite) for its own state database; we are on `sea-orm 1.1.20` / `sqlx 0.8.6`. Both resolve side by side. `sqlx 0.9.0` was *already* in our lockfile (via `temps-proxy`), and both sqlx-sqlite versions share a single `libsqlite3-sys 0.30.1`, so there is **no `links = "sqlite3"` conflict**.
 - **Size:** `Cargo.lock` grows by 100 packages (1259 → 1359). `temps-agents`' normal (non-dev) dependency graph grows by 76 unique packages (916 → 992, +8%): the `microsandbox-*` crates, the second sea-orm stack, `oci-client`/`oci-spec`, and libkrun device crates (`msb_krun_*`, `vmm-sys-util`, `kvm-*`/`hvf`) pulled in through `microsandbox-filesystem`.
 - **Compile:** no new native build tools. `cmake` and `protoc` are pre-existing workspace requirements (pingora's `zlib-ng`, `temps-otel`), not added by this crate.
@@ -63,13 +63,24 @@ All SDK state lives under a Temps-owned home, never the user's `~/.microsandbox`
 ```
 <data_dir>/microsandbox/      0700
   config.json                 Temps-owned SDK config (absent = SDK defaults)
-  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.7)
+  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.8)
   db/ sandboxes/ cache/ …     SDK-managed
 ```
 
 - Every SDK call is bound to an explicitly built `LocalBackend` (`home`, `config_path`, `deployment_profile`). The SDK's *ambient* default backend also honours `MSB_BACKEND` / `MSB_API_KEY` / `MSB_PROFILE`, any of which could otherwise route sandboxes to a remote service; we never use the ambient default.
 - The runtime pair is installed only by an explicit operator action, `temps microsandbox setup`. It calls the SDK's `setup::ensure_runtime`, which downloads the official release archive for the pinned version and verifies the installed pair. The command then boots a smoke-test VM. Server startup never downloads anything.
+- **The runtime must equal the SDK version.** The SDK launches only a runtime whose embedded `.msbver` section equals its own crate version (`launch_contract.rs`), and `ensure_runtime` keeps any complete existing pair without comparing versions. A host that ran an older build's setup therefore keeps a runtime this build refuses ("no tested sandbox launch contract for runtime X"). Temps guards this three ways: the availability probe reads the installed `msb`'s version through the SDK's own `resolve_runtime_version` and reports `RuntimeVersionMismatch` (installed vs. expected, with the setup command) instead of registering a backend that cannot launch; `temps microsandbox setup` replaces a mismatched pair that lives under the Temps home (`install_runtime` with `force`, which backs up and rolls back on failure) and refuses, naming the variable, when the pair comes from `MSB_PATH` / `MSB_LIBKRUNFW_PATH`, which Temps never overwrites; and the unit test `pinned_runtime_version_matches_the_sdk_this_build_links` fails the build if `MICROSANDBOX_VERSION` and the Cargo pin drift apart on a future bump.
 - No new Temps environment variables. Backend selection is the existing `agent_sandbox.sandbox_backend` setting plus the per-sandbox `backend` field. The SDK's own `MSB_PATH`/`MSB_LIBKRUNFW_PATH` overrides still apply, since they are runtime-resolution inputs the SDK reads, not Temps configuration.
+
+#### Which data directory a setup command acts on
+
+The server reads state from its own data directory (`TEMPS_DATA_DIR`, else `~/.temps`), and a shell inherits none of that. The legacy `deploy.sh` layout keeps the instance's keys under `~/.temps/data`, so a bare `temps microsandbox setup` or `temps firecracker setup` used to provision `~/.temps` and leave the server (which reads `~/.temps/data`) reporting the backend as unavailable. Both commands now resolve the directory the same way (`commands/data_dir_discovery.rs`):
+
+1. `--data-dir` / `TEMPS_DATA_DIR` in the shell.
+2. A running `temps serve` on this host (Linux): its `--data-dir` argument, else `TEMPS_DATA_DIR` or `$HOME/.temps` from `/proc/<pid>/environ`. If several servers use different directories, nothing is guessed.
+3. The layout `temps doctor` recognises (`~/.temps/data` when it holds `auth_secret`/`encryption_key`, else `~/.temps`).
+
+The banner prints the directory and where it came from. If an explicit directory differs from a running server's, setup warns that the server will not see what is installed there. If the resolved directory holds no Temps data (no `encryption_key`/`auth_secret`), setup says so and names `--data-dir`; it still proceeds, because a machine that has not started Temps yet legitimately has none. A runtime or Firecracker state found under another candidate directory is reported the same way. The server only reads backends at startup, so a newly provisioned backend needs a restart of `temps serve`; the unavailability messages say so and print the exact `setup --data-dir …` command for the server's directory.
 
 ### 4. Availability gating and selection
 
@@ -122,7 +133,7 @@ Deferred (required before this backend could be recommended for untrusted multi-
 
 ### 7. Out of scope for v1 (phase 2)
 
-- **Snapshots / fork (ADR-037).** The SDK has snapshot, fork and CoW-memory restore, but ADR-037's surface is a content-addressed, credential-scrubbed artifact file with a digest and a cross-backend 422. Mapping SDK snapshots onto that (export archive → digest → scrub → restore) is not a straight translation, so `take_snapshot` / `create_from_snapshot` keep the trait default ("not supported").
+- **Snapshots / fork (ADR-037).** The SDK has snapshot, fork and CoW-memory restore, but ADR-037's surface is a content-addressed, credential-scrubbed artifact file with a digest and a cross-backend 422. Mapping SDK snapshots onto that (export archive → digest → scrub → restore) is not a straight translation, so `take_snapshot` / `create_from_snapshot` keep the trait default ("not supported"). The snapshot service refuses a microsandbox sandbox with 501 `Snapshot is not supported by backend 'microsandbox'` *before* it scrubs credentials or stops the sandbox, so asking for a snapshot never interrupts a running workload. Use a `firecracker` or `docker` sandbox when snapshots are needed.
 - **Worker nodes (ADR-048).** `"microsandbox"` on a worker-placed sandbox is rejected with a validation error, the same as Firecracker today.
 - **Preview URLs / port publishing.** No ports are published. The preview gateway resolves Docker container names only.
 - **Retained agent runtime transport** (`connect_agent_runtime`): trait default (unsupported).
@@ -134,7 +145,7 @@ Deferred (required before this backend could be recommended for untrusted multi-
 
 Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends (ADR-008), so tabs, scrollback replay and detach/reattach are identical. Nothing in the image is assumed: the default `alpine:3.20` has no `bash`, `socat` or `dtach`.
 
-- **Guest agent.** `temps microsandbox setup` stages a static Linux `temps-pty-agent` at `<data_dir>/microsandbox/guest/` (`--pty-agent-bin`, or a file next to the `temps` executable; it must match the guest architecture — the host's on Linux, aarch64 on Apple Silicon — and is built with `cargo build --release --target <arch>-unknown-linux-musl -p temps-pty-agent`; the release workflow does not publish it yet). On the first terminal for a sandbox the provider writes it into the guest through the SDK file API at `/usr/local/lib/temps/pty-agent-<sha256 prefix>`, root-owned `0755` in a root-owned directory (content-addressed, so a new build installs beside the old one). A VM that is recreated or restarted keeps it on its root disk.
+- **Guest agent.** `temps microsandbox setup` stages a static Linux `temps-pty-agent` at `<data_dir>/microsandbox/guest/` (`--pty-agent-bin`, or a file next to the `temps` executable; it must match the guest architecture — the host's on Linux, aarch64 on Apple Silicon — and is built with `cargo build --release --target <arch>-unknown-linux-musl -p temps-pty-agent`; release archives ship the matching static `temps-pty-agent` next to `temps`, `scripts/install.sh` and `temps upgrade` install it beside the binary, and setup finds it there without `--pty-agent-bin`). On the first terminal for a sandbox the provider writes it into the guest through the SDK file API at `/usr/local/lib/temps/pty-agent-<sha256 prefix>`, root-owned `0755` in a root-owned directory (content-addressed, so a new build installs beside the old one). A VM that is recreated or restarted keeps it on its root disk.
 - **Start.** The agent is started detached (`setsid`, `nohup` fallback) as the sandbox's **default exec user** — the same identity every `exec` runs as — with `/run/temps-pty` created `0700` for that uid. Every step is idempotent: a probe (`temps-pty-agent --probe`, which connects rather than testing for the socket file, since a crashed agent leaves a stale one) gates both installation and start, and the agent itself refuses to bind over a live socket, so concurrent first attaches cannot orphan each other's tabs.
 - **Attach.** `attach_pty` is an SDK streaming exec of `temps-pty-agent --relay` with stdin piped (`exec_stream_with(.., stdin_pipe())`). Exec stdout is the `output` stream; `input` is a bounded 64 KiB pipe pumped into the SDK's stdin sink and closed on drop, which ends the relay but not the agent. Relay stderr is surfaced as the attach error, never mixed into the frame stream.
 - **Shell.** The default tab command uses `bash -l` when the guest has bash and `sh -l` otherwise.
@@ -153,7 +164,7 @@ Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends 
 ### Negative
 
 - +76 crates in the agents graph, including a second ORM stack (sea-orm 2 / sqlx 0.9 + SQLite) that the SDK uses only for its own bookkeeping. Compile time and binary size grow.
-- A pre-1.0 dependency (`=0.7.7`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
+- A pre-1.0 dependency (`=0.7.8`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
 - libkrun's shared guest/VMM security context means this backend is weaker than Firecracker against VMM-escape attacks. Mitigated by positioning and the confinement in §6, but not eliminated.
 - Two microVM backends double the microVM test matrix.
 
@@ -197,5 +208,5 @@ E2E tests (`TEMPS_DATA_DIR=<dir with runtime> cargo test --lib -p temps-agents s
 - ADR-036: Persistent Workspace Sandboxes
 - ADR-037: Sandbox Snapshots
 - ADR-048: Multi-Node Sandboxes
-- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.7)
+- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.8)
 - libkrun: https://github.com/containers/libkrun (security model section)
