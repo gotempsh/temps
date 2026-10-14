@@ -66,6 +66,7 @@ use temps_monitoring::{
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
 use temps_otel::plugin::OtelPlugin;
+use temps_project_groups::ProjectGroupsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
 use temps_proxy::ProxyPlugin;
@@ -1515,18 +1516,39 @@ async fn serve_original_console(req: Request) -> Response {
     serve_static_from(&WEBSITE, req)
 }
 
+/// Detail text for a request path that must never fall through to the SPA,
+/// or `None` when the console may serve it.
+///
+/// The returned text is a fixed literal (no request data), so it is safe to
+/// embed in the JSON body verbatim.
+fn unmatched_api_detail(path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/") {
+        Some("No API route matched")
+    } else if path == "/ai/v1" || path.starts_with("/ai/v1/") {
+        Some(
+            "No API route matched. The AI gateway is served under /api/ai/v1, \
+             for example /api/ai/v1/chat/completions",
+        )
+    } else {
+        None
+    }
+}
+
 fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     let raw_path = req.uri().path();
 
     // Never serve the SPA for /api/ paths — those should 404 if unmatched
-    // by any API router (including external plugin proxies).
-    if raw_path.starts_with("/api/") {
+    // by any API router (including external plugin proxies). The same goes for
+    // `/ai/v1/*`: the AI gateway lives under `/api/ai/v1`, and answering a
+    // client that dropped the `/api` prefix with the console HTML (200) makes
+    // every OpenAI SDK fail with an unparseable body instead of a pointer to
+    // the right URL.
+    if let Some(detail) = unmatched_api_detail(raw_path) {
+        let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"status":404,"title":"Not Found","detail":"No API route matched"}"#,
-            ))
+            .body(Body::from(body))
             .unwrap();
     }
 
@@ -1959,9 +1981,18 @@ fn log_aggregator_storage_config(
 /// (`config.is_clickhouse_enabled()`). When the monitoring store is set to
 /// ClickHouse but the env vars are absent, this logs a warning and returns
 /// `None` so the caller falls back to TimescaleDB (fail-open to the default
-/// path, never silently losing metrics). Construction does no I/O; migrations
-/// are spawned separately by the caller.
-fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics::MetricsStore>> {
+/// path, never silently losing metrics). Construction does no I/O.
+///
+/// `compression` is the wire-compression mode every ClickHouse client of this
+/// process uses (`ConfigService::clickhouse_compression`). Migrations are
+/// applied on a detached task and retried until they apply, so a server that
+/// is still starting — or one whose responses cannot be decoded until the
+/// operator fixes it — does not leave the store without its tables until the
+/// next restart.
+fn build_ch_metrics_store(
+    config: &ServerConfig,
+    compression: temps_clickhouse::ClickHouseCompression,
+) -> Option<Arc<dyn temps_metrics::MetricsStore>> {
     use temps_metrics::{ClickHouseMetricsConfig, ClickhouseMetricsStore, MetricsStore};
 
     if !config.is_clickhouse_enabled() {
@@ -1978,46 +2009,33 @@ fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics
         config.clickhouse_database.clone().unwrap_or_default(),
         config.clickhouse_user.clone().unwrap_or_default(),
         config.clickhouse_password.clone().unwrap_or_default(),
-    );
+    )
+    .with_compression(compression);
     let store = Arc::new(ClickhouseMetricsStore::new(cfg));
 
-    // Run migrations in the background so startup is not blocked. If they fail,
-    // the first write/read surfaces the error per-call. Guard on the runtime
-    // handle: this is called from an async path today, but a bare tokio::spawn
-    // panics if ever invoked from a sync context (no reactor) — fall back to a
-    // short-lived current-thread runtime in that case.
+    // Run migrations in the background so startup is not blocked, retrying
+    // until they apply. `spawn_retrying` works with or without a Tokio runtime
+    // on this thread.
     let client = store.client().clone();
     let database = config.clickhouse_database.clone().unwrap_or_default();
-    let run_migrations = async move {
-        match temps_metrics::clickhouse_migrations::apply_migrations(&client, &database).await {
-            Ok(report) => debug!(
+    temps_clickhouse::spawn_retrying(
+        "resource-metrics",
+        temps_clickhouse::MigrationRetryPolicy::default(),
+        move || {
+            let client = client.clone();
+            let database = database.clone();
+            async move {
+                temps_metrics::clickhouse_migrations::apply_migrations(&client, &database).await
+            }
+        },
+        |report| {
+            debug!(
                 applied = ?report.applied,
                 skipped = report.skipped.len(),
                 "ClickHouse resource-metrics migrations applied"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "ClickHouse resource-metrics migrations failed; \
-                 metric writes/queries will surface the error per-call"
-            ),
-        }
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn(run_migrations);
-        }
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt.block_on(run_migrations),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "Could not build a runtime to apply ClickHouse resource-metrics \
-                 migrations; they will be attempted on first read/write"
-            ),
+            )
         },
-    }
+    );
 
     Some(store as Arc<dyn MetricsStore>)
 }
@@ -3158,18 +3176,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let templates_override_path = config.data_dir.join("templates.yaml");
     let template_service = Arc::new(TemplateService::new(Some(templates_override_path))?);
 
-    // Load additional template files if specified
+    // Load additional template files if specified. `load_additional` warns and
+    // skips individual templates with unknown presets or other validation
+    // errors; it only returns `Err` when the file itself is missing or
+    // unparsable, which is always a boot-time configuration mistake.
     for additional_path in &additional_templates {
         info!("Loading additional templates from {:?}", additional_path);
         if let Err(e) = template_service.load_additional(additional_path).await {
             return Err(anyhow::anyhow!(
-                "❌ Failed to load additional templates from {:?}\n\n\
+                "Failed to load additional templates from {:?}\n\n\
                 Error: {}\n\n\
-                Please check the file exists and contains valid YAML with valid services.\n\
-                Valid services are: {}",
+                Check that the file exists and contains valid YAML. Templates with \
+                unrecognised presets are skipped with a warning; valid presets are: {}",
                 additional_path,
                 e,
-                temps_core::templates::VALID_SERVICES.join(", ")
+                temps_core::templates::VALID_PRESETS.join(", ")
             ));
         }
     }
@@ -3282,6 +3303,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering TeamsPlugin");
     let teams_plugin = Box::new(TeamsPlugin::new());
     plugin_manager.register_plugin(teams_plugin);
+
+    // 5.2. ProjectGroupsPlugin - optional parent grouping for projects. Its
+    // member lists are filtered through the ProjectAccessChecker above.
+    debug!("Registering ProjectGroupsPlugin");
+    plugin_manager.register_plugin(Box::new(ProjectGroupsPlugin::new()));
 
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");
@@ -4085,11 +4111,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                 Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
                                     as Arc<dyn MetricsStore>)
                             }
-                            MetricsStoreKind::ClickHouse => build_ch_metrics_store(&config)
-                                .or_else(|| {
-                                    Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
-                                        as Arc<dyn MetricsStore>)
-                                }),
+                            MetricsStoreKind::ClickHouse => {
+                                build_ch_metrics_store(&config, cfg_svc.clickhouse_compression())
+                                    .or_else(|| {
+                                        Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
+                                            as Arc<dyn MetricsStore>)
+                                    })
+                            }
                         },
                         _ => None,
                     },
@@ -4144,8 +4172,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             match cfg_svc.get_settings().await {
                 Ok(settings) => {
                     let metrics_store: Arc<dyn MetricsStore> = match settings.monitoring.store {
-                        MetricsStoreKind::ClickHouse => build_ch_metrics_store(&config)
-                            .unwrap_or_else(|| Arc::new(TimescaleMetricsStore::new(db.clone()))),
+                        MetricsStoreKind::ClickHouse => {
+                            build_ch_metrics_store(&config, cfg_svc.clickhouse_compression())
+                                .unwrap_or_else(|| Arc::new(TimescaleMetricsStore::new(db.clone())))
+                        }
                         MetricsStoreKind::TimescaleDb => {
                             Arc::new(TimescaleMetricsStore::new(db.clone()))
                         }
@@ -6790,5 +6820,58 @@ mod log_storage_config_tests {
             }
             other => panic!("expected the S3 backend, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spa_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn api_paths_never_fall_through_to_the_spa() {
+        assert_eq!(
+            unmatched_api_detail("/api/does-not-exist"),
+            Some("No API route matched")
+        );
+    }
+
+    #[test]
+    fn ai_gateway_path_without_api_prefix_points_to_the_real_base_url() {
+        for path in ["/ai/v1", "/ai/v1/models", "/ai/v1/chat/completions"] {
+            let detail = unmatched_api_detail(path)
+                .unwrap_or_else(|| panic!("{path} must not be answered with the console HTML"));
+            assert!(
+                detail.contains("/api/ai/v1"),
+                "detail for {path} must name the correct base URL, got: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_routes_are_still_served_by_the_spa() {
+        for path in ["/", "/ai", "/ai-first", "/ai/v1x", "/projects/1/ai/v1"] {
+            assert_eq!(
+                unmatched_api_detail(path),
+                None,
+                "{path} is a console route and must keep the SPA fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_answers_ai_gateway_prefix_with_a_json_404() {
+        let request = axum::http::Request::builder()
+            .uri("/ai/v1/models")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = serve_static_from(&WEBSITE, request);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(b"application/json".as_slice())
+        );
     }
 }

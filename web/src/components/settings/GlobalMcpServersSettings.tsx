@@ -99,7 +99,7 @@ export function GlobalMcpServersSettings() {
         <div>
           <h2 className="text-lg font-semibold">Global MCP Servers</h2>
           <p className="text-sm text-muted-foreground mt-1">
-            Platform-wide MCP server configurations available to all projects.
+            Platform-wide MCP server configurations available to all services.
             Configs are merged into{' '}
             <code className="text-xs bg-muted px-1 rounded">
               .claude/settings.json
@@ -149,7 +149,7 @@ export function GlobalMcpServersSettings() {
               No global MCP servers
             </h3>
             <p className="text-sm text-muted-foreground text-center mb-4 max-w-md">
-              Global MCP servers are available to all projects. Define common
+              Global MCP servers are available to all services. Define common
               tools like browser automation, database access, or file system
               servers here.
             </p>
@@ -179,7 +179,7 @@ export function GlobalMcpServersSettings() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete global MCP server?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete this MCP server. All projects that
+              This will permanently delete this MCP server. All services that
               reference it will lose access.
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -459,7 +459,7 @@ function GlobalMcpDialog({
           <DialogDescription>
             {isEdit
               ? 'Update this global MCP server configuration.'
-              : 'Define a new global MCP server available to all projects.'}
+              : 'Define a new global MCP server available to all services.'}
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">

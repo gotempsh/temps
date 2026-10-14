@@ -142,7 +142,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
             <CardHeader>
               <CardTitle>Service Status</CardTitle>
               <CardDescription>
-                Cluster-wide status of Blob Storage. Once enabled, every project
+                Cluster-wide status of Blob Storage. Once enabled, every service
                 on this instance can store files through the SDK below.
               </CardDescription>
             </CardHeader>
@@ -153,7 +153,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Status</p>
                       <p
-                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}
+                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-700 dark:text-green-600' : 'text-red-700 dark:text-red-600'}`}
                       >
                         {status?.healthy ? (
                           <CheckCircle2 className="h-4 w-4" />
@@ -194,7 +194,7 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                       An administrator must enable the Blob service from{' '}
                       <strong>Storage Settings → Platform Services</strong>.
                       Once enabled, the SDK on the Documentation tab works out
-                      of the box — no further per-project setup needed.
+                      of the box — no further per-service setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
@@ -305,7 +305,7 @@ TEMPS_PROJECT_ID=42`}
                   language="bash"
                 />
                 <p className="text-sm text-muted-foreground">
-                  Need an isolated client (multiple projects, custom timeouts,
+                  Need an isolated client (multiple services, custom timeouts,
                   testing)? Use{' '}
                   <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
                     createClient
@@ -437,7 +437,7 @@ console.log(snapshot.url)`}
                 <CodeBlock
                   code={`interface BlobInfo {
   url: string         // Full URL to access the blob
-  pathname: string    // Path within project storage
+  pathname: string    // Path within service storage
   contentType: string // MIME type (e.g., 'image/png')
   size: number        // Size in bytes
   uploadedAt: string  // ISO 8601 timestamp
@@ -673,7 +673,10 @@ function ApiMethod({
       </div>
       <div>
         <p className="text-xs text-muted-foreground mb-1">Signature</p>
-        <pre className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
+        <pre
+          tabIndex={0}
+          className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap"
+        >
           <HighlightedCode code={signature} language="typescript" />
         </pre>
       </div>

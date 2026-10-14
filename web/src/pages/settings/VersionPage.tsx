@@ -288,9 +288,10 @@ export function VersionPage() {
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
                 This server was started with{' '}
-                <span className="font-mono">--disable-self-update</span>, which
-                overrides this setting. Remove the flag and restart temps to
-                allow console updates.
+                <span className="font-mono">--disable-self-update</span> (or{' '}
+                <span className="font-mono">TEMPS_DISABLE_SELF_UPDATE</span>),
+                which overrides this setting. Remove the flag or variable and
+                restart temps to allow console updates.
               </span>
             </p>
           )}

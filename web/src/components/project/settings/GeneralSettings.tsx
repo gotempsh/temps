@@ -53,13 +53,13 @@ const projectSchema = z.object({
   name: z
     .string()
     .trim()
-    .min(1, 'Project name is required')
-    .max(100, 'Project name must be 100 characters or fewer'),
+    .min(1, 'Service name is required')
+    .max(100, 'Service name must be 100 characters or fewer'),
   slug: z
     .string()
     .trim()
-    .min(1, 'Project slug is required')
-    .max(63, 'Project slug must be 63 characters or fewer')
+    .min(1, 'Service slug is required')
+    .max(63, 'Service slug must be 63 characters or fewer')
     .regex(
       /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
       'Use lowercase letters, numbers and single hyphens (no leading or trailing hyphen)'
@@ -80,7 +80,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
     meta: {
-      errorTitle: 'Failed to update project settings',
+      errorTitle: 'Failed to update service settings',
     },
   })
 
@@ -126,7 +126,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     // through". Attaching a fixed error toast up front would flash a red
     // "Failed to update project" behind the verification dialog for a save
     // that is about to succeed.
-    const toastId = toast.loading('Updating project...')
+    const toastId = toast.loading('Updating service...')
     let updated
     try {
       updated = await request
@@ -142,11 +142,11 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       }
       const problem = error as { detail?: string; message?: string }
       toast.error(
-        problem.detail || problem.message || 'Failed to update project'
+        problem.detail || problem.message || 'Failed to update service'
       )
       return
     }
-    toast.success('Project updated successfully', { id: toastId })
+    toast.success('Service updated successfully', { id: toastId })
     refetch()
     // Navigate to the slug the server persisted, not the one submitted: the
     // server normalizes it, so routing on the raw input can land on a URL that
@@ -165,9 +165,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         },
       }),
       {
-        loading: 'Updating cross-project trace sharing...',
-        success: 'Cross-project trace sharing updated',
-        error: 'Failed to update cross-project trace sharing',
+        loading: 'Updating cross-service trace sharing...',
+        success: 'Cross-service trace sharing updated',
+        error: 'Failed to update cross-service trace sharing',
       }
     )
     refetch()
@@ -197,7 +197,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
     meta: {
-      errorTitle: 'Failed to delete project',
+      errorTitle: 'Failed to delete service',
     },
   })
 
@@ -210,12 +210,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
           path: { id: project.id! },
         }),
         {
-          loading: 'Deleting project...',
+          loading: 'Deleting service...',
           success: () => {
             navigate('/projects')
-            return 'Project deleted'
+            return 'Service deleted'
           },
-          error: 'Failed to delete project',
+          error: 'Failed to delete service',
         }
       )
     } catch (error) {
@@ -230,7 +230,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       <Form {...projectForm}>
         <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
           <SettingsSection
-            title="Project identity"
+            title="Service identity"
             icon={FolderPen}
             defaultOpen
           >
@@ -240,7 +240,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Project Name</FormLabel>
+                    <FormLabel>Service name</FormLabel>
                     <FormControl>
                       <Input {...field} className="max-w-[400px]" />
                     </FormControl>
@@ -260,12 +260,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 name="slug"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Project Slug</FormLabel>
+                    <FormLabel>Service slug</FormLabel>
                     <FormControl>
                       <Input {...field} className="max-w-[400px]" />
                     </FormControl>
                     <FormDescription className="text-muted-foreground">
-                      This will be used in your project&apos;s URL
+                      This will be used in your service&apos;s URL
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -300,14 +300,20 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         <div>
           <div className="flex flex-row items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5 pr-4">
-              <Label className="text-base">Cross-project trace sharing</Label>
+              <Label
+                htmlFor="cross-project-trace-sharing"
+                className="text-base"
+              >
+                Cross-service trace sharing
+              </Label>
               <p className="text-sm text-muted-foreground">
-                When on, this project&apos;s spans appear in other
-                projects&apos; unified cross-project traces. Turn off to keep
-                this project&apos;s spans private to itself.
+                When on, this service&apos;s spans appear in other
+                services&apos; unified cross-service traces. Turn off to keep
+                this service&apos;s spans private to itself.
               </p>
             </div>
             <Switch
+              id="cross-project-trace-sharing"
               checked={project?.cross_project_trace_sharing ?? true}
               onCheckedChange={handleToggleCrossProjectTraceSharing}
               disabled={updateProjectSettings.isPending}
@@ -321,7 +327,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         <div>
           <div className="flex flex-row items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5 pr-4">
-              <Label className="text-base">Source code in stack traces</Label>
+              <Label htmlFor="error-source-context" className="text-base">
+                Source code in stack traces
+              </Label>
               <p className="text-sm text-muted-foreground">
                 Off by default. When enabled, upload your application source per
                 release (via the CLI or API, keyed by the deployed commit/tag)
@@ -330,6 +338,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               </p>
             </div>
             <Switch
+              id="error-source-context"
               checked={project?.error_source_context_enabled ?? false}
               onCheckedChange={handleToggleErrorSourceContext}
               disabled={updateProjectSettings.isPending}
@@ -339,9 +348,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       </SettingsSection>
 
       {/* Danger Zone */}
-      <SettingsSection title="Delete project" icon={Trash2}>
+      <SettingsSection title="Delete service" icon={Trash2}>
         <p className="text-sm text-muted-foreground mt-1 mb-4">
-          Permanently delete this project and all of its contents from the
+          Permanently delete this service and all of its contents from the
           platform. This action is not reversible, so please continue with
           caution.
         </p>
@@ -353,14 +362,14 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
           }}
         >
           <AlertDialogTrigger asChild>
-            <Button variant="destructive">Delete project</Button>
+            <Button variant="destructive">Delete service</Button>
           </AlertDialogTrigger>
           <AlertDialogContent>
             <AlertDialogHeader>
               <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
               <AlertDialogDescription>
                 This action cannot be undone. This will permanently delete this
-                project and remove all associated data from our servers.
+                service and remove all associated data from our servers.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <div className="space-y-2">

@@ -660,7 +660,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
               <Sparkles className="mt-0.5 size-4 shrink-0 text-primary" />
               <div className="min-w-0">
                 <p className="font-medium">
-                  Recommended for this project:{' '}
+                  Recommended for this service:{' '}
                   {PLATFORMS.find((p) => p.id === recommendedPlatform)?.name}
                 </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
@@ -668,7 +668,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                   <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
                     {project.preset}
                   </code>{' '}
-                  preset we detected in this project.
+                  preset we detected in this service.
                 </p>
               </div>
             </div>

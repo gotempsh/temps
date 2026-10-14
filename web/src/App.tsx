@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
@@ -25,7 +26,7 @@ import {
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import { BrowserRouter, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
 import {
@@ -86,6 +87,11 @@ const PlatformTools = lazy(() =>
 )
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
+)
+const ProjectGroupDetail = lazy(() =>
+  import('./pages/ProjectGroupDetail').then((m) => ({
+    default: m.ProjectGroupDetail,
+  }))
 )
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
@@ -630,11 +636,11 @@ const FullAppRoutes = () => {
                     ))}
                     <Route
                       path="/"
-                      element={<Navigate to="/projects" replace />}
+                      element={<RedirectWithQuery to="/projects" />}
                     />
                     <Route
                       path="/dashboard"
-                      element={<Navigate to="/projects" replace />}
+                      element={<RedirectWithQuery to="/projects" />}
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
@@ -642,10 +648,11 @@ const FullAppRoutes = () => {
                     <Route path="/setup/ai" element={<AiOnboarding />} />
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
+                    <Route path="/p/:slug" element={<ProjectGroupDetail />} />
                     <Route
                       path="/drop"
                       element={
-                        <Navigate to="/projects/new?source=drop" replace />
+                        <RedirectWithQuery to="/projects/new?source=drop" />
                       }
                     />
                     <Route path="/revenue" element={<Revenue />} />
@@ -664,15 +671,18 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/monitoring/server" element={<Server />} />
                     <Route path="/monitoring" element={<Monitoring />}>
-                      <Route index element={<Navigate to="alerts" replace />} />
+                      <Route
+                        index
+                        element={<RedirectWithQuery to="alerts" />}
+                      />
                       <Route
                         path="resources"
-                        element={<Navigate to="/proxy" replace />}
+                        element={<RedirectWithQuery to="/proxy" />}
                       />
                       <Route
                         path="providers/add"
                         element={
-                          <Navigate to="/settings/notifications/new" replace />
+                          <RedirectWithQuery to="/settings/notifications/new" />
                         }
                       />
                       <Route
@@ -683,7 +693,7 @@ const FullAppRoutes = () => {
                     </Route>
                     <Route
                       path="/alarms"
-                      element={<Navigate to="/monitoring/alarms" replace />}
+                      element={<RedirectWithQuery to="/monitoring/alarms" />}
                     />
                     {/* Observe section */}
                     <Route path="/analytics" element={<GlobalAnalytics />} />
@@ -995,43 +1005,43 @@ const FullAppRoutes = () => {
                     {/* Backward-compat: old /settings/<resource> links → new top-level */}
                     <Route
                       path="/settings/domains/*"
-                      element={<Navigate to="/domains" replace />}
+                      element={<RedirectWithQuery to="/domains" />}
                     />
                     <Route
                       path="/settings/email/*"
-                      element={<Navigate to="/email" replace />}
+                      element={<RedirectWithQuery to="/email" />}
                     />
                     <Route
                       path="/settings/ai-gateway/*"
-                      element={<Navigate to="/ai-gateway" replace />}
+                      element={<RedirectWithQuery to="/ai-gateway" />}
                     />
                     <Route
                       path="/settings/ai-providers"
-                      element={<Navigate to="/ai-gateway" replace />}
+                      element={<RedirectWithQuery to="/ai-gateway" />}
                     />
                     <Route
                       path="/settings/agent-sandbox/*"
-                      element={<Navigate to="/agent-sandbox" replace />}
+                      element={<RedirectWithQuery to="/agent-sandbox" />}
                     />
                     <Route
                       path="/settings/skills/*"
-                      element={<Navigate to="/skills" replace />}
+                      element={<RedirectWithQuery to="/skills" />}
                     />
                     <Route
                       path="/settings/mcp-servers/*"
-                      element={<Navigate to="/mcp-servers" replace />}
+                      element={<RedirectWithQuery to="/mcp-servers" />}
                     />
                     <Route
                       path="/settings/git-providers/*"
-                      element={<Navigate to="/git-providers" replace />}
+                      element={<RedirectWithQuery to="/git-providers" />}
                     />
                     <Route
                       path="/settings/dns-providers/*"
-                      element={<Navigate to="/dns-providers" replace />}
+                      element={<RedirectWithQuery to="/dns-providers" />}
                     />
                     <Route
                       path="/settings/backups/*"
-                      element={<Navigate to="/backups" replace />}
+                      element={<RedirectWithQuery to="/backups" />}
                     />
                     {/* Projects */}
                     <Route path="/projects/new" element={<NewProject />} />

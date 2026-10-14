@@ -12,10 +12,11 @@ import type { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { BellRing, Pencil, Plus, Trash2 } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { withReturnTo } from '@/lib/safe-return-to'
 import { toast } from 'sonner'
@@ -64,6 +65,16 @@ export function NotificationRoutesManagement({
       refetchRoutes()
     },
   })
+
+  const [routeToDelete, setRouteToDelete] = useState<{
+    id: number
+    name: string
+  } | null>(null)
+  const handleConfirmDelete = () => {
+    if (!routeToDelete) return
+    deleteMutation.mutate({ path: { id: routeToDelete.id } })
+    setRouteToDelete(null)
+  }
 
   const routes = routePage?.items || []
   const isLoading = routesLoading || providersLoading
@@ -154,7 +165,7 @@ export function NotificationRoutesManagement({
                     aria-label={`Delete ${route.name}`}
                     disabled={deleteMutation.isPending}
                     onClick={() =>
-                      deleteMutation.mutate({ path: { id: route.id } })
+                      setRouteToDelete({ id: route.id, name: route.name })
                     }
                   >
                     <Trash2 className="h-4 w-4" />
@@ -188,6 +199,13 @@ export function NotificationRoutesManagement({
           ))}
         </div>
       )}
+      <ConfirmDialog
+        open={routeToDelete !== null}
+        onOpenChange={(open) => !open && setRouteToDelete(null)}
+        title={`Delete ${routeToDelete?.name ?? 'notification route'}?`}
+        description="This permanently deletes the notification route. Alerts matching it will no longer be delivered through it. This cannot be undone."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

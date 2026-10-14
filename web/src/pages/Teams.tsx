@@ -127,7 +127,7 @@ function CreateTeamDialog({ open, onOpenChange }: CreateTeamDialogProps) {
           <DialogTitle>Create team</DialogTitle>
           <DialogDescription>
             Teams group users. Once created, grant the team access to the
-            projects its members should reach.
+            services its members should reach.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
@@ -285,8 +285,8 @@ export function Teams() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Teams</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Group users, then grant each team access to the projects it should
-            reach. Projects with no grants stay open to everyone.
+            Group users, then grant each team access to the services it should
+            reach. Services with no grants stay open to everyone.
           </p>
         </div>
         <CreateActionButton
@@ -314,7 +314,7 @@ export function Teams() {
             <EmptyState
               icon={Users}
               title="No teams yet"
-              description="Create a team, add members, then grant it access to a project from that project's Access tab."
+              description="Create a team, add members, then grant it access to a service from that service's Access tab."
               action={
                 <Button onClick={() => setCreateOpen(true)}>
                   <Plus className="mr-2 h-4 w-4" />
@@ -395,8 +395,8 @@ export function Teams() {
             <AlertDialogDescription>
               This permanently deletes the team
               {teamToDelete ? ` "${teamToDelete.name}"` : ''} along with its
-              memberships and project-access grants. Members lose access to
-              every project they could only reach through this team. This cannot
+              memberships and service-access grants. Members lose access to
+              every service they could only reach through this team. This cannot
               be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>

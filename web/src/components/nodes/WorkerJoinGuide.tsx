@@ -44,6 +44,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
@@ -101,9 +102,9 @@ export function useWireguardMesh() {
 function CommandLine({ command }: { command: string }) {
   return (
     <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-      <span className="flex-1 overflow-x-auto whitespace-nowrap">
+      <ScrollRegion className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
         {command}
-      </span>
+      </ScrollRegion>
       <CopyButton minimal className="h-6 w-6 shrink-0" value={command} />
     </div>
   )

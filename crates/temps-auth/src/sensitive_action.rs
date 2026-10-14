@@ -62,9 +62,10 @@ pub const STEP_UP_TTL_MINUTES: i64 = 5;
 /// # Why this is not the loss it looks like — and what would change that
 ///
 /// The gate this replaces was never a control for unenrolled users. Enrolment
-/// itself is guarded only by `permission_guard!(auth, UsersWrite)`:
-/// `POST /users/me/mfa/setup` and `/users/me/mfa/verify` ask for no password
-/// and no step-up. An attacker holding a stolen session for an unenrolled
+/// itself is guarded only by an interactive-session check
+/// (`require_self_service_mfa_user`, no `UsersWrite` needed so a User-role
+/// account can protect itself): `POST /users/me/mfa/setup` and
+/// `/users/me/mfa/verify` ask for no step-up. An attacker holding a stolen session for an unenrolled
 /// account could therefore enrol *their own* authenticator and satisfy the old
 /// challenge in two calls — while leaving their TOTP secret on the victim's
 /// account, which is both a persistence mechanism and a permanent lockout for

@@ -574,7 +574,7 @@ async fn build_snapshot(
             );
         }
         if public_route_count > supported_count && unsupported_reasons.is_empty() {
-            unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, or a remotely reachable backend".to_string());
+            unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, project-group path routing, or a remotely reachable backend".to_string());
         }
         PublicIngressSnapshot {
             enabled: true,

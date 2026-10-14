@@ -233,6 +233,16 @@ pub enum DeploymentError {
         source_deployment_id: i32,
     },
 
+    /// The project's app runs outside Temps (`hosting: external`), so Temps
+    /// does not create deployments for it. `reason` is the operator-facing
+    /// explanation, which already names the project and how to change it.
+    #[error("Project {project_id} ('{project_name}') is hosted externally: {reason}")]
+    ProjectHostedExternally {
+        project_id: i32,
+        project_name: String,
+        reason: String,
+    },
+
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
 
@@ -248,6 +258,18 @@ impl From<sea_orm::DbErr> for DeploymentError {
                 reason: error.to_string(),
             },
         }
+    }
+}
+
+/// Whether a project's hosting allows Temps to deploy it.
+fn hosting_deploy_check(project: &projects::Model) -> Result<(), DeploymentError> {
+    match project.hosting.deploy_refusal(&project.name) {
+        Some(reason) => Err(DeploymentError::ProjectHostedExternally {
+            project_id: project.id,
+            project_name: project.name.clone(),
+            reason,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1819,20 +1841,38 @@ impl DeploymentService {
         Ok(deployment)
     }
 
+    /// Most recent deployment of a project, or `None` when the project exists
+    /// but has never been deployed (a normal state, not an error).
+    ///
+    /// A project that does not exist (or was soft-deleted) is a
+    /// [`DeploymentError::NotFound`] naming the project, so callers can tell
+    /// "nothing deployed yet" apart from "wrong project id".
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
-    ) -> Result<Deployment, DeploymentError> {
-        let deployment_with_pipeline = deployments::Entity::find()
+    ) -> Result<Option<Deployment>, DeploymentError> {
+        // Check the project first: a soft-deleted project keeps its deployment
+        // rows, and must read as "not found" rather than returning them.
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "project {} not found",
+                project_id
+            )));
+        }
+
+        let Some(deployment) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                DeploymentError::NotFound(format!("project {} not found", project_id))
-            })?;
-
-        let deployment = deployment_with_pipeline;
+        else {
+            return Ok(None);
+        };
 
         // Check if this deployment is current for any environment
         let is_current = environments::Entity::find()
@@ -1850,9 +1890,10 @@ impl DeploymentService {
             .get(&deployment.environment_id)
             .cloned();
 
-        Ok(self
-            .map_db_deployment_to_deployment(deployment, is_current, environment)
-            .await)
+        Ok(Some(
+            self.map_db_deployment_to_deployment(deployment, is_current, environment)
+                .await,
+        ))
     }
 
     pub async fn get_deployment(
@@ -2654,6 +2695,32 @@ impl DeploymentService {
             return Err(DeploymentError::DockerSocketDeployRequiresAdmin { slug });
         }
         Ok(())
+    }
+
+    /// Refuse to create a deployment for a project whose app runs outside
+    /// Temps (`hosting: external`).
+    ///
+    /// A project that no longer exists is let through: the operation that
+    /// follows reports the missing project with its own context.
+    pub async fn ensure_project_hosted_locally(
+        &self,
+        project_id: i32,
+    ) -> Result<(), DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, project_id, "Could not load project before deploying");
+                DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Could not load project {project_id} to check where it is hosted: {error}"
+                    ),
+                }
+            })?;
+        match project {
+            Some(project) => hosting_deploy_check(&project),
+            None => Ok(()),
+        }
     }
 
     /// Where the image reused by a rollback or promotion lives (and so how a
@@ -6841,6 +6908,62 @@ mod tests {
         );
     }
 
+    /// The hosting check used by rollback and promotion: it lives in the
+    /// service so the handlers never read the project row themselves.
+    #[tokio::test]
+    async fn externally_hosted_projects_are_refused_before_a_deployment_is_created() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker unavailable; skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to prepare test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+        let service = create_deployment_service_for_test(db.clone());
+
+        assert!(
+            service
+                .ensure_project_hosted_locally(project.id)
+                .await
+                .is_ok(),
+            "a hosted project may be deployed"
+        );
+        // A missing project is left for the operation itself to report.
+        assert!(service
+            .ensure_project_hosted_locally(project.id + 10_000)
+            .await
+            .is_ok());
+
+        let mut external: projects::ActiveModel = project.clone().into();
+        external.hosting = Set(temps_entities::types::Hosting::External);
+        external
+            .update(db.as_ref())
+            .await
+            .expect("mark the project external");
+
+        match service.ensure_project_hosted_locally(project.id).await {
+            Err(DeploymentError::ProjectHostedExternally {
+                project_id,
+                project_name,
+                reason,
+            }) => {
+                assert_eq!(project_id, project.id);
+                assert_eq!(project_name, project.name);
+                assert!(reason.contains(&project.name), "{reason}");
+            }
+            other => panic!("expected ProjectHostedExternally, got {other:?}"),
+        }
+    }
+
     struct NoopLogWriter;
 
     #[async_trait::async_trait]
@@ -9498,6 +9621,69 @@ mod tests {
             .unwrap();
         assert_eq!(updated_deployment2.state, "stopped");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_distinguishes_empty_project_from_missing_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping get_last_deployment integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let service = create_deployment_service_for_test(db.clone());
+
+        // Project with a deployment -> Some(latest).
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let last = service
+            .get_last_deployment(project.id)
+            .await?
+            .expect("project with a deployment must return it");
+        assert_eq!(last.id, deployment.id);
+
+        // Project that exists but was never deployed -> Ok(None).
+        let empty_project = projects::ActiveModel {
+            name: Set("Never Deployed".to_string()),
+            slug: Set("never-deployed".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo-empty".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        assert!(service
+            .get_last_deployment(empty_project.id)
+            .await?
+            .is_none());
+
+        // A soft-deleted project keeps its deployment rows but reads as not found.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .expect("project exists")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.update(db.as_ref()).await?;
+        let result = service.get_last_deployment(project.id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {} not found", project.id)
+        ));
+
+        // Unknown project -> NotFound naming the project.
+        let missing_id = empty_project.id + 10_000;
+        let result = service.get_last_deployment(missing_id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {missing_id} not found")
+        ));
         Ok(())
     }
 

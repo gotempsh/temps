@@ -73,7 +73,10 @@ export function ErrorFallback({
                   <p className="text-xs font-medium text-muted-foreground mb-1">
                     Error Stack:
                   </p>
-                  <pre className="text-xs bg-muted p-3 rounded overflow-auto max-h-40">
+                  <pre
+                    tabIndex={0}
+                    className="text-xs bg-muted p-3 rounded overflow-auto max-h-40"
+                  >
                     {error.stack}
                   </pre>
                 </div>
@@ -82,7 +85,10 @@ export function ErrorFallback({
                     <p className="text-xs font-medium text-muted-foreground mb-1">
                       Component Stack:
                     </p>
-                    <pre className="text-xs bg-muted p-3 rounded overflow-auto max-h-40">
+                    <pre
+                      tabIndex={0}
+                      className="text-xs bg-muted p-3 rounded overflow-auto max-h-40"
+                    >
                       {errorInfo.componentStack}
                     </pre>
                   </div>

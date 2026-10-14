@@ -146,7 +146,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
         <div>
           <h2 className="text-xl font-semibold">Access</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Control which teams can reach this project.
+            Control which teams can reach this service.
           </p>
         </div>
         <Button
@@ -190,8 +190,8 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
           </AlertTitle>
           <AlertDescription>
             {isRestricted
-              ? 'Only members of these teams — and instance administrators — can see or open this project. Revoking the last grant makes it open again.'
-              : 'Any user with the relevant instance permission can see and open this project. Granting a team access is what restricts it.'}
+              ? 'Only members of these teams — and instance administrators — can see or open this service. Revoking the last grant makes it open again.'
+              : 'Any user with the relevant instance permission can see and open this service. Granting a team access is what restricts it.'}
           </AlertDescription>
         </Alert>
       )}
@@ -204,7 +204,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
           </CardTitle>
           <CardDescription>
             A member&apos;s permissions here are the narrower of their role in
-            the team and the role the team holds on this project.{' '}
+            the team and the role the team holds on this service.{' '}
             {ROLE_ENFORCEMENT_NOTE}
           </CardDescription>
         </CardHeader>
@@ -255,7 +255,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
                 icon={Users}
                 title="Create a team to restrict access"
                 requirement="No teams exist yet."
-                example="Give your operations team access to this project."
+                example="Give your operations team access to this service."
                 settingsHref="/settings/teams"
                 settingsLabel="Go to Teams"
               />
@@ -265,7 +265,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
                 size="compact"
                 icon={Globe}
                 title="No team restrictions"
-                description="Grant a team access to restrict this project to its members."
+                description="Grant a team access to restrict this service to its members."
                 action={
                   !teamsFailed && (
                     <Button onClick={() => setGrantOpen(true)}>
@@ -277,7 +277,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
               />
             ) : (
               <DataTable
-                aria-label="Teams with project access"
+                aria-label="Teams with service access"
                 rows={grantList}
                 rowKey={(grant) => grant.id}
                 isLoading={
@@ -298,7 +298,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
                   },
                   {
                     key: 'role',
-                    header: 'Role on this project',
+                    header: 'Role on this service',
                     render: (grant) => (
                       <>
                         <span className="capitalize">{grant.role}</span>
@@ -336,8 +336,8 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
             <DialogTitle>Grant team access</DialogTitle>
             <DialogDescription>
               {isRestricted
-                ? 'Add another team to this project.'
-                : 'This is the first grant — it will restrict the project to the teams listed here.'}
+                ? 'Add another team to this service.'
+                : 'This is the first grant — it will restrict the service to the teams listed here.'}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
@@ -357,12 +357,12 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
               </Select>
               {availableTeams.length === 0 && (
                 <p className="text-xs text-muted-foreground">
-                  Every team already has access to this project.
+                  Every team already has access to this service.
                 </p>
               )}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="access-role">Role on this project</Label>
+              <Label htmlFor="access-role">Role on this service</Label>
               <RoleSelect id="access-role" value={role} onChange={setRole} />
               <p className="text-xs text-muted-foreground">
                 {ROLE_DESCRIPTIONS[role]}
@@ -409,10 +409,10 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
               {grantToRevoke
                 ? `"${teamName(grantToRevoke.team_id)}"`
                 : 'this team'}{' '}
-              lose access to this project immediately, unless another team also
+              lose access to this service immediately, unless another team also
               grants it to them.
               {grantList.length === 1 &&
-                ' This is the last grant — revoking it makes the project open to everyone again.'}
+                ' This is the last grant — revoking it makes the service open to everyone again.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

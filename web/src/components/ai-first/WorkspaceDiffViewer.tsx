@@ -13,7 +13,7 @@ function DiffLine({ line }: { line: ParsedDiffLine }) {
         data-diff-line="true"
         className="border-y border-border bg-muted/60 px-3 py-1.5 font-mono text-[9px] leading-4 text-muted-foreground"
       >
-        <span className="mr-2 text-muted-foreground/60">•••</span>
+        <span className="mr-2 text-muted-foreground">•••</span>
         {line.content}
       </div>
     )
@@ -55,8 +55,8 @@ function DiffLine({ line }: { line: ParsedDiffLine }) {
       <span
         className={cn(
           'select-none text-center font-semibold',
-          line.kind === 'added' && 'text-emerald-400',
-          line.kind === 'removed' && 'text-red-600 dark:text-red-400'
+          line.kind === 'added' && 'text-emerald-700 dark:text-emerald-400',
+          line.kind === 'removed' && 'text-red-700 dark:text-red-400'
         )}
       >
         {marker}
@@ -98,15 +98,18 @@ export function WorkspaceDiffViewer({
             New file
           </span>
         )}
-        <span className="font-mono text-[9px] font-semibold text-emerald-400">
+        <span className="font-mono text-[9px] font-semibold text-emerald-700 dark:text-emerald-400">
           +{parsed.additions}
         </span>
-        <span className="font-mono text-[9px] font-semibold text-red-600 dark:text-red-400">
+        <span className="font-mono text-[9px] font-semibold text-red-700 dark:text-red-400">
           −{parsed.deletions}
         </span>
       </div>
 
-      <div className="max-h-[52vh] overflow-y-auto overscroll-contain py-1">
+      <div
+        tabIndex={0}
+        className="max-h-[52vh] overflow-y-auto overscroll-contain py-1"
+      >
         {parsed.lines.map((line, index) => (
           <DiffLine key={`${index}-${line.kind}`} line={line} />
         ))}

@@ -157,7 +157,7 @@ export default function CrossProjectTraceDetail() {
 
   const projectName = (span: SpanRecord) =>
     projectById.get(span.project_id)?.project_name ??
-    `Project ${span.project_id}`
+    `Service ${span.project_id}`
 
   // This view is global, so there is no single list it belongs to. The first
   // contributing project's trace list is the closest thing; before the trace
@@ -253,7 +253,7 @@ export default function CrossProjectTraceDetail() {
         <EmptyState
           icon={Layers}
           title="No spans available"
-          description="Spans for this trace are not available or have expired across all projects."
+          description="Spans for this trace are not available or have expired across all services."
         />
       </div>
     )
@@ -271,7 +271,7 @@ export default function CrossProjectTraceDetail() {
   const facts: DetailFact[] = [
     { label: 'Duration', value: formatDuration(data.total_duration_ms) },
     { label: 'Spans', value: data.span_count },
-    { label: 'Projects', value: data.projects.length },
+    { label: 'Services', value: data.projects.length },
     {
       label: 'Errors',
       value: (
@@ -296,13 +296,13 @@ export default function CrossProjectTraceDetail() {
           {/* Truncation callout */}
           {data.truncated && (
             <Callout tone="warning" title="Trace view truncated">
-              This view was truncated to stay within cross-project limits.
+              This view was truncated to stay within cross-service limits.
               {data.truncated_projects.length > 0 && (
                 <>
                   {' '}
-                  Spans from {data.truncated_projects.length} project
+                  Spans from {data.truncated_projects.length} service
                   {data.truncated_projects.length === 1 ? '' : 's'} were dropped
-                  (project id{data.truncated_projects.length === 1 ? '' : 's'}:{' '}
+                  (service id{data.truncated_projects.length === 1 ? '' : 's'}:{' '}
                   {data.truncated_projects.join(', ')}).
                 </>
               )}
@@ -314,7 +314,7 @@ export default function CrossProjectTraceDetail() {
             <Callout tone="info" title="Some spans are hidden">
               <span className="inline-flex items-center gap-1.5">
                 <EyeOff className="h-3.5 w-3.5 shrink-0" />
-                Some projects opted out of cross-project trace sharing, so their
+                Some services opted out of cross-service trace sharing, so their
                 spans are not shown here.
               </span>
             </Callout>

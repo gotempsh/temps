@@ -83,7 +83,7 @@ const CONTEXT_META: Record<string, { label: string; Icon: typeof GitBranch }> =
   {
     deployment: { label: 'Deployment', Icon: GitBranch },
     alert: { label: 'Alert', Icon: Bell },
-    project: { label: 'Project', Icon: FolderGit2 },
+    project: { label: 'Service', Icon: FolderGit2 },
   }
 
 function metaFor(contextType: string) {
@@ -655,7 +655,7 @@ export function DockBody({
                 {inConversation
                   ? (active?.title ?? 'AI chat')
                   : picking
-                    ? 'New project chat'
+                    ? 'New service chat'
                     : 'AI assistant'}
               </h2>
             </div>
@@ -675,12 +675,12 @@ export function DockBody({
               </p>
             ) : picking ? (
               <p className="text-sm text-muted-foreground">
-                Choose a project to start a general chat about it.
+                Choose a service to start a general chat about it.
               </p>
             ) : (
               <p className="text-sm text-muted-foreground">
-                Resume any AI conversation across your projects, or start a new
-                chat for a project.
+                Resume any AI conversation across your services, or start a new
+                chat for a service.
               </p>
             )}
           </div>
@@ -706,8 +706,8 @@ export function DockBody({
                     variant="outline"
                     onClick={() => setPicking(true)}
                     className="h-8 rounded-l-none px-1.5"
-                    title="New chat in another project"
-                    aria-label="New chat in another project"
+                    title="New chat in another service"
+                    aria-label="New chat in another service"
                   >
                     <ChevronDown className="h-4 w-4" />
                   </Button>
@@ -741,7 +741,7 @@ export function DockBody({
                   startProjectChat({
                     id: active.projectId,
                     slug: active.projectSlug,
-                    name: active.projectName ?? 'Project',
+                    name: active.projectName ?? 'Service',
                   })
                 }
                 className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
@@ -804,10 +804,10 @@ export function DockBody({
               }
               autoStart={active!.autoStart}
               lazyCreate={active!.contextType === 'project'}
-              emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
+              emptyHint="Ask anything about this service — deployments, logs, traces, and errors."
               placeholder={
                 active!.contextType === 'project'
-                  ? 'Ask about this project…'
+                  ? 'Ask about this service…'
                   : 'Ask a follow-up…'
               }
               onConversationChange={handleConversationChange}
@@ -820,7 +820,7 @@ export function DockBody({
               <div>
                 <p className="font-medium">No AI conversations yet</p>
                 <p className="mt-1 max-w-sm text-sm text-muted-foreground">
-                  Start a project chat to investigate deployments, logs, traces,
+                  Start a service chat to investigate deployments, logs, traces,
                   and errors with context.
                 </p>
               </div>
@@ -968,7 +968,7 @@ function ConversationList({
         <MessageSquare className="h-7 w-7 text-muted-foreground" />
         <p className="text-sm font-medium">No AI conversations yet</p>
         <p className="max-w-xs text-sm text-muted-foreground">
-          Click “New chat” to start one for a project, or open a failed
+          Click “New chat” to start one for a service, or open a failed
           deployment / firing alert and choose “Debug with AI”.
         </p>
       </div>
@@ -1116,7 +1116,7 @@ function ProjectPicker({
         <Input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Search projects…"
+          placeholder="Search services…"
           className="pl-8"
         />
       </div>
@@ -1129,14 +1129,14 @@ function ProjectPicker({
       ) : projects.length === 0 ? (
         <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
           <FolderGit2 className="h-7 w-7 text-muted-foreground" />
-          <p className="text-sm font-medium">No projects yet</p>
+          <p className="text-sm font-medium">No services yet</p>
           <p className="max-w-xs text-sm text-muted-foreground">
-            Create a project to start an AI chat for it.
+            Create a service to start an AI chat for it.
           </p>
         </div>
       ) : filtered.length === 0 ? (
         <p className="px-1 text-sm text-muted-foreground">
-          No projects match “{q}”.
+          No services match “{q}”.
         </p>
       ) : (
         <div className="h-full space-y-1 overflow-y-auto pr-1">

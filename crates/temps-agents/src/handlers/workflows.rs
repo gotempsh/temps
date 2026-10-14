@@ -188,7 +188,7 @@ pub async fn workflow_dry_run(
     // 400 instead of having the run fail with an opaque "Validation" error
     // halfway through `execute_run_inner`.
     let mut config: temps_core::WorkflowYamlConfig =
-        serde_yaml::from_str(&request.yaml).map_err(|e| {
+        yaml_serde::from_str(&request.yaml).map_err(|e| {
             Problem::from(AgentError::Validation {
                 message: format!("Invalid workflow YAML: {}", e),
             })
@@ -239,7 +239,7 @@ pub async fn workflow_dry_run(
     config.deliverable = "report".to_string();
 
     let workflow_name = config.name.clone();
-    let normalized_yaml = serde_yaml::to_string(&config).map_err(|e| {
+    let normalized_yaml = yaml_serde::to_string(&config).map_err(|e| {
         Problem::from(AgentError::Validation {
             message: format!("Failed to re-serialize normalized YAML: {}", e),
         })

@@ -160,7 +160,7 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
         <div>
           <h1 className="text-xl font-semibold">Revenue</h1>
           <p className="text-sm text-muted-foreground">
-            Track MRR, ARR, churn, and active customers for this project.
+            Track MRR, ARR, churn, and active customers for this service.
           </p>
         </div>
         {hasIntegrations && (
@@ -483,12 +483,13 @@ function TrendChip({ trend }: { trend: NonNullable<SummaryCard['trend']> }) {
         : Minus
   const toneClass =
     trend.tone === 'positive'
-      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
       : trend.tone === 'negative'
-        ? 'bg-red-500/10 text-red-600 dark:text-red-400'
+        ? 'bg-red-500/10 text-red-700 dark:text-red-400'
         : 'bg-muted text-muted-foreground'
   return (
     <span
+      role="img"
       className={`inline-flex items-center rounded-full px-1.5 py-0.5 ${toneClass}`}
       aria-label={trend.label}
       title={trend.label}

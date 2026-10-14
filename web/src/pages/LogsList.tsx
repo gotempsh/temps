@@ -171,7 +171,7 @@ export default function LogsList({ project }: LogsListProps) {
     ].filter(Boolean)
     return [
       'The user is in the OpenTelemetry Logs explorer in the Temps console.',
-      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
       `Time range: ${timeRange}.${filters.length ? ` Active filters: ${filters.join(', ')}.` : ''}`,
       'Fetch logs with the temps CLI: `telemetry-logs query_logs --severity/--service_name/--search/--trace_id`.',
     ].join('\n')
@@ -255,7 +255,10 @@ export default function LogsList({ project }: LogsListProps) {
             />
 
             <Select value={severity} onValueChange={setSeverity}>
-              <SelectTrigger className="w-full sm:w-[150px]">
+              <SelectTrigger
+                aria-label="Severity"
+                className="w-full sm:w-[150px]"
+              >
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
               <SelectContent>

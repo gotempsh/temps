@@ -150,6 +150,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
           )}
           {cronQuery.isLoading ? (
             <div
+              role="status"
               className="grid gap-4 md:grid-cols-2"
               aria-label="Loading cron job configuration"
             >

@@ -11,7 +11,11 @@
 //! 2. Runtime: the pinned `msb` + `libkrunfw` pair, installed by the
 //!    microsandbox SDK into `<data_dir>/microsandbox` and verified; an
 //!    existing complete pair is kept.
-//! 3. Smoke: boot a real microVM through the same provider the server uses,
+//! 3. Terminal agent: stage the static Linux `temps-pty-agent` that the
+//!    provider writes into a guest the first time a terminal is opened
+//!    (`temps sandbox shell`). Optional — sandboxes run without it, they just
+//!    cannot open terminals.
+//! 4. Smoke: boot a real microVM through the same provider the server uses,
 //!    run a command, destroy it.
 //!
 //! The server registers the backend at startup when stages 1 and 2 hold,
@@ -24,6 +28,8 @@ use std::path::PathBuf;
 use temps_agents::sandbox::microsandbox::{
     microsandbox_capability, MicrosandboxSandboxConfig, MICROSANDBOX_VERSION,
 };
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+use temps_agents::sandbox::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use {
     std::collections::HashMap,
@@ -63,6 +69,13 @@ pub struct MicrosandboxSetupCommand {
     /// Skip the smoke-test VM boot after installing
     #[arg(long)]
     pub skip_smoke: bool,
+
+    /// Path to the static Linux `temps-pty-agent` build for the guest
+    /// architecture (the host's, on Linux; aarch64 on Apple Silicon). It is
+    /// what gives sandboxes interactive terminals. Defaults to a
+    /// `temps-pty-agent` file next to the running executable.
+    #[arg(long)]
+    pub pty_agent_bin: Option<PathBuf>,
 }
 
 impl MicrosandboxCommand {
@@ -103,6 +116,7 @@ impl MicrosandboxSetupCommand {
 
         if self.check {
             let capability = microsandbox_capability(&data_dir);
+            report_terminal_support(&capability.terminal);
             return match capability.reason {
                 None => {
                     ok("ready: the server registers this backend at startup");
@@ -129,6 +143,7 @@ impl MicrosandboxSetupCommand {
 
     #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
     async fn install(self, config: MicrosandboxSandboxConfig) -> anyhow::Result<()> {
+        let pty_agent_dest = config.pty_agent_bin();
         let provider = MicrosandboxSandboxProvider::new(config)?;
 
         // Stage 1: a hypervisor is a hardware/OS property; installing the
@@ -154,7 +169,10 @@ impl MicrosandboxSetupCommand {
             runtime.libkrunfw_path.display()
         ));
 
-        // Stage 3: boot a real VM through the server's provider.
+        // Stage 3: guest terminal agent.
+        stage_pty_agent(&pty_agent_dest, self.pty_agent_bin.as_deref())?;
+
+        // Stage 4: boot a real VM through the server's provider.
         if self.skip_smoke {
             warn("smoke test skipped");
         } else {
@@ -220,6 +238,68 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
         result.stdout.trim()
     ));
     Ok(())
+}
+
+/// Install the guest terminal agent at `dest` from `explicit` or, failing
+/// that, a `temps-pty-agent` file next to the running executable (release
+/// archives ship it there).
+///
+/// Optional by design: a missing binary is a warning that says how to fix
+/// it, because sandboxes run fine without terminals. A file that is not a
+/// Linux executable *is* an error — copying a macOS build into a Linux guest
+/// would only fail later, at the first terminal.
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+fn stage_pty_agent(
+    dest: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let source = explicit.map(PathBuf::from).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+            .filter(|p| p.exists())
+    });
+    let Some(source) = source else {
+        if dest.exists() {
+            ok(&format!(
+                "terminal agent already staged at {}",
+                dest.display()
+            ));
+        } else {
+            warn(
+                "temps-pty-agent not found next to this executable: sandboxes run but \
+                 `temps sandbox shell` is unavailable until you re-run with \
+                 --pty-agent-bin <path-to-static-linux-build>",
+            );
+        }
+        return Ok(());
+    };
+    stage_pty_agent_binary(&source, dest)?;
+    ok(&format!(
+        "terminal agent staged from {} (written into a sandbox on its first terminal)",
+        source.display()
+    ));
+    Ok(())
+}
+
+/// Say whether terminals will work, and what to do if not. Informational:
+/// the backend itself is ready without them.
+fn report_terminal_support(terminal: &temps_agents::sandbox::TerminalCapability) {
+    if terminal.supported {
+        ok("terminals: guest terminal agent is staged (`temps sandbox shell` works)");
+        return;
+    }
+    // `setup_command` is already the complete fix, flag included.
+    println!(
+        "  {} terminals unavailable: {}{}",
+        "!".yellow().bold(),
+        terminal.reason.as_deref().unwrap_or("unknown reason"),
+        terminal
+            .setup_command
+            .as_deref()
+            .map(|c| format!(" (run `{c}`)"))
+            .unwrap_or_default()
+    );
 }
 
 fn ok(message: &str) {

@@ -95,13 +95,31 @@ pub fn is_container_runtime_unavailable(error: &str) -> bool {
         "docker client is unavailable",
         "could not find docker environment",
         "docker socket",
-        // testcontainers when no daemon socket exists at the default path,
-        // e.g. Colima/Rancher Desktop without DOCKER_HOST set.
+        // testcontainers when no runtime is installed or running, e.g.
+        // "failed to initialize a docker client: Socket not found: /var/run/docker.sock"
+        // (also Colima/Rancher Desktop without DOCKER_HOST set). A bare
+        // "socket not found" is deliberately not a marker: it is only a
+        // missing runtime when it names a Docker socket, see
+        // `is_missing_docker_socket`.
         "failed to initialize a docker client",
-        "socket not found",
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
     ]
     .iter()
     .any(|marker| message.contains(marker))
+        || is_missing_docker_socket(&message)
+}
+
+/// "Socket not found" / "No such file or directory" only mean the container
+/// runtime is missing when the message also names a Docker socket path, so a
+/// missing migration file or unrelated socket still fails the test.
+fn is_missing_docker_socket(message: &str) -> bool {
+    let names_docker_socket = message.contains("docker.sock") || message.contains("docker socket");
+    names_docker_socket
+        && (message.contains("socket not found")
+            || message.contains("no such file or directory")
+            || message.contains("connection refused")
+            || message.contains("permission denied"))
 }
 
 /// Shared test database container that lives for the duration of the test run
@@ -301,7 +319,49 @@ impl Drop for TestDatabase {
     }
 }
 
+/// Longest a test database's cleanup waits for a lock on its schema.
+///
+/// `Drop` runs cleanup on a blocked thread and joins it, so an unbounded
+/// `DROP SCHEMA ... CASCADE` that queues behind a lock held by a connection
+/// of the same test (one left idle in a transaction) hangs the test process
+/// with no output: the holder's own rollback can only run once this returns.
+/// The schema belongs to a throwaway test run, so giving up after a warning
+/// leaks a few empty tables at worst.
+const SCHEMA_CLEANUP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl TestDatabase {
+    /// `DROP SCHEMA ... CASCADE` that gives up after `lock_timeout` instead
+    /// of waiting on a lock indefinitely. `SET LOCAL` scopes the timeout to
+    /// this one transaction, so the connection is returned unchanged.
+    async fn drop_schema_bounded<C>(
+        conn: &C,
+        schema_name: &str,
+        lock_timeout: std::time::Duration,
+    ) -> Result<(), sea_orm::DbErr>
+    where
+        C: ConnectionTrait + sea_orm::TransactionTrait,
+    {
+        let txn = conn.begin().await?;
+        let result = async {
+            txn.execute_unprepared(&format!(
+                "SET LOCAL lock_timeout = '{}ms'",
+                lock_timeout.as_millis().max(1)
+            ))
+            .await?;
+            txn.execute_unprepared(&format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name))
+                .await
+        }
+        .await;
+        match result {
+            Ok(_) => txn.commit().await,
+            Err(error) => {
+                // Roll back now rather than at Drop, which only queues it.
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Internal cleanup logic shared between Drop and the async cleanup() method.
     /// Uses the existing SeaORM connection pool.
     async fn run_cleanup(
@@ -310,10 +370,10 @@ impl TestDatabase {
         needs_counter_decrement: bool,
     ) {
         if let Some(schema_name) = schema {
-            let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-            let statement = Statement::from_string(DatabaseBackend::Postgres, drop_schema_sql);
-
-            if let Err(e) = db.execute(statement).await {
+            if let Err(e) =
+                Self::drop_schema_bounded(db.as_ref(), schema_name, SCHEMA_CLEANUP_LOCK_TIMEOUT)
+                    .await
+            {
                 eprintln!("Warning: Failed to drop test schema {}: {}", schema_name, e);
             }
         }
@@ -342,11 +402,13 @@ impl TestDatabase {
 
             match Database::connect(connect_options).await {
                 Ok(fresh_db) => {
-                    let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-                    let statement =
-                        Statement::from_string(DatabaseBackend::Postgres, drop_schema_sql);
-
-                    if let Err(e) = fresh_db.execute(statement).await {
+                    if let Err(e) = Self::drop_schema_bounded(
+                        &fresh_db,
+                        schema_name,
+                        SCHEMA_CLEANUP_LOCK_TIMEOUT,
+                    )
+                    .await
+                    {
                         eprintln!("Warning: Failed to drop test schema {}: {}", schema_name, e);
                     }
                     let _ = fresh_db.close().await;
@@ -1090,6 +1152,40 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn container_runtime_unavailable_recognises_missing_docker_runtime() {
+        for message in [
+            "failed to initialize a docker client: Socket not found: /var/run/docker.sock",
+            "Failed to Initialize a Docker Client: client error",
+            "Socket not found: /var/run/docker.sock",
+            "error trying to connect: No such file or directory (os error 2) while opening /var/run/docker.sock",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            "could not find Docker environment",
+            "hyper legacy client: client error (connect)",
+        ] {
+            assert!(
+                is_container_runtime_unavailable(message),
+                "expected {message:?} to be classified as runtime unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn container_runtime_unavailable_does_not_swallow_real_failures() {
+        for message in [
+            "migration m20260101_000001 failed: relation \"projects\" already exists",
+            "No such file or directory (os error 2): /tmp/fixtures/missing.sql",
+            "Socket not found: /run/postgresql/.s.PGSQL.5432",
+            "error returned from database: duplicate key value violates unique constraint",
+            "pull access denied for timescale/does-not-exist",
+        ] {
+            assert!(
+                !is_container_runtime_unavailable(message),
+                "expected {message:?} NOT to be classified as runtime unavailable"
+            );
+        }
+    }
+
     async fn test_database_or_skip() -> anyhow::Result<Option<TestDatabase>> {
         match TestDatabase::new().await {
             Ok(database) => Ok(Some(database)),
@@ -1121,6 +1217,58 @@ mod tests {
         assert!(!is_container_runtime_unavailable(
             "Failed to pull timescale/timescaledb-ha: manifest unknown"
         ));
+    }
+
+    #[tokio::test]
+    async fn schema_cleanup_gives_up_when_a_lock_is_held() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+        let Some(test_db) = test_database_or_skip().await? else {
+            return Ok(());
+        };
+        let schema = test_db
+            .schema_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("test database has no schema of its own"))?;
+        test_db
+            .execute_sql("CREATE TABLE held_lock_table (id INT)")
+            .await?;
+
+        // Another connection of the same test sits in a transaction holding a
+        // lock that DROP SCHEMA ... CASCADE needs on the table.
+        let holder = test_db.db.begin().await?;
+        holder
+            .execute_unprepared(&format!(
+                "LOCK TABLE {schema}.held_lock_table IN ACCESS SHARE MODE"
+            ))
+            .await?;
+
+        let started = std::time::Instant::now();
+        let dropped = TestDatabase::drop_schema_bounded(
+            test_db.db.as_ref(),
+            &schema,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let error = dropped.expect_err("a held lock must stop the schema drop");
+        assert!(
+            error.to_string().contains("lock timeout"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the drop must be bounded by the lock timeout, took {:?}",
+            started.elapsed()
+        );
+
+        // Once the holder is gone the same drop goes through.
+        holder.rollback().await?;
+        TestDatabase::drop_schema_bounded(
+            test_db.db.as_ref(),
+            &schema,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+        Ok(())
     }
 
     #[tokio::test]

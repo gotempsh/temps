@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useServiceGroup } from '@/components/project-groups/ServiceGroupControl'
+import { groupHref, TERMS } from '@/lib/terminology'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import {
   getLastDeploymentOptions,
   getEnvironmentVariablesOptions,
@@ -63,6 +66,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import { projectLoadState } from '@/lib/project-load-state'
 import {
@@ -160,16 +164,19 @@ export function ProjectDetail() {
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
 
-  const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
-    {
+  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } =
+    useQuery({
       ...getLastDeploymentOptions({
         path: {
           id: project?.id || 0,
         },
       }),
+      select: selectLastDeployment,
       enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
-        const data = query.state.data
+        // `state.data` is the raw response; the deployment is `null` until the
+        // first deploy.
+        const data = query.state.data?.deployment
         // Poll more frequently for active deployments
         if (
           data &&
@@ -184,8 +191,10 @@ export function ProjectDetail() {
       },
       // Also refetch when window regains focus
       refetchOnWindowFocus: true,
-    }
-  )
+    })
+  // The API answers 200 with `deployment: null` for a project that has never
+  // deployed; consumers take `undefined` for "nothing yet".
+  const lastDeployment = lastDeploymentOrNull ?? undefined
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({
@@ -296,7 +305,7 @@ export function ProjectDetail() {
         savedRuntime.image_ref ||
         lastDeployment?.metadata?.externalImageRef
       if (!imageRef) {
-        toast.error('No image reference found for this project')
+        toast.error('No image reference found for this service')
         return
       }
       await deployImage.mutateAsync({
@@ -315,12 +324,21 @@ export function ProjectDetail() {
     navigate(deploymentsAfterStartPath(project.slug))
   }
 
+  // Breadcrumb shows the project (group) this service belongs to.
+  const serviceGroup = useServiceGroup(project?.id).data?.group ?? null
+
   useEffect(() => {
     const projectPath = `/projects/${project?.slug || slug}`
     const variablesPath = `${projectPath}/environment-variables`
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
-      { label: project?.slug || 'Project Details', href: projectPath },
+      ...(serviceGroup
+        ? [{ label: serviceGroup.name, href: groupHref(serviceGroup.slug) }]
+        : []),
+      {
+        label: project?.slug || `${TERMS.service.singular} details`,
+        href: projectPath,
+      },
       ...(isVariableRoute
         ? [
             { label: 'Environment Variables', href: variablesPath },
@@ -341,6 +359,7 @@ export function ProjectDetail() {
   }, [
     setBreadcrumbs,
     project?.slug,
+    serviceGroup,
     slug,
     isVariableRoute,
     breadcrumbVariableId,
@@ -378,7 +397,7 @@ export function ProjectDetail() {
     return (
       <div className="p-4 sm:p-6">
         <ErrorAlert
-          title="Failed to load project"
+          title="Failed to load service"
           description={
             readFailureServerDetail(error) ?? readFailureExplanation(error)
           }
@@ -464,7 +483,7 @@ export function ProjectDetail() {
         <div className="min-w-0 flex-1 overflow-y-auto p-4">
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
               {['project', 'integrations', 'setup'].map((path) => (
                 <Route
                   key={path}
@@ -608,7 +627,6 @@ export function ProjectDetail() {
             repository?.clone_url || project.git_url || undefined
           }
           repositoryProviderType={repositoryProviderType}
-          lastDeployment={lastDeployment}
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
@@ -642,7 +660,7 @@ export function ProjectDetail() {
               <ShieldAlert className="h-4 w-4 text-primary" />
               <AlertDescription className="flex items-center justify-between">
                 <span className="text-foreground">
-                  Attack Mode is enabled for this project
+                  Attack Mode is enabled for this service
                 </span>
                 <Button
                   variant="ghost"
@@ -659,10 +677,10 @@ export function ProjectDetail() {
           <ProjectTour />
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
               <Route
                 path="hosting"
-                element={<Navigate to="../settings/delivery" replace />}
+                element={<RedirectWithQuery to="../settings/delivery" />}
               />
               <Route
                 path="integrations"
@@ -679,7 +697,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="tools"
-                element={<Navigate to="../settings/general" replace />}
+                element={<RedirectWithQuery to="../settings/general" />}
               />
               <Route
                 path="setup"
@@ -851,7 +869,7 @@ export function ProjectDetail() {
                   any lingering /dashboards links. */}
               <Route
                 path="dashboards/*"
-                element={<Navigate to="../metrics/dashboards" replace />}
+                element={<RedirectWithQuery to="../metrics/dashboards" />}
               />
               <Route
                 path="ai-gateway"

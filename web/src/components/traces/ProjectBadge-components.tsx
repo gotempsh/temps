@@ -60,7 +60,7 @@ export function ProjectDot({
       // role-less generic element is ignored by most screen readers, which
       // would leave the project unreadable once the slug text is gone.
       role="img"
-      aria-label={`Project: ${name}`}
+      aria-label={`Service: ${name}`}
     />
   )
 }
@@ -76,7 +76,7 @@ export function ProjectLegend({
   if (projects.length === 0) return null
   return (
     <div className={cn('flex flex-wrap items-center gap-2', className)}>
-      <span className="text-xs text-muted-foreground">Projects:</span>
+      <span className="text-xs text-muted-foreground">Services:</span>
       {projects.map((p) => (
         <ProjectBadge
           key={p.project_id}

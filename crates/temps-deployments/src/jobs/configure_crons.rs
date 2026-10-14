@@ -7,7 +7,6 @@
 
 use async_trait::async_trait;
 use sea_orm::EntityTrait;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
@@ -16,6 +15,7 @@ use temps_entities::projects;
 use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
+use crate::jobs::temps_yaml::{read_temps_yaml, TempsYamlLookup};
 use crate::jobs::RepositoryOutput;
 
 /// Service interface for cron configuration
@@ -128,7 +128,10 @@ impl ConfigureCronsJob {
     async fn log(&self, message: String) -> Result<(), WorkflowError> {
         // Detect log level from message content/emojis
         let level = Self::detect_log_level(&message);
+        self.log_at(level, message).await
+    }
 
+    async fn log_at(&self, level: LogLevel, message: String) -> Result<(), WorkflowError> {
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_structured_log(log_id, level, message.clone())
@@ -153,34 +156,42 @@ impl ConfigureCronsJob {
         }
     }
 
-    /// Load and parse .temps.yaml configuration
+    /// Load and parse .temps.yaml configuration.
+    ///
+    /// A missing file is normal (nothing to configure). A file that exists but
+    /// cannot be read or parsed is written to the deployment log as a warning
+    /// naming the file and the cause, so the user learns that the configuration
+    /// they wrote was not applied, and then fails this (non-required) job.
     async fn load_temps_config(
         &self,
         repo_dir: &Path,
         project: &projects::Model,
     ) -> Result<Option<TempsConfig>, WorkflowError> {
-        let project_dir = repo_dir.join(&project.directory);
-        let config_path = project_dir.join(".temps.yaml");
-
-        if !config_path.exists() {
-            self.log(format!(
-                "No .temps.yaml found at {:?}, skipping cron configuration",
-                config_path
-            ))
-            .await?;
-            return Ok(None);
+        match read_temps_yaml(repo_dir, &project.directory) {
+            Ok(TempsYamlLookup::Missing { path }) => {
+                self.log(format!(
+                    "No .temps.yaml found at {:?}, skipping cron configuration",
+                    path
+                ))
+                .await?;
+                Ok(None)
+            }
+            Ok(TempsYamlLookup::Found { path, config }) => {
+                self.log(format!("Found .temps.yaml at {:?}", path)).await?;
+                Ok(Some(*config))
+            }
+            Err(error) => {
+                self.log_at(
+                    LogLevel::Warning,
+                    format!(
+                        "⚠ {error}. The cron configuration from .temps.yaml was NOT applied \
+                         to this deployment; fix the file and deploy again"
+                    ),
+                )
+                .await?;
+                Err(WorkflowError::JobExecutionFailed(error.to_string()))
+            }
         }
-
-        self.log(format!("Found .temps.yaml at {:?}", config_path))
-            .await?;
-
-        let config_contents = fs::read_to_string(&config_path).map_err(WorkflowError::IoError)?;
-
-        let config = TempsConfig::from_yaml(&config_contents).map_err(|e| {
-            WorkflowError::JobExecutionFailed(format!("Failed to parse .temps.yaml: {}", e))
-        })?;
-
-        Ok(Some(config))
     }
 
     /// Configure cron jobs based on repository configuration
@@ -445,6 +456,162 @@ mod tests {
             self.captured_configs.lock().unwrap().extend(cron_configs);
             Ok(())
         }
+    }
+
+    // ── Uploaded (Drop) bundle: the tree has no git checkout ──────────────
+
+    use crate::jobs::temps_yaml::test_support::uploaded_source_project;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    /// A job wired like the planner wires it for an uploaded source, over a
+    /// mock database that knows only the Drop project.
+    fn drop_job(
+        cron_service: Arc<dyn CronConfigService>,
+        log_service: Arc<LogService>,
+    ) -> ConfigureCronsJob {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![uploaded_source_project(7)]])
+            .into_connection();
+        ConfigureCronsJob::new(
+            "configure_crons".to_string(),
+            "prepare_source_bundle".to_string(),
+            "mark_deployment_complete".to_string(),
+            7,
+            3,
+            Arc::new(db),
+            cron_service,
+        )
+        .with_log_id("deployment-9-job-configure_crons.log".to_string())
+        .with_log_service(log_service)
+    }
+
+    fn bundle_output(dir: &std::path::Path) -> RepositoryOutput {
+        RepositoryOutput {
+            repo_dir: dir.to_path_buf(),
+            checkout_ref: "uploaded-source".to_string(),
+            repo_owner: "drop".to_string(),
+            repo_name: "drop-app".to_string(),
+        }
+    }
+
+    async fn job_log(log_service: &LogService) -> Vec<temps_logs::LogEntry> {
+        log_service
+            .get_structured_logs("deployment-9-job-configure_crons.log")
+            .await
+            .expect("the job wrote its log")
+    }
+
+    #[tokio::test]
+    async fn a_temps_yaml_in_an_uploaded_bundle_configures_its_crons() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        std::fs::write(bundle.path().join("index.html"), "<!doctype html>").unwrap();
+        std::fs::write(
+            bundle.path().join(".temps.yaml"),
+            "cron:\n  - path: /api/tick\n    schedule: \"*/10 * * * *\"\n",
+        )
+        .unwrap();
+        let logs = tempfile::tempdir().expect("logs");
+        let log_service = Arc::new(LogService::new(logs.path().to_path_buf()));
+        let cron_service = Arc::new(MockCronConfigService::new());
+        let job = drop_job(cron_service.clone(), log_service.clone());
+
+        job.configure_crons(&bundle_output(bundle.path()))
+            .await
+            .expect("crons are configured from the bundle");
+
+        let configured = cron_service.get_captured_configs();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].path, "/api/tick");
+        assert_eq!(configured[0].schedule, "*/10 * * * *");
+        let entries = job_log(&log_service).await;
+        assert!(entries
+            .iter()
+            .any(|e| e.message.starts_with("Found .temps.yaml")));
+        assert!(entries.iter().all(|e| e.level != LogLevel::Warning));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_without_temps_yaml_is_not_an_error_or_a_warning() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        std::fs::write(bundle.path().join("index.html"), "<!doctype html>").unwrap();
+        let logs = tempfile::tempdir().expect("logs");
+        let log_service = Arc::new(LogService::new(logs.path().to_path_buf()));
+        let cron_service = Arc::new(MockCronConfigService::new());
+        let job = drop_job(cron_service.clone(), log_service.clone());
+
+        job.configure_crons(&bundle_output(bundle.path()))
+            .await
+            .expect("an absent file is normal");
+
+        assert!(cron_service.get_captured_configs().is_empty());
+        let entries = job_log(&log_service).await;
+        assert!(entries
+            .iter()
+            .any(|e| e.message.starts_with("No .temps.yaml found")));
+        assert!(entries.iter().all(|e| e.level != LogLevel::Warning));
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_temps_yaml_in_a_bundle_is_a_logged_warning() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        std::fs::write(
+            bundle.path().join(".temps.yaml"),
+            "cron:\n  - path: /api/tick\n    schedule: [unclosed\n",
+        )
+        .unwrap();
+        let logs = tempfile::tempdir().expect("logs");
+        let log_service = Arc::new(LogService::new(logs.path().to_path_buf()));
+        let cron_service = Arc::new(MockCronConfigService::new());
+        let job = drop_job(cron_service.clone(), log_service.clone());
+
+        let error = job
+            .configure_crons(&bundle_output(bundle.path()))
+            .await
+            .expect_err("a broken file must not be silently ignored");
+
+        assert!(
+            error.to_string().contains("Cannot parse .temps.yaml"),
+            "{error}"
+        );
+        assert!(cron_service.get_captured_configs().is_empty());
+        let entries = job_log(&log_service).await;
+        let warning = entries
+            .iter()
+            .find(|e| e.level == LogLevel::Warning)
+            .expect("the deployment log carries a warning");
+        assert!(
+            warning.message.contains(".temps.yaml"),
+            "{}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("NOT applied"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_temps_yaml_in_a_bundle_is_a_logged_warning() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        // A directory where the file should be: present, but not readable.
+        std::fs::create_dir(bundle.path().join(".temps.yaml")).unwrap();
+        let logs = tempfile::tempdir().expect("logs");
+        let log_service = Arc::new(LogService::new(logs.path().to_path_buf()));
+        let job = drop_job(Arc::new(MockCronConfigService::new()), log_service.clone());
+
+        assert!(job
+            .configure_crons(&bundle_output(bundle.path()))
+            .await
+            .is_err());
+
+        let entries = job_log(&log_service).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.level == LogLevel::Warning
+                    && e.message.contains("Cannot read .temps.yaml"))
+        );
     }
 
     #[test]

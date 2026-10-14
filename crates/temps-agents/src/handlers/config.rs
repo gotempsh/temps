@@ -93,6 +93,11 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Exec Failed")
                     .with_detail(error.to_string())
             }
+            AgentError::SandboxTerminalTimeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("Terminal Attach Timed Out")
+                    .with_detail(error.to_string())
+            }
             AgentError::SnapshotSizeLimitExceeded { .. } => {
                 problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
                     .with_title("Snapshot Storage Limit Exceeded")

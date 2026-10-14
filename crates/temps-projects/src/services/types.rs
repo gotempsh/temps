@@ -114,6 +114,8 @@ pub struct Project {
     /// so a Git project can additionally be shipped from an uploaded archive
     /// (`drop`) without losing its repository. NULL/false means off.
     pub allow_alternate_sources: Option<bool>,
+    /// Whether Temps runs the app (`hosted`) or only observes it (`external`).
+    pub hosting: temps_entities::types::Hosting,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
     /// ADR-027 Phase 3: whether this project's traces appear in cross-project
@@ -414,6 +416,10 @@ pub struct CreateProjectRequest {
     /// persisted here.
     #[serde(default)]
     pub template_slug: Option<String>,
+    /// `external` creates a project Temps never deploys: the app runs
+    /// elsewhere and only sends its telemetry.
+    #[serde(default)]
+    pub hosting: temps_entities::types::Hosting,
 }
 
 /// `app.example.com (binding 3), www.example.com (binding 4)` -- names both
@@ -601,6 +607,19 @@ pub enum ProjectError {
         "Additional verification is required before moving a slug that grants host Docker access"
     )]
     SlugClaimStepUpRequired { problem: Box<Problem> },
+
+    /// A one-service project was asked to move onto a template release that
+    /// has several services. Only the first service's runtime could be
+    /// applied, so the release must be deployed as a whole app instead.
+    #[error(
+        "Project {project_id} runs a single service of template '{template_slug}', but release {template_slug}@{target_version} has {service_count} services that must be created together; it cannot be upgraded one service at a time. Deploy the template as a whole app instead"
+    )]
+    SingleServiceUpgradeToMultiService {
+        project_id: i32,
+        template_slug: String,
+        target_version: String,
+        service_count: usize,
+    },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

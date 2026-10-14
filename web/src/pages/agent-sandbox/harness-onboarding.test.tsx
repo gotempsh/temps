@@ -40,6 +40,7 @@ const provider: ProviderCatalogDto = {
   model_source: 'bootstrap',
   supports_max_turns: true,
   workspace_ready: false,
+  login_supported: false,
 }
 
 describe('harness onboarding', () => {
@@ -195,6 +196,75 @@ describe('harness onboarding', () => {
         local_credential: detected,
       }).map((method) => method.id)
     ).toEqual(['subscription', 'api_key'])
+  })
+
+  test('offers console sign-in first and keeps pasting as the advanced route', () => {
+    const flavors = [
+      {
+        id: 'subscription',
+        label: 'Claude subscription',
+        description: '',
+        format: 'oauth_token',
+      },
+      { id: 'api_key', label: 'API key', description: '', format: 'api_key' },
+    ]
+    const methods = harnessConnectionMethods({
+      id: 'claude_cli',
+      name: 'Claude Code',
+      auth_flavors: flavors,
+      local_credential: null,
+      login_supported: true,
+    })
+    expect(methods.map((method) => method.id)).toEqual([
+      'console-login',
+      'subscription',
+      'api_key',
+    ])
+    expect(methods[0].label).toBe('Sign in with Claude')
+    // Only the subscription paste route is demoted; API keys keep their name.
+    expect(methods[1].label).toBe('Paste token (advanced)')
+    expect(methods[2].label).toBe('API key')
+  })
+
+  test('console sign-in stays offered when the CLI is not installed', () => {
+    const methods = harnessConnectionMethods({
+      id: 'claude_cli',
+      name: 'Claude Code',
+      auth_flavors: [],
+      local_credential: null,
+      login_supported: true,
+    })
+    expect(methods.map((method) => method.id)).toEqual(['console-login'])
+  })
+
+  test('replacing a saved subscription credential preselects console sign-in', () => {
+    const methods = harnessConnectionMethods({
+      id: 'claude_cli',
+      name: 'Claude Code',
+      auth_flavors: [
+        {
+          id: 'subscription',
+          label: 'S',
+          description: '',
+          format: 'oauth_token',
+        },
+        { id: 'api_key', label: 'K', description: '', format: 'api_key' },
+      ],
+      local_credential: null,
+      login_supported: true,
+    })
+    expect(
+      initialConnectionMethodId(
+        { credential_saved: true, current_auth_type: 'subscription' },
+        methods
+      )
+    ).toBe('console-login')
+    expect(
+      initialConnectionMethodId(
+        { credential_saved: true, current_auth_type: 'api_key' },
+        methods
+      )
+    ).toBe('api_key')
   })
 
   test('OpenAI-compatible helpers build the stored document and model selection', () => {

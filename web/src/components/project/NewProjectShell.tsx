@@ -10,6 +10,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
@@ -22,8 +23,11 @@ import {
   CircleHelp,
   UploadCloud,
   Boxes,
+  RefreshCw,
   Activity,
 } from 'lucide-react'
+import { useTargetGroup } from '@/components/project-groups/useJoinGroupAfterCreate'
+import { groupHref } from '@/lib/terminology'
 import Github from '@/icons/Github'
 import Gitlab from '@/icons/Gitlab'
 import Gitea from '@/icons/Gitea'
@@ -38,7 +42,7 @@ export type ProjectSource =
   | 'monitor'
 
 /**
- * Shared page shell for every step of project creation — the source picker,
+ * Shared page shell for every step of service creation — the source picker,
  * the repository configurator, the template configurator, and the Git URL
  * flow all render inside the same header (title + connection chips) and
  * source-tab row, so switching between "choosing" and "configuring" never
@@ -55,6 +59,7 @@ export function NewProjectShell({
 }) {
   const connectionsQuery = useQuery({ ...listConnectionsOptions() })
   const connections = connectionsQuery.data
+  const target = useTargetGroup()
   const { data: gitProviders } = useQuery({ ...listGitProvidersOptions() })
 
   const providerTypeForConnectionId = (
@@ -121,7 +126,7 @@ export function NewProjectShell({
     <div className="flex-1 min-w-0">
       <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">New Project</h1>
+          <h1 className="text-2xl font-bold tracking-tight">New service</h1>
           <p className="text-sm text-muted-foreground mt-1">
             Deploy your code or monitor an application hosted elsewhere.
           </p>
@@ -170,11 +175,13 @@ export function NewProjectShell({
         )}
       </div>
 
+      <TargetGroupNotice target={target} />
+
       <Tabs
         value={activeSource ?? ''}
         onValueChange={(value) => onSelectSource(value as ProjectSource)}
       >
-        <TabsList aria-label="Project setup">
+        <TabsList aria-label="Service setup">
           {sources.map((source) => {
             const Icon = source.icon
             return (
@@ -188,6 +195,63 @@ export function NewProjectShell({
         </TabsList>
         <TabsContent value={activeSource ?? ''}>{children}</TabsContent>
       </Tabs>
+    </div>
+  )
+}
+
+/**
+ * Says which project a service created here joins (`?group=<id>`), or that
+ * it cannot, before the user fills anything in.
+ */
+function TargetGroupNotice({
+  target,
+}: {
+  target: ReturnType<typeof useTargetGroup>
+}) {
+  if (target.groupId === null) return null
+  if (target.query.isLoading) {
+    return <Skeleton className="mb-6 h-10 w-full max-w-md" />
+  }
+  if (target.query.isError || !target.group) {
+    return (
+      <div
+        role="alert"
+        className="mb-6 flex flex-col gap-2 rounded-lg border border-destructive/40 px-4 py-3 text-sm sm:flex-row sm:items-center"
+      >
+        <p className="flex-1">
+          The project this service should join could not be loaded. The service
+          is still created; if adding it to the project fails, you can retry or
+          add it later from the project page.
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={target.query.isFetching}
+          onClick={() => void target.query.refetch()}
+        >
+          <RefreshCw
+            className={
+              target.query.isFetching ? 'size-4 animate-spin' : 'size-4'
+            }
+          />
+          Retry
+        </Button>
+      </div>
+    )
+  }
+  return (
+    <div className="mb-6 flex items-center gap-2 rounded-lg border px-4 py-3 text-sm text-muted-foreground">
+      <Boxes className="size-4 shrink-0" />
+      <span>
+        The new service is added to{' '}
+        <Link
+          to={groupHref(target.group.slug)}
+          className="font-medium text-foreground underline underline-offset-2"
+        >
+          {target.group.name}
+        </Link>
+        .
+      </span>
     </div>
   )
 }

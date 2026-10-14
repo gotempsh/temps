@@ -66,7 +66,6 @@ import {
 } from 'lucide-react'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import {
@@ -82,6 +81,7 @@ import {
   isLikelySecretProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import {
   normalizeTemplateServiceType,
   toggleDatabaseSelection,
@@ -120,7 +120,7 @@ const SOURCE_TYPE_OPTIONS: {
 
 // Form schema for manual projects
 const formSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
+  name: z.string().min(1, 'Service name is required'),
   sourceType: z.enum(['manual', 'docker_image', 'static_files'] as const),
   // Docker image specific
   imageUrl: z.string().optional(),
@@ -146,7 +146,6 @@ export function ManualProjectConfigurator({
   defaultValues,
   className,
 }: ManualProjectConfiguratorProps) {
-  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [deliveryProvider, setDeliveryProvider] = useState<
     'none' | 'cloudflare' | 'bunny' | undefined
@@ -210,65 +209,91 @@ export function ManualProjectConfigurator({
     return Array.from(servicesById.values())
   }, [existingServices, newlyCreatedServices])
 
-  // Project creation mutation
+  // `?group=<id>`: the new service joins that project. The server resolves
+  // the project's shared variables while it plans a deployment, so the join
+  // happens before the image deployment is started, never after.
+  const { finish, joinBeforeDeploy, continueTo, joinGroupDialog } =
+    useJoinGroupAfterCreate()
+
+  /**
+   * Deploy the image entered on this form to a service that was just created
+   * and then leave the page. Without it the image was dropped and the
+   * service had nothing to deploy. Every failure is reported here, so it is
+   * safe to run again from the join dialog's Retry.
+   */
+  const deployImageAndLeave = async (
+    service: { id: number; slug: string },
+    imageRef: string
+  ) => {
+    try {
+      const firstDeploy = await startFirstImageDeploy(service.id, imageRef, {
+        listEnvironments: async (projectId) => {
+          const { data: environments } = await getEnvironments({
+            path: { project_id: projectId },
+            throwOnError: true,
+          })
+          return environments
+        },
+        deployImage: ({ projectId, environmentId, imageRef }) =>
+          deployFromImage({
+            path: {
+              project_id: projectId,
+              environment_id: environmentId,
+            },
+            body: { image_ref: imageRef },
+            throwOnError: true,
+          }),
+      })
+      if (firstDeploy.status === 'started') {
+        toast.success(`Deploying to ${firstDeploy.environmentName}`)
+        continueTo(deploymentsAfterStartPath(service.slug))
+        return
+      }
+      if (firstDeploy.status === 'no_environment') {
+        toast.error(
+          'The service has no environment to deploy the image to. Create one, then deploy from the Deployments tab.'
+        )
+      }
+      continueTo(`/projects/${service.slug}?new=true&source=${sourceType}`)
+    } catch (error) {
+      toast.error(
+        `Service created, but the image deployment did not start: ${problemDetail(
+          error,
+          'unknown error'
+        )}`
+      )
+      // Service creation does not store the image, so hand it to the
+      // deploy dialog rather than making the user retype it.
+      continueTo(imageDeployRetryPath(service.slug, imageRef))
+    }
+  }
+
+  // Service creation mutation
   const projectMutation = useMutation({
     ...createProjectMutation(),
     meta: {
-      errorTitle: 'Failed to create project',
+      errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
-      toast.success('Project created successfully!')
+      toast.success('Service created')
 
-      // Deploy the image entered on this form. Without this the image was
-      // dropped and the project had nothing to deploy.
       const imageRef = form.getValues('imageUrl')?.trim()
-      if (sourceType !== 'static_files' && imageRef) {
-        try {
-          const firstDeploy = await startFirstImageDeploy(data.id, imageRef, {
-            listEnvironments: async (projectId) => {
-              const { data: environments } = await getEnvironments({
-                path: { project_id: projectId },
-                throwOnError: true,
-              })
-              return environments
-            },
-            deployImage: ({ projectId, environmentId, imageRef }) =>
-              deployFromImage({
-                path: {
-                  project_id: projectId,
-                  environment_id: environmentId,
-                },
-                body: { image_ref: imageRef },
-                throwOnError: true,
-              }),
-          })
-          if (firstDeploy.status === 'started') {
-            toast.success(`Deploying to ${firstDeploy.environmentName}`)
-            navigate(deploymentsAfterStartPath(data.slug))
-            return
-          }
-          if (firstDeploy.status === 'no_environment') {
-            toast.error(
-              'The project has no environment to deploy the image to. Create one, then deploy from the Deployments tab.'
-            )
-          }
-        } catch (error) {
-          toast.error(
-            `Project created, but the image deployment did not start: ${problemDetail(
-              error,
-              'unknown error'
-            )}`
-          )
-          // Project creation does not store the image, so hand it to the
-          // deploy dialog rather than making the user retype it.
-          navigate(imageDeployRetryPath(data.slug, imageRef))
-          return
-        }
+      if (sourceType === 'static_files' || !imageRef) {
+        // Nothing to deploy from here: no ordering to protect.
+        await finish(
+          data,
+          `/projects/${data.slug}?new=true&source=${sourceType}`
+        )
+        return
       }
 
-      navigate(`/projects/${data.slug}?new=true&source=${sourceType}`)
+      const deploy = () => deployImageAndLeave(data, imageRef)
+      // Join first. When that fails nothing is deployed; the dialog offers
+      // Retry, which joins again and then runs `deploy`.
+      if (!(await joinBeforeDeploy(data, deploy))) return
+      await deploy()
     },
   })
 
@@ -473,7 +498,7 @@ export function ManualProjectConfigurator({
         name="name"
         render={({ field }) => (
           <FormItem>
-            <FormLabel>Project Name</FormLabel>
+            <FormLabel>Service name</FormLabel>
             <FormControl>
               <Input {...field} placeholder="my-awesome-project" />
             </FormControl>
@@ -512,8 +537,8 @@ export function ManualProjectConfigurator({
         <Alert>
           <FileArchive className="h-4 w-4" />
           <AlertDescription>
-            After creating the project, you&apos;ll be able to upload your
-            static files (tar.gz or zip) through the project dashboard or API.
+            After creating the service, you&apos;ll be able to upload your
+            static files (tar.gz or zip) through the service dashboard or API.
           </AlertDescription>
         </Alert>
       )}
@@ -522,12 +547,12 @@ export function ManualProjectConfigurator({
         <Alert>
           <Settings className="h-4 w-4" />
           <AlertDescription>
-            <strong>Flexible Project:</strong> After creation, you can deploy
+            <strong>Flexible service:</strong> After creation, you can deploy
             using any method:
             <ul className="list-disc list-inside mt-2 text-xs">
               <li>Docker images from any registry</li>
               <li>Static files (tar.gz or zip uploads)</li>
-              <li>Git repository (configure later in project settings)</li>
+              <li>Git repository (configure later in service settings)</li>
             </ul>
           </AlertDescription>
         </Alert>
@@ -638,6 +663,7 @@ export function ManualProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -730,7 +756,7 @@ export function ManualProjectConfigurator({
               ).length > 1
                 ? 's'
                 : ''}{' '}
-              will be linked to this project
+              will be linked to this service
             </AlertDescription>
           </Alert>
         )}
@@ -984,8 +1010,8 @@ export function ManualProjectConfigurator({
           {/* Project Configuration */}
           <Card>
             <CardHeader>
-              <CardTitle>Project Configuration</CardTitle>
-              <CardDescription>Configure your project settings</CardDescription>
+              <CardTitle>Service configuration</CardTitle>
+              <CardDescription>Configure your service settings</CardDescription>
             </CardHeader>
             <CardContent>{renderProjectConfig()}</CardContent>
           </Card>
@@ -1061,18 +1087,20 @@ export function ManualProjectConfigurator({
               {isSubmitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Creating Project...
+                  Creating service...
                 </>
               ) : (
                 <>
                   <CheckCircle2 className="mr-2 h-4 w-4" />
-                  Create Project
+                  Create service
                 </>
               )}
             </Button>
           </div>
         </form>
       </Form>
+
+      {joinGroupDialog}
 
       {/* Create Service Dialog */}
       <CreateServiceDialog

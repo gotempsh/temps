@@ -191,6 +191,7 @@ export function ApiKeyCreateModal({
                 <FormLabel>Your API Key</FormLabel>
                 <div className="flex gap-2">
                   <Input
+                    aria-label="Your API Key"
                     value={newKeySecret}
                     readOnly
                     className="font-mono text-sm"

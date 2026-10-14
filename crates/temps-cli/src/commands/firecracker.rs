@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use temps_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
+
 use super::upgrade::{download_asset, download_asset_text, verify_checksum};
 
 /// Supported Firecracker release. Pinned deliberately (snapshot format and
@@ -51,6 +53,9 @@ const TAP_NAME_PREFIX: &str = "temps-fc-tap";
 const SMOKE_MARKER: &str = "TEMPS_FC_SMOKE_OK";
 const SMOKE_IMAGE: &str = "busybox:stable";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Command that stages the guest terminal agent, shown with the reason when
+/// it is missing.
+const PTY_AGENT_SETUP_HINT: &str = temps_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
 
 /// Manage the Firecracker microVM sandbox backend
 #[derive(Args)]
@@ -115,6 +120,13 @@ pub struct FirecrackerSetupCommand {
     /// Defaults to a `temps-vm-agent` file next to the running executable.
     #[arg(long)]
     pub vm_agent_bin: Option<PathBuf>,
+
+    /// Path to the static musl `temps-pty-agent` guest binary to install.
+    /// It is what gives sandboxes interactive terminals
+    /// (`temps sandbox shell`). Defaults to a `temps-pty-agent` file next to
+    /// the running executable.
+    #[arg(long)]
+    pub pty_agent_bin: Option<PathBuf>,
 }
 
 /// Provisioned state, written only after stages succeed. The sandbox
@@ -160,6 +172,10 @@ impl Dirs {
 
     fn jailer_bin(&self) -> PathBuf {
         self.bin.join("jailer")
+    }
+
+    fn pty_agent_bin(&self) -> PathBuf {
+        self.bin.join(PTY_AGENT_BINARY_NAME)
     }
 
     fn kernel_file(&self) -> PathBuf {
@@ -296,6 +312,7 @@ impl FirecrackerSetupCommand {
         section("Firecracker binaries");
         self.stage_binaries(&dirs).await?;
         self.stage_vm_agent(&dirs)?;
+        self.stage_pty_agent(&dirs)?;
 
         section("Guest kernel");
         self.stage_kernel(&dirs).await?;
@@ -526,6 +543,21 @@ impl FirecrackerSetupCommand {
             failures += 1;
         }
 
+        // Terminal agent: optional, so absence is a warning, not a failure.
+        match TerminalCapability::from_staged_binary(&dirs.pty_agent_bin(), PTY_AGENT_SETUP_HINT) {
+            TerminalCapability {
+                supported: true, ..
+            } => pass("Terminal agent", dirs.pty_agent_bin().display().to_string()),
+            TerminalCapability { reason, .. } => warn(
+                "Terminal agent",
+                format!(
+                    "{} — `temps sandbox shell` is unavailable on Firecracker sandboxes \
+                     until it is staged",
+                    reason.unwrap_or_default()
+                ),
+            ),
+        }
+
         // State / smoke
         match read_state(dirs) {
             Some(s) if s.smoke_ok => pass("Smoke test", "Passed on last setup"),
@@ -647,6 +679,53 @@ impl FirecrackerSetupCommand {
                     "temps-vm-agent binary not found (looked next to this executable). \
                      Firecracker sandboxes stay unavailable until it is installed — \
                      re-run with --vm-agent-bin <path>.",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Install the static musl PTY agent that powers interactive terminals.
+    /// Injected next to the VM agent into every rootfs converted afterwards
+    /// (the rootfs cache key includes its hash, so a changed binary
+    /// re-converts). Sourced from `--pty-agent-bin` or a `temps-pty-agent`
+    /// file next to the running executable.
+    ///
+    /// Optional by design: without it sandboxes still create and run
+    /// commands, they just cannot open terminals — so a missing binary is a
+    /// warning that says exactly how to fix it, never a failed setup.
+    fn stage_pty_agent(&self, dirs: &Dirs) -> anyhow::Result<()> {
+        let source = self.pty_agent_bin.clone().or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+                .filter(|p| p.exists())
+        });
+        let dest = dirs.pty_agent_bin();
+        match source {
+            Some(src) if src.exists() => {
+                stage_pty_agent_binary(&src, &dest)?;
+                pass(
+                    "Terminal agent",
+                    format!(
+                        "Installed from {} — sandboxes created from now on support \
+                         `temps sandbox shell`; recreate existing ones to add it",
+                        src.display()
+                    ),
+                );
+            }
+            Some(src) => {
+                anyhow::bail!("--pty-agent-bin {} does not exist", src.display());
+            }
+            None if dest.exists() => {
+                pass("Terminal agent", "Already installed");
+            }
+            None => {
+                warn(
+                    "Terminal agent",
+                    "temps-pty-agent binary not found (looked next to this executable). \
+                     Sandboxes work but cannot open terminals (`temps sandbox shell`) \
+                     until it is installed — re-run with --pty-agent-bin <path>.",
                 );
             }
         }

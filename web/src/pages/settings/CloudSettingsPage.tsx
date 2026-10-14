@@ -360,7 +360,7 @@ export function CloudSettingsPage() {
                   Connection state
                 </p>
                 <div className="flex items-center gap-3">
-                  <span className="grid size-9 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-500">
+                  <span className="grid size-9 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500">
                     <Check className="size-4" />
                   </span>
                   <div>
@@ -520,7 +520,7 @@ export function CloudSettingsPage() {
                 <p>
                   Disconnecting disables Cloud exports, removes managed backup
                   schedules, and revokes Cloud console access and its sessions.
-                  It removes the saved Cloud credential. Local projects and
+                  It removes the saved Cloud credential. Local services and
                   deployments remain available. After reconnecting, review your
                   Cloud exports and backup schedule.
                 </p>

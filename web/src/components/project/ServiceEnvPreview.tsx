@@ -4,6 +4,7 @@
 import { useCallback, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getServicePreviewEnvironmentVariablesMaskedOptions } from '@/api/client/@tanstack/react-query.gen'
+import { revealServiceEnvironmentVariables } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
 import {
@@ -142,11 +143,20 @@ export function ServiceEnvPreview({
             {envVars && showPreview && (
               <>
                 <EnvVariablesDisplay
+                  key={serviceId}
                   variables={envVars}
                   showCopy={true}
                   showMaskToggle={true}
                   defaultMasked={true}
                   maxHeight="10rem"
+                  reveal={async () =>
+                    (
+                      await revealServiceEnvironmentVariables({
+                        path: { id: serviceId },
+                        throwOnError: true,
+                      })
+                    ).data
+                  }
                 />
                 <p className="text-xs text-muted-foreground text-center mt-3">
                   These variables will be automatically available in your

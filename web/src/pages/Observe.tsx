@@ -32,7 +32,7 @@ import {
   Workflow,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { useComposedSearchParams, useUrlBoundText } from '@temps-sdk/ds'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
 
@@ -81,7 +81,7 @@ function sameKindSet(
  */
 export default function Observe({ project }: ObserveProps) {
   usePageTitle(`Observe · ${project.name}`)
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
   const [selectedEvent, setSelectedEvent] = useState<ObservabilityEvent | null>(
     null
   )
@@ -123,35 +123,36 @@ export default function Observe({ project }: ObserveProps) {
   }, [searchParams])
 
   const updateFilters = (next: ObserveFilters) => {
-    const params = new URLSearchParams(searchParams)
-    if (sameKindSet(next.kinds, DEFAULT_KINDS)) {
-      params.delete('kinds')
-    } else {
-      params.set('kinds', next.kinds.join(','))
-    }
-    if (next.timeRange === '24h') {
-      params.delete('time_range')
-    } else {
-      params.set('time_range', next.timeRange)
-    }
-    if (next.search) {
-      params.set('search', next.search)
-    } else {
-      params.delete('search')
-    }
-    if (next.environmentId != null) {
-      params.set('environment_id', String(next.environmentId))
-    } else {
-      params.delete('environment_id')
-    }
-    // Bots hidden is the default — only persist when the user has flipped
-    // it off so the URL doesn't carry redundant state.
-    if (next.hideBots) {
-      params.delete('hide_bots')
-    } else {
-      params.set('hide_bots', 'false')
-    }
-    setSearchParams(params, { replace: true })
+    updateSearchParams((params) => {
+      if (sameKindSet(next.kinds, DEFAULT_KINDS)) {
+        params.delete('kinds')
+      } else {
+        params.set('kinds', next.kinds.join(','))
+      }
+      if (next.timeRange === '24h') {
+        params.delete('time_range')
+      } else {
+        params.set('time_range', next.timeRange)
+      }
+      if (next.search) {
+        params.set('search', next.search)
+      } else {
+        params.delete('search')
+      }
+      if (next.environmentId != null) {
+        params.set('environment_id', String(next.environmentId))
+      } else {
+        params.delete('environment_id')
+      }
+      // Bots hidden is the default — only persist when the user has flipped
+      // it off so the URL doesn't carry redundant state.
+      if (next.hideBots) {
+        params.delete('hide_bots')
+      } else {
+        params.set('hide_bots', 'false')
+      }
+      return params
+    })
   }
 
   const window = useMemo(
@@ -242,25 +243,25 @@ const KIND_META: Record<
   request: {
     label: 'Requests',
     icon: Network,
-    accent: 'text-sky-500',
+    accent: 'text-sky-700 dark:text-sky-500',
     gutter: 'border-l-sky-500',
   },
   span: {
     label: 'Traces',
     icon: Workflow,
-    accent: 'text-violet-500',
+    accent: 'text-violet-600 dark:text-violet-500',
     gutter: 'border-l-violet-500',
   },
   error: {
     label: 'Errors',
     icon: AlertOctagon,
-    accent: 'text-rose-500',
+    accent: 'text-rose-700 dark:text-rose-500',
     gutter: 'border-l-rose-500',
   },
   revenue: {
     label: 'Revenue',
     icon: CircleDollarSign,
-    accent: 'text-emerald-500',
+    accent: 'text-emerald-700 dark:text-emerald-500',
     gutter: 'border-l-emerald-500',
   },
 }
@@ -282,6 +283,10 @@ function CockpitHeader({
   events: ObservabilityEvent[]
 }) {
   const buckets = useMemo(() => bucketByKind(events, 24), [events])
+  const [searchText, setSearchText] = useUrlBoundText(
+    filters.search,
+    (search) => onChange({ ...filters, search })
+  )
 
   const toggle = (kind: EventKind) => {
     const next = filters.kinds.includes(kind)
@@ -324,13 +329,20 @@ function CockpitHeader({
                 'group flex flex-col gap-2 rounded-lg border p-3 text-left transition-colors',
                 active
                   ? 'border-border bg-card'
-                  : 'border-dashed border-border bg-background opacity-60 hover:opacity-100'
+                  : 'border-dashed border-border bg-background hover:bg-muted/40'
               )}
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
                   <Icon className={cn('size-4 shrink-0', meta.accent)} />
-                  <span className="truncate text-sm font-medium">
+                  <span
+                    className={cn(
+                      'truncate text-sm font-medium',
+                      // Dim by colour, not `opacity`: an opacity on the whole
+                      // button drops the label below WCAG 1.4.3 contrast.
+                      !active && 'text-muted-foreground'
+                    )}
+                  >
                     {meta.label}
                   </span>
                 </div>
@@ -350,8 +362,8 @@ function CockpitHeader({
           <Input
             type="search"
             placeholder="grep path / class / event…"
-            value={filters.search}
-            onChange={(e) => onChange({ ...filters, search: e.target.value })}
+            value={searchText}
+            onChange={(e) => setSearchText(e.target.value)}
             className="pl-9 font-mono"
           />
         </div>
@@ -558,7 +570,9 @@ function EmptyState() {
 function ErrorState({ message }: { message: string }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 p-12 text-center">
-      <p className="text-sm font-medium text-rose-500">Failed to load events</p>
+      <p className="text-sm font-medium text-rose-700 dark:text-rose-500">
+        Failed to load events
+      </p>
       <p className="text-xs text-muted-foreground">{message}</p>
     </div>
   )

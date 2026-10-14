@@ -15,7 +15,6 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use serde_yaml;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 use urlencoding;
 use uuid::Uuid;
+use yaml_serde;
 
 use cron::Schedule;
 use temps_core::notifications::BackupFailureData;
@@ -1648,6 +1648,28 @@ pub struct BackupService {
 }
 
 impl BackupService {
+    /// Why running a backup of external service `service_id` with
+    /// `engine_key` would restart its database now, or `None`. Only the
+    /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
+    pub async fn backup_restart_reason(
+        &self,
+        service_id: i32,
+        engine_key: &str,
+    ) -> Result<Option<String>, BackupError> {
+        if engine_key != "postgres_walg" {
+            return Ok(None);
+        }
+        self.external_service_manager
+            .backup_restart_reason(service_id)
+            .await
+            .map_err(|e| {
+                BackupError::ExternalService(format!(
+                    "Failed to check whether backing up service {} restarts it: {}",
+                    service_id, e
+                ))
+            })
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         external_service_manager: Arc<ExternalServiceManager>,
@@ -1974,7 +1996,7 @@ impl BackupService {
         // credentials. Legacy manifests wrote it in plaintext. New recovery
         // sets encrypt it with a key derived from the S3 secret already needed
         // to download the backup, so bucket contents alone do not expose it.
-        let server_config = serde_yaml::to_string(&self.config_service.get_server_config())
+        let server_config = yaml_serde::to_string(&self.config_service.get_server_config())
             .map_err(|error| {
                 BackupError::Configuration(format!(
                     "Failed to serialize server config for recovery set {}: {}",
@@ -8173,7 +8195,7 @@ RETURNING id
         )],
     ) -> Result<serde_json::Value, BackupError> {
         let config_yaml =
-            serde_yaml::to_string(&self.config_service.get_server_config()).map_err(|error| {
+            yaml_serde::to_string(&self.config_service.get_server_config()).map_err(|error| {
                 BackupError::Configuration(format!(
                     "Failed to serialize server config for backup {}: {}",
                     backup.backup_id, error

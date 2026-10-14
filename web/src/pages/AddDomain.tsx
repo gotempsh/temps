@@ -299,17 +299,17 @@ export function AddDomain() {
                                         simpler setup.
                                       </p>
                                       <div className="space-y-1 text-sm">
-                                        <div className="flex items-center gap-2 text-green-600">
+                                        <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                           <CheckCircle className="h-4 w-4" />
                                           <span>
                                             Simple setup - just point DNS
                                           </span>
                                         </div>
-                                        <div className="flex items-center gap-2 text-green-600">
+                                        <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                           <CheckCircle className="h-4 w-4" />
                                           <span>Automatic validation</span>
                                         </div>
-                                        <div className="flex items-center gap-2 text-green-600">
+                                        <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                           <CheckCircle className="h-4 w-4" />
                                           <span>
                                             No additional DNS configuration
@@ -344,18 +344,18 @@ export function AddDomain() {
                                       accessible.
                                     </p>
                                     <div className="space-y-1 text-sm">
-                                      <div className="flex items-center gap-2 text-green-600">
+                                      <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                         <CheckCircle className="h-4 w-4" />
                                         <span>
                                           Supports wildcard certificates
                                           (*.example.com)
                                         </span>
                                       </div>
-                                      <div className="flex items-center gap-2 text-green-600">
+                                      <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                         <CheckCircle className="h-4 w-4" />
                                         <span>Works without HTTP access</span>
                                       </div>
-                                      <div className="flex items-center gap-2 text-yellow-600">
+                                      <div className="flex items-center gap-2 text-yellow-700 dark:text-yellow-600">
                                         <Info className="h-4 w-4" />
                                         <span>
                                           Requires manual DNS record creation

@@ -66,9 +66,14 @@ impl TempsPlugin for ProxyPlugin {
             // selection degrades to the default TimescaleDB backend if it is
             // somehow absent — proxy logging must never fail to register. When
             // present and CH is enabled, the handler reads go to ClickHouse.
-            let server_config = context
-                .get_service::<temps_config::ConfigService>()
-                .map(|cs| cs.get_server_config());
+            let config_service = context.get_service::<temps_config::ConfigService>();
+            let server_config = config_service.as_ref().map(|cs| cs.get_server_config());
+            // The ClickHouse wire-compression mode this process runs with,
+            // resolved once from the stored setting by `ConfigPlugin`.
+            let clickhouse_compression = config_service
+                .as_ref()
+                .map(|cs| cs.clickhouse_compression())
+                .unwrap_or_default();
 
             // Pre-registered by the top-level `temps serve` orchestrator
             // (commands/serve/mod.rs) BEFORE any plugin's `register_services`
@@ -101,6 +106,7 @@ impl TempsPlugin for ProxyPlugin {
                     db.clone(),
                     ip_service.clone(),
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                    clickhouse_compression,
                 ),
                 None => {
                     tracing::debug!(

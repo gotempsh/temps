@@ -124,7 +124,7 @@ async fn setup() -> Option<ChTestEnv> {
     ));
     // Seed proxy logs through the REAL ClickHouse write path.
     ch_proxy_store
-        .write_batch(vec![
+        .write_batch(&[
             proxy_log_entry("req-ch-1", "/api/orders", 200, None),
             proxy_log_entry("req-ch-2", "/api/orders/17", 500, None),
             proxy_log_entry("req-ch-bot", "/robots.txt", 200, Some("GPTBot")),

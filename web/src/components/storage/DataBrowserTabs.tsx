@@ -83,7 +83,7 @@ export function DataBrowserTabs({
             <div className="flex-1 min-w-0 flex flex-col">
               <span className="truncate font-medium">{tabLabel(tab)}</span>
               {tabSubtitle(tab) && (
-                <span className="truncate text-[10px] text-muted-foreground/70">
+                <span className="truncate text-[10px] text-muted-foreground">
                   {tabSubtitle(tab)}
                 </span>
               )}

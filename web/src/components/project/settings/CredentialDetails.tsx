@@ -167,6 +167,7 @@ export function CredentialDetails({
   badge,
   facts,
   createdAt,
+  actions,
 }: {
   projectId: number
   subject: CredentialSubject
@@ -175,6 +176,8 @@ export function CredentialDetails({
   /** Leading summary facts (value, scope); check health and creation follow. */
   facts: ReactNode
   createdAt: string | number
+  /** Extra header actions, shown before "Configure checks". */
+  actions?: ReactNode
 }) {
   const noun = subjectNoun(subject.kind)
   const [params, setParams] = useSearchParams()
@@ -243,9 +246,12 @@ export function CredentialDetails({
     refetchInterval: tab === 'history' && page === 1 ? 5000 : false,
   })
   const configure = (
-    <Button variant="outline" size="sm" asChild>
-      <Link to={`${detailPath}/checks`}>Configure checks</Link>
-    </Button>
+    <>
+      {actions}
+      <Button variant="outline" size="sm" asChild>
+        <Link to={`${detailPath}/checks`}>Configure checks</Link>
+      </Button>
+    </>
   )
   return (
     <section
@@ -462,7 +468,9 @@ export function CredentialDetails({
                         </TableCell>
                         <TableCell className="min-w-48 align-top py-2 whitespace-normal text-muted-foreground">
                           {details.check_name || (
-                            <span aria-label="Not applicable">—</span>
+                            <span role="img" aria-label="Not applicable">
+                              —
+                            </span>
                           )}
                         </TableCell>
                         <TableCell className="align-top py-2">
@@ -470,6 +478,7 @@ export function CredentialDetails({
                             <Status status={details.result.status} />
                           ) : (
                             <span
+                              role="img"
                               className="text-muted-foreground"
                               aria-label="Not applicable"
                             >

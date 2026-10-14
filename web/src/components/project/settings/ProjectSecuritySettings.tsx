@@ -250,9 +250,9 @@ export function ProjectSecuritySettings({
             body: projectSettings,
           }),
           {
-            loading: 'Updating project settings...',
-            success: 'Project settings updated successfully',
-            error: 'Failed to update project settings',
+            loading: 'Updating service settings...',
+            success: 'Service settings updated successfully',
+            error: 'Failed to update service settings',
           }
         )
       }
@@ -335,7 +335,7 @@ export function ProjectSecuritySettings({
         <InfoIcon className="h-4 w-4" />
         <AlertTitle>Configuration Inheritance</AlertTitle>
         <AlertDescription>
-          Project-level security settings override global settings. Leave fields
+          Service-level security settings override global settings. Leave fields
           empty to inherit from global configuration.
         </AlertDescription>
       </Alert>
@@ -351,7 +351,7 @@ export function ProjectSecuritySettings({
             <div className="space-y-0.5">
               <Label htmlFor="attack-mode">Enable Attack Mode</Label>
               <p className="text-sm text-muted-foreground">
-                Require CAPTCHA verification for all visitors to this project
+                Require CAPTCHA verification for all visitors to this service
               </p>
             </div>
             <Switch
@@ -392,7 +392,7 @@ export function ProjectSecuritySettings({
       {/* AI Assistance Card */}
       <SettingsSection
         title="AI Assistance"
-        description="Configure AI summaries and assistance for this project"
+        description="Configure AI summaries and assistance for this service"
         icon={Bot}
       >
         <div className="space-y-4">
@@ -457,7 +457,7 @@ export function ProjectSecuritySettings({
                 Enable vulnerability scanning
               </Label>
               <p className="text-sm text-muted-foreground">
-                Scan this project&apos;s deployed Docker images for known CVEs,
+                Scan this service&apos;s deployed Docker images for known CVEs,
                 categorized by severity, after every deploy and once daily. Off
                 by default.
               </p>
@@ -483,7 +483,7 @@ export function ProjectSecuritySettings({
       {/* Security Headers Card */}
       <SettingsSection
         title="Security Headers"
-        description="Configure project HTTP security headers that override global settings"
+        description="Configure service HTTP security headers that override global settings"
         icon={ShieldCheck}
       >
         <div className="space-y-4">
@@ -607,7 +607,7 @@ export function ProjectSecuritySettings({
       {/* Rate Limiting Card */}
       <SettingsSection
         title="Rate Limiting"
-        description="Configure project rate limits that override global settings"
+        description="Configure service rate limits that override global settings"
         icon={TrafficCone}
       >
         <div className="space-y-4">
@@ -674,9 +674,9 @@ export function ProjectSecuritySettings({
 
               <div className="space-y-4">
                 <div>
-                  <Label>Whitelist IPs (Project-specific)</Label>
+                  <Label>Whitelist IPs (Service-specific)</Label>
                   <p className="text-sm text-muted-foreground mb-2">
-                    Additional IPs that bypass rate limiting for this project
+                    Additional IPs that bypass rate limiting for this service
                   </p>
                   <div className="space-y-2">
                     {(securityConfig?.rateLimiting?.whitelistIps || []).map(
@@ -713,9 +713,9 @@ export function ProjectSecuritySettings({
                 </div>
 
                 <div>
-                  <Label>Blacklist IPs (Project-specific)</Label>
+                  <Label>Blacklist IPs (Service-specific)</Label>
                   <p className="text-sm text-muted-foreground mb-2">
-                    Additional IPs to block for this project
+                    Additional IPs to block for this service
                   </p>
                   <div className="space-y-2">
                     {(securityConfig?.rateLimiting?.blacklistIps || []).map(

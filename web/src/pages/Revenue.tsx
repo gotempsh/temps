@@ -95,7 +95,7 @@ export function Revenue() {
 
   const projectOptions = useMemo<SearchableSelectOption[]>(() => {
     const opts: SearchableSelectOption[] = [
-      { value: ALL_PROJECTS, label: 'All projects' },
+      { value: ALL_PROJECTS, label: 'All services' },
     ]
     for (const p of projectsQuery.data?.projects ?? []) {
       opts.push({ value: String(p.id), label: p.name })
@@ -158,7 +158,7 @@ export function Revenue() {
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">Revenue</h1>
         <p className="text-sm text-muted-foreground">
-          Transactions, invoices, and subscription events across every project.
+          Transactions, invoices, and subscription events across every service.
         </p>
       </div>
 
@@ -263,16 +263,18 @@ export function Revenue() {
               className="w-full sm:w-[260px]"
             />
             <SearchableSelect
+              label="Project"
               value={projectFilter}
               onValueChange={setProjectFilter}
               options={projectOptions}
-              placeholder="Filter by project"
-              searchPlaceholder="Search projects..."
-              emptyText="No projects."
+              placeholder="Filter by service"
+              searchPlaceholder="Search services..."
+              emptyText="No services."
               className="w-full sm:w-[220px]"
               disabled={projectsQuery.isLoading}
             />
             <SearchableSelect
+              label="Event type"
               value={typeFilter}
               onValueChange={setTypeFilter}
               options={typeOptions}
@@ -302,7 +304,7 @@ export function Revenue() {
             <TableHeader>
               <TableRow>
                 <TableHead>Event</TableHead>
-                <TableHead className="hidden md:table-cell">Project</TableHead>
+                <TableHead className="hidden md:table-cell">Service</TableHead>
                 <TableHead className="hidden lg:table-cell">Customer</TableHead>
                 <TableHead className="text-right">Amount</TableHead>
                 <TableHead className="text-right">MRR Δ</TableHead>
@@ -346,7 +348,7 @@ export function Revenue() {
                       description={
                         hasFilters
                           ? 'Try widening the date range or clearing filters.'
-                          : 'Connect Stripe or LemonSqueezy on a project to start capturing invoices and subscription changes.'
+                          : 'Connect Stripe or LemonSqueezy on a service to start capturing invoices and subscription changes.'
                       }
                       action={
                         hasFilters ? (
@@ -445,11 +447,11 @@ function EventBadge({ type }: { type: string }) {
         : 'muted'
   const className =
     tone === 'emerald'
-      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
+      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20'
       : tone === 'blue'
         ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20'
         : tone === 'red'
-          ? 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20'
+          ? 'bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20'
           : 'bg-muted text-muted-foreground border-border'
   return (
     <Badge variant="outline" className={`font-mono text-[11px] ${className}`}>
@@ -469,8 +471,8 @@ function MrrDelta({
     return <span className="text-muted-foreground">—</span>
   const positive = minor > 0
   const cls = positive
-    ? 'text-emerald-600 dark:text-emerald-400'
-    : 'text-red-600 dark:text-red-400'
+    ? 'text-emerald-700 dark:text-emerald-400'
+    : 'text-red-700 dark:text-red-400'
   return (
     <span className={cls}>
       {positive ? '+' : ''}

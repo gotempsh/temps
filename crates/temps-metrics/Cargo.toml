@@ -26,6 +26,7 @@ clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # Scraper: entity access and config
 temps-core = { path = "../temps-core" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
 

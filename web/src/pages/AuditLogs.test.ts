@@ -31,6 +31,34 @@ describe('audit operation filters', () => {
       keywords: 'VISITOR_ENRICHED',
     })
   })
+  test('offers every project group operation under Projects', () => {
+    const projectOptions = buildOperationOptions().filter(
+      (option) => option.group === 'Projects'
+    )
+    expect(projectOptions.map((option) => option.value)).toEqual([
+      'TEMPLATE_INSTANTIATION_STARTED',
+      'TEMPLATE_INSTANTIATION_RETRIED',
+      'PROJECT_GROUP_CREATED',
+      'PROJECT_GROUP_UPDATED',
+      'PROJECT_GROUP_DELETED',
+      'PROJECT_GROUP_PROJECT_ADDED',
+      'PROJECT_GROUP_PROJECT_REMOVED',
+      'PROJECT_GROUP_ENV_VAR_CREATED',
+      'PROJECT_GROUP_ENV_VAR_UPDATED',
+      'PROJECT_GROUP_ENV_VAR_DELETED',
+      'PROJECT_GROUP_REPOSITORY_SET',
+      'PROJECT_GROUP_REPOSITORY_CLEARED',
+      'PROJECT_GROUP_PROJECT_FOLLOWS_REPOSITORY',
+      'PROJECT_GROUP_PROJECT_UNFOLLOWS_REPOSITORY',
+      'PROJECT_GROUP_ROUTE_ADDED',
+      'PROJECT_GROUP_ROUTE_REMOVED',
+    ])
+    expect(
+      projectOptions.find(
+        (option) => option.value === 'PROJECT_GROUP_PROJECT_ADDED'
+      )?.label
+    ).toBe('Service Added to Project')
+  })
   test('offers permission denials in the authentication group', () => {
     expect(
       buildOperationOptions().find(

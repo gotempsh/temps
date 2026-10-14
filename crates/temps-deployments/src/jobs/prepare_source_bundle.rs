@@ -12,6 +12,18 @@ use temps_core::drop_entries::{classify_drop_entry, DropEntryDisposition, DropSk
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_logs::{LogLevel, LogService};
 
+/// Entry name for diagnostics. This is the decoded name that `enclosed_name`
+/// and the classifier operate on (legacy CP437 names included), so an error
+/// names the same path the archive actually contains. `ZipFile::name` is
+/// fallible since zip 9; only on a real decode error fall back to a lossy
+/// rendering of the raw bytes.
+fn entry_display_name<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> String {
+    match entry.name() {
+        Ok(name) => name.into_owned(),
+        Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+    }
+}
+
 pub struct PrepareSourceBundleJob {
     job_id: String,
     archive_path: PathBuf,
@@ -143,7 +155,7 @@ impl PrepareSourceBundleJob {
                 entry
                     .enclosed_name()
                     .ok_or_else(|| WorkflowError::InvalidArchiveEntry {
-                        path: entry.name().to_string(),
+                        path: entry_display_name(&entry),
                         reason: "entry path escapes the source root".to_string(),
                     })?;
             Self::validate_path(&enclosed)?;
@@ -160,7 +172,7 @@ impl PrepareSourceBundleJob {
                 }
                 DropEntryDisposition::Refuse { reason } => {
                     return Err(WorkflowError::InvalidArchiveEntry {
-                        path: entry.name().to_string(),
+                        path: entry_display_name(&entry),
                         reason: format!(
                             "{reason}; Drop never accepts private keys or credentials, remove \
                              it from the archive"
@@ -173,7 +185,7 @@ impl PrepareSourceBundleJob {
                 .is_some_and(|mode| mode & 0o170000 == 0o120000)
             {
                 return Err(WorkflowError::InvalidArchiveEntry {
-                    path: entry.name().to_string(),
+                    path: entry_display_name(&entry),
                     reason: "symbolic links are not allowed".to_string(),
                 });
             }
@@ -325,6 +337,30 @@ mod tests {
         }
         archive.finish().expect("complete archive");
         archive_path
+    }
+
+    /// A legacy archive stores names in CP437 with no UTF-8 flag; zip decodes
+    /// them, and diagnostics must show the decoded name rather than the
+    /// replacement-character rendering of the raw bytes.
+    #[test]
+    fn entry_display_name_uses_the_decoded_cp437_name() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        // `X` is patched to 0x82 (e-acute in CP437); same length, so offsets
+        // and CRCs are untouched, and an ASCII name carries no UTF-8 flag.
+        let path = zip_with(temporary.path(), &[("cafX/server.key", "fixture-only")]);
+        let mut bytes = fs::read(&path).expect("read archive");
+        let mut patched = 0;
+        while let Some(at) = bytes.windows(4).position(|window| window == b"cafX") {
+            bytes[at + 3] = 0x82;
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "local header and central directory");
+        fs::write(&path, &bytes).expect("write archive");
+
+        let mut archive =
+            zip::ZipArchive::new(fs::File::open(&path).expect("open archive")).expect("zip");
+        let entry = archive.by_index(0).expect("entry");
+        assert_eq!(entry_display_name(&entry), "caf\u{e9}/server.key");
     }
 
     /// The build must see exactly what the upload inspection kept: templates

@@ -1621,7 +1621,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                   aria-label="Toggle columns"
                 >
                   <Columns3 className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline text-xs">Columns</span>
+                  <span className="max-sm:sr-only text-xs">Columns</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44">

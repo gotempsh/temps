@@ -191,3 +191,143 @@ export function uniqueSlug(prefix: string, testInfo: TestInfo): string {
   const rand = Math.random().toString(36).slice(2, 8)
   return `${prefix}-${worker}-${retry}-${rand}`.toLowerCase().slice(0, 32)
 }
+
+/**
+ * Route-mock data for the projects list (`/projects`), which lists project
+ * groups ("Projects") and the services outside them ("Services").
+ *
+ * The page asks `GET /project-groups` first and then `GET /projects`, adding
+ * `ungrouped=true` once any group exists (grouped services show inside their
+ * group's card instead) and `search=` for the filter box. The helpers below
+ * answer the way the server does, so a spec that mocks them still exercises
+ * the page's real request logic rather than a canned list.
+ */
+export const PROJECTS_LIST_API = /\/api\/projects(?:\?|$)/
+export const PROJECT_GROUPS_LIST_API = /\/api\/project-groups(?:\?|$)/
+
+export interface ServiceFixture {
+  id: number
+  name: string
+  slug: string
+  source_type: string
+  project_type: string
+  hosting: 'hosted' | 'external'
+  main_branch: string
+  directory: string
+  preset: string
+  created_at: number
+  updated_at: number
+  deployment_config: Record<string, unknown>
+  last_deployment: number | null
+}
+
+export function serviceFixture(id: number, name: string): ServiceFixture {
+  return {
+    id,
+    name,
+    slug: name.toLowerCase().replace(/ /g, '-'),
+    source_type: 'git',
+    project_type: 'app',
+    hosting: 'hosted',
+    main_branch: 'main',
+    directory: '.',
+    preset: 'nextjs',
+    created_at: 1788951600,
+    updated_at: 1788951600,
+    deployment_config: {},
+    last_deployment: null,
+  }
+}
+
+export interface GroupFixture {
+  id: number
+  name: string
+  slug: string
+  description: null
+  repository: null
+  created_at: string
+  updated_at: string
+  projects: {
+    id: number
+    name: string
+    slug: string
+    directory: string
+    hosting: 'hosted' | 'external'
+    inherits_repository: boolean
+    last_deployment: string | null
+    main_branch: string
+    preset: string
+    project_type: string
+    repo_name: string
+    repo_owner: string
+    source_type: string
+  }[]
+}
+
+export function groupFixture(
+  id: number,
+  name: string,
+  members: ServiceFixture[] = []
+): GroupFixture {
+  return {
+    id,
+    name,
+    slug: name.toLowerCase().replace(/ /g, '-'),
+    description: null,
+    repository: null,
+    created_at: '2026-09-01T00:00:00Z',
+    updated_at: '2026-09-01T00:00:00Z',
+    projects: members.map((service) => ({
+      id: service.id,
+      name: service.name,
+      slug: service.slug,
+      directory: service.directory,
+      hosting: service.hosting,
+      inherits_repository: false,
+      last_deployment: null,
+      main_branch: service.main_branch,
+      preset: service.preset,
+      project_type: service.project_type,
+      repo_name: '',
+      repo_owner: '',
+      source_type: service.source_type,
+    })),
+  }
+}
+
+/** `GET /project-groups` body: every group on one page. */
+export function projectGroupsListBody(groups: GroupFixture[]) {
+  return { groups, page: 1, page_size: 100, total: groups.length }
+}
+
+/**
+ * `GET /projects` body for `url`, honouring `search` (case-insensitive name or
+ * slug), `ungrouped=true` (leave out services that belong to a group) and
+ * `page`/`per_page`.
+ */
+export function servicesListBody(
+  url: URL,
+  services: ServiceFixture[],
+  groups: GroupFixture[] = []
+) {
+  const search = url.searchParams.get('search')?.trim().toLowerCase()
+  const grouped = new Set(
+    groups.flatMap((group) => group.projects.map((member) => member.id))
+  )
+  const matching = services.filter(
+    (service) =>
+      (url.searchParams.get('ungrouped') !== 'true' ||
+        !grouped.has(service.id)) &&
+      (!search ||
+        service.name.toLowerCase().includes(search) ||
+        service.slug.toLowerCase().includes(search))
+  )
+  const page = Number(url.searchParams.get('page') ?? '1')
+  const perPage = Number(url.searchParams.get('per_page') ?? '20')
+  return {
+    projects: matching.slice((page - 1) * perPage, page * perPage),
+    total: matching.length,
+    page,
+    per_page: perPage,
+  }
+}

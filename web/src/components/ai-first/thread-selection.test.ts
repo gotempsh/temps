@@ -21,6 +21,7 @@ function thread(
     context_id: `app:${publicId}`,
     title: 'Application thread',
     status: 'active',
+    kind: 'ai',
     created_at: createdAt,
     last_activity_at: lastActivityAt,
     ai_provider: 'claude_cli',

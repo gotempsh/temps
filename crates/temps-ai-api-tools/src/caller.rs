@@ -444,6 +444,21 @@ fn build_request_parts_scoped(
             }
         }
 
+        // List parameters must be JSON arrays of the declared item type. The CLI
+        // wraps a bare `15` into `[15]` itself; this catches a value that
+        // reached here some other way, before a human is asked to approve a
+        // request the API is guaranteed to reject.
+        if param.ty == "array" && !value.is_null() {
+            if let Some(problem) = check_array_value(&value, param.item_ty.as_deref()) {
+                return Err(ApiToolError::BadParamType {
+                    name: param.name.clone(),
+                    problem,
+                    expected: array_type_description(param.item_ty.as_deref()),
+                    operation_id: op.operation_id.clone(),
+                });
+            }
+        }
+
         // Enum membership check.
         if !param.enum_values.is_empty() {
             let str_val = value_to_string(&value);
@@ -706,7 +721,12 @@ impl InternalApiCaller {
     /// Sections the `auth` caller can't read at all are omitted.
     pub fn cli_root_help(&self, auth: &AuthContext) -> String {
         let permit = |op: &ApiOperation| self.permitted(op, auth);
-        match crate::cli::resolve(&self.index, "--help", &permit) {
+        match crate::cli::resolve(
+            &self.index,
+            "--help",
+            &permit,
+            crate::cli::CliMode::ReadOnly,
+        ) {
             crate::cli::CliAction::Terminal(text) => text,
             // resolve("--help") is always Terminal; this arm is unreachable.
             crate::cli::CliAction::Execute(..) => String::new(),
@@ -719,7 +739,7 @@ impl InternalApiCaller {
     /// so only sections the caller has write access to are shown.
     pub fn cli_write_root_help(&self, auth: &AuthContext) -> String {
         let permit = |op: &ApiOperation| self.permitted_write(op, auth);
-        match crate::cli::resolve(&self.index, "--help", &permit) {
+        match crate::cli::resolve(&self.index, "--help", &permit, crate::cli::CliMode::Write) {
             crate::cli::CliAction::Terminal(text) => text,
             crate::cli::CliAction::Execute(..) => String::new(),
         }
@@ -775,7 +795,7 @@ impl InternalApiCaller {
     /// Always returns model-facing text — help, an error, or the response body.
     pub async fn run_cli(&self, command: &str, scope: &ApiCallScope) -> String {
         let permit = |op: &ApiOperation| self.permitted(op, &scope.auth);
-        match crate::cli::resolve(&self.index, command, &permit) {
+        match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::ReadOnly) {
             crate::cli::CliAction::Terminal(text) => text,
             crate::cli::CliAction::Execute(op, params) => {
                 let op_id = op.operation_id.clone();
@@ -820,7 +840,7 @@ impl InternalApiCaller {
     /// the returned [`PreparedWrite`].
     pub fn prepare_write_cli(&self, command: &str, scope: &ApiCallScope) -> WritePrepareOutcome {
         let permit = |op: &ApiOperation| self.permitted_write(op, &scope.auth);
-        match crate::cli::resolve(&self.index, command, &permit) {
+        match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
             crate::cli::CliAction::Execute(op, params) => {
                 // Validate by running build_request_parts but discarding the
@@ -1105,6 +1125,41 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b_chars.len()]
+}
+
+/// Check a list-valued parameter: the value must be a JSON array and every
+/// item must satisfy the declared item type. Returns the problem, or `None`.
+fn check_array_value(value: &Value, item_ty: Option<&str>) -> Option<String> {
+    let Some(items) = value.as_array() else {
+        return Some(format!(
+            "got {} instead of a list",
+            if value.is_string() {
+                render_value(value)
+            } else {
+                json_kind(value).to_string()
+            }
+        ));
+    };
+    let item_ty = item_ty?;
+    items
+        .iter()
+        .enumerate()
+        .find(|(_, item)| !json_matches_type(item, item_ty))
+        .map(|(index, item)| {
+            format!(
+                "item {} is {}, expected {item_ty}",
+                index + 1,
+                render_value(item)
+            )
+        })
+}
+
+/// Human-readable form of a list type for [`ApiToolError::BadParamType`].
+fn array_type_description(item_ty: Option<&str>) -> String {
+    match item_ty {
+        Some(item) => format!("a JSON array of {item} values"),
+        None => "a JSON array".to_string(),
+    }
 }
 
 /// Check an object-valued parameter against its schema shape.
@@ -1492,6 +1547,7 @@ mod tests {
             location: ParamLocation::Path,
             required: true,
             ty: "integer".to_string(),
+            item_ty: None,
             enum_values: vec![],
             description: None,
             object_shape: None,
@@ -1504,6 +1560,7 @@ mod tests {
             location: ParamLocation::Query,
             required,
             ty: "string".to_string(),
+            item_ty: None,
             enum_values: vec![],
             description: None,
             object_shape: None,
@@ -1516,6 +1573,7 @@ mod tests {
             location: ParamLocation::Body,
             required,
             ty: "string".to_string(),
+            item_ty: None,
             enum_values: vec![],
             description: None,
             object_shape: None,
@@ -1528,6 +1586,7 @@ mod tests {
             location: ParamLocation::Body,
             required,
             ty: "string".to_string(),
+            item_ty: None,
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             description: None,
             object_shape: None,
@@ -1597,6 +1656,7 @@ mod tests {
             location: ParamLocation::Query,
             required: false,
             ty: "string".to_string(),
+            item_ty: None,
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             description: None,
             object_shape: None,
@@ -2903,6 +2963,62 @@ mod tests {
         assert!(
             matches!(outcome, WritePrepareOutcome::Invalid(_)),
             "expected Invalid outcome for missing required param"
+        );
+    }
+
+    #[test]
+    fn array_body_param_rejects_a_scalar_before_it_reaches_the_router() {
+        let mut ids = body_param("environment_ids", true);
+        ids.ty = "array".to_string();
+        ids.item_ty = Some("integer".to_string());
+        let op = make_op("create_environment_variable", "/env-vars", vec![ids]);
+
+        let error = build_request_parts(
+            &op,
+            &serde_json::json!({"environment_ids": "15"}),
+            &[],
+            20,
+            100,
+        )
+        .unwrap_err();
+        match &error {
+            ApiToolError::BadParamType { name, expected, .. } => {
+                assert_eq!(name, "environment_ids");
+                assert!(expected.contains("array of integer"), "{expected}");
+            }
+            other => panic!("expected BadParamType, got {other:?}"),
+        }
+        assert!(error.to_string().contains("environment_ids"), "{error}");
+
+        let error = build_request_parts(
+            &op,
+            &serde_json::json!({"environment_ids": [15, "x"]}),
+            &[],
+            20,
+            100,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("item 2"), "{error}");
+    }
+
+    #[test]
+    fn array_body_param_accepts_a_well_typed_array() {
+        let mut ids = body_param("environment_ids", true);
+        ids.ty = "array".to_string();
+        ids.item_ty = Some("integer".to_string());
+        let op = make_op("create_environment_variable", "/env-vars", vec![ids]);
+
+        let built = build_request_parts(
+            &op,
+            &serde_json::json!({"environment_ids": [15, 16]}),
+            &[],
+            20,
+            100,
+        )
+        .expect("a well-typed array is accepted");
+        assert_eq!(
+            built.body,
+            Some(serde_json::json!({"environment_ids": [15, 16]}))
         );
     }
 }

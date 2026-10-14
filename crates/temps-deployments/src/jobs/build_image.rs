@@ -262,7 +262,7 @@ fn write_no_follow(path: &Path, contents: &[u8], create_new: bool) -> Result<(),
     file.write_all(contents).map_err(WorkflowError::IoError)
 }
 
-fn read_confined_control_file(
+pub(crate) fn read_confined_control_file(
     root: &Path,
     path: &Path,
     max_bytes: u64,

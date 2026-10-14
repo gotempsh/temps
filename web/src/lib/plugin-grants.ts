@@ -37,8 +37,8 @@ export const pluginPermissionLabels = {
       'Send plugin content to the host’s configured AI provider. Subject to the limits below.',
   },
   projects_read: {
-    label: 'Read projects',
-    description: 'Read project metadata across this instance.',
+    label: 'Read services',
+    description: 'Read service metadata across this instance.',
   },
   environments_read: {
     label: 'Read environments',
@@ -56,7 +56,7 @@ export const pluginPermissionLabels = {
   events_read: {
     label: 'Receive platform events',
     description:
-      'Receive subscribed project, deployment, and domain events across this instance.',
+      'Receive subscribed service, deployment, and domain events across this instance.',
   },
   api_write: {
     label: 'Change supported API resources',

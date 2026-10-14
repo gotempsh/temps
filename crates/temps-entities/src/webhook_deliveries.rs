@@ -26,9 +26,25 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub response_body: Option<String>,
     pub error_message: Option<String>,
+    /// 1-based position of this attempt within its delivery.
     pub attempt_number: i32,
+    /// Stable identity of the delivery this attempt belongs to: the `id` of
+    /// the delivery's first attempt. Every attempt row (the original send and
+    /// each retry) of one delivery carries the same value, and it is what the
+    /// `X-Webhook-Delivery` header contains. `None` only transiently, between
+    /// inserting a first attempt and recording its result, and on rows
+    /// written by a failed result update; use [`Model::stable_delivery_id`].
+    pub delivery_id: Option<i32>,
     pub created_at: DBDateTime,
     pub delivered_at: Option<DBDateTime>,
+}
+
+impl Model {
+    /// The delivery identity shared by all attempts of this delivery. A row
+    /// without an explicit `delivery_id` is its own first attempt.
+    pub fn stable_delivery_id(&self) -> i32 {
+        self.delivery_id.unwrap_or(self.id)
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

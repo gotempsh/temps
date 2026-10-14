@@ -309,7 +309,10 @@ function PlanApprovalVariant({
   return (
     <div className="space-y-3">
       {plan ? (
-        <div className={cn(proseClasses, 'max-h-72 overflow-auto')}>
+        <div
+          tabIndex={0}
+          className={cn(proseClasses, 'max-h-72 overflow-auto')}
+        >
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={markdownComponents}
@@ -663,7 +666,7 @@ export function PermissionCard({
         })
       } else {
         if (projectId == null) {
-          throw new Error('Project permission resolution requires a project.')
+          throw new Error('Service permission resolution requires a service.')
         }
         await resolveProjectPermission({
           body: { decision },

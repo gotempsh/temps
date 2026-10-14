@@ -36,6 +36,7 @@ export function featureKeyForPath(pathname: string): string | undefined {
   if (projectRoute.startsWith('ai-gateway')) return 'ai-gateway'
   if (projectRoute.includes('database-browser')) return 'database-browser'
 
+  if (pathname.startsWith('/p/')) return 'project-groups'
   if (pathname.startsWith('/monitoring')) return 'alerts-metric-alerts'
   if (pathname.startsWith('/sandboxes')) return 'sandboxes-preview-environments'
   if (pathname.startsWith('/settings/teams')) return 'teams'

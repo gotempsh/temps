@@ -176,7 +176,7 @@ function PartOfBulkActivation({
       <AlertTitle>Part of a bulk Cloud activation</AlertTitle>
       <AlertDescription className="space-y-3">
         <p>
-          This backfill was not started for this project on its own — it is one
+          This backfill was not started for this service on its own — it is one
           step of an instance-wide activation ({row.status}).{' '}
           {PROJECT_STATUS_HINTS[row.status]}
         </p>
@@ -219,7 +219,7 @@ function NotOptedIn({ status }: { status: CloudBackfillStatusResponse }) {
   return (
     <Alert>
       <AlertCircle className="h-4 w-4" aria-hidden="true" />
-      <AlertTitle>This project is not set up for Cloud read-back</AlertTitle>
+      <AlertTitle>This service is not set up for Cloud read-back</AlertTitle>
       <AlertDescription className="space-y-3">
         <p>
           Telemetry fidelity is <code className="font-mono">metered</code>, so
@@ -356,5 +356,5 @@ function CommandBlock({
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
   if (typeof error === 'string' && error) return error
-  return 'The instance did not return a status for this project.'
+  return 'The instance did not return a status for this service.'
 }

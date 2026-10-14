@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { InheritedVariablesPanel } from '@/components/project-groups/InheritedVariablesPanel'
 import {
   EnvironmentVariableResponse,
   EnvironmentInfo,
@@ -971,7 +972,7 @@ function AddEnvironmentVariableDialog({
         <DialogHeader>
           <DialogTitle>Add Environment Variable</DialogTitle>
           <DialogDescription>
-            Add a new environment variable to your project.
+            Add a new environment variable to your service.
           </DialogDescription>
         </DialogHeader>
         <form
@@ -1851,6 +1852,9 @@ export function EnvironmentVariablesSettings({
             </div>
           )}
         </div>
+        <div className="mb-5">
+          <InheritedVariablesPanel project={project} />
+        </div>
         {(hasVariables ||
           orderedEnvironments.length > 0 ||
           Boolean(search)) && (
@@ -1946,7 +1950,7 @@ export function EnvironmentVariablesSettings({
                 No environment variables
               </EmptyPlaceholder.Title>
               <EmptyPlaceholder.Description>
-                Add environment variables to configure your project across
+                Add environment variables to configure your service across
                 different environments.
               </EmptyPlaceholder.Description>
               <div className="flex gap-2">
@@ -2237,14 +2241,17 @@ export function EnvironmentVariablesSettings({
                             </span>
                           </div>
                           {keys.length === 0 ? (
-                            <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">
+                            <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">
                               No keys missing relative to{' '}
                               {environment.id === comparisonFirst.id
                                 ? comparisonSecond.name
                                 : comparisonFirst.name}
                             </p>
                           ) : (
-                            <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-xs font-mono">
+                            <ul
+                              tabIndex={0}
+                              className="mt-2 max-h-32 space-y-1 overflow-y-auto text-xs font-mono"
+                            >
                               {keys.map((key) => (
                                 <li key={key} className="break-all">
                                   {key}
@@ -2305,7 +2312,10 @@ export function EnvironmentVariablesSettings({
                   <p className="text-sm font-medium text-foreground">
                     Variables to be deleted:
                   </p>
-                  <div className="max-h-[200px] overflow-auto border rounded-md p-3 space-y-1">
+                  <div
+                    tabIndex={0}
+                    className="max-h-[200px] overflow-auto border rounded-md p-3 space-y-1"
+                  >
                     {(envVariables ?? [])
                       .filter((v) => visibleSelectedIds.has(v.id))
                       .map((v) => (

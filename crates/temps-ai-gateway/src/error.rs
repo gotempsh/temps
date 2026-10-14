@@ -50,7 +50,7 @@ pub enum AiGatewayError {
 
     #[error(
         "{endpoint} is only available for OpenAI models; model '{model}' is served by provider \
-         '{provider}'. Use /ai/v1/chat/completions for this model instead."
+         '{provider}'. Use /api/ai/v1/chat/completions for this model instead."
     )]
     UnsupportedEndpoint {
         endpoint: String,

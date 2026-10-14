@@ -84,6 +84,7 @@ import {
   SetupWizardShell,
   WizardStepId,
 } from '@/components/project/setup/SetupWizardShell'
+import { useInvalidateGroups } from '@/components/project-groups/useProjectGroups'
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -113,6 +114,8 @@ import { EditFunnel } from '@/pages/EditFunnel'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { toast } from 'sonner'
+import { setProjectHosting } from '@/api/client/sdk.gen'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   getDateRangeFromFilter,
   QUICK_FILTERS,
@@ -255,7 +258,7 @@ export function AnalyticsFilters({
             onEnvironmentChange(value ? parseInt(value) : undefined)
           }
         >
-          <SelectTrigger className="w-[200px]">
+          <SelectTrigger aria-label="Environment" className="w-[200px]">
             <SelectValue placeholder="All environments" />
           </SelectTrigger>
           <SelectContent>
@@ -1405,7 +1408,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                 <Button
                   variant="link"
                   size="sm"
-                  className="text-yellow-600 dark:text-yellow-400"
+                  className="text-yellow-700 dark:text-yellow-400"
                   onClick={() =>
                     navigate(`/projects/${project.slug}/analytics/setup`)
                   }
@@ -1935,6 +1938,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             <div className="space-y-1.5">
               <div className="flex gap-2">
                 <Input
+                  aria-label="Public key"
                   value={primaryKey.public_key}
                   readOnly
                   className="font-mono text-sm"
@@ -2095,8 +2099,55 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
 }
 
 // Analytics Setup Component
+/**
+ * Offered when a project Temps hosts is set up as "not hosted on Temps":
+ * marking it External labels it and stops Temps from trying to deploy it.
+ */
+function MarkExternalNotice({ project }: ProjectAnalyticsProps) {
+  // Hosting shows on the service and on its project's cards.
+  const invalidate = useInvalidateGroups()
+  const [saving, setSaving] = React.useState(false)
+  const markExternal = async () => {
+    setSaving(true)
+    try {
+      await setProjectHosting({
+        path: { id: project.id },
+        body: { hosting: 'external' },
+        throwOnError: true,
+      })
+      toast.success(`${project.name} is marked as running outside Temps`)
+      await invalidate()
+    } catch (err) {
+      toast.error(getErrorMessage(err, 'Could not mark it as external'))
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center">
+      <p className="flex-1 text-sm text-muted-foreground">
+        Is this app hosted outside Temps? Mark the service External so it is
+        labelled that way and Temps never tries to deploy it. You can change
+        this later in Settings.
+      </p>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={saving}
+        onClick={() => void markExternal()}
+      >
+        {saving && <Loader2 className="size-4 animate-spin" />}
+        Mark as External
+      </Button>
+    </div>
+  )
+}
+
 function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
-  const [selectedFramework, setSelectedFramework] = React.useState('nextjs-app')
+  // An app hosted elsewhere sends its data with an ingest key.
+  const [selectedFramework, setSelectedFramework] = React.useState(
+    project.hosting === 'external' ? 'external' : 'nextjs-app'
+  )
   const [selectedPackageManager, setSelectedPackageManager] =
     React.useState('npm')
 
@@ -2554,7 +2605,12 @@ After implementation:
           </div>
 
           {isExternal ? (
-            <IngestKeySetup project={project} />
+            <>
+              {project.hosting !== 'external' && (
+                <MarkExternalNotice project={project} />
+              )}
+              <IngestKeySetup project={project} />
+            </>
           ) : (
             <>
               <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">

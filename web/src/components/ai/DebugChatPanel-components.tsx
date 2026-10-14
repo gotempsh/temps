@@ -431,6 +431,7 @@ function ToolBlock({ value }: { value: string }) {
   }
   return (
     <div
+      tabIndex={0}
       className={cn(
         proseClasses,
         'scrollbar-thin max-h-48 overflow-auto [&_pre]:my-0 [&_pre]:text-[11px]'
@@ -610,7 +611,7 @@ const ACTION_STATUS: Record<string, { label: string; cls: string }> = {
     cls: 'text-amber-700 dark:text-amber-400',
   },
   executing: { label: 'Running…', cls: 'text-muted-foreground' },
-  executed: { label: 'Executed', cls: 'text-green-600 dark:text-green-400' },
+  executed: { label: 'Executed', cls: 'text-green-700 dark:text-green-400' },
   failed: { label: 'Failed', cls: 'text-destructive' },
   rejected: { label: 'Rejected', cls: 'text-muted-foreground' },
   expired: { label: 'Expired', cls: 'text-muted-foreground' },
@@ -686,7 +687,7 @@ function PendingActionCard({
     return (
       <div className="min-w-0 overflow-hidden rounded-lg border border-green-500/30 bg-green-500/5 text-xs">
         <GeneratedProjectCollection
-          title="Application projects"
+          title="Application services"
           presentation={committedApplicationProjects}
           framed={false}
         />
@@ -696,8 +697,8 @@ function PendingActionCard({
             Operation details
           </summary>
           <div className="min-w-0 space-y-2 border-t border-green-500/20 px-3 py-2.5 sm:px-4">
-            <div className="font-medium text-green-600 dark:text-green-400">
-              Project created and attached to the persistent workspace
+            <div className="font-medium text-green-700 dark:text-green-400">
+              Service created and attached to the persistent workspace
             </div>
             <ToolBlock value={tool.result ?? ''} />
           </div>
@@ -1312,7 +1313,7 @@ function InteractiveToolsNotice({
 
 function requiredProjectId(projectId?: number): number {
   if (projectId == null) {
-    throw new Error('A project-scoped chat requires a project id.')
+    throw new Error('A service-scoped chat requires a service id.')
   }
   return projectId
 }
@@ -1936,7 +1937,7 @@ export function DebugChatPanel({
   autoStart = false,
   placeholder = 'Ask a follow-up…',
   lazyCreate = false,
-  emptyHint = 'Ask anything about this project.',
+  emptyHint = 'Ask anything about this service.',
   onConversationChange,
   onLiveEvent,
   onConversationStatusInvalidated,
