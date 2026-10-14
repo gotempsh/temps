@@ -18,8 +18,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use sea_orm::sea_query::LockType;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use temps_core::docker_socket_grant::DeployCaller;
@@ -626,7 +626,77 @@ impl GroupRepositoryService {
     /// them authorized; a project that starts following later is written by
     /// its own [`Self::set_inheritance`], which reads the group after this
     /// commit.
+    ///
+    /// The write-through cannot share that transaction, so the row locks are
+    /// gone while it runs. To keep a second change from saving a newer
+    /// repository and writing it to a member, only for this call to then
+    /// overwrite the member with the older one, the whole call (check, save
+    /// and every member write) runs under the group's repository write lease
+    /// ([`Self::lease_repository_writes`]). A concurrent change to the same
+    /// group's repository is refused with
+    /// [`ProjectGroupError::RepositoryChangeInProgress`] and changes nothing.
     async fn apply_repository(
+        &self,
+        group_id: i32,
+        repo: &GroupRepository,
+        authorized_follower_ids: &HashSet<i32>,
+        caller: DeployCaller,
+    ) -> Result<(project_groups::Model, Vec<MemberSyncResult>), ProjectGroupError> {
+        let lease = self.lease_repository_writes(group_id).await?;
+        let outcome = self
+            .apply_repository_leased(group_id, repo, authorized_follower_ids, caller)
+            .await;
+        // Nothing was written through the lease's transaction, so ending it
+        // is only about releasing the advisory lock.
+        if let Err(error) = lease.rollback().await {
+            tracing::warn!(
+                group_id,
+                error = %error,
+                "project groups: releasing the repository write lease failed; it is released \
+                 when the connection is closed"
+            );
+        }
+        outcome
+    }
+
+    /// Takes the group's repository write lease: a transaction-scoped
+    /// advisory lock, held by the returned (otherwise idle) transaction until
+    /// it ends, that serializes every change of one group's repository from
+    /// the check to the last member write.
+    ///
+    /// It is taken before any row lock of the lock order on
+    /// [`ProjectGroupService`] and never waited for (`try`), so it cannot take
+    /// part in a lock cycle, and a busy group neither parks requests on pool
+    /// connections nor stacks them up behind provider round trips. The key is
+    /// scoped to the current schema as well as the group id, so two schemas
+    /// that reuse the same group id do not contend.
+    async fn lease_repository_writes(
+        &self,
+        group_id: i32,
+    ) -> Result<sea_orm::DatabaseTransaction, ProjectGroupError> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(ProjectGroupError::db(format!(
+                "starting the repository write lease of project group {group_id}"
+            )))?;
+        if let Err(error) = try_lock_repository_writes(&txn, group_id).await {
+            if let Err(rollback) = txn.rollback().await {
+                tracing::warn!(
+                    group_id,
+                    error = %rollback,
+                    "project groups: rollback failed after {error}"
+                );
+            }
+            return Err(error);
+        }
+        Ok(txn)
+    }
+
+    /// [`Self::apply_repository`] while the caller holds the group's
+    /// repository write lease.
+    async fn apply_repository_leased(
         &self,
         group_id: i32,
         repo: &GroupRepository,
@@ -714,6 +784,9 @@ impl GroupRepositoryService {
                 "starting transaction for clearing repository of project group {group_id}"
             )))?;
         let result = async {
+            // A change that is still writing through to the members must
+            // finish before the group is detached from them.
+            try_lock_repository_writes(&txn, group_id).await?;
             let locked = ProjectGroupService::lock_repository_followers(
                 &txn,
                 group_id,
@@ -867,6 +940,40 @@ impl GroupRepositoryService {
             format!("repository inheritance change of project {project_id}"),
         )
         .await
+    }
+}
+
+/// Takes the transaction-scoped advisory lock that serializes changes to one
+/// group's repository, without waiting for it. See
+/// [`GroupRepositoryService::lease_repository_writes`].
+async fn try_lock_repository_writes<C: ConnectionTrait>(
+    conn: &C,
+    group_id: i32,
+) -> Result<(), ProjectGroupError> {
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock(\
+                 hashtextextended(current_schema() || ':project_group_repository:' || $1::text, 0)\
+             ) AS acquired",
+            [group_id.into()],
+        ))
+        .await
+        .map_err(ProjectGroupError::db(format!(
+            "taking the repository write lease of project group {group_id}"
+        )))?;
+    let acquired = match row {
+        Some(row) => row
+            .try_get::<bool>("", "acquired")
+            .map_err(ProjectGroupError::db(format!(
+                "reading the repository write lease of project group {group_id}"
+            )))?,
+        None => false,
+    };
+    if acquired {
+        Ok(())
+    } else {
+        Err(ProjectGroupError::RepositoryChangeInProgress { group_id })
     }
 }
 
@@ -1980,6 +2087,179 @@ pub(crate) mod tests {
             "got {err:?}"
         );
         assert!(following(&conn, elsewhere).await.is_empty());
+    }
+
+    /// A public repository on a branch of `acme/shop`, which writes through
+    /// to a member without any provider round trip.
+    fn public_branch(branch: &str) -> GroupRepository {
+        GroupRepository {
+            git_provider_connection_id: None,
+            public_provider: Some("github".to_string()),
+            repo_owner: "acme".into(),
+            repo_name: "shop".into(),
+            main_branch: branch.into(),
+            repository_id: None,
+            clone_url: None,
+        }
+    }
+
+    async fn project_branch(conn: &DatabaseConnection, project_id: i32) -> String {
+        projects::Entity::find_by_id(project_id)
+            .one(conn)
+            .await
+            .expect("load project")
+            .expect("project exists")
+            .main_branch
+    }
+
+    /// Two changes of one group's repository must not interleave their member
+    /// writes: a member could otherwise be saved by the newer change and then
+    /// overwritten by the older one, while the group stores the newer
+    /// repository. The second change is refused while the first is still
+    /// writing through (its member write is held up here), changes nothing,
+    /// and succeeds once the first has finished, leaving the member on the
+    /// newer repository.
+    #[tokio::test]
+    async fn a_second_repository_change_is_refused_while_the_first_is_writing_through() {
+        use sea_orm::TransactionTrait;
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let repos = Arc::new(repos);
+        let group = group_with_followers(&conn, "Leased", &[9461], &[9461]).await;
+        let authorized: HashSet<i32> = [9461].into_iter().collect();
+        let caller = DeployCaller::from_instance_admin(false);
+
+        // Holds up every write to `projects` (not the row locks the change
+        // takes) so A stops inside its member write, after saving the group.
+        let hold = conn.begin().await.unwrap();
+        hold.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "LOCK TABLE projects IN SHARE MODE",
+        ))
+        .await
+        .unwrap();
+
+        let a = {
+            let repos = repos.clone();
+            let authorized = authorized.clone();
+            let group_id = group.id;
+            tokio::spawn(async move {
+                repos
+                    .apply_repository(group_id, &public_branch("release-a"), &authorized, caller)
+                    .await
+            })
+        };
+        let mut waited = Duration::ZERO;
+        while branch_of(&conn, group.id).await.as_deref() != Some("release-a") {
+            assert!(
+                waited < Duration::from_secs(20),
+                "change A never saved the group's repository"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !a.is_finished(),
+            "change A must still be writing through to the member"
+        );
+        assert_eq!(project_branch(&conn, 9461).await, "main");
+
+        // B (newer) and a clear both arrive in that window: refused, nothing
+        // changed, group still on A's repository.
+        let b = repos
+            .apply_repository(group.id, &public_branch("release-b"), &authorized, caller)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &b,
+                ProjectGroupError::RepositoryChangeInProgress { group_id } if *group_id == group.id
+            ),
+            "got {b:?}"
+        );
+        let cleared = repos
+            .clear_repository(group.id, &authorized)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &cleared,
+                ProjectGroupError::RepositoryChangeInProgress { group_id } if *group_id == group.id
+            ),
+            "got {cleared:?}"
+        );
+        assert_eq!(
+            branch_of(&conn, group.id).await.as_deref(),
+            Some("release-a")
+        );
+        assert_eq!(following(&conn, group.id).await, vec![9461]);
+
+        // A's member write goes through, and the member matches the group.
+        hold.commit().await.unwrap();
+        let (_, results) = done(a).await.expect("A writes through");
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+        assert_eq!(project_branch(&conn, 9461).await, "release-a");
+
+        // The lease was released with A: B, retried, wins and the member
+        // follows it.
+        let (updated, results) = repos
+            .apply_repository(group.id, &public_branch("release-b"), &authorized, caller)
+            .await
+            .expect("B succeeds once A has finished");
+        assert_eq!(updated.main_branch.as_deref(), Some("release-b"));
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+        assert_eq!(
+            branch_of(&conn, group.id).await.as_deref(),
+            Some("release-b")
+        );
+        assert_eq!(project_branch(&conn, 9461).await, "release-b");
+    }
+
+    /// A change that fails (here: a follower nobody authorized) must not keep
+    /// the group's repository write lease, or the group could never be
+    /// changed again until the connection happened to be recycled.
+    #[tokio::test]
+    async fn a_failed_repository_change_releases_the_write_lease() {
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping repository test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some(repos) = repository_service(conn.clone()).await else {
+            return;
+        };
+        let group = group_with_followers(&conn, "Lease release", &[9471], &[9471]).await;
+        let caller = DeployCaller::from_instance_admin(false);
+
+        let err = repos
+            .apply_repository(
+                group.id,
+                &public_branch("release-a"),
+                &HashSet::new(),
+                caller,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::RepositoryFollowersChanged { .. }),
+            "got {err:?}"
+        );
+        let authorized: HashSet<i32> = [9471].into_iter().collect();
+        repos
+            .apply_repository(group.id, &public_branch("release-a"), &authorized, caller)
+            .await
+            .expect("the lease was released by the refused change");
+        repos
+            .clear_repository(group.id, &authorized)
+            .await
+            .expect("and by the change that followed it");
     }
 
     #[test]

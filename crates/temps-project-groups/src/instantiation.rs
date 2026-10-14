@@ -2059,6 +2059,67 @@ impl InstantiationEngine {
         Ok(())
     }
 
+    /// The account a fork is created in: the one the request names, or, when
+    /// it names none, the connection's own account, which is where the
+    /// provider puts a repository created without an owner. `None` when
+    /// neither is known.
+    async fn fork_owner(&self, fork: &ForkRequest) -> Result<Option<String>, InstantiationError> {
+        if let Some(owner) = fork
+            .repository_owner
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+        {
+            return Ok(Some(owner.to_string()));
+        }
+        let connection = self
+            .git
+            .get_connection(fork.git_provider_connection_id)
+            .await
+            .map_err(|error| InstantiationError::from_problem(Problem::from(error)))?;
+        let account = connection.account_name.trim();
+        Ok((!account.is_empty()).then(|| account.to_string()))
+    }
+
+    /// The repository a previous run of this instantiation already created
+    /// for `fork`, if any. It is recorded by name when it is created, so it
+    /// can be found again even though the plan never stored it. Only a row
+    /// created since the instantiation began is ours: an older one of the
+    /// same name belongs to someone else.
+    async fn find_created_fork(
+        &self,
+        fork: &ForkRequest,
+        model: &template_instantiations::Model,
+    ) -> Result<Option<temps_entities::repositories::Model>, InstantiationError> {
+        let Some(owner) = self.fork_owner(fork).await? else {
+            warn!(
+                instantiation_id = model.id,
+                connection_id = fork.git_provider_connection_id,
+                repository = %fork.repository_name,
+                "The git connection has no account name, so a repository a previous run \
+                 created cannot be looked up before creating it"
+            );
+            return Ok(None);
+        };
+        match self
+            .git
+            .get_repository_by_owner_and_name_in_connection(
+                &owner,
+                &fork.repository_name,
+                fork.git_provider_connection_id,
+            )
+            .await
+        {
+            Ok(recorded) => Ok((recorded.created_at >= model.created_at).then_some(recorded)),
+            Err(
+                temps_git::services::git_provider_manager::GitProviderManagerError::RepositoryNotFound(
+                    _,
+                ),
+            ) => Ok(None),
+            Err(error) => Err(InstantiationError::from_problem(Problem::from(error))),
+        }
+    }
+
     async fn step_repository(
         &self,
         plan: &mut InstantiationPlan,
@@ -2090,29 +2151,10 @@ impl InstantiationEngine {
                     // before recording `plan.repository`, the provider would reject the
                     // creation attempt with a name-conflict error. Detect this by looking
                     // up a row already recorded for this connection+owner+name, and reuse
-                    // it instead of creating a duplicate.
-                    let owner = fork.repository_owner.clone().unwrap_or_else(|| {
-                        // fall back to connection's account name; empty string is safe
-                        // because the lookup uses the name only if we get a hit
-                        String::new()
-                    });
-                    let existing = if !owner.is_empty() {
-                        self.git
-                            .get_repository_by_owner_and_name_in_connection(
-                                &owner,
-                                &fork.repository_name,
-                                fork.git_provider_connection_id,
-                            )
-                            .await
-                            .ok()
-                    } else {
-                        None
-                    };
-                    let repo = if let Some(recorded) = existing.filter(|r| {
-                        // Only adopt rows created after this instantiation started — an
-                        // older row for a same-named repo belongs to someone else.
-                        r.created_at >= model.created_at
-                    }) {
+                    // it instead of creating a duplicate. The owner is resolved the way
+                    // the creation resolves it, so a request that named none resumes too.
+                    let existing = self.find_created_fork(&fork, model).await?;
+                    let repo = if let Some(recorded) = existing {
                         info!(
                             instantiation_id = model.id,
                             repo = %recorded.full_name,
@@ -4128,6 +4170,61 @@ services:
         }
     }
 
+    /// An engine over `conn` whose collaborators are real services on the
+    /// test schema. `None` when no Docker client can be created.
+    fn test_engine(
+        conn: &Arc<DatabaseConnection>,
+        project_service: Arc<temps_projects::ProjectService>,
+        git: Arc<temps_git::GitProviderManager>,
+    ) -> Option<InstantiationEngine> {
+        let docker = bollard::Docker::connect_with_local_defaults().ok()?;
+        let encryption = Arc::new(EncryptionService::new(&"0".repeat(64)).expect("test key"));
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                None,
+            )
+            .expect("server config"),
+        );
+        let config = Arc::new(temps_config::ConfigService::new(
+            server_config,
+            conn.clone(),
+        ));
+        let audit: Arc<dyn temps_core::AuditLogger> = Arc::new(DiscardingAudit);
+        Some(InstantiationEngine::new(
+            conn.clone(),
+            encryption.clone(),
+            Arc::new(ProjectGroupService::new(conn.clone())),
+            Arc::new(GroupEnvVarService::new(conn.clone(), encryption.clone())),
+            Arc::new(GroupRepositoryService::new(
+                conn.clone(),
+                project_service.clone(),
+                git.clone(),
+            )),
+            Arc::new(GroupRouteService::new(conn.clone())),
+            TemplateServiceCreator {
+                project_service,
+                config_service: config,
+                public_hostname_resolver: Arc::new(temps_core::StandardHostnameResolver),
+                audit_service: audit.clone(),
+                telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            },
+            Arc::new(temps_providers::ExternalServiceManager::new(
+                conn.clone(),
+                encryption,
+                Arc::new(docker),
+                Arc::new(temps_providers::DnsRegistry::new(conn.clone())),
+            )),
+            git,
+            Arc::new(temps_auth::DefaultSensitiveActionAuthorizer::new(
+                conn.clone(),
+            )),
+            audit,
+        ))
+    }
+
     async fn project_ids_and_types(
         db: &DatabaseConnection,
         plan: &InstantiationPlan,
@@ -4181,55 +4278,10 @@ services:
             eprintln!("Docker client unavailable, skipping instantiation test");
             return;
         };
-        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+        let Some(engine) = test_engine(&conn, project_service, git) else {
             eprintln!("Docker client unavailable, skipping instantiation test");
             return;
         };
-        let encryption = Arc::new(EncryptionService::new(&"0".repeat(64)).expect("test key"));
-        let server_config = Arc::new(
-            temps_config::ServerConfig::new(
-                "127.0.0.1:3000".to_string(),
-                "postgresql://test".to_string(),
-                None,
-                None,
-            )
-            .expect("server config"),
-        );
-        let config = Arc::new(temps_config::ConfigService::new(
-            server_config,
-            conn.clone(),
-        ));
-        let audit: Arc<dyn temps_core::AuditLogger> = Arc::new(DiscardingAudit);
-        let engine = InstantiationEngine::new(
-            conn.clone(),
-            encryption.clone(),
-            Arc::new(ProjectGroupService::new(conn.clone())),
-            Arc::new(GroupEnvVarService::new(conn.clone(), encryption.clone())),
-            Arc::new(GroupRepositoryService::new(
-                conn.clone(),
-                project_service.clone(),
-                git.clone(),
-            )),
-            Arc::new(GroupRouteService::new(conn.clone())),
-            TemplateServiceCreator {
-                project_service: project_service.clone(),
-                config_service: config,
-                public_hostname_resolver: Arc::new(temps_core::StandardHostnameResolver),
-                audit_service: audit.clone(),
-                telemetry: Arc::new(temps_core::NoopTelemetryReporter),
-            },
-            Arc::new(temps_providers::ExternalServiceManager::new(
-                conn.clone(),
-                encryption,
-                Arc::new(docker),
-                Arc::new(temps_providers::DnsRegistry::new(conn.clone())),
-            )),
-            git,
-            Arc::new(temps_auth::DefaultSensitiveActionAuthorizer::new(
-                conn.clone(),
-            )),
-            audit,
-        );
 
         let user = temps_entities::users::ActiveModel {
             name: Set("Instantiation Owner".to_string()),
@@ -4325,6 +4377,187 @@ services:
             .await
             .expect("lookup");
         assert_eq!(stored.len(), 3, "the retry did not create a second set");
+    }
+
+    /// The crash window of the fork step: the provider created the
+    /// repository and it was recorded by name, but the process stopped before
+    /// `plan.repository` was stored. A request that named no owner creates the
+    /// fork in the connection's own account, so the retry must look it up
+    /// there and adopt it. Creating it again would be rejected by the provider
+    /// (the name is taken) and leave the run failed with the repository
+    /// orphaned. No git provider can be reached from this connection, so a
+    /// retry that tried to create the repository fails the step.
+    #[tokio::test]
+    async fn a_fork_created_without_an_owner_is_adopted_on_resume() {
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{git_provider_connections, git_providers, repositories};
+        let Ok(db) = TestDatabase::with_migrations().await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping instantiation test");
+            return;
+        };
+        let conn = db.connection_arc();
+        let Some((project_service, git)) =
+            crate::repository::tests::project_service(conn.clone()).await
+        else {
+            eprintln!("Docker client unavailable, skipping instantiation test");
+            return;
+        };
+        let Some(engine) = test_engine(&conn, project_service, git) else {
+            eprintln!("Docker client unavailable, skipping instantiation test");
+            return;
+        };
+
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Fork Owner".to_string()),
+            email: Set("fork-owner@example.com".to_string()),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("the acting user is inserted");
+        let provider = git_providers::ActiveModel {
+            name: Set("fork-provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("provider");
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(Some(user.id)),
+            account_name: Set("starter-account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("connection");
+
+        let template: ProjectTemplate = yaml_serde::from_str(STACK_APP).expect("template");
+        let services = planned(&template);
+        let mut plan = InstantiationPlan {
+            template,
+            carries_release: true,
+            provenance: Some("stack-app".to_string()),
+            target: PlannedTarget::NewProject {
+                name: "Stack".to_string(),
+                slug: "stack".to_string(),
+            },
+            fork: Some(ForkRequest {
+                git_provider_connection_id: connection.id,
+                repository_name: "starter-copy".to_string(),
+                repository_owner: None,
+                private: true,
+                automatic_deploy: false,
+            }),
+            repository: None,
+            follow_repository: false,
+            databases: Vec::new(),
+            services,
+            storage_claim_ids: Vec::new(),
+            group_id: None,
+            steps: Vec::new(),
+        };
+        let now = Utc::now();
+        let model = template_instantiations::ActiveModel {
+            id: Set(31),
+            user_id: Set(user.id),
+            idempotency_key: Set("fork-run".to_string()),
+            kind: Set("template".to_string()),
+            template_slug: Set(Some("stack-app".to_string())),
+            name: Set("Stack".to_string()),
+            status: Set("running".to_string()),
+            plan: Set(serde_json::to_value(&plan).expect("plan")),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("the instantiation is stored");
+        let model = engine
+            .ledger
+            .claim(model.id, InstantiationEngine::HEARTBEAT_LEASE_SECS)
+            .await
+            .expect("the claim query runs")
+            .expect("a running row without a heartbeat is claimable");
+
+        // What the first attempt left behind: the repository, recorded under
+        // the connection's account, after the run began.
+        let created_at = now + chrono::Duration::seconds(1);
+        repositories::ActiveModel {
+            git_provider_connection_id: Set(connection.id),
+            owner: Set("starter-account".to_string()),
+            name: Set("starter-copy".to_string()),
+            full_name: Set("starter-account/starter-copy".to_string()),
+            description: Set(None),
+            private: Set(true),
+            fork: Set(false),
+            created_at: Set(created_at),
+            updated_at: Set(created_at),
+            pushed_at: Set(created_at),
+            size: Set(0),
+            stargazers_count: Set(0),
+            watchers_count: Set(0),
+            language: Set(None),
+            default_branch: Set("trunk".to_string()),
+            open_issues_count: Set(0),
+            topics: Set("[]".to_string()),
+            repo_object: Set("{}".to_string()),
+            installation_id: Set(None),
+            clone_url: Set(Some(
+                "https://git.example.test/starter-account/starter-copy.git".to_string(),
+            )),
+            ssh_url: Set(None),
+            preset: Set(None),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("the repository the first attempt created");
+
+        let auth = AuthContext::new_session(user, temps_auth::Role::Admin);
+        engine
+            .step_repository(
+                &mut plan,
+                &PlanSecrets::default(),
+                &model,
+                &auth,
+                &RequestOrigin::default(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the existing fork must be adopted, not created again: {error}")
+            });
+
+        let target = plan.repository.expect("the repository is recorded");
+        assert_eq!(target.repo_owner, "starter-account");
+        assert_eq!(target.repo_name, "starter-copy");
+        assert_eq!(target.branch, "trunk");
+        assert_eq!(
+            target.git_url.as_deref(),
+            Some("https://git.example.test/starter-account/starter-copy.git")
+        );
+        assert_eq!(target.git_provider_connection_id, Some(connection.id));
+        assert!(!target.is_public, "the fork is private");
     }
 
     fn group_repository(

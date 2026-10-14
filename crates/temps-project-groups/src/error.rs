@@ -160,6 +160,16 @@ pub enum ProjectGroupError {
     )]
     RepositoryChanged { group_id: i32, project_id: i32 },
 
+    /// Another request is changing (or clearing) the group's repository and
+    /// writing it through to the members right now. Two such changes must not
+    /// interleave their member writes, or a member could end up on the older
+    /// repository while the group stores the newer one. Nothing was changed.
+    #[error(
+        "The repository of project group {group_id} is being changed by another request; \
+         retry once it has finished"
+    )]
+    RepositoryChangeInProgress { group_id: i32 },
+
     #[error("{source_name} already sends {path_prefix} to another service")]
     RouteConflict {
         source_name: String,
@@ -264,6 +274,12 @@ impl From<ProjectGroupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectGroupError::RepositoryChangeInProgress { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Repository Change In Progress")
+                    .with_detail(error.to_string())
+            }
+
             ProjectGroupError::EnvVarConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Variable Already Exists")
                 .with_detail(error.to_string()),
@@ -332,6 +348,14 @@ mod tests {
             message.contains("project group 7") && message.contains("project 41"),
             "got {message}"
         );
+        assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn a_concurrent_repository_change_is_a_conflict_naming_the_group() {
+        let error = ProjectGroupError::RepositoryChangeInProgress { group_id: 7 };
+        let message = error.to_string();
+        assert!(message.contains("project group 7"), "got {message}");
         assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
     }
 }

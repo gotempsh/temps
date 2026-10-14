@@ -1535,7 +1535,7 @@ pub async fn get_group_repository(
         (status = 400, description = "Connection, repository or branch not usable"),
         (status = 403, description = "Insufficient permissions, or no access to every project in the group"),
         (status = 404, description = "Project group not found"),
-        (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"),
+        (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1630,7 +1630,7 @@ pub async fn set_group_repository(
         (status = 200, description = "Repository removed; projects keep their current git settings and stop following", body = ProjectGroupResponse),
         (status = 403, description = "Insufficient permissions, or no access to every project in the group"),
         (status = 404, description = "Project group not found"),
-        (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked; nothing was changed. Retry the request"),
+        (status = 409, description = "A project started following the group's repository while the request was being authorized, so it was not checked, or another request is changing the group's repository right now; nothing was changed. Retry the request"),
     ),
     security(("bearer_auth" = []))
 )]
