@@ -309,6 +309,7 @@ export function HttpChecksSettings({
                   variant="outline"
                   size="sm"
                   disabled={action.isPending}
+                  // confirm-delete-guard: ignore -- running a check is not destructive
                   onClick={() => action.mutate({ check, operation: 'run' })}
                 >
                   Check now
@@ -318,6 +319,7 @@ export function HttpChecksSettings({
                   variant="ghost"
                   size="sm"
                   disabled={action.isPending}
+                  // confirm-delete-guard: ignore -- pausing a check is not destructive
                   onClick={() => action.mutate({ check, operation: 'pause' })}
                 >
                   {check.enabled ? 'Pause' : 'Resume'}

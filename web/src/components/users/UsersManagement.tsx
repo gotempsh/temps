@@ -180,6 +180,7 @@ export function UsersManagement({
     currentRoles: string[]
   ) => {
     // Remove all existing roles first (since only one role can be active)
+    // confirm-delete-guard: ignore -- part of switching a user's role, which the role dialog confirms
     for (const existingRole of currentRoles) {
       if (existingRole !== roleType) {
         await removeRole.mutateAsync({

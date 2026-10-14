@@ -137,9 +137,9 @@ function ConfirmDeleteBody({
             {consequences ? (
               // Focusable so keyboard users can scroll long lists: Radix's
               // focus loop only visits tabbable elements.
-              <p className="max-h-48 overflow-y-auto" tabIndex={0}>
+              <div className="max-h-48 overflow-y-auto" tabIndex={0}>
                 {consequences}
-              </p>
+              </div>
             ) : null}
             {irreversible ? <p>This cannot be undone.</p> : null}
           </div>

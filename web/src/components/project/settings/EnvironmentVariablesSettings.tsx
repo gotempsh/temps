@@ -1700,9 +1700,10 @@ export function EnvironmentVariablesSettings({
     }
   }
 
-  const selectedKeys = (envVariables ?? [])
-    .filter((v) => visibleSelectedIds.has(v.id))
-    .map((v) => v.key)
+  const selectedRows = (envVariables ?? []).filter((v) =>
+    visibleSelectedIds.has(v.id)
+  )
+  const selectedKeys = selectedRows.map((v) => v.key)
 
   const handleBulkDelete = async () => {
     let successCount = 0
@@ -2278,7 +2279,26 @@ export function EnvironmentVariablesSettings({
         onOpenChange={setIsBulkDeleteDialogOpen}
         resourceType="environment variables"
         resourceName={summarizeKeys(selectedKeys)}
-        consequences={`${selectedKeys.length} variable${selectedKeys.length !== 1 ? 's are' : ' is'} removed from every environment ${selectedKeys.length !== 1 ? 'they apply' : 'it applies'} to. Running deployments keep the old values until they are redeployed.`}
+        consequences={
+          <>
+            <p>
+              Removed from every environment they apply to. Running deployments
+              keep the old values until they are redeployed.
+            </p>
+            <ul className="mt-2 space-y-1">
+              {selectedRows.map((variable) => (
+                <li key={variable.id}>
+                  <span className="font-mono text-foreground">
+                    {variable.key}
+                  </span>
+                  {' · '}
+                  {variable.environments.map((env) => env.name).join(', ') ||
+                    'no environments'}
+                </li>
+              ))}
+            </ul>
+          </>
+        }
         onConfirm={() => void handleBulkDelete()}
       />
     </div>

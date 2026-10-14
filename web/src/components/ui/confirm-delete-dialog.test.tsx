@@ -167,8 +167,8 @@ test('long consequences sit in a keyboard-focusable scroll region', () => {
       onConfirm={() => {}}
     />
   )
-  const region = Array.from(dialog().querySelectorAll('p')).find((p) =>
-    p.textContent?.includes('Pinned by 40 environments')
+  const region = Array.from(dialog().querySelectorAll('div')).find(
+    (el) => el.textContent === 'Pinned by 40 environments'
   )
   expect(region?.getAttribute('tabindex')).toBe('0')
   expect(region?.className).toContain('overflow-y-auto')
