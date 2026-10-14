@@ -361,3 +361,45 @@ test('useUrlSearchText with a shared urlState composes with a sibling patch in t
   expect(input.value).toBe('openssl')
   view.unmount()
 })
+
+test('separate useUrlState instances compose a search edit and a sibling write in one tick', async () => {
+  function Search() {
+    const [text, setText] = useUrlSearchText('q')
+    return (
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+    )
+  }
+  function Tabs() {
+    const { patch } = useUrlState<'tab'>()
+    const location = useLocation()
+    return (
+      <div>
+        <button onClick={() => patch({ tab: 'history' })}>history</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/runtime']}>
+      <Search />
+      <Tabs />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'oom' } })
+    fireEvent.click(view.getByText('history'))
+  })
+  await settle(1200)
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('oom')
+  expect(params.get('tab')).toBe('history')
+  expect(input.value).toBe('oom')
+  view.unmount()
+})

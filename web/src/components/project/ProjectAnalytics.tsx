@@ -114,6 +114,7 @@ import { EditFunnel } from '@/pages/EditFunnel'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { toast } from 'sonner'
+import { useUrlState } from '@temps-sdk/ds'
 import { setProjectHosting } from '@/api/client/sdk.gen'
 import { getErrorMessage } from '@/utils/errorHandling'
 import {
@@ -1249,7 +1250,8 @@ interface ProjectAnalyticsOverviewProps {
 }
 function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams] = useSearchParams()
+  const { patch: patchUrl } = useUrlState<'filter' | 'from' | 'to'>()
 
   // Restore date filter from URL search params (enables browser back/forward)
   // Keyed on the three date parameters only: unrelated query parameters (the
@@ -1268,19 +1270,22 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
       setPendingChartRange(null)
-      const params = new URLSearchParams()
-      params.set('filter', next.quickFilter)
-      if (
+      const custom =
         next.quickFilter === 'custom' &&
         next.dateRange?.from &&
         next.dateRange?.to
-      ) {
-        params.set('from', next.dateRange.from.toISOString())
-        params.set('to', next.dateRange.to.toISOString())
-      }
-      setSearchParams(params, { replace: false })
+      // Only the date keys are written, so unrelated parameters (the section
+      // page finder's `find`) survive a range change.
+      patchUrl(
+        {
+          filter: next.quickFilter,
+          from: custom ? next.dateRange?.from?.toISOString() : undefined,
+          to: custom ? next.dateRange?.to?.toISOString() : undefined,
+        },
+        { replace: false }
+      )
     },
-    [setSearchParams]
+    [patchUrl]
   )
 
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
