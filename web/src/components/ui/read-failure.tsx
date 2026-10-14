@@ -22,14 +22,15 @@ export function ReadFailure({
   error,
   cached = false,
   onRetry,
-  retrying,
+  retrying = false,
   embedded = false,
 }: {
   resource: string
   error: unknown
   cached?: boolean
-  onRetry: () => void
-  retrying: boolean
+  /** Omit when there is nothing to replay, e.g. a permission the role lacks. */
+  onRetry?: () => void
+  retrying?: boolean
   embedded?: boolean
 }) {
   const forbidden = isForbiddenRead(error)
@@ -51,23 +52,24 @@ export function ReadFailure({
         <p>{readFailureExplanation(error)}</p>
         {serverDetail && (
           <p className="break-words">
-            <span className="font-medium">Server response:</span>{' '}
-            {serverDetail}
+            <span className="font-medium">Server response:</span> {serverDetail}
           </p>
         )}
         {cached && (
           <p>Showing last-known data. It is stale and may have changed.</p>
         )}
-        <Button
-          variant="outline"
-          size="sm"
-          aria-disabled={retrying}
-          onClick={() => {
-            if (!retrying) onRetry()
-          }}
-        >
-          {retrying ? 'Retrying…' : 'Retry'}
-        </Button>
+        {onRetry && (
+          <Button
+            variant="outline"
+            size="sm"
+            aria-disabled={retrying}
+            onClick={() => {
+              if (!retrying) onRetry()
+            }}
+          >
+            {retrying ? 'Retrying…' : 'Retry'}
+          </Button>
+        )}
       </AlertDescription>
     </Alert>
   )
