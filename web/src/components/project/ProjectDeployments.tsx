@@ -126,7 +126,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       },
     }),
     retry: false,
-    refetchOnWindowFocus: true,
+    // Same dialog guard as the interval below: a focus refetch while a dialog
+    // is open would shift the selected row off the page just the same.
+    refetchOnWindowFocus: () => !anyDialogOpen,
     // A deployment started in the background (webhook, CLI, another tab)
     // must show up without a reload, and a running one must progress.
     // Paused while a dialog is open: the dialogs resolve their target row from

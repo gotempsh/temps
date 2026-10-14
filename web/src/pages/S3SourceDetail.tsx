@@ -295,9 +295,11 @@ export function S3SourceDetail() {
   )
 
   // Client-side filter + pagination over the recent-backups list. The list
-  // is DB-first (ADR-014 §"Fast listings") and capped, so doing this on the
-  // client is fine — no backend pagination needed yet. If/when the cap goes
-  // away, swap this for `?page=&page_size=` on the API. Search text and page
+  // is DB-first (ADR-014 §"Fast listings") but the endpoint returns every
+  // retained backup, not a capped page, so filtering here is only fine while
+  // the history is small. That is also why idle polling above stops past a few
+  // hundred rows (see `sourceBackupsRefetchInterval`). Once the endpoint takes
+  // `?page=&page_size=`, swap this for server-side paging. Search text and page
   // number live in the URL (not local state) so a filtered/paged view can be
   // shared or survive a refresh.
   const { get: getBackupsUrlState, patch: patchBackupsUrlState } = useUrlState<
