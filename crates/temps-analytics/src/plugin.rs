@@ -167,6 +167,21 @@ impl TempsPlugin for AnalyticsPlugin {
                     }
                 }
             });
+            // Retention for stored IP addresses and visitors, and the
+            // `events`/`error_events` policies. Skipped, loudly, when the
+            // settings service is not part of this binary's plugin set.
+            match context.get_service::<temps_config::ConfigService>() {
+                Some(config) => {
+                    let db = context.require_service::<sea_orm::DatabaseConnection>();
+                    crate::retention::spawn_retention_job(
+                        Arc::new(crate::retention::AnalyticsRetentionService::new(db)),
+                        config,
+                    );
+                }
+                None => tracing::warn!(
+                    "analytics: settings service unavailable; analytics retention job not started"
+                ),
+            }
             let service = context.require_service::<ApiTrafficService>();
             if let Some(source) =
                 context.get_service::<dyn crate::api_traffic::ApiTrafficDataSource>()

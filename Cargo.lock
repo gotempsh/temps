@@ -12429,6 +12429,7 @@ dependencies = [
  "sha2 0.11.0",
  "temps-ai",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-database",
  "temps-entities",

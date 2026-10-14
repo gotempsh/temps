@@ -1299,6 +1299,53 @@ export type AnalyticsProjectOption = {
     project_name: string;
 };
 
+/**
+ * How long product analytics data, and the identifiers attached to it, are
+ * kept.
+ *
+ * `ip_geolocations` holds the full client IP address and is referenced by
+ * events, proxy logs, error events, visitors, performance metrics and audit
+ * logs. Before these settings existed nothing ever removed an IP once stored,
+ * and nothing removed visitors, so the retention of the referencing tables
+ * said nothing about how long an address was kept.
+ *
+ * A job removes an IP row only when **no** table references it, so the
+ * effective retention of an address is the longest window among the data that
+ * still points at it. Audit logs keep their IP for as long as the audit
+ * record exists.
+ *
+ * `None` on an optional window means "keep" -- the behaviour before the
+ * setting existed -- so upgrading never starts deleting data on its own,
+ * except for the unreferenced-IP cleanup, which only drops cache rows that
+ * nothing points at.
+ */
+export type AnalyticsRetentionSettings = {
+    /**
+     * Retain captured error events for this many days. `null` keeps them
+     * until the project is deleted. Error groups keep their counters.
+     */
+    error_events_days?: number | null;
+    /**
+     * Retain analytics events (page views, custom events) for this many
+     * days. Applied as the TimescaleDB retention policy of the `events`
+     * hypertable. ClickHouse-backed analytics keep their own storage TTL.
+     */
+    events_days?: number;
+    /**
+     * Delete a stored client IP address (and its derived location) once
+     * nothing references it and it has not been looked up for this many
+     * days. `null` keeps every address ever seen.
+     */
+    unreferenced_ip_days?: number | null;
+    /**
+     * Delete visitors that have not been seen for this many days. Their
+     * events, proxy logs and error events stay (until their own retention
+     * ends) but are no longer linked to a visitor; session replays of the
+     * visitor are deleted with it. `null` keeps visitors indefinitely.
+     */
+    visitor_days?: number | null;
+};
+
 export type AnalyticsSessionEventsResponse = {
     events: Array<SessionEvent>;
     session_id: string;
@@ -1649,6 +1696,13 @@ export type AppSettings = {
      */
     ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
     /**
+     * Retention windows for product analytics data and for the personal
+     * identifiers (visitors, client IP addresses) attached to it.
+     * Applied by a background job, not at save time, so a change takes
+     * effect within the job's interval.
+     */
+    analytics_retention?: AnalyticsRetentionSettings;
+    /**
      * Admin preference for anonymous product telemetry (the events sent to
      * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
      * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
@@ -1922,6 +1976,11 @@ export type AppSettingsResponse = {
      * Persistent AI workspace file transfer and preview limits.
      */
     ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
+    /**
+     * Retention of analytics events and of the visitors and client IP
+     * addresses attached to them.
+     */
+    analytics_retention: AnalyticsRetentionSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.

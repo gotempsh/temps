@@ -332,6 +332,7 @@ mod m20261013_000001_webhook_delivery_identity;
 mod m20261013_000002_add_kind_to_ai_conversations;
 mod m20261013_000003_allow_source_built_service_release;
 mod m20261014_000001_add_instantiation_claim_token;
+mod m20261014_000002_index_ip_geolocation_references;
 
 pub struct Migrator;
 
@@ -741,6 +742,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261013_000003_allow_source_built_service_release::Migration),
             // Each claim of a template instantiation gets an ownership token.
             Box::new(m20261014_000001_add_instantiation_claim_token::Migration),
+            // Partial indexes on the columns that reference stored IP addresses.
+            Box::new(m20261014_000002_index_ip_geolocation_references::Migration),
         ]
     }
 }

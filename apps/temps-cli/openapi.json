@@ -2934,6 +2934,57 @@
         ],
         "type": "object"
       },
+      "AnalyticsRetentionSettings": {
+        "description": "How long product analytics data, and the identifiers attached to it, are\nkept.\n\n`ip_geolocations` holds the full client IP address and is referenced by\nevents, proxy logs, error events, visitors, performance metrics and audit\nlogs. Before these settings existed nothing ever removed an IP once stored,\nand nothing removed visitors, so the retention of the referencing tables\nsaid nothing about how long an address was kept.\n\nA job removes an IP row only when **no** table references it, so the\neffective retention of an address is the longest window among the data that\nstill points at it. Audit logs keep their IP for as long as the audit\nrecord exists.\n\n`None` on an optional window means \"keep\" -- the behaviour before the\nsetting existed -- so upgrading never starts deleting data on its own,\nexcept for the unreferenced-IP cleanup, which only drops cache rows that\nnothing points at.",
+        "properties": {
+          "error_events_days": {
+            "default": null,
+            "description": "Retain captured error events for this many days. `null` keeps them\nuntil the project is deleted. Error groups keep their counters.",
+            "example": 90,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "events_days": {
+            "default": 90,
+            "description": "Retain analytics events (page views, custom events) for this many\ndays. Applied as the TimescaleDB retention policy of the `events`\nhypertable. ClickHouse-backed analytics keep their own storage TTL.",
+            "example": 90,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "unreferenced_ip_days": {
+            "default": 30,
+            "description": "Delete a stored client IP address (and its derived location) once\nnothing references it and it has not been looked up for this many\ndays. `null` keeps every address ever seen.",
+            "example": 30,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "visitor_days": {
+            "default": null,
+            "description": "Delete visitors that have not been seen for this many days. Their\nevents, proxy logs and error events stay (until their own retention\nends) but are no longer linked to a visitor; session replays of the\nvisitor are deleted with it. `null` keeps visitors indefinitely.",
+            "example": 425,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AnalyticsSessionEventsResponse": {
         "properties": {
           "events": {
@@ -3553,6 +3604,16 @@
             },
             "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
           },
+          "analytics_retention": {
+            "$ref": "#/components/schemas/AnalyticsRetentionSettings",
+            "default": {
+              "error_events_days": null,
+              "events_days": 90,
+              "unreferenced_ip_days": 30,
+              "visitor_days": null
+            },
+            "description": "Retention windows for product analytics data and for the personal\nidentifiers (visitors, client IP addresses) attached to it.\nApplied by a background job, not at save time, so a change takes\neffect within the job's interval."
+          },
           "anonymous_telemetry_enabled": {
             "default": null,
             "description": "Admin preference for anonymous product telemetry (the events sent to\nthe Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud\nmirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).\n\n- `None` (default) — the operator has not chosen; the built-in default\n  applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).\n- `Some(true)` / `Some(false)` — an admin turned it on/off from\n  Settings › Telemetry. Applied at runtime without a restart.\n\nThe `TEMPS_TELEMETRY=0` environment variable is a host-level kill\nswitch that wins over this value unconditionally. The dedicated\n`PATCH /settings/telemetry` endpoint is the only write path: the\ngeneric settings save restores the stored value under the row lock, so\nan older client round-tripping the whole document cannot flip it.",
@@ -3950,6 +4011,10 @@
             "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
             "description": "Persistent AI workspace file transfer and preview limits."
           },
+          "analytics_retention": {
+            "$ref": "#/components/schemas/AnalyticsRetentionSettings",
+            "description": "Retention of analytics events and of the visitors and client IP\naddresses attached to them."
+          },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "description": "Build-time resource limits (control-plane only). No sensitive content,\npassed through as-is."
@@ -4162,6 +4227,7 @@
           "monitoring",
           "observability_compression",
           "observability_retention",
+          "analytics_retention",
           "clickhouse",
           "geo",
           "effective_metrics_store",
