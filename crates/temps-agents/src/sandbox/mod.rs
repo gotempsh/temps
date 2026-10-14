@@ -615,10 +615,10 @@ pub fn check_guest_agent(bytes: &[u8]) -> Result<(), GuestAgentRejection> {
     Ok(())
 }
 
-/// Why a guest terminal agent could not be staged on the host.
+/// Why a guest agent (`temps-pty-agent` or `temps-vm-agent`) could not be staged on the host.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyAgentStagingError {
-    #[error("guest terminal agent {path} does not exist")]
+    #[error("guest agent {path} does not exist")]
     Missing { path: PathBuf },
 
     #[error("{path} {reason}")]
@@ -627,7 +627,7 @@ pub enum PtyAgentStagingError {
         reason: GuestAgentRejection,
     },
 
-    #[error("cannot stage guest terminal agent {source_path} at {dest}: {reason}")]
+    #[error("cannot stage guest agent {source_path} at {dest}: {reason}")]
     Io {
         source_path: PathBuf,
         dest: PathBuf,
@@ -635,7 +635,7 @@ pub enum PtyAgentStagingError {
     },
 }
 
-/// Copy a guest terminal agent from `source` to `dest` (mode 0755),
+/// Copy a guest agent (the terminal or the VM agent) from `source` to `dest` (mode 0755),
 /// refusing anything the guest cannot run — not a Linux ELF, built for
 /// another CPU, or dynamically linked — so a wrong build fails at setup
 /// instead of at the first terminal (see [`check_guest_agent`]).

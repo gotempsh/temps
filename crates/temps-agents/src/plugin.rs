@@ -191,70 +191,87 @@ async fn build_sandbox_provider(
     Arc::new(RoutingSandboxProvider::new(backends, default))
 }
 
-/// Keep the guest terminal agent each microVM backend injects in step with
-/// the `temps-pty-agent` shipped beside this executable (release archive,
-/// installer and `temps upgrade` all place it there).
+/// Keep the guest agents each microVM backend injects in step with the ones
+/// shipped beside this executable (release archive, installer, `deploy.sh`
+/// and `temps upgrade` all place them there): `temps-pty-agent` for terminals
+/// and, for Firecracker, `temps-vm-agent` -- the only transport into a VM, so
+/// without it the backend is unavailable.
 ///
 /// Only backends an operator has already set up are touched -- their state
 /// directory exists -- so a host that never opted into microVMs gets no new
 /// directories. Failures are logged and otherwise ignored: a stale agent
-/// degrades terminals (reported by the capability status) but must never stop
-/// the server from starting.
+/// degrades the backend (reported by the capability status) but must never
+/// stop the server from starting. Runs before the providers are probed, so a
+/// Firecracker host whose setup predated a release that ships the VM agent
+/// becomes available on the first start after upgrading.
 fn refresh_staged_pty_agents(data_dir: &std::path::Path) {
     use crate::sandbox::firecracker::FirecrackerSandboxConfig;
     use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
     use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
 
-    let Some(source) = std::env::current_exe()
+    const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
+
+    let Some(exe_dir) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(PTY_AGENT_BINARY_NAME)))
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
     else {
         return;
     };
-    if !source.is_file() {
-        tracing::debug!(
-            "no {} beside the temps executable ({}); guest terminal agents are not refreshed",
-            PTY_AGENT_BINARY_NAME,
-            source.display()
-        );
-        return;
-    }
 
     let microsandbox = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
     let firecracker = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    // (backend, state dir that proves setup ran, shipped file name, staged path)
     let targets = [
         (
             "microsandbox",
             microsandbox.home(),
+            PTY_AGENT_BINARY_NAME,
             microsandbox.pty_agent_bin(),
         ),
         (
             "firecracker",
             firecracker.fc_root(),
+            PTY_AGENT_BINARY_NAME,
             firecracker.pty_agent_bin(),
         ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            VM_AGENT_BINARY_NAME,
+            firecracker.agent_bin(),
+        ),
     ];
-    for (backend, state_dir, staged) in targets {
+    for (backend, state_dir, name, staged) in targets {
         if !state_dir.is_dir() {
+            continue;
+        }
+        let source = exe_dir.join(name);
+        if !source.is_file() {
+            tracing::debug!(
+                backend,
+                "no {} beside the temps executable ({}); the staged copy is not refreshed",
+                name,
+                source.display()
+            );
             continue;
         }
         match sync_pty_agent_binary(&source, &staged) {
             Ok(PtyAgentSync::AlreadyCurrent) => tracing::debug!(
                 backend,
                 staged = %staged.display(),
-                "guest terminal agent is current"
+                "staged {} is current",
+                name
             ),
             Ok(PtyAgentSync::Staged) => tracing::info!(
                 backend,
                 staged = %staged.display(),
                 source = %source.display(),
-                "updated the staged guest terminal agent to the one shipped with this temps"
+                "updated the staged {} to the one shipped with this temps",
+                name
             ),
-            Err(error) => tracing::warn!(
-                backend,
-                "could not refresh the staged guest terminal agent: {}",
-                error
-            ),
+            Err(error) => {
+                tracing::warn!(backend, "could not refresh the staged {}: {}", name, error)
+            }
         }
     }
 }

@@ -233,7 +233,7 @@ impl FirecrackerSandboxConfig {
     fn firecracker_bin(&self) -> PathBuf {
         self.fc_root().join("bin/firecracker")
     }
-    fn agent_bin(&self) -> PathBuf {
+    pub(crate) fn agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-vm-agent")
     }
     /// Static musl `temps-pty-agent`, injected next to the VM agent so the
