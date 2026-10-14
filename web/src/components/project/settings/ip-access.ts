@@ -152,12 +152,46 @@ export function withPresets(
   return [...current, ...additions]
 }
 
+/** The presets that are not in the list yet. */
+export function missingPresets(
+  current: CidrEntry[],
+  presets: CidrEntry[]
+): CidrEntry[] {
+  return withPresets(current, presets).slice(current.length)
+}
+
 /** True when every preset is already in the list (hides the "add" action). */
 export function hasAllPresets(
   current: CidrEntry[],
   presets: CidrEntry[]
 ): boolean {
-  return withPresets(current, presets).length === current.length
+  return missingPresets(current, presets).length === 0
+}
+
+/**
+ * Whether adding every missing preset keeps the list within `limit`. Adding
+ * only some of them would leave the operator with a half-applied preset, so
+ * the action is all-or-nothing.
+ */
+export function presetsFit(
+  current: CidrEntry[],
+  presets: CidrEntry[],
+  limit: number = MAX_CIDRS
+): boolean {
+  return current.length + missingPresets(current, presets).length <= limit
+}
+
+/**
+ * Which stored policy "Try an address" must evaluate when the draft is not
+ * evaluated as given. An environment that is set to follow the project is
+ * governed by the project's list, not by an override it is about to drop, so
+ * the project endpoint answers; every other case asks the scope itself.
+ */
+export function probeScope(
+  isEnvironment: boolean,
+  mode: IpAccessFormMode
+): 'project' | 'scope' {
+  return isEnvironment && mode === 'inherit' ? 'project' : 'scope'
 }
 
 /** Single host form of an address, for the "add my IP" button. */

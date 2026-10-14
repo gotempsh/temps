@@ -10,6 +10,9 @@ import {
   hostCidr,
   initialFormMode,
   ipAccessFormSchema,
+  missingPresets,
+  presetsFit,
+  probeScope,
   showsEntries,
   policySummary,
   withPresets,
@@ -116,6 +119,50 @@ describe('presets', () => {
       '203.0.113.0/24',
       'fd7a:115c:a1e0::/48',
     ])
+  })
+})
+
+describe('preset capacity', () => {
+  const filler = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      cidr: `10.${Math.floor(index / 256)}.${index % 256}.0/24`,
+    }))
+
+  test('lists only the presets that are missing', () => {
+    expect(
+      missingPresets([{ cidr: '100.64.0.0/10' }], TAILSCALE_PRESETS).map(
+        (entry) => entry.cidr
+      )
+    ).toEqual(['fd7a:115c:a1e0::/48'])
+  })
+
+  test('refuses a preset action that would pass the entry limit', () => {
+    // 255 entries leave room for one, but two presets are missing.
+    expect(presetsFit(filler(MAX_CIDRS - 1), TAILSCALE_PRESETS)).toBe(false)
+    expect(presetsFit(filler(MAX_CIDRS - 2), TAILSCALE_PRESETS)).toBe(true)
+  })
+
+  test('counts only the missing presets against the capacity', () => {
+    // One preset is already listed and one is missing: that needs one slot.
+    const room = [...filler(MAX_CIDRS - 2), { cidr: '100.64.0.0/10' }]
+    expect(room).toHaveLength(MAX_CIDRS - 1)
+    expect(presetsFit(room, TAILSCALE_PRESETS)).toBe(true)
+    const full = [...filler(MAX_CIDRS - 1), { cidr: '100.64.0.0/10' }]
+    expect(full).toHaveLength(MAX_CIDRS)
+    expect(presetsFit(full, TAILSCALE_PRESETS)).toBe(false)
+  })
+})
+
+describe('probe scope', () => {
+  test('an environment that follows the project is tested against the project', () => {
+    expect(probeScope(true, 'inherit')).toBe('project')
+  })
+
+  test('every other combination tests the scope itself', () => {
+    expect(probeScope(true, 'allow')).toBe('scope')
+    expect(probeScope(true, 'disabled')).toBe('scope')
+    expect(probeScope(false, 'allow')).toBe('scope')
+    expect(probeScope(false, 'disabled')).toBe('scope')
   })
 })
 

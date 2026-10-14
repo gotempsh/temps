@@ -57,7 +57,7 @@ import {
   Trash2,
   UserRound,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Controller, useFieldArray, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import {
@@ -69,7 +69,10 @@ import {
   ipAccessFormSchema,
   modeLabel,
   initialFormMode,
+  missingPresets,
   policySummary,
+  presetsFit,
+  probeScope,
   showsEntries,
   type IpAccessFormValues,
   type IpAccessFormMode,
@@ -137,37 +140,56 @@ export function ProjectIpAccessCard({
   })
   const policy = policyQuery.data
 
+  const unconfiguredValues: IpAccessFormValues = {
+    mode: isEnvironment ? 'inherit' : 'disabled',
+    cidrs: [],
+  }
+  const valuesFor = (saved: ProjectIpAccessDetail): IpAccessFormValues => ({
+    mode: initialFormMode(saved, isEnvironment),
+    cidrs: saved.cidrs.map((entry) => ({
+      cidr: entry.cidr,
+      description: entry.description ?? '',
+    })),
+  })
+
   const form = useForm<IpAccessFormValues>({
     resolver: zodResolver(ipAccessFormSchema),
     // What an unconfigured scope looks like; the effect below swaps in the
     // saved policy once it has loaded.
-    defaultValues: {
-      mode: isEnvironment ? 'inherit' : 'disabled',
-      cidrs: [],
-    },
+    defaultValues: unconfiguredValues,
   })
   const { fields, append, remove, replace } = useFieldArray({
     control: form.control,
     name: 'cidrs',
   })
 
-  // Load the saved policy into the form whenever the server copy changes, but
-  // never over edits the user has not saved yet.
+  // Load the saved policy into the form when it first arrives or the scope
+  // changes. A later change to the server copy (another operator, the CLI)
+  // never overwrites edits that have not been saved: the draft is kept and
+  // the operator is told the saved list moved. This card's own save and
+  // remove reset the form explicitly instead.
+  const isDirty = form.formState.isDirty
+  const dirtyRef = useRef(isDirty)
+  dirtyRef.current = isDirty
+  const loadedScopeRef = useRef<string | null>(null)
+  const [changedElsewhere, setChangedElsewhere] = useState(false)
   const savedAt = policy?.updated_at ?? null
   const hasPolicy = policy !== undefined
+  const scopeKey = `${projectId}/${environmentId ?? 'project'}`
   useEffect(() => {
     if (!policy) return
-    form.reset({
-      mode: initialFormMode(policy, environmentId !== undefined),
-      cidrs: policy.cidrs.map((entry) => ({
-        cidr: entry.cidr,
-        description: entry.description ?? '',
-      })),
-    })
-    // `policy` identity changes on refetch; the timestamp and scope identify
-    // a genuinely different saved version.
+    const sameScope = loadedScopeRef.current === scopeKey
+    if (sameScope && dirtyRef.current) {
+      setChangedElsewhere(true)
+      return
+    }
+    loadedScopeRef.current = scopeKey
+    setChangedElsewhere(false)
+    form.reset(valuesFor(policy))
+    // `policy` identity changes on every refetch; the timestamp and scope
+    // identify a genuinely different saved version.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPolicy, savedAt, projectId, environmentId])
+  }, [hasPolicy, savedAt, scopeKey])
 
   const mode = useWatch({ control: form.control, name: 'mode' })
   const currentCidrs = useWatch({ control: form.control, name: 'cidrs' })
@@ -198,6 +220,8 @@ export function ProjectIpAccessCard({
     },
     onSuccess: (saved) => {
       queryClient.setQueryData(queryKey, saved)
+      form.reset(valuesFor(saved))
+      setChangedElsewhere(false)
       setLockout(null)
       setProbeResult(null)
       toast.success(
@@ -235,6 +259,9 @@ export function ProjectIpAccessCard({
     onSuccess: () => {
       setConfirmRemove(false)
       setProbeResult(null)
+      // Back to an unconfigured scope; the refetch below confirms it.
+      form.reset(unconfiguredValues)
+      setChangedElsewhere(false)
       queryClient.invalidateQueries({ queryKey })
       toast.success(
         isEnvironment
@@ -249,12 +276,18 @@ export function ProjectIpAccessCard({
   })
 
   const probeMutation = useMutation({
-    mutationFn: async (body: {
-      ip: string
-      mode: IpAccessMode
-      cidrs: { cidr: string; description?: string | null }[]
+    mutationFn: async ({
+      body,
+      viaProject,
+    }: {
+      body: {
+        ip: string
+        mode?: IpAccessMode
+        cidrs?: { cidr: string; description?: string | null }[]
+      }
+      viaProject: boolean
     }) => {
-      const result = isEnvironment
+      const result = isEnvironment && !viaProject
         ? await testEnvironmentIpAccess({
             path: { project_id: projectId, environment_id: environmentId },
             body,
@@ -303,21 +336,27 @@ export function ProjectIpAccessCard({
     // an invalid draft falls back to the stored policy.
     const draft = ipAccessFormSchema.safeParse(values)
     probeMutation.mutate({
-      ip: address,
-      ...(draft.success && draft.data.mode !== 'inherit'
-        ? {
-            mode: draft.data.mode as IpAccessMode,
-            cidrs: draft.data.cidrs.map((entry) => ({
-              cidr: entry.cidr.trim(),
-              description: entry.description?.trim() || null,
-            })),
-          }
-        : ({} as { mode: IpAccessMode; cidrs: [] })),
+      // An environment set to follow the project is governed by the project's
+      // stored list, whatever override it holds today.
+      viaProject: probeScope(isEnvironment, values.mode) === 'project',
+      body: {
+        ip: address,
+        ...(draft.success && draft.data.mode !== 'inherit'
+          ? {
+              mode: draft.data.mode as IpAccessMode,
+              cidrs: draft.data.cidrs.map((entry) => ({
+                cidr: entry.cidr.trim(),
+                description: entry.description?.trim() || null,
+              })),
+            }
+          : {}),
+      },
     })
   }
 
   const yourIp = policy?.your_ip ?? null
   const canAddPresets = !hasAllPresets(currentCidrs, TAILSCALE_PRESETS)
+  const presetsHaveRoom = presetsFit(currentCidrs, TAILSCALE_PRESETS)
   const yourIpListed =
     yourIp !== null &&
     currentCidrs.some((entry) => entry.cidr.trim() === hostCidr(yourIp))
@@ -327,12 +366,10 @@ export function ProjectIpAccessCard({
     form.formState.errors.cidrs?.root?.message
 
   const addPresets = () => {
-    const existing = new Set(
-      currentCidrs.map((entry) => entry.cidr.trim().toLowerCase())
-    )
-    TAILSCALE_PRESETS.filter(
-      (preset) => !existing.has(preset.cidr.toLowerCase())
-    ).forEach((preset) =>
+    // All or nothing: a half-applied preset is worse than none, and going
+    // past the limit leaves a draft the form cannot save.
+    if (!presetsFit(currentCidrs, TAILSCALE_PRESETS)) return
+    missingPresets(currentCidrs, TAILSCALE_PRESETS).forEach((preset) =>
       append({ cidr: preset.cidr, description: preset.description ?? '' })
     )
   }
@@ -386,6 +423,18 @@ export function ProjectIpAccessCard({
             </span>
           )}
         </div>
+
+        {changedElsewhere && (
+          <Alert>
+            <CircleAlert className="h-4 w-4" />
+            <AlertTitle>The saved list changed</AlertTitle>
+            <AlertDescription>
+              Someone else (or the CLI) saved a different list for this{' '}
+              {scopeNoun} while you were editing. Your edits are kept; saving
+              replaces the newer list. Use Discard changes to load it instead.
+            </AlertDescription>
+          </Alert>
+        )}
 
         <Controller
           control={form.control}
@@ -460,7 +509,15 @@ export function ProjectIpAccessCard({
                     type="button"
                     variant="outline"
                     size="sm"
-                    disabled={atLimit}
+                    disabled={atLimit || !presetsHaveRoom}
+                    title={
+                      presetsHaveRoom
+                        ? undefined
+                        : `Not enough room: the Tailscale ranges need ${
+                            missingPresets(currentCidrs, TAILSCALE_PRESETS)
+                              .length
+                          } more entries and the list holds at most ${MAX_CIDRS}.`
+                    }
                     onClick={addPresets}
                   >
                     <Network className="mr-2 h-4 w-4" />
@@ -626,19 +683,10 @@ export function ProjectIpAccessCard({
               type="button"
               variant="ghost"
               onClick={() => {
-                form.reset({
-                  mode: initialFormMode(policy, isEnvironment),
-                  cidrs: policy.cidrs.map((entry) => ({
-                    cidr: entry.cidr,
-                    description: entry.description ?? '',
-                  })),
-                })
-                replace(
-                  policy.cidrs.map((entry) => ({
-                    cidr: entry.cidr,
-                    description: entry.description ?? '',
-                  }))
-                )
+                const saved = valuesFor(policy)
+                form.reset(saved)
+                replace(saved.cidrs)
+                setChangedElsewhere(false)
               }}
             >
               Discard changes
