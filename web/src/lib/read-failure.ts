@@ -44,6 +44,13 @@ export function readFailureExplanation(error: unknown): string {
   // is an answer: Temps, or whatever sits in front of it, was reached and
   // declined the request. "Could not contact Temps" would be wrong.
   const status = httpStatusOf(error)
+  // A timeout or a rate limit is a passing condition: the retry policy treats
+  // it as retryable, so telling the user a retry cannot help would be wrong.
+  if (status === 408 || status === 429) {
+    return `Temps or a proxy in front of it answered HTTP ${status} (${
+      status === 429 ? 'too many requests' : 'request timeout'
+    }). This is usually temporary: wait a moment, then retry.`
+  }
   if (status !== undefined && status >= 400 && status < 500) {
     return `The request was rejected with HTTP ${status} by Temps or a proxy in front of it. Retrying the same request will not help.`
   }

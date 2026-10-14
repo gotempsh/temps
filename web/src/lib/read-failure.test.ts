@@ -55,6 +55,15 @@ describe('readFailureExplanation', () => {
     expect(text).toContain('HTTP 413')
     expect(text).not.toContain('Could not contact Temps')
   })
+
+  test('a timeout or a rate limit is temporary, so it never says retrying is useless', () => {
+    for (const status of [408, 429]) {
+      const text = readFailureExplanation({ title: 'Slow down', status })
+      expect(text).toContain(`HTTP ${status}`)
+      expect(text).toContain('temporary')
+      expect(text).not.toContain('will not help')
+    }
+  })
 })
 
 describe('readFailureServerDetail', () => {
