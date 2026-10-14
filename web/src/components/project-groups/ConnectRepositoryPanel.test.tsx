@@ -45,11 +45,15 @@ const PRESETS = {
 }
 
 function panel(
-  props: { group?: ProjectGroupResponse; onConnected?: () => void } = {}
+  props: {
+    group?: ProjectGroupResponse
+    onConnected?: () => void
+    client?: QueryClient
+  } = {}
 ) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  })
+  const client =
+    props.client ??
+    new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return (
     <QueryClientProvider client={client}>
       <PresetContext.Provider value={PRESETS}>
@@ -391,5 +395,75 @@ test('a service that could not follow keeps the page open and is named', async (
   expect(
     within(document.body).getByRole('button', { name: 'Retry' })
   ).toBeTruthy()
+  api.restore()
+})
+
+test('paging the list after picking a repository does not save it', async () => {
+  const bodies: unknown[] = []
+  const api = mockApi({
+    ...WITH_CONNECTION,
+    'GET /git-connections/11/repositories': () =>
+      jsonResponse({
+        repositories: [repo(1, 'storefront'), repo(2, 'admin-console')],
+        total_count: 40,
+      }),
+    'PUT /project-groups/7/repository': async (request) => {
+      bodies.push(await request.json())
+      return jsonResponse({ group: GROUP, services: [] })
+    },
+  })
+  let connected = 0
+  render(panel({ onConnected: () => (connected += 1) }))
+  const body = within(document.body)
+  await waitFor(() => expect(body.getByText('admin-console')).toBeTruthy())
+
+  await act(async () => {
+    fireEvent.click(body.getByText('admin-console').closest('button')!)
+  })
+  await act(async () => {
+    fireEvent.click(body.getByRole('button', { name: 'Next' }))
+  })
+  await settle()
+
+  expect(bodies).toEqual([])
+  expect(connected).toBe(0)
+  api.restore()
+})
+
+test('a pick is dropped when its connection stops being the active one', async () => {
+  const second = { ...CONNECTION, id: 12, account_name: 'acme-labs' }
+  let connectionList = [CONNECTION, second]
+  const api = mockApi({
+    ...WITH_CONNECTION,
+    'GET /git-connections': () =>
+      jsonResponse({
+        connections: connectionList,
+        page: 1,
+        per_page: 20,
+        total_count: connectionList.length,
+      }),
+    'GET /git-connections/12/repositories': () =>
+      jsonResponse({ repositories: [], total_count: 0 }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(panel({ client }))
+  const body = within(document.body)
+  await waitFor(() => expect(body.getByText('admin-console')).toBeTruthy())
+  await act(async () => {
+    fireEvent.click(body.getByText('admin-console').closest('button')!)
+  })
+  await settle()
+  expect(saveButton().disabled).toBe(false)
+
+  // The connection is deactivated elsewhere; the list refreshes.
+  connectionList = [second]
+  await act(async () => {
+    await client.invalidateQueries({ queryKey: [{ _id: 'listConnections' }] })
+  })
+  await settle()
+
+  expect(saveButton().disabled).toBe(true)
   api.restore()
 })

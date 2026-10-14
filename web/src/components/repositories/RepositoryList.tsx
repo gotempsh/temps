@@ -454,6 +454,7 @@ export function RepositoryList({
               </div>
               {!searchQuery && (
                 <Button
+                  type="button"
                   onClick={handleSyncRepositories}
                   disabled={syncMutation.isPending || isConnectionSyncing}
                   className="gap-2"
@@ -694,6 +695,7 @@ export function RepositoryList({
       {(currentPage > 1 || hasMorePages) && (
         <div className="flex items-center justify-center gap-2">
           <Button
+            type="button"
             variant="outline"
             size="sm"
             onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
@@ -708,6 +710,7 @@ export function RepositoryList({
           </span>
 
           <Button
+            type="button"
             variant="outline"
             size="sm"
             onClick={() => setCurrentPage((p) => p + 1)}

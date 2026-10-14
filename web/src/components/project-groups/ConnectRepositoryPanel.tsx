@@ -87,17 +87,22 @@ export function ConnectRepositoryPanel({
       branchChoice: '',
     },
   })
-  const [modeChoice, connectionChoice, repository, publicUrl, branchChoice] =
-    useWatch({
-      control: form.control,
-      name: [
-        'modeChoice',
-        'connectionChoice',
-        'repository',
-        'publicUrl',
-        'branchChoice',
-      ],
-    })
+  const [
+    modeChoice,
+    connectionChoice,
+    pickedRepository,
+    publicUrl,
+    branchChoice,
+  ] = useWatch({
+    control: form.control,
+    name: [
+      'modeChoice',
+      'connectionChoice',
+      'repository',
+      'publicUrl',
+      'branchChoice',
+    ],
+  })
 
   const connections = useQuery({ ...listConnectionsOptions() })
   const activeConnections = useMemo(
@@ -120,6 +125,16 @@ export function ConnectRepositoryPanel({
     activeConnections.find((c) => c.id === connectionChoice)?.id ??
     activeConnections[0]?.id ??
     null
+
+  // A repository belongs to the connection it was listed under. When the
+  // effective connection changes underneath the pick (the connection was
+  // deactivated elsewhere and the list refreshed), the pick no longer applies:
+  // saving it would pair its owner and name with a different provider.
+  const repository =
+    pickedRepository &&
+    pickedRepository.git_provider_connection_id === connectionId
+      ? pickedRepository
+      : null
 
   // The public repository the URL names, when it is one Temps can read.
   const publicTarget = useMemo(() => publicTargetOf(publicUrl), [publicUrl])
@@ -211,7 +226,9 @@ export function ConnectRepositoryPanel({
   return (
     <Form {...form}>
       <form
-        onSubmit={(event) => void form.handleSubmit(submit)(event)}
+        // Saving is only ever the Save button: Enter in a search box or any
+        // picker control must never save the repository.
+        onSubmit={(event) => event.preventDefault()}
         className="space-y-6"
       >
         <Card>
@@ -344,7 +361,11 @@ export function ConnectRepositoryPanel({
                   {failures.length > 0 ? 'Close' : 'Cancel'}
                 </Link>
               </Button>
-              <Button type="submit" disabled={!canSave}>
+              <Button
+                type="button"
+                disabled={!canSave}
+                onClick={() => void form.handleSubmit(submit)()}
+              >
                 {save.isPending && <Loader2 className="size-4 animate-spin" />}
                 {save.isPending
                   ? 'Saving…'
