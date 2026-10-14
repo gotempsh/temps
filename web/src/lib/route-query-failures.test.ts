@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import {
+  ROUTE_FAILURE_IGNORE,
   collectRouteQueryFailures,
   isReportableReadFailure,
   markReadFailureHandled,
@@ -64,6 +65,21 @@ describe('collectRouteQueryFailures', () => {
     const stop = await failedQuery(client, 'left-page', problem(500))
     stop()
     expect(collectRouteQueryFailures(client)).toHaveLength(0)
+  })
+
+  test('ignores a background read that opted out of route reporting', async () => {
+    const client = new QueryClient()
+    const observer = new QueryObserver(client, {
+      queryKey: ['optional-banner'],
+      queryFn: () => Promise.reject(problem(403, 'Forbidden')),
+      retry: false,
+      meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    })
+    const stop = observer.subscribe(() => {})
+    await observer.refetch().catch(() => {})
+    expect(client.getQueryState(['optional-banner'])?.status).toBe('error')
+    expect(collectRouteQueryFailures(client)).toHaveLength(0)
+    stop()
   })
 
   test('ignores a failed refetch that still has data to show', async () => {

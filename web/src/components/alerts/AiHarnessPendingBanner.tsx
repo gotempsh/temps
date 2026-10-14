@@ -6,6 +6,7 @@ import { ArrowRight, Terminal } from 'lucide-react'
 import { Link, useLocation } from 'react-router'
 import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 /**
  * Keeps a half-finished external harness connection visible until the
@@ -17,6 +18,9 @@ export function AiHarnessPendingBanner() {
   const { data } = useQuery({
     ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
     retry: false,
+    // An optional setup banner on every page: roles without API-key access
+    // are refused here, and that is not a failure of the page they are on.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
     refetchInterval: (query) =>
       getAiHarnessStatus(query.state.data?.api_keys) === 'waiting'
         ? 10_000

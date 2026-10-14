@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { MutationCache, QueryClient } from '@tanstack/react-query'
 import {
   installUnhandledRejectionReporter,
   markErrorReported,
   rejectionNotice,
+  wasErrorReported,
   type RejectionNotice,
 } from './unhandled-rejections'
 
@@ -102,5 +104,36 @@ describe('installUnhandledRejectionReporter', () => {
     expect(fake.listenerCount).toBe(1)
     dispose()
     expect(fake.listenerCount).toBe(0)
+  })
+})
+
+describe('mutations that handle their own failure', () => {
+  test('the mutation cache marks the error even when the mutation has its own onError', async () => {
+    const client = new QueryClient({
+      mutationCache: new MutationCache({
+        onError: (error) => markErrorReported(error),
+      }),
+    })
+    const failure = { title: 'Conflict', status: 409, detail: 'Already there' }
+    let announcedLocally = 0
+    const result = await client
+      .getMutationCache()
+      .build(client, {
+        mutationFn: async () => {
+          throw failure
+        },
+        // Replaces the client's default onError, as most pages' own do.
+        onError: () => {
+          announcedLocally += 1
+        },
+      })
+      .execute(undefined)
+      .catch((error: unknown) => error)
+    expect(result).toBe(failure)
+    expect(announcedLocally).toBe(1)
+    // The handler's `await mutateAsync` rejection is therefore not announced
+    // a second time by the unhandled-rejection reporter.
+    expect(wasErrorReported(failure)).toBe(true)
+    expect(rejectionNotice(failure)).toBeUndefined()
   })
 })

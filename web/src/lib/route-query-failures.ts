@@ -60,6 +60,14 @@ function isHandled(error: unknown): boolean {
   return error !== null && typeof error === 'object' && handledErrors.has(error)
 }
 
+/**
+ * `meta: { routeFailure: 'ignore' }` on a query that is background context
+ * rather than something the page waits on -- an optional banner's read that a
+ * role may legitimately be refused. Its failure says nothing about the page
+ * and would otherwise be reported as one on every route.
+ */
+export const ROUTE_FAILURE_IGNORE = 'ignore'
+
 export interface RouteQueryFailure {
   queryHash: string
   error: unknown
@@ -84,6 +92,7 @@ export function collectRouteQueryFailures(
         query.state.data === undefined &&
         !query.isDisabled() &&
         query.getObserversCount() > 0 &&
+        query.meta?.routeFailure !== ROUTE_FAILURE_IGNORE &&
         isReportableReadFailure(query.state.error) &&
         !isHandled(query.state.error),
     })

@@ -20,6 +20,7 @@ import {
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
 import {
+  MutationCache,
   QueryCache,
   QueryClient,
   QueryClientProvider,
@@ -1173,6 +1174,13 @@ const getErrorTitle = (
 }
 
 const queryClient = new QueryClient({
+  // Runs for every failed mutation, including those that define their own
+  // `onError` (which replaces the default one below). Whoever announces the
+  // failure, a handler that also awaits the mutation without a catch must not
+  // have it announced a second time by the unhandled-rejection reporter.
+  mutationCache: new MutationCache({
+    onError: (error) => markErrorReported(error),
+  }),
   queryCache: new QueryCache({
     onError: (error, query) => {
       // ProblemDetails response bodies never carry a "status" field -- the
@@ -1233,10 +1241,6 @@ const queryClient = new QueryClient({
     },
     mutations: {
       onError: (error: unknown, _variables, context) => {
-        // Whatever happens below, the user hears about this failure here (or
-        // in the step-up dialog). A handler that also awaits the mutation
-        // without a catch must not announce it a second time.
-        markErrorReported(error)
         const problemDetails = error as ProblemDetails
 
         // Sensitive mutations own this response: they open a step-up dialog
