@@ -23,6 +23,7 @@
 //!     (rows in `on_demand_pending`/`on_demand_issuing`/`on_demand_failed` within
 //!     the last 24h, ADR §3) so a fresh proxy doesn't re-enqueue everything.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -84,6 +85,22 @@ impl OnDemandCertProvisioner for DomainServiceProvisioner {
             .provision_on_demand(hostname, &email)
             .await
             .map_err(map_provision_error)
+    }
+
+    async fn covered_hostnames(&self, hostnames: &[String]) -> HashSet<String> {
+        match self.domain_service.find_covered_hostnames(hostnames).await {
+            Ok(covered) => covered,
+            Err(e) => {
+                // Fail open: `provision_on_demand` re-checks coverage itself, so
+                // a lookup error costs at most a skipped no-op job.
+                warn!(
+                    hosts = hostnames.len(),
+                    "on-demand TLS: certificate coverage lookup failed, pre-provisioning without it: {}",
+                    e
+                );
+                HashSet::new()
+            }
+        }
     }
 }
 
@@ -300,12 +317,14 @@ pub async fn build_on_demand_cert_manager(
         encryption_service.clone(),
     ));
     let cert_provider = Arc::new(LetsEncryptProvider::new(repository.clone()));
-    let domain_service = Arc::new(DomainService::new(
-        db.clone(),
-        cert_provider,
-        repository,
-        encryption_service,
-    ));
+    // The DNS preflight keeps an environment URL whose hostname has no DNS
+    // record yet (e.g. a base domain with only an apex record, no wildcard)
+    // from sending an order that cannot validate and spending the CA's
+    // failed-authorization budget; it takes the normal backoff ladder instead.
+    let domain_service = Arc::new(
+        DomainService::new(db.clone(), cert_provider, repository, encryption_service)
+            .with_dns_preflight(true),
+    );
 
     let provisioner: Arc<dyn OnDemandCertProvisioner> = Arc::new(DomainServiceProvisioner {
         domain_service,
