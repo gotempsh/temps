@@ -130,8 +130,11 @@ pub struct AppSettings {
     /// stored value.
     pub blob: BlobSettings,
 
-    // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
-    // auto-enabled by `temps setup` for QuickStart (sslip.io) installs.
+    // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). On for new
+    // installations (see `AppSettings::default`); a stored row that predates the
+    // section stays off via `legacy_on_demand_tls_settings`, so an upgrade never
+    // starts issuing certificates the operator was not told about.
+    #[serde(default = "legacy_on_demand_tls_settings")]
     pub on_demand_tls: OnDemandTlsSettings,
 
     // AI configuration settings (global config repo for skills, MCP servers, etc.)
@@ -1549,14 +1552,19 @@ pub struct BlobSettings {
 /// console host) that have no active cert, rather than silently failing the
 /// handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
 ///
-/// Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
-/// installs where `temps setup` auto-enables it and derives `zone`.
+/// New installations start with it on (`AppSettings::default`); the zone comes
+/// from `zone` or is derived from `external_url`/`preview_domain`, and nothing
+/// is issued while none can be derived or `external_url` is loopback. A settings
+/// row stored before this section existed stays off until the operator enables
+/// it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct OnDemandTlsSettings {
-    /// Master switch. When `false` (default) the proxy's on-demand cert gate
-    /// rejects every SNI and no issuance is ever triggered.
-    #[schema(example = false)]
+    /// Master switch. When `false` the proxy's on-demand cert gate rejects
+    /// every SNI and no issuance is ever triggered. New installations start
+    /// with it `true`; a stored settings row that predates this section keeps
+    /// `false`.
+    #[schema(example = true)]
     pub enabled: bool,
 
     /// Zone suffix for the allowlist gate. A hostname passes the gate only if
@@ -1585,6 +1593,13 @@ pub struct OnDemandTlsSettings {
     ///     which IS certed.
     #[schema(example = "http")]
     pub deployment_url_mode: String,
+}
+
+/// The value for a stored settings row that has no (or an unreadable)
+/// `on_demand_tls` section: feature off, exactly what such an install ran with
+/// before the section existed.
+fn legacy_on_demand_tls_settings() -> OnDemandTlsSettings {
+    OnDemandTlsSettings::default()
 }
 
 impl Default for OnDemandTlsSettings {
@@ -2294,7 +2309,14 @@ impl Default for AppSettings {
             preview_gateway: PreviewGatewaySettings::default(),
             kv: KvSettings::default(),
             blob: BlobSettings::default(),
-            on_demand_tls: OnDemandTlsSettings::default(),
+            // New installations opt in: stable environment URLs not covered by
+            // a wildcard certificate are ordered over HTTP-01 without any setup
+            // step. It still does nothing until a public zone can be derived and
+            // `external_url` is not loopback, so local installs are unaffected.
+            on_demand_tls: OnDemandTlsSettings {
+                enabled: true,
+                ..OnDemandTlsSettings::default()
+            },
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             trusted_private_networks: Vec::new(),
@@ -2535,9 +2557,19 @@ impl AppSettings {
                     serde_json::from_value::<ClickHouseSettings>(section.clone()).ok()
                 })
                 .unwrap_or_default();
+            // A stored section that does not parse falls back to the legacy
+            // (off) value rather than the new-install default, for the same
+            // reason `anonymous_telemetry_enabled` is preserved above.
+            let on_demand_tls = value
+                .get("on_demand_tls")
+                .and_then(|section| {
+                    serde_json::from_value::<OnDemandTlsSettings>(section.clone()).ok()
+                })
+                .unwrap_or_else(legacy_on_demand_tls_settings);
             Self {
                 anonymous_telemetry_enabled,
                 clickhouse,
+                on_demand_tls,
                 ..Self::default()
             }
         })
@@ -3508,10 +3540,43 @@ mod tests {
     }
 
     #[test]
-    fn app_settings_default_includes_on_demand_tls_disabled() {
+    fn app_settings_default_enables_on_demand_tls_for_new_installations() {
         let s = AppSettings::default();
-        assert!(!s.on_demand_tls.enabled);
+        assert!(s.on_demand_tls.enabled);
+        assert_eq!(s.on_demand_tls.zone, None);
         assert_eq!(s.on_demand_tls.deployment_url_mode, "http");
+    }
+
+    #[test]
+    fn stored_section_without_enabled_stays_off() {
+        // A partial section written by an older build keeps its explicit shape;
+        // only a wholly absent section is treated as legacy-off too.
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "on_demand_tls": { "zone": "apps.example.com" }
+        }));
+        assert!(!parsed.on_demand_tls.enabled);
+        assert_eq!(
+            parsed.on_demand_tls.zone.as_deref(),
+            Some("apps.example.com")
+        );
+    }
+
+    #[test]
+    fn explicitly_stored_opt_out_survives_a_malformed_sibling_section() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "on_demand_tls": { "enabled": false },
+            "clickhouse": "not-an-object"
+        }));
+        assert!(!parsed.on_demand_tls.enabled);
+    }
+
+    #[test]
+    fn unreadable_on_demand_section_falls_back_to_legacy_off() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "on_demand_tls": "garbage",
+            "clickhouse": "not-an-object"
+        }));
+        assert!(!parsed.on_demand_tls.enabled);
     }
 
     #[test]

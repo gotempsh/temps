@@ -17252,8 +17252,10 @@ export type OnDemandTlsSettings = {
      */
     deployment_url_mode?: string;
     /**
-     * Master switch. When `false` (default) the proxy's on-demand cert gate
-     * rejects every SNI and no issuance is ever triggered.
+     * Master switch. When `false` the proxy's on-demand cert gate rejects
+     * every SNI and no issuance is ever triggered. New installations start
+     * with it `true`; a stored settings row that predates this section keeps
+     * `false`.
      */
     enabled?: boolean;
     /**

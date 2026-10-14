@@ -36788,8 +36788,8 @@
           },
           "enabled": {
             "default": false,
-            "description": "Master switch. When `false` (default) the proxy's on-demand cert gate\nrejects every SNI and no issuance is ever triggered.",
-            "example": false,
+            "description": "Master switch. When `false` the proxy's on-demand cert gate rejects\nevery SNI and no issuance is ever triggered. New installations start\nwith it `true`; a stored settings row that predates this section keeps\n`false`.",
+            "example": true,
             "type": "boolean"
           },
           "hourly_cap": {
