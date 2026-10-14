@@ -226,10 +226,19 @@ impl IpAddressService {
                         "stored IP address was removed while being looked up; re-creating it"
                     );
                 }
-                // A failed write leaves the id unprotected, so it is not
-                // cached: the next lookup tries again.
+                // A failed write leaves the id unprotected: the cleanup could
+                // delete the row before the caller stores the id, and the
+                // insert would then fail its foreign key. Callers already
+                // treat a failed lookup as "no geolocation" for that one
+                // event, which is cheaper than losing the event, so the
+                // failure is reported instead of returning the id.
                 LastUsedWrite::Failed => {
-                    return Ok(self.refresh_if_stale(existing_ip, now).await);
+                    return Err(anyhow::anyhow!(
+                        "Could not mark IP address record {} ('{}') as in use; not returning \
+                         an id the retention cleanup may delete",
+                        id,
+                        ip_address_str
+                    ));
                 }
                 LastUsedWrite::Recorded | LastUsedWrite::NotNeeded => {
                     let info = self.refresh_if_stale(existing_ip, now).await;
@@ -322,7 +331,7 @@ impl IpAddressService {
                     ip_geolocation_id = id,
                     error = %e,
                     "could not record that a stored IP address is in use; it is served \
-                     uncached so the next lookup retries"
+                     not handed out, so the next lookup retries"
                 );
                 LastUsedWrite::Failed
             }
@@ -809,5 +818,35 @@ mod tests {
         assert_eq!(info.id, 42, "the deleted row's id must not be handed out");
         let cached = service.cache.get("203.0.113.20").await.unwrap();
         assert_eq!(cached.id, 42);
+    }
+
+    /// If the protecting write fails, the id must not be handed out: the
+    /// cleanup could delete the row before the caller inserts its event.
+    #[tokio::test]
+    async fn a_failed_last_used_write_does_not_hand_out_the_id() {
+        let now = Utc::now();
+        let mut row = stored_row(now);
+        row.id = 51;
+        row.ip_address = "203.0.113.30".to_string();
+        row.last_used_at = None;
+
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .append_exec_errors([sea_orm::DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(
+            db,
+            Arc::new(GeoIpService::Mock(crate::MockGeoIpService::new())),
+        );
+
+        let error = service
+            .get_or_create_ip("203.0.113.30")
+            .await
+            .expect_err("an unprotected id must not be returned");
+
+        assert!(error.to_string().contains("51"), "{error}");
+        assert!(service.cache.get("203.0.113.30").await.is_none());
     }
 }
