@@ -270,7 +270,14 @@ impl SandboxService {
                 reason: format!("list exited {}: {}", result.exit_code, result.stdout.trim()),
             });
         }
-        Ok(parse_list_output(path, &result.stdout))
+        // A directory the sandbox user cannot read must not look empty: the
+        // console would tell the user it has no files.
+        parse_list_output(path, &result.stdout).ok_or_else(|| SandboxError::Validation {
+            message: format!(
+                "Directory '{path}' in sandbox {public_id} cannot be listed: the sandbox \
+                 user lacks read and search permission on it"
+            ),
+        })
     }
 
     /// Write multiple files in one call. Mirrors `@vercel/sandbox`'s
@@ -395,6 +402,10 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
 /// Shell script that prints `missing`, `notdir`, `denied`, or `ok` followed by
 /// one `<k> <name>` line per entry (`k` is `f`, `d`, `l` or `o`).
 ///
+/// `denied` covers a directory the sandbox user cannot both read and search:
+/// without read permission the globs below match nothing and the directory
+/// would be reported as empty.
+///
 /// Written for busybox `sh`: no `find -printf`, no arrays. Names are expanded
 /// by the shell's own globbing relative to the directory, so none of them is
 /// ever re-parsed as part of a command line. A name containing a newline would
@@ -405,6 +416,7 @@ fn list_script(path: &str) -> String {
         "d={p}\n\
          if [ ! -e \"$d\" ]; then echo missing; exit 0; fi\n\
          if [ ! -d \"$d\" ]; then echo notdir; exit 0; fi\n\
+         if [ ! -r \"$d\" ] || [ ! -x \"$d\" ]; then echo denied; exit 0; fi\n\
          cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
          echo ok\n\
          n=0\n\
@@ -421,9 +433,13 @@ fn list_script(path: &str) -> String {
     )
 }
 
-/// Turn the output of [`list_script`] into a [`DirListing`].
-fn parse_list_output(path: &str, stdout: &str) -> DirListing {
-    let mut lines = stdout.lines();
+/// Turn the output of [`list_script`] into a [`DirListing`], or `None` when
+/// the directory exists but the sandbox user may not read it.
+///
+/// Lines are split on `\n` alone: `str::lines` also strips a trailing `\r`,
+/// which is a legal last byte of a file name and would rename the entry.
+fn parse_list_output(path: &str, stdout: &str) -> Option<DirListing> {
+    let mut lines = stdout.split('\n');
     let status = lines.next().map(str::trim).unwrap_or("");
     let listing = |exists: bool, is_dir: bool| DirListing {
         path: path.to_string(),
@@ -433,11 +449,9 @@ fn parse_list_output(path: &str, stdout: &str) -> DirListing {
         truncated: false,
     };
     match status {
-        "missing" => return listing(false, false),
-        // A directory the sandbox user cannot enter: it exists and is a
-        // directory, its contents just are not visible.
-        "denied" => return listing(true, true),
-        "notdir" => return listing(true, false),
+        "missing" => return Some(listing(false, false)),
+        "denied" => return None,
+        "notdir" => return Some(listing(true, false)),
         _ => {}
     }
 
@@ -468,11 +482,11 @@ fn parse_list_output(path: &str, stdout: &str) -> DirListing {
         let b_dir = b.kind == DirEntryKind::Directory;
         b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
     });
-    DirListing {
+    Some(DirListing {
         entries,
         truncated,
         ..listing(true, true)
-    }
+    })
 }
 
 /// POSIX single-quote escape — see `exec::shell_escape`. Duplicated here
@@ -615,14 +629,32 @@ mod tests {
 
     #[test]
     fn parse_list_reports_missing_and_not_a_directory() {
-        let missing = parse_list_output("/nope", "missing\n");
+        let missing = parse_list_output("/nope", "missing\n").expect("a listing");
         assert!(!missing.exists && !missing.is_dir && missing.entries.is_empty());
 
-        let file = parse_list_output("/etc/hosts", "notdir\n");
+        let file = parse_list_output("/etc/hosts", "notdir\n").expect("a listing");
         assert!(file.exists && !file.is_dir && file.entries.is_empty());
+    }
 
-        let denied = parse_list_output("/root", "denied\n");
-        assert!(denied.exists && denied.is_dir && denied.entries.is_empty());
+    #[test]
+    fn parse_list_does_not_turn_a_denied_directory_into_an_empty_one() {
+        assert!(parse_list_output("/root", "denied\n").is_none());
+    }
+
+    #[test]
+    fn list_script_refuses_a_directory_it_cannot_read_and_search() {
+        let script = list_script("/root");
+        assert!(
+            script.contains("[ ! -r \"$d\" ] || [ ! -x \"$d\" ]"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn parse_list_keeps_a_trailing_carriage_return_in_a_name() {
+        let listing = parse_list_output("/work", "ok\nf config\nf config\r\n").expect("a listing");
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["config", "config\r"]);
     }
 
     #[test]
@@ -630,7 +662,8 @@ mod tests {
         let listing = parse_list_output(
             "/work",
             "ok\nf zebra.txt\nd src\nl current\nf  leading space\no fifo\nd .git\n",
-        );
+        )
+        .expect("a listing");
         let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
@@ -650,7 +683,8 @@ mod tests {
 
     #[test]
     fn parse_list_ignores_malformed_lines() {
-        let listing = parse_list_output("/work", "ok\nx unknown-kind\nnospace\nf \nf real\n");
+        let listing = parse_list_output("/work", "ok\nx unknown-kind\nnospace\nf \nf real\n")
+            .expect("a listing");
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].name, "real");
     }
@@ -661,7 +695,7 @@ mod tests {
         for i in 0..=MAX_LIST_ENTRIES {
             out.push_str(&format!("f file-{i:05}\n"));
         }
-        let listing = parse_list_output("/big", &out);
+        let listing = parse_list_output("/big", &out).expect("a listing");
         assert!(listing.truncated);
         assert_eq!(listing.entries.len(), MAX_LIST_ENTRIES);
 
@@ -671,7 +705,8 @@ mod tests {
                 .take(MAX_LIST_ENTRIES + 1)
                 .collect::<Vec<_>>()
                 .join("\n"),
-        );
+        )
+        .expect("a listing");
         assert!(!exact.truncated, "exactly the cap is not truncated");
     }
 }

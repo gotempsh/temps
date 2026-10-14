@@ -2561,8 +2561,9 @@ pub async fn stat_path(
     params(("path" = String, Query, description = "Absolute path of a directory inside the sandbox")),
     responses(
         (status = 200, description = "Directory entries (exists=false when missing, is_dir=false for a file — not errors)", body = DirectoryListingResponse),
-        (status = 400, description = "Validation error"),
-        (status = 404, description = "Sandbox not found")
+        (status = 400, description = "Validation error, or the directory is not readable by the sandbox user"),
+        (status = 404, description = "Sandbox not found"),
+        (status = 409, description = "Sandbox is not running (stopped or paused), so its filesystem cannot be listed")
     ),
     security(("bearer_auth" = []))
 )]

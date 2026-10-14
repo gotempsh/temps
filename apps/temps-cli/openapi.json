@@ -133239,10 +133239,13 @@
             "description": "Directory entries (exists=false when missing, is_dir=false for a file — not errors)"
           },
           "400": {
-            "description": "Validation error"
+            "description": "Validation error, or the directory is not readable by the sandbox user"
           },
           "404": {
             "description": "Sandbox not found"
+          },
+          "409": {
+            "description": "Sandbox is not running (stopped or paused), so its filesystem cannot be listed"
           }
         },
         "security": [

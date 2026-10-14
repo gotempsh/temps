@@ -72563,13 +72563,17 @@ export type ListDirData = {
 
 export type ListDirErrors = {
     /**
-     * Validation error
+     * Validation error, or the directory is not readable by the sandbox user
      */
     400: unknown;
     /**
      * Sandbox not found
      */
     404: unknown;
+    /**
+     * Sandbox is not running (stopped or paused), so its filesystem cannot be listed
+     */
+    409: unknown;
 };
 
 export type ListDirResponses = {
