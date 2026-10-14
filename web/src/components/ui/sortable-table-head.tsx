@@ -34,15 +34,17 @@ export function SortableTableHead({
       aria-sort={
         active ? (direction === 'asc' ? 'ascending' : 'descending') : undefined
       }
-      className={cn(align === 'right' && 'text-right', className)}
+      // The button fills the cell (padding moves from the cell to the
+      // button) so the whole header is the click target, not just its label.
+      className={cn('p-0', align === 'right' && 'text-right', className)}
     >
       <button
         type="button"
         onClick={onClick}
         aria-label={`Sort by ${label}, ${nextDirection}`}
         className={cn(
-          'inline-flex items-center gap-1 rounded py-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
-          align === 'right' && 'ml-auto',
+          'flex h-full min-h-12 w-full items-center gap-1 rounded px-4 py-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+          align === 'right' && 'justify-end',
           active && 'text-foreground'
         )}
       >
