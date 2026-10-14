@@ -46,6 +46,14 @@ const BATCH_SIZE: i64 = 500;
 const MAX_BATCHES_PER_RUN: usize = 200;
 /// Pause between batches, so the sweep yields to ingest.
 const BATCH_PAUSE: Duration = Duration::from_millis(200);
+/// Ceiling for `timescaledb.max_tuples_decompressed_per_dml_transaction` in a
+/// visitor batch. The server default (100 000) is too low for the rows a
+/// batch of visitors can own; "unlimited" (0) would let one batch decompress
+/// whatever the oldest chunks hold. At most a few hundred MB of tuples.
+const DECOMPRESSION_LIMIT: i64 = 500_000;
+/// Visitors skipped for exceeding [`DECOMPRESSION_LIMIT`] on their own before
+/// the pass gives up, so a systemic misconfiguration cannot run all pass.
+const MAX_OVERSIZED_VISITORS: usize = 20;
 
 /// Tables whose retention is a TimescaleDB policy managed here.
 const EVENTS_TABLE: &str = "events";
@@ -140,6 +148,31 @@ impl IpCursor {
 struct IpWindowRow {
     id: i32,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct IdRow {
+    id: i32,
+}
+
+/// Outcome of one visitor delete statement.
+#[derive(Debug)]
+enum VisitorBatch {
+    Deleted {
+        deleted: u64,
+        candidates: usize,
+    },
+    /// TimescaleDB refused the statement for decompressing too many tuples.
+    OverLimit {
+        ids: Vec<i32>,
+    },
+}
+
+/// Whether `error` is TimescaleDB's decompression guard on a DML statement.
+fn is_decompression_limit(error: &DbErr) -> bool {
+    error
+        .to_string()
+        .contains("tuple decompression limit exceeded")
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -320,33 +353,73 @@ impl AnalyticsRetentionService {
     /// Delete visitors last seen before `cutoff`, at most
     /// `BATCH_SIZE * MAX_BATCHES_PER_RUN` per call. Returns the rows deleted.
     ///
-    /// Each batch is one transaction. Two things about it are deliberate:
+    /// Each batch is one transaction. Three things about it are deliberate:
     ///
-    /// - The outer `DELETE` repeats the age test. The candidate subquery sees
-    ///   the snapshot the statement started with, so a visitor that returned
-    ///   (ingestion advanced `last_seen`) while the batch was running would
-    ///   otherwise still be in the candidate set; PostgreSQL re-evaluates the
-    ///   *target* row's predicate after waiting for the concurrent update, so
-    ///   with it the refreshed visitor is kept.
+    /// - The `DELETE` repeats the age test. The candidate ids were read in
+    ///   their own statement, so a visitor that returned (ingestion advanced
+    ///   `last_seen`) in between would otherwise still be deleted; PostgreSQL
+    ///   re-evaluates the *target* row's predicate after waiting for the
+    ///   concurrent update, so with it the refreshed visitor is kept.
     /// - Deleting a visitor rewrites every `error_events`/`events`/`proxy_logs`
     ///   row that points at it (`ON DELETE SET NULL`). Those hypertables are
-    ///   compressed, and TimescaleDB aborts a statement that has to
-    ///   decompress more than `max_tuples_decompressed_per_dml_transaction`
-    ///   tuples (100 000 by default) -- which would fail this batch, and the
-    ///   same oldest batch on every later pass. The limit is lifted for this
-    ///   transaction only; the work stays bounded by `BATCH_SIZE` parents.
+    ///   compressed, and TimescaleDB aborts a statement that has to decompress
+    ///   more than `max_tuples_decompressed_per_dml_transaction` tuples (100 000
+    ///   by default) -- which would fail this batch, and the same oldest batch
+    ///   on every later pass. The limit is raised to [`DECOMPRESSION_LIMIT`]
+    ///   for this transaction only, never removed, so memory stays bounded.
+    /// - A batch that still hits the limit is retried at half the size. A
+    ///   single visitor that exceeds it on its own is left in place for this
+    ///   pass (and logged) instead of failing the pass or being retried
+    ///   forever in front of everything behind it.
     pub async fn purge_visitors(
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<u64, AnalyticsRetentionError> {
         let mut total = 0u64;
-        for batch in 0..MAX_BATCHES_PER_RUN {
-            let deleted = self.purge_visitor_batch(cutoff).await?;
-            total += deleted;
-            if deleted < BATCH_SIZE as u64 {
-                break;
+        let mut batch_size = BATCH_SIZE;
+        // Visitors whose own child rows exceed the decompression limit. Local
+        // to the pass, so a later pass (or a raised server limit) retries them.
+        let mut oversized: Vec<i32> = Vec::new();
+
+        for statement in 0..MAX_BATCHES_PER_RUN {
+            match self
+                .purge_visitor_batch(cutoff, batch_size, &oversized)
+                .await?
+            {
+                VisitorBatch::Deleted {
+                    deleted,
+                    candidates,
+                } => {
+                    total += deleted;
+                    if (candidates as i64) < batch_size {
+                        break;
+                    }
+                }
+                VisitorBatch::OverLimit { ids } if ids.len() == 1 => {
+                    warn!(
+                        visitor_id = ids[0],
+                        limit = DECOMPRESSION_LIMIT,
+                        "visitor has more related rows than the decompression limit allows                          in one transaction; leaving it in place for this pass"
+                    );
+                    oversized.extend(ids);
+                    if oversized.len() >= MAX_OVERSIZED_VISITORS {
+                        warn!(
+                            skipped = oversized.len(),
+                            "ending the visitor retention pass: too many visitors exceed the                              decompression limit; raise \
+                             timescaledb.max_tuples_decompressed_per_dml_transaction"
+                        );
+                        break;
+                    }
+                }
+                VisitorBatch::OverLimit { ids } => {
+                    batch_size = (ids.len() as i64 / 2).max(1);
+                    debug!(
+                        batch_size,
+                        "visitor batch exceeded the decompression limit; retrying smaller"
+                    );
+                }
             }
-            if batch + 1 < MAX_BATCHES_PER_RUN {
+            if statement + 1 < MAX_BATCHES_PER_RUN {
                 tokio::time::sleep(BATCH_PAUSE).await;
             }
         }
@@ -356,7 +429,9 @@ impl AnalyticsRetentionService {
     async fn purge_visitor_batch(
         &self,
         cutoff: DateTime<Utc>,
-    ) -> Result<u64, AnalyticsRetentionError> {
+        batch_size: i64,
+        skip: &[i32],
+    ) -> Result<VisitorBatch, AnalyticsRetentionError> {
         let operation = || format!("delete visitors last seen before {cutoff}");
         let txn = self
             .db
@@ -367,29 +442,62 @@ impl AnalyticsRetentionService {
         // `set_config(.., true)` is `SET LOCAL`. Guarded by `pg_settings` so
         // that a server without the setting (older TimescaleDB, or none) is
         // left alone instead of failing on an unknown parameter.
-        txn.execute(Statement::from_string(
+        txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT set_config('timescaledb.max_tuples_decompressed_per_dml_transaction', '0', true) \
+            "SELECT set_config('timescaledb.max_tuples_decompressed_per_dml_transaction', $1, true) \
              WHERE EXISTS (SELECT 1 FROM pg_settings \
                            WHERE name = 'timescaledb.max_tuples_decompressed_per_dml_transaction')",
+            [DECOMPRESSION_LIMIT.to_string().into()],
         ))
         .await
         .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
 
+        let ids: Vec<i32> = IdRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM visitor WHERE last_seen < $1 AND id <> ALL($3::int4[]) \
+             ORDER BY last_seen ASC LIMIT $2",
+            [cutoff.into(), batch_size.into(), skip.to_vec().into()],
+        ))
+        .all(&txn)
+        .await
+        .map_err(|source| AnalyticsRetentionError::database(operation(), source))?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+        if ids.is_empty() {
+            txn.commit()
+                .await
+                .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+            return Ok(VisitorBatch::Deleted {
+                deleted: 0,
+                candidates: 0,
+            });
+        }
+
         let result = txn
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "DELETE FROM visitor WHERE last_seen < $1 AND id IN ( \
-                     SELECT id FROM visitor WHERE last_seen < $1 \
-                     ORDER BY last_seen ASC LIMIT $2)",
-                [cutoff.into(), BATCH_SIZE.into()],
+                "DELETE FROM visitor WHERE last_seen < $1 AND id = ANY($2::int4[])",
+                [cutoff.into(), ids.clone().into()],
             ))
-            .await
-            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
-        txn.commit()
-            .await
-            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
-        Ok(result.rows_affected())
+            .await;
+        match result {
+            Ok(result) => {
+                txn.commit()
+                    .await
+                    .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+                Ok(VisitorBatch::Deleted {
+                    deleted: result.rows_affected(),
+                    candidates: ids.len(),
+                })
+            }
+            Err(source) if is_decompression_limit(&source) => {
+                // The transaction is aborted; dropping it rolls it back.
+                drop(txn);
+                Ok(VisitorBatch::OverLimit { ids })
+            }
+            Err(source) => Err(AnalyticsRetentionError::database(operation(), source)),
+        }
     }
 
     /// Delete stored IP addresses that nothing references and that were last
@@ -628,19 +736,31 @@ mod tests {
         }
     }
 
+    fn exec_ok(rows_affected: u64) -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected,
+        }
+    }
+
+    fn id_rows(
+        ids: impl IntoIterator<Item = i32>,
+    ) -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        ids.into_iter()
+            .map(|id| std::collections::BTreeMap::from([("id", sea_orm::Value::Int(Some(id)))]))
+            .collect()
+    }
+
+    fn decompression_limit_error() -> DbErr {
+        DbErr::Custom("tuple decompression limit exceeded by operation".into())
+    }
+
     #[tokio::test]
     async fn purge_visitors_stops_after_a_short_batch() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results([
-                MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                },
-                MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 7,
-                },
-            ])
+            .append_query_results([id_rows(1..=7)])
+            // set_config, then the DELETE
+            .append_exec_results([exec_ok(0), exec_ok(7)])
             .into_connection();
         let service = mock_service(db);
 
@@ -657,20 +777,12 @@ mod tests {
         let cutoff = Utc::now() - chrono::Duration::days(425);
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([
-                    MockExecResult {
-                        last_insert_id: 0,
-                        rows_affected: 0,
-                    },
-                    MockExecResult {
-                        last_insert_id: 0,
-                        rows_affected: 0,
-                    },
-                ])
+                .append_query_results([id_rows([9])])
+                .append_exec_results([exec_ok(0), exec_ok(1)])
                 .into_connection(),
         );
         let service = AnalyticsRetentionService::new(db.clone());
-        service.purge_visitors(cutoff).await.expect("empty pass");
+        service.purge_visitors(cutoff).await.expect("one visitor");
         drop(service);
 
         let log = Arc::try_unwrap(db)
@@ -679,23 +791,25 @@ mod tests {
         assert_eq!(log.len(), 1, "one transaction per batch");
         let rendered = format!("{log:?}");
         assert!(
-            rendered.contains("DELETE FROM visitor WHERE last_seen < $1 AND id IN"),
+            rendered.contains("DELETE FROM visitor WHERE last_seen < $1 AND id = ANY($2"),
             "the target row repeats the age test: {rendered}"
         );
         assert!(rendered.contains("LIMIT $2"), "{rendered}");
         assert!(
             rendered.contains("max_tuples_decompressed_per_dml_transaction"),
-            "the decompression limit is lifted for the batch: {rendered}"
+            "the decompression limit is raised for the batch: {rendered}"
+        );
+        assert!(
+            rendered.contains(&DECOMPRESSION_LIMIT.to_string()),
+            "the limit is finite, not unlimited: {rendered}"
         );
     }
 
     #[tokio::test]
     async fn purge_visitors_reports_the_failed_operation() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results([MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
+            .append_query_results([id_rows([1])])
+            .append_exec_results([exec_ok(0)])
             .append_exec_errors([DbErr::Custom("deadlock detected".into())])
             .into_connection();
         let service = mock_service(db);
@@ -711,6 +825,54 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("deadlock detected"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_over_the_decompression_limit_is_retried_smaller() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // First attempt: a full batch that the server refuses. Second: the
+            // halved batch, which is short and finishes the pass.
+            .append_query_results([id_rows(1..=BATCH_SIZE as i32), id_rows(1..=3)])
+            .append_exec_results([exec_ok(0)])
+            .append_exec_errors([decompression_limit_error()])
+            .append_exec_results([exec_ok(0), exec_ok(3)])
+            .into_connection();
+        let service = mock_service(db);
+
+        let deleted = service
+            .purge_visitors(Utc::now())
+            .await
+            .expect("the limit is handled, not surfaced");
+
+        assert_eq!(deleted, 3);
+    }
+
+    #[tokio::test]
+    async fn one_visitor_over_the_limit_is_skipped_not_fatal() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The single candidate is refused; the next selection (which
+            // excludes it) is empty, so the pass ends cleanly.
+            .append_query_results([id_rows([5]), id_rows([])])
+            .append_exec_results([exec_ok(0)])
+            .append_exec_errors([decompression_limit_error()])
+            .append_exec_results([exec_ok(0)])
+            .into_connection();
+        let service = mock_service(db);
+
+        let deleted = service
+            .purge_visitors(Utc::now())
+            .await
+            .expect("an oversized visitor must not fail the pass");
+
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn only_the_decompression_guard_is_treated_as_a_limit() {
+        assert!(is_decompression_limit(&decompression_limit_error()));
+        assert!(!is_decompression_limit(&DbErr::Custom(
+            "deadlock detected".into()
+        )));
     }
 
     #[tokio::test]
