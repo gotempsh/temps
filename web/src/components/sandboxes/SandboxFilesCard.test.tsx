@@ -768,13 +768,19 @@ test('a backend with undocumented write semantics gets a hedged warning', async 
 
 const WORK_DIR = '/home/temps/workspace'
 
-function listing(path: string, entries: { name: string; kind: string }[]) {
+function listing(
+  path: string,
+  entries: { name: string; kind: string }[],
+  paging: { page?: number; has_more?: boolean } = {}
+) {
   return jsonResponse({
     path,
     exists: true,
     is_dir: true,
     entries,
-    truncated: false,
+    page: paging.page ?? 1,
+    page_size: 100,
+    has_more: paging.has_more ?? false,
   })
 }
 
@@ -866,20 +872,65 @@ test('a stopped sandbox is never asked for a listing', () => {
   api.restore()
 })
 
-test('a truncated listing tells the operator the rest is not shown', async () => {
+test('a long directory is read one page at a time', async () => {
+  const requested: string[] = []
   const api = mockApi({
-    'GET /v1/sandboxes/sbx_1/fs/list': () =>
-      jsonResponse({
-        path: WORK_DIR,
-        exists: true,
-        is_dir: true,
-        entries: [{ name: 'a.txt', kind: 'file' }],
-        truncated: true,
-      }),
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) => {
+      const page = Number(new URL(request.url).searchParams.get('page') ?? '1')
+      requested.push(`${page}`)
+      return page === 1
+        ? listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
+            page: 1,
+            has_more: true,
+          })
+        : listing(WORK_DIR, [{ name: 'b.txt', kind: 'file' }], { page: 2 })
+    },
   })
   const view = renderCard()
 
-  await view.findByText(/Only the first 1 entries are shown/)
+  await view.findByRole('button', { name: /a\.txt/ })
+  const previous = view.getByRole('button', {
+    name: 'Previous page',
+  }) as HTMLButtonElement
+  expect(previous.disabled).toBe(true)
+  fireEvent.click(view.getByRole('button', { name: 'Next page' }))
+
+  await view.findByRole('button', { name: /b\.txt/ })
+  expect(requested).toEqual(['1', '2'])
+  expect(
+    (view.getByRole('button', { name: 'Next page' }) as HTMLButtonElement)
+      .disabled
+  ).toBe(true)
+  api.restore()
+})
+
+test('entering a directory starts again from its first page', async () => {
+  const pages: Record<string, string[]> = {}
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) => {
+      const url = new URL(request.url)
+      const path = url.searchParams.get('path') ?? ''
+      const page = url.searchParams.get('page') ?? '1'
+      pages[path] = [...(pages[path] ?? []), page]
+      if (path === WORK_DIR) {
+        return page === '1'
+          ? listing(WORK_DIR, [{ name: 'src', kind: 'directory' }], {
+              page: 1,
+              has_more: true,
+            })
+          : listing(WORK_DIR, [{ name: 'z', kind: 'directory' }], { page: 2 })
+      }
+      return listing(path, [{ name: 'main.ts', kind: 'file' }])
+    },
+  })
+  const view = renderCard()
+
+  await view.findByRole('button', { name: /src/ })
+  fireEvent.click(view.getByRole('button', { name: 'Next page' }))
+  fireEvent.click(await view.findByRole('button', { name: /^z/ }))
+
+  await view.findByRole('button', { name: /main\.ts/ })
+  expect(pages[`${WORK_DIR}/z`]).toEqual(['1'])
   api.restore()
 })
 

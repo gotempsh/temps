@@ -17107,7 +17107,7 @@
       "DirectoryListingResponse": {
         "properties": {
           "entries": {
-            "description": "Directories first, then names in byte order.",
+            "description": "Directories first, then everything else, each group in byte order of\nthe name. One page of the directory.",
             "items": {
               "$ref": "#/components/schemas/DirectoryEntry"
             },
@@ -17117,16 +17117,26 @@
             "description": "`false` when the path does not exist (not an error).",
             "type": "boolean"
           },
+          "has_more": {
+            "description": "More entries exist after this page.",
+            "type": "boolean"
+          },
           "is_dir": {
             "description": "`false` when the path exists but is not a directory.",
             "type": "boolean"
           },
+          "page": {
+            "description": "1-based page these entries are.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Entries per page that was applied (default 20, at most 100).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "path": {
             "type": "string"
-          },
-          "truncated": {
-            "description": "More than the listing cap exist; `entries` holds the first of them.",
-            "type": "boolean"
           }
         },
         "required": [
@@ -17134,7 +17144,9 @@
           "exists",
           "is_dir",
           "entries",
-          "truncated"
+          "page",
+          "page_size",
+          "has_more"
         ],
         "type": "object"
       },
@@ -133219,6 +133231,26 @@
             }
           },
           {
+            "description": "1-based page (default 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page (default 20, max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
             "in": "path",
             "name": "id",
             "required": true,
@@ -133236,7 +133268,7 @@
                 }
               }
             },
-            "description": "Directory entries (exists=false when missing, is_dir=false for a file — not errors)"
+            "description": "One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)"
           },
           "400": {
             "description": "Validation error, or the directory is not readable by the sandbox user"

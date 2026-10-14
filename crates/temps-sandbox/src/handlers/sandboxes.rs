@@ -1037,6 +1037,10 @@ impl From<StatInfo> for StatResponse {
 #[serde(deny_unknown_fields)]
 pub struct ListDirQuery {
     pub path: String,
+    /// 1-based page. Defaults to 1.
+    pub page: Option<usize>,
+    /// Entries per page. Defaults to 20, at most 100.
+    pub page_size: Option<usize>,
 }
 
 /// What a directory entry is. Symlinks are reported, never followed.
@@ -1063,10 +1067,15 @@ pub struct DirectoryListingResponse {
     pub exists: bool,
     /// `false` when the path exists but is not a directory.
     pub is_dir: bool,
-    /// Directories first, then names in byte order.
+    /// Directories first, then everything else, each group in byte order of
+    /// the name. One page of the directory.
     pub entries: Vec<DirectoryEntry>,
-    /// More than the listing cap exist; `entries` holds the first of them.
-    pub truncated: bool,
+    /// 1-based page these entries are.
+    pub page: usize,
+    /// Entries per page that was applied (default 20, at most 100).
+    pub page_size: usize,
+    /// More entries exist after this page.
+    pub has_more: bool,
 }
 
 impl From<crate::services::fs::DirListing> for DirectoryListingResponse {
@@ -1089,7 +1098,9 @@ impl From<crate::services::fs::DirListing> for DirectoryListingResponse {
                     },
                 })
                 .collect(),
-            truncated: listing.truncated,
+            page: listing.page,
+            page_size: listing.page_size,
+            has_more: listing.has_more,
         }
     }
 }
@@ -2558,9 +2569,13 @@ pub async fn stat_path(
     tag = "Sandboxes",
     get,
     path = "/v1/sandboxes/{id}/fs/list",
-    params(("path" = String, Query, description = "Absolute path of a directory inside the sandbox")),
+    params(
+        ("path" = String, Query, description = "Absolute path of a directory inside the sandbox"),
+        ("page" = Option<usize>, Query, description = "1-based page (default 1)"),
+        ("page_size" = Option<usize>, Query, description = "Entries per page (default 20, max 100)")
+    ),
     responses(
-        (status = 200, description = "Directory entries (exists=false when missing, is_dir=false for a file — not errors)", body = DirectoryListingResponse),
+        (status = 200, description = "One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)", body = DirectoryListingResponse),
         (status = 400, description = "Validation error, or the directory is not readable by the sandbox user"),
         (status = 404, description = "Sandbox not found"),
         (status = 409, description = "Sandbox is not running (stopped or paused), so its filesystem cannot be listed")
@@ -2576,7 +2591,7 @@ pub async fn list_dir(
     sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::ProjectsRead)?;
     let listing = state
         .sandbox_service
-        .fs_list(&id, auth.user_id(), &q.path)
+        .fs_list(&id, auth.user_id(), &q.path, q.page, q.page_size)
         .await?;
     Ok(Json(DirectoryListingResponse::from(listing)))
 }
@@ -3328,6 +3343,13 @@ mod tests {
     }
 
     #[test]
+    fn list_dir_query_accepts_paging() {
+        let query: ListDirQuery =
+            serde_json::from_str(r#"{"path":"/a","page":3,"page_size":50}"#).expect("parses");
+        assert_eq!((query.page, query.page_size), (Some(3), Some(50)));
+    }
+
+    #[test]
     fn list_dir_response_uses_snake_case_kinds_and_keeps_order() {
         use crate::services::fs::{DirEntry, DirEntryKind, DirListing};
         let response = DirectoryListingResponse::from(DirListing {
@@ -3344,12 +3366,16 @@ mod tests {
                     kind: DirEntryKind::Symlink,
                 },
             ],
-            truncated: true,
+            page: 2,
+            page_size: 20,
+            has_more: true,
         });
         let json = serde_json::to_value(&response).expect("serializes");
         assert_eq!(json["entries"][0]["kind"], "directory");
         assert_eq!(json["entries"][1]["kind"], "symlink");
-        assert_eq!(json["truncated"], true);
+        assert_eq!(json["page"], 2);
+        assert_eq!(json["page_size"], 20);
+        assert_eq!(json["has_more"], true);
     }
 
     #[test]

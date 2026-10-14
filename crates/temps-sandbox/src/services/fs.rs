@@ -30,10 +30,22 @@ pub struct StatInfo {
     pub size: u64,
 }
 
-/// Most entries one directory listing returns. A directory with more is
-/// reported as `truncated` rather than streamed without bound: the listing is
-/// held in memory on the control plane and rendered by a browser.
-pub const MAX_LIST_ENTRIES: usize = 1000;
+/// Entries per page when the caller does not ask for a size.
+pub const DEFAULT_LIST_PAGE_SIZE: usize = 20;
+/// Most entries one page returns. A directory with more is read one page at a
+/// time: a page is held in memory on the control plane and rendered by a
+/// browser, so no request can make either side hold the whole directory.
+pub const MAX_LIST_PAGE_SIZE: usize = 100;
+
+/// Clamp a requested page and page size to what the endpoint serves.
+pub fn list_page_bounds(page: Option<usize>, page_size: Option<usize>) -> (usize, usize) {
+    (
+        page.unwrap_or(1).max(1),
+        page_size
+            .unwrap_or(DEFAULT_LIST_PAGE_SIZE)
+            .clamp(1, MAX_LIST_PAGE_SIZE),
+    )
+}
 
 /// What a directory entry is, without following a symlink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +69,14 @@ pub struct DirListing {
     pub path: String,
     pub exists: bool,
     pub is_dir: bool,
-    /// Directories first, then names in byte order. At most
-    /// [`MAX_LIST_ENTRIES`].
+    /// One page: directories first, then everything else, each group in byte
+    /// order of the name. At most `page_size` entries.
     pub entries: Vec<DirEntry>,
-    /// The directory holds more than [`MAX_LIST_ENTRIES`] entries.
-    pub truncated: bool,
+    /// 1-based page these entries are.
+    pub page: usize,
+    pub page_size: usize,
+    /// Entries exist after this page.
+    pub has_more: bool,
 }
 
 /// One entry in a batched filesystem write.
@@ -244,8 +259,11 @@ impl SandboxService {
         public_id: &str,
         user_id: i32,
         path: &str,
+        page: Option<usize>,
+        page_size: Option<usize>,
     ) -> Result<DirListing, SandboxError> {
         validate_absolute(path, "list")?;
+        let (page, page_size) = list_page_bounds(page, page_size);
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
         self.touch(internal_id, row.timeout_secs).await;
         let handle = self
@@ -254,7 +272,11 @@ impl SandboxService {
             .await
             .map_err(|e| Self::provider_err(public_id, e))?;
 
-        let cmd = vec!["sh".into(), "-c".into(), list_script(path)];
+        let cmd = vec![
+            "sh".into(),
+            "-c".into(),
+            list_script(path, (page - 1).saturating_mul(page_size), page_size),
+        ];
         let result = self
             .registry()
             .provider()
@@ -272,11 +294,13 @@ impl SandboxService {
         }
         // A directory the sandbox user cannot read must not look empty: the
         // console would tell the user it has no files.
-        parse_list_output(path, &result.stdout).ok_or_else(|| SandboxError::Validation {
-            message: format!(
-                "Directory '{path}' in sandbox {public_id} cannot be listed: the sandbox \
+        parse_list_output(path, &result.stdout, page, page_size).ok_or_else(|| {
+            SandboxError::Validation {
+                message: format!(
+                    "Directory '{path}' in sandbox {public_id} cannot be listed: the sandbox \
                  user lacks read and search permission on it"
-            ),
+                ),
+            }
         })
     }
 
@@ -402,34 +426,60 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
 /// Shell script that prints `missing`, `notdir`, `denied`, or `ok` followed by
 /// one `<k> <name>` line per entry (`k` is `f`, `d`, `l` or `o`).
 ///
-/// `denied` covers a directory the sandbox user cannot both read and search:
-/// without read permission the globs below match nothing and the directory
-/// would be reported as empty.
+/// `denied` covers a directory the sandbox user cannot both read and search,
+/// and a path hidden behind an ancestor it cannot search: without read
+/// permission the globs below match nothing, and `[ -e ]` is false for
+/// anything under a locked parent, so either would be reported as empty or
+/// missing.
+///
+/// Only one page leaves the sandbox: the first `skip` entries are counted and
+/// dropped, and the scan stops after `want` (one more than the page, so the
+/// caller can tell "exactly a page" from "more than a page"). Directories are
+/// emitted first, in a second pass the rest, so the order is the same for
+/// every page of the same directory. `LC_ALL=C` makes the glob order bytewise
+/// instead of locale dependent.
 ///
 /// Written for busybox `sh`: no `find -printf`, no arrays. Names are expanded
 /// by the shell's own globbing relative to the directory, so none of them is
 /// ever re-parsed as part of a command line. A name containing a newline would
-/// break the line framing and is skipped. One entry past the cap is emitted so
-/// the caller can tell "exactly the cap" from "more than the cap".
-fn list_script(path: &str) -> String {
+/// break the line framing and is skipped.
+fn list_script(path: &str, skip: usize, page_size: usize) -> String {
     format!(
-        "d={p}\n\
-         if [ ! -e \"$d\" ]; then echo missing; exit 0; fi\n\
+        "LC_ALL=C; export LC_ALL\n\
+         d={p}\n\
+         if [ ! -e \"$d\" ]; then\n\
+           a=$d\n\
+           while [ \"$a\" != / ]; do\n\
+             a=${{a%/*}}\n\
+             if [ -z \"$a\" ]; then a=/; fi\n\
+             if [ -d \"$a\" ] && [ ! -x \"$a\" ]; then echo denied; exit 0; fi\n\
+           done\n\
+           echo missing; exit 0\n\
+         fi\n\
          if [ ! -d \"$d\" ]; then echo notdir; exit 0; fi\n\
          if [ ! -r \"$d\" ] || [ ! -x \"$d\" ]; then echo denied; exit 0; fi\n\
          cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
          echo ok\n\
+         seen=0\n\
          n=0\n\
-         for f in .[!.]* ..?* *; do\n\
-           if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi\n\
-           case \"$f\" in *'\n'*) continue;; esac\n\
-           if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; elif [ -f \"$f\" ]; then k=f; else k=o; fi\n\
-           printf '%s %s\\n' \"$k\" \"$f\"\n\
-           n=$((n+1))\n\
-           if [ \"$n\" -gt {cap} ]; then break; fi\n\
+         for pass in d o; do\n\
+           for f in .[!.]* ..?* *; do\n\
+             if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi\n\
+             case \"$f\" in *'\n'*) continue;; esac\n\
+             if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; elif [ -f \"$f\" ]; then k=f; else k=o; fi\n\
+             if [ \"$pass\" = d ]; then\n\
+               if [ \"$k\" != d ]; then continue; fi\n\
+             elif [ \"$k\" = d ]; then continue; fi\n\
+             seen=$((seen+1))\n\
+             if [ \"$seen\" -le {skip} ]; then continue; fi\n\
+             printf '%s %s\\n' \"$k\" \"$f\"\n\
+             n=$((n+1))\n\
+             if [ \"$n\" -gt {page_size} ]; then break 2; fi\n\
+           done\n\
          done\n",
         p = shell_quote(path),
-        cap = MAX_LIST_ENTRIES,
+        skip = skip,
+        page_size = page_size,
     )
 }
 
@@ -437,8 +487,14 @@ fn list_script(path: &str) -> String {
 /// the directory exists but the sandbox user may not read it.
 ///
 /// Lines are split on `\n` alone: `str::lines` also strips a trailing `\r`,
-/// which is a legal last byte of a file name and would rename the entry.
-fn parse_list_output(path: &str, stdout: &str) -> Option<DirListing> {
+/// which is a legal last byte of a file name and would rename the entry. The
+/// script already ordered the entries, so they are kept as received.
+fn parse_list_output(
+    path: &str,
+    stdout: &str,
+    page: usize,
+    page_size: usize,
+) -> Option<DirListing> {
     let mut lines = stdout.split('\n');
     let status = lines.next().map(str::trim).unwrap_or("");
     let listing = |exists: bool, is_dir: bool| DirListing {
@@ -446,7 +502,9 @@ fn parse_list_output(path: &str, stdout: &str) -> Option<DirListing> {
         exists,
         is_dir,
         entries: Vec::new(),
-        truncated: false,
+        page,
+        page_size,
+        has_more: false,
     };
     match status {
         "missing" => return Some(listing(false, false)),
@@ -475,16 +533,11 @@ fn parse_list_output(path: &str, stdout: &str) -> Option<DirListing> {
         })
         .collect();
 
-    let truncated = entries.len() > MAX_LIST_ENTRIES;
-    entries.truncate(MAX_LIST_ENTRIES);
-    entries.sort_by(|a, b| {
-        let a_dir = a.kind == DirEntryKind::Directory;
-        let b_dir = b.kind == DirEntryKind::Directory;
-        b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
-    });
+    let has_more = entries.len() > page_size;
+    entries.truncate(page_size);
     Some(DirListing {
         entries,
-        truncated,
+        has_more,
         ..listing(true, true)
     })
 }
@@ -621,47 +674,81 @@ mod tests {
     }
 
     #[test]
-    fn list_script_quotes_the_path_and_caps_the_listing() {
-        let script = list_script("/work space/it's");
-        assert!(script.starts_with("d='/work space/it'\\''s'\n"), "{script}");
-        assert!(script.contains("-gt 1000"), "{script}");
+    fn list_script_quotes_the_path_and_reads_one_page() {
+        let script = list_script("/work space/it's", 40, 20);
+        assert!(script.contains("d='/work space/it'\\''s'\n"), "{script}");
+        assert!(
+            script.contains("-le 40"),
+            "skips the earlier pages: {script}"
+        );
+        assert!(
+            script.contains("-gt 20"),
+            "stops after a page and one: {script}"
+        );
+        assert!(script.contains("LC_ALL=C"), "{script}");
+    }
+
+    #[test]
+    fn page_bounds_default_and_clamp() {
+        assert_eq!(list_page_bounds(None, None), (1, DEFAULT_LIST_PAGE_SIZE));
+        assert_eq!(list_page_bounds(Some(0), Some(0)), (1, 1));
+        assert_eq!(
+            list_page_bounds(Some(3), Some(100_000)),
+            (3, MAX_LIST_PAGE_SIZE)
+        );
     }
 
     #[test]
     fn parse_list_reports_missing_and_not_a_directory() {
-        let missing = parse_list_output("/nope", "missing\n").expect("a listing");
+        let missing = parse_list_output("/nope", "missing\n", 1, 20).expect("a listing");
         assert!(!missing.exists && !missing.is_dir && missing.entries.is_empty());
 
-        let file = parse_list_output("/etc/hosts", "notdir\n").expect("a listing");
+        let file = parse_list_output("/etc/hosts", "notdir\n", 1, 20).expect("a listing");
         assert!(file.exists && !file.is_dir && file.entries.is_empty());
     }
 
     #[test]
     fn parse_list_does_not_turn_a_denied_directory_into_an_empty_one() {
-        assert!(parse_list_output("/root", "denied\n").is_none());
+        assert!(parse_list_output("/root", "denied\n", 1, 20).is_none());
     }
 
     #[test]
     fn list_script_refuses_a_directory_it_cannot_read_and_search() {
-        let script = list_script("/root");
+        let script = list_script("/root", 0, 20);
         assert!(
             script.contains("[ ! -r \"$d\" ] || [ ! -x \"$d\" ]"),
             "{script}"
         );
     }
 
+    /// `[ -e ]` is false for anything under a parent the user cannot search,
+    /// which would read as "does not exist". The script walks the ancestors
+    /// before concluding that.
+    #[test]
+    fn list_script_tells_a_locked_parent_from_a_missing_path() {
+        let script = list_script("/srv/private/data", 0, 20);
+        let missing = script.find("echo missing").expect("reports missing");
+        let walk = script
+            .find("[ -d \"$a\" ] && [ ! -x \"$a\" ]")
+            .expect("checks ancestors");
+        assert!(walk < missing, "ancestors are checked first: {script}");
+    }
+
     #[test]
     fn parse_list_keeps_a_trailing_carriage_return_in_a_name() {
-        let listing = parse_list_output("/work", "ok\nf config\nf config\r\n").expect("a listing");
+        let listing =
+            parse_list_output("/work", "ok\nf config\nf config\r\n", 1, 20).expect("a listing");
         let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["config", "config\r"]);
     }
 
     #[test]
-    fn parse_list_sorts_directories_first_and_keeps_awkward_names() {
+    fn parse_list_keeps_the_order_the_script_produced() {
         let listing = parse_list_output(
             "/work",
-            "ok\nf zebra.txt\nd src\nl current\nf  leading space\no fifo\nd .git\n",
+            "ok\nd .git\nd src\nf  leading space\nl current\no fifo\nf zebra.txt\n",
+            1,
+            20,
         )
         .expect("a listing");
         let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
@@ -677,36 +764,31 @@ mod tests {
             ]
         );
         assert_eq!(listing.entries[3].kind, DirEntryKind::Symlink);
-        assert!(!listing.truncated);
+        assert!(!listing.has_more);
         assert!(listing.exists && listing.is_dir);
     }
 
     #[test]
     fn parse_list_ignores_malformed_lines() {
-        let listing = parse_list_output("/work", "ok\nx unknown-kind\nnospace\nf \nf real\n")
-            .expect("a listing");
+        let listing =
+            parse_list_output("/work", "ok\nx unknown-kind\nnospace\nf \nf real\n", 1, 20)
+                .expect("a listing");
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].name, "real");
     }
 
     #[test]
-    fn parse_list_flags_a_listing_over_the_cap() {
+    fn parse_list_flags_more_entries_after_the_page() {
         let mut out = String::from("ok\n");
-        for i in 0..=MAX_LIST_ENTRIES {
-            out.push_str(&format!("f file-{i:05}\n"));
+        for i in 0..=3 {
+            out.push_str(&format!("f file-{i}\n"));
         }
-        let listing = parse_list_output("/big", &out).expect("a listing");
-        assert!(listing.truncated);
-        assert_eq!(listing.entries.len(), MAX_LIST_ENTRIES);
+        let listing = parse_list_output("/big", &out, 2, 3).expect("a listing");
+        assert!(listing.has_more);
+        assert_eq!(listing.entries.len(), 3);
+        assert_eq!((listing.page, listing.page_size), (2, 3));
 
-        let exact = parse_list_output(
-            "/big",
-            &out.lines()
-                .take(MAX_LIST_ENTRIES + 1)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .expect("a listing");
-        assert!(!exact.truncated, "exactly the cap is not truncated");
+        let exact = parse_list_output("/big", "ok\nf a\nf b\nf c\n", 1, 3).expect("a listing");
+        assert!(!exact.has_more, "exactly a page is not followed by more");
     }
 }

@@ -23,6 +23,9 @@ import {
   parentDirectory,
 } from './sandbox-files'
 
+/** Entries requested per page; the server's largest page. */
+const LIST_PAGE_SIZE = 100
+
 interface SandboxDirectoryBrowserProps {
   sandboxId: string
   /** Where the browser starts; normally the sandbox's working directory. */
@@ -46,10 +49,22 @@ export function SandboxDirectoryBrowser({
   blocked,
   onOpenFile,
 }: SandboxDirectoryBrowserProps) {
-  const [directory, setDirectory] = useState(() => initialDirectory(workDir))
+  const [directory, setCurrentDirectory] = useState(() =>
+    initialDirectory(workDir)
+  )
+  const [page, setPage] = useState(1)
+  // A page number means nothing in another directory, so every move starts
+  // again from the first page.
+  const setDirectory = (path: string) => {
+    setCurrentDirectory(path)
+    setPage(1)
+  }
 
   const listing = useQuery({
-    ...listDirOptions({ path: { id: sandboxId }, query: { path: directory } }),
+    ...listDirOptions({
+      path: { id: sandboxId },
+      query: { path: directory, page, page_size: LIST_PAGE_SIZE },
+    }),
     enabled: !blocked,
     retry: false,
     // Another tool (the terminal beside this card) changes the tree, so a
@@ -101,6 +116,8 @@ export function SandboxDirectoryBrowser({
         error={listing.isError ? listing.error : null}
         directory={directory}
         listing={data}
+        page={page}
+        onPage={setPage}
         onEnter={setDirectory}
         onOpenFile={onOpenFile}
         onUp={() => setDirectory(parentDirectory(directory))}
@@ -119,9 +136,11 @@ interface DirectoryBodyProps {
         exists: boolean
         is_dir: boolean
         entries: DirectoryEntry[]
-        truncated: boolean
+        has_more: boolean
       }
     | undefined
+  page: number
+  onPage: (page: number) => void
   onEnter: (path: string) => void
   onOpenFile: (path: string) => void
   onUp: () => void
@@ -133,6 +152,8 @@ function DirectoryBody({
   error,
   directory,
   listing,
+  page,
+  onPage,
   onEnter,
   onOpenFile,
   onUp,
@@ -189,7 +210,7 @@ function DirectoryBody({
       </div>
     )
   }
-  if (listing.entries.length === 0) {
+  if (listing.entries.length === 0 && page === 1) {
     return (
       <p className="text-xs text-muted-foreground">This directory is empty.</p>
     )
@@ -210,11 +231,28 @@ function DirectoryBody({
           </li>
         ))}
       </ul>
-      {listing.truncated && (
-        <p className="text-xs text-muted-foreground">
-          Only the first {listing.entries.length} entries are shown. Open a file
-          by its path to reach the rest.
-        </p>
+      {(page > 1 || listing.has_more) && (
+        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={page <= 1}
+            onClick={() => onPage(page - 1)}
+          >
+            Previous page
+          </Button>
+          <span>Page {page}</span>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={!listing.has_more}
+            onClick={() => onPage(page + 1)}
+          >
+            Next page
+          </Button>
+        </div>
       )}
     </div>
   )

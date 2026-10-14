@@ -8216,7 +8216,8 @@ export type DirectoryEntryKind = 'file' | 'directory' | 'symlink' | 'other';
 
 export type DirectoryListingResponse = {
     /**
-     * Directories first, then names in byte order.
+     * Directories first, then everything else, each group in byte order of
+     * the name. One page of the directory.
      */
     entries: Array<DirectoryEntry>;
     /**
@@ -8224,14 +8225,22 @@ export type DirectoryListingResponse = {
      */
     exists: boolean;
     /**
+     * More entries exist after this page.
+     */
+    has_more: boolean;
+    /**
      * `false` when the path exists but is not a directory.
      */
     is_dir: boolean;
-    path: string;
     /**
-     * More than the listing cap exist; `entries` holds the first of them.
+     * 1-based page these entries are.
      */
-    truncated: boolean;
+    page: number;
+    /**
+     * Entries per page that was applied (default 20, at most 100).
+     */
+    page_size: number;
+    path: string;
 };
 
 /**
@@ -72881,6 +72890,14 @@ export type ListDirData = {
          * Absolute path of a directory inside the sandbox
          */
         path: string;
+        /**
+         * 1-based page (default 1)
+         */
+        page?: number;
+        /**
+         * Entries per page (default 20, max 100)
+         */
+        page_size?: number;
     };
     url: '/v1/sandboxes/{id}/fs/list';
 };
@@ -72902,7 +72919,7 @@ export type ListDirErrors = {
 
 export type ListDirResponses = {
     /**
-     * Directory entries (exists=false when missing, is_dir=false for a file — not errors)
+     * One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)
      */
     200: DirectoryListingResponse;
 };
