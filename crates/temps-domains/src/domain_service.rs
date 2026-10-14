@@ -151,6 +151,22 @@ pub(crate) fn verification_method_label(raw: &str) -> &'static str {
 /// invalidated. Terminal: the order cannot be finalized or re-submitted.
 pub(crate) const ORDER_STATUS_INVALID: &str = "invalid";
 
+/// Prefix of the `error_chain` written by the DNS preflight, so the failure
+/// path can tell "never reached the CA" apart from a real ACME failure.
+const DNS_PREFLIGHT_MARKER: &str = "DNS preflight: ";
+
+/// The one-level wildcard that would cover `host` (`app.example.com` ->
+/// `*.example.com`). Mirrors the proxy certificate loader's `wildcard_for` so
+/// coverage decisions here match what a handshake would be served.
+fn wildcard_parent(host: &str) -> Option<String> {
+    let (_, parent) = host.split_once('.')?;
+    if parent.is_empty() {
+        None
+    } else {
+        Some(format!("*.{parent}"))
+    }
+}
+
 pub struct DomainService {
     db: Arc<DatabaseConnection>,
     cert_provider: Arc<dyn CertificateProvider>,
@@ -159,6 +175,10 @@ pub struct DomainService {
     /// Anonymous product telemetry. No-op unless wired with
     /// [`Self::with_telemetry`].
     telemetry: Arc<dyn TelemetryReporter>,
+    /// When set, on-demand issuance resolves the hostname first and fails fast
+    /// (without touching the CA) when it has no DNS records. See
+    /// [`Self::with_dns_preflight`].
+    dns_preflight: bool,
 }
 
 /// How a challenge operation finds its `domains` row.
@@ -192,7 +212,21 @@ impl DomainService {
             repository,
             encryption_service,
             telemetry: Arc::new(NoopTelemetryReporter),
+            dns_preflight: false,
         }
+    }
+
+    /// Resolve the hostname before every on-demand ACME order and fail fast
+    /// with a `dns_failure` attempt when it has no DNS records.
+    ///
+    /// Custom domains are attached by users, so a hostname can be added before
+    /// its DNS exists. Ordering anyway would burn the CA's failed-authorization
+    /// budget (5 per hostname per hour) for a result that cannot succeed; the
+    /// preflight records the failure and applies the normal backoff ladder
+    /// without sending a request. Off by default so unit tests stay offline.
+    pub fn with_dns_preflight(mut self, enabled: bool) -> Self {
+        self.dns_preflight = enabled;
+        self
     }
 
     /// Report failed certificate attempts as anonymous `ssl_certificate_failed`
@@ -1360,6 +1394,25 @@ impl DomainService {
             return Err(err);
         }
 
+        // 0. A hostname already served by an exact or wildcard certificate needs
+        //    no order. The route-reload pre-provisioning path hands this method
+        //    every cert-eligible host, so covered ones are dropped here.
+        match self.find_covered_hostnames(&[hostname.to_string()]).await {
+            Ok(covered) if covered.contains(hostname) => {
+                debug!(
+                    hostname = %hostname,
+                    "on-demand TLS: hostname already covered by a certificate, skipping order"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.record_on_demand_outcome(hostname, false, false, None, Some(&e), started)
+                    .await;
+                return Err(e);
+            }
+        }
+
         // 1. Create or reuse the domains row, transitioning into the issuing state.
         //    HTTP-01 is the only supported on-demand challenge (wildcards/DNS-01
         //    are explicitly out of scope per ADR §2).
@@ -1379,7 +1432,7 @@ impl DomainService {
 
         // 2. Run the ACME order: request_challenge persists the order + serves the
         //    token, complete_challenge finalizes and stores cert+key as "active".
-        match self.run_on_demand_acme(hostname, email).await {
+        match self.issue_on_demand(hostname, email).await {
             Ok(()) => {
                 let duration_ms = Self::elapsed_ms(started);
                 info!(
@@ -1425,13 +1478,133 @@ impl DomainService {
                     duration_ms,
                     "on-demand TLS: issuance failed"
                 );
-                // acme_request_sent is true whenever we reached request_challenge.
+                // acme_request_sent is true whenever we reached request_challenge;
+                // a DNS preflight failure never reached the CA.
+                let reached_ca = !Self::is_dns_preflight_failure(&e);
                 let acme_status = Self::acme_status_for(&e);
-                self.record_on_demand_outcome(hostname, true, true, acme_status, Some(&e), started)
-                    .await;
+                self.record_on_demand_outcome(
+                    hostname,
+                    reached_ca,
+                    reached_ca,
+                    acme_status,
+                    Some(&e),
+                    started,
+                )
+                .await;
                 Err(e)
             }
         }
+    }
+
+    /// Run the optional DNS preflight, then the ACME order.
+    async fn issue_on_demand(&self, hostname: &str, email: &str) -> Result<(), DomainServiceError> {
+        if self.dns_preflight {
+            Self::preflight_dns(hostname).await?;
+        }
+        self.run_on_demand_acme(hostname, email).await
+    }
+
+    /// Fail fast when `hostname` has no DNS records at all.
+    ///
+    /// Only existence is checked: the instance does not know every address it is
+    /// reachable on (NAT, load balancers, several IPs), so comparing against one
+    /// would reject valid setups. A hostname that resolves somewhere else still
+    /// fails the CA's own validation and takes the normal backoff ladder.
+    async fn preflight_dns(hostname: &str) -> Result<(), DomainServiceError> {
+        const DNS_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let failure = |reason: String| DomainServiceError::OnDemandIssuanceFailed {
+            hostname: hostname.to_string(),
+            category: "dns_failure".to_string(),
+            error_chain: format!("{DNS_PREFLIGHT_MARKER}{reason}"),
+        };
+
+        let lookup = tokio::time::timeout(
+            DNS_PREFLIGHT_TIMEOUT,
+            tokio::net::lookup_host((hostname, 80)),
+        )
+        .await
+        .map_err(|_| {
+            failure(format!(
+                "DNS lookup for {hostname} timed out after {}s",
+                DNS_PREFLIGHT_TIMEOUT.as_secs()
+            ))
+        })?;
+
+        match lookup {
+            Ok(mut addrs) => {
+                if addrs.next().is_some() {
+                    Ok(())
+                } else {
+                    Err(failure(format!(
+                        "DNS lookup for {hostname} returned no addresses; point an A/AAAA record at this server"
+                    )))
+                }
+            }
+            Err(e) => Err(failure(format!(
+                "DNS lookup for {hostname} failed: {e}; point an A/AAAA record at this server"
+            ))),
+        }
+    }
+
+    fn is_dns_preflight_failure(err: &DomainServiceError) -> bool {
+        matches!(
+            err,
+            DomainServiceError::OnDemandIssuanceFailed { error_chain, .. }
+                if error_chain.starts_with(DNS_PREFLIGHT_MARKER)
+        )
+    }
+
+    /// Of `hostnames`, return those a serving certificate already covers: a
+    /// `domains` row for the host itself, or for its one-level wildcard parent
+    /// (`app.example.com` -> `*.example.com`), holding both certificate and key.
+    ///
+    /// This is the same rule the proxy's certificate loader applies at handshake
+    /// time (exact match first, then the wildcard), so "covered" here means
+    /// exactly "the handshake would be served". One query regardless of how many
+    /// hostnames are passed.
+    pub async fn find_covered_hostnames(
+        &self,
+        hostnames: &[String],
+    ) -> Result<std::collections::HashSet<String>, DomainServiceError> {
+        use sea_orm::QuerySelect;
+
+        let mut covered = std::collections::HashSet::new();
+        if hostnames.is_empty() {
+            return Ok(covered);
+        }
+
+        // Chunked so a large route table never builds an unbounded IN list.
+        for chunk in hostnames.chunks(500) {
+            let mut candidates: Vec<String> = Vec::with_capacity(chunk.len() * 2);
+            for host in chunk {
+                candidates.push(host.clone());
+                if let Some(wildcard) = wildcard_parent(host) {
+                    candidates.push(wildcard);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+
+            let served: std::collections::HashSet<String> = domains::Entity::find()
+                .select_only()
+                .column(domains::Column::Domain)
+                .filter(domains::Column::Domain.is_in(candidates))
+                .filter(domains::Column::Certificate.is_not_null())
+                .filter(domains::Column::PrivateKey.is_not_null())
+                .into_tuple::<String>()
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .collect();
+
+            for host in chunk {
+                let by_wildcard = wildcard_parent(host).is_some_and(|w| served.contains(&w));
+                if served.contains(host) || by_wildcard {
+                    covered.insert(host.clone());
+                }
+            }
+        }
+        Ok(covered)
     }
 
     /// Create the `domains` row for `hostname` if absent, then move it into the
@@ -2459,6 +2632,143 @@ mod tests {
             attempt.error_category.as_deref(),
             Some("challenge_mismatch")
         );
+    }
+
+    #[test]
+    fn test_wildcard_parent_is_one_level() {
+        assert_eq!(
+            wildcard_parent("app.example.com").as_deref(),
+            Some("*.example.com")
+        );
+        assert_eq!(wildcard_parent("example.com").as_deref(), Some("*.com"));
+        assert_eq!(wildcard_parent("localhost"), None);
+        assert_eq!(wildcard_parent("trailing."), None);
+    }
+
+    async fn insert_served_cert(db: &DatabaseConnection, domain: &str, with_key: bool) {
+        let now = Utc::now();
+        domains::ActiveModel {
+            domain: Set(domain.to_string()),
+            certificate: Set(Some("CERT".to_string())),
+            private_key: Set(with_key.then(|| "KEY".to_string())),
+            status: Set("active".to_string()),
+            is_wildcard: Set(domain.starts_with("*.")),
+            verification_method: Set("dns-01".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed domains row");
+    }
+
+    #[tokio::test]
+    async fn test_find_covered_hostnames_matches_exact_and_wildcard_only_with_key() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
+        else {
+            return;
+        };
+        insert_served_cert(db.as_ref(), "*.apps.example.com", true).await;
+        insert_served_cert(db.as_ref(), "exact.other.example.com", true).await;
+        // A row without key material does not serve a handshake.
+        insert_served_cert(db.as_ref(), "*.keyless.example.com", false).await;
+
+        let hosts: Vec<String> = [
+            "web.apps.example.com",      // wildcard-covered
+            "exact.other.example.com",   // exact row
+            "web.keyless.example.com",   // wildcard row has no key
+            "web.unrelated.example.com", // nothing
+            "a.b.apps.example.com",      // two levels deep: *.apps does not match
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let covered = service
+            .find_covered_hostnames(&hosts)
+            .await
+            .expect("coverage query should succeed");
+
+        assert!(covered.contains("web.apps.example.com"));
+        assert!(covered.contains("exact.other.example.com"));
+        assert!(!covered.contains("web.keyless.example.com"));
+        assert!(!covered.contains("web.unrelated.example.com"));
+        assert!(!covered.contains("a.b.apps.example.com"));
+        assert!(service
+            .find_covered_hostnames(&[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_skips_wildcard_covered_host() {
+        // Fail mode: any attempt to reach the provider would surface as an error.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "provider must not be called for a covered host".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        insert_served_cert(db.as_ref(), "*.apps.example.com", true).await;
+
+        service
+            .provision_on_demand("web.apps.example.com", "ops@example.com")
+            .await
+            .expect("a wildcard-covered host needs no order");
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq("web.apps.example.com"))
+            .one(db.as_ref())
+            .await
+            .unwrap();
+        assert!(row.is_none(), "no per-host row may be created");
+        assert!(service
+            .latest_on_demand_attempt("web.apps.example.com")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_dns_preflight_fails_without_reaching_ca() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
+        else {
+            return;
+        };
+        let service = service.with_dns_preflight(true);
+        // `.invalid` is reserved (RFC 6761) and never resolves.
+        let hostname = "custom.no-such-host.invalid";
+
+        let err = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect_err("an unresolvable host must fail the preflight");
+        assert!(matches!(
+            &err,
+            DomainServiceError::OnDemandIssuanceFailed { category, .. } if category == "dns_failure"
+        ));
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("a failed row carries the backoff");
+        assert_eq!(row.status, "on_demand_failed");
+        assert!(row.on_demand_backoff_until.is_some());
+        assert!(row.certificate.is_none());
+
+        let attempt = service
+            .latest_on_demand_attempt(hostname)
+            .await
+            .unwrap()
+            .expect("the failure is audited");
+        assert_eq!(attempt.outcome, "failed");
+        assert_eq!(attempt.error_category.as_deref(), Some("dns_failure"));
+        assert_eq!(attempt.acme_request_sent, Some(false));
     }
 
     #[tokio::test]
