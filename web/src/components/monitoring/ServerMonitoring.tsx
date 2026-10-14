@@ -853,7 +853,7 @@ function SectionIntro({
     <PageHeader
       title="Server"
       actions={
-        <div className="flex shrink-0 flex-wrap items-center gap-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
           <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
             {paused
               ? 'Updates paused'

@@ -96,7 +96,15 @@ export function SettingsSection({
           aria-hidden="true"
         />
       </summary>
-      <div ref={contentRef} className="min-w-0 border-t p-4 sm:p-5">
+      {/* A closed <details> skips rendering its content but still lays the
+          controls out, so they report on-screen boxes that the summary sits
+          on top of. `invisible` makes the collapsed state explicit to anything
+          that measures or hit-tests the page, and does not affect an open
+          section. */}
+      <div
+        ref={contentRef}
+        className="min-w-0 border-t p-4 group-[:not([open])]/settings:invisible sm:p-5"
+      >
         {children}
       </div>
     </details>

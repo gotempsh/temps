@@ -155,7 +155,7 @@ function severityBadge(severity: string) {
       return <Badge variant="destructive">Critical</Badge>
     case 'warning':
       return (
-        <Badge className="border-transparent bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-400">
+        <Badge className="border-transparent bg-amber-500/15 text-amber-800 hover:bg-amber-500/25 dark:text-amber-400">
           Warning
         </Badge>
       )
