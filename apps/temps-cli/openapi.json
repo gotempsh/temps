@@ -29076,6 +29076,28 @@
         ],
         "type": "object"
       },
+      "IpAccessCidrEntry": {
+        "description": "One CIDR in a policy, in canonical form (network address, explicit prefix).",
+        "properties": {
+          "cidr": {
+            "description": "Canonical CIDR, e.g. `10.0.0.0/8` or `fd7a:115c:a1e0::/48`.",
+            "example": "100.64.0.0/10",
+            "type": "string"
+          },
+          "description": {
+            "description": "Optional human label, e.g. `Office`.",
+            "example": "Tailscale",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cidr"
+        ],
+        "type": "object"
+      },
       "IpAccessControlQuery": {
         "description": "Query parameters for listing IP access control rules",
         "properties": {
@@ -29132,6 +29154,15 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "IpAccessMode": {
+        "description": "How a scope's CIDR list is applied.",
+        "enum": [
+          "disabled",
+          "allow",
+          "deny"
+        ],
+        "type": "string"
       },
       "JobStatusResponse": {
         "description": "Snapshot of a background job. `status` is one of \"running\" | \"exited\"\n| \"failed\"; `exit_code` is populated only when `status == \"exited\"`.",
@@ -38594,6 +38625,16 @@
         ],
         "type": "string"
       },
+      "PolicySource": {
+        "description": "Which policy decided a test.",
+        "enum": [
+          "draft",
+          "environment",
+          "project",
+          "none"
+        ],
+        "type": "string"
+      },
       "PortMapping": {
         "description": "Port mapping",
         "properties": {
@@ -39632,6 +39673,78 @@
           "id",
           "slug",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "ProjectIpAccessDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ProjectIpAccessResponse"
+          },
+          {
+            "properties": {
+              "your_ip": {
+                "description": "The address this request arrived from, as the console resolved it.\nIt is the address the project will see only if the console and the\nproject are reached over the same network path.",
+                "example": "203.0.113.9",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "A stored policy plus the address the console saw for the caller, so the\nUI can offer \"add my IP\" and warn before a lock-out."
+      },
+      "ProjectIpAccessResponse": {
+        "description": "One scope's stored policy.",
+        "properties": {
+          "cidrs": {
+            "items": {
+              "$ref": "#/components/schemas/IpAccessCidrEntry"
+            },
+            "type": "array"
+          },
+          "configured": {
+            "description": "`false` when nothing is stored for this scope. For an environment that\nmeans it inherits the project-wide policy.",
+            "type": "boolean"
+          },
+          "environment_id": {
+            "description": "`null` for the project-wide policy.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_cidrs": {
+            "description": "Maximum number of CIDRs a policy may hold.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "example": "2026-10-13T09:30:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "configured",
+          "mode",
+          "cidrs",
+          "max_cidrs"
         ],
         "type": "object"
       },
@@ -49788,6 +49901,31 @@
         ],
         "type": "object"
       },
+      "SetProjectIpAccessRequest": {
+        "description": "Request body for `PUT`: the complete policy for one scope.",
+        "properties": {
+          "acknowledge_lockout": {
+            "description": "Apply an allow list that excludes (or a deny list that includes) the\naddress this request came from. Without it such a save is refused\nwith 409 so an operator cannot lock themselves out by accident.",
+            "type": "boolean"
+          },
+          "cidrs": {
+            "description": "CIDRs (IPv4 or IPv6). A bare address is a single host. At most 256.",
+            "items": {
+              "$ref": "#/components/schemas/IpAccessCidrEntry"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode",
+            "description": "`disabled` keeps the list but enforces nothing; `allow` admits only\nlisted clients; `deny` blocks listed clients."
+          }
+        },
+        "required": [
+          "mode",
+          "cidrs"
+        ],
+        "type": "object"
+      },
       "SetRequest": {
         "description": "Request to set a value",
         "properties": {
@@ -53552,6 +53690,76 @@
         "required": [
           "success",
           "sent_to"
+        ],
+        "type": "object"
+      },
+      "TestProjectIpAccessRequest": {
+        "description": "Request body for the \"try an address against the rules\" endpoint.",
+        "properties": {
+          "cidrs": {
+            "items": {
+              "$ref": "#/components/schemas/IpAccessCidrEntry"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "ip": {
+            "description": "Address to evaluate.",
+            "example": "100.101.102.103",
+            "type": "string"
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IpAccessMode",
+                "description": "Evaluate this unsaved draft instead of the stored policy. Both `mode`\nand `cidrs` must be given together."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ip"
+        ],
+        "type": "object"
+      },
+      "TestProjectIpAccessResponse": {
+        "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "ip": {
+            "description": "The address as evaluated (IPv4-mapped IPv6 is shown as IPv4).",
+            "type": "string"
+          },
+          "matched_cidr": {
+            "description": "The listed CIDR the address fell inside, when one did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode"
+          },
+          "reason": {
+            "description": "One-sentence explanation suitable for display.",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/PolicySource"
+          }
+        },
+        "required": [
+          "ip",
+          "allowed",
+          "source",
+          "mode",
+          "reason"
         ],
         "type": "object"
       },
@@ -110917,6 +111125,405 @@
         "x-maturity": "experimental"
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/ip-access": {
+      "delete": {
+        "description": "The environment goes back to inheriting the project-wide policy.",
+        "operationId": "delete_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Policy removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment or policy not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "description": "`configured: false` means the environment inherits the project-wide policy.",
+        "operationId": "get_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "The environment's own IP access policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "Replaces (does not extend) the project-wide policy for this environment.\nMode `disabled` exempts the environment from a project-wide list.",
+        "operationId": "put_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "Policy saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Policy would lock out the caller"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/ip-access/test": {
+      "post": {
+        "description": "Evaluates the policy that governs the environment (its own, else the\nproject's), or an unsaved draft when `mode` and `cidrs` are supplied.",
+        "operationId": "test_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestProjectIpAccessResponse"
+                }
+              }
+            },
+            "description": "Evaluation result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid address or draft"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Try an address against an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-alert-rules": {
       "get": {
         "operationId": "list_alert_rules",
@@ -114709,6 +115316,365 @@
         "tags": [
           "Status Page"
         ]
+      }
+    },
+    "/projects/{project_id}/ip-access": {
+      "delete": {
+        "description": "The project becomes reachable from any address again (environments with\ntheir own policy keep it).",
+        "operationId": "delete_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Policy removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or policy not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "description": "Returns `configured: false` and mode `disabled` when nothing is stored.",
+        "operationId": "get_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "The project-wide IP access policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "Replaces the whole project-wide policy. An `allow` list must name at least\none CIDR. A save that would lock out the caller's own address is refused\nwith `409` unless `acknowledge_lockout` is `true`.",
+        "operationId": "put_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "Policy saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Policy would lock out the caller"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/ip-access/test": {
+      "post": {
+        "description": "Evaluates the stored policy, or an unsaved draft when `mode` and `cidrs`\nare supplied, using the same matcher the proxy uses.",
+        "operationId": "test_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestProjectIpAccessResponse"
+                }
+              }
+            },
+            "description": "Evaluation result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid address or draft"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Try an address against a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/logs": {
@@ -130595,6 +131561,10 @@
     {
       "description": "IP access control management endpoints",
       "name": "IP Access Control"
+    },
+    {
+      "description": "Per-project and per-environment client IP allow/deny lists",
+      "name": "Project IP Access"
     },
     {
       "description": "Static file serving endpoints",
