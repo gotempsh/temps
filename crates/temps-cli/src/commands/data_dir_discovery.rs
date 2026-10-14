@@ -140,7 +140,13 @@ fn running_server_data_dir() -> Option<(u32, PathBuf)> {
             continue;
         };
         let environ = std::fs::read(entry.path().join("environ")).unwrap_or_default();
-        if let Some(dir) = server_data_dir_from_process(&cmdline, &environ) {
+        let Some(dir) = server_data_dir_from_process(&cmdline, &environ) else {
+            continue;
+        };
+        // A relative `--data-dir ./data` means relative to the server's own
+        // working directory, not to wherever setup is run from.
+        let cwd = std::fs::read_link(entry.path().join("cwd")).ok();
+        if let Some(dir) = absolute_against(dir, cwd.as_deref()) {
             found.push((pid, dir));
         }
     }
@@ -156,6 +162,20 @@ fn running_server_data_dir() -> Option<(u32, PathBuf)> {
 #[cfg(not(target_os = "linux"))]
 fn running_server_data_dir() -> Option<(u32, PathBuf)> {
     None
+}
+
+/// `dir` as an absolute path: unchanged when already absolute, else joined to
+/// the process's working directory. `None` when it is relative and that
+/// working directory is unknown (another user's process), because guessing
+/// would point setup at the wrong directory.
+#[cfg(any(target_os = "linux", test))]
+fn absolute_against(dir: PathBuf, cwd: Option<&Path>) -> Option<PathBuf> {
+    if dir.is_absolute() {
+        Some(dir)
+    } else {
+        // `components()` drops the `.` of `./data`.
+        cwd.map(|cwd| cwd.join(dir).components().collect())
+    }
 }
 
 /// The data directory a `temps serve` process runs with, from its raw
@@ -244,6 +264,29 @@ mod tests {
         // Unreadable environment (another user's process) and no flag:
         // undeterminable, so not guessed.
         assert_eq!(server_data_dir_from_process(&cmdline, &[]), None);
+    }
+
+    #[test]
+    fn relative_server_dirs_resolve_against_the_servers_working_directory() {
+        let cwd = Path::new("/srv/temps");
+        assert_eq!(
+            absolute_against(PathBuf::from("./data"), Some(cwd)),
+            Some(PathBuf::from("/srv/temps/data"))
+        );
+        assert_eq!(
+            absolute_against(PathBuf::from("data"), Some(cwd)),
+            Some(PathBuf::from("/srv/temps/data"))
+        );
+        assert_eq!(
+            absolute_against(PathBuf::from("/var/lib/temps"), Some(cwd)),
+            Some(PathBuf::from("/var/lib/temps"))
+        );
+        // Unknown working directory: undeterminable, not guessed.
+        assert_eq!(absolute_against(PathBuf::from("data"), None), None);
+        assert_eq!(
+            absolute_against(PathBuf::from("/var/lib/temps"), None),
+            Some(PathBuf::from("/var/lib/temps"))
+        );
     }
 
     #[test]
