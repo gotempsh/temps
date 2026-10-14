@@ -32,7 +32,9 @@ use temps_agents::sandbox::microsandbox::{
 use temps_agents::sandbox::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
 
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
-use super::upgrade::{fetch_guest_agents_from_release, ReleaseGuestAgents};
+use super::upgrade::{
+    fetch_guest_agents_from_release, guest_agent_needs_fetch, ReleaseGuestAgents,
+};
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use {
     std::collections::HashMap,
@@ -244,6 +246,7 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
         memory_limit_mb: Some(256),
         pids_limit: None,
         disk_size_mb: None,
+        allow_docker: false,
         network_mode: Some("none".to_string()),
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(60),
@@ -292,9 +295,8 @@ async fn fetch_missing_pty_agent(
 ) -> Option<ReleaseGuestAgents> {
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
-        .is_some_and(|p| p.exists());
-    if explicit.is_some() || beside || dest.exists() {
+        .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)));
+    if !guest_agent_needs_fetch(explicit, beside.as_deref(), dest) {
         return None;
     }
     println!("  fetching temps-pty-agent from the release that matches this binary (checksum-verified)...");

@@ -1232,11 +1232,18 @@ pub(crate) fn normalize_release_tag(version: &str) -> anyhow::Result<String> {
 
 /// Fetch a specific release by tag from GitHub.
 pub(crate) async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
+    fetch_specific_release_from(version, GITHUB_RELEASES_API).await
+}
+
+async fn fetch_specific_release_from(
+    version: &str,
+    releases_api: &str,
+) -> anyhow::Result<GitHubRelease> {
     let tag = normalize_release_tag(version)?;
 
     // Built by pushing a validated segment rather than string interpolation, so
     // even a future validation slip cannot alter the path structure.
-    let mut url = reqwest::Url::parse("https://api.github.com/repos/gotempsh/temps/releases/tags/")
+    let mut url = reqwest::Url::parse(&format!("{}/tags/", releases_api.trim_end_matches('/')))
         .map_err(|e| anyhow::anyhow!("Failed to build the release URL: {e}"))?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Failed to build the release URL"))?
@@ -1804,60 +1811,106 @@ pub(crate) async fn fetch_guest_agents_from_release(
     names: &[&str],
 ) -> anyhow::Result<ReleaseGuestAgents> {
     let target = platform_target()?;
-    let tag = current_version_tag();
-    let release = fetch_specific_release(&tag).await?;
-    let tarball_name = format!("temps-{}.tar.gz", target);
-    let asset = release
-        .assets
+    fetch_guest_agents_from_release_from(
+        names,
+        GITHUB_RELEASES_API,
+        &current_version_tag(),
+        &target,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+}
+
+/// One deadline covers release metadata, the streamed archive and checksum bodies.
+/// The endpoint/deadline are injectable so tests never depend on public releases.
+async fn fetch_guest_agents_from_release_from(
+    names: &[&str],
+    releases_api: &str,
+    tag: &str,
+    target: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<ReleaseGuestAgents> {
+    if names
         .iter()
-        .find(|a| a.name == tarball_name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "release {} has no {} asset to take the guest agents from",
-                release.tag_name,
-                tarball_name
-            )
-        })?;
-
-    let dir = tempfile::tempdir()
-        .map_err(|e| anyhow::anyhow!("Failed to create a scratch directory: {}", e))?;
-    let tarball_path = dir.path().join(&tarball_name);
-    let mut tarball = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&tarball_path)
-        .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tarball_path.display(), e))?;
-
-    let computed =
-        download_asset_to_file(&asset.browser_download_url, &mut tarball, &tarball_path).await?;
-    let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
-    verify_computed_checksum(&computed, &checksum_text)?;
-
-    for name in names {
-        let out_path = dir.path().join(name);
-        let mut out = fs::File::create(&out_path)
-            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", out_path.display(), e))?;
-        let extracted = extract_entry_from_tarball_file(
-            &mut tarball,
-            &tarball_path,
-            &mut out,
-            &out_path,
-            name,
-        )?;
-        drop(out);
-        if extracted.is_none() {
-            let _ = fs::remove_file(&out_path);
-        }
+        .any(|name| ![VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME].contains(name))
+    {
+        return Err(anyhow::anyhow!(
+            "Unknown guest agent requested from release {tag}"
+        ));
     }
-    // The ~110 MB archive is not needed once the entries are out.
-    drop(tarball);
-    let _ = fs::remove_file(&tarball_path);
+    tokio::time::timeout(deadline, async {
+        let release = fetch_specific_release_from(tag, releases_api).await?;
+        let tarball_name = format!("temps-{}.tar.gz", target);
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == tarball_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "release {} has no {} asset to take the guest agents from",
+                    release.tag_name,
+                    tarball_name
+                )
+            })?;
 
-    Ok(ReleaseGuestAgents {
-        dir,
-        tag: release.tag_name,
+        let dir = tempfile::tempdir()
+            .map_err(|e| anyhow::anyhow!("Failed to create a scratch directory: {}", e))?;
+        let tarball_path = dir.path().join(&tarball_name);
+        let mut tarball = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&tarball_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tarball_path.display(), e))?;
+
+        let computed =
+            download_asset_to_file(&asset.browser_download_url, &mut tarball, &tarball_path)
+                .await?;
+        let checksum_text = fetch_expected_checksum(&release, &tarball_name).await?;
+        verify_computed_checksum(&computed, &checksum_text)?;
+
+        for name in names {
+            let out_path = dir.path().join(name);
+            let mut out = fs::File::create(&out_path)
+                .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", out_path.display(), e))?;
+            let extracted = extract_entry_from_tarball_file(
+                &mut tarball,
+                &tarball_path,
+                &mut out,
+                &out_path,
+                name,
+            )?;
+            drop(out);
+            if extracted.is_none() {
+                let _ = fs::remove_file(&out_path);
+            }
+        }
+        // The ~110 MB archive is not needed once the entries are out.
+        drop(tarball);
+        let _ = fs::remove_file(&tarball_path);
+
+        Ok(ReleaseGuestAgents {
+            dir,
+            tag: release.tag_name,
+        })
     })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Fetching guest agents from release {tag} timed out after {} seconds",
+            deadline.as_secs_f64(),
+        )
+    })?
+}
+
+/// Explicit paths take precedence even when invalid: setup reports that error
+/// rather than silently substituting a download for the operator's choice.
+pub(crate) fn guest_agent_needs_fetch(
+    explicit: Option<&Path>,
+    beside: Option<&Path>,
+    dest: &Path,
+) -> bool {
+    explicit.is_none() && !beside.is_some_and(Path::is_file) && !dest.is_file()
 }
 
 /// A guest-side binary shipped beside `temps` in the Linux release tarballs.
@@ -3182,7 +3235,180 @@ mod tests {
         assert!(upgrade_scratch_paths(dir.path()).is_empty());
     }
 
-    /// Build a gzipped tarball of regular files, in the given order.
+    /// Serve release metadata, archive and checksum from localhost for fetch tests.
+    async fn guest_release_server(
+        archive: Vec<u8>,
+        bad_checksum: bool,
+        stall: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{
+            body::Body,
+            extract::{OriginalUri, State},
+            http::Response,
+            routing::get,
+            Router,
+        };
+        use sha2::{Digest, Sha256};
+        #[derive(Clone)]
+        struct Fixture {
+            base: String,
+            archive: Vec<u8>,
+            checksum: String,
+            stall: Option<&'static str>,
+        }
+        async fn serve(State(f): State<Fixture>, OriginalUri(uri): OriginalUri) -> Response<Body> {
+            let path = uri.path();
+            if f.stall == Some("headers") && path.ends_with("v1.2.3") {
+                std::future::pending::<()>().await;
+            }
+            if f.stall.is_some_and(|stage| path.ends_with(stage)) {
+                return Response::new(Body::from_stream(futures::stream::pending::<
+                    Result<bytes::Bytes, std::io::Error>,
+                >()));
+            }
+            let body = if path.ends_with("archive") {
+                f.archive
+            } else if path.ends_with("checksum") {
+                f.checksum.into_bytes()
+            } else {
+                serde_json::to_vec(&serde_json::json!({
+                    "tag_name": "v1.2.3", "prerelease": false, "draft": false,
+                    "html_url": "https://example.test/releases/v1.2.3",
+                    "assets": [
+                        {"name":"temps-test.tar.gz", "browser_download_url":format!("{}/archive", f.base), "size":f.archive.len()},
+                        {"name":"temps-test.tar.gz.sha256", "browser_download_url":format!("{}/checksum", f.base), "size":64}
+                    ]
+                })).unwrap()
+            };
+            Response::new(Body::from(body))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hash = if bad_checksum {
+            "0".repeat(64)
+        } else {
+            hex::encode(Sha256::digest(&archive))
+        };
+        let fixture = Fixture {
+            base: base.clone(),
+            archive,
+            checksum: hash,
+            stall,
+        };
+        let app = Router::new()
+            .route("/tags/{tag}", get(serve))
+            .route("/archive", get(serve))
+            .route("/checksum", get(serve))
+            .with_state(fixture);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_extracts_both_agents_and_cleans_scratch() {
+        let archive = tarball_with_entries(&[
+            (VM_AGENT_BINARY_NAME, b"vm"),
+            (PTY_AGENT_BINARY_NAME, b"pty"),
+        ]);
+        let (api, server) = guest_release_server(archive, false, None).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        server.abort();
+        let agents = result.unwrap();
+        assert_eq!(agents.tag(), "v1.2.3");
+        assert_eq!(
+            fs::read(agents.path(VM_AGENT_BINARY_NAME).unwrap()).unwrap(),
+            b"vm"
+        );
+        assert_eq!(
+            fs::read(agents.path(PTY_AGENT_BINARY_NAME).unwrap()).unwrap(),
+            b"pty"
+        );
+        let scratch = agents.dir.path().to_path_buf();
+        assert!(!scratch.join("temps-test.tar.gz").exists());
+        drop(agents);
+        assert!(!scratch.exists());
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_rejects_checksum_and_reports_absent_agents() {
+        let archive = tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]);
+        let (api, server) = guest_release_server(archive.clone(), true, None).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        server.abort();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Checksum mismatch"));
+        let (api, server) = guest_release_server(archive, false, None).await;
+        let result = fetch_guest_agents_from_release_from(
+            &[VM_AGENT_BINARY_NAME, PTY_AGENT_BINARY_NAME],
+            &api,
+            "v1.2.3",
+            "test",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        server.abort();
+        let agents = result.unwrap();
+        assert!(agents.path(VM_AGENT_BINARY_NAME).is_some());
+        assert!(agents.path(PTY_AGENT_BINARY_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn guest_release_fetch_bounds_every_response_body() {
+        for stage in ["headers", "v1.2.3", "archive", "checksum"] {
+            let (api, server) = guest_release_server(
+                tarball_with_entries(&[(VM_AGENT_BINARY_NAME, b"vm")]),
+                false,
+                Some(stage),
+            )
+            .await;
+            let result = fetch_guest_agents_from_release_from(
+                &[VM_AGENT_BINARY_NAME],
+                &api,
+                "v1.2.3",
+                "test",
+                std::time::Duration::from_millis(250),
+            )
+            .await;
+            server.abort();
+            assert!(
+                result.unwrap_err().to_string().contains("timed out"),
+                "stage {stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_release_fetch_is_only_needed_without_explicit_sibling_or_staged_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("sibling");
+        let dest = dir.path().join("staged");
+        assert!(guest_agent_needs_fetch(None, Some(&sibling), &dest));
+        assert!(!guest_agent_needs_fetch(Some(&sibling), None, &dest));
+        fs::write(&sibling, b"agent").unwrap();
+        assert!(!guest_agent_needs_fetch(None, Some(&sibling), &dest));
+        fs::remove_file(&sibling).unwrap();
+        fs::write(&dest, b"agent").unwrap();
+        assert!(!guest_agent_needs_fetch(None, None, &dest));
+    }
+
     #[test]
     fn release_guest_agents_report_only_the_entries_that_were_extracted() {
         let dir = tempfile::tempdir().unwrap();

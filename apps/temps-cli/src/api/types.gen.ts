@@ -6596,6 +6596,11 @@ export type CreateS3SourceRequest = {
 export type CreateSandboxBody = {
     _runtime?: string | null;
     /**
+     * Permit installing/running Docker with normal guest-root privileges.
+     * Requires backend="microsandbox". Does not install Docker or expose the host socket.
+     */
+    allow_docker?: boolean;
+    /**
      * Isolation backend: `"docker"` (default), `"firecracker"` (ADR-029,
      * hardware-virtualized microVM — requires a host provisioned with
      * `temps firecracker setup`) or `"microsandbox"` (ADR-050, experimental
@@ -22253,6 +22258,10 @@ export type SandboxInner = {
      * `None` for sandboxes created via this API.
      */
     agent_run_id?: number | null;
+    /**
+     * Normal guest-root semantics enabled for Docker (microsandbox only).
+     */
+    allow_docker: boolean;
     /**
      * Isolation backend: "docker" | "firecracker" | "microsandbox". `None` on legacy rows
      * created before the backend was recorded.

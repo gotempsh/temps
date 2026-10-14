@@ -615,6 +615,7 @@ pub async fn create_sandbox(
         memory_limit_mb: req.memory_limit_mb,
         pids_limit: req.pids_limit,
         disk_size_mb: req.disk_size_mb,
+        allow_docker: false,
         network_mode: req.network_mode,
         env_vars: req.env_vars,
         idle_timeout: Duration::from_secs(req.idle_timeout_secs),

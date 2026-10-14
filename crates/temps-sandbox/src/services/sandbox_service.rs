@@ -147,6 +147,8 @@ impl std::fmt::Display for SandboxLifecycle {
 /// options — we accept what SDK clients send and ignore the rest.
 #[derive(Debug, Clone, Default)]
 pub struct CreateSandboxRequest {
+    /// Opt in to normal guest-root semantics for Docker (microsandbox only).
+    pub allow_docker: bool,
     /// Optional Docker image override. `None` → platform default.
     pub image: Option<String>,
     /// Optional human-readable name. Defaults to the internal ID.
@@ -615,6 +617,8 @@ pub struct NodeSandboxes {
 /// columns out of the public surface.
 #[derive(Debug, Clone)]
 pub struct SandboxSummary {
+    /// Whether normal guest-root semantics were requested for Docker.
+    pub allow_docker: bool,
     pub public_id: String,
     pub name: String,
     pub status: String,
@@ -656,6 +660,12 @@ pub struct SandboxSummary {
 impl From<&sandboxes::Model> for SandboxSummary {
     fn from(m: &sandboxes::Model) -> Self {
         Self {
+            allow_docker: m
+                .metadata
+                .as_ref()
+                .and_then(|v| v.get("allow_docker"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             public_id: m.public_id.clone(),
             name: m.name.clone(),
             status: m.status.clone(),
@@ -2057,6 +2067,7 @@ impl SandboxService {
         // unless the operator changed it), so existing clients see no
         // behavior change.
         let backend = parse_requested_backend(req.backend.as_deref())?;
+        validate_allow_docker(req.allow_docker, backend)?;
 
         // ADR-048: decide which node hosts the sandbox before anything is
         // created. Explicit requests are validated against the operator
@@ -2119,6 +2130,7 @@ impl SandboxService {
 
         let metadata_value = {
             let mut meta = serde_json::Map::new();
+            meta.insert("allow_docker".into(), serde_json::json!(req.allow_docker));
             if !req.ports.is_empty() {
                 meta.insert("ports".into(), serde_json::json!(req.ports));
             }
@@ -2219,6 +2231,7 @@ impl SandboxService {
             memory_limit_mb: req.memory_limit_mb,
             pids_limit: req.pids_limit,
             disk_size_mb: req.disk_size_mb,
+            allow_docker: req.allow_docker,
             network_mode: None,
             env_vars: req.env,
             idle_timeout: Duration::from_secs(timeout),
@@ -2345,6 +2358,7 @@ impl SandboxService {
                 "backend": row.backend,
                 "image": row.image,
                 "disk_size_mb": req.disk_size_mb,
+                "allow_docker": req.allow_docker,
                 "node_id": node_id,
             })),
         )
@@ -5076,6 +5090,7 @@ fn application_sandbox_create_config(
         memory_limit_mb: Some(config.memory_limit_mb),
         pids_limit: Some(config.pids_limit),
         disk_size_mb: Some(config.disk_limit_mb),
+        allow_docker: false,
         network_mode: None,
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -5139,6 +5154,19 @@ fn source_target_guard_script(work_dir: &str, target_dir: &str) -> String {
 
 fn source_target_restore_script() -> &'static str {
     "if [ \"$(id -u)\" -eq 0 ] && [ -d /dev/fd/9 ] && id -u temps >/dev/null 2>&1; then chown \"$(id -u temps):$(id -g temps)\" /dev/fd/9; chmod 755 /dev/fd/9; fi"
+}
+
+/// Guest privilege escalation is a creation-time, explicit backend opt-in.
+fn validate_allow_docker(
+    allow_docker: bool,
+    backend: Option<temps_agents::sandbox::SandboxBackend>,
+) -> Result<(), SandboxError> {
+    if allow_docker && backend != Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
+        return Err(SandboxError::Validation {
+            message: "allow_docker requires backend=microsandbox; Docker inside Firecracker is not supported yet".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Parse the backend a create request asked for. `None` = host default.
@@ -5909,6 +5937,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn allow_docker_requires_explicit_microsandbox_backend() {
+        use temps_agents::sandbox::SandboxBackend;
+        for backend in [
+            None,
+            Some(SandboxBackend::Docker),
+            Some(SandboxBackend::Firecracker),
+        ] {
+            assert!(validate_allow_docker(true, backend).is_err());
+            assert!(validate_allow_docker(false, backend).is_ok());
+        }
+        assert!(validate_allow_docker(true, Some(SandboxBackend::Microsandbox)).is_ok());
+    }
+
+    #[test]
     fn request_carries_preview_password() {
         // The field is plumbed through the service input DTO so handlers
         // don't need to reach around the service to wire it in.
@@ -5992,6 +6034,16 @@ pub(crate) mod tests {
         const _: () = assert!(MIN_TIMEOUT_SECS < DEFAULT_TIMEOUT_SECS);
         const _: () = assert!(DEFAULT_TIMEOUT_SECS < MAX_TIMEOUT_SECS);
         assert_eq!(MAX_TIMEOUT_SECS, 86400);
+    }
+
+    #[test]
+    fn allow_docker_is_reported_from_persisted_metadata() {
+        let mut row = agent_run_row(None);
+        assert!(!SandboxSummary::from(&row).allow_docker);
+        row.metadata = Some(serde_json::json!({"allow_docker": true}));
+        assert!(SandboxSummary::from(&row).allow_docker);
+        row.metadata = Some(serde_json::json!({"allow_docker": false}));
+        assert!(!SandboxSummary::from(&row).allow_docker);
     }
 
     fn agent_run_row(run_id: Option<i32>) -> sandboxes::Model {
@@ -8613,6 +8665,7 @@ mod storage_cleanup_tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(3600),

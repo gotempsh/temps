@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use temps_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
 
-use super::upgrade::{fetch_guest_agents_from_release, ReleaseGuestAgents};
+use super::upgrade::{
+    fetch_guest_agents_from_release, guest_agent_needs_fetch, ReleaseGuestAgents,
+};
 
 use super::upgrade::{download_asset, download_asset_text, verify_checksum};
 
@@ -694,19 +696,20 @@ impl FirecrackerSetupCommand {
             std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(|d| d.join(name)))
-                .is_some_and(|p| p.exists())
         };
         let mut missing: Vec<&str> = Vec::new();
-        if self.vm_agent_bin.is_none()
-            && !beside("temps-vm-agent")
-            && !dirs.bin.join("temps-vm-agent").exists()
-        {
+        if guest_agent_needs_fetch(
+            self.vm_agent_bin.as_deref(),
+            beside("temps-vm-agent").as_deref(),
+            &dirs.bin.join("temps-vm-agent"),
+        ) {
             missing.push("temps-vm-agent");
         }
-        if self.pty_agent_bin.is_none()
-            && !beside(PTY_AGENT_BINARY_NAME)
-            && !dirs.pty_agent_bin().exists()
-        {
+        if guest_agent_needs_fetch(
+            self.pty_agent_bin.as_deref(),
+            beside(PTY_AGENT_BINARY_NAME).as_deref(),
+            &dirs.pty_agent_bin(),
+        ) {
             missing.push(PTY_AGENT_BINARY_NAME);
         }
         if missing.is_empty() {

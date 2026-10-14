@@ -1142,6 +1142,7 @@ impl RemoteSandboxProvider {
 #[async_trait]
 impl SandboxProvider for RemoteSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(SandboxBackend::Docker)?;
         let label = config
             .container_name_override
             .clone()
@@ -1812,6 +1813,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: Default::default(),
             idle_timeout: Duration::from_secs(60),

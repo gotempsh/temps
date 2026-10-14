@@ -163,6 +163,9 @@ pub struct SandboxHandle {
 
 /// Configuration for creating a new sandbox.
 pub struct SandboxCreateConfig {
+    /// Permit guest Docker installation by retaining normal guest-root semantics.
+    /// Only microsandbox supports this opt-in; never grants host Docker access.
+    pub allow_docker: bool,
     /// The agent run this sandbox belongs to. Used as the fallback
     /// container suffix (`temps-sandbox-<run_id>`) and for the per-run
     /// home volume.
@@ -222,6 +225,21 @@ pub struct SandboxCreateConfig {
     /// host. Only read by [`node_routing::NodeRoutingSandboxProvider`];
     /// concrete providers ignore it.
     pub node_id: Option<i32>,
+}
+
+impl SandboxCreateConfig {
+    /// Fail closed rather than silently ignoring an unsupported guest privilege request.
+    pub(crate) fn validate_allow_docker(&self, backend: SandboxBackend) -> Result<(), AgentError> {
+        if self.allow_docker && backend != SandboxBackend::Microsandbox {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "sandbox run {}: allow_docker requires the microsandbox backend; {} does not support guest Docker",
+                    self.run_id, backend
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The error [`SandboxProvider::read_file_bounded`] returns for a file over
@@ -643,7 +661,7 @@ pub enum PtyAgentStagingError {
 /// Both microVM backends' setup commands stage through this, so they agree on
 /// what a valid agent is.
 pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgentStagingError> {
-    use std::io::Read;
+    use std::io::{Read, Seek};
     use std::os::unix::fs::PermissionsExt;
 
     let io_err = |e: std::io::Error| PtyAgentStagingError::Io {
@@ -670,15 +688,25 @@ pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgent
         path: source.to_path_buf(),
         reason,
     })?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(io_err)?;
-    }
-    // Write beside the destination and rename, so a running server never
-    // reads a half-copied agent.
-    let tmp = dest.with_extension("staging");
-    std::fs::copy(source, &tmp).map_err(io_err)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(io_err)?;
-    std::fs::rename(&tmp, dest).map_err(io_err)?;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(io_err)?;
+    // Every writer owns a distinct file in the destination filesystem. Setup
+    // and startup refresh may race, but only a complete agent is published.
+    let mut staged = tempfile::Builder::new()
+        .prefix(".temps-guest-agent-")
+        .tempfile_in(parent)
+        .map_err(io_err)?;
+    file.rewind().map_err(io_err)?;
+    std::io::copy(&mut file, staged.as_file_mut()).map_err(io_err)?;
+    staged
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .map_err(io_err)?;
+    staged.as_file().sync_all().map_err(io_err)?;
+    staged.persist(dest).map_err(|e| io_err(e.error))?;
     Ok(())
 }
 
@@ -1718,6 +1746,49 @@ mod tests {
         // No temporary left behind, and re-staging over an existing file works.
         assert!(!dest.with_extension("staging").exists());
         stage_pty_agent_binary(&elf, &dest).unwrap();
+    }
+
+    #[test]
+    fn overlapping_agent_writes_publish_only_complete_binaries() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("agent");
+        let payloads = [
+            test_elf::static_for_host(&vec![1; 2 * 1024 * 1024]),
+            test_elf::static_for_host(&vec![2; 2 * 1024 * 1024]),
+        ];
+        let sources = [dir.path().join("source-a"), dir.path().join("source-b")];
+        for (source, bytes) in sources.iter().zip(&payloads) {
+            std::fs::write(source, bytes).unwrap();
+        }
+        stage_pty_agent_binary(&sources[0], &dest).unwrap();
+        let gate = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for source in &sources {
+                let gate = gate.clone();
+                let dest = &dest;
+                scope.spawn(move || {
+                    gate.wait();
+                    for _ in 0..12 {
+                        stage_pty_agent_binary(source, dest).unwrap();
+                    }
+                });
+            }
+            gate.wait();
+            for _ in 0..48 {
+                let published = std::fs::read(&dest).unwrap();
+                assert!(
+                    payloads.contains(&published),
+                    "published a partial or mixed binary"
+                );
+            }
+        });
+        assert!(payloads.contains(&std::fs::read(&dest).unwrap()));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            3,
+            "temporary files leaked"
+        );
     }
 
     #[test]

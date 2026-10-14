@@ -914,7 +914,7 @@ impl MicrosandboxSandboxProvider {
             .image(image)
             .cpus(plan.cpus)
             .memory(plan.memory_mib)
-            .security(SecurityProfile::Restricted)
+            .security(guest_security_profile(config.allow_docker))
             .labels([
                 ("sh.temps.backend", PROVIDER_NAME.to_string()),
                 ("sh.temps.run_id", run_id.to_string()),
@@ -1977,6 +1977,14 @@ fn parse_uid_gid(stdout: &str) -> Option<(u32, u32)> {
     lines.next().is_none().then_some((uid, gid))
 }
 
+fn guest_security_profile(allow_docker: bool) -> SecurityProfile {
+    if allow_docker {
+        SecurityProfile::Default
+    } else {
+        SecurityProfile::Restricted
+    }
+}
+
 fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBackend, AgentError> {
     let home = config.home();
     LocalBackend::builder()
@@ -2199,6 +2207,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -2497,6 +2506,77 @@ mod tests {
             return None;
         }
         Some(provider)
+    }
+
+    #[test]
+    fn docker_opt_in_selects_guest_root_semantics() {
+        assert_eq!(guest_security_profile(false), SecurityProfile::Restricted);
+        assert_eq!(guest_security_profile(true), SecurityProfile::Default);
+        let mut config = create_config();
+        config.allow_docker = true;
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Docker)
+            .is_err());
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Firecracker)
+            .is_err());
+        assert!(config.validate_allow_docker(SandboxBackend::Local).is_err());
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Microsandbox)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn e2e_allow_docker_installs_and_runs_nested_container() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        let mut config = e2e_config("nested-docker", "full");
+        config.allow_docker = true;
+        config.memory_limit_mb = Some(1024);
+        config.disk_size_mb = Some(4096);
+        let provider = &provider;
+        with_sandbox(provider, config, |handle| async move {
+            let result = sh(
+                provider,
+                &handle,
+                r#"
+                set -eu
+                grep -Eq '^NoNewPrivs:[[:space:]]+0$' /proc/self/status
+                apk add --no-cache docker
+                mkdir -p /sys/fs/cgroup
+                mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
+                dockerd --storage-driver=vfs --iptables=false --bridge=none >/tmp/dockerd.log 2>&1 &
+                daemon=$!
+                trap 'kill "$daemon" 2>/dev/null || true' EXIT
+                ready=0
+                for i in $(seq 1 30); do
+                    if docker info >/dev/null 2>&1; then ready=1; break; fi
+                    sleep 1
+                done
+                if [ "$ready" != 1 ]; then cat /tmp/dockerd.log; exit 1; fi
+                docker run --rm --network none alpine:3.20 echo temps-nested-docker-ok
+            "#,
+            )
+            .await;
+            assert_eq!(result.exit_code, 0, "{}\n{}", result.stdout, result.stderr);
+            assert!(result.stdout.contains("temps-nested-docker-ok"));
+            provider.stop(&handle).await.unwrap();
+            provider.start(&handle).await.unwrap();
+            provider.evict(&handle.sandbox_name);
+            let resumed = sh(
+                provider,
+                &handle,
+                "grep -Eq '^NoNewPrivs:[[:space:]]+0$' /proc/self/status && docker --version",
+            )
+            .await;
+            assert_eq!(
+                resumed.exit_code, 0,
+                "{}\n{}",
+                resumed.stdout, resumed.stderr
+            );
+        })
+        .await;
     }
 
     fn e2e_config(label: &str, network_mode: &str) -> SandboxCreateConfig {

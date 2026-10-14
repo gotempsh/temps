@@ -509,6 +509,10 @@ pub struct ResourcesBody {
 
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct CreateSandboxBody {
+    /// Permit installing/running Docker with normal guest-root privileges.
+    /// Requires backend="microsandbox". Does not install Docker or expose the host socket.
+    #[serde(default)]
+    pub allow_docker: bool,
     /// Docker image override. `null` uses the platform default.
     #[serde(default)]
     pub image: Option<String>,
@@ -630,6 +634,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             memory_limit_mb: b.memory_limit_mb.or(resources.memory),
             pids_limit: b.pids_limit,
             disk_size_mb: b.disk_size_mb,
+            allow_docker: b.allow_docker,
             source: b.source.map(SandboxSource::from),
             preview_password: b.preview_password,
             ports: b.ports,
@@ -671,6 +676,8 @@ pub struct SandboxRoute {
 /// the SDK's zod validator rejects missing required fields.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SandboxInner {
+    /// Normal guest-root semantics enabled for Docker (microsandbox only).
+    pub allow_docker: bool,
     pub id: String,
     pub memory: u64,
     pub vcpus: f64,
@@ -783,6 +790,7 @@ impl SandboxResponse {
                 name: s.name,
                 image: s.image,
                 backend: s.backend,
+                allow_docker: s.allow_docker,
                 disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
@@ -3089,6 +3097,7 @@ mod tests {
     fn sandbox_response_converts_summary() {
         let now = Utc::now();
         let summary = SandboxSummary {
+            allow_docker: false,
             public_id: "sbx_abc".into(),
             node_id: None,
             node_name: "control-plane".into(),
@@ -3121,6 +3130,7 @@ mod tests {
 
         let now = Utc::now();
         let summary = SandboxSummary {
+            allow_docker: false,
             public_id: "sbx_abcd1234ef567890".into(),
             node_id: None,
             node_name: "control-plane".into(),
@@ -3153,6 +3163,15 @@ mod tests {
             "https://ws-abcd1234ef567890-3000.localho.st"
         );
         assert_eq!(r.routes[1].port, 5173);
+    }
+
+    #[test]
+    fn allow_docker_defaults_off_and_round_trips() {
+        let body: CreateSandboxBody = serde_json::from_str("{}").unwrap();
+        assert!(!CreateSandboxRequest::from(body).allow_docker);
+        let body: CreateSandboxBody =
+            serde_json::from_str(r#"{"backend":"microsandbox","allow_docker":true}"#).unwrap();
+        assert!(CreateSandboxRequest::from(body).allow_docker);
     }
 
     #[test]

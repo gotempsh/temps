@@ -205,18 +205,20 @@ async fn build_sandbox_provider(
 /// Firecracker host whose setup predated a release that ships the VM agent
 /// becomes available on the first start after upgrading.
 fn refresh_staged_pty_agents(data_dir: &std::path::Path) {
-    use crate::sandbox::firecracker::FirecrackerSandboxConfig;
-    use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
-    use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
-
-    const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
-
     let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
     else {
         return;
     };
+    refresh_staged_guest_agents_from(data_dir, &exe_dir);
+}
+
+fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::path::Path) {
+    use crate::sandbox::firecracker::FirecrackerSandboxConfig;
+    use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
+    use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
+    const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
 
     let microsandbox = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
     let firecracker = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
@@ -1070,6 +1072,69 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn startup_refresh_updates_all_three_targets_and_leaves_unconfigured_backends_alone() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let pty = test_elf::static_for_host(b"new-pty");
+        let vm = test_elf::static_for_host(b"new-vm");
+        std::fs::write(exe.path().join("temps-pty-agent"), &pty).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), &vm).unwrap();
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(!ms.home().exists());
+        assert!(!fc.fc_root().exists());
+        std::fs::create_dir_all(ms.pty_agent_bin().parent().unwrap()).unwrap();
+        std::fs::write(ms.pty_agent_bin(), test_elf::static_for_host(b"old")).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert!(
+            !fc.fc_root().exists(),
+            "refresh must not configure another backend"
+        );
+        for dest in [ms.pty_agent_bin(), fc.pty_agent_bin(), fc.agent_bin()] {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, test_elf::static_for_host(b"stale")).unwrap();
+        }
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+        // Missing and rejected shipped sources preserve working copies.
+        std::fs::remove_file(exe.path().join("temps-pty-agent")).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), b"invalid").unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+    }
+
+    #[test]
+    fn startup_refresh_continues_after_a_target_fails() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let bytes = test_elf::static_for_host(b"current");
+        for name in ["temps-pty-agent", "temps-vm-agent"] {
+            std::fs::write(exe.path().join(name), &bytes).unwrap();
+        }
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        std::fs::create_dir_all(ms.pty_agent_bin()).unwrap(); // rename onto a directory must fail
+        std::fs::create_dir_all(fc.fc_root()).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(ms.pty_agent_bin().is_dir());
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), bytes);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), bytes);
+    }
 
     #[test]
     fn default_backend_honours_only_registered_microvm_backends() {
