@@ -53,5 +53,7 @@ test('a refused node list keeps the page heading and explains the refusal', () =
   expect(html).toContain('Worker nodes: access denied')
   expect(html).toContain('Requires settings:read permission')
   expect(html).not.toContain('Failed to load worker nodes')
+  // A refused read is refused again on replay, so no Retry is offered.
+  expect(html).not.toContain('Retry')
   client.clear()
 })

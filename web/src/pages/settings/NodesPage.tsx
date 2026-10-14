@@ -96,7 +96,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
-import { isVerifiedNotFound } from '@/lib/read-failure'
+import { isForbiddenRead, isVerifiedNotFound } from '@/lib/read-failure'
 import { refetchUnlessRefused } from '@/lib/query-retry'
 import { Input } from '@/components/ui/input'
 import {
@@ -1856,7 +1856,9 @@ export function NodesPage() {
             <ReadFailure
               resource="Worker nodes"
               error={error}
-              onRetry={() => void refetchNodes()}
+              onRetry={
+                isForbiddenRead(error) ? undefined : () => void refetchNodes()
+              }
               retrying={nodesFetching}
             />
           </CardContent>
