@@ -59,6 +59,9 @@ const ipAccessControlSchema = z.object({
 
 type IpAccessControlFormData = z.infer<typeof ipAccessControlSchema>
 
+/** Stable fallback so memoised lists do not recompute on every render. */
+const NO_RULES: IpAccessControlResponse[] = []
+
 export function IpAccessControl() {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -74,7 +77,7 @@ export function IpAccessControl() {
     error: readError,
     refetch,
   } = useQuery(listIpAccessControlOptions())
-  const rules = cachedRules ?? []
+  const rules = cachedRules ?? NO_RULES
   // A refused or failed read is not an empty rule list: the zero-rule view
   // would invite an Add IP Rule that the server also refuses. A failed
   // *refresh* (e.g. the refetch after a mutation) keeps the last-known rules
