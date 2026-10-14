@@ -26,6 +26,13 @@ import type {
   PlatformSettings,
 } from '@/api/platformSettings'
 import {
+  type AnalyticsRetentionField,
+  ANALYTICS_RETENTION_DEFAULTS,
+  ANALYTICS_RETENTION_FIELDS,
+  emptyToNull,
+  validateRetentionWindow,
+} from './analytics-retention'
+import {
   AlertCircle,
   Archive,
   BarChart2,
@@ -98,58 +105,6 @@ const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
   container_logs_days: 30,
 }
 
-const ANALYTICS_RETENTION_DEFAULTS: AnalyticsRetentionSettings = {
-  events_days: 90,
-  error_events_days: null,
-  visitor_days: null,
-  unreferenced_ip_days: 30,
-}
-
-interface AnalyticsRetentionField {
-  name: keyof AnalyticsRetentionSettings
-  label: string
-  /** What is stored, so the admin knows which data the window governs. */
-  stores: string
-  description: string
-  /** A field that can be left empty to keep the data forever. */
-  optional: boolean
-}
-
-const ANALYTICS_RETENTION_FIELDS: AnalyticsRetentionField[] = [
-  {
-    name: 'events_days',
-    label: 'Page views and events',
-    stores: 'events',
-    description:
-      'Raw page views and custom events, including the IP address each one was recorded from. Applies to the built-in database: when ClickHouse analytics is enabled, its copy of events keeps to the ClickHouse table TTL (5 years by default), which this window does not change.',
-    optional: false,
-  },
-  {
-    name: 'error_events_days',
-    label: 'Error events',
-    stores: 'error_events',
-    description:
-      'Individual error occurrences. Error groups and their counters are kept.',
-    optional: true,
-  },
-  {
-    name: 'visitor_days',
-    label: 'Visitors',
-    stores: 'visitor',
-    description:
-      'Visitors not seen for this long are deleted and no longer appear in visitor lists. Deleting a visitor also deletes its session replays, and detaches it from the events, error events and request logs that are kept.',
-    optional: true,
-  },
-  {
-    name: 'unreferenced_ip_days',
-    label: 'Stored IP addresses',
-    stores: 'ip_geolocations',
-    description:
-      'A stored address is deleted once no event, visitor, log or audit entry uses it any more and it has not been looked up for this long.',
-    optional: true,
-  },
-]
-
 const CONTAINER_LOG_BUDGET_DEFAULTS: ContainerLogBudgetFormData = {
   cache_mb: 2048,
   head_buffer_mb: 8,
@@ -191,17 +146,6 @@ const DurationInput = forwardRef<HTMLInputElement, DurationInputProps>(
   )
 )
 DurationInput.displayName = 'DurationInput'
-
-/**
- * A cleared number input yields `''`, which must become `null` ("use the
- * default") rather than `NaN` — the server rejects a non-number and would
- * otherwise report a validation error for a field the admin just cleared.
- */
-function emptyToNull(value: unknown): number | null {
-  if (value === '' || value === null || value === undefined) return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
 
 function describeGeoSource(source: string | null): string {
   if (source === 'maxmind_official') return 'MaxMind (license key)'
@@ -301,15 +245,7 @@ function AnalyticsRetentionFieldCard({
         placeholder={field.optional ? 'Keep' : undefined}
         {...register(`analytics_retention.${field.name}`, {
           setValueAs: emptyToNull,
-          validate: (value) => {
-            if (value === null) {
-              return field.optional || 'A retention window is required'
-            }
-            return (
-              (Number.isInteger(value) && value >= 1 && value <= 3650) ||
-              'Must be a whole number of days from 1 to 3650'
-            )
-          },
+          validate: (value) => validateRetentionWindow(value, field.optional),
         })}
       />
       <p className="text-xs text-muted-foreground">
@@ -1177,9 +1113,10 @@ export function MonitoringSettingsPage() {
           </div>
           <p className="text-xs text-muted-foreground">
             Shortening a window permanently deletes data beyond that age. Leave
-            an optional window empty to keep that data indefinitely. An IP
-            address is also kept for as long as anything still refers to it, so
-            its window only starts once the last reference is gone.
+            an optional window empty to keep that data indefinitely. A stored IP
+            address is only deleted once nothing refers to it and it has not
+            been looked up for the whole window; one that is still in use is
+            kept however long that takes.
           </p>
         </div>
       </SettingsSection>
