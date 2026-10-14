@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Button, Disclosure, Field, FormErrors } from '@temps-sdk/ds'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -14,24 +16,30 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import type { PublicIngressStatusResponse } from '@/api/client/types.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePublicIngress } from '@/hooks/usePublicIngress'
 import {
-  useSettings,
+  useSettingsPage,
   useUpdateSettings,
   type PlatformSettings,
 } from '@/hooks/useSettings'
 import { client } from '@/api/client/client.gen'
+import { getPublicIngressStatusQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import {
-  AlertCircle,
+  AlertTriangle,
   Loader2,
   RefreshCw,
   Save,
   ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
+import { useLocation } from 'react-router'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/layout/PageContainer'
 
@@ -39,6 +47,7 @@ type SettingsFormData = Pick<
   PlatformSettings,
   | 'external_url'
   | 'internal_url'
+  | 'public_ingress_url'
   | 'preview_domain'
   | 'edge_target'
   | 'screenshots'
@@ -51,10 +60,74 @@ function optionalString(value: string | null | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null
 }
 
+/**
+ * Client-side mirror of the server's public ingress URL rules, so a typo is
+ * caught before the save round-trip. The server stays authoritative: it also
+ * refuses unreachable hosts and hostnames a project already uses.
+ */
+function validatePublicIngressUrl(value: string | null | undefined) {
+  const trimmed = value?.trim() ?? ''
+  if (!trimmed) return true // optional — falls back to the external URL
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+    return 'Must start with http:// or https://'
+  if (trimmed.includes('#') || trimmed.includes('?'))
+    return 'Must not contain # or ? characters'
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.pathname !== '/' && parsed.pathname !== '')
+      return 'Must be a bare origin such as https://hooks.example.com, without a path'
+  } catch {
+    return 'Must be a valid URL'
+  }
+  return true
+}
+
+/**
+ * States where callbacks currently go and whether they can arrive, under the
+ * public ingress field. Always rendered: an unset field is the common case and
+ * the operator still needs to see which URL providers are being given.
+ */
+function PublicIngressSummary({
+  status,
+  isPending,
+}: {
+  status: PublicIngressStatusResponse | undefined
+  isPending: boolean
+}) {
+  if (isPending) {
+    return <Skeleton className="mt-2 h-4 w-72 max-w-full" />
+  }
+  if (!status) return null
+
+  return (
+    <div className="mt-2 space-y-2">
+      <p className="text-sm text-muted-foreground">
+        Callbacks are currently sent to{' '}
+        <code className="rounded bg-muted px-1 py-0.5 text-xs">
+          {status.effective_url}
+        </code>
+        {status.source === 'external_url_fallback'
+          ? ' (the external URL, because no public ingress URL is set).'
+          : '.'}
+      </p>
+      {!status.configured && (
+        <Alert variant="warning">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Third parties cannot reach this URL</AlertTitle>
+          <AlertDescription>{status.reason}</AlertDescription>
+        </Alert>
+      )}
+    </div>
+  )
+}
+
 export function Settings() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
+  const queryClient = useQueryClient()
+  const location = useLocation()
+  const publicIngress = usePublicIngress()
   const [isRefreshingRoutes, setIsRefreshingRoutes] = useState(false)
 
   const {
@@ -68,6 +141,7 @@ export function Settings() {
     defaultValues: {
       external_url: '',
       internal_url: '',
+      public_ingress_url: '',
       preview_domain: 'localho.st',
       edge_target: '',
       console_force_https: null,
@@ -109,6 +183,7 @@ export function Settings() {
       reset({
         external_url: settings.external_url || '',
         internal_url: settings.internal_url || '',
+        public_ingress_url: settings.public_ingress_url || '',
         preview_domain: settings.preview_domain || 'localho.st',
         edge_target: settings.edge_target || '',
         console_force_https: settings.console_force_https ?? null,
@@ -125,16 +200,32 @@ export function Settings() {
     }
   }, [settings, reset])
 
+  // Onboarding links from other pages land on `/settings#public-ingress`;
+  // bring the field into view once the form has rendered.
+  const settingsLoaded = Boolean(settings)
+  useEffect(() => {
+    if (!settingsLoaded || location.hash !== '#public-ingress') return
+    document
+      .getElementById('public-ingress')
+      ?.scrollIntoView({ block: 'center' })
+  }, [settingsLoaded, location.hash])
+
   const onSubmit = async (data: SettingsFormData) => {
     try {
       const normalized: SettingsFormData = {
         ...data,
         edge_target: optionalString(data.edge_target),
+        public_ingress_url: optionalString(data.public_ingress_url),
       }
       await updateSettings.mutateAsync(normalized)
       reset({
         ...normalized,
         edge_target: normalized.edge_target || '',
+        public_ingress_url: normalized.public_ingress_url || '',
+      })
+      // The effective callback URL is derived from what was just saved.
+      await queryClient.invalidateQueries({
+        queryKey: getPublicIngressStatusQueryKey(),
       })
       toast.success('Settings saved successfully')
     } catch (err: any) {
@@ -156,13 +247,10 @@ export function Settings() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>
-          Failed to load settings. Please try again later.
-        </AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
@@ -219,6 +307,34 @@ export function Settings() {
                 />
               )}
             </Field>
+
+            <div id="public-ingress" className="scroll-mt-24">
+              <Field
+                label="Public ingress URL"
+                optional
+                error={errors.public_ingress_url?.message}
+                help={{
+                  label: 'About the public ingress URL',
+                  content:
+                    'The address third parties call back: email open and click tracking, git provider webhooks, SES delivery events, revenue webhooks and error-tracking DSNs. Set it when the console is restricted (VPN, firewall, allowlist), so only this hostname has to be public. Temps serves nothing but those callback routes on it. Use a hostname outside the preview domain, which is reserved for the names Temps generates.',
+                }}
+              >
+                {(fieldProps) => (
+                  <Input
+                    {...fieldProps}
+                    type="url"
+                    placeholder="https://hooks.your-domain.com"
+                    {...register('public_ingress_url', {
+                      validate: validatePublicIngressUrl,
+                    })}
+                  />
+                )}
+              </Field>
+              <PublicIngressSummary
+                status={publicIngress.status}
+                isPending={publicIngress.isPending}
+              />
+            </div>
 
             <div className="space-y-2">
               <Label htmlFor="preview-domain">Preview Domain</Label>

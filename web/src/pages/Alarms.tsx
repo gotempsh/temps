@@ -10,6 +10,7 @@ import {
   listProjectAlarmsQueryKey,
   resolveAlarmMutation,
   silenceAlarmMutation,
+  unsilenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { bulkUpdateProjectAlarms } from '@/api/client'
 import type {
@@ -35,6 +36,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -182,8 +184,12 @@ function statusBadge(status: string) {
   }
 }
 
+// A silence only mutes an alarm that is still open: once it is resolved the
+// backend lets the next breach alarm again, so don't advertise a mute that no
+// longer applies.
 function isSilenced(alarm: AlarmResponse): boolean {
   return (
+    alarm.status !== 'resolved' &&
     !!alarm.silenced_until &&
     new Date(alarm.silenced_until).getTime() > Date.now()
   )
@@ -430,6 +436,15 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
   })
 
+  const unsilence = useMutation({
+    ...unsilenceAlarmMutation(),
+    onSuccess: () => {
+      toast.success('Alarm silence lifted')
+      invalidate()
+    },
+    onError: (err: Error) => toast.error(`Failed to unsilence: ${err.message}`),
+  })
+
   const bulk = useMutation({
     // The project is part of the variables so a project switch mid-request
     // can't redirect later rounds or the cache invalidation elsewhere.
@@ -538,6 +553,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     acknowledge.isPending ||
     resolve.isPending ||
     silence.isPending ||
+    unsilence.isPending ||
     bulk.isPending
   const hasSelection = selectionCount(selection) !== 0
   const pageSelectable = selectableIds(items).length > 0
@@ -603,7 +619,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           disabled={projectsLoading || projects.length === 0 || bulk.isPending}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
-            <SelectValue placeholder="Select a project…" />
+            <SelectValue placeholder="Select a service…" />
           </SelectTrigger>
           <SelectContent>
             {projects.map((p) => (
@@ -802,8 +818,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     <EmptyState
                       size="compact"
                       icon={AlarmClock}
-                      title="No project selected"
-                      description="Select a project to view its alarm history."
+                      title="No service selected"
+                      description="Select a service to view its alarm history."
                     />
                   </TableCell>
                 </TableRow>
@@ -843,7 +859,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       description={
                         hasFilters
                           ? 'Try adjusting your filters to see more results.'
-                          : 'Nothing has fired for this project yet.'
+                          : 'Nothing has fired for this service yet.'
                       }
                     />
                   </TableCell>
@@ -991,6 +1007,23 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                                   {opt.label}
                                 </DropdownMenuItem>
                               ))}
+                              {isSilenced(alarm) && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    onClick={() =>
+                                      unsilence.mutate({
+                                        path: {
+                                          project_id: effectiveProjectId ?? 0,
+                                          alarm_id: alarm.id,
+                                        },
+                                      })
+                                    }
+                                  >
+                                    Unsilence now
+                                  </DropdownMenuItem>
+                                </>
+                              )}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         )}
@@ -1054,8 +1087,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmAction === 'acknowledge'
-                ? 'Every firing alarm in this project that matches the current filters — including ones on other pages — will be marked acknowledged.'
-                : 'Every firing or acknowledged alarm in this project that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
+                ? 'Every firing alarm in this service that matches the current filters — including ones on other pages — will be marked acknowledged.'
+                : 'Every firing or acknowledged alarm in this service that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

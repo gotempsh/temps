@@ -10,7 +10,7 @@ export const DEPLOYMENT_TOKEN_PERMISSIONS = [
   {
     value: 'analytics:read',
     label: 'Read analytics',
-    description: 'Read project analytics data.',
+    description: 'Read service analytics data.',
   },
   {
     value: 'events:write',
@@ -25,7 +25,7 @@ export const DEPLOYMENT_TOKEN_PERMISSIONS = [
   {
     value: 'emails:send',
     label: 'Send email',
-    description: 'Send email for this project.',
+    description: 'Send email for this service.',
   },
   {
     value: 'errors:read',
@@ -40,7 +40,7 @@ export const DEPLOYMENT_TOKEN_PERMISSIONS = [
   {
     value: 'flags:read',
     label: 'Read feature flags',
-    description: 'Evaluate project feature flags.',
+    description: 'Evaluate service feature flags.',
   },
   {
     value: 'blob:read',

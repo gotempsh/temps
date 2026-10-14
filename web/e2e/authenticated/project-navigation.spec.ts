@@ -13,7 +13,7 @@ test('direct project links and direct flat settings navigation', async ({
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.goto(`${root}/settings`)
   await expect(page).toHaveURL(/settings\/general$/)
-  const primary = page.getByRole('list', { name: 'Project navigation' })
+  const primary = page.getByRole('list', { name: 'Service navigation' })
   await expect(primary.getByRole('link')).toHaveCount(12)
   await expect(primary.getByRole('link')).toHaveText([
     'Overview',
@@ -45,7 +45,15 @@ test('direct project links and direct flat settings navigation', async ({
   })
   await primary.getByRole('link', { name: 'Settings', exact: true }).click()
   const settings = page.getByRole('navigation', { name: 'Settings pages' })
-  await expect(settings.getByRole('link')).toHaveCount(7)
+  await expect(settings.getByRole('link')).toHaveText([
+    'General',
+    'Build & deploy',
+    'Domains',
+    'Variables',
+    'Automation',
+    'Integrations',
+    'Telemetry',
+  ])
   await expect(settings.locator('a > svg')).toHaveCount(7)
   await settings
     .getByRole('link', { name: 'Build & deploy', exact: true })
@@ -105,16 +113,37 @@ test('direct project links and direct flat settings navigation', async ({
     path: '/tmp/temps-project-security-flat.png',
     fullPage: true,
   })
-  for (const [section, count] of [
-    ['Logs', 3],
-    ['Traces', 2],
-    ['Monitoring', 3],
-    ['Analytics', 14],
+  // Each contextual navigation lists exactly these pages, in this order.
+  // Naming them (rather than only counting) is what catches a page being
+  // added, dropped or renamed; `toHaveText` with an array also pins the count.
+  for (const [section, pages] of [
+    ['Logs', ['Application logs', 'Request logs', 'Telemetry logs']],
+    ['Traces', ['Traces', 'AI traces']],
+    ['Monitoring', ['Metrics', 'Uptime', 'Status pages', 'Alert rules']],
+    [
+      'Analytics',
+      [
+        'Overview',
+        'Visitors',
+        'Live visitors',
+        'Live globe',
+        'Journey',
+        'Activity report',
+        'Pages',
+        'Sessions',
+        'Funnels',
+        'Web performance',
+        'AI visitors',
+        'API traffic',
+        'AI crawlers',
+        'Revenue',
+      ],
+    ],
   ] as const) {
     await primary.getByRole('link', { name: section, exact: true }).click()
     const nav = page.getByRole('navigation', { name: `${section} pages` })
-    await expect(nav.getByRole('link')).toHaveCount(count)
-    await expect(nav.locator('a > svg')).toHaveCount(count)
+    await expect(nav.getByRole('link')).toHaveText([...pages])
+    await expect(nav.locator('a > svg')).toHaveCount(pages.length)
     await expect(
       primary.getByRole('link', { name: section, exact: true })
     ).toHaveAttribute('aria-current', 'page')

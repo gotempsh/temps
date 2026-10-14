@@ -71,15 +71,23 @@ impl TempsPlugin for PerformancePlugin {
         // route table (by Host header) or from an ADR-040 ingest key, never
         // from a caller-supplied project_id, so there is no project scope to
         // check here.
-        let routes = configure_public_routes().with_state(Arc::new(AppState {
+        let ingest_key_service =
+            context.require_service::<temps_analytics::AnalyticsIngestKeyService>();
+        let ingest_rate_limiter =
+            context.require_service::<temps_analytics::AnalyticsIngestRateLimiter>();
+        // The CORS layer resolves keys through the very same service and
+        // limiter the handlers use, so the two can never disagree about a key.
+        let cors = temps_analytics::ingest_keys::KeyedIngestCors::new(
+            ingest_key_service.clone(),
+            ingest_rate_limiter.clone(),
+        );
+        let routes = configure_public_routes(cors).with_state(Arc::new(AppState {
             performance_service,
             route_table,
             ip_address_service,
             project_access_checker: None,
-            ingest_key_service: context
-                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
-            ingest_rate_limiter: context
-                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+            ingest_key_service,
+            ingest_rate_limiter,
         }));
 
         Some(PluginRoutes::new(routes))

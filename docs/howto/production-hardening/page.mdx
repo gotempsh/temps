@@ -106,6 +106,8 @@ On a self-hosted install you may want some of those features to reach your own n
 - Cloud metadata endpoints (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`) stay blocked even inside a trusted range.
 - Every user who can configure one of the features above can reach the trusted networks, so keep the list as narrow as possible. Some of these features return what they fetch: importers copy a database's contents into a project, sandbox seeding downloads a URL, and AI providers return the upstream response. Do not trust the network where the Temps database, the Docker API or other management services listen. Trusting `127.0.0.0/8` makes the Temps host itself reachable.
 - Changes are recorded in the audit log as `TRUSTED_PRIVATE_NETWORKS_UPDATED` with the previous and new lists, and reach every Temps process within a few seconds.
+- The list applies to every outbound feature at once. Trusting a whole subnet, such as a Tailscale `100.64.0.0/10` range, makes every host on it reachable through webhooks, uptime checks and the rest. Prefer single-address entries (`192.168.1.20`, `10.0.0.5/32`, `fd12::5/128`) for the hosts you actually need.
+- To reach one self-hosted AI model server, you do not need this list at all: an administrator can trust that server's exact IP address and port on its AI provider key (**AI Gateway → Self-hosted (OpenAI-compatible) → Trust this private address for this key only**). The trust applies to that key only, is shown on the key, is recorded in the audit log as part of `AI_PROVIDER_KEY_CREATED`/`AI_PROVIDER_KEY_UPDATED`, and is dropped if the key's base URL moves. See [Self-hosted providers](/docs/ai-gateway#self-hosted).
 
 ---
 

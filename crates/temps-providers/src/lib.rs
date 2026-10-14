@@ -9,6 +9,7 @@ pub mod data_import;
 pub mod env_vars_provider_impl;
 pub mod externalsvc;
 pub mod health_monitor;
+pub mod managed_names;
 pub mod mariadb_query;
 pub mod parameter_strategies;
 pub mod pg_stat_statements;

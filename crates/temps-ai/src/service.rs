@@ -179,6 +179,13 @@ pub enum AiError {
     /// The provider/gateway returned an error.
     #[error("AI provider error for '{purpose}': {reason}")]
     Provider { purpose: String, reason: String },
+    /// The provider's reply stream ended before the provider said it was
+    /// finished: the connection dropped, a transport error or timeout hit
+    /// mid-reply, or the body closed without a terminal chunk (`finish_reason`
+    /// or `[DONE]`). Text received so far is incomplete and must not be
+    /// treated as a finished answer.
+    #[error("AI provider stream for '{purpose}' ended before the reply was complete: {reason}")]
+    StreamInterrupted { purpose: String, reason: String },
     /// Retained runtime diagnostic after exact turn-secret redaction at source.
     #[error("retained AI harness error for '{purpose}': {reason}")]
     RetainedHarnessDiagnostic { purpose: String, reason: String },
@@ -247,6 +254,28 @@ pub trait AiService: Send + Sync {
     /// Provider-aware readiness for a pinned conversation.
     async fn chat_capable_for(&self, _provider: Option<&str>) -> bool {
         self.chat_capable().await
+    }
+
+    /// Why `provider` is not chat-capable, when the adapter can say more
+    /// than "not configured" -- e.g. a self-hosted key that does not declare
+    /// streaming. `None` lets the caller use its generic setup message.
+    async fn chat_unavailable_reason(&self, _provider: Option<&str>) -> Option<String> {
+        None
+    }
+
+    /// Whether chat turns on `provider` for `model` (the conversation's
+    /// saved model; `None` = the configured default) may carry function/tool
+    /// schemas. Adapters that cannot call tools return `false`, so callers
+    /// leave the tools out (and say so) rather than having the turn refused.
+    async fn tool_calling_for(&self, _provider: Option<&str>, _model: Option<&str>) -> bool {
+        true
+    }
+
+    /// The provider a new chat should default to when none is chosen, if the
+    /// adapter can pick one that can actually serve chat. `None` lets the
+    /// caller fall back to its own default.
+    async fn default_chat_provider(&self) -> Option<String> {
+        None
     }
 
     /// Return the normalized controls and realtime features for one provider.
@@ -342,6 +371,34 @@ pub trait AiService: Send + Sync {
         Err(AiError::Provider {
             purpose: "provider.harness.smoke".into(),
             reason: format!("harness smoke test is unavailable for '{provider}'"),
+        })
+    }
+
+    /// Report whether the provider's harness CLI inside the caller's
+    /// persistent workspace is behind the latest release. Reads are cached;
+    /// `refresh` forces a new look inside the workspace.
+    async fn workspace_harness_update_status(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+        _refresh: bool,
+    ) -> Result<crate::HarnessUpdateStatus, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        })
+    }
+
+    /// Update the provider's harness CLI inside the caller's persistent
+    /// workspace to the latest release and return its new status.
+    async fn update_workspace_harness(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+    ) -> Result<crate::HarnessUpdateStatus, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
         })
     }
 

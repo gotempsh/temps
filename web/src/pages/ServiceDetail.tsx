@@ -14,7 +14,10 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { revealServiceParameter } from '@/api/client/sdk.gen'
+import {
+  revealServiceEnvironmentVariables,
+  revealServiceParameter,
+} from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import {
   externalServiceBackupsQueryKey,
@@ -107,7 +110,12 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -335,6 +343,7 @@ export function ServiceDetail() {
     data: serviceBackupsData,
     isLoading: isLoadingBackups,
     isFetching: isFetchingBackups,
+    isPlaceholderData: isBackupsPlaceholderData,
     refetch: refetchBackups,
   } = useQuery({
     ...listExternalServiceBackupsOptions(
@@ -343,6 +352,10 @@ export function ServiceDetail() {
       BACKUPS_PAGE_SIZE
     ),
     enabled: !!serviceId,
+    // Keep the previous page (and its `total`) on screen while the next page
+    // loads; without it `data` is undefined mid-navigation and the page-range
+    // clamp below would read total=0 and bounce the user back to page 1.
+    placeholderData: keepPreviousData,
   })
 
   const serviceBackups = serviceBackupsData?.backups ?? []
@@ -361,13 +374,22 @@ export function ServiceDetail() {
   )
 
   useEffect(() => {
+    // Only trust the total once the requested page has actually loaded: before
+    // that (initial load, deep link, or placeholder data from the previous
+    // page) the total is unknown or stale and must not clamp the page.
+    if (!serviceBackupsData || isBackupsPlaceholderData) return
     if (backupsPage > backupsTotalPages) {
       // The server total can shrink after a backup is removed while this page
       // is open; synchronize the requested page back into the valid range.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setBackupsPage(backupsTotalPages)
     }
-  }, [backupsPage, backupsTotalPages])
+  }, [
+    backupsPage,
+    backupsTotalPages,
+    serviceBackupsData,
+    isBackupsPlaceholderData,
+    setBackupsPage,
+  ])
 
   const paginatedBackups = serviceBackups
 
@@ -394,9 +416,9 @@ export function ServiceDetail() {
 
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
-    meta: { errorTitle: 'Failed to link project' },
+    meta: { errorTitle: 'Failed to link service' },
     onSuccess: (_data, variables) => {
-      toast.success('Project linked successfully')
+      toast.success('Service linked successfully')
       refetchLinkedProjects()
       setIsLinkPopoverOpen(false)
       const project = allProjectsData?.projects?.find(
@@ -645,7 +667,7 @@ export function ServiceDetail() {
 
   const backAction = (
     <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage">
+      <Link to="/storage" aria-label="Back to storage">
         <ArrowLeft className="h-4 w-4" />
       </Link>
     </Button>
@@ -777,7 +799,7 @@ export function ServiceDetail() {
               <PopoverContent className="w-[320px] p-0" align="end">
                 <div className="border-b p-3">
                   <p className="text-xs font-medium text-muted-foreground">
-                    Linked projects
+                    Linked services
                   </p>
                   <LinkedResourceNote
                     serviceType={service.service.service_type}
@@ -807,14 +829,14 @@ export function ServiceDetail() {
                     </ul>
                   ) : (
                     <p className="mt-2 text-xs text-muted-foreground">
-                      No projects yet.
+                      No services linked yet.
                     </p>
                   )}
                 </div>
                 <Command>
-                  <CommandInput placeholder="Link a project..." />
+                  <CommandInput placeholder="Link a service..." />
                   <CommandList>
-                    <CommandEmpty>No projects found.</CommandEmpty>
+                    <CommandEmpty>No services found.</CommandEmpty>
                     <CommandGroup>
                       {allProjectsData?.projects
                         ?.filter(
@@ -1530,7 +1552,7 @@ export function ServiceDetail() {
                         disabled={backupsPage === 1}
                       >
                         <ChevronLeft className="h-4 w-4" />
-                        <span className="hidden sm:inline">Previous</span>
+                        <span className="max-sm:sr-only">Previous</span>
                       </Button>
                       <div className="hidden sm:flex items-center gap-1">
                         {backupsPageWindow.map((pageNum) => (
@@ -1557,7 +1579,7 @@ export function ServiceDetail() {
                         }
                         disabled={backupsPage === backupsTotalPages}
                       >
-                        <span className="hidden sm:inline">Next</span>
+                        <span className="max-sm:sr-only">Next</span>
                         <ChevronRight className="h-4 w-4" />
                       </Button>
                     </div>
@@ -1847,8 +1869,8 @@ export function ServiceDetail() {
               <CardHeader>
                 <CardTitle>Environment Variables</CardTitle>
                 <CardDescription>
-                  Preview of environment variables available to projects using
-                  this service
+                  Preview of environment variables available to the services
+                  linked to it
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -1869,15 +1891,24 @@ export function ServiceDetail() {
                 ) : envVars ? (
                   <>
                     <EnvVariablesDisplay
+                      key={id}
                       variables={envVars}
                       showCopy={true}
                       showMaskToggle={true}
                       defaultMasked={true}
                       maxHeight="20rem"
+                      reveal={async () =>
+                        (
+                          await revealServiceEnvironmentVariables({
+                            path: { id: parseInt(id!) },
+                            throwOnError: true,
+                          })
+                        ).data
+                      }
                     />
                     <p className="text-xs text-muted-foreground text-center mt-3">
-                      These variables are automatically available to projects
-                      that use this service
+                      These variables are automatically available to every
+                      linked service
                     </p>
                   </>
                 ) : null}
@@ -1896,8 +1927,8 @@ export function ServiceDetail() {
               <span className="font-medium text-foreground">
                 {service.service.name}
               </span>
-              ? All connected projects will lose access to this service until it
-              is started again.
+              ? Every linked service will lose access to it until it is started
+              again.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

@@ -12,10 +12,10 @@ import { toast } from 'sonner'
 import { format } from 'date-fns'
 import {
   createProjectFromTemplateMutation,
-  getProjectsQueryKey,
   listConnectionsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateProjectLists } from '@/lib/project-list-cache'
 import type {
   CreatableServiceTypeRoute,
   TemplateResponse,
@@ -102,6 +102,9 @@ import {
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
+import { MultiServiceTemplateConfigurator } from './MultiServiceTemplateConfigurator'
+import { isMultiServiceTemplate } from './multi-service-template'
 import {
   AlertCircle,
   Building2,
@@ -150,7 +153,7 @@ function ProviderIcon({
 
 // Form schema
 const formSchema = z.object({
-  projectName: z.string().min(1, 'Project name is required'),
+  projectName: z.string().min(1, 'Service name is required'),
   repositoryName: z.string().min(1, 'Repository name is required'),
   repositoryOwner: z.string().optional(),
   // Optional: when omitted the project deploys directly from the template's
@@ -252,7 +255,19 @@ function runtimeProfileSummary(runtime: TemplateRuntimeDefaults): string {
   return values.join(' · ')
 }
 
-export function TemplateConfigurator({
+/**
+ * Configures a template before creating it. A template with several
+ * services is created by the server as one operation (instantiate) and gets
+ * its own form; a single-service template keeps the one-request flow.
+ */
+export function TemplateConfigurator(props: TemplateConfiguratorProps) {
+  if (isMultiServiceTemplate(props.template)) {
+    return <MultiServiceTemplateConfigurator {...props} />
+  }
+  return <SingleServiceTemplateConfigurator {...props} />
+}
+
+function SingleServiceTemplateConfigurator({
   template,
   onCancel,
   onSuccess,
@@ -260,6 +275,13 @@ export function TemplateConfigurator({
 }: TemplateConfiguratorProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  // `?group=<id>`: the created service joins that project and the user
+  // lands there; a failed join is reported with Retry (never silent).
+  const {
+    group: targetGroup,
+    finish,
+    joinGroupDialog,
+  } = useJoinGroupAfterCreate()
   const [deliveryProvider, setDeliveryProvider] = useState<
     'none' | 'cloudflare' | 'bunny' | undefined
   >(undefined)
@@ -553,19 +575,29 @@ export function TemplateConfigurator({
   const createFromTemplateMutation = useMutation({
     ...createProjectFromTemplateMutation(),
     onSuccess: async (data) => {
-      // Generated SDK keys are `[{ _id: 'getProjects', ... }]`; a string-array
-      // key matches none of them, so the project lists stayed stale.
-      await queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() })
       if (data.deployment_queued === false) {
         toast.warning(
           data.deployment_error ??
-            `Project "${data.project_name}" was created, but deployment must be retried.`
+            `Service "${data.project_name}" was created, but deployment must be retried.`
         )
       } else {
-        toast.success(`Project "${data.project_name}" created successfully!`)
+        toast.success(`Service "${data.project_name}" created successfully!`)
       }
       onSuccess?.()
-      navigate(`/projects/${data.project_slug}?new=true`)
+      // The server queues a Git service's first deployment as part of
+      // creating it and the create request has no project field, so join
+      // before anything else (cache refreshes included) to keep the window in
+      // which that deployment is planned without the project's shared
+      // variables as short as possible.
+      await finish(
+        {
+          id: data.project_id,
+          slug: data.project_slug,
+          name: data.project_name,
+        },
+        `/projects/${data.project_slug}?new=true`
+      )
+      await invalidateProjectLists(queryClient)
     },
     onError: (error, variables) => {
       // ADR 045: a slug this host grants the Docker socket to is admin-only
@@ -583,8 +615,8 @@ export function TemplateConfigurator({
       // message via `detail` / `title` rather than `error.message` (which is
       // `undefined` and previously rendered as "Failed to create project: undefined").
       const message = getErrorMessage(error, 'Unknown error')
-      toast.error(`Failed to create project: ${message}`)
-      console.error('Template project creation failed:', error)
+      toast.error(`Failed to create service: ${message}`)
+      console.error('Template service creation failed:', error)
     },
   })
 
@@ -615,7 +647,7 @@ export function TemplateConfigurator({
       return
     }
     if (isServicesError) {
-      toast.error('Reload the database list before creating this project.')
+      toast.error('Reload the database list before creating this service.')
       return
     }
     if (providedEnvironmentVariables === null) {
@@ -642,7 +674,7 @@ export function TemplateConfigurator({
     ).filter((requirement) => !requirement.isSatisfied)
     if (missingServiceRequirements.length > 0) {
       toast.error(
-        `Select ${missingServiceRequirements.map((requirement) => requirement.label).join(', ')} before creating this project.`
+        `Select ${missingServiceRequirements.map((requirement) => requirement.label).join(', ')} before creating this service.`
       )
       return
     }
@@ -773,6 +805,7 @@ export function TemplateConfigurator({
   return (
     <div className={cn('space-y-6', className)}>
       {verificationDialog}
+      {joinGroupDialog}
       {/* Template Info Header */}
       <Card>
         <CardHeader className="pb-3">
@@ -827,7 +860,7 @@ export function TemplateConfigurator({
           onSubmit={form.handleSubmit(handleSubmit, (errors) => {
             if (errors.runtime) setRuntimeOpen(true)
             toast.error(
-              'Review the highlighted fields before creating your project.'
+              'Review the highlighted fields before creating your service.'
             )
           })}
           className="space-y-6"
@@ -835,8 +868,8 @@ export function TemplateConfigurator({
           {/* Project Configuration */}
           <Card>
             <CardHeader>
-              <CardTitle>Project Configuration</CardTitle>
-              <CardDescription>Configure your new project</CardDescription>
+              <CardTitle>Service Configuration</CardTitle>
+              <CardDescription>Configure your new service</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <FormField
@@ -844,9 +877,9 @@ export function TemplateConfigurator({
                 name="projectName"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Project Name</FormLabel>
+                    <FormLabel>Service Name</FormLabel>
                     <FormControl>
-                      <Input {...field} placeholder="My Awesome Project" />
+                      <Input {...field} placeholder="My Awesome Service" />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -2020,7 +2053,12 @@ export function TemplateConfigurator({
             value={deliveryProvider}
             onChange={setDeliveryProvider}
           />
-          <div className="flex justify-end gap-3">
+          <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-end">
+            {targetGroup && (
+              <p className="text-sm text-muted-foreground sm:mr-auto">
+                This service will be added to {targetGroup.name}
+              </p>
+            )}
             {onCancel && (
               <Button
                 type="button"
@@ -2042,12 +2080,12 @@ export function TemplateConfigurator({
               {createFromTemplateMutation.isPending ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Creating Project...
+                  Creating Service...
                 </>
               ) : (
                 <>
                   <CheckCircle2 className="mr-2 h-4 w-4" />
-                  Create Project from Template
+                  Create Service from Template
                 </>
               )}
             </Button>

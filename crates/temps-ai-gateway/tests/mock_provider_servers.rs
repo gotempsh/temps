@@ -428,6 +428,233 @@ async fn openai_embeddings(
 }
 
 // ============================================================================
+// Recording OpenAI-compatible Mock Server (self-hosted / OpenRouter stand-in)
+// ============================================================================
+
+/// One request a [`MockRecordingServer`] received.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRequest {
+    pub path: String,
+    pub model: Option<String>,
+    pub authorization: Option<String>,
+}
+
+/// An OpenAI-compatible server that lists a fixed set of (arbitrary) model
+/// IDs at `/v1/models`, serves chat completions (incl. streaming),
+/// embeddings and `/v1/responses`, and records every request so a test can
+/// prove which upstream a gateway request reached.
+///
+/// Used both as a self-hosted server (MLX/vLLM style `org/model` IDs, no
+/// authentication) and as a stand-in for OpenRouter.
+#[allow(dead_code)]
+pub struct MockRecordingServer {
+    pub addr: SocketAddr,
+    pub base_url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct RecordingState {
+    models: std::sync::Arc<Vec<String>>,
+    require_key: bool,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+}
+
+#[allow(dead_code)]
+impl MockRecordingServer {
+    pub async fn start(models: &[&str], require_key: bool) -> Self {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = RecordingState {
+            models: std::sync::Arc::new(models.iter().map(|model| model.to_string()).collect()),
+            require_key,
+            requests: requests.clone(),
+        };
+        let app = Router::new()
+            .route("/v1/models", axum::routing::get(recording_models))
+            .route("/v1/chat/completions", post(recording_chat))
+            .route("/v1/embeddings", post(recording_embeddings))
+            .route("/v1/responses", post(recording_responses))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}/v1", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            addr,
+            base_url,
+            requests,
+            _handle: handle,
+        }
+    }
+
+    /// Requests received so far, in order.
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// Inference requests (anything but the model listing) received so far.
+    pub fn inference_requests(&self) -> Vec<RecordedRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|request| request.path != "/v1/models")
+            .collect()
+    }
+}
+
+fn record(
+    state: &RecordingState,
+    path: &str,
+    headers: &HeaderMap,
+    body: Option<&serde_json::Value>,
+) -> Option<axum::response::Response> {
+    // `Some` carries the rejection to return instead of handling the request.
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    state.requests.lock().unwrap().push(RecordedRequest {
+        path: path.to_string(),
+        model: body
+            .and_then(|body| body.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        authorization: authorization.clone(),
+    });
+    let authenticated = authorization
+        .as_deref()
+        .is_some_and(|value| value.starts_with("Bearer ") && value.len() > 7);
+    if state.require_key && !authenticated {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": {"message": "Invalid API key"}})),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+fn unknown_model(
+    state: &RecordingState,
+    body: &serde_json::Value,
+) -> Option<axum::response::Response> {
+    let model = body.get("model").and_then(serde_json::Value::as_str)?;
+    (!state.models.iter().any(|known| known == model)).then(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": {"message": format!("No instance found for model {model}")}})),
+        )
+            .into_response()
+    })
+}
+
+async fn recording_models(
+    axum::extract::State(state): axum::extract::State<RecordingState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(response) = record(&state, "/v1/models", &headers, None) {
+        return response;
+    }
+    let data: Vec<serde_json::Value> = state
+        .models
+        .iter()
+        .map(|id| serde_json::json!({"id": id, "object": "model", "owned_by": "local"}))
+        .collect();
+    Json(serde_json::json!({"object": "list", "data": data})).into_response()
+}
+
+async fn recording_chat(
+    axum::extract::State(state): axum::extract::State<RecordingState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    if let Some(response) = record(&state, "/v1/chat/completions", &headers, Some(&body)) {
+        return response;
+    }
+    if let Some(response) = unknown_model(&state, &body) {
+        return response;
+    }
+    let model = body["model"].as_str().unwrap_or_default().to_string();
+    if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+        let stream = async_stream::stream! {
+            for chunk in [
+                serde_json::json!({"id": "chatcmpl-local", "object": "chat.completion.chunk", "created": 1710000000, "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hello"}, "finish_reason": null}]}),
+                serde_json::json!({"id": "chatcmpl-local", "object": "chat.completion.chunk", "created": 1710000000, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": " from self-hosted"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6}}),
+            ] {
+                yield Ok::<_, std::convert::Infallible>(format!("data: {chunk}\n\n"));
+            }
+            yield Ok::<_, std::convert::Infallible>("data: [DONE]\n\n".to_string());
+        };
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+    Json(serde_json::json!({
+        "id": "chatcmpl-local",
+        "object": "chat.completion",
+        "created": 1710000000,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from self-hosted"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6}
+    }))
+    .into_response()
+}
+
+async fn recording_embeddings(
+    axum::extract::State(state): axum::extract::State<RecordingState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    if let Some(response) = record(&state, "/v1/embeddings", &headers, Some(&body)) {
+        return response;
+    }
+    if let Some(response) = unknown_model(&state, &body) {
+        return response;
+    }
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [{"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0}],
+        "model": body["model"],
+        "usage": {"prompt_tokens": 2, "total_tokens": 2}
+    }))
+    .into_response()
+}
+
+async fn recording_responses(
+    axum::extract::State(state): axum::extract::State<RecordingState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    if let Some(response) = record(&state, "/v1/responses", &headers, Some(&body)) {
+        return response;
+    }
+    if let Some(response) = unknown_model(&state, &body) {
+        return response;
+    }
+    Json(serde_json::json!({
+        "id": "resp_local",
+        "object": "response",
+        "model": body["model"],
+        "created_at": 1710000000i64,
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "Hello from self-hosted Responses"}]}],
+        "usage": {"input_tokens": 2, "output_tokens": 4, "total_tokens": 6}
+    }))
+    .into_response()
+}
+
+// ============================================================================
 // Anthropic Mock Server
 // ============================================================================
 

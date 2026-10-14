@@ -364,10 +364,8 @@ impl DataSource for S3Source {
                             "created".to_string(),
                             serde_json::json!(created.to_string()),
                         );
-                        metadata.insert(
-                            "region".to_string(),
-                            serde_json::json!(self.region.clone()),
-                        );
+                        metadata
+                            .insert("region".to_string(), serde_json::json!(self.region.clone()));
 
                         Some(ContainerInfo {
                             name,
@@ -389,10 +387,7 @@ impl DataSource for S3Source {
             }
 
             // Depth >= 1: Not supported (S3 is flat - buckets contain objects directly)
-            _ => Err(DataError::InvalidQuery(format!(
-                "S3 hierarchy only supports 1 level (bucket). Path depth: {}. Use list_entities to list objects.",
-                path.depth()
-            ))),
+            _ => Err(DataError::container_path_too_deep("S3", path, 1)),
         }
     }
 

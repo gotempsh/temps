@@ -92,21 +92,28 @@ impl TempsPlugin for SessionReplayPlugin {
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
-        let routes = crate::handlers::configure_public_routes().with_state(Arc::new(
+        // ADR-040: the keyed ingest path. Required, not optional — an absent
+        // key service would silently turn every keyed request back into a Host
+        // lookup, which is the exact failure this replaces.
+        let ingest_key_service =
+            context.require_service::<temps_analytics::AnalyticsIngestKeyService>();
+        let ingest_rate_limiter =
+            context.require_service::<temps_analytics::AnalyticsIngestRateLimiter>();
+        // The CORS layer resolves keys through the very same service and
+        // limiter the handlers use, so the two can never disagree about a key.
+        let cors = temps_analytics::ingest_keys::KeyedIngestCors::new(
+            ingest_key_service.clone(),
+            ingest_rate_limiter.clone(),
+        );
+        let routes = crate::handlers::configure_public_routes(cors).with_state(Arc::new(
             crate::handlers::types::AppState {
                 session_replay_service,
                 audit_service,
                 route_table,
                 telemetry,
                 project_access_checker: None,
-                // ADR-040: the keyed ingest path. Required, not optional — an
-                // absent key service would silently turn every keyed request
-                // back into a Host lookup, which is the exact failure this
-                // replaces.
-                ingest_key_service: context
-                    .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
-                ingest_rate_limiter: context
-                    .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+                ingest_key_service,
+                ingest_rate_limiter,
             },
         ));
 

@@ -150,7 +150,7 @@ describe('workspace and operator views', () => {
       </MemoryRouter>
     )
     expect(html).toContain('/ai-harnesses/claude-code.svg')
-    expect(html).toContain('aria-label="0 projects"')
+    expect(html).toContain('aria-label="0 services"')
     expect(html).toContain('aria-label="Threads running"')
     expect(html).toContain('aria-label="1 finished thread"')
     expect(html).toContain('aria-label="1 failed thread"')

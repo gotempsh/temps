@@ -7,6 +7,18 @@ use std::sync::Arc;
 pub struct ProxyConfig {
     pub address: String,
     pub console_address: String,
+    /// Listener that serves only the console's public routes (ADR-051): health
+    /// probes and the unauthenticated-by-session receivers under `/api`
+    /// (tracking, provider webhooks, ingest). Requests for the public ingress
+    /// hostname, requests the admin gate denies, and public ingest paths on
+    /// any host are sent here instead of to `console_address`, so they cannot
+    /// reach an admin handler or the dashboard whatever their path.
+    ///
+    /// `None` when no such listener exists (a split `temps proxy` started
+    /// without `--console-ingress-address`): the proxy then keeps the earlier
+    /// behaviour, a 404 for gate-denied requests and `console_address` for
+    /// public ingest paths.
+    pub console_ingress_address: Option<String>,
     /// Proxy-owned loopback service for authenticated worker DNS sync.
     /// `None` keeps the routes on the console, used when cluster DNS is off.
     pub internal_dns_sync_address: Option<String>,
@@ -35,6 +47,7 @@ impl Default for ProxyConfig {
         Self {
             address: "127.0.0.1:8080".to_string(),
             console_address: "127.0.0.1:3000".to_string(),
+            console_ingress_address: None,
             internal_dns_sync_address: None,
             tls_address: None,
             preview_domain: Some("localhost".to_string()), // Default for local development

@@ -433,9 +433,10 @@ async fn receive_build(
         image_name: spec.image_name,
         context_path: context_dir,
         dockerfile_path: Some(dockerfile),
-        // Only the control plane's cache namespace (validated above); project
-        // variables never reach a worker build.
-        build_args: worker_build_args(spec.cache_namespace),
+        // The control plane's cache namespace and the build-argument values
+        // it chose to send (both validated with the spec above). They stay
+        // in memory and go to the local daemon as `--build-arg` values.
+        build_args: worker_build_args(spec.cache_namespace, spec.build_args),
         build_args_buildkit: Default::default(),
         platform: spec.platform,
         log_path: scratch.path().join("build.log"),
@@ -776,30 +777,53 @@ fn tar_response(body: Body) -> Response {
         .into_response()
 }
 
-/// The build arguments a worker build runs with: only the control plane's
-/// cache namespace (already validated with the spec), so builds of different
-/// projects on this node never share BuildKit cache mounts.
-fn worker_build_args(cache_namespace: Option<String>) -> std::collections::HashMap<String, String> {
-    cache_namespace
-        .map(|namespace| {
-            std::collections::HashMap::from([(
-                temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
-                namespace,
-            )])
-        })
-        .unwrap_or_default()
+/// The build arguments a worker build runs with: the values the control
+/// plane sent for the Dockerfile's `ARG`s, plus its cache namespace, so builds
+/// of different projects on this node never share BuildKit cache mounts.
+/// Both were validated with the spec; `BuildSpec::validate` refuses every
+/// `BUILDKIT_*` name in `build_args`, so a value can never replace the
+/// namespace.
+fn worker_build_args(
+    cache_namespace: Option<String>,
+    build_args: std::collections::BTreeMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut args: std::collections::HashMap<String, String> = build_args.into_iter().collect();
+    if let Some(namespace) = cache_namespace {
+        args.insert(
+            temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+            namespace,
+        );
+    }
+    args
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn worker_build_args_hold_only_the_cache_namespace() {
-        assert!(super::worker_build_args(None).is_empty());
-        let args = super::worker_build_args(Some("abc123".to_string()));
+    fn worker_build_args_hold_the_sent_values_and_the_cache_namespace() {
+        use std::collections::BTreeMap;
+        use temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG;
+        assert!(super::worker_build_args(None, BTreeMap::new()).is_empty());
+        let args = super::worker_build_args(Some("abc123".to_string()), BTreeMap::new());
         assert_eq!(args.len(), 1);
         assert_eq!(
-            args.get(temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG)
-                .map(String::as_str),
+            args.get(CACHE_MOUNT_NAMESPACE_ARG).map(String::as_str),
+            Some("abc123")
+        );
+        let args = super::worker_build_args(
+            Some("abc123".to_string()),
+            BTreeMap::from([(
+                "VITE_API_URL".to_string(),
+                "https://api.example.test".to_string(),
+            )]),
+        );
+        assert_eq!(args.len(), 2);
+        assert_eq!(
+            args.get("VITE_API_URL").map(String::as_str),
+            Some("https://api.example.test")
+        );
+        assert_eq!(
+            args.get(CACHE_MOUNT_NAMESPACE_ARG).map(String::as_str),
             Some("abc123")
         );
     }
@@ -874,6 +898,192 @@ mod tests {
                     response.headers()[header::CONTENT_TYPE],
                     "application/problem+json"
                 );
+            }
+        }
+    }
+
+    /// Records the request a worker build hands to the local daemon, and
+    /// echoes the kind of progress line Docker prints.
+    #[derive(Default)]
+    struct RecordingBuilder {
+        requests: std::sync::Mutex<Vec<BuildRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_deployer::ImageBuilder for RecordingBuilder {
+        async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            self.build_image_with_callback(BuildRequestWithCallback {
+                request,
+                log_callback: None,
+            })
+            .await
+        }
+        async fn build_image_with_callback(
+            &self,
+            request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            if let Some(callback) = &request.log_callback {
+                callback("#5 [builder 4/5] RUN npm run build".to_string()).await;
+            }
+            let image_name = request.request.image_name.clone();
+            self.requests
+                .lock()
+                .map_err(|error| BuilderError::Other(error.to_string()))?
+                .push(request.request);
+            Ok(BuildResult {
+                image_id: "sha256:worker-built".into(),
+                image_name,
+                size_bytes: 1,
+                build_duration_ms: 1,
+            })
+        }
+        async fn import_image(
+            &self,
+            _image_path: std::path::PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
+            unimplemented!("not used by builds")
+        }
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &Path,
+        ) -> Result<(), BuilderError> {
+            unimplemented!("not used by builds")
+        }
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), BuilderError> {
+            unimplemented!("not used by builds")
+        }
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            unimplemented!("not used by builds")
+        }
+        async fn remove_image(&self, _image_name: &str) -> Result<(), BuilderError> {
+            unimplemented!("not used by builds")
+        }
+        async fn inspect_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, BuilderError> {
+            unimplemented!("no platform is requested")
+        }
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".into()
+        }
+    }
+
+    /// Issue #1344 across the real wire: the control plane's
+    /// `RemoteNodeDeployer` uploads to this agent's build handler, which
+    /// hands the Dockerfile's build-argument values to the local daemon --
+    /// and nothing it streams back quotes them.
+    #[tokio::test]
+    async fn worker_build_receives_build_argument_values_over_the_authenticated_channel() {
+        use axum::{routing::post, Router};
+        let builder = Arc::new(RecordingBuilder::default());
+        let remote_for_containers = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AgentState {
+            container_deployer: remote_for_containers,
+            image_builder: builder.clone(),
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+        let router = Router::new()
+            .route("/agent/images/build", post(build_image))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM node:22 AS builder\nARG VITE_API_URL\nARG VITE_SENTRY_DSN\nRUN npm run build\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("index.html"), "<!doctype html>").unwrap();
+        const API_URL: &str = "https://api.example.test/v1";
+        const DSN: &str = "https://synthetic-public-key@errors.example.test/7";
+        let remote = temps_deployer::remote::RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "node-token".into(),
+            "worker-1".into(),
+        )
+        .unwrap();
+        let logs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log_sink = logs.clone();
+        let callback: temps_deployer::LogCallback = Arc::new(move |line| {
+            let log_sink = log_sink.clone();
+            Box::pin(async move {
+                log_sink.lock().unwrap().push(line);
+            })
+        });
+        let result = temps_deployer::ImageBuilder::build_image_with_callback(
+            &remote,
+            BuildRequestWithCallback {
+                request: BuildRequest {
+                    cache_from: Vec::new(),
+                    image_name: "web:worker".into(),
+                    context_path: source.path().to_path_buf(),
+                    dockerfile_path: None,
+                    build_args: std::collections::HashMap::from([
+                        ("VITE_API_URL".to_string(), API_URL.to_string()),
+                        ("VITE_SENTRY_DSN".to_string(), DSN.to_string()),
+                        ("UNREAD".to_string(), "must-not-transfer".to_string()),
+                        (
+                            temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                            "ns-web".to_string(),
+                        ),
+                    ]),
+                    build_args_buildkit: Default::default(),
+                    platform: None,
+                    log_path: source.path().join("build.log"),
+                },
+                log_callback: Some(callback),
+            },
+        )
+        .await
+        .expect("the worker builds with its build arguments");
+        server.abort();
+
+        assert_eq!(result.image_name, "web:worker");
+        let requests = builder.requests.lock().unwrap();
+        let request = requests.first().expect("the daemon received the build");
+        assert_eq!(
+            request.build_args,
+            std::collections::HashMap::from([
+                ("VITE_API_URL".to_string(), API_URL.to_string()),
+                ("VITE_SENTRY_DSN".to_string(), DSN.to_string()),
+                (
+                    temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                    "ns-web".to_string(),
+                ),
+            ])
+        );
+        let logs = logs.lock().unwrap();
+        assert!(!logs.is_empty(), "the build streamed its progress");
+        for line in logs.iter() {
+            for value in [API_URL, DSN, "must-not-transfer"] {
+                assert!(!line.contains(value), "log line quotes a value: {line}");
             }
         }
     }

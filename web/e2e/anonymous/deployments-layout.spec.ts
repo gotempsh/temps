@@ -98,7 +98,8 @@ for (const width of [1920, 1024, 768, 640, 390, 320]) {
           deployment_config: {},
           preset: 'dockerfile',
         }
-      else if (path.endsWith('/last-deployment')) json = deployments[0]
+      else if (path.endsWith('/last-deployment'))
+        json = { deployment: deployments[0] }
       else if (path === '/api/projects/2/deployments')
         json = {
           deployments:
@@ -158,10 +159,20 @@ for (const width of [1920, 1024, 768, 640, 390, 320]) {
       path: testInfo.outputPath(`deployments-${width}.png`),
       fullPage: true,
     })
+    // The deployment already serving traffic is not a rollback target: it can
+    // only be redeployed.
     await first.getByRole('button', { name: 'Open menu' }).click()
     await expect(
       page.getByRole('menuitem', { name: 'Redeploy', exact: true })
     ).toBeVisible()
+    await expect(
+      page.getByRole('menuitem', { name: 'Rollback to this' })
+    ).toHaveCount(0)
+    await page.keyboard.press('Escape')
+    // A stopped deployment that a later one superseded is the primary
+    // rollback target.
+    const superseded = page.locator('li').filter({ hasText: '#3732' })
+    await superseded.getByRole('button', { name: 'Open menu' }).click()
     await expect(
       page.getByRole('menuitem', { name: 'Rollback to this' })
     ).toBeVisible()

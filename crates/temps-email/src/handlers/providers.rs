@@ -689,21 +689,24 @@ pub async fn test_provider(
     }))
 }
 
-/// The public SES tracking webhook URL for the current external URL.
+/// The SES tracking webhook URL handed to SNS.
+///
+/// SNS delivers from AWS, not from an operator's network, so the URL is built
+/// from the public ingress URL (ADR-051) rather than the console's.
 async fn tracking_webhook_url(state: &AppState) -> Result<String, Problem> {
-    let external_url = state
+    let ingress_url = state
         .config_service
-        .get_external_url_or_default()
+        .get_public_ingress_url()
         .await
         .map_err(|e| {
-            error!("Failed to resolve external URL: {}", e);
+            error!("Failed to resolve the public ingress URL: {}", e);
             internal_server_error()
-                .detail("Failed to resolve the instance external URL")
+                .detail("Failed to resolve the instance public ingress URL")
                 .build()
         })?;
     Ok(format!(
         "{}/api/t/webhook/ses",
-        external_url.trim_end_matches('/')
+        ingress_url.trim_end_matches('/')
     ))
 }
 

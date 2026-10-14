@@ -177,6 +177,25 @@ impl AiService for AiProviderRegistry {
         }
     }
 
+    async fn chat_unavailable_reason(&self, provider: Option<&str>) -> Option<String> {
+        self.routed(provider)
+            .await?
+            .chat_unavailable_reason(provider)
+            .await
+    }
+
+    async fn tool_calling_for(&self, provider: Option<&str>, model: Option<&str>) -> bool {
+        match self.routed(provider).await {
+            Some(service) => service.tool_calling_for(provider, model).await,
+            None => false,
+        }
+    }
+
+    async fn default_chat_provider(&self) -> Option<String> {
+        // An omitted provider is always gateway-only.
+        self.gateway.default_chat_provider().await
+    }
+
     async fn capabilities_for(
         &self,
         provider: Option<&str>,
@@ -293,6 +312,41 @@ impl AiService for AiProviderRegistry {
             })?;
         service
             .run_saved_credential_smoke(provider, auth_type, credential, principal_id, model)
+            .await
+    }
+
+    async fn workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+        refresh: bool,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .workspace_harness_update_status(provider, principal_id, refresh)
+            .await
+    }
+
+    async fn update_workspace_harness(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .update_workspace_harness(provider, principal_id)
             .await
     }
 

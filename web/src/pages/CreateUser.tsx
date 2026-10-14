@@ -79,13 +79,13 @@ const ROLE_OPTIONS = [
     value: 'user' as const,
     label: 'User',
     description:
-      'Can deploy and operate every existing and future project, but cannot manage users or system settings.',
+      'Can deploy and operate every existing and future service, but cannot manage users or system settings.',
   },
   {
     value: 'admin' as const,
     label: 'Administrator',
     description:
-      'Full control of projects, users, roles, settings, and system resources.',
+      'Full control of services, users, roles, settings, and system resources.',
   },
 ]
 
@@ -94,21 +94,21 @@ const TEAM_ROLE_OPTIONS: Array<{
   label: string
   description: string
 }> = [
-  { value: 'viewer', label: 'Viewer', description: 'Can view team projects.' },
+  { value: 'viewer', label: 'Viewer', description: 'Can view team services.' },
   {
     value: 'deployer',
     label: 'Deployer',
-    description: 'Can view and deploy team projects.',
+    description: 'Can view and deploy team services.',
   },
   {
     value: 'admin',
     label: 'Team admin',
-    description: 'Can operate projects and manage team members.',
+    description: 'Can operate services and manage team members.',
   },
   {
     value: 'owner',
     label: 'Team owner',
-    description: 'Full control of the team and its project access.',
+    description: 'Full control of the team and its service access.',
   },
 ]
 
@@ -561,7 +561,7 @@ export function CreateUser() {
                 {selectedTeamId && (
                   <div className="rounded-lg border border-border/60 bg-muted/40 p-4 text-sm text-muted-foreground">
                     Team membership and the platform role are separate. A User
-                    still has all-project access from their platform role;
+                    still has all-service access from their platform role;
                     joining a team does not narrow those permissions.
                   </div>
                 )}

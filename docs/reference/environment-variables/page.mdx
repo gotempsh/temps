@@ -15,6 +15,7 @@ export const sections = [
   { title: "CLI Configuration", id: "cli" },
   { title: "SDK Configuration", id: "sdk" },
   { title: "Precedence Rules", id: "precedence" },
+  { title: "Project (group) variables", id: "project-variables" },
 ];
 
 # Environment Variables Reference
@@ -396,6 +397,36 @@ bunx @temps-sdk/cli environments vars set \
   -e production \
   API_URL "https://api-prod.example.com"
 ```
+
+### Project (group) variables {{ anchor: true, id: 'project-variables' }}
+
+When a service belongs to a [Project](/docs/projects) (a group of services), the project's shared variables are one more layer. For a deployment of the service, from highest to lowest priority:
+
+1. **Values Temps sets for the platform**, such as `SENTRY_DSN`, `TEMPS_API_URL`, `TEMPS_API_TOKEN` and `CRON_SECRET`. A project variable cannot replace them. `HOST` (default `0.0.0.0`) is the exception: a service or project variable can set it.
+2. **The service's own variables** (the environment-level and service-level values above). Where a service variable and a project variable with the same name both apply to the environment, the service's value wins.
+3. **The project's shared variables.** Within the project, a variable scoped to the environment's slug (for example `production`) wins over the project's all-environments variable with the same name.
+4. **Defaults from linked databases and storage**, such as `DATABASE_URL` from a linked PostgreSQL. A project variable overrides them, so one shared value can point every service at the same external database.
+
+Rules that apply to project variables:
+
+- **Previews are opt-in.** An all-environments project variable reaches preview environments only when it is marked to include previews (off by default). A variable scoped to an environment slug applies only to environments with that slug.
+- **Names are case-sensitive.** `LOG_LEVEL` and `log_level` are two variables.
+- **Secrets are write-only.** A secret project variable can be replaced but never read back.
+- **Changes apply on the next deployment** of each service. Running containers keep the values they started with.
+
+```bash
+# Every service in the "shop" project gets LOG_LEVEL=info
+bunx @temps-sdk/cli project-groups vars set shop LOG_LEVEL info
+
+# Only production, and include an all-environments value in previews
+bunx @temps-sdk/cli project-groups vars set shop API_BASE_URL https://api.example.com -e production
+bunx @temps-sdk/cli project-groups vars set shop FEATURE_FLAGS on --preview
+
+# What does the "web" service inherit, and which values does it override?
+bunx @temps-sdk/cli project-groups vars inherited web
+```
+
+See [Share variables across services](/docs/share-variables-across-services) for the console steps.
 
 ---
 

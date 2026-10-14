@@ -184,7 +184,7 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
           <DialogHeader>
             <DialogTitle>Add Cron Jobs</DialogTitle>
             <DialogDescription>
-              Follow these steps to add cron jobs to your project
+              Follow these steps to add cron jobs to your service
             </DialogDescription>
           </DialogHeader>
           <InstructionsContent />

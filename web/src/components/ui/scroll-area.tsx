@@ -5,23 +5,52 @@ import * as React from 'react'
 import * as ScrollAreaPrimitive from '@radix-ui/react-scroll-area'
 
 import { cn } from '@/lib/utils'
+import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 
 const ScrollArea = React.forwardRef<
   React.ElementRef<typeof ScrollAreaPrimitive.Root>,
   React.ComponentPropsWithoutRef<typeof ScrollAreaPrimitive.Root>
->(({ className, children, ...props }, ref) => (
-  <ScrollAreaPrimitive.Root
-    ref={ref}
-    className={cn('relative overflow-hidden', className)}
-    {...props}
-  >
-    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
-      {children}
-    </ScrollAreaPrimitive.Viewport>
-    <ScrollBar />
-    <ScrollAreaPrimitive.Corner />
-  </ScrollAreaPrimitive.Root>
-))
+>(
+  (
+    {
+      className,
+      children,
+      'aria-label': ariaLabel,
+      'aria-labelledby': ariaLabelledBy,
+      ...props
+    },
+    ref
+  ) => {
+    // The viewport is what scrolls, so it is the element that must be keyboard
+    // reachable; the label moves there too because `aria-label` is prohibited
+    // on the root `div`, which has no role.
+    const region = useScrollableRegion<HTMLDivElement>()
+    const regionProps = scrollableRegionProps(region.scrollable, ariaLabel)
+    const labelProps =
+      region.scrollable && ariaLabelledBy
+        ? { 'aria-labelledby': ariaLabelledBy, 'aria-label': undefined }
+        : {}
+
+    return (
+      <ScrollAreaPrimitive.Root
+        ref={ref}
+        className={cn('relative overflow-hidden', className)}
+        {...props}
+      >
+        <ScrollAreaPrimitive.Viewport
+          ref={region.ref}
+          className="h-full w-full rounded-[inherit] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          {...regionProps}
+          {...labelProps}
+        >
+          {children}
+        </ScrollAreaPrimitive.Viewport>
+        <ScrollBar />
+        <ScrollAreaPrimitive.Corner />
+      </ScrollAreaPrimitive.Root>
+    )
+  }
+)
 ScrollArea.displayName = ScrollAreaPrimitive.Root.displayName
 
 const ScrollBar = React.forwardRef<

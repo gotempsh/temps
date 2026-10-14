@@ -46,6 +46,49 @@ pub enum EmailError {
     #[error("Idempotency key '{key}' was reused with a different email payload")]
     IdempotencyConflict { key: String },
 
+    /// The email is not in a state that may be delivered again: it was
+    /// already sent, the provider may already have accepted it, it is still
+    /// being delivered, or its recipients are suppressed.
+    #[error("Email {email_id} cannot be resent (status: {status}): {reason}")]
+    NotResendable {
+        email_id: uuid::Uuid,
+        status: String,
+        reason: String,
+    },
+
+    /// The background task delivering a console resend ended without a
+    /// result (it panicked, or the runtime shut down underneath it).
+    #[error("Resend of email {email_id} was interrupted: {reason}")]
+    ResendInterrupted {
+        email_id: uuid::Uuid,
+        reason: String,
+    },
+
+    /// The provider was handed the email and accepted it, or may have, but
+    /// that result could not be saved. The email is not undelivered, and
+    /// sending it again could deliver it twice.
+    #[error(
+        "Email {email_id} was handed to the provider (outcome: {outcome}) but that result \
+         could not be recorded: {reason}"
+    )]
+    DeliveryOutcomeNotRecorded {
+        email_id: uuid::Uuid,
+        outcome: String,
+        reason: String,
+    },
+
+    /// The provider definitively rejected the email, but that result could
+    /// not be saved. The email was not delivered, so sending it again is safe.
+    #[error(
+        "Email {email_id} was rejected by the provider ({rejection}) but that result could not \
+         be recorded: {reason}"
+    )]
+    DeliveryRejectionNotRecorded {
+        email_id: uuid::Uuid,
+        rejection: String,
+        reason: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 

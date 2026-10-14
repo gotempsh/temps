@@ -98,6 +98,14 @@ pub struct MfaDisabledAudit {
     pub username: String,
 }
 
+/// An account holder started (or restarted) MFA enrollment. The pending
+/// secret and recovery codes are never part of the audit payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct MfaSetupStartedAudit {
+    pub context: AuditContext,
+    pub username: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MfaVerifiedAudit {
     pub context: AuditContext,
@@ -451,6 +459,29 @@ impl AuditOperation for UserRestoredAudit {
 impl AuditOperation for MfaEnabledAudit {
     fn operation_type(&self) -> String {
         "MFA_ENABLED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for MfaSetupStartedAudit {
+    fn operation_type(&self) -> String {
+        "MFA_SETUP_STARTED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

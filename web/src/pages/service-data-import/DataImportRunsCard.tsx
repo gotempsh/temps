@@ -267,7 +267,7 @@ function RunsBody({
                         onClick={() => onCancel(run.id)}
                       >
                         <XCircle className="h-4 w-4 sm:mr-2" />
-                        <span className="hidden sm:inline">Cancel</span>
+                        <span className="max-sm:sr-only">Cancel</span>
                       </Button>
                     )}
                   </TableCell>

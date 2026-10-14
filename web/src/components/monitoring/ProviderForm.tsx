@@ -15,6 +15,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -248,15 +249,16 @@ export function ProviderForm({
                     <FormItem>
                       <FormLabel>SMTP Port</FormLabel>
                       <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
+                        <NumberInput
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
                           placeholder={getSuggestedPort()}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value ? parseInt(e.target.value) : ''
-                            )
+                          inputMode="numeric"
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
+                          value={field.value}
                         />
                       </FormControl>
                       <FormDescription>
@@ -596,18 +598,17 @@ export function ProviderForm({
                   <FormItem>
                     <FormLabel>Timeout (seconds)</FormLabel>
                     <FormControl>
-                      <Input
-                        {...field}
-                        type="number"
+                      <NumberInput
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
                         placeholder="30"
                         min={1}
                         max={300}
-                        onChange={(e) =>
-                          field.onChange(
-                            e.target.value ? parseInt(e.target.value) : 30
-                          )
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
                         }
-                        value={field.value || 30}
+                        value={field.value}
                       />
                     </FormControl>
                     <FormMessage />
@@ -719,7 +720,10 @@ export function ProviderForm({
               <h4 className="text-sm font-medium mb-2">
                 Webhook Payload Format
               </h4>
-              <pre className="text-xs text-muted-foreground overflow-x-auto">
+              <pre
+                tabIndex={0}
+                className="text-xs text-muted-foreground overflow-x-auto"
+              >
                 <HighlightedCode
                   code={`{
   "id": "notification-uuid",

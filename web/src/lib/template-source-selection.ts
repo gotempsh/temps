@@ -7,7 +7,7 @@ import type { ProjectSource } from '@/components/project/NewProjectShell'
 export function templateSource(
   template: Pick<TemplateResponse, 'kind'>
 ): Extract<ProjectSource, 'services' | 'templates'> {
-  return template.kind === 'service' ? 'services' : 'templates'
+  return template.kind === 'app' ? 'services' : 'templates'
 }
 
 export function templateBelongsToSource(

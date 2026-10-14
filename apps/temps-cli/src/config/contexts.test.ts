@@ -4,6 +4,7 @@
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
 import {
   pickActiveContext,
+  pickSavedDefaultContext,
   envContextName,
   contextExists,
   __resetMissingContextWarning,
@@ -93,6 +94,27 @@ describe('pickActiveContext', () => {
   test('whitespace-only TEMPS_CONTEXT is ignored, active flag wins', () => {
     process.env[ENV_KEY] = '   '
     expect(pickActiveContext(contexts)?.name).toBe('local')
+  })
+})
+
+describe('pickSavedDefaultContext', () => {
+  const contexts = [ctx('local'), ctx('prod', { isActive: true }), ctx('stage')]
+
+  test('returns the context flagged active on disk', () => {
+    expect(pickSavedDefaultContext(contexts)?.name).toBe('prod')
+  })
+
+  test('ignores TEMPS_CONTEXT, unlike pickActiveContext', () => {
+    process.env[ENV_KEY] = 'local'
+    expect(pickActiveContext(contexts)?.name).toBe('local')
+    expect(pickSavedDefaultContext(contexts)?.name).toBe('prod')
+    process.env[ENV_KEY] = 'does-not-exist'
+    expect(pickSavedDefaultContext(contexts)?.name).toBe('prod')
+  })
+
+  test('falls back to the first context, and to null when there are none', () => {
+    expect(pickSavedDefaultContext([ctx('a'), ctx('b')])?.name).toBe('a')
+    expect(pickSavedDefaultContext([])).toBeNull()
   })
 })
 

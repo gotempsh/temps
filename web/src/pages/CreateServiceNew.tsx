@@ -610,7 +610,7 @@ export function CreateService() {
             <Link2 className="size-4" />
             <AlertTitle>
               Create and link to{' '}
-              {projectQuery.data?.name ?? `project ${projectId}`}
+              {projectQuery.data?.name ?? `service ${projectId}`}
             </AlertTitle>
             <AlertDescription>
               {createAndLinkDescription(serviceType ?? '')}

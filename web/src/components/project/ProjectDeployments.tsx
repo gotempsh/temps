@@ -63,6 +63,7 @@ import {
   RefreshCw,
   Upload,
   UploadCloud,
+  Globe,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 import {
@@ -399,7 +400,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           : serviceTemplateDeployOverrides(project)
         const ref = editedImageRef?.trim() || resolveImageRef()
         if (!ref) {
-          toast.error('No image reference found for this project')
+          toast.error('No image reference found for this service')
           return
         }
         await redeployImage.mutateAsync({
@@ -826,6 +827,31 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     )
   }
 
+  if (!deploymentsData?.deployments.length && project.hosting === 'external') {
+    return (
+      <EmptyPlaceholder
+        className="border-2 border-dashed"
+        icon={Globe}
+        title="Runs outside Temps"
+        description="This app is hosted elsewhere, so Temps does not deploy it. Its analytics, errors and traces arrive through an ingest key."
+        action={
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button asChild>
+              <Link to={`/projects/${project.slug}/analytics`}>
+                Set up analytics
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to={`/projects/${project.slug}/settings/delivery`}>
+                Let Temps host it
+              </Link>
+            </Button>
+          </div>
+        }
+      />
+    )
+  }
+
   if (!deploymentsData?.deployments.length) {
     return (
       <>
@@ -999,7 +1025,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               disabled={currentPage <= 1 || isFetching}
             >
               <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline ml-1">Previous</span>
+              <span className="max-sm:sr-only ml-1">Previous</span>
             </Button>
             <Button
               variant="outline"
@@ -1008,7 +1034,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >
-              <span className="hidden sm:inline mr-1">Next</span>
+              <span className="max-sm:sr-only mr-1">Next</span>
               <ChevronRight className="h-4 w-4" />
             </Button>
           </div>

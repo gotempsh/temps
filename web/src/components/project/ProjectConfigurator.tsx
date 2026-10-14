@@ -87,7 +87,6 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import {
@@ -116,6 +115,7 @@ import {
   isLikelySecretProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import {
   normalizeTemplateServiceType,
   toggleDatabaseSelection,
@@ -187,7 +187,7 @@ const slugifyPath = (path: string): string => {
 
 // Form schema definition
 const formSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
+  name: z.string().min(1, 'Service name is required'),
   preset: z.string().min(1, 'Preset is required'),
   autoDeploy: z.boolean(),
   rootDirectory: z.string(),
@@ -623,7 +623,6 @@ export function ProjectConfigurator({
   defaultValues,
   className,
 }: ProjectConfiguratorProps) {
-  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [deliveryProvider, setDeliveryProvider] = useState<
     'none' | 'cloudflare' | 'bunny' | undefined
@@ -984,17 +983,25 @@ export function ProjectConfigurator({
     )
   }
 
-  // Default project creation mutation
+  // `?group=<id>`: the new service joins that project.
+  const { finish, joinGroupDialog } = useJoinGroupAfterCreate()
+
+  // Default service creation mutation
   const projectMutation = useMutation({
     ...createProjectMutation(),
     meta: {
-      errorTitle: 'Failed to create project',
+      errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
+      // The server queues a Git service's first deployment as part of
+      // creating it and the create request has no project field, so join
+      // before anything else (cache refreshes included) to keep the window in
+      // which that deployment is planned without the project's shared
+      // variables as short as possible.
+      toast.success('Service created')
+      await finish(data, `/projects/${data.slug}?new=true`)
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
-      toast.success('Project created successfully!')
-      navigate(`/projects/${data.slug}?new=true`)
     },
   })
 
@@ -1417,9 +1424,9 @@ export function ProjectConfigurator({
           name="name"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Project Name</FormLabel>
+              <FormLabel>Service name</FormLabel>
               <FormControl>
-                <Input {...field} placeholder="Enter project name" />
+                <Input {...field} placeholder="Enter service name" />
               </FormControl>
               <FormMessage />
             </FormItem>
@@ -1700,7 +1707,7 @@ export function ProjectConfigurator({
                   <AlertCircle className="h-4 w-4" />
                   <AlertDescription>
                     This Dockerfile exposes port {effectiveDetectedPort}, but
-                    the project is configured for port {selectedPort}. Temps
+                    the service is configured for port {selectedPort}. Temps
                     routes to the exposed image port after the build, so an app
                     that listens on the configured PORT value may fail its
                     health check. Make these ports match unless your startup
@@ -1778,6 +1785,7 @@ export function ProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -1870,7 +1878,7 @@ export function ProjectConfigurator({
               ).length > 1
                 ? 's'
                 : ''}{' '}
-              will be linked to this project
+              will be linked to this service
             </AlertDescription>
           </Alert>
         )}
@@ -1962,6 +1970,7 @@ export function ProjectConfigurator({
                   <div key={v.key} className="flex items-start gap-2">
                     <Checkbox
                       className="mt-2.5"
+                      aria-label={`Import ${v.key}`}
                       checked={selectedEnvExampleKeys.has(v.key)}
                       onCheckedChange={(checked) => {
                         setSelectedEnvExampleKeys((prev) => {
@@ -2078,7 +2087,7 @@ export function ProjectConfigurator({
                                   >
                                     <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
                                     <div className="flex flex-col min-w-0">
-                                      <span>This project&apos;s URL</span>
+                                      <span>This service&apos;s URL</span>
                                       <span className="text-xs text-muted-foreground truncate">
                                         {suggestedAppUrl}
                                       </span>
@@ -2327,7 +2336,7 @@ export function ProjectConfigurator({
                                         >
                                           <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
                                           <div className="flex flex-col min-w-0">
-                                            <span>This project&apos;s URL</span>
+                                            <span>This service&apos;s URL</span>
                                             <span className="text-xs text-muted-foreground truncate">
                                               {suggestedAppUrl}
                                             </span>
@@ -2466,8 +2475,8 @@ export function ProjectConfigurator({
           {/* All sections in one view for inline/compact mode */}
           <Card>
             <CardHeader>
-              <CardTitle>Project Configuration</CardTitle>
-              <CardDescription>Configure your project settings</CardDescription>
+              <CardTitle>Service configuration</CardTitle>
+              <CardDescription>Configure your service settings</CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               {renderRepoConfig()}
@@ -2540,18 +2549,20 @@ export function ProjectConfigurator({
               {isSubmitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Creating Project...
+                  Creating service...
                 </>
               ) : (
                 <>
                   <CheckCircle2 className="mr-2 h-4 w-4" />
-                  Create Project
+                  Create service
                 </>
               )}
             </Button>
           </div>
         </form>
       </Form>
+
+      {joinGroupDialog}
 
       {/* Create Service Dialog */}
       {selectedServiceType && (

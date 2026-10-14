@@ -23,7 +23,10 @@ use temps_core::{
 use tracing::error;
 use uuid::Uuid;
 
-use super::audit::{DeploymentEmailPrincipal, EmailSendRequestedAudit, EmailSentAudit};
+use super::audit::{
+    DeploymentEmailPrincipal, EmailResendCompletedAudit, EmailResendRequestedAudit,
+    EmailSendRequestedAudit, EmailSentAudit,
+};
 use super::types::{
     AppState, EmailResponse, EmailStatsResponse, ListEmailsQuery, PaginatedEmailsResponse,
     SendEmailRequestBody, SendEmailResponseBody,
@@ -81,6 +84,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/emails", post(send_email).get(list_emails))
         .route("/emails/{id}", get(get_email))
+        .route("/emails/{id}/resend", post(resend_email))
         .route("/emails/stats", get(get_email_stats))
 }
 
@@ -428,6 +432,96 @@ pub async fn get_email(
     Ok(Json(response))
 }
 
+/// Resend a captured email
+///
+/// Delivers a `captured` email again under the same ID, re-running the
+/// domain, project-authorization, suppression and provider checks. Use it
+/// once whatever captured the email is fixed (e.g. sending was enabled for
+/// its domain). The response `status` is the new outcome and can be
+/// `captured` again if the cause is still present. Deployment tokens retry by
+/// repeating the send with the same `Idempotency-Key` instead.
+#[utoipa::path(
+    tag = "Emails",
+    post,
+    path = "/emails/{id}/resend",
+    responses(
+        (status = 200, description = "Delivery attempted; `status` is the new outcome", body = SendEmailResponseBody),
+        (status = 400, description = "Invalid email ID"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions, or a deployment token"),
+        (status = 404, description = "Email not found"),
+        (status = 409, description = "The email cannot be resent in its current state (already sent, delivery outcome unknown, still sending, or suppressed recipients)"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = String, Path, description = "Email ID (UUID)")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resend_email(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailsSend);
+
+    if auth.deployment_token_info().is_some() {
+        return Err(forbidden()
+            .detail(
+                "Deployment tokens cannot resend emails; repeat the send with the same \
+                 Idempotency-Key instead",
+            )
+            .build());
+    }
+
+    let email_id = Uuid::parse_str(&id)
+        .map_err(|_| bad_request().detail("Invalid email ID format").build())?;
+
+    let correlation_id = Uuid::new_v4();
+    let request_audit = EmailResendRequestedAudit {
+        user_id: auth.user_id_opt(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+        correlation_id,
+        email_id,
+    };
+    state
+        .audit_service
+        .create_audit_log(&request_audit)
+        .await
+        .map_err(|audit_error| {
+            error!("Refusing unaudited resend of email {email_id}: {audit_error}");
+            internal_server_error()
+                .title("Audit Log Unavailable")
+                .detail("The email was not resent because its audit record could not be stored")
+                .build()
+        })?;
+
+    let result = state.email_service.resend(email_id).await.map_err(|e| {
+        error!("Failed to resend email {email_id}: {e}");
+        Problem::from(e)
+    })?;
+
+    let audit = EmailResendCompletedAudit {
+        user_id: auth.user_id_opt(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+        correlation_id,
+        email_id,
+        status: result.status.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for resend of email {email_id}: {e}");
+    }
+
+    Ok(Json(SendEmailResponseBody {
+        id: result.id.to_string(),
+        status: result.status,
+        provider_message_id: result.provider_message_id,
+    }))
+}
+
 /// Get email statistics
 #[utoipa::path(
     tag = "Emails",
@@ -678,6 +772,7 @@ mod tests {
             tls_address: None,
             console_address: "0.0.0.0:3001".to_string(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

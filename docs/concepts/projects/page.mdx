@@ -1,42 +1,56 @@
 export const metadata = {
-  title: 'Projects',
+  title: 'Projects and Services',
   description:
-    'Understand what a project is in Temps, what it contains, and how projects relate to environments, services, and deployments.',
+    'A Service is one deployable app in Temps. A Project groups the services that ship together so they share a repository, variables and path routes.',
   alternates: {
     canonical: '/docs/projects',
   },
 }
 
 export const sections = [
-  { title: 'What is a project', id: 'what-is-a-project' },
-  { title: 'What a project contains', id: 'what-a-project-contains' },
-  { title: 'Project sources', id: 'project-sources' },
-  { title: 'How projects relate to other concepts', id: 'how-projects-relate-to-other-concepts' },
+  { title: 'Services and projects', id: 'services-and-projects' },
+  { title: 'What a service contains', id: 'what-a-service-contains' },
+  { title: 'Service sources', id: 'service-sources' },
+  { title: 'What a project shares', id: 'what-a-project-shares' },
+  { title: 'What stays per service', id: 'what-stays-per-service' },
   { title: 'Naming and subdomains', id: 'naming-and-subdomains' },
-  { title: 'Project settings', id: 'project-settings' },
-  { title: 'When to create a new project', id: 'when-to-create-a-new-project' },
+  { title: 'Service settings', id: 'service-settings' },
+  { title: 'When to create a project', id: 'when-to-create-a-project' },
+  { title: 'Projects in the CLI', id: 'projects-in-the-cli' },
 ]
 
-# Projects
+# Projects and Services
 
-A project is the top-level organizational unit in Temps. It represents one deployable application — a web app, an API, a static site, or a documentation site. Everything in Temps (deployments, environments, domains, analytics, error tracking, environment variables) belongs to a project. {{ className: 'lead' }}
+A **Service** is one deployable app: a web app, an API, a worker, a static site. A **Project** groups the services that ship together, such as a frontend, its API and a background worker, so they can share a repository, variables and path routes. Projects are optional: a service works on its own exactly as before. {{ className: 'lead' }}
 
----
-
-## What is a project {{ anchor: true, id: 'what-is-a-project' }}
-
-A project is a mapping between a **source** (a Git repository, a Docker image, or a static file bundle) and a **running application** on your server. When you create a project, you tell Temps where the code lives and how to build it. Temps handles the rest: cloning, building, deploying, routing, SSL, and monitoring.
-
-Each project gets:
-
-- A **slug** derived from its name (e.g. `my-app`), used in URLs and container names
-- A **default environment** (production), with optional preview environments per branch
-- An **auto-assigned subdomain** (e.g. `my-app.yourdomain.com`)
-- Its own **deployment history**, analytics, error tracking, and logs
+<Note>
+Earlier versions of Temps called each app a "project". Those are now **Services**, with the same slugs, URLs, domains, deployments and variables. A **Project** is new: it is a group of services, and upgrading does not create any for you. See [Upgrade Temps](/docs/upgrade-temps#upgrading-to-projects-and-services).
+</Note>
 
 ---
 
-## What a project contains {{ anchor: true, id: 'what-a-project-contains' }}
+## Services and projects {{ anchor: true, id: 'services-and-projects' }}
+
+A service maps a **source** (a Git repository, a Docker image, or a static file bundle) to a **running application** on your server. You tell Temps where the code lives and how to build it; Temps clones, builds, deploys, routes, issues certificates and monitors it. Deployments, environments, domains, analytics, error tracking and logs all belong to a service.
+
+A project sits one level above. It has a name, a slug and a list of services. Each service belongs to at most one project; moving a service into a project takes it out of the one it was in.
+
+<Mermaid chart={`
+graph TD
+    P[Project: Shop] --> W[Service: web]
+    P --> A[Service: api]
+    P --> K[Service: worker]
+    P -.shares.-> R[Repository and branch]
+    P -.shares.-> V[Shared variables]
+    P -.shares.-> RT[Path routes: /api on web goes to api]
+    W --> E1[Environment: production]
+    W --> E2[Environment: preview/feature-x]
+    E1 --> D1[Deployments]
+`} />
+
+---
+
+## What a service contains {{ anchor: true, id: 'what-a-service-contains' }}
 
 | Component | Description |
 |-----------|-------------|
@@ -44,92 +58,88 @@ Each project gets:
 | **Deployments** | The history of every build and deploy. Each deployment is linked to a Git commit (or an image/bundle). |
 | **Environment Variables** | Key-value pairs injected into containers at deploy time. Scoped per environment. |
 | **Domains** | Custom domains with SSL certificates, assigned per environment. |
-| **Linked Services** | Managed databases and storage (PostgreSQL, Redis, MongoDB, S3) connected to the project. |
+| **Linked databases** | Managed databases and storage (PostgreSQL, Redis, MongoDB, S3) connected to the service. |
 | **Analytics** | Page views, visitors, custom events, funnels, and session replays. |
-| **Error Tracking** | Captured errors with stack traces, grouped by type. Each project has its own DSN. |
+| **Error Tracking** | Captured errors with stack traces, grouped by type. Each service has its own DSN. |
 | **Monitors** | Uptime checks that verify the application is healthy. |
 | **Webhooks** | Outbound HTTP notifications for deployment events. |
 
 ---
 
-## Project sources {{ anchor: true, id: 'project-sources' }}
-
-A project's source determines where the code comes from and how it is built.
+## Service sources {{ anchor: true, id: 'service-sources' }}
 
 | Source type | How it works |
 |------------|-------------|
 | **Git repository** | Temps clones the repo, detects the framework, builds a Docker image, and deploys it. Pushes to the tracked branch trigger automatic deploys. |
 | **Docker image** | You provide a registry image (or upload a tarball). Temps pulls and deploys it without building. |
 | **Static files** | You upload a zip or tar.gz of pre-built static files. Temps serves them directly. |
-| **Template** | Temps forks a built-in starter template to your Git provider and deploys it. |
+| **Template** | Temps creates the service (or several, in a project) from the template catalog. |
+| **External** | The app runs somewhere else (Vercel, Netlify, your own VPS). Temps never deploys it; it only receives its analytics, errors and traces. See [Track an app hosted elsewhere](/docs/track-an-app-hosted-elsewhere). |
 
-The source type is set when you create the project. Git-based projects additionally have:
-
-- A **main branch** (usually `main` or `master`) that maps to the production environment
-- A **framework preset** (auto-detected: Next.js, Vite, Express, Dockerfile, static, etc.)
-- Optional **build command** and **app directory** overrides
+Git-based services additionally have a **main branch** that maps to the production environment, a **framework preset** (auto-detected), and optional **build command** and **app directory** overrides.
 
 ---
 
-## How projects relate to other concepts {{ anchor: true, id: 'how-projects-relate-to-other-concepts' }}
+## What a project shares {{ anchor: true, id: 'what-a-project-shares' }}
 
-<Mermaid chart={`
-graph TD
-    P[Project] --> E1[Environment: Production]
-    P --> E2[Environment: Staging]
-    P --> E3[Environment: Preview/feature-x]
-    E1 --> D1[Deployment 1]
-    E1 --> D2[Deployment 2]
-    E1 --> D3[Deployment 3 - current]
-    P --> EV[Environment Variables]
-    P --> S[Linked Services]
-    S --> PG[PostgreSQL]
-    S --> RD[Redis]
-    E1 --> DOM[Custom Domain]
-    P --> AN[Analytics & Error Tracking]
-    P --> MO[Monitors]
-`} />
+A project can hold three things for its services. Each one is optional.
 
-- **Project → Environments**: A project has one or more environments. The production environment is created automatically. Preview environments are created per branch when enabled.
-- **Environment → Deployments**: Each environment has its own deployment history. The "current" deployment is the one serving traffic.
-- **Project → Services**: Managed services are linked at the project level. Each environment gets its own isolated database/cache within the shared service.
-- **Project → Environment Variables**: Variables are defined at the project level and scoped to specific environments.
+<Properties>
+  <Property name="Repository">
+    One repository and branch for the whole project, for monorepos. Services that **follow** the project's repository build from it, each from its own directory. Changing the project's repository or branch updates every service that follows it. A service can stop following and keep its current settings. See [Import services from a monorepo](/docs/import-services-from-a-monorepo).
+  </Property>
+  <Property name="Shared variables">
+    Variables every service in the project receives, for example `LOG_LEVEL` or `API_BASE_URL`. A service's own variable with the same name wins. See [Share variables across services](/docs/share-variables-across-services).
+  </Property>
+  <Property name="Path routes">
+    Serve a path of one service's domains from another service, for example `/api` on the frontend's domain from the API service, so the browser sees one origin. See [Route a path to another service](/docs/route-a-path-to-another-service).
+  </Property>
+</Properties>
+
+---
+
+## What stays per service {{ anchor: true, id: 'what-stays-per-service' }}
+
+Grouping services does not merge them. Each service keeps its own:
+
+- builds and deployment history, and whether it deploys on push
+- environments, domains and certificates
+- preset, directory, resources, replicas and health check
+- environment variables (which override the project's shared ones)
+- linked databases
+- analytics, error tracking, logs and monitors
+- protections: password, attack mode and limits. A request routed from another service's domain gets the **target** service's protections.
+
+Removing a service from a project, or deleting the project, never stops or deletes a service: it keeps running as a standalone service and stops receiving the project's shared variables on its next deployment. Path routes that involve it are removed.
 
 ---
 
 ## Naming and subdomains {{ anchor: true, id: 'naming-and-subdomains' }}
 
-The project name determines the default subdomain:
+A service's name determines its default subdomain:
 
-| Project name | Slug | Default URL |
+| Service name | Slug | Default URL |
 |-------------|------|-------------|
 | My App | `my-app` | `my-app.yourdomain.com` |
 | API Service | `api-service` | `api-service.yourdomain.com` |
 
-The slug is generated from the name: lowercased, spaces and special characters replaced with hyphens. It is used in:
+The slug is generated from the name: lowercased, spaces and special characters replaced with hyphens. It is used in the default subdomain, container names (e.g. `my-app-production`), per-service database names (e.g. `my_app_production`) and file paths for static deployments.
 
-- The default subdomain
-- Docker container names (e.g. `my-app-production`)
-- Per-project database names (e.g. `my_app_production`)
-- File paths for static deployments
-
-You can add custom domains to override the default subdomain. See [Add a Custom Domain](/docs/add-a-custom-domain).
+A project has its own slug too, used in its console URL. It does not change any service's hostnames. You can add custom domains to override a service's default subdomain. See [Add a Custom Domain](/docs/add-a-custom-domain).
 
 ---
 
-## Project settings {{ anchor: true, id: 'project-settings' }}
-
-Key settings available on each project:
+## Service settings {{ anchor: true, id: 'service-settings' }}
 
 <Properties>
   <Property name="Name">
     Display name. Changing the name does not change the slug or existing URLs.
   </Property>
   <Property name="Branch">
-    The Git branch that maps to the production environment. Default: `main`.
+    The Git branch that maps to the production environment. Default: `main`. For a service that follows its project's repository, the project sets it.
   </Property>
   <Property name="Framework Preset">
-    The detected or manually set framework. Affects how Temps builds the project.
+    The detected or manually set framework. Affects how Temps builds the service.
   </Property>
   <Property name="Build Command">
     Override the auto-detected build command (e.g. `npm run build`).
@@ -140,6 +150,9 @@ Key settings available on each project:
   <Property name="Preview Environments">
     Toggle automatic preview environments for non-main branches.
   </Property>
+  <Property name="Hosting">
+    **Hosted** (Temps builds and runs it) or **External** (it runs elsewhere and Temps only receives its telemetry).
+  </Property>
   <Property name="Deployment Config">
     Default CPU, memory, replicas, and exposed port for new environments.
   </Property>
@@ -147,19 +160,40 @@ Key settings available on each project:
 
 ---
 
-## When to create a new project {{ anchor: true, id: 'when-to-create-a-new-project' }}
+## When to create a project {{ anchor: true, id: 'when-to-create-a-project' }}
 
-**Create a new project when:**
+**Create a project when services ship together:**
 
-- You have a separate deployable application (different repo, different build process)
-- You want independent deployment history and analytics
-- The application serves a different domain
-- You want separate error tracking and monitoring
+- A monorepo with several deployable apps (web, API, workers) on one branch
+- A frontend that calls a same-origin `/api` served by another service
+- Several services that need the same configuration (`LOG_LEVEL`, an external API key)
+- A multi-service template, such as an app with a backend and a frontend
 
-**Use environments within the same project when:**
+**Keep a standalone service when:**
 
-- You need staging/preview versions of the same application
-- You want to test the same codebase with different configuration
-- You need branch-based previews for code review
+- The app is self-contained and shares nothing with other services
+- You are deploying a single container or static site
 
-**One project per repo** is the most common pattern. For monorepos with multiple deployable apps, create a separate project per app and set the **App Directory** to the relevant subdirectory.
+**Create a separate service, not an environment, when** the code is a different deployable app (different build, different domain, separate analytics). **Use environments within one service** for staging and branch previews of the same app.
+
+---
+
+## Projects in the CLI {{ anchor: true, id: 'projects-in-the-cli' }}
+
+The CLI keeps its command names, so the words differ from the console:
+
+| Console | CLI command | Manages |
+|---------|-------------|---------|
+| Service | `projects` | Each deployable app |
+| Project | `project-groups` | Groups of services |
+| Databases and storage | `services` | Managed PostgreSQL, Redis, MongoDB, S3 |
+
+```bash
+# Create a project with two existing services
+bunx @temps-sdk/cli project-groups create --name "Acme Shop" --service web --service api
+
+# Which project is a service in?
+bunx @temps-sdk/cli projects group -p web
+```
+
+See the [CLI reference](/docs/cli) for every command.

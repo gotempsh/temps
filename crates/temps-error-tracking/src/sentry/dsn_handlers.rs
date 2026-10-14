@@ -166,12 +166,14 @@ async fn create_dsn(
     permission_guard!(auth, ErrorTrackingCreate);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Get base URL from config service if not provided (defaults to http://localho.st)
+    // A DSN is embedded in applications and browser SDKs that report from
+    // anywhere, so unless the caller names a base it uses the public ingress
+    // URL (ADR-051), which defaults to the external URL.
     let base_url = match request.base_url {
         Some(url) => url,
         None => state
             .config_service
-            .get_external_url_or_default()
+            .get_public_ingress_url()
             .await
             .map_err(|e| SentryIngesterError::Validation(format!("Config error: {}", e)))?,
     };
@@ -218,12 +220,14 @@ async fn get_or_create_dsn(
     permission_guard!(auth, ErrorTrackingCreate);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Get base URL from config service if not provided (defaults to http://localho.st)
+    // A DSN is embedded in applications and browser SDKs that report from
+    // anywhere, so unless the caller names a base it uses the public ingress
+    // URL (ADR-051), which defaults to the external URL.
     let base_url = match request.base_url {
         Some(url) => url,
         None => state
             .config_service
-            .get_external_url_or_default()
+            .get_public_ingress_url()
             .await
             .map_err(|e| SentryIngesterError::Validation(format!("Config error: {}", e)))?,
     };
@@ -268,10 +272,11 @@ async fn list_dsns(
     permission_guard!(auth, ErrorTrackingRead);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Get base URL from config service (with default fallback to http://localho.st)
+    // DSNs use the public ingress URL (ADR-051), which defaults to the
+    // external URL.
     let base_url = state
         .config_service
-        .get_external_url_or_default()
+        .get_public_ingress_url()
         .await
         .map_err(|e| SentryIngesterError::Validation(format!("Config error: {}", e)))?;
 
@@ -310,12 +315,14 @@ async fn regenerate_dsn(
     permission_guard!(auth, ErrorTrackingWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Get base URL from config service if not provided (defaults to http://localho.st)
+    // A DSN is embedded in applications and browser SDKs that report from
+    // anywhere, so unless the caller names a base it uses the public ingress
+    // URL (ADR-051), which defaults to the external URL.
     let base_url = match request.base_url {
         Some(url) => url,
         None => state
             .config_service
-            .get_external_url_or_default()
+            .get_public_ingress_url()
             .await
             .map_err(|e| SentryIngesterError::Validation(format!("Config error: {}", e)))?,
     };

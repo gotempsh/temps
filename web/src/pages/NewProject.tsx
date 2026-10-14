@@ -13,11 +13,11 @@ export function NewProject() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
-      { label: 'New Project' },
+      { label: 'New service' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('New Project')
+  usePageTitle('New service')
 
   return (
     <PageContainer>

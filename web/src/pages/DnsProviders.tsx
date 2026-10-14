@@ -3,12 +3,10 @@
 
 import {
   deleteDnsProvider as deleteProvider,
-  listDnsProviders as listProviders,
   testProviderConnection,
   type DnsProviderResponse,
 } from '@/api/client'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,6 +18,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -32,6 +31,10 @@ import {
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  DNS_PROVIDERS_QUERY_KEY,
+  dnsProvidersQueryOptions,
+} from '@/lib/dns-providers-query'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -90,20 +93,14 @@ export function DnsProviders() {
     isLoading,
     error,
     refetch,
-  } = useQuery({
-    queryKey: ['dnsProviders'],
-    queryFn: async () => {
-      const response = await listProviders()
-      return response.data
-    },
-    retry: false,
-  })
+    isFetching,
+  } = useQuery(dnsProvidersQueryOptions())
 
   const deleteProviderMut = useMutation({
     mutationFn: (id: number) => deleteProvider({ path: { id } }),
     onSuccess: () => {
       toast.success('DNS provider deleted successfully')
-      queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
+      queryClient.invalidateQueries({ queryKey: DNS_PROVIDERS_QUERY_KEY })
       setProviderToDelete(null)
     },
     onError: (error: Error) => {
@@ -188,14 +185,12 @@ export function DnsProviders() {
         </div>
 
         {error ? (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Error</AlertTitle>
-            <AlertDescription>
-              Failed to load DNS providers. Please try again later or contact
-              support if the issue persists.
-            </AlertDescription>
-          </Alert>
+          <ReadFailure
+            resource="DNS providers"
+            error={error}
+            onRetry={() => void refetch()}
+            retrying={isFetching}
+          />
         ) : isLoading ? (
           <div className="divide-y rounded-lg border">
             {Array.from({ length: 3 }).map((_, i) => (

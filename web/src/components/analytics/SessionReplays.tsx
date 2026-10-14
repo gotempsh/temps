@@ -331,7 +331,7 @@ export function SessionReplays({
                           className="gap-1.5"
                         >
                           <Play className="h-3 w-3" />
-                          <span className="hidden sm:inline">Watch</span>
+                          <span className="max-sm:sr-only">Watch</span>
                         </Button>
                       </TableCell>
                     </TableRow>

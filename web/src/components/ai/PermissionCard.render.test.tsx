@@ -46,8 +46,8 @@ describe('PermissionCard rich platform writes', () => {
 
     expect(markup).toContain('Create PostgreSQL')
     expect(markup).toContain('aria-label="PostgreSQL logo"')
-    expect(markup).toContain('Target project')
-    expect(markup).toContain('Project 42')
+    expect(markup).toContain('Target service')
+    expect(markup).toContain('Service 42')
     expect(markup).toContain('Approve &amp; run')
     expect(markup).not.toContain('password')
     expect(markup).not.toContain('parameters:')
@@ -61,8 +61,8 @@ describe('PermissionCard rich platform writes', () => {
     })
 
     expect(markup).toContain('Link existing database')
-    expect(markup).toContain('Service 7')
-    expect(markup).toContain('Project 42')
+    expect(markup).toContain('Database 7')
+    expect(markup).toContain('Service 42')
     expect(markup).toContain('refresh workspace networking')
     expect(markup).not.toContain('parameters:')
   })

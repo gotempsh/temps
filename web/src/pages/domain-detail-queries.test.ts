@@ -11,7 +11,10 @@ import {
   listDnsProvidersQueryKey,
   listRenewalAttemptsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { isDomainDetailQuery } from './domain-detail-queries'
+import {
+  isDomainDetailQuery,
+  refreshDomainDetail,
+} from './domain-detail-queries'
 
 test('matches the renewal attempts query for any page', () => {
   expect(
@@ -44,4 +47,53 @@ test('ignores unrelated and malformed keys', () => {
   expect(isDomainDetailQuery([])).toBe(false)
   expect(isDomainDetailQuery([null])).toBe(false)
   expect(isDomainDetailQuery(undefined)).toBe(false)
+})
+
+// A failed validation is returned as an error, but the server has already
+// persisted a failed renewal attempt. The page wires `onError` to a refresh.
+test('refreshDomainDetail surfaces a failed attempt after a rejected mutation', async () => {
+  const { QueryClient, MutationObserver } =
+    await import('@tanstack/react-query')
+  const client = new QueryClient()
+  const historyKey = listRenewalAttemptsQueryKey({
+    path: { domain: 'app.example.test' },
+    query: { page: 1, page_size: 10 },
+  })
+  let serverAttempts: string[] = []
+  const history = client.getQueryCache().build(client, {
+    queryKey: historyKey,
+    queryFn: async () => ({ attempts: [...serverAttempts] }),
+  })
+  // Observe it so invalidation refetches, as the mounted timeline does.
+  const observer = new (await import('@tanstack/react-query')).QueryObserver(
+    client,
+    {
+      queryKey: historyKey,
+      queryFn: async () => ({ attempts: [...serverAttempts] }),
+    }
+  )
+  const unsubscribe = observer.subscribe(() => {})
+  await observer.refetch()
+  expect(history.state.data).toEqual({ attempts: [] })
+
+  const mutation = new MutationObserver(client, {
+    mutationFn: async () => {
+      serverAttempts = ['failed']
+      throw new Error('challenge validation failed')
+    },
+    onError: () => refreshDomainDetail(client),
+  })
+  await mutation.mutate().catch(() => {})
+
+  expect(history.state.data).toEqual({ attempts: ['failed'] })
+  unsubscribe()
+})
+
+test('refreshDomainDetail drops the order query when asked to clear it', async () => {
+  const { QueryClient } = await import('@tanstack/react-query')
+  const client = new QueryClient()
+  const orderKey = getDomainOrderQueryKey({ path: { domain_id: 1 } })
+  client.setQueryData(orderKey, { id: 1 })
+  await refreshDomainDetail(client, { clearOrder: orderKey })
+  expect(client.getQueryData(orderKey)).toBeUndefined()
 })

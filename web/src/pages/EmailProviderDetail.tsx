@@ -351,7 +351,7 @@ export function EmailProviderDetail() {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <CardTitle>Domains</CardTitle>
                   <Button variant="outline" size="sm" asChild>
-                    <Link to="/email?tab=domains">
+                    <Link to={`/email/domains/new?provider=${provider.id}`}>
                       <Plus className="mr-2 size-4" />
                       Add domain
                     </Link>
@@ -377,7 +377,7 @@ export function EmailProviderDetail() {
                     description="Add a sending domain and assign it to this provider to start sending email."
                     action={
                       <Button asChild size="sm">
-                        <Link to="/email?tab=domains">
+                        <Link to={`/email/domains/new?provider=${provider.id}`}>
                           <Plus className="mr-2 size-4" />
                           Add domain
                         </Link>

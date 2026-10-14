@@ -47,7 +47,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`whoami`](#whoami) - Display current authenticated user and active context
 - [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
 - [`configure`](#configure) - Configure CLI settings (AWS-style wizard)
-- [`projects`](#projects) - Manage projects
+- [`projects`](#projects) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 - [`drop`](#drop) - Detect and deploy a local source directory or ZIP without Git
 - [`deploy`](#deploy) - Deploy a project from git
 - [`deploy:static`](#deploystatic) - Deploy static files (tar.gz, zip, or directory)
@@ -66,6 +66,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`users`](#users) - Manage platform users
 - [`teams`](#teams) - Manage teams and project access
 - [`access`](#access) - Manage which teams can reach a project
+- [`project-groups`](#project-groups) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
+- [`instantiations`](#instantiations) - Follow and retry template creations and imports
 - [`apikeys`](#apikeys) - Manage API keys for programmatic access
 - [`monitors`](#monitors) - Manage uptime monitors for status pages
 - [`webhooks`](#webhooks) - Manage webhooks for project events
@@ -88,18 +90,19 @@ Use this index or search for a top-level command heading to load only the releva
 - [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
 - [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
-- [`ip-access`](#ip-access) - Manage IP access control rules
+- [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
 - [`logs`](#logs) - Search collected logs across every project and database you can access
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
+- [`status-pages`](#status-pages) - Publish public status pages for selected monitors
 - [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
 - [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
-- [`templates`](#templates) - Browse deployment templates
+- [`templates`](#templates) - Browse templates and create them
 - [`platform`](#platform) - View platform and server information
 - [`presets`](#presets) - Browse available build presets
 - [`analytics`](#analytics) - View project analytics
@@ -127,6 +130,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`cloud`](#cloud) - Temps Cloud
 - [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
+- [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
+- [`stop`](#stop) - Stop the Temps server and database started by `temps start`
 
 ## Commands
 
@@ -259,21 +264,23 @@ Reset configuration to defaults
 
 ## `projects` (alias: `project`, `p`)
 
-Manage projects
+Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 
 **Subcommands:**
 
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
-- `list` (`ls`) - List all projects
-- `create` (`new`) - Create a new project (git-based or manual deployment)
-- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
-- `show` (`get`) - Show project details
-- `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+- `list` (`ls`) - List all services
+- `create` (`new`) - Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
+- `show` (`get`) - Show service details, including the project (group) it belongs to
+- `group` - Show which project (group of services) a service belongs to
+- `update` (`edit`) - Update service name and description
+- `settings` - Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
-- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+- `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
+- `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `config` - Update deployment configuration (resources, replicas)
-- `delete` (`rm`) - Delete a project
+- `delete` (`rm`) - Delete a service
 
 ### `projects secrets`
 
@@ -344,7 +351,7 @@ Delete a project secret
 
 ### `projects list` (alias: `ls`)
 
-List all projects
+List all services
 
 **Options:**
 
@@ -356,29 +363,30 @@ List all projects
 
 ### `projects create` (alias: `new`)
 
-Create a new project (git-based or manual deployment)
+Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Project name | - | No |
-| `-d, --description <description>` | Project description | - | No |
+| `-n, --name <name>` | Service name | - | No |
+| `-d, --description <description>` | Service description | - | No |
 | `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | No |
 | `--branch <branch>` | Git branch | - | No |
 | `--directory <directory>` | Root directory (relative to repo) | - | No |
 | `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | No |
 | `--connection <id>` | Git connection ID | - | No |
-| `--manual` | Create a manual (non-git) project - deploy via Docker image or static files | - | No |
+| `--manual` | Create a manual (non-git) service - deploy via Docker image or static files | - | No |
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
-| `--delivery-provider <provider>` | Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
+| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes) | - | No |
+| `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
 ### `projects cloudflare-capability` (alias: `delivery-capability`)
 
-Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
+Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
 
 **Options:**
 
@@ -388,18 +396,29 @@ Show whether Cloudflare/Bunny delivery is ready and which one new projects get b
 
 ### `projects show` (alias: `get`)
 
-Show project details
+Show service details, including the project (group) it belongs to
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Service slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects group`
+
+Show which project (group of services) a service belongs to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Service slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects update` (alias: `edit`)
 
-Update project name and description
+Update service name and description
 
 **Options:**
 
@@ -413,7 +432,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 
 **Options:**
 
@@ -453,7 +472,7 @@ Update git repository settings
 
 ### `projects source`
 
-Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 
 **Options:**
 
@@ -463,6 +482,17 @@ Show or change how a project is deployed (primary source, and whether it also ac
 | `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
 | `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
 | `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects hosting`
+
+Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects config`
@@ -487,7 +517,7 @@ Update deployment configuration (resources, replicas)
 
 ### `projects delete` (alias: `rm`)
 
-Delete a project
+Delete a service
 
 **Options:**
 
@@ -1712,6 +1742,7 @@ Run a backup for an external service
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
+| `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |
 
 ## `runtime-logs` (alias: `rlogs`)
 
@@ -3046,6 +3077,304 @@ Revoke a team's access to a project
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
+
+## `project-groups` (alias: `pg`)
+
+Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
+
+**Subcommands:**
+
+- `list` (`ls`) - List projects (groups) and their services
+- `show` (`get`) - Show a project (group), by slug or id
+- `create` (`new`) - Create a project (group), optionally with services
+- `update` (`edit`) - Rename a project (group) or change its description
+- `delete` (`rm`) - Delete a project (group); its services keep running as standalone services
+- `add` - Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+- `remove` - Remove a service (slug or id) from a project (group); it becomes a standalone service
+- `repo` - The repository a project deploys its services from (monorepos)
+- `import` - Scan the project's repository and add its apps as services that follow it
+- `follow` - Make a service follow the project's repository and branch (keeps its directory)
+- `unfollow` - Stop a service following the project's repository; it keeps its current settings
+- `routes` - Serve a path of one service's domains from another service (e.g. /api → backend)
+- `vars` - Variables shared by every service in a project (group)
+
+### `project-groups list` (alias: `ls`)
+
+List projects (groups) and their services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | How many per page (default 100, at most 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups show` (alias: `get`)
+
+Show a project (group), by slug or id
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups create` (alias: `new`)
+
+Create a project (group), optionally with services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Project name | - | No |
+| `-s, --slug <slug>` | URL slug (derived from the name when omitted) | - | No |
+| `-d, --description <text>` | What the services do together | - | No |
+| `--service <service...>` | Services to put in the project, by slug or id as listed by `projects list` (apps, not the databases of the `services` command) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups update` (alias: `edit`)
+
+Rename a project (group) or change its description
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | New name | - | No |
+| `-s, --slug <slug>` | New slug | - | No |
+| `-d, --description <text>` | New description ("" clears it) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups delete` (alias: `rm`)
+
+Delete a project (group); its services keep running as standalone services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups add`
+
+Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+
+### `project-groups remove`
+
+Remove a service (slug or id) from a project (group); it becomes a standalone service
+
+### `project-groups repo`
+
+The repository a project deploys its services from (monorepos)
+
+**Subcommands:**
+
+- `show` - Show the project's repository and which services follow it
+- `set` - Point the project at a repository and branch; services that follow it are updated to match
+- `unset` - Remove the repository; services keep their current settings and stop following
+
+#### `project-groups repo show`
+
+Show the project's repository and which services follow it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups repo set`
+
+Point the project at a repository and branch; services that follow it are updated to match
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-c, --connection <id>` | Git connection id (see: git-providers / connections) | - | No |
+| `--public <provider>` | Use a public repository without a connection: github or gitlab | - | No |
+| `-r, --repo <owner/name|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
+| `-b, --branch <branch>` | Branch to deploy from, e.g. main | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups repo unset`
+
+Remove the repository; services keep their current settings and stop following
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups import`
+
+Scan the project's repository and add its apps as services that follow it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
+| `--dry-run` | List what would be created without creating anything | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); the import keeps running on the server | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `project-groups follow`
+
+Make a service follow the project's repository and branch (keeps its directory)
+
+### `project-groups unfollow`
+
+Stop a service following the project's repository; it keeps its current settings
+
+### `project-groups routes`
+
+Serve a path of one service's domains from another service (e.g. /api → backend)
+
+**Subcommands:**
+
+- `list` (`ls`) - List path routes and how each applies per environment
+- `add` - Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+- `remove` (`rm`) - Stop routing <prefix>; <source> serves it itself again
+
+#### `project-groups routes list` (alias: `ls`)
+
+List path routes and how each applies per environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups routes add`
+
+Send requests under <prefix> on <source>'s domains to <target>, e.g. `routes add shop web /api api`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--strip-prefix` | Forward /api/users as /users (default: keep the full path) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups routes remove` (alias: `rm`)
+
+Stop routing <prefix>; <source> serves it itself again
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+
+### `project-groups vars`
+
+Variables shared by every service in a project (group)
+
+**Subcommands:**
+
+- `list` (`ls`) - List shared variables (secret values are never shown)
+- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+- `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
+- `unset` - Remove a shared variable
+
+#### `project-groups vars list` (alias: `ls`)
+
+List shared variables (secret values are never shown)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars set`
+
+Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environment <slug>` | Only this environment (e.g. production); default: all | - | No |
+| `--secret` | Write-only: the value can never be read back | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
+| `--preview` | Also send an all-environments variable to preview deployments (off by default) | - | No |
+| `--no-preview` | Do not send it to preview deployments | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars inherited`
+
+Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars unset`
+
+Remove a shared variable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environment <slug>` | The environment it was scoped to; default: all | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+## `instantiations` (alias: `inst`)
+
+Follow and retry template creations and imports
+
+**Subcommands:**
+
+- `list` (`ls`) - List your recent template creations and imports, newest first
+- `show` (`get`) - Show every step of a template creation or import
+- `retry` - Continue from the step that failed; finished steps are not repeated
+
+### `instantiations list` (alias: `ls`)
+
+List your recent template creations and imports, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--group <project>` | Only those that added services to this project (group slug or id) | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | How many per page (default 20, at most 100) | - | No |
+| `--limit <n>` | Same as --per-page | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `instantiations show` (alias: `get`)
+
+Show every step of a template creation or import
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--wait` | Wait until it finishes | - | No |
+| `--timeout <minutes>` | With --wait: stop waiting after this long (default 30) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `instantiations retry`
+
+Continue from the step that failed; finished steps are not repeated
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `apikeys` (alias: `keys`)
 
@@ -5345,7 +5674,7 @@ Remove a delivery binding and the DNS record it manages
 
 ## `ip-access` (alias: `ipa`)
 
-Manage IP access control rules
+Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 
 **Subcommands:**
 
@@ -5355,6 +5684,7 @@ Manage IP access control rules
 - `update` - Update an IP access control rule
 - `remove` (`rm`) - Delete an IP access control rule
 - `check` - Check if an IP address is blocked
+- `project` - Allow or deny IP ranges for one project or environment
 
 ### `ip-access list` (alias: `ls`)
 
@@ -5424,6 +5754,70 @@ Check if an IP address is blocked
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--ip <ip>` | IP address to check | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ip-access project`
+
+Allow or deny IP ranges for one project or environment
+
+**Subcommands:**
+
+- `show` - Show the IP access list
+- `set` - Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+- `clear` - Remove the list (an environment then follows the project list)
+- `test` - Check whether an address would be allowed
+
+#### `ip-access project show`
+
+Show the IP access list
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project set`
+
+Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--mode <mode>` | disabled, allow (only listed) or deny (block listed) | - | Yes |
+| `--cidr <cidr>` | Address or CIDR range; repeat or comma-separate | `` | No |
+| `--tailscale` | Include the Tailscale ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) | - | No |
+| `--acknowledge-lockout` | Apply even if it would block the address you are calling from | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project clear`
+
+Remove the list (an environment then follows the project list)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+#### `ip-access project test`
+
+Check whether an address would be allowed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--ip <ip>` | Address to evaluate | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `audit`
@@ -5955,6 +6349,7 @@ Manage incidents for status pages and monitoring
 - `create` (`add`) - Create a new incident
 - `show` - Show incident details
 - `update-status` - Update an incident status
+- `set-visibility` - Show or hide an incident update on published status pages
 - `updates` - List status updates for an incident
 - `bucketed` - Get bucketed incident data for a project
 
@@ -6009,6 +6404,20 @@ Update an incident status
 | `--id <id>` | Incident ID | - | Yes |
 | `-s, --status <status>` | New status (investigating, identified, monitoring, resolved) | - | No |
 | `-m, --message <message>` | Status update message | - | No |
+| `--public` | Show this update on published status pages (private by default) | - | No |
+
+### `incidents set-visibility`
+
+Show or hide an incident update on published status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Incident ID | - | Yes |
+| `--update-id <id>` | Incident update ID (see `incidents updates`) | - | Yes |
+| `--public` | Show the update on published status pages | - | No |
+| `--private` | Hide the update from published status pages | - | No |
 
 ### `incidents updates`
 
@@ -6035,6 +6444,189 @@ Get bucketed incident data for a project
 | `--end-time <time>` | End time (ISO 8601) | - | No |
 | `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
+
+## `status-pages` (alias: `status-page`)
+
+Publish public status pages for selected monitors
+
+**Subcommands:**
+
+- `list` (`ls`) - List a project's status pages
+- `create` - Create a draft status page
+- `show` - Show a status page
+- `update` - Change the title, description or monitor selection
+- `publish` - Publish the page at its public URL
+- `unpublish` - Unpublish; the public URL returns 404 immediately
+- `rotate-url` - Replace the public URL; the old one stops working
+- `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
+- `domains` (`domain`) - Serve a status page on your own hostname
+
+### `status-pages list` (alias: `ls`)
+
+List a project's status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages create`
+
+Create a draft status page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `-t, --title <title>` | Public page title | - | Yes |
+| `-d, --description <text>` | Public description | - | No |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages show`
+
+Show a status page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages update`
+
+Change the title, description or monitor selection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-t, --title <title>` | Public page title | - | No |
+| `-d, --description <text>` | Public description ("" clears it) | - | No |
+| `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
+| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages publish`
+
+Publish the page at its public URL
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages unpublish`
+
+Unpublish; the public URL returns 404 immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages rotate-url`
+
+Replace the public URL; the old one stops working
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages delete` (alias: `rm`)
+
+Delete a status page; its public URL returns 404 immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages domains` (alias: `domain`)
+
+Serve a status page on your own hostname
+
+**Subcommands:**
+
+- `list` (`ls`) - List a status page's custom domains and the DNS records they need
+- `add` - Attach a hostname; it serves only after ownership is verified
+- `verify` - Prove ownership and issue the certificate
+- `renew` - Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+- `remove` (`rm`) - Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+#### `status-pages domains list` (alias: `ls`)
+
+List a status page's custom domains and the DNS records they need
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains add`
+
+Attach a hostname; it serves only after ownership is verified
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--hostname <hostname>` | Hostname, e.g. status.example.com | - | Yes |
+| `--dns` | Verify with a DNS TXT record instead of HTTP | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains verify`
+
+Prove ownership and issue the certificate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains renew`
+
+Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains remove` (alias: `rm`)
+
+Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
 
 ## `alarms` (alias: `alarm`)
 
@@ -6366,11 +6958,12 @@ Show a stored import session (the plan it was created with)
 
 ## `templates` (alias: `tpl`)
 
-Browse deployment templates
+Browse templates and create them
 
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
+- `create` - Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
@@ -6382,7 +6975,32 @@ List available templates
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--kind <kind>` | Filter by template gallery (starter, service) | - | No |
+| `--kind <kind>` | Filter by kind: starter or app | - | No |
+
+### `templates create`
+
+Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <name>` | Put the services in a new project (group) with this name; the default for several services | - | No |
+| `--into <project>` | Add the services to an existing project (group), by slug or id (see: project-groups list) | - | No |
+| `--standalone` | Create a one-service template without a project (group); the default for one service | - | No |
+| `--name <service=name...>` | Name a created service; a one-service template also takes a bare name | - | No |
+| `--env <[service:]KEY=VALUE...>` | Set a variable; prefix the service when the template cannot tell | - | No |
+| `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored) | - | No |
+| `--database <type=new|type=new:name|type=id...>` | Create or link each database the template needs (default: create) | - | No |
+| `--fork-connection <id>` | Starters only: copy the code into a new repository on this git connection | - | No |
+| `--repo-name <name>` | Name of the new repository (with --fork-connection) | - | No |
+| `--repo-owner <owner>` | Account or organization for the new repository | - | No |
+| `--public-repo` | Make the new repository public (private by default) | - | No |
+| `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
+| `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
+| `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `templates validate`
 
@@ -7363,6 +7981,7 @@ Create a new sandbox
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
+| `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -8026,7 +8645,26 @@ AI assistant status for a project
 
 **Subcommands:**
 
+- `provider` - Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
 - `readiness` - Show which AI prerequisites this project meets, and how to fix the rest
+
+### `ai provider`
+
+Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
+
+**Subcommands:**
+
+- `login` - Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
+
+#### `ai provider login`
+
+Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Print the final sign-in state as JSON | - | No |
 
 ### `ai readiness`
 
@@ -8697,6 +9335,32 @@ PoC: install Temps on an existing Linux VPS over SSH and save a client context
 | `--telemetry` | Opt in to coarse setup-step analytics for this attempt only | - | No |
 | `--no-telemetry` | Do not send setup analytics (default) | - | No |
 | `-y, --yes` | Approve the installation plan without prompting | - | No |
+
+## `start`
+
+Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
+| `--runtime-version <tag>` | Run this exact Temps release | - | No |
+| `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
+| `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
+| `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
+| `--json` | Print the result as JSON, for scripts and agents | - | No |
+
+## `stop`
+
+Stop the Temps server and database started by `temps start`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--delete-data` | Also delete everything in your local Temps: its apps, services, sandboxes, database and admin password (asks first) | - | No |
+| `-y, --yes` | Do not ask before deleting data | - | No |
 
 
 ---

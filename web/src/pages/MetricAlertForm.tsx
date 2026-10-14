@@ -38,6 +38,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -490,7 +491,7 @@ function AlertFormBody({
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
-  const onSubmit = async (data: AlertFormData) => {
+  const onSubmit = (data: AlertFormData) => {
     // Build the typed `detection_config` variant the user chose. The Zod enums
     // guarantee the string fields are valid literals, so the narrowing casts are
     // sound, and the backend re-validates the final config.
@@ -515,7 +516,7 @@ function AlertFormBody({
     // backend now supports per-series anomaly detection too.)
     const dynamic_alerts = data.dynamic_alerts && data.group_by.length > 0
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { id },
         query: { project_id: project.id },
         body: {
@@ -535,7 +536,7 @@ function AlertFormBody({
         },
       })
     } else {
-      await createMutation.mutateAsync({
+      createMutation.mutate({
         body: {
           project_id: project.id,
           name: data.name,
@@ -587,7 +588,7 @@ function AlertFormBody({
             {isEditing
               ? 'Update the signal, threshold, and notification settings.'
               : 'Fire a notification when a metric crosses a threshold.'}{' '}
-            Watches metrics from project{' '}
+            Watches metrics from service{' '}
             <span className="font-medium text-foreground">{project.name}</span>{' '}
             only.
           </p>
@@ -913,17 +914,15 @@ function AlertFormBody({
                           <FormItem>
                             <FormLabel>Max series to track</FormLabel>
                             <FormControl>
-                              <Input
-                                type="number"
+                              <NumberInput
                                 min={1}
                                 max={100}
-                                {...field}
-                                onChange={(e) =>
-                                  field.onChange(
-                                    e.target.value === ''
-                                      ? undefined
-                                      : e.target.valueAsNumber
-                                  )
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
                                 }
                               />
                             </FormControl>
@@ -945,17 +944,15 @@ function AlertFormBody({
                               Notification grouping threshold
                             </FormLabel>
                             <FormControl>
-                              <Input
-                                type="number"
+                              <NumberInput
                                 min={1}
                                 max={1000}
-                                {...field}
-                                onChange={(e) =>
-                                  field.onChange(
-                                    e.target.value === ''
-                                      ? undefined
-                                      : e.target.valueAsNumber
-                                  )
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
                                 }
                               />
                             </FormControl>
@@ -1075,17 +1072,12 @@ function AlertFormBody({
                             </Select>
                             {preset === 'custom' && (
                               <FormControl>
-                                <Input
-                                  type="number"
+                                <NumberInput
                                   step="0.1"
                                   min={0}
                                   value={field.value}
-                                  onChange={(e) =>
-                                    field.onChange(
-                                      e.target.value === ''
-                                        ? undefined
-                                        : e.target.valueAsNumber
-                                    )
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
                                   }
                                 />
                               </FormControl>
@@ -1264,16 +1256,14 @@ function AlertFormBody({
                       <FormItem>
                         <FormLabel>Threshold</FormLabel>
                         <FormControl>
-                          <Input
-                            type="number"
+                          <NumberInput
                             step="any"
-                            {...field}
-                            onChange={(e) =>
-                              field.onChange(
-                                e.target.value === ''
-                                  ? undefined
-                                  : e.target.valueAsNumber
-                              )
+                            name={field.name}
+                            ref={field.ref}
+                            onBlur={field.onBlur}
+                            value={field.value}
+                            onValueChange={(value) =>
+                              field.onChange(value ?? Number.NaN)
                             }
                           />
                         </FormControl>
@@ -1300,16 +1290,14 @@ function AlertFormBody({
                     <FormItem>
                       <FormLabel>Evaluation window (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
+                        <NumberInput
                           min={1}
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value === ''
-                                ? undefined
-                                : e.target.valueAsNumber
-                            )
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>
@@ -1328,16 +1316,14 @@ function AlertFormBody({
                     <FormItem>
                       <FormLabel>For duration (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
+                        <NumberInput
                           min={1}
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value === ''
-                                ? undefined
-                                : e.target.valueAsNumber
-                            )
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>
@@ -1374,7 +1360,7 @@ function AlertFormBody({
                     </Select>
                     <FormDescription>
                       Maps to the notification severity. Alerts are delivered
-                      through notification routes, which apply to all projects;
+                      through notification routes, which apply to all services;
                       routes match on this severity.
                     </FormDescription>
                     <FormMessage />

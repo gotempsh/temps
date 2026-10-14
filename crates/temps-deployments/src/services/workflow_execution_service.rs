@@ -149,18 +149,30 @@ struct SelectedNodeBuilder {
     remote: Arc<dyn ImageBuilder>,
 }
 
+/// How many images a worker build of a non-static deployment produces.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerBuildScope {
+    /// Every target node runs one architecture: one build, as always.
+    SingleArchitecture,
+    /// The target nodes span several architectures: one native build per
+    /// platform, each on a worker of that architecture.
+    PerArchitecture,
+}
+
 fn validate_worker_build_scope(
     deployment_id: i32,
     platforms: &[String],
-) -> Result<(), WorkflowExecutionError> {
-    if platforms.len() == 1 {
-        return Ok(());
+) -> Result<WorkerBuildScope, WorkflowExecutionError> {
+    match platforms.len() {
+        0 => Err(WorkflowExecutionError::InvalidJobConfig(format!(
+            "Deployment {deployment_id}: no target worker has reported a buildable \
+             architecture, so there is no platform to build for. Check that a worker is active \
+             and has completed a heartbeat (`temps join`), and that the target nodes/labels \
+             select it"
+        ))),
+        1 => Ok(WorkerBuildScope::SingleArchitecture),
+        _ => Ok(WorkerBuildScope::PerArchitecture),
     }
-    Err(WorkflowExecutionError::InvalidJobConfig(format!(
-        "Deployment {deployment_id}: Worker build protocol v1 requires exactly one target \
-         architecture. Restrict target nodes/labels to a single architecture, or deploy a \
-         prebuilt multi-platform registry image. Reported target platforms: {platforms:?}"
-    )))
 }
 
 /// Open an authenticated agent connection to `node` for image work.
@@ -201,6 +213,46 @@ async fn connect_build_node(
             node.name, node.id
         )
     })
+}
+
+/// How long a per-architecture build candidate has to answer its health probe.
+const BUILDER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connect to `node` and confirm, over its authenticated agent channel, that
+/// it is reachable and runs `platform` -- what its agent reports now, not
+/// only what its node row last recorded. `Err` is why it was passed over.
+async fn probe_platform_builder(
+    node: &temps_entities::nodes::Model,
+    platform: &str,
+    config: &temps_config::ConfigService,
+    encryption: &temps_core::EncryptionService,
+) -> Result<temps_deployer::remote::RemoteNodeDeployer, String> {
+    let remote = connect_build_node(node, config, encryption).await?;
+    // Bounded: a worker that accepts the connection and never answers must
+    // not hold up the deployment for the client's full request timeout.
+    let reported = tokio::time::timeout(BUILDER_PROBE_TIMEOUT, remote.refresh_platform())
+        .await
+        .map_err(|_| {
+            format!(
+                "worker '{}' (id={}) did not answer on its agent connection within {}s",
+                node.name,
+                node.id,
+                BUILDER_PROBE_TIMEOUT.as_secs()
+            )
+        })?;
+    match reported {
+        Some(reported) if temps_deployer::platform::platforms_match(&reported, platform) => {
+            Ok(remote)
+        }
+        Some(reported) => Err(format!(
+            "worker '{}' (id={}) is recorded as {platform} but its agent reports {reported}",
+            node.name, node.id
+        )),
+        None => Err(format!(
+            "worker '{}' (id={}) did not answer on its agent connection",
+            node.name, node.id
+        )),
+    }
 }
 
 /// Reaches the worker that built an image, for jobs that read files out of
@@ -245,30 +297,47 @@ struct OffloadBuildCandidate {
     platform: Option<String>,
 }
 
-/// Project variables a framework inlines into a generated build, which keep
-/// that build on the control plane. Names only, never values.
+/// Secret variables a framework inlines into the application, which keep an
+/// offloaded build on the control plane: a worker never receives a secret
+/// value, so the bundle it built would hold them empty. Names only.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "{names} {verb} inlined into the application at build time, and worker builds cannot \
-     receive project variables yet",
+    "{names} {verb} inlined into the application at build time, but {pronoun} secret, and \
+     secret values never leave the control plane for a worker build",
     names = .variables.join(", "),
-    verb = if .variables.len() == 1 { "is" } else { "are" }
+    verb = if .variables.len() == 1 { "is" } else { "are" },
+    pronoun = if .variables.len() == 1 { "it is" } else { "they are" }
 )]
 struct InlinedVariablesKeepBuildLocal {
     variables: Vec<String>,
 }
 
-/// A worker build receives no variable values, so a generated build that a
-/// framework inlines variables into would ship them empty.
+/// A worker build receives every value that is not secret -- the project's
+/// own variables and the platform's public ones alike -- so only a secret
+/// variable the framework inlines changes what a worker would build.
 fn inlined_variables_allow_offload(
-    inlined_build_variables: &[String],
+    withheld_inlined_variables: &[String],
 ) -> Result<(), InlinedVariablesKeepBuildLocal> {
-    if inlined_build_variables.is_empty() {
+    if withheld_inlined_variables.is_empty() {
         return Ok(());
     }
     Err(InlinedVariablesKeepBuildLocal {
-        variables: inlined_build_variables.to_vec(),
+        variables: withheld_inlined_variables.to_vec(),
     })
+}
+
+/// The inlined variables among `build_args` whose values a worker build
+/// would not receive (not in the planner's `worker_build_arg_keys`).
+fn withheld_inlined_variables<'a>(
+    build_args: impl IntoIterator<Item = &'a String>,
+    worker_build_arg_keys: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    crate::jobs::build_image::build_inlined_variables(
+        build_args
+            .into_iter()
+            .filter(|name| !worker_build_arg_keys.contains(*name))
+            .map(String::as_str),
+    )
 }
 
 /// Whether a build that the control plane would run can move to a worker
@@ -1203,23 +1272,23 @@ impl WorkflowExecutionService {
                 // build that needs them stays on the control plane.
                 let needs_npm_credentials =
                     crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
-                // A worker build receives no variable values. Autopack builds
-                // there without them; any other generated build that inlines
-                // one stays here when it can (BuildImageJob refuses otherwise).
-                let inlined_build_variables = if temps_presets::get_preset_for_storage(
-                    project.preset,
-                    project.preset_config.as_ref(),
-                )
-                .ok()
-                .flatten()
-                .is_some_and(|preset| preset.uses_autopack())
-                {
-                    Vec::new()
-                } else {
-                    crate::jobs::build_image::build_inlined_variables(
-                        build_args_map.keys().map(String::as_str),
-                    )
-                };
+                // Names whose values may be sent to a worker build (names
+                // only, plaintext). A job planned before the field existed
+                // has none: a worker then receives no value at all.
+                let worker_build_arg_keys: std::collections::BTreeSet<String> = config
+                    .get(crate::services::workflow_planner::WORKER_BUILD_ARG_KEYS_FIELD)
+                    .and_then(|value| value.as_array())
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(|key| key.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Only a secret value the framework inlines changes what a
+                // worker builds; such a build stays here when it can.
+                let inlined_build_variables =
+                    withheld_inlined_variables(build_args_map.keys(), &worker_build_arg_keys);
+                builder = builder.worker_build_arg_keys(worker_build_arg_keys);
                 if !build_args_map.is_empty() {
                     let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
                     builder = builder.build_args(build_args);
@@ -1391,7 +1460,7 @@ impl WorkflowExecutionService {
                         environment.deployment_config.as_ref(),
                         project.deployment_config.as_ref(),
                     );
-                    let selected = self
+                    let mut selected = self
                         .select_node_builder(
                             deployment.id,
                             &project.slug,
@@ -1400,10 +1469,34 @@ impl WorkflowExecutionService {
                             static_output_only,
                         )
                         .await?;
-                    builder = builder
-                        .remote_builder_node_id(selected.node_id)
-                        .target_platforms(vec![selected.platform.clone()]);
-                    selected.remote
+                    if selected.len() > 1 {
+                        // A mixed-architecture deployment: one native build
+                        // per architecture, each on its own worker.
+                        let primary = selected[0].remote.clone();
+                        builder = builder.platform_builders(
+                            selected
+                                .into_iter()
+                                .map(|selected| crate::jobs::build_image::WorkerPlatformBuilder {
+                                    platform: selected.platform,
+                                    node_id: selected.node_id,
+                                    node_name: selected.node_name,
+                                    builder: selected.remote,
+                                })
+                                .collect(),
+                        );
+                        primary
+                    } else {
+                        let selected = selected.pop().ok_or_else(|| {
+                            WorkflowExecutionError::JobCreationFailed(format!(
+                                "Deployment {}: no build node was selected",
+                                deployment.id
+                            ))
+                        })?;
+                        builder = builder
+                            .remote_builder_node_id(selected.node_id)
+                            .target_platforms(vec![selected.platform.clone()]);
+                        selected.remote
+                    }
                 };
                 let job = builder.build(image_builder)?;
 
@@ -2956,7 +3049,7 @@ impl WorkflowExecutionService {
         target_nodes: Option<&[i32]>,
         target_labels: Option<&serde_json::Value>,
         static_output_only: bool,
-    ) -> Result<SelectedNodeBuilder, WorkflowExecutionError> {
+    ) -> Result<Vec<SelectedNodeBuilder>, WorkflowExecutionError> {
         let scheduler = self.node_scheduler.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
                 "Deployment {deployment_id} cannot select a build node: node scheduler is unavailable"
@@ -2980,9 +3073,21 @@ impl WorkflowExecutionService {
                     ))
                 })?;
             // Inspect the entire eligible target set, not just the first
-            // replica. Protocol v1 has one image owner; never silently drop
-            // other platforms.
-            validate_worker_build_scope(deployment_id, &platforms)?;
+            // replica: every architecture a replica may land on needs its
+            // own image, built natively on a worker of that architecture.
+            if validate_worker_build_scope(deployment_id, &platforms)?
+                == WorkerBuildScope::PerArchitecture
+            {
+                return self
+                    .select_platform_builders(
+                        deployment_id,
+                        project_slug,
+                        target_nodes,
+                        target_labels,
+                        &platforms,
+                    )
+                    .await;
+            }
             platforms
         };
         let outcome = scheduler
@@ -3044,7 +3149,162 @@ impl WorkflowExecutionService {
                     ))
                 })?,
         };
-        self.connect_build_node(deployment_id, node, platform).await
+        Ok(vec![
+            self.connect_build_node(deployment_id, node, platform)
+                .await?,
+        ])
+    }
+
+    /// Choose one worker per platform for a deployment whose target nodes
+    /// span several architectures, each building its own architecture
+    /// natively.
+    ///
+    /// For every platform a dedicated builder (`temps.sh/role=builder`) of
+    /// that architecture is preferred, then a node this deployment could be
+    /// placed on. Each candidate is probed over its authenticated agent
+    /// connection first: an unreachable worker, or one whose agent reports
+    /// another architecture than its node row, is passed over for the next
+    /// one. A platform with no usable worker stops the deployment with
+    /// [`WorkflowExecutionError::NoBuilderForArchitecture`] before anything
+    /// is built -- there is no emulated fallback.
+    async fn select_platform_builders(
+        &self,
+        deployment_id: i32,
+        project_slug: &str,
+        target_nodes: Option<&[i32]>,
+        target_labels: Option<&serde_json::Value>,
+        platforms: &[String],
+    ) -> Result<Vec<SelectedNodeBuilder>, WorkflowExecutionError> {
+        let scheduler = self.node_scheduler.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot select build nodes: node scheduler is unavailable"
+            ))
+        })?;
+        let encryption = self.encryption_service.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot reach its build nodes: the encryption service \
+                 that unseals agent tokens is unavailable"
+            ))
+        })?;
+        // Every architecture's candidates are probed at the same time, so a
+        // slow or unreachable worker of one architecture does not hold up the
+        // choice for the others. The result keeps `platforms`' order.
+        futures::future::try_join_all(platforms.iter().map(|platform| async move {
+            let mut passed_over: Vec<String> = Vec::new();
+            let mut tried: Vec<i32> = Vec::new();
+            let no_builder = |reason: String| WorkflowExecutionError::NoBuilderForArchitecture {
+                deployment_id,
+                platform: platform.clone(),
+                reason,
+            };
+
+            // Every dedicated builder of this architecture, lowest id first,
+            // before any application worker: placement below never offers a
+            // build-only node, so one that is skipped here is never tried.
+            let mut dedicated: std::collections::VecDeque<_> = scheduler
+                .select_builder_nodes(platform)
+                .await
+                .map_err(|error| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Deployment {deployment_id} cannot list {platform} build nodes: {error}"
+                    ))
+                })?
+                .into();
+            let builder = loop {
+                let node = match dedicated.pop_front() {
+                    Some(node) => node,
+                    None => {
+                        let outcome = scheduler
+                            .schedule_placement(
+                                crate::services::node_scheduler::ReplicaPlacementRequest {
+                                    replica_count: 1,
+                                    labels: target_labels,
+                                    target_node_ids: target_nodes,
+                                    anti_affinity: true,
+                                    exclude_node_ids: &tried,
+                                    image_platforms: std::slice::from_ref(platform),
+                                    project_slug: Some(project_slug),
+                                    exclude_control_plane: true,
+                                },
+                            )
+                            .await;
+                        let assignment = match outcome {
+                            Ok(outcome) => outcome.assignments.into_iter().next(),
+                            Err(error) if passed_over.is_empty() => {
+                                return Err(no_builder(format!(
+                                    "no eligible {platform} worker: {error}"
+                                )));
+                            }
+                            Err(_) => None,
+                        };
+                        // The scheduler relaxes `exclude_node_ids` once every
+                        // candidate is excluded and offers one again, so a
+                        // repeat means no other worker of this platform is left.
+                        let Some(crate::services::NodeAssignment::Remote { node_id, .. }) =
+                            assignment.filter(|assignment| {
+                                assignment
+                                    .node_id()
+                                    .is_some_and(|node_id| !tried.contains(&node_id))
+                            })
+                        else {
+                            return Err(no_builder(if passed_over.is_empty() {
+                                format!("no eligible {platform} worker")
+                            } else {
+                                passed_over.join("; ")
+                            }));
+                        };
+                        scheduler
+                            .node_service()
+                            .get_by_id(node_id)
+                            .await
+                            .map_err(|error| {
+                                WorkflowExecutionError::JobCreationFailed(format!(
+                                    "Cannot load worker {node_id} to build {platform} for \
+                                         deployment {deployment_id}: {error}"
+                                ))
+                            })?
+                    }
+                };
+                tried.push(node.id);
+                match probe_platform_builder(
+                    &node,
+                    platform,
+                    self.config_service.as_ref(),
+                    encryption.as_ref(),
+                )
+                .await
+                {
+                    Ok(remote) => break (node, remote),
+                    Err(reason) => {
+                        warn!(
+                            deployment_id,
+                            node_id = node.id,
+                            node_name = %node.name,
+                            platform = %platform,
+                            "Passing over worker for a per-architecture build: {}",
+                            reason
+                        );
+                        passed_over.push(reason);
+                    }
+                }
+            };
+            let (node, remote) = builder;
+            info!(
+                deployment_id,
+                node_id = node.id,
+                node_name = %node.name,
+                build_only = crate::services::node_scheduler::is_build_only_node(&node),
+                platform = %platform,
+                "Building one architecture of a mixed-architecture deployment on node"
+            );
+            Ok::<_, WorkflowExecutionError>(SelectedNodeBuilder {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                platform: platform.clone(),
+                remote: Arc::new(remote),
+            })
+        }))
+        .await
     }
 
     /// Open an authenticated agent client to `node` for building `platform`.
@@ -4030,6 +4290,22 @@ pub enum WorkflowExecutionError {
         #[source]
         source: crate::services::node_service::NodeError,
     },
+
+    /// A mixed-architecture deployment has a target architecture that no
+    /// reachable worker of that architecture can build. Builds are never
+    /// emulated, so the deployment stops before anything is built.
+    #[error(
+        "Deployment {deployment_id} targets {platform} nodes, but no {platform} worker can \
+         build its image: {reason}. Each architecture is built natively on a worker of that \
+         architecture, never emulated: bring a {platform} worker online (or label one \
+         `temps.sh/role=builder`), or restrict this environment's target nodes/labels to the \
+         architectures that have a reachable worker"
+    )]
+    NoBuilderForArchitecture {
+        deployment_id: i32,
+        platform: String,
+        reason: String,
+    },
 }
 
 impl WorkflowExecutionError {
@@ -4049,7 +4325,10 @@ impl WorkflowExecutionError {
             | Self::Validation(_)
             // The operator's placement configuration, recorded on the
             // deployment as its failure reason.
-            | Self::DedicatedNodesNotPinned { .. } => true,
+            | Self::DedicatedNodesNotPinned { .. }
+            // The cluster's state: a target architecture has no reachable
+            // worker. Recorded on the deployment with the fix.
+            | Self::NoBuilderForArchitecture { .. } => true,
             Self::DatabaseError(_)
             | Self::NoJobsFound(_)
             | Self::MissingJobConfig(_)
@@ -4099,15 +4378,53 @@ mod tests {
         }
     }
 
+    /// One target architecture keeps the single worker build every
+    /// homogeneous cluster does today; several get one native build per
+    /// architecture; none is a configuration error naming the deployment.
     #[test]
-    fn worker_build_scope_rejects_mixed_architectures_before_building() {
-        use super::validate_worker_build_scope;
-        assert!(validate_worker_build_scope(42, &["linux/amd64".into()]).is_ok());
-        for platforms in [vec![], vec!["linux/amd64".into(), "linux/arm64".into()]] {
-            let error = validate_worker_build_scope(42, &platforms).unwrap_err();
-            assert!(error.to_string().contains("Deployment 42"));
-            assert!(error.to_string().contains("target nodes/labels"));
-        }
+    fn worker_build_scope_groups_target_platforms() {
+        use super::{validate_worker_build_scope, WorkerBuildScope};
+        assert_eq!(
+            validate_worker_build_scope(42, &["linux/amd64".into()]).unwrap(),
+            WorkerBuildScope::SingleArchitecture
+        );
+        assert_eq!(
+            validate_worker_build_scope(42, &["linux/amd64".into(), "linux/arm64".into()]).unwrap(),
+            WorkerBuildScope::PerArchitecture
+        );
+        let error = validate_worker_build_scope(42, &[]).unwrap_err();
+        assert!(error.to_string().contains("Deployment 42"), "{error}");
+        assert!(error.to_string().contains("target nodes/labels"), "{error}");
+    }
+
+    /// The refusal names the architecture and both fixes, and is recorded as
+    /// an outcome of the deployment (cluster state), not a Temps fault.
+    #[test]
+    fn no_builder_for_architecture_names_the_platform_and_the_fix() {
+        let error = WorkflowExecutionError::NoBuilderForArchitecture {
+            deployment_id: 9,
+            platform: "linux/amd64".to_string(),
+            reason: "worker 'w-amd' (id=3) did not answer on its agent connection".to_string(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Deployment 9 targets linux/amd64 nodes"),
+            "{message}"
+        );
+        assert!(message.contains("w-amd"), "{message}");
+        assert!(message.contains("never emulated"), "{message}");
+        assert!(
+            message.contains("bring a linux/amd64 worker online"),
+            "{message}"
+        );
+        assert!(message.contains("target nodes/labels"), "{message}");
+        assert!(error.is_workload_outcome());
+        let classified =
+            crate::services::failure_classifier::classify_failure_reason(Some(&message));
+        assert_eq!(
+            classified.code,
+            crate::services::failure_classifier::DeploymentFailureCode::ImagePlatformMismatch
+        );
     }
 
     /// Build location `node` moves a build only when a worker can produce the
@@ -4201,17 +4518,55 @@ mod tests {
         }
     }
 
-    /// A build whose framework inlines a project variable stays on the
-    /// control plane, naming the variable (never its value); platform and
-    /// runtime-only variables never keep a build there.
+    /// Only a secret variable the framework inlines keeps an offloaded build
+    /// on the control plane, named (never its value). The platform's public
+    /// variables -- `VITE_SENTRY_DSN`, `VITE_SENTRY_TUNNEL` and the other
+    /// frameworks' equivalents -- and the project's non-secret variables are
+    /// sent to the worker, so they never keep a build here (issue #1344).
     #[test]
     fn inlined_build_variables_keep_offloaded_builds_local() {
-        use super::inlined_variables_allow_offload;
+        use super::{inlined_variables_allow_offload, withheld_inlined_variables};
+        use std::collections::BTreeSet;
+
+        let build_args: Vec<String> = [
+            "HOST",
+            "SENTRY_DSN",
+            "VITE_SENTRY_DSN",
+            "VITE_SENTRY_TUNNEL",
+            "NEXT_PUBLIC_SENTRY_DSN",
+            "PUBLIC_SENTRY_TUNNEL",
+            "VITE_API_URL",
+            "VITE_PRIVATE_KEY",
+            "TEMPS_API_TOKEN",
+            "BUILDKIT_CACHE_MOUNT_NS",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let sent: BTreeSet<String> = build_args
+            .iter()
+            .filter(|name| !matches!(name.as_str(), "VITE_PRIVATE_KEY" | "TEMPS_API_TOKEN"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            withheld_inlined_variables(&build_args, &sent),
+            vec!["VITE_PRIVATE_KEY".to_string()]
+        );
+        let all_public: BTreeSet<String> = sent
+            .iter()
+            .cloned()
+            .chain(["VITE_PRIVATE_KEY".to_string()])
+            .collect();
+        assert_eq!(
+            inlined_variables_allow_offload(&withheld_inlined_variables(&build_args, &all_public)),
+            Ok(())
+        );
 
         assert_eq!(inlined_variables_allow_offload(&[]), Ok(()));
         let one = inlined_variables_allow_offload(&["VITE_API_URL".to_string()]).unwrap_err();
         assert_eq!(one.variables, vec!["VITE_API_URL".to_string()]);
         assert!(one.to_string().contains("VITE_API_URL is inlined"), "{one}");
+        assert!(one.to_string().contains("it is secret"), "{one}");
         let two = inlined_variables_allow_offload(&[
             "NEXT_PUBLIC_A".to_string(),
             "NEXT_PUBLIC_B".to_string(),
@@ -4788,6 +5143,8 @@ mod tests {
                 file_count: 10,
                 total_size_bytes: 1024,
                 deployed_at: Utc::now(),
+                skipped_count: 0,
+                skipped_paths: Vec::new(),
             })
         }
 
@@ -6475,6 +6832,451 @@ mod tests {
             Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
         ));
 
+        Ok(())
+    }
+
+    /// A stand-in worker agent that answers `GET /agent/health` with
+    /// `platform`, for as long as the test runs.
+    async fn spawn_health_agent(platform: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let body = serde_json::json!({
+                        "success": true,
+                        "data": { "status": "ok", "platform": platform }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// An address nothing listens on: a worker that is down.
+    async fn unreachable_agent() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    const TEST_MASTER_KEY: &str = "01234567890123456789012345678901";
+
+    async fn insert_worker(
+        db: &DbConnection,
+        name: &str,
+        address: &str,
+        architecture: &str,
+    ) -> Result<temps_entities::nodes::Model, Box<dyn std::error::Error>> {
+        insert_node(db, name, address, architecture, serde_json::json!({})).await
+    }
+
+    async fn insert_node(
+        db: &DbConnection,
+        name: &str,
+        address: &str,
+        architecture: &str,
+        labels: serde_json::Value,
+    ) -> Result<temps_entities::nodes::Model, Box<dyn std::error::Error>> {
+        let encryption = temps_core::EncryptionService::new(TEST_MASTER_KEY)?;
+        Ok(temps_entities::nodes::ActiveModel {
+            name: Set(name.to_string()),
+            token_hash: Set(format!("hash-{name}")),
+            token_encrypted: Set(Some(encryption.encrypt(b"agent-token")?)),
+            address: Set(address.to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("active".to_string()),
+            labels: Set(labels),
+            capacity: Set(serde_json::json!({})),
+            architecture: Set(Some(architecture.to_string())),
+            last_heartbeat: Set(Some(Utc::now())),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?)
+    }
+
+    /// The control-plane profile: no Docker daemon, no local workloads.
+    async fn control_plane_service(
+        db: Arc<DbConnection>,
+    ) -> Result<WorkflowExecutionService, Box<dyn std::error::Error>> {
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        let node_service = Arc::new(crate::services::NodeService::new(db));
+        service.set_node_scheduler(Arc::new(
+            crate::services::NodeScheduler::new(node_service).with_local_workloads_enabled(false),
+        ));
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+        Ok(service)
+    }
+
+    fn platforms_and_nodes(selected: &[SelectedNodeBuilder]) -> Vec<(String, i32)> {
+        selected
+            .iter()
+            .map(|selected| (selected.platform.clone(), selected.node_id))
+            .collect()
+    }
+
+    /// Target nodes spanning two architectures get one builder per
+    /// architecture, each a worker of that architecture -- in the order the
+    /// scheduler lists the platforms, so the first owns the plain tag.
+    #[tokio::test]
+    async fn mixed_architecture_targets_get_one_native_builder_per_platform(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let arm = insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        let amd = insert_worker(
+            &db,
+            "w-amd",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        assert_eq!(
+            platforms_and_nodes(&selected),
+            vec![
+                ("linux/amd64".to_string(), amd.id),
+                ("linux/arm64".to_string(), arm.id)
+            ]
+        );
+        Ok(())
+    }
+
+    /// A single-architecture cluster keeps exactly one build, as before.
+    #[tokio::test]
+    async fn single_architecture_targets_keep_one_builder() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        insert_worker(
+            &db,
+            "w-arm-1",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(
+            &db,
+            "w-arm-2",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].platform, "linux/arm64");
+        Ok(())
+    }
+
+    /// An unreachable worker of one architecture is passed over for another
+    /// worker of the same architecture.
+    #[tokio::test]
+    async fn an_unreachable_builder_is_replaced_by_another_of_its_architecture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        let dead =
+            insert_worker(&db, "w-amd-down", &unreachable_agent().await, "linux/amd64").await?;
+        let live = insert_worker(
+            &db,
+            "w-amd-up",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        let amd = selected
+            .iter()
+            .find(|selected| selected.platform == "linux/amd64")
+            .expect("an amd64 builder");
+        assert_eq!(amd.node_id, live.id);
+        assert_ne!(amd.node_id, dead.id);
+        Ok(())
+    }
+
+    /// A target architecture with no reachable worker -- or only one whose
+    /// agent reports another architecture than its node row -- stops the
+    /// deployment with a typed error naming that architecture. Nothing is
+    /// emulated and nothing is built for the other architecture first.
+    #[tokio::test]
+    async fn an_architecture_without_a_usable_worker_is_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (amd_address, why) in [
+            (unreachable_agent().await, "did not answer"),
+            (
+                spawn_health_agent("linux/arm64").await,
+                "is recorded as linux/amd64 but its agent reports linux/arm64",
+            ),
+        ] {
+            let test_db = TestDatabase::with_migrations().await?;
+            let db = test_db.connection_arc();
+            insert_worker(
+                &db,
+                "w-arm",
+                &spawn_health_agent("linux/arm64").await,
+                "linux/arm64",
+            )
+            .await?;
+            insert_worker(&db, "w-amd", &amd_address, "linux/amd64").await?;
+            let service = control_plane_service(db).await?;
+
+            let error = match service
+                .select_node_builder(17, "app", None, None, false)
+                .await
+            {
+                Ok(selected) => panic!(
+                    "expected a refusal, got {:?}",
+                    platforms_and_nodes(&selected)
+                ),
+                Err(error) => error,
+            };
+            match &error {
+                WorkflowExecutionError::NoBuilderForArchitecture {
+                    deployment_id,
+                    platform,
+                    reason,
+                } => {
+                    assert_eq!(*deployment_id, 17);
+                    assert_eq!(platform, "linux/amd64");
+                    assert!(reason.contains("w-amd"), "{reason}");
+                    assert!(reason.contains(why), "{reason}");
+                }
+                other => panic!("expected NoBuilderForArchitecture, got {other}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every dedicated builder of an architecture is tried before any
+    /// application worker: with the first amd64 builder and the amd64
+    /// application worker both down, the second amd64 builder still builds.
+    #[tokio::test]
+    async fn a_spare_dedicated_builder_replaces_an_unreachable_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let builder = serde_json::json!({ "temps.sh/role": "builder" });
+        insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(&db, "w-amd", &unreachable_agent().await, "linux/amd64").await?;
+        let first = insert_node(
+            &db,
+            "b-amd-1",
+            &unreachable_agent().await,
+            "linux/amd64",
+            builder.clone(),
+        )
+        .await?;
+        let spare = insert_node(
+            &db,
+            "b-amd-2",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+            builder,
+        )
+        .await?;
+        assert!(first.id < spare.id);
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        let amd = selected
+            .iter()
+            .find(|selected| selected.platform == "linux/amd64")
+            .expect("an amd64 builder");
+        assert_eq!(amd.node_id, spare.id);
+        Ok(())
+    }
+
+    /// Target nodes pin the architectures built: a deployment restricted to
+    /// one architecture builds once even on a mixed cluster.
+    #[tokio::test]
+    async fn target_nodes_restrict_the_architectures_built(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let arm = insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(
+            &db,
+            "w-amd",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", Some(&[arm.id]), None, false)
+            .await?;
+
+        assert_eq!(
+            platforms_and_nodes(&selected),
+            vec![("linux/arm64".to_string(), arm.id)]
+        );
+        Ok(())
+    }
+
+    /// Replicas of a mixed-architecture build land only on nodes whose
+    /// architecture has an image, and each replica's tag and image source are
+    /// the ones built for its node. With one node drained, its replica moves
+    /// to a node of the other architecture and takes that architecture's
+    /// image -- never the drained architecture's.
+    #[tokio::test]
+    async fn replicas_are_placed_and_sourced_by_architecture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let arm = insert_worker(&db, "w-arm", "http://127.0.0.1:9", "linux/arm64").await?;
+        let amd = insert_worker(&db, "w-amd", "http://127.0.0.1:9", "linux/amd64").await?;
+        let scheduler = crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))
+        .with_local_workloads_enabled(false);
+        let output = crate::jobs::deploy_image::BuildImageOutput {
+            image_tag: "app:latest".to_string(),
+            image_id: "sha256:amd".to_string(),
+            size_bytes: 1,
+            build_context: ".".into(),
+            dockerfile_path: "Dockerfile".into(),
+            image_tags_by_platform: HashMap::from([
+                ("linux/amd64".to_string(), "app:latest".to_string()),
+                ("linux/arm64".to_string(), "app:latest-arm64".to_string()),
+            ]),
+            builder_node_id: Some(amd.id),
+            builder_node_ids_by_platform: HashMap::from([
+                ("linux/amd64".to_string(), amd.id),
+                ("linux/arm64".to_string(), arm.id),
+            ]),
+            image_ids_by_platform: HashMap::new(),
+        };
+        let platforms: Vec<String> = vec!["linux/amd64".into(), "linux/arm64".into()];
+
+        let placed = |exclude: Vec<i32>, replicas: u32| {
+            let scheduler = &scheduler;
+            let platforms = &platforms;
+            async move {
+                scheduler
+                    .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                        replica_count: replicas,
+                        labels: None,
+                        target_node_ids: None,
+                        anti_affinity: true,
+                        exclude_node_ids: &exclude,
+                        image_platforms: platforms,
+                        project_slug: Some("app"),
+                        exclude_control_plane: false,
+                    })
+                    .await
+            }
+        };
+
+        let outcome = placed(vec![], 2).await?;
+        let mut seen = Vec::new();
+        for assignment in &outcome.assignments {
+            let node_id = assignment.node_id().expect("a worker");
+            let tag = output.tag_for_platform(assignment.platform());
+            let source = output.builder_node_for_tag(tag);
+            seen.push((node_id, tag.to_string(), source));
+        }
+        seen.sort();
+        let mut expected = vec![
+            (arm.id, "app:latest-arm64".to_string(), Some(arm.id)),
+            (amd.id, "app:latest".to_string(), Some(amd.id)),
+        ];
+        expected.sort();
+        assert_eq!(seen, expected);
+
+        // Drain the arm64 node: its replica moves to the amd64 node, which
+        // runs (and already holds) the amd64 image.
+        temps_entities::nodes::Entity::update_many()
+            .col_expr(
+                temps_entities::nodes::Column::Status,
+                sea_orm::sea_query::Expr::value("draining"),
+            )
+            .filter(temps_entities::nodes::Column::Id.eq(arm.id))
+            .exec(db.as_ref())
+            .await?;
+        let outcome = placed(vec![], 1).await?;
+        let moved = &outcome.assignments[0];
+        assert_eq!(moved.node_id(), Some(amd.id));
+        let tag = output.tag_for_platform(moved.platform());
+        assert_eq!(tag, "app:latest");
+        assert_eq!(output.builder_node_for_tag(tag), Some(amd.id));
+
+        // A build that only covered arm64 can never be placed on the amd64
+        // node that remains: the deployment fails instead of running the
+        // wrong architecture.
+        let error = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: None,
+                target_node_ids: None,
+                anti_affinity: true,
+                exclude_node_ids: &[],
+                image_platforms: &["linux/arm64".to_string()],
+                project_slug: Some("app"),
+                exclude_control_plane: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("linux/arm64"), "{error}");
         Ok(())
     }
 }

@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { MAX_QUERY_RETRIES, shouldRetryQuery } from './query-retry'
+import {
+  MAX_QUERY_RETRIES,
+  refetchUnlessRefused,
+  shouldRetryQuery,
+} from './query-retry'
 
 describe('shouldRetryQuery', () => {
   test('never retries a deterministic 4xx answer', () => {
@@ -12,7 +16,7 @@ describe('shouldRetryQuery', () => {
   })
 
   test('retries a missing last deployment zero times', () => {
-    // GET /projects/{id}/last-deployment answers 404 before a first deploy.
+    // GET /projects/{id}/last-deployment answers 404 only for an unknown project.
     expect(
       shouldRetryQuery(0, {
         title: 'Not Found',
@@ -38,5 +42,24 @@ describe('shouldRetryQuery', () => {
     expect(shouldRetryQuery(0, new TypeError('Failed to fetch'))).toBe(true)
     expect(shouldRetryQuery(1, 'Bad Gateway')).toBe(true)
     expect(shouldRetryQuery(MAX_QUERY_RETRIES, new Error('boom'))).toBe(false)
+  })
+})
+
+describe('refetchUnlessRefused', () => {
+  const stateOf = (error: unknown) => ({ state: { error } })
+
+  test('keeps polling a healthy or transiently failing read', () => {
+    const interval = refetchUnlessRefused(30_000)
+    expect(interval(stateOf(null))).toBe(30_000)
+    expect(interval(stateOf({ title: 'x', status: 503 }))).toBe(30_000)
+    expect(interval(stateOf(new TypeError('Failed to fetch')))).toBe(30_000)
+  })
+
+  test('stops polling once the server has refused the read', () => {
+    const interval = refetchUnlessRefused(30_000)
+    expect(interval(stateOf({ title: 'Forbidden', status: 403 }))).toBe(false)
+    expect(interval(stateOf({ title: 'Unauthorized', status: 401 }))).toBe(
+      false
+    )
   })
 })

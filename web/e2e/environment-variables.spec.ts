@@ -45,7 +45,7 @@ async function mockApi(page: Page) {
       return
     }
     if (path.endsWith('/last-deployment')) {
-      await route.fulfill({ status: 404, json: { detail: 'No deployments' } })
+      await route.fulfill({ json: { deployment: null } })
       return
     }
     const json =
@@ -111,7 +111,7 @@ test('environment and name filters persist, include preview inheritance, and lim
   await page.goto(path)
   await expect(row(page, 'PROD_ONLY')).toBeVisible()
   await expect(row(page, 'PREVIEW_DEFAULT')).toHaveCount(0)
-  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await page.getByRole('button', { name: /^Filters/ }).click()
   await page.getByLabel('Environment', { exact: true }).click()
   await page.getByRole('option', { name: 'preview', exact: true }).click()
   await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
@@ -123,7 +123,7 @@ test('environment and name filters persist, include preview inheritance, and lim
   await search.fill('shared')
   await expect(row(page, 'PREVIEW_DEFAULT')).toHaveCount(0)
   await page.reload()
-  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await page.getByRole('button', { name: /^Filters/ }).click()
   await expect(search).toHaveValue('shared')
   await expect(row(page, 'SHARED_VALUE')).toBeVisible()
   await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
@@ -182,7 +182,7 @@ test('full values are available only after reveal and on demand, including integ
     .click()
   await expect(page.getByRole('dialog').locator('pre')).toHaveText(fullValue)
   await page.keyboard.press('Escape')
-  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await page.getByRole('button', { name: /^Filters/ }).click()
   await page.getByLabel('Environment', { exact: true }).click()
   await page.getByRole('option', { name: 'preview', exact: true }).click()
   await expect(
@@ -269,7 +269,7 @@ test('filters and full-value dialog stay closed until requested', async ({
   await mockApi(page)
   await page.setViewportSize({ width: 1600, height: 1000 })
   await page.goto(path + '?environment=2&q=shared')
-  const filters = page.getByRole('button', { name: 'Filters', exact: true })
+  const filters = page.getByRole('button', { name: /^Filters/ })
   await expect(row(page, 'SHARED_VALUE')).toBeVisible()
   await expect(filters).toHaveAttribute('aria-expanded', 'false')
   await expect(filters).toContainText('preview')
@@ -395,7 +395,7 @@ test('environment failure keeps manual variable management and preserves an expl
     .getByRole('button', { name: 'Reveal SHARED_VALUE', exact: true })
     .click()
   await expect.poll(() => revealed.length).toBeGreaterThan(0)
-  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await page.getByRole('button', { name: /^Filters/ }).click()
   await page
     .getByRole('textbox', { name: 'Filter environment variables by name' })
     .fill('shared')
@@ -412,12 +412,10 @@ test('environment failure keeps manual variable management and preserves an expl
     path: '/tmp/pr1153-environments-failure.png',
     fullPage: true,
   })
-  await test
-    .info()
-    .attach('Variables remain usable when environments fail', {
-      path: '/tmp/pr1153-environments-failure.png',
-      contentType: 'image/png',
-    })
+  await test.info().attach('Variables remain usable when environments fail', {
+    path: '/tmp/pr1153-environments-failure.png',
+    contentType: 'image/png',
+  })
   fail = false
   await page.getByRole('button', { name: 'Retry environments' }).click()
   await expect(
@@ -492,13 +490,11 @@ test('Compose missing keys follow the selected environment including preview inh
     path: '/tmp/pr1153-missing-production-variable.png',
     fullPage: true,
   })
-  await test
-    .info()
-    .attach('Missing variable in production', {
-      path: '/tmp/pr1153-missing-production-variable.png',
-      contentType: 'image/png',
-    })
-  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await test.info().attach('Missing variable in production', {
+    path: '/tmp/pr1153-missing-production-variable.png',
+    contentType: 'image/png',
+  })
+  await page.getByRole('button', { name: /^Filters/ }).click()
   await page.getByLabel('Environment', { exact: true }).click()
   await page.getByRole('option', { name: 'staging', exact: true }).click()
   await expect(row(page, 'DATABASE_URL')).toBeVisible()

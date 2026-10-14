@@ -243,27 +243,17 @@ impl TempsPlugin for GitPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        // Get the GitAppState from plugin context
-        let git_app_state = context
-            .get_plugin_state::<crate::handlers::types::GitAppState>("git")
-            .expect("GitAppState should be available");
-
-        // Rebind the authorizer here rather than trust the one captured in
-        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
-        // be registered by a plugin later in registration order, and
-        // last-write-wins service registration means the earliest-registered
-        // instance otherwise wins silently. `configure_routes` runs only
-        // after every plugin's `register_services` has completed, so
-        // re-resolving here always sees the final policy — same pattern as
-        // AuthPlugin's `with_sensitive_action_authorizer`.
-        let git_app_state = Arc::new(crate::handlers::types::GitAppState {
-            sensitive_action_authorizer: context
-                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
-            ..(*git_app_state).clone()
-        });
-
         // Configure routes using the existing route configuration
-        let router = handlers::configure_routes().with_state(git_app_state);
+        let router = handlers::configure_routes().with_state(route_state(context));
+
+        Some(PluginRoutes::new(router))
+    }
+
+    /// Provider webhook receivers (ADR-051 D3). Providers deliver from the
+    /// open internet with a signature or delivery token and no session, so
+    /// these must be reachable when the console itself is restricted.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = handlers::configure_public_routes().with_state(route_state(context));
 
         Some(PluginRoutes::new(router))
     }
@@ -273,6 +263,28 @@ impl TempsPlugin for GitPlugin {
         schema.merge(PublicRepositoriesApiDoc::openapi());
         Some(schema)
     }
+}
+
+/// The handler state shared by the admin and public git routers.
+fn route_state(context: &PluginContext) -> Arc<crate::handlers::types::GitAppState> {
+    // Get the GitAppState from plugin context
+    let git_app_state = context
+        .get_plugin_state::<crate::handlers::types::GitAppState>("git")
+        .expect("GitAppState should be available");
+
+    // Rebind the authorizer here rather than trust the one captured in
+    // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+    // be registered by a plugin later in registration order, and
+    // last-write-wins service registration means the earliest-registered
+    // instance otherwise wins silently. Route configuration runs only
+    // after every plugin's `register_services` has completed, so
+    // re-resolving here always sees the final policy — same pattern as
+    // AuthPlugin's `with_sensitive_action_authorizer`.
+    Arc::new(crate::handlers::types::GitAppState {
+        sensitive_action_authorizer: context
+            .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+        ..(*git_app_state).clone()
+    })
 }
 
 #[cfg(test)]

@@ -164,7 +164,7 @@ export function InsightsPanel({
               onClick={askAi}
             >
               <Sparkles className="size-4 shrink-0" />
-              <span className="hidden sm:inline">Ask AI</span>
+              <span className="max-sm:sr-only">Ask AI</span>
             </Button>
           )}
         </div>

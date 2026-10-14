@@ -86,6 +86,7 @@ temps-screenshots = { path = "../temps-screenshots" }
 temps-status-page = { path = "../temps-status-page" }
 temps-static-files = { path = "../temps-static-files" }
 temps-teams = { path = "../temps-teams" }
+temps-project-groups = { path = "../temps-project-groups" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-webhooks = { path = "../temps-webhooks" }
 temps-wireguard = { path = "../temps-wireguard" }
@@ -103,7 +104,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 dirs = { version = "7.0" }
 gethostname = "1.1"
 rand = { workspace = true }

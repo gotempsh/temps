@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { errorWithStatus } from '@/lib/http-error-status'
+
 /** Preserve the server's contextual Problem Details message in setup errors. */
 export function deliveryError(error: unknown): string {
   if (error instanceof Error) return error.message
@@ -18,7 +20,8 @@ export function requireDeliveryData<T>(response: {
   data?: T
   error?: unknown
 }): T {
-  if (response.error) throw new Error(deliveryError(response.error))
+  if (response.error)
+    throw errorWithStatus(deliveryError(response.error), response.error)
   if (response.data === undefined)
     throw new Error(
       'The server returned no result. Please refresh and try again.'

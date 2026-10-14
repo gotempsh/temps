@@ -8,6 +8,7 @@ pub mod definition_service;
 pub mod executor;
 pub mod prompt_builder;
 pub mod provider_credential_service;
+pub mod provider_login_service;
 pub mod run_service;
 pub mod sandbox_injector;
 pub mod sandbox_registry;

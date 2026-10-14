@@ -160,6 +160,11 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
         "IP access and geo controls do not yet have dedicated end-to-end coverage.",
     ),
     feature(
+        "project-groups",
+        Maturity::Experimental,
+        "Grouping services into projects is an experiment; naming and inheritance may change or be removed.",
+    ),
+    feature(
         "ai-chat",
         Maturity::Experimental,
         "The AI chat surface and interaction model are still being designed.",
@@ -240,6 +245,17 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/revenue") || path.contains("/revenue/") {
         return Some("revenue-tracking");
     }
+    if path.starts_with("/project-groups")
+        || path.ends_with("/group")
+        || path.ends_with("/inherited-env-vars")
+        || path.contains("/templates/")
+            && (path.ends_with("/instantiate") || path.contains("/instantiations"))
+        || path.starts_with("/instantiations")
+        || path.ends_with("/hosting")
+        || path.contains("/import") && path.contains("/project-groups")
+    {
+        return Some("project-groups");
+    }
     if path.contains("/service-template") || path.contains("/service-runtime") {
         return Some("service-template-catalog");
     }
@@ -276,7 +292,11 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/dashboards") {
         return Some("dashboards-metrics-explorer");
     }
-    if path.starts_with("/status-pages") || path.starts_with("/incidents") {
+    if path.starts_with("/status-pages")
+        || path.starts_with("/status/")
+        || path.contains("/status-pages")
+        || path.starts_with("/incidents")
+    {
         return Some("status-pages");
     }
     if path.starts_with("/screenshots") {
@@ -417,6 +437,19 @@ mod tests {
             Some("service-template-catalog")
         );
         assert_eq!(feature_key_for_api_path("/projects"), None);
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/status-pages"),
+            Some("status-pages")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/status/{slug}/summary.json"),
+            Some("status-pages")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/status"),
+            None,
+            "the authenticated project status overview keeps its own maturity"
+        );
     }
 
     #[test]

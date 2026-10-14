@@ -17,7 +17,7 @@ use super::types::GitAppState as AppState;
 /// (MUST-FIX 2 from the security review). Gitea webhook deliveries are
 /// typically a few KiB; the 512 KiB limit provides a large safety margin
 /// while preventing memory exhaustion from oversized payloads.
-pub fn configure_routes() -> Router<Arc<AppState>> {
+pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new().route(
         "/webhook/git/gitea/events",
         post(gitea_webhook_events).layer(DefaultBodyLimit::max(512 * 1024)),

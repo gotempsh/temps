@@ -1292,6 +1292,11 @@ impl TraefikDiscoveryService {
         if let Some(console_host) = app_settings.console_hostname() {
             reserved.add(&console_host);
         }
+        // ADR-051: a discovered container must not take the hostname Temps
+        // serves third-party callbacks on.
+        if let Some(ingress_host) = app_settings.public_ingress_hostname() {
+            reserved.add(&ingress_host);
+        }
 
         let preview_domain = app_settings.preview_domain.clone();
         for env in environments::Entity::find()

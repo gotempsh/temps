@@ -6,6 +6,7 @@ import {
   importEmailDomain as importEmailDomainSdk,
   listDiscoverableDomains as listDiscoverableDomainsSdk,
   listEmailProviders as listEmailProvidersSdk,
+  verifyDomain,
   type CreateEmailDomainRequest,
   type EmailDomainWithDnsResponse,
   type EmailProviderResponse,
@@ -51,7 +52,7 @@ import {
   Sparkles,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
@@ -673,7 +674,13 @@ export function EmailDomainNew() {
 
   // Step 2 field state — controlled inputs to avoid react-hook-form
   // complexity across step transitions in a wizard.
-  const [providerId, setProviderId] = useState<number | undefined>(undefined)
+  // `?provider=<id>` preselects the provider when the wizard is opened from a
+  // provider's detail page, so the user doesn't have to pick it again.
+  const [searchParams] = useSearchParams()
+  const [providerId, setProviderId] = useState<number | undefined>(() => {
+    const fromUrl = Number(searchParams.get('provider'))
+    return Number.isInteger(fromUrl) && fromUrl > 0 ? fromUrl : undefined
+  })
   const [domain, setDomain] = useState('')
   const [providerIdentityId, setProviderIdentityId] = useState('')
   const [step2Errors, setStep2Errors] = useState<Step2Errors>({})
@@ -683,8 +690,10 @@ export function EmailDomainNew() {
     queryKey: ['email-providers'],
     queryFn: listEmailProviders,
   })
-  const isSelectedProviderScaleway =
-    providers.find((p) => p.id === providerId)?.provider_type === 'scaleway'
+  const selectedProviderType = providers.find(
+    (p) => p.id === providerId
+  )?.provider_type
+  const isSelectedProviderScaleway = selectedProviderType === 'scaleway'
 
   // Discoverable-domains picker — only fetched in import mode, once a
   // provider is chosen. Always resolves (never throws) per the endpoint's
@@ -698,11 +707,36 @@ export function EmailDomainNew() {
     })
 
   const createMutation = useMutation({
-    mutationFn: createEmailDomain,
+    mutationFn: async (form: CreateDomainFormData) => {
+      const created = await createEmailDomain(form)
+      if (selectedProviderType !== 'smtp') return created
+      // Temps checks no DNS for SMTP domains (they are verified at the
+      // upstream provider), but the server stores every new domain as
+      // "pending", and sends from a pending domain are captured instead of
+      // delivered. Enable sending right away so there is no hidden step; if
+      // that fails the domain page offers "Enable sending" instead.
+      const verified = await verifyDomain({ path: { id: created.domain.id } })
+      return verified.data ?? created
+    },
     onSuccess: (data) => {
-      toast.success('Domain added', {
-        description: 'Configure the DNS records to finish verification.',
-      })
+      if (selectedProviderType === 'smtp') {
+        if (data.domain.status === 'verified') {
+          toast.success('Domain added', {
+            description: `Emails from ${data.domain.domain} will be delivered through your SMTP provider.`,
+          })
+        } else {
+          toast.warning('Domain added, but sending is paused', {
+            description: 'Enable sending on the domain page.',
+          })
+        }
+      } else {
+        toast.success('Domain added', {
+          description:
+            data.domain.status === 'verified'
+              ? 'Your domain is verified and ready to send email.'
+              : 'Configure the DNS records to finish verification.',
+        })
+      }
       queryClient.invalidateQueries({ queryKey: ['email-domains'] })
       queryClient.setQueryData(['email-domain', data.domain.id], data)
       navigate(`/email/domains/${data.domain.id}`)

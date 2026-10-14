@@ -19,9 +19,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Card,
   CardContent,
@@ -47,7 +47,6 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  AlertCircle,
   ChevronRight,
   Cloud,
   EllipsisVertical,
@@ -154,12 +153,10 @@ export function AuthSettingsPage() {
   }, [setBreadcrumbs])
 
   const providers = providersQuery.data ?? []
-  const error = providersQuery.error
-    ? problemMessage(
-        providersQuery.error,
-        'Failed to load authentication settings'
-      )
-    : null
+  // The "no providers" empty state is a statement about the installation, so
+  // it needs a read that succeeded. A refused or failed read knows nothing.
+  const providersUnknown =
+    providersQuery.isError && providersQuery.data === undefined
 
   const handleToggle = (provider: OidcProviderResponse, enabled: boolean) => {
     updateProvider.mutate({
@@ -193,15 +190,17 @@ export function AuthSettingsPage() {
         )}
       </div>
 
-      {error && (
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>Could not load settings</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
+      {providersQuery.isError && (
+        <ReadFailure
+          resource="SSO providers"
+          error={providersQuery.error}
+          cached={!providersUnknown}
+          onRetry={() => void providersQuery.refetch()}
+          retrying={providersQuery.isFetching}
+        />
       )}
 
-      {providersQuery.isLoading ? (
+      {providersUnknown ? null : providersQuery.isLoading ? (
         <div className="space-y-2">
           {[0, 1, 2].map((idx) => (
             <Skeleton key={idx} className="h-14 w-full rounded-md" />

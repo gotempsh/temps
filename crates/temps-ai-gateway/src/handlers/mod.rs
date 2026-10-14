@@ -4,6 +4,7 @@
 pub mod gateway;
 pub mod native;
 pub mod pricing;
+mod provider_audit;
 pub mod provider_status;
 pub mod providers;
 mod sse_usage;

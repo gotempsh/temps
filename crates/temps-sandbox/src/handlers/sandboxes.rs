@@ -113,6 +113,29 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Creation Failed")
                     .with_detail(error.to_string())
             }
+            SandboxError::ImageUnavailable {
+                ref sandbox_id,
+                ref image,
+                ref reason,
+            } => {
+                // The registry's own error text can carry hostnames and request
+                // detail, so it goes to the log; the response names the image.
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    image = %image,
+                    reason = %reason,
+                    "sandbox image could not be pulled"
+                );
+                let detail = format!(
+                    "Sandbox image '{image}' could not be pulled for sandbox {sandbox_id}. \
+                     Check that this host can reach the image registry and that the \
+                     tag is published; an administrator can pre-load it with `docker pull {image}`."
+                );
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/sandbox-image-unavailable")
+                    .with_title("Sandbox Image Unavailable")
+                    .with_detail(detail)
+            }
             SandboxError::ExecFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Exec Failed")
@@ -486,6 +509,10 @@ pub struct ResourcesBody {
 
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct CreateSandboxBody {
+    /// Permit installing/running Docker with normal guest-root privileges.
+    /// Requires backend="microsandbox". Does not install Docker or expose the host socket.
+    #[serde(default)]
+    pub allow_docker: bool,
     /// Docker image override. `null` uses the platform default.
     #[serde(default)]
     pub image: Option<String>,
@@ -607,6 +634,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             memory_limit_mb: b.memory_limit_mb.or(resources.memory),
             pids_limit: b.pids_limit,
             disk_size_mb: b.disk_size_mb,
+            allow_docker: b.allow_docker,
             source: b.source.map(SandboxSource::from),
             preview_password: b.preview_password,
             ports: b.ports,
@@ -648,6 +676,8 @@ pub struct SandboxRoute {
 /// the SDK's zod validator rejects missing required fields.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SandboxInner {
+    /// Normal guest-root semantics enabled for Docker (microsandbox only).
+    pub allow_docker: bool,
     pub id: String,
     pub memory: u64,
     pub vcpus: f64,
@@ -760,6 +790,7 @@ impl SandboxResponse {
                 name: s.name,
                 image: s.image,
                 backend: s.backend,
+                allow_docker: s.allow_docker,
                 disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
@@ -1006,6 +1037,87 @@ impl From<StatInfo> for StatResponse {
             is_dir: s.is_dir,
             is_file: s.is_file,
             size: s.size,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListDirQuery {
+    pub path: String,
+    /// 1-based page. Defaults to 1.
+    pub page: Option<usize>,
+    /// Entries per page. Defaults to 20, at most 100.
+    pub page_size: Option<usize>,
+}
+
+/// What a directory entry is. Symlinks are reported, never followed.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DirectoryEntry {
+    /// Name within the directory, without any path.
+    pub name: String,
+    pub kind: DirectoryEntryKind,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DirectoryListingResponse {
+    pub path: String,
+    /// `false` when the path does not exist (not an error).
+    pub exists: bool,
+    /// `false` when the path exists but is not a directory.
+    pub is_dir: bool,
+    /// Directories first, then everything else, each group in byte order of
+    /// the name. One page of the directory.
+    pub entries: Vec<DirectoryEntry>,
+    /// 1-based page these entries are.
+    pub page: usize,
+    /// Entries per page that was applied (default 20, at most 100).
+    pub page_size: usize,
+    /// Entries in the whole directory, so `ceil(total / page_size)` is the
+    /// number of pages. At most 10000: see `truncated`.
+    pub total: usize,
+    /// The directory has more entries than the listing reads (10000), so
+    /// `total` and the pages cover only the first 10000 names the filesystem
+    /// returned.
+    pub truncated: bool,
+    /// More entries exist after this page.
+    pub has_more: bool,
+}
+
+impl From<crate::services::fs::DirListing> for DirectoryListingResponse {
+    fn from(listing: crate::services::fs::DirListing) -> Self {
+        use crate::services::fs::DirEntryKind;
+        Self {
+            path: listing.path,
+            exists: listing.exists,
+            is_dir: listing.is_dir,
+            entries: listing
+                .entries
+                .into_iter()
+                .map(|entry| DirectoryEntry {
+                    name: entry.name,
+                    kind: match entry.kind {
+                        DirEntryKind::File => DirectoryEntryKind::File,
+                        DirEntryKind::Directory => DirectoryEntryKind::Directory,
+                        DirEntryKind::Symlink => DirectoryEntryKind::Symlink,
+                        DirEntryKind::Other => DirectoryEntryKind::Other,
+                    },
+                })
+                .collect(),
+            page: listing.page,
+            page_size: listing.page_size,
+            total: listing.total,
+            truncated: listing.truncated,
+            has_more: listing.has_more,
         }
     }
 }
@@ -2472,6 +2584,37 @@ pub async fn stat_path(
 
 #[utoipa::path(
     tag = "Sandboxes",
+    get,
+    path = "/v1/sandboxes/{id}/fs/list",
+    params(
+        ("path" = String, Query, description = "Absolute path of a directory inside the sandbox"),
+        ("page" = Option<usize>, Query, description = "1-based page (default 1)"),
+        ("page_size" = Option<usize>, Query, description = "Entries per page (default 20, max 100)")
+    ),
+    responses(
+        (status = 200, description = "One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)", body = DirectoryListingResponse),
+        (status = 400, description = "Validation error, or the directory is not readable by the sandbox user"),
+        (status = 404, description = "Sandbox not found"),
+        (status = 409, description = "Sandbox is not running (stopped or paused), so its filesystem cannot be listed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_dir(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ListDirQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::ProjectsRead)?;
+    let listing = state
+        .sandbox_service
+        .fs_list(&id, auth.user_id(), &q.path, q.page, q.page_size)
+        .await?;
+    Ok(Json(DirectoryListingResponse::from(listing)))
+}
+
+#[utoipa::path(
+    tag = "Sandboxes",
     post,
     path = "/v1/sandboxes/{id}/fs/mkdir",
     request_body = MkdirBody,
@@ -2815,6 +2958,7 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
             post(write_files).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/v1/sandboxes/{id}/fs/stat", get(stat_path))
+        .route("/v1/sandboxes/{id}/fs/list", get(list_dir))
         .route("/v1/sandboxes/{id}/fs/mkdir", post(mkdir))
         .route("/v1/sandboxes/{id}/domain", get(domain))
         .route(
@@ -2916,11 +3060,36 @@ mod tests {
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            (
+                SandboxError::ImageUnavailable {
+                    sandbox_id: "sbx_1".into(),
+                    image: "registry.example.test/team/img:1.0.0".into(),
+                    reason: "manifest unknown".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ];
         for (error, status) in cases {
             let label = error.to_string();
             assert_eq!(Problem::from(error).status_code, status, "{label}");
         }
+    }
+
+    #[test]
+    fn image_unavailable_problem_names_the_image_and_remediation_without_the_registry_error() {
+        let problem = Problem::from(SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_1".into(),
+            image: "registry.example.test/team/img:1.0.0".into(),
+            reason: "manifest unknown".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.body["title"], "Sandbox Image Unavailable");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("registry.example.test/team/img:1.0.0"));
+        assert!(detail.contains("sbx_1"));
+        assert!(detail.contains("docker pull"));
+        // The registry's own text stays in the server log, not the response.
+        assert!(!detail.contains("manifest unknown"));
     }
 
     #[test]
@@ -3041,6 +3210,7 @@ mod tests {
     fn sandbox_response_converts_summary() {
         let now = Utc::now();
         let summary = SandboxSummary {
+            allow_docker: false,
             public_id: "sbx_abc".into(),
             node_id: None,
             node_name: "control-plane".into(),
@@ -3073,6 +3243,7 @@ mod tests {
 
         let now = Utc::now();
         let summary = SandboxSummary {
+            allow_docker: false,
             public_id: "sbx_abcd1234ef567890".into(),
             node_id: None,
             node_name: "control-plane".into(),
@@ -3105,6 +3276,15 @@ mod tests {
             "https://ws-abcd1234ef567890-3000.localho.st"
         );
         assert_eq!(r.routes[1].port, 5173);
+    }
+
+    #[test]
+    fn allow_docker_defaults_off_and_round_trips() {
+        let body: CreateSandboxBody = serde_json::from_str("{}").unwrap();
+        assert!(!CreateSandboxRequest::from(body).allow_docker);
+        let body: CreateSandboxBody =
+            serde_json::from_str(r#"{"backend":"microsandbox","allow_docker":true}"#).unwrap();
+        assert!(CreateSandboxRequest::from(body).allow_docker);
     }
 
     #[test]
@@ -3183,6 +3363,51 @@ mod tests {
     #[test]
     fn stat_query_rejects_unknown_field() {
         assert_rejects_unknown::<StatQuery>(r#"{"path":"/a","extra":"b"}"#);
+    }
+
+    #[test]
+    fn list_dir_query_rejects_unknown_field() {
+        assert_rejects_unknown::<ListDirQuery>(r#"{"path":"/a","extra":"b"}"#);
+    }
+
+    #[test]
+    fn list_dir_query_accepts_paging() {
+        let query: ListDirQuery =
+            serde_json::from_str(r#"{"path":"/a","page":3,"page_size":50}"#).expect("parses");
+        assert_eq!((query.page, query.page_size), (Some(3), Some(50)));
+    }
+
+    #[test]
+    fn list_dir_response_uses_snake_case_kinds_and_keeps_order() {
+        use crate::services::fs::{DirEntry, DirEntryKind, DirListing};
+        let response = DirectoryListingResponse::from(DirListing {
+            path: "/work".into(),
+            exists: true,
+            is_dir: true,
+            entries: vec![
+                DirEntry {
+                    name: "src".into(),
+                    kind: DirEntryKind::Directory,
+                },
+                DirEntry {
+                    name: "link".into(),
+                    kind: DirEntryKind::Symlink,
+                },
+            ],
+            page: 2,
+            page_size: 20,
+            total: 45,
+            truncated: false,
+            has_more: true,
+        });
+        let json = serde_json::to_value(&response).expect("serializes");
+        assert_eq!(json["entries"][0]["kind"], "directory");
+        assert_eq!(json["entries"][1]["kind"], "symlink");
+        assert_eq!(json["page"], 2);
+        assert_eq!(json["page_size"], 20);
+        assert_eq!(json["total"], 45);
+        assert_eq!(json["truncated"], false);
+        assert_eq!(json["has_more"], true);
     }
 
     #[test]

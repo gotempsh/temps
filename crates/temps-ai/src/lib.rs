@@ -32,6 +32,7 @@ pub mod typed;
 
 pub use preflight::{
     HarnessCheck, HarnessCheckMode, HarnessCheckOverall, HarnessCheckReport, HarnessCheckStatus,
+    HarnessUpdateStatus,
 };
 pub use provider::{
     ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,

@@ -29,7 +29,7 @@ async-stream = "0.3"
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }
 chrono = { workspace = true }
@@ -60,9 +60,11 @@ tempfile = { workspace = true }
 # and its runtime binary + libkrunfw ABI move in lockstep with the crate.
 # Default features are off: `download-binaries` fetches the runtime from the
 # network inside build.rs, `cloud` / `keyring` are unused. Not linked on musl
-# (the Alpine container image): the SDK's VMM crate does not compile there,
-# and the backend reports itself unavailable with that reason instead.
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-microsandbox = { version = "=0.7.7", default-features = false, features = ["local", "net"] }
+# (the Alpine container image) or on Intel macOS: the SDK's VMM crate does not
+# compile there, and the backend reports itself unavailable with that reason
+# instead. The same predicate gates every use of the SDK in this crate and in
+# `temps-cli`'s `microsandbox` command — keep them in step.
+[target.'cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
+microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
 
 [dev-dependencies]

@@ -52,7 +52,7 @@ describe('describeDockerSocket', () => {
 
   test('an ungranted project with no reason still says something actionable', () => {
     expect(describeDockerSocket(capability({ reason: null })).detail).toBe(
-      'No host grants this project access to the Docker socket.'
+      'No host grants this service access to the Docker socket.'
     )
   })
 

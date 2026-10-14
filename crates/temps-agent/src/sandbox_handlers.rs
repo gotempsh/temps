@@ -251,8 +251,9 @@ async fn require_handle(
 
 /// Map a provider error to the status the control plane's client reads:
 /// 404 = the container is gone, 400 = bad request, 422 = not available on a
-/// worker node, 503 = this node can't serve sandboxes right now, 500 = the
-/// operation itself failed.
+/// worker node, 503 = this node can't serve sandboxes right now, 504 = the
+/// guest did not answer a terminal attach in time, 500 = the operation itself
+/// failed.
 fn provider_err(e: AgentError) -> ApiError {
     let status = match &e {
         AgentError::SandboxNotFound { .. } => StatusCode::NOT_FOUND,
@@ -261,6 +262,7 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         AgentError::SandboxConflictOnNode { .. } => StatusCode::CONFLICT,
+        AgentError::SandboxTerminalTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         AgentError::SandboxProviderUnavailable { .. }
         | AgentError::SandboxNodeUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         AgentError::SandboxCreationFailed { .. }
@@ -613,6 +615,7 @@ pub async fn create_sandbox(
         memory_limit_mb: req.memory_limit_mb,
         pids_limit: req.pids_limit,
         disk_size_mb: req.disk_size_mb,
+        allow_docker: false,
         network_mode: req.network_mode,
         env_vars: req.env_vars,
         idle_timeout: Duration::from_secs(req.idle_timeout_secs),

@@ -54,6 +54,44 @@ pub enum ProxyLogServiceError {
     ClickHouse { operation: String, reason: String },
 }
 
+/// Postgres SQLSTATE for `deadlock_detected`.
+const SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
+/// Postgres SQLSTATE for `serialization_failure`.
+const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
+
+impl ProxyLogServiceError {
+    /// `true` when Postgres rolled the statement back because of a lock or
+    /// serialization conflict (`40P01` deadlock detected, `40001`
+    /// serialization failure) and re-running the identical statement is the
+    /// documented remedy. Both leave no partial rows behind, so retrying
+    /// cannot duplicate entries. Every other error -- connection loss,
+    /// constraint violations, a ClickHouse failure -- is not retried: it will
+    /// not change on a second attempt, or a second attempt could duplicate
+    /// rows.
+    pub fn is_transient_write_conflict(&self) -> bool {
+        use sea_orm::{DbErr, RuntimeErr};
+
+        let error = match self {
+            ProxyLogServiceError::DatabaseError(
+                DbErr::Exec(RuntimeErr::SqlxError(error))
+                | DbErr::Query(RuntimeErr::SqlxError(error)),
+            ) => error,
+            ProxyLogServiceError::DatabaseError(_)
+            | ProxyLogServiceError::InvalidFilter(_)
+            | ProxyLogServiceError::TrafficAggregationRateLimited { .. }
+            | ProxyLogServiceError::TrafficAggregationTimeout { .. }
+            | ProxyLogServiceError::TrafficAggregationTooManyGroups { .. }
+            | ProxyLogServiceError::ClickHouse { .. } => return false,
+        };
+        error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .is_some_and(|code| {
+                code == SQLSTATE_DEADLOCK_DETECTED || code == SQLSTATE_SERIALIZATION_FAILURE
+            })
+    }
+}
+
 /// Response model for proxy logs
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProxyLogResponse {
@@ -3026,9 +3064,120 @@ impl ProjectHealthSummary {
     }
 }
 
+/// Test double for a Postgres error carrying a given SQLSTATE, shared with the
+/// batch writer's retry tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ProxyLogServiceError;
+    use sea_orm::sqlx::error::{DatabaseError, ErrorKind};
+    use sea_orm::{DbErr, RuntimeErr};
+    use std::borrow::Cow;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct FakePgError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl fmt::Display for FakePgError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{} ({})", self.message, self.code)
+        }
+    }
+
+    impl std::error::Error for FakePgError {}
+
+    impl DatabaseError for FakePgError {
+        fn message(&self) -> &str {
+            self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
+
+    fn sqlx_error(code: &'static str, message: &'static str) -> RuntimeErr {
+        RuntimeErr::SqlxError(sea_orm::sqlx::Error::Database(Box::new(FakePgError {
+            code,
+            message,
+        })))
+    }
+
+    /// A statement-level Postgres failure with the given SQLSTATE, shaped the
+    /// way sea-orm surfaces it from `execute`.
+    pub(crate) fn pg_exec_error(code: &'static str, message: &'static str) -> ProxyLogServiceError {
+        ProxyLogServiceError::DatabaseError(DbErr::Exec(sqlx_error(code, message)))
+    }
+
+    /// Same failure shaped the way sea-orm surfaces it from `query_*`.
+    pub(crate) fn pg_query_error(
+        code: &'static str,
+        message: &'static str,
+    ) -> ProxyLogServiceError {
+        ProxyLogServiceError::DatabaseError(DbErr::Query(sqlx_error(code, message)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{pg_exec_error, pg_query_error};
     use super::*;
+
+    #[test]
+    fn deadlock_detected_is_a_transient_write_conflict() {
+        assert!(pg_exec_error("40P01", "deadlock detected").is_transient_write_conflict());
+    }
+
+    #[test]
+    fn serialization_failure_is_a_transient_write_conflict() {
+        assert!(pg_exec_error("40001", "could not serialize access").is_transient_write_conflict());
+    }
+
+    #[test]
+    fn query_path_deadlock_is_a_transient_write_conflict() {
+        assert!(pg_query_error("40P01", "deadlock detected").is_transient_write_conflict());
+    }
+
+    #[test]
+    fn other_database_errors_are_not_transient_write_conflicts() {
+        // foreign_key_violation, unique_violation, admin_shutdown,
+        // undefined_table: retrying cannot change the outcome.
+        for code in ["23503", "23505", "57P01", "42P01"] {
+            assert!(
+                !pg_exec_error(code, "other failure").is_transient_write_conflict(),
+                "SQLSTATE {code} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn non_database_errors_are_not_transient_write_conflicts() {
+        assert!(
+            !ProxyLogServiceError::DatabaseError(sea_orm::DbErr::Custom("boom".into()))
+                .is_transient_write_conflict()
+        );
+        assert!(!ProxyLogServiceError::ClickHouse {
+            operation: "write_batch (end)".to_string(),
+            reason: "40P01 deadlock detected".to_string(),
+        }
+        .is_transient_write_conflict());
+        assert!(
+            !ProxyLogServiceError::InvalidFilter("40P01".to_string()).is_transient_write_conflict()
+        );
+    }
 
     #[test]
     fn status_class_range_includes_1xx() {

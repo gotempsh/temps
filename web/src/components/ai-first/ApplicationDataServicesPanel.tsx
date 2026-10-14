@@ -96,15 +96,15 @@ export function ApplicationDataServicesPanel({ application }: Props) {
         <div className="space-y-1">
           <h2 className="text-base font-semibold tracking-tight">Databases</h2>
           <p className="text-sm text-muted-foreground">
-            Databases are linked through an application project.
+            Databases are linked through an application service.
           </p>
         </div>
         <div className="flex items-start gap-2 rounded-lg border border-dashed border-border p-3">
           <Database className="size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0">
-            <p className="text-sm font-medium">Add a project first</p>
+            <p className="text-sm font-medium">Add a service first</p>
             <p className="text-xs text-muted-foreground">
-              Create a workspace project or link an existing one above, then its
+              Create a workspace service or link an existing one above, then its
               databases can join the private sandbox network.
             </p>
           </div>
@@ -135,7 +135,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
         path: { id, project_id: projectId },
       })
       await linkedQuery.refetch()
-      toast.success('Database unlinked from the project and sandbox')
+      toast.success('Database unlinked from the service and sandbox')
     } catch (cause) {
       toast.error(errorMessage(cause, 'Could not unlink the database.'))
     }
@@ -153,7 +153,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
           )}
         </div>
         <p className="text-sm text-muted-foreground">
-          Linked data services provide project runtime variables and join this
+          Linked databases provide service runtime variables and join this
           workspace&apos;s private sandbox network.
         </p>
       </div>
@@ -164,7 +164,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
             Manage databases for
           </p>
           <RichProjectPicker
-            ariaLabel="Project whose databases to manage"
+            ariaLabel="Service whose databases to manage"
             disabled={busy}
             onValueChange={(nextProjectId) => {
               setRequestedProjectId(nextProjectId)
@@ -177,7 +177,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
       )}
 
       {servicesQuery.isPending || linkedQuery.isPending ? (
-        <div className="space-y-2" aria-label="Loading databases">
+        <div role="status" className="space-y-2" aria-label="Loading databases">
           {Array.from({ length: 2 }).map((_, index) => (
             <div
               className="h-14 animate-pulse rounded-lg bg-muted"
@@ -188,7 +188,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
       ) : servicesQuery.isError || linkedQuery.isError ? (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3">
           <p className="text-sm text-destructive">
-            Could not load databases for this project.
+            Could not load databases for this service.
           </p>
           <Button
             className="mt-2"
@@ -267,7 +267,7 @@ export function ApplicationDataServicesPanel({ application }: Props) {
                   <p className="text-sm font-medium">No databases linked</p>
                   <p className="text-xs text-muted-foreground">
                     Link one below to make it available to{' '}
-                    {selectedProject?.name ?? 'this project'}.
+                    {selectedProject?.name ?? 'this service'}.
                   </p>
                 </div>
               </div>

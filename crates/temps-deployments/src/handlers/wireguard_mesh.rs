@@ -436,6 +436,7 @@ pub(crate) mod admin_test_support {
             tls_address: None,
             console_address: "127.0.0.1:0".to_string(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

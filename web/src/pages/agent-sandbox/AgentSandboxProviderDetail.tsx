@@ -57,7 +57,7 @@ export function AgentSandboxProviderDetail() {
 
   if (isPending) {
     return (
-      <div className="space-y-4" aria-label="Loading harness">
+      <div role="status" className="space-y-4" aria-label="Loading harness">
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-48 w-full" />
       </div>

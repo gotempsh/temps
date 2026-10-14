@@ -11,7 +11,9 @@ use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
 use crate::providers::openai_responses::{self, ReasoningContextCache, ResponsesStreamTranslator};
-use crate::providers::{external_http_client, AiProvider, ProviderCapability, ProviderInfo};
+use crate::providers::{
+    with_bearer, AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo,
+};
 use crate::types::{
     ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest, EmbeddingResponse, ModelInfo,
 };
@@ -25,13 +27,13 @@ const MAX_RESPONSES_SSE_EVENT_BYTES: usize = 1024 * 1024;
 pub struct OpenAiCompatProvider {
     info: ProviderInfo,
     models: Vec<ModelInfo>,
-    client: reqwest::Client,
+    client: ProviderHttpClient,
     reasoning_cache: ReasoningContextCache,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(info: ProviderInfo, models: Vec<ModelInfo>) -> Self {
-        let client = external_http_client(Duration::from_secs(300));
+        let client = ProviderHttpClient::new(Duration::from_secs(300));
 
         Self {
             info,
@@ -76,10 +78,7 @@ impl OpenAiCompatProvider {
         let body =
             openai_responses::build_request(&req, &self.reasoning_cache, &cache_namespace, false)
                 .await?;
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
+        let response = with_bearer(self.client.post(&url), api_key)
             .json(&body)
             .send()
             .await?;
@@ -121,10 +120,7 @@ impl OpenAiCompatProvider {
         let body =
             openai_responses::build_request(&req, &self.reasoning_cache, &cache_namespace, true)
                 .await?;
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
+        let response = with_bearer(self.client.post(&url), api_key)
             .json(&body)
             .send()
             .await?;
@@ -323,6 +319,29 @@ impl OpenAiCompatProvider {
     }
 }
 
+impl OpenAiCompatProvider {
+    /// A self-hosted OpenAI-compatible server (MLX, vLLM, llama.cpp,
+    /// LM Studio, Ollama's OpenAI API). There is no default endpoint -- the
+    /// key's base URL is required -- and no static model list: models come
+    /// only from the server's own `/models` listing.
+    pub fn openai_compatible() -> Self {
+        Self::new(
+            ProviderInfo {
+                id: crate::self_hosted::OPENAI_COMPATIBLE,
+                display_name: "Self-hosted (OpenAI-compatible)",
+                default_base_url: "",
+                capabilities: &[
+                    ProviderCapability::ChatCompletion,
+                    ProviderCapability::ChatCompletionStreaming,
+                    ProviderCapability::Embeddings,
+                    ProviderCapability::ToolUse,
+                ],
+            },
+            Vec::new(),
+        )
+    }
+}
+
 fn model(id: &str, owned_by: &str) -> ModelInfo {
     ModelInfo {
         id: id.to_string(),
@@ -338,6 +357,11 @@ impl AiProvider for OpenAiCompatProvider {
     }
 
     fn supports_model(&self, model: &str) -> bool {
+        // A self-hosted server serves whatever it lists; routing to it is
+        // decided by the configured catalog, never by the name.
+        if crate::self_hosted::is_self_hosted(self.info.id) {
+            return !model.is_empty();
+        }
         let model_lower = model.to_lowercase();
         self.models
             .iter()
@@ -371,10 +395,7 @@ impl AiProvider for OpenAiCompatProvider {
             sanitize_openai_request(&mut req);
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
+        let response = with_bearer(self.client.post(&url), api_key)
             .json(&req)
             .send()
             .await?;
@@ -431,10 +452,7 @@ impl AiProvider for OpenAiCompatProvider {
             .entry("stream_options")
             .or_insert_with(|| serde_json::json!({"include_usage": true}));
 
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
+        let response = with_bearer(self.client.post(&url), api_key)
             .json(&req)
             .send()
             .await?;
@@ -484,10 +502,7 @@ impl AiProvider for OpenAiCompatProvider {
 
         let url = format!("{}/embeddings", self.resolve_base_url(base_url));
 
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
+        let response = with_bearer(self.client.post(&url), api_key)
             .json(request)
             .send()
             .await?;
@@ -674,6 +689,17 @@ mod tests {
         let provider = OpenAiCompatProvider::xai();
         assert!(provider.supports_model("grok-3"));
         assert!(!provider.supports_model("gpt-4o"));
+    }
+
+    #[test]
+    fn self_hosted_provider_accepts_arbitrary_model_ids_and_has_no_defaults() {
+        let provider = OpenAiCompatProvider::openai_compatible();
+        assert_eq!(provider.info().id, "openai_compatible");
+        assert_eq!(provider.info().default_base_url, "");
+        assert!(provider.available_models().is_empty());
+        assert!(provider.supports_model("mlx-community/Some-Model-4bit"));
+        assert!(provider.supports_model("llama3.2:3b"));
+        assert!(!provider.supports_model(""));
     }
 
     #[test]

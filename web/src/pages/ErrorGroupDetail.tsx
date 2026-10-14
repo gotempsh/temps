@@ -179,7 +179,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const assistantContext = errorGroup
     ? [
         'The user is viewing an error group (error tracking) in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
         `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
         `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
         'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
@@ -191,9 +191,9 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     switch (level?.toLowerCase()) {
       case 'error':
       case 'fatal':
-        return 'text-red-600 bg-red-100 dark:bg-red-900/20'
+        return 'text-red-700 dark:text-red-600 bg-red-100 dark:bg-red-900/20'
       case 'warning':
-        return 'text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
+        return 'text-yellow-700 dark:text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
       case 'info':
         return 'text-blue-600 bg-blue-100 dark:bg-blue-900/20'
       default:

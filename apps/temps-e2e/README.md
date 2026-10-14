@@ -785,7 +785,10 @@ confirmed live that a deleted session's direct-by-ID playback now 404s.
 3. trigger a real backup (`POST /backups/external-services/{id}/run`) --
    202 + async job, per ADR-014 -- and poll `GET /backups/{backup_id}` to a
    real `completed` state (a real `wal-g backup-push`, a real S3 upload --
-   the postgres backup engine is WAL-G, not pg_dump)
+   the postgres backup engine is WAL-G, not pg_dump). The first WAL-G backup
+   restarts a service whose archiving is off, so the request sends
+   `confirm_restart: true`; without it the server answers `409
+   RESTART_CONFIRMATION_REQUIRED` and starts nothing
 4. write 2 MORE rows (count now 7) -- data the backup does NOT contain
 5. start an in-place restore from the backup taken at step 3
    (`POST /external-services/{id}/restore`) and poll

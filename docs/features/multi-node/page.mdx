@@ -657,26 +657,39 @@ file-type limits as a local build, and serves it from its own proxy like any
 other static deployment. Static output does not depend on CPU architecture, so
 any eligible worker can build it, including on a mixed-architecture cluster.
 
+When the nodes a deployment may run on span **more than one architecture**
+(for example arm64 and amd64 workers), it builds one image per architecture,
+each natively on a worker of that architecture, in parallel — see
+[Worker builds on a mixed cluster](#mixed-architecture-worker-builds).
+
 Current limits of worker builds:
 
-- **One target architecture per container image.** If the nodes a deployment
-  may run on span more than one architecture, it fails before any source is
-  uploaded and asks you to restrict target nodes or labels to one
-  architecture, or to deploy a prebuilt multi-platform registry image.
-- **No build secrets.** Generated package-registry credentials
-  (`NPM_TOKEN`/`.npmrc`) and environment values passed as build arguments are
-  not sent to workers. A build that needs them fails with a message naming
-  what was withheld.
-- **No build-time variables.** Project variables are set when the container
-  runs, not while a worker builds it. A generated Dockerfile is rendered
-  without them, so an ordinary Vite or Next.js app builds on a worker. If the
-  app sets a variable its framework inlines into the bundle (`VITE_*`,
-  `NEXT_PUBLIC_*`, `PUBLIC_*`, `REACT_APP_*`, `GATSBY_*`, `NUXT_PUBLIC_*`,
-  `EXPO_PUBLIC_*`), the build stays on the control plane when it can, and
-  otherwise fails before building with the variable names and the
-  alternatives. Autopack builds on the worker and warns instead. Your own
-  Dockerfile may declare an `ARG` that no project variable sets (for example
-  `ARG NODE_VERSION=22`); an `ARG` that one would set is refused by name.
+- **Secrets stay on the control plane.** A worker build receives the values
+  of variables that are not secret: your project variables that are not marked
+  secret, and the platform's public ones (the bind address, the browser
+  Sentry DSN and tunnel, the API and telemetry endpoints). They travel to the
+  node inside the build request, over the same authenticated agent channel as
+  the source, and are applied as `docker build --build-arg` values, so a
+  `VITE_*`, `NEXT_PUBLIC_*` or `PUBLIC_*` variable is inlined into the bundle
+  exactly as on a local build. Variables marked secret, linked-service
+  credentials, the deployment token and generated package-registry
+  credentials (`NPM_TOKEN`/`.npmrc`) are never sent:
+  - A generated Dockerfile builds without them and the build log names what
+    was withheld. If one of them is a variable the framework inlines into the
+    bundle (for example a secret `VITE_*`), the log warns that it will be
+    empty; with build location *Worker node* on a server that can build
+    locally, that build stays on the control plane instead.
+  - Your own Dockerfile may declare any `ARG`. One that would read a withheld
+    value is refused by name before anything is uploaded, rather than built
+    without it. Read the value when the container runs, recreate it as a
+    non-secret variable if it is not sensitive, or build on the control plane.
+  - A build that needs `NPM_TOKEN`/`.npmrc` fails with a message naming what
+    was withheld.
+- **Upgrade agents with the control plane.** Build-argument values use
+  version 2 of the worker build protocol. A build with no value to send still
+  uses version 1, so an older agent keeps building those; one that receives a
+  version 2 request refuses it and the deployment asks you to upgrade Temps on
+  that worker.
 
 Build caches stay separate per project on a shared worker: like the control
 plane, a worker scopes `RUN --mount=type=cache` mounts by project, environment
@@ -749,6 +762,43 @@ excluded from the deployment — the rest of the cluster still deploys normally.
 If emulated build times don't suit you, the alternatives are to restrict the
 environment to nodes of a single architecture with target nodes or labels, or
 to push a pre-built image.
+
+### Worker builds on a mixed cluster {{ anchor: true, id: 'mixed-architecture-worker-builds' }}
+
+With `--profile control-plane`, a deployment whose eligible nodes span several
+architectures needs no setting and no emulation. Temps builds each
+architecture on a worker of that architecture — a `temps.sh/role=builder`
+node when there is one, otherwise a worker the deployment could run on — and
+all of them in parallel. The first architecture keeps the plain tag; the
+others are suffixed, as above. A cluster whose workers share one architecture
+builds once, exactly as before.
+
+- **Logs.** Every line of each build is prefixed with its platform
+  (`[linux/arm64] ...`) in the deployment's build log, followed by which
+  worker built which image.
+- **All or nothing.** If one architecture fails, the builds still running are
+  stopped and the deployment fails with that architecture's error. It is never
+  rolled out on only some of its architectures.
+- **Placement.** Each replica lands on a node whose architecture has an image,
+  and receives that image from the worker that built it, over the same
+  authenticated agent channel as any other worker-built image. Rollbacks and
+  promotions reuse the same per-architecture images; a replica that moves to a
+  node of another architecture runs that architecture's image, and a deploy
+  that would need an architecture it never built fails instead of running the
+  wrong one.
+- **Caches.** Each architecture gets its own `RUN --mount=type=cache`
+  namespace, so native artifacts (`node_modules`, `target/`) built for one
+  architecture are never reused by another.
+- **No worker for an architecture.** Before anything is built, each chosen
+  worker is checked over its agent connection (10-second limit). Candidates
+  are tried in order: every `temps.sh/role=builder` node of that
+  architecture, lowest id first, then the workers the deployment could run
+  on. An unreachable worker, or one whose agent reports another
+  architecture, is replaced by the next candidate; if none is left, the
+  deployment fails naming the architecture, for example
+  `Deployment 42 targets linux/amd64 nodes, but no linux/amd64 worker can
+  build its image`. Bring such a worker online, or restrict target nodes or
+  labels to the architectures that have one.
 
 ### Replica counts on a mixed cluster
 

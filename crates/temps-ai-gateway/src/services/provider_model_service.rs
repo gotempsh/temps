@@ -123,6 +123,18 @@ impl ProviderModelService {
             .gateway
             .discover_models_for_key(provider_key_id)
             .await?;
+        self.apply_discovered(provider_key_id, discovered).await
+    }
+
+    /// Replace a key's discovered catalog with `discovered`: listed models
+    /// become available (new ones enabled), previously discovered models the
+    /// listing no longer contains become unavailable, and manual rows and
+    /// the administrator's enable/disable choices are kept.
+    pub async fn apply_discovered(
+        &self,
+        provider_key_id: i32,
+        discovered: Vec<crate::types::ModelInfo>,
+    ) -> Result<Vec<ai_provider_models::Model>, AiGatewayError> {
         let existing = self.list_for_key(provider_key_id).await?;
         let manual_ids: HashSet<&str> = existing
             .iter()
@@ -379,6 +391,10 @@ mod tests {
             base_url: None,
             default_model: None,
             is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
             created_at: now,
             updated_at: now,
         }

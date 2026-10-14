@@ -36,7 +36,7 @@ use super::types::GitAppState as AppState;
 ///
 /// This prevents any caller from learning whether a given token is registered
 /// in Temps. The token-bearing request path is NEVER logged.
-pub fn configure_routes() -> Router<Arc<AppState>> {
+pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new().route(
         "/webhook/git/generic/events/{delivery_token}",
         post(generic_webhook_events).layer(DefaultBodyLimit::max(512 * 1024)),
@@ -380,6 +380,7 @@ mod tests {
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             cross_project_trace_sharing: true,
@@ -393,6 +394,7 @@ mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             enable_preview_environments: false,
             preview_envs_on_demand: false,

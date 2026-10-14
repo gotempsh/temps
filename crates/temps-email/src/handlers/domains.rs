@@ -66,6 +66,10 @@ impl From<EmailError> for Problem {
                 .with_title("Idempotency Key Conflict")
                 .with_detail(error.to_string()),
 
+            EmailError::NotResendable { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Email Not Resendable")
+                .with_detail(error.to_string()),
+
             EmailError::Validation(_) | EmailError::InvalidProviderType(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Validation Error")
@@ -123,6 +127,9 @@ impl From<EmailError> for Problem {
             | EmailError::Smtp(_)
             | EmailError::Serialization(_)
             | EmailError::TrackingRewrite { .. }
+            | EmailError::ResendInterrupted { .. }
+            | EmailError::DeliveryOutcomeNotRecorded { .. }
+            | EmailError::DeliveryRejectionNotRecorded { .. }
             | EmailError::SendFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")

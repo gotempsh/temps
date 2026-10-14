@@ -69,6 +69,24 @@ describe('buildPlatformSettingsUpdateBody', () => {
   // Same `#[serde(default)]` trap: `container_logs` carries both the Docker
   // rotation options and the collected-log cache/head budgets (ADR-046), and
   // none of them survived an unrelated save before it was round-tripped.
+  // `null` is the explicit "keep this data" choice. Dropping the block would
+  // make serde restore the defaults, turning a configured "keep visitors
+  // forever" into a 30-day IP cleanup on the next unrelated save.
+  test('round-trips analytics retention including the keep (null) windows', () => {
+    const analyticsRetention = {
+      events_days: 365,
+      error_events_days: null,
+      visitor_days: 425,
+      unreferenced_ip_days: null,
+    }
+
+    const body = buildPlatformSettingsUpdateBody({
+      analytics_retention: analyticsRetention,
+    } as PlatformSettings)
+
+    expect(body.analytics_retention).toEqual(analyticsRetention)
+  })
+
   test('round-trips container log rotation and budgets', () => {
     const containerLogs = {
       max_size: '100m',

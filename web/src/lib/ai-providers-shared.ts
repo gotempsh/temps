@@ -10,7 +10,15 @@
 // backend's provider enum (lowercase, no spaces).
 
 export type AiProviderId =
-  'openai' | 'anthropic' | 'xai' | 'gemini' | 'openrouter'
+  'openai' | 'anthropic' | 'xai' | 'gemini' | 'openrouter' | 'openai_compatible'
+
+/** Provider id of a self-hosted OpenAI-compatible server (MLX, vLLM, ...). */
+export const SELF_HOSTED_PROVIDER_ID: AiProviderId = 'openai_compatible'
+
+/** Whether a provider id is the self-hosted OpenAI-compatible type. */
+export function isSelfHostedProvider(id: string | null | undefined): boolean {
+  return id === SELF_HOSTED_PROVIDER_ID
+}
 
 export interface AiProviderMeta {
   id: AiProviderId
@@ -29,7 +37,10 @@ export interface AiProviderMeta {
   accentClass: string
   /** Short tagline for cards that show the provider without models. */
   tagline: string
-  /** Public docs URL for "Where do I find my key?" links. */
+  /**
+   * Public docs URL for "Where do I find my key?" links. Empty when there is
+   * no vendor console to link to (a self-hosted server).
+   */
   keyDocsUrl: string
 }
 
@@ -79,6 +90,17 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
     defaultModel: 'openai/gpt-4o-mini',
     accentClass: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
     keyDocsUrl: 'https://openrouter.ai/keys',
+  },
+  {
+    id: 'openai_compatible',
+    name: 'Self-hosted (OpenAI-compatible)',
+    tagline: 'MLX, vLLM, llama.cpp, LM Studio or Ollama on your own network',
+    models: 'Whatever models your server lists at /v1/models',
+    // Placeholder for code snippets; a configured key's own default model
+    // is used instead when there is one.
+    defaultModel: 'your-model-id',
+    accentClass: 'bg-slate-500/10 text-slate-700 dark:text-slate-300',
+    keyDocsUrl: '',
   },
 ]
 

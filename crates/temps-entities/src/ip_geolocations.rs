@@ -27,7 +27,16 @@ pub struct Model {
     pub asn_org: Option<String>,
     pub is_hosting_provider: Option<bool>,
     pub created_at: DBDateTime,
+    /// When the geolocation was last verified against the GeoIP database.
     pub updated_at: DBDateTime,
+    /// When a writer last resolved this row's id for use as a reference.
+    ///
+    /// Distinct from `updated_at`, which only advances once per
+    /// `geo.stale_lookup_days`. Retention deletes an address only once this is
+    /// older than its window, so an id a writer is about to store (or holds in
+    /// its cache) is never one the cleanup is entitled to remove. `NULL` on
+    /// rows written before the column existed: read as `updated_at`.
+    pub last_used_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -934,7 +934,12 @@ impl MariaDbService {
             .await?;
 
         if let Some(existing) = containers.first() {
-            let existing_image = existing.image.as_deref().unwrap_or("");
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| existing.image.clone())
+                .unwrap_or_default();
             if existing_image == config.docker_image {
                 info!(
                     "Container {} already exists with same image",
@@ -947,24 +952,46 @@ impl MariaDbService {
                 "Container {} already exists with different image (current: {}, requested: {}), recreating it",
                 container_name, existing_image, config.docker_image
             );
-            let _ = docker
-                .stop_container(&container_name, None::<StopContainerOptions>)
-                .await;
-            docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        v: false,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to remove existing MariaDB container: {}", e)
-                })?;
+            super::recreate_guard::recreate_preserving_data(
+                super::recreate_guard::RecreateRequest {
+                    docker,
+                    engine: super::recreate_guard::ManagedEngine::MariaDb,
+                    service_name: &self.name,
+                    container_name: &container_name,
+                    replacement: self.replacement_storage(),
+                    operation: "changing its image",
+                },
+                || self.create_fresh_container(docker, config, resource_limits),
+            )
+            .await?;
+            return Ok(());
         }
 
+        self.create_fresh_container(docker, config, resource_limits)
+            .await
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/var/lib/mysql".to_string(),
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: format!("mariadb_data_{}", self.name),
+                target: "/var/lib/mysql".to_string(),
+            }],
+        }
+    }
+
+    /// Create, start and wait for a new container. The caller has made sure
+    /// no container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &MariaDbConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
         self.warn_if_host_capacity_tight(docker, config, resource_limits)
             .await;
 
@@ -3744,6 +3771,19 @@ pub(crate) fn mariadb_volume_names(name: &str) -> [String; 1] {
 
 #[async_trait]
 impl ExternalService for MariaDbService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::MariaDb,
+            self.replacement_storage(),
+        ))
+    }
+
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
             containers: vec![mariadb_container_name(&self.name)],

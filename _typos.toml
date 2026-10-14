@@ -38,11 +38,18 @@ oif = "oif"
 Oif = "Oif"
 # Expected last four characters of "properly" in a masking regression test.
 erly = "erly"
+# First chunk of "hello" split across two writes in the microsandbox
+# stream-capture line-splitting test (crates/temps-agents/src/sandbox/microsandbox/sdk.rs).
+hel = "hel"
 # The "mis-" prefix in hyphenated words like "mis-routes"/"mis-routing"
 # (ADR-041's ledger docs) and "mis-attribute"/"mis-attributed" (ADR-040 docs
 # and ingest-key handlers). typos tokenizes on the hyphen and mistakes the
 # fragment "mis" for "miss"/"mist".
 mis = "mis"
+# "café" written as `caf\u{e9}` in the AI gateway SSE split-UTF-8 test
+# (crates/temps-ai-gateway/src/handlers/gateway.rs); typos reads the "caf"
+# before the escape as a misspelling of "calf".
+caf = "caf"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

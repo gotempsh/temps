@@ -44,6 +44,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
@@ -64,6 +65,7 @@ import {
   WithCode,
 } from '@/components/nodes/mesh-ui'
 import { problemDetail } from '@/lib/api-problem'
+import { httpStatusOf } from '@/lib/http-error-status'
 import {
   defaultInternetMethod,
   defaultJoinPath,
@@ -93,17 +95,21 @@ const WITHOUT_SYSTEMD = (
 export function useWireguardMesh() {
   return useQuery({
     ...wireguardMeshStatusGetOptions(),
-    refetchInterval: (query) =>
-      query.state.data?.state === 'starting' ? 5_000 : 30_000,
+    refetchInterval: (query) => {
+      // A refused read (a role without settings:read) is not asked again.
+      const status = httpStatusOf(query.state.error)
+      if (status === 401 || status === 403) return false
+      return query.state.data?.state === 'starting' ? 5_000 : 30_000
+    },
   })
 }
 
 function CommandLine({ command }: { command: string }) {
   return (
     <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-      <span className="flex-1 overflow-x-auto whitespace-nowrap">
+      <ScrollRegion className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
         {command}
-      </span>
+      </ScrollRegion>
       <CopyButton minimal className="h-6 w-6 shrink-0" value={command} />
     </div>
   )

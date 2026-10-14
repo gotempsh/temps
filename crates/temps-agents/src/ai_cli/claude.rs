@@ -5,39 +5,33 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 
+use super::host_cli::{self, HostIdentity, ProviderLocation};
+use super::login::{
+    scan_line_for_link, validate_pasted_code, LinkScan, LoginChallenge, LoginControl, LoginError,
+    LoginHandle, CHALLENGE_TIMEOUT, CLAUDE_LOGIN_HOSTS, MAX_SCANNED_OUTPUT_BYTES,
+};
 use super::{
-    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
-    AiRunConfig, AiRunResult, NativeToolEvent,
+    copy_environment_variable, AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult,
+    NativeToolEvent,
 };
 use crate::error::AgentError;
-use crate::sandbox::user::SANDBOX_USER;
 
 const MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Check if a Unix user exists by name.
-fn user_exists(name: &str) -> bool {
-    std::process::Command::new("id")
-        .arg("-u")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 pub struct ClaudeCliProvider;
 
-fn cancellation_safe_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    sanitize_command_environment(&mut command);
+/// The `claude` command every host-side invocation starts from: status,
+/// discovery and turns all share one OS user and one credential location
+/// (see [`host_cli`]), so "signed in" and "can run" cannot disagree.
+fn claude_command() -> Command {
+    let location = host_cli::active_managed_location("claude_cli");
+    let mut command = host_cli::host_command("claude", &HostIdentity::resolve(), location.as_ref());
     copy_environment_variable(&mut command, "ANTHROPIC_API_KEY");
-    command.kill_on_drop(true);
     command
 }
 
 fn model_discovery_command() -> Command {
-    let mut command = cancellation_safe_command("claude");
+    let mut command = claude_command();
     command.args([
         "--print",
         "--output-format",
@@ -308,6 +302,405 @@ fn apply_permission_args(cmd: &mut Command, permission_mode: Option<&str>) {
     cmd.arg("--permission-mode").arg(cli_mode);
 }
 
+/// Probe installation and sign-in state with commands built by `make_command`.
+async fn probe_status(make_command: impl Fn() -> Command) -> AiCliStatus {
+    let version_output = make_command()
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    let (installed, version) = match version_output {
+        Ok(output) if output.status.success() => {
+            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (true, if ver.is_empty() { None } else { Some(ver) })
+        }
+        _ => {
+            return AiCliStatus {
+                provider: "claude_cli".into(),
+                installed: false,
+                version: None,
+                authenticated: false,
+                auth_method: None,
+                email: None,
+                subscription_type: None,
+                setup_hint: Some(
+                    "Install Claude CLI: npm install -g @anthropic-ai/claude-code".into(),
+                ),
+            };
+        }
+    };
+
+    let auth_output = make_command()
+        .args(["auth", "status"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    const SIGN_IN_HINT: &str = "Use \"Sign in with Claude\" in Settings > AI Agents, paste a token from `claude setup-token`, or set ANTHROPIC_API_KEY.";
+    let (authenticated, auth_method, email, subscription_type, setup_hint) = match auth_output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match serde_json::from_str::<serde_json::Value>(&stdout) {
+                Ok(json)
+                    if json
+                        .get("loggedIn")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false) =>
+                {
+                    (
+                        true,
+                        json.get("authMethod")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        json.get("email").and_then(|v| v.as_str()).map(String::from),
+                        json.get("subscriptionType")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        None,
+                    )
+                }
+                _ => (false, None, None, None, Some(SIGN_IN_HINT.into())),
+            }
+        }
+        _ => (false, None, None, None, Some(SIGN_IN_HINT.into())),
+    };
+
+    AiCliStatus {
+        provider: "claude_cli".into(),
+        installed,
+        version,
+        authenticated,
+        auth_method,
+        email,
+        subscription_type,
+        setup_hint,
+    }
+}
+
+/// Ask the CLI that owns `location` to use (and therefore refresh) its own
+/// credential with one minimal request. The result is read from the
+/// credential file afterwards; nothing the CLI prints is kept.
+pub async fn refresh_managed_login(
+    location: &ProviderLocation,
+    timeout: std::time::Duration,
+) -> Result<(), LoginError> {
+    let identity = HostIdentity::resolve();
+    let mut command = host_cli::host_command("claude", &identity, Some(location));
+    command
+        .args([
+            "--print",
+            "ok",
+            "--output-format",
+            "json",
+            "--max-turns",
+            "1",
+            "--tools",
+            "",
+        ])
+        .current_dir(&location.home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|error| LoginError::Spawn {
+        provider_id: "claude_cli".to_string(),
+        reason: error.to_string(),
+    })?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(LoginError::CliRejected {
+            provider_id: "claude_cli".to_string(),
+            exit_code: status.code().unwrap_or(-1),
+        }),
+        Ok(Err(error)) => Err(LoginError::Io {
+            provider_id: "claude_cli".to_string(),
+            operation: "waiting for the credential refresh".to_string(),
+            reason: error.to_string(),
+        }),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(LoginError::Timeout {
+                provider_id: "claude_cli".to_string(),
+                timeout_secs: timeout.as_secs(),
+            })
+        }
+    }
+}
+
+/// How to launch the sign-in. `program` is injectable so tests can stand in a
+/// script for the real CLI.
+pub struct ClaudeLoginOptions {
+    pub program: std::ffi::OsString,
+    pub identity: HostIdentity,
+    pub location: ProviderLocation,
+    pub challenge_timeout: std::time::Duration,
+}
+
+/// Kills a whole process group when dropped unless disarmed. `runuser`
+/// forks, so killing only the process we spawned would orphan the CLI.
+struct ProcessGroupKill {
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupKill {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pgid: pid.and_then(|pid| i32::try_from(pid).ok()),
+        }
+    }
+
+    fn kill(&self) {
+        if let Some(pgid) = self.pgid {
+            // SAFETY: kill(2) with a negative pid signals a process group;
+            // an already-exited group simply yields ESRCH, which is ignored.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// The child was reaped; its pid may be reused, so never signal it again.
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcessGroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+struct ClaudeLoginControl {
+    provider_id: String,
+    stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    cancel: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl LoginControl for ClaudeLoginControl {
+    async fn submit_code(&self, code: &str) -> Result<(), LoginError> {
+        use tokio::io::AsyncWriteExt;
+
+        let code = validate_pasted_code(code)?;
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or_else(|| LoginError::Io {
+            provider_id: self.provider_id.clone(),
+            operation: "submitting the code".to_string(),
+            reason: "the CLI is no longer accepting input".to_string(),
+        })?;
+        let io_error = |error: std::io::Error| LoginError::Io {
+            provider_id: self.provider_id.clone(),
+            operation: "submitting the code".to_string(),
+            reason: error.to_string(),
+        };
+        stdin.write_all(code.as_bytes()).await.map_err(io_error)?;
+        stdin.write_all(b"\n").await.map_err(io_error)?;
+        stdin.flush().await.map_err(io_error)?;
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        self.cancel.notify_one();
+    }
+}
+
+/// Start `claude auth login --claudeai` and return once it has offered a link.
+///
+/// The CLI is given `BROWSER=echo` so it never tries to open a browser on the
+/// server; the link is scraped from stdout and checked against
+/// [`CLAUDE_LOGIN_HOSTS`]. The pasted code goes to stdin. Output is scanned
+/// for the link and otherwise discarded: it is never logged or stored.
+pub async fn begin_claude_login(options: ClaudeLoginOptions) -> Result<LoginHandle, LoginError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    const PROVIDER_ID: &str = "claude_cli";
+    let io_error = |operation: &str, reason: String| LoginError::Io {
+        provider_id: PROVIDER_ID.to_string(),
+        operation: operation.to_string(),
+        reason,
+    };
+
+    let ClaudeLoginOptions {
+        program,
+        identity,
+        location,
+        challenge_timeout,
+    } = options;
+
+    host_cli::prepare_login_location(PROVIDER_ID, &identity, &location).await?;
+
+    let mut command = host_cli::host_command(&program, &identity, Some(&location));
+    // `echo` stands in for a browser: the CLI "opens" the link by printing it.
+    command
+        .args(["auth", "login", "--claudeai"])
+        .env("BROWSER", "echo")
+        .current_dir(&location.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LoginError::NotInstalled {
+                provider_id: PROVIDER_ID.to_string(),
+            }
+        } else {
+            LoginError::Spawn {
+                provider_id: PROVIDER_ID.to_string(),
+                reason: error.to_string(),
+            }
+        }
+    })?;
+    let mut group = ProcessGroupKill::new(child.id());
+
+    let stdin = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io_error("capturing CLI output", "stdout was not piped".to_string()))?;
+    let stderr = child.stderr.take();
+
+    let (link_tx, link_rx) = tokio::sync::oneshot::channel::<Result<String, LoginError>>();
+    tokio::spawn(async move {
+        let mut link_tx = Some(link_tx);
+        let mut reader = BufReader::new(stdout.take(MAX_SCANNED_OUTPUT_BYTES as u64));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if link_tx.is_none() {
+                continue;
+            }
+            let found = match scan_line_for_link(PROVIDER_ID, &line, CLAUDE_LOGIN_HOSTS) {
+                LinkScan::Accepted(url) => Some(Ok(url)),
+                LinkScan::Rejected { host } => Some(Err(LoginError::DisallowedHost {
+                    provider_id: PROVIDER_ID.to_string(),
+                    host,
+                })),
+                LinkScan::Nothing => None,
+            };
+            if let Some(result) = found {
+                if let Some(tx) = link_tx.take() {
+                    let _ = tx.send(result);
+                }
+            }
+        }
+        // Keep the pipe drained so the CLI never blocks on a full buffer.
+        let mut rest = reader.into_inner().into_inner();
+        let _ = tokio::io::copy(&mut rest, &mut tokio::io::sink()).await;
+    });
+    if let Some(mut stderr) = stderr {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        });
+    }
+
+    let challenge = tokio::select! {
+        link = tokio::time::timeout(challenge_timeout, link_rx) => match link {
+            Ok(Ok(Ok(url))) => url,
+            Ok(Ok(Err(error))) => {
+                group.kill();
+                let _ = child.wait().await;
+                group.disarm();
+                return Err(error);
+            }
+            Ok(Err(_closed)) => {
+                // Output ended without a link; the exit status says why.
+                let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                group.kill();
+                group.disarm();
+                return Err(match status {
+                    Ok(Ok(status)) if matches!(status.code(), Some(126 | 127)) => {
+                        LoginError::NotInstalled { provider_id: PROVIDER_ID.to_string() }
+                    }
+                    Ok(Ok(status)) if !status.success() => LoginError::CliRejected {
+                        provider_id: PROVIDER_ID.to_string(),
+                        exit_code: status.code().unwrap_or(-1),
+                    },
+                    _ => LoginError::NoChallenge {
+                        provider_id: PROVIDER_ID.to_string(),
+                        waited_secs: challenge_timeout.as_secs(),
+                    },
+                });
+            }
+            Err(_elapsed) => {
+                group.kill();
+                let _ = child.wait().await;
+                group.disarm();
+                return Err(LoginError::NoChallenge {
+                    provider_id: PROVIDER_ID.to_string(),
+                    waited_secs: challenge_timeout.as_secs(),
+                });
+            }
+        },
+        status = child.wait() => {
+            group.disarm();
+            return Err(match status {
+                Ok(status) if matches!(status.code(), Some(126 | 127)) => LoginError::NotInstalled {
+                    provider_id: PROVIDER_ID.to_string(),
+                },
+                Ok(status) => LoginError::CliRejected {
+                    provider_id: PROVIDER_ID.to_string(),
+                    exit_code: status.code().unwrap_or(-1),
+                },
+                Err(error) => io_error("waiting for the CLI", error.to_string()),
+            });
+        }
+    };
+
+    let control = std::sync::Arc::new(ClaudeLoginControl {
+        provider_id: PROVIDER_ID.to_string(),
+        stdin: tokio::sync::Mutex::new(stdin),
+        cancel: tokio::sync::Notify::new(),
+    });
+    let waiter = control.clone();
+    let completion = Box::pin(async move {
+        let result = tokio::select! {
+            status = child.wait() => {
+                group.disarm();
+                match status {
+                    Ok(status) if status.success() => Ok(()),
+                    Ok(status) => Err(LoginError::CliRejected {
+                        provider_id: PROVIDER_ID.to_string(),
+                        exit_code: status.code().unwrap_or(-1),
+                    }),
+                    Err(error) => Err(LoginError::Io {
+                        provider_id: PROVIDER_ID.to_string(),
+                        operation: "waiting for the CLI".to_string(),
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+            _ = waiter.cancel.notified() => {
+                group.kill();
+                let _ = child.wait().await;
+                group.disarm();
+                Err(LoginError::Cancelled { provider_id: PROVIDER_ID.to_string() })
+            }
+        };
+        // Closing stdin tells a still-running reader there is no more input.
+        waiter.stdin.lock().await.take();
+        result
+    });
+
+    Ok(LoginHandle {
+        challenge: LoginChallenge {
+            verification_url: challenge,
+            user_code: None,
+            requires_code: true,
+        },
+        control,
+        completion,
+    })
+}
+
 #[async_trait]
 impl AiCliProvider for ClaudeCliProvider {
     fn name(&self) -> &str {
@@ -315,7 +708,7 @@ impl AiCliProvider for ClaudeCliProvider {
     }
 
     async fn check_installed(&self) -> bool {
-        cancellation_safe_command("claude")
+        claude_command()
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -326,82 +719,47 @@ impl AiCliProvider for ClaudeCliProvider {
     }
 
     async fn get_status(&self) -> AiCliStatus {
-        // Check if installed
-        let version_output = cancellation_safe_command("claude")
-            .arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+        probe_status(claude_command).await
+    }
 
-        let (installed, version) = match version_output {
-            Ok(output) if output.status.success() => {
-                let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                (true, if ver.is_empty() { None } else { Some(ver) })
-            }
-            _ => {
-                return AiCliStatus {
-                    provider: "claude_cli".into(),
-                    installed: false,
-                    version: None,
-                    authenticated: false,
-                    auth_method: None,
-                    email: None,
-                    subscription_type: None,
-                    setup_hint: Some(
-                        "Install Claude CLI: npm install -g @anthropic-ai/claude-code".into(),
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    async fn begin_login(&self, config_dir: &std::path::Path) -> Result<LoginHandle, LoginError> {
+        let location =
+            ProviderLocation::from_config_dir("claude_cli", config_dir).ok_or_else(|| {
+                LoginError::Io {
+                    provider_id: "claude_cli".to_string(),
+                    operation: "resolving the sign-in directory".to_string(),
+                    reason: format!(
+                        "{} is not a Claude config directory (expected a directory named .claude)",
+                        config_dir.display()
                     ),
-                };
-            }
-        };
-
-        // Check auth status
-        let auth_output = cancellation_safe_command("claude")
-            .args(["auth", "status"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
-
-        let (authenticated, auth_method, email, subscription_type, setup_hint) = match auth_output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if logged_in {
-                        (
-                            true,
-                            json.get("authMethod").and_then(|v| v.as_str()).map(String::from),
-                            json.get("email").and_then(|v| v.as_str()).map(String::from),
-                            json.get("subscriptionType").and_then(|v| v.as_str()).map(String::from),
-                            None,
-                        )
-                    } else {
-                        (false, None, None, None, Some(
-                            "Run 'claude setup-token' on the server to authenticate, or set ANTHROPIC_API_KEY. Configure in Settings > AI Agents.".into(),
-                        ))
-                    }
-                } else {
-                    (false, None, None, None, Some(
-                        "Run 'claude setup-token' on the server to authenticate.".into(),
-                    ))
                 }
-            }
-            _ => (false, None, None, None, Some(
-                "Run 'claude setup-token' on the server to authenticate, or set ANTHROPIC_API_KEY. Configure in Settings > AI Agents.".into(),
-            )),
-        };
+            })?;
+        begin_claude_login(ClaudeLoginOptions {
+            program: std::ffi::OsString::from("claude"),
+            identity: HostIdentity::resolve(),
+            location,
+            challenge_timeout: CHALLENGE_TIMEOUT,
+        })
+        .await
+    }
 
-        AiCliStatus {
-            provider: "claude_cli".into(),
-            installed,
-            version,
-            authenticated,
-            auth_method,
-            email,
-            subscription_type,
-            setup_hint,
-        }
+    async fn verify_login(&self, config_dir: &std::path::Path) -> Result<AiCliStatus, LoginError> {
+        let location =
+            ProviderLocation::from_config_dir("claude_cli", config_dir).ok_or_else(|| {
+                LoginError::Io {
+                    provider_id: "claude_cli".to_string(),
+                    operation: "resolving the sign-in directory".to_string(),
+                    reason: format!("{} is not a Claude config directory", config_dir.display()),
+                }
+            })?;
+        let identity = HostIdentity::resolve();
+        // No ANTHROPIC_API_KEY here: an ambient API key would make the CLI
+        // report "logged in" and confirm a sign-in that never happened.
+        Ok(probe_status(|| host_cli::host_command("claude", &identity, Some(&location))).await)
     }
 
     async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
@@ -427,31 +785,10 @@ impl AiCliProvider for ClaudeCliProvider {
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let is_root = unsafe { libc::geteuid() } == 0;
-
-        // Build the claude argv exactly the same in both branches. Each
-        // arg goes through Command::arg, so no shell ever parses
-        // user-controlled prompts/model/api_key data — values stay in
-        // their own argv slot and are passed straight to execve().
-        //
-        // When running as root, Claude CLI refuses
-        // --dangerously-skip-permissions. We drop privileges via
-        // `runuser -u <user> -- claude <args...>`. `runuser` is the
-        // recommended replacement for `su -c`: it preserves separate
-        // argv slots, has no shell-string parameter, and is available
-        // on every Linux distro temps targets (util-linux).
-        let mut cmd = if is_root {
-            let run_user = if user_exists(SANDBOX_USER) {
-                SANDBOX_USER
-            } else {
-                "nobody"
-            };
-            let mut c = cancellation_safe_command("runuser");
-            c.arg("-u").arg(run_user).arg("--").arg("claude");
-            c
-        } else {
-            cancellation_safe_command("claude")
-        };
+        // Same user, HOME and credential location as `get_status`; see
+        // `claude_command`. Arguments stay in their own argv slots, so user
+        // prompts never touch a shell.
+        let mut cmd = claude_command();
         cmd.arg("--print")
             .arg(&config.prompt)
             .arg("--output-format")
@@ -593,22 +930,10 @@ impl AiCliProvider for ClaudeCliProvider {
     async fn continue_conversation(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let is_root = unsafe { libc::geteuid() } == 0;
-
-        // Same shell-free pattern as `run`: argv slots all the way down,
-        // never a single `su -c '<string>'` that re-parses user data.
-        let mut cmd = if is_root {
-            let run_user = if user_exists(SANDBOX_USER) {
-                SANDBOX_USER
-            } else {
-                "nobody"
-            };
-            let mut c = cancellation_safe_command("runuser");
-            c.arg("-u").arg(run_user).arg("--").arg("claude");
-            c
-        } else {
-            cancellation_safe_command("claude")
-        };
+        // Same user, HOME and credential location as `get_status`; see
+        // `claude_command`. Arguments stay in their own argv slots, so user
+        // prompts never touch a shell.
+        let mut cmd = claude_command();
         cmd.arg("--print")
             .arg("--continue")
             .arg(&config.prompt)
@@ -761,22 +1086,10 @@ impl ClaudeCliProvider {
         use temps_ai::streaming::PermissionRequest;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let is_root = unsafe { libc::geteuid() } == 0;
-
-        // Build the command using the same shell-free pattern as `run` — argv
-        // slots all the way to execve(), user prompt never touches a shell.
-        let mut cmd = if is_root {
-            let run_user = if user_exists(SANDBOX_USER) {
-                SANDBOX_USER
-            } else {
-                "nobody"
-            };
-            let mut c = cancellation_safe_command("runuser");
-            c.arg("-u").arg(run_user).arg("--").arg("claude");
-            c
-        } else {
-            cancellation_safe_command("claude")
-        };
+        // Same user, HOME and credential location as `get_status`; see
+        // `claude_command`. Arguments stay in their own argv slots, so user
+        // prompts never touch a shell.
+        let mut cmd = claude_command();
 
         // Interactive protocol flags.
         // IMPORTANT: no --dangerously-skip-permissions and no --permission-mode
@@ -1552,7 +1865,7 @@ mod tests {
     }
 
     fn thinking_args(level: &str) -> Vec<String> {
-        let mut command = cancellation_safe_command("claude");
+        let mut command = Command::new("claude");
         apply_thinking_args(&mut command, Some(level));
         command
             .as_std()
@@ -1588,7 +1901,7 @@ mod tests {
             ("plan", "plan"),
             ("full-access", "bypassPermissions"),
         ] {
-            let mut command = cancellation_safe_command("claude");
+            let mut command = Command::new("claude");
             apply_permission_args(&mut command, Some(mode));
             let args = command
                 .as_std()
@@ -1619,7 +1932,7 @@ mod tests {
                 authorization_token: "ephemeral-test-token".to_string(),
             }),
         };
-        let mut command = cancellation_safe_command("claude");
+        let mut command = Command::new("claude");
         configure_chat_mcp(&mut command, &config)
             .await
             .expect("write MCP config");
@@ -1670,7 +1983,7 @@ mod tests {
                 authorization_token: "ephemeral-test-token".to_string(),
             }),
         };
-        let mut command = cancellation_safe_command("claude");
+        let mut command = Command::new("claude");
         configure_chat_mcp(&mut command, &config)
             .await
             .expect("write MCP config");
@@ -1702,7 +2015,7 @@ mod tests {
             resume_session_id: None,
             mcp_server: None,
         };
-        let mut command = cancellation_safe_command("claude");
+        let mut command = Command::new("claude");
         configure_chat_mcp(&mut command, &config)
             .await
             .expect("configure tool restrictions");
@@ -1739,7 +2052,7 @@ mod tests {
             resume_session_id: None,
             mcp_server: None,
         };
-        let mut command = cancellation_safe_command("claude");
+        let mut command = Command::new("claude");
         configure_chat_mcp(&mut command, &config)
             .await
             .expect("configure tool restrictions");

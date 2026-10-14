@@ -378,6 +378,283 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
+async fn test_source_built_service_release_migration_relaxes_identity_constraint(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping source-built service release migration test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping source-built service release migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261013_000003_allow_source_built_service_release";
+    let migrations = Migrator::migrations();
+    assert!(
+        migrations
+            .iter()
+            .any(|migration| migration.name() == target),
+        "migration {target} not found in Migrator"
+    );
+    Migrator::up(&db, None).await?;
+
+    let insert = |slug: &str, project_type: &str, release: &str, template_slug: &str| {
+        format!(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, \
+              slug, project_type, service_template, template_slug) \
+             VALUES ('{slug}', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                     '{slug}', '{project_type}', {release}, {template_slug})"
+        )
+    };
+
+    // A source-built service of an app keeps its lifecycle and its release,
+    // with the template it came from.
+    for (slug, project_type) in [("built-server", "server"), ("built-static", "static")] {
+        db.execute_unprepared(&insert(slug, project_type, "'{}'::jsonb", "'infra-app'"))
+            .await?;
+    }
+    // Image-only services are unchanged.
+    db.execute_unprepared(&insert(
+        "image-service",
+        "service",
+        "'{}'::jsonb",
+        "'infra-app'",
+    ))
+    .await?;
+    // Plain projects need no provenance.
+    db.execute_unprepared(&insert("plain-server", "server", "NULL", "NULL"))
+        .await?;
+
+    // A release without provenance is still not a regular project's to carry.
+    for (case, template_slug) in [("null", "NULL"), ("blank", "'   '")] {
+        for project_type in ["server", "static"] {
+            let slug = format!("orphan-{project_type}-{case}");
+            assert!(
+                db.execute_unprepared(&insert(&slug, project_type, "'{}'::jsonb", template_slug))
+                    .await
+                    .is_err(),
+                "a {project_type} project with a release and a {case} template slug must be rejected"
+            );
+        }
+    }
+    // The service lifecycle keeps its stricter rule.
+    assert!(
+        db.execute_unprepared(&insert(
+            "service-no-release",
+            "service",
+            "NULL",
+            "'infra-app'"
+        ))
+        .await
+        .is_err(),
+        "a service project must persist its exact template release"
+    );
+    assert!(
+        db.execute_unprepared(&insert("service-no-slug", "service", "'{}'::jsonb", "NULL"))
+            .await
+            .is_err(),
+        "a service project must name its template"
+    );
+    // The type vocabulary is closed.
+    assert!(
+        db.execute_unprepared(&insert("bogus-type", "worker", "NULL", "NULL"))
+            .await
+            .is_err(),
+        "an unknown project type must be rejected"
+    );
+
+    // Down restores the original rule and clears the snapshots it forbids,
+    // keeping the services themselves and their provenance. Everything
+    // registered after the target is reverted with it.
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT slug, service_template IS NOT NULL AS has_release, template_slug \
+             FROM projects WHERE slug IN ('built-server', 'built-static', 'image-service') \
+             ORDER BY slug"
+                .to_string(),
+        ))
+        .await?;
+    let state = rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String>("", "slug")?,
+                row.try_get::<bool>("", "has_release")?,
+                row.try_get::<Option<String>>("", "template_slug")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    assert_eq!(
+        state,
+        vec![
+            (
+                "built-server".to_string(),
+                false,
+                Some("infra-app".to_string())
+            ),
+            (
+                "built-static".to_string(),
+                false,
+                Some("infra-app".to_string())
+            ),
+            (
+                "image-service".to_string(),
+                true,
+                Some("infra-app".to_string())
+            ),
+        ]
+    );
+    assert!(
+        db.execute_unprepared(&insert(
+            "late-built",
+            "server",
+            "'{}'::jsonb",
+            "'infra-app'"
+        ))
+        .await
+        .is_err(),
+        "after down, a server project cannot carry a release again"
+    );
+
+    // And it can be applied again on the reverted schema.
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared(&insert("rebuilt", "server", "'{}'::jsonb", "'infra-app'"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_instantiation_claim_token_migration_is_nullable_and_reversible() -> anyhow::Result<()>
+{
+    if external_db_configured() {
+        println!("Skipping claim token migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping claim token migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261014_000001_add_instantiation_claim_token";
+    let steps = steps_back_to(target);
+
+    // Apply everything before the target and store a row, as an upgrade
+    // from a database that predates the column would have.
+    Migrator::up(&db, Some(Migrator::migrations().len() as u32 - steps)).await?;
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, created_at, updated_at) \
+             VALUES ('Claim token user', 'claim-token@example.test', now(), now()) \
+             RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted user row");
+    let user_id: i32 = user.try_get("", "id")?;
+    db.execute_unprepared(&format!(
+        "INSERT INTO template_instantiations (user_id, idempotency_key, kind, name, plan) \
+         VALUES ({user_id}, 'before', 'template', 'Before', '{{}}'::jsonb)"
+    ))
+    .await?;
+
+    let claim_token_column = || {
+        db.query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_name = 'template_instantiations' AND column_name = 'claim_token'"
+                .to_string(),
+        ))
+    };
+    assert!(claim_token_column().await?.is_empty());
+
+    Migrator::up(&db, Some(1)).await?;
+    let columns = claim_token_column().await?;
+    assert_eq!(columns.len(), 1, "the column must exist after up");
+    assert_eq!(columns[0].try_get::<String>("", "is_nullable")?, "YES");
+    // The row stored before the column exists carries no token.
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT claim_token FROM template_instantiations WHERE idempotency_key = 'before'"
+                .to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].try_get::<Option<String>>("", "claim_token")?, None);
+
+    Migrator::down(&db, Some(steps)).await?;
+    assert!(
+        claim_token_column().await?.is_empty(),
+        "the column must be gone after down"
+    );
+    // The stored row survives the round trip.
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM template_instantiations WHERE idempotency_key = 'before'".to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 1);
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(claim_token_column().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");
@@ -5574,6 +5851,894 @@ async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Resul
         .expect("old schema must enqueue reconciliation");
     assert!(state.try_get::<Option<i64>>("", "watermark")?.is_none());
     assert!(!state.try_get::<bool>("", "completed")?);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Macro: standard container spin-up so tests don't repeat 15 lines each
+// ---------------------------------------------------------------------------
+macro_rules! start_pg_container {
+    ($test_name:expr) => {{
+        if external_db_configured() {
+            println!("Skipping {}: external database configured", $test_name);
+            return Ok(());
+        }
+        match GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(vec![
+                "postgres",
+                "-c",
+                "timescaledb.max_background_workers=0",
+            ])
+            .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Skipping {}: Docker unavailable: {error}", $test_name);
+                return Ok(());
+            }
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// m20260928_000001 — project_groups + project_group_members
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_groups_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_groups_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260928_000001_create_project_groups";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    // Apply everything before the target.
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!table_exists_in_db(&db, "project_groups").await?);
+    assert!(!table_exists_in_db(&db, "project_group_members").await?);
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_groups").await?);
+    assert!(table_exists_in_db(&db, "project_group_members").await?);
+
+    // Insert a group and a membership row to exercise the FK.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) \
+         VALUES ('pg-test-service', '', '', '.', 'main', 'nodejs', now(), now(), 'pg-test-svc')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO project_groups (name, slug) VALUES ('My Project', 'my-project')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO project_group_members (project_id, group_id) \
+         SELECT p.id, g.id FROM projects p, project_groups g \
+         WHERE p.slug = 'pg-test-svc' AND g.slug = 'my-project'",
+    )
+    .await?;
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "project_groups").await?);
+    assert!(!table_exists_in_db(&db, "project_group_members").await?);
+
+    // Up again — idempotent.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_groups").await?);
+    assert!(table_exists_in_db(&db, "project_group_members").await?);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// m20260928_000002 — project_group_env_vars
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_group_env_vars_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_group_env_vars_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260928_000002_create_project_group_env_vars";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!table_exists_in_db(&db, "project_group_env_vars").await?);
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_group_env_vars").await?);
+
+    // The include_in_preview column must default to FALSE.
+    let default_val: String = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'project_group_env_vars' \
+               AND column_name = 'include_in_preview'"
+                .to_string(),
+        ))
+        .await?
+        .expect("include_in_preview column exists")
+        .try_get("", "column_default")?;
+    assert_eq!(
+        default_val, "false",
+        "include_in_preview must default to false to prevent secret leakage into previews"
+    );
+
+    // Insert a group and a group var; verify include_in_preview defaults to false.
+    db.execute_unprepared(
+        "INSERT INTO project_groups (name, slug) VALUES ('Env Test', 'env-test-group')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO project_group_env_vars (group_id, key, value) \
+         SELECT id, 'API_URL', 'encrypted_val' FROM project_groups \
+         WHERE slug = 'env-test-group'",
+    )
+    .await?;
+    let in_preview: bool = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT include_in_preview FROM project_group_env_vars WHERE key = 'API_URL'"
+                .to_string(),
+        ))
+        .await?
+        .expect("env var row exists")
+        .try_get("", "include_in_preview")?;
+    assert!(
+        !in_preview,
+        "group env vars must default include_in_preview=false"
+    );
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "project_group_env_vars").await?);
+
+    // Up again.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_group_env_vars").await?);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// m20260928_000003 — project_groups repository columns + inherits_repository
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_group_repository_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_group_repository_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260928_000003_add_project_group_repository";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!column_exists(&db, "project_groups", "repo_owner").await?);
+    assert!(!column_exists(&db, "project_group_members", "inherits_repository").await?);
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "project_groups", "repo_owner").await?);
+    assert!(column_exists(&db, "project_groups", "repo_name").await?);
+    assert!(column_exists(&db, "project_groups", "main_branch").await?);
+    assert!(column_exists(&db, "project_groups", "public_provider").await?);
+    assert!(column_exists(&db, "project_group_members", "inherits_repository").await?);
+
+    // A group with partial repo columns must be rejected (all-or-nothing
+    // is enforced by ck_project_groups_repository).
+    let partial = db
+        .execute_unprepared(
+            "INSERT INTO project_groups (name, slug, repo_owner) \
+             VALUES ('Bad', 'bad-repo', 'owner-only')",
+        )
+        .await;
+    assert!(
+        partial.is_err(),
+        "partial repository columns must be rejected"
+    );
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "project_groups", "repo_owner").await?);
+    assert!(!column_exists(&db, "project_group_members", "inherits_repository").await?);
+
+    // Up again.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "project_groups", "repo_owner").await?);
+    assert!(column_exists(&db, "project_group_members", "inherits_repository").await?);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// m20260928_000004 — project_group_routes + triggers
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_group_routes_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_group_routes_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260928_000004_create_project_group_routes";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!table_exists_in_db(&db, "project_group_routes").await?);
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_group_routes").await?);
+
+    // Insert two services and a group.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) VALUES \
+         ('frontend', '', '', '.', 'main', 'nodejs', now(), now(), 'routes-frontend'), \
+         ('backend',  '', '', '.', 'main', 'nodejs', now(), now(), 'routes-backend')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO project_groups (name, slug) VALUES ('Routes Project', 'routes-project')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO project_group_members (project_id, group_id) \
+         SELECT p.id, g.id FROM projects p, project_groups g \
+         WHERE p.slug IN ('routes-frontend','routes-backend') \
+           AND g.slug = 'routes-project'",
+    )
+    .await?;
+
+    // A route referencing only members must succeed.
+    db.execute_unprepared(
+        "INSERT INTO project_group_routes \
+         (group_id, source_project_id, target_project_id, path_prefix) \
+         SELECT g.id, f.id, b.id, '/api' \
+         FROM project_groups g, projects f, projects b \
+         WHERE g.slug = 'routes-project' \
+           AND f.slug = 'routes-frontend' \
+           AND b.slug = 'routes-backend'",
+    )
+    .await?;
+
+    // A route with source and target both being the same project must fail.
+    let self_route = db
+        .execute_unprepared(
+            "INSERT INTO project_group_routes \
+             (group_id, source_project_id, target_project_id, path_prefix) \
+             SELECT g.id, f.id, f.id, '/same' \
+             FROM project_groups g, projects f \
+             WHERE g.slug = 'routes-project' AND f.slug = 'routes-frontend'",
+        )
+        .await;
+    assert!(self_route.is_err(), "source == target must be rejected");
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "project_group_routes").await?);
+
+    // Up again — all triggers and functions recreated idempotently.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_group_routes").await?);
+
+    Ok(())
+}
+
+/// Seeds two member projects (`frontend`, `backend`) of one group, and returns
+/// `(group_id, frontend_id, backend_id)`, for the route/membership race tests.
+async fn seed_group_with_two_members(
+    db: &DatabaseConnection,
+    suffix: &str,
+) -> anyhow::Result<(i32, i32, i32)> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let ids = |rows: Vec<sea_orm::QueryResult>| -> anyhow::Result<i32> {
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("insert returned no row"))?;
+        Ok(row.try_get_by_index::<i32>(0)?)
+    };
+    let mut project_ids = Vec::new();
+    for name in ["frontend", "backend"] {
+        let rows = db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "INSERT INTO projects \
+                     (name, repo_name, repo_owner, directory, main_branch, preset, \
+                      created_at, updated_at, slug) \
+                     VALUES ('{name}', '', '', '.', 'main', 'nodejs', now(), now(), \
+                             'race-{suffix}-{name}') RETURNING id"
+                ),
+            ))
+            .await?;
+        project_ids.push(ids(rows)?);
+    }
+    let rows = db
+        .query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO project_groups (name, slug) \
+                 VALUES ('Race {suffix}', 'race-{suffix}') RETURNING id"
+            ),
+        ))
+        .await?;
+    let group_id = ids(rows)?;
+    for project_id in &project_ids {
+        db.execute_unprepared(&format!(
+            "INSERT INTO project_group_members (project_id, group_id) \
+             VALUES ({project_id}, {group_id})"
+        ))
+        .await?;
+    }
+    Ok((group_id, project_ids[0], project_ids[1]))
+}
+
+async fn route_count(db: &DatabaseConnection, group_id: i32) -> anyhow::Result<i64> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT COUNT(*) FROM project_group_routes WHERE group_id = {group_id}"),
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("count returned no row"))?;
+    Ok(row.try_get_by_index::<i64>(0)?)
+}
+
+/// A route insert that overlaps an uncommitted membership delete must not
+/// commit a route for the departed member (the trigger's membership read has
+/// to wait on the in-flight delete and then see it).
+#[tokio::test]
+async fn test_project_group_route_insert_waits_for_concurrent_membership_delete(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_route_insert_waits_for_concurrent_membership_delete"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+    let (group_id, frontend, backend) = seed_group_with_two_members(&db, "insert-waits").await?;
+
+    // Transaction 1 removes `backend` from the group but has not committed.
+    let leaver = db.begin().await?;
+    leaver
+        .execute_unprepared(&format!(
+            "DELETE FROM project_group_members WHERE project_id = {backend}"
+        ))
+        .await?;
+
+    // Transaction 2 inserts a route to it. It has to wait for transaction 1.
+    let inserter_db = std::sync::Arc::clone(&db);
+    let inserter = tokio::spawn(async move {
+        let txn = inserter_db.begin().await?;
+        txn.execute_unprepared(&format!(
+            "INSERT INTO project_group_routes \
+             (group_id, source_project_id, target_project_id, path_prefix) \
+             VALUES ({group_id}, {frontend}, {backend}, '/api')"
+        ))
+        .await?;
+        txn.commit().await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !inserter.is_finished(),
+        "the route insert must block on the uncommitted membership delete"
+    );
+
+    leaver.commit().await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(20), inserter).await??;
+    let err = outcome.expect_err("the route must be rejected once the member has left");
+    assert!(
+        err.to_string().contains("is not a member of group"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(route_count(&db, group_id).await?, 0);
+    Ok(())
+}
+
+/// The reverse order: a membership delete that overlaps an uncommitted route
+/// insert must wait for it and then drop the committed route, so no route
+/// survives between ex-members.
+#[tokio::test]
+async fn test_project_group_membership_delete_waits_for_concurrent_route_insert(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_membership_delete_waits_for_concurrent_route_insert"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+
+    // Both a delete and a move to another group must serialize behind the
+    // route insert.
+    for (suffix, statement) in [("delete-waits", None), ("move-waits", Some("move"))] {
+        let (group_id, frontend, backend) = seed_group_with_two_members(&db, suffix).await?;
+        let other_group = {
+            use sea_orm::{DatabaseBackend, Statement};
+            let row = db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "INSERT INTO project_groups (name, slug) \
+                         VALUES ('Other {suffix}', 'other-{suffix}') RETURNING id"
+                    ),
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("insert returned no row"))?;
+            row.try_get_by_index::<i32>(0)?
+        };
+
+        // Transaction 1 inserts the route and holds it uncommitted.
+        let writer = db.begin().await?;
+        writer
+            .execute_unprepared(&format!(
+                "INSERT INTO project_group_routes \
+                 (group_id, source_project_id, target_project_id, path_prefix) \
+                 VALUES ({group_id}, {frontend}, {backend}, '/api')"
+            ))
+            .await?;
+
+        // Transaction 2 removes (or moves) `backend`. It has to wait.
+        let leaver_db = std::sync::Arc::clone(&db);
+        let leave_sql = match statement {
+            Some(_) => format!(
+                "UPDATE project_group_members SET group_id = {other_group} \
+                 WHERE project_id = {backend}"
+            ),
+            None => format!("DELETE FROM project_group_members WHERE project_id = {backend}"),
+        };
+        let leaver = tokio::spawn(async move {
+            let txn = leaver_db.begin().await?;
+            txn.execute_unprepared(&leave_sql).await?;
+            txn.commit().await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !leaver.is_finished(),
+            "{suffix}: the membership change must block on the uncommitted route insert"
+        );
+
+        writer.commit().await?;
+        tokio::time::timeout(Duration::from_secs(20), leaver).await???;
+        assert_eq!(
+            route_count(&db, group_id).await?,
+            0,
+            "{suffix}: a route between ex-members must not survive"
+        );
+    }
+    Ok(())
+}
+
+/// A project that is in no group has no membership row to lock, so a
+/// membership writer's lock on the project row is what a route insert must
+/// wait for. Without it the trigger would read "not a member" while the
+/// writer's placement is still uncommitted and reject a route that is valid
+/// the moment the writer commits; and, worse, the writer could have read the
+/// project's routes before the insert and then moved it.
+#[tokio::test]
+async fn test_project_group_route_insert_waits_for_membership_writers_project_lock(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_route_insert_waits_for_membership_writers_project_lock"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+    let (group_id, frontend, backend) = seed_group_with_two_members(&db, "project-lock").await?;
+    // Take `backend` out of the group so it is a project with no membership.
+    db.execute_unprepared(&format!(
+        "DELETE FROM project_group_members WHERE project_id = {backend}"
+    ))
+    .await?;
+
+    // The writer locks the project row, as the service layer does, and
+    // places it back into the group without committing.
+    let writer = db.begin().await?;
+    writer
+        .execute_unprepared(&format!(
+            "SELECT 1 FROM projects WHERE id = {backend} FOR NO KEY UPDATE"
+        ))
+        .await?;
+    writer
+        .execute_unprepared(&format!(
+            "INSERT INTO project_group_members (project_id, group_id) \
+             VALUES ({backend}, {group_id})"
+        ))
+        .await?;
+
+    let inserter_db = std::sync::Arc::clone(&db);
+    let inserter = tokio::spawn(async move {
+        inserter_db
+            .execute_unprepared(&format!(
+                "INSERT INTO project_group_routes \
+                 (group_id, source_project_id, target_project_id, path_prefix) \
+                 VALUES ({group_id}, {frontend}, {backend}, '/api')"
+            ))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !inserter.is_finished(),
+        "the route insert must wait for the writer's lock on the project row"
+    );
+
+    writer.commit().await?;
+    tokio::time::timeout(Duration::from_secs(20), inserter).await???;
+    assert_eq!(route_count(&db, group_id).await?, 1);
+    Ok(())
+}
+
+/// The reverse: a route insert holds its endpoint project rows `FOR SHARE`
+/// until it commits, so a membership writer that starts with the project
+/// lock (the service layer's step 1) cannot read the routes around it.
+#[tokio::test]
+async fn test_project_group_membership_writer_project_lock_waits_for_route_insert(
+) -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+    use std::time::Duration;
+
+    let container = start_pg_container!(
+        "test_project_group_membership_writer_project_lock_waits_for_route_insert"
+    );
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    let db = std::sync::Arc::new(db);
+    let (group_id, frontend, backend) = seed_group_with_two_members(&db, "writer-waits").await?;
+
+    let router = db.begin().await?;
+    router
+        .execute_unprepared(&format!(
+            "INSERT INTO project_group_routes \
+             (group_id, source_project_id, target_project_id, path_prefix) \
+             VALUES ({group_id}, {frontend}, {backend}, '/api')"
+        ))
+        .await?;
+
+    let writer_db = std::sync::Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        let txn = writer_db.begin().await?;
+        // Both endpoints, ascending id, like the service layer.
+        txn.execute_unprepared(&format!(
+            "SELECT 1 FROM projects WHERE id IN ({frontend}, {backend}) \
+             ORDER BY id FOR NO KEY UPDATE"
+        ))
+        .await?;
+        txn.commit().await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !writer.is_finished(),
+        "the membership writer's project lock must wait for the uncommitted route insert"
+    );
+
+    router.commit().await?;
+    tokio::time::timeout(Duration::from_secs(20), writer).await???;
+    assert_eq!(route_count(&db, group_id).await?, 1);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// m20260929_000001 — template_instantiations
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_template_instantiations_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_template_instantiations_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260929_000001_create_template_instantiations";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!table_exists_in_db(&db, "template_instantiations").await?);
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "template_instantiations").await?);
+
+    // Insert a user and a minimal instantiation row.
+    db.execute_unprepared(
+        "INSERT INTO users (name, email, created_at, updated_at) \
+         VALUES ('Test User', 'ti-test@example.com', now(), now())",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO template_instantiations \
+         (user_id, idempotency_key, kind, name, plan) \
+         SELECT id, 'idem-key-1', 'template', 'My App', '{}' \
+         FROM users WHERE email = 'ti-test@example.com'",
+    )
+    .await?;
+
+    // Idempotency constraint: same (user_id, idempotency_key) must fail.
+    let duplicate = db
+        .execute_unprepared(
+            "INSERT INTO template_instantiations \
+             (user_id, idempotency_key, kind, name, plan) \
+             SELECT id, 'idem-key-1', 'template', 'Duplicate', '{}' \
+             FROM users WHERE email = 'ti-test@example.com'",
+        )
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "duplicate (user_id, idempotency_key) must be rejected"
+    );
+
+    // Invalid kind must fail.
+    let bad_kind = db
+        .execute_unprepared(
+            "INSERT INTO template_instantiations \
+             (user_id, idempotency_key, kind, name, plan) \
+             SELECT id, 'idem-key-bad', 'unknown', 'Bad Kind', '{}' \
+             FROM users WHERE email = 'ti-test@example.com'",
+        )
+        .await;
+    assert!(bad_kind.is_err(), "invalid kind must be rejected");
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "template_instantiations").await?);
+
+    // Up again.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "template_instantiations").await?);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// m20260929_000002 — projects.hosting column
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_hosting_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_hosting_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260929_000002_add_project_hosting";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!column_exists(&db, "projects", "hosting").await?);
+
+    // Insert a pre-migration project (no hosting column yet).
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) \
+         VALUES ('hosting-test', '', '', '.', 'main', 'nodejs', now(), now(), 'hosting-test')",
+    )
+    .await?;
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "hosting").await?);
+
+    // Pre-existing project must have been backfilled with 'hosted'.
+    let hosting: String = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT hosting FROM projects WHERE slug = 'hosting-test'".to_string(),
+        ))
+        .await?
+        .expect("pre-migration project still present")
+        .try_get("", "hosting")?;
+    assert_eq!(
+        hosting, "hosted",
+        "existing projects must default to 'hosted' after migration up"
+    );
+
+    // Invalid hosting value must be rejected by the CHECK constraint.
+    let bad_hosting = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, \
+              created_at, updated_at, slug, hosting) \
+             VALUES ('bad-hosting', '', '', '.', 'main', 'nodejs', now(), now(), \
+                     'bad-hosting', 'managed')",
+        )
+        .await;
+    assert!(
+        bad_hosting.is_err(),
+        "invalid hosting value 'managed' must be rejected"
+    );
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "projects", "hosting").await?);
+
+    // Up again — constraint must be recreated.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "hosting").await?);
+    let bad_hosting_again = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, \
+              created_at, updated_at, slug, hosting) \
+             VALUES ('bad-hosting-2', '', '', '.', 'main', 'nodejs', now(), now(), \
+                     'bad-hosting-2', 'serverless')",
+        )
+        .await;
+    assert!(
+        bad_hosting_again.is_err(),
+        "invalid hosting value must still be rejected after re-up"
+    );
+
+    Ok(())
+}
+
+/// The `instantiation_token` of the project with `slug`.
+async fn project_instantiation_token(
+    db: &DatabaseConnection,
+    slug: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT instantiation_token FROM projects WHERE slug = $1",
+            [slug.into()],
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project {slug} not found"))?;
+    Ok(row.try_get::<Option<String>>("", "instantiation_token")?)
+}
+
+// ---------------------------------------------------------------------------
+// m20260930_000001 — projects.instantiation_token column
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_project_instantiation_token_migration_up_down_up() -> anyhow::Result<()> {
+    let container = start_pg_container!("test_project_instantiation_token_migration_up_down_up");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260930_000001_add_project_instantiation_token";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not registered"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert!(!column_exists(&db, "projects", "instantiation_token").await?);
+
+    // A project that exists before the migration stays valid, with no token.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) \
+         VALUES ('token-test', '', '', '.', 'main', 'nodejs', now(), now(), 'token-test')",
+    )
+    .await?;
+
+    // Up.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "instantiation_token").await?);
+    assert_eq!(project_instantiation_token(&db, "token-test").await?, None);
+
+    // At most one project can carry a given token; NULL is unconstrained.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug, instantiation_token) \
+         VALUES ('owned', '', '', '.', 'main', 'nodejs', now(), now(), 'owned', \
+                 'instantiation:7:service:backend')",
+    )
+    .await?;
+    assert_eq!(
+        project_instantiation_token(&db, "owned").await?.as_deref(),
+        Some("instantiation:7:service:backend")
+    );
+    let duplicate = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, \
+              created_at, updated_at, slug, instantiation_token) \
+             VALUES ('imposter', '', '', '.', 'main', 'nodejs', now(), now(), 'imposter', \
+                     'instantiation:7:service:backend')",
+        )
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "a second project must not carry an existing instantiation token"
+    );
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, \
+          created_at, updated_at, slug) \
+         VALUES ('plain-2', '', '', '.', 'main', 'nodejs', now(), now(), 'plain-2')",
+    )
+    .await?;
+
+    // Down.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "projects", "instantiation_token").await?);
+
+    // Up again.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "instantiation_token").await?);
+    assert_eq!(project_instantiation_token(&db, "owned").await?, None);
+
     Ok(())
 }
 

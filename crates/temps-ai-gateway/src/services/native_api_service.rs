@@ -43,7 +43,7 @@ use crate::providers::openai_native::{
     NATIVE_REQUEST_TIMEOUT,
 };
 use crate::services::gateway_service::{
-    ByokOverride, CredentialType, GatewayService, ResolvedCredentials,
+    ByokOverride, CredentialType, GatewayService, ResolvedCredentials, ServedBy,
 };
 use crate::services::usage_service::{AiRequestContext, UsageService};
 
@@ -469,7 +469,8 @@ impl NativeApiService {
                 &format!("batches/{}", record.upstream_id),
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !reply.is_success() {
             return Err(AiGatewayError::Validation {
                 message: "Provider could not retrieve tracked batch".into(),
@@ -489,6 +490,12 @@ impl NativeApiService {
     }
 
     fn base_url(&self, credentials: &ResolvedCredentials) -> Result<String, AiGatewayError> {
+        // Re-check at every use, including background reconciliation of
+        // objects created with a caller's key: the trusted networks may have
+        // changed since, and a pre-existing row may predate the http rule.
+        if self.client.enforces_url_policy() {
+            credentials.check_base_url()?;
+        }
         let base_url = match credentials.base_url.as_deref() {
             Some(base_url) => base_url.to_string(),
             None => self
@@ -541,11 +548,7 @@ impl NativeApiService {
             return Ok(None);
         };
         if let Some(base_url) = byok.base_url.as_deref() {
-            temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
-                AiGatewayError::InvalidProviderUrl {
-                    reason: error.to_string(),
-                }
-            })?;
+            crate::provider_url::check_provider_url(base_url, None)?;
         }
         Ok(Some(ResolvedCredentials {
             provider_id: OPENAI,
@@ -553,6 +556,8 @@ impl NativeApiService {
             base_url: byok.base_url.clone(),
             credential_type: CredentialType::Byok,
             system_key_id: None,
+            key_trust: None,
+            self_hosted_capabilities: None,
         }))
     }
 
@@ -565,13 +570,20 @@ impl NativeApiService {
         &self,
         request: &ResponsesRequest,
         byok: &ByokOverride,
-    ) -> Result<(ResponsesOutcome, CredentialType), AiGatewayError> {
+    ) -> Result<(ResponsesOutcome, ServedBy), AiGatewayError> {
         validate_model_id(&request.model)?;
         let credentials = self
             .gateway_service
             .resolve_credentials(&request.model, byok)
             .await?;
-        Self::require_openai(&credentials, "/ai/v1/responses", &request.model)?;
+        if credentials.self_hosted_capabilities.is_some() {
+            // A self-hosted server may implement the Responses API; the
+            // administrator declares it on the key.
+            credentials
+                .require_capability(&request.model, "the Responses API", |c| c.responses_api)?;
+        } else {
+            Self::require_openai(&credentials, "/api/ai/v1/responses", &request.model)?;
+        }
         if credentials.credential_type == CredentialType::System {
             reject_stateful_request(request)?;
         }
@@ -586,6 +598,11 @@ impl NativeApiService {
             }
         })?);
         let base_url = self.base_url(&credentials)?;
+        let served_by = ServedBy {
+            provider_id: credentials.provider_id,
+            credential_type: credentials.credential_type,
+            system_key_id: credentials.system_key_id,
+        };
 
         if !request.stream {
             let reply = self
@@ -597,7 +614,8 @@ impl NativeApiService {
                     "responses",
                     Some(body),
                 )
-                .await?;
+                .await
+                .map_err(|error| credentials.caller_facing(error))?;
             let usage = if reply.is_success() {
                 serde_json::from_slice::<ResponseObject>(&reply.body)
                     .ok()
@@ -605,10 +623,7 @@ impl NativeApiService {
             } else {
                 None
             };
-            return Ok((
-                ResponsesOutcome::Reply { reply, usage },
-                credentials.credential_type,
-            ));
+            return Ok((ResponsesOutcome::Reply { reply, usage }, served_by));
         }
 
         let response = self
@@ -621,13 +636,11 @@ impl NativeApiService {
                 Some(body),
                 false,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !response.status().is_success() {
             let reply = read_reply(response, "responses").await?;
-            return Ok((
-                ResponsesOutcome::Reply { reply, usage: None },
-                credentials.credential_type,
-            ));
+            return Ok((ResponsesOutcome::Reply { reply, usage: None }, served_by));
         }
         let model = request.model.clone();
         let stream = response.bytes_stream().map(move |chunk| {
@@ -636,10 +649,7 @@ impl NativeApiService {
                 reason: error.without_url().to_string(),
             })
         });
-        Ok((
-            ResponsesOutcome::Stream(Box::pin(stream)),
-            credentials.credential_type,
-        ))
+        Ok((ResponsesOutcome::Stream(Box::pin(stream)), served_by))
     }
 
     // ------------------------------------------------------------------------
@@ -660,7 +670,7 @@ impl NativeApiService {
             .gateway_service
             .resolve_credentials(&summary.model, byok)
             .await?;
-        Self::require_openai(&credentials, "/ai/v1/files", &summary.model)?;
+        Self::require_openai(&credentials, "/api/ai/v1/files", &summary.model)?;
         let base_url = self.base_url(&credentials)?;
 
         let file = tokio::fs::File::open(spooled.file.path())
@@ -682,7 +692,8 @@ impl NativeApiService {
                 spooled.length,
                 text_fields,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         drop(spooled);
         if !reply.is_success() {
             return Ok(reply);
@@ -738,6 +749,7 @@ impl NativeApiService {
                 None,
             )
             .await
+            .map_err(|error| credentials.caller_facing(error))
     }
 
     /// Download a file's content. Successful downloads are streamed, never
@@ -764,7 +776,8 @@ impl NativeApiService {
                 None,
                 true,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !response.status().is_success() {
             return Ok(Err(read_reply(response, &path).await?));
         }
@@ -803,7 +816,8 @@ impl NativeApiService {
                 &format!("files/{file_id}"),
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if reply.is_success() {
             if let Some(record) = record {
                 ai_gateway_objects::Entity::delete_by_id(record.id)
@@ -890,7 +904,8 @@ impl NativeApiService {
                 "batches",
                 Some(body),
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !reply.is_success() {
             return Ok(reply);
         }
@@ -969,7 +984,8 @@ impl NativeApiService {
         let reply = self
             .client
             .send_buffered(method, &base_url, &credentials.api_key, &path, None)
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if let (true, Some(record)) = (reply.is_success(), record) {
             match serde_json::from_slice::<BatchObject>(&reply.body) {
                 Ok(batch) => self.observe_batch(&record, &batch).await?,
@@ -1123,7 +1139,8 @@ impl NativeApiService {
                 None,
                 true,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !response.status().is_success() {
             return Err(AiGatewayError::Validation {
                 message: "Batch output is not yet available for accounting".into(),
@@ -1182,6 +1199,7 @@ impl NativeApiService {
             .client
             .send_buffered(method, &base_url, &credentials.api_key, &path, None)
             .await
+            .map_err(|error| credentials.caller_facing(error))
         {
             Ok(reply) if reply.is_success() => {}
             Ok(reply) => error!(
@@ -1267,6 +1285,8 @@ impl NativeApiService {
             base_url: record.byok_base_url.clone(),
             credential_type: CredentialType::Byok,
             system_key_id: None,
+            key_trust: None,
+            self_hosted_capabilities: None,
         })
     }
 
@@ -1573,6 +1593,8 @@ mod tests {
                 base_url: Some(url.into()),
                 credential_type: CredentialType::Byok,
                 system_key_id: None,
+                key_trust: None,
+                self_hosted_capabilities: None,
             };
             let error = svc.base_url(&credentials).unwrap_err();
             assert!(matches!(error, AiGatewayError::InvalidProviderUrl { .. }));
@@ -1992,6 +2014,8 @@ mod tests {
                 base_url: None,
                 credential_type: CredentialType::Byok,
                 system_key_id: None,
+                key_trust: None,
+                self_hosted_capabilities: None,
             })
             .unwrap();
         let second = svc
@@ -2001,6 +2025,8 @@ mod tests {
                 base_url: None,
                 credential_type: CredentialType::Byok,
                 system_key_id: None,
+                key_trust: None,
+                self_hosted_capabilities: None,
             })
             .unwrap();
         assert_ne!(first, second);
@@ -2133,6 +2159,8 @@ mod tests {
                     base_url: Some(format!("{}/v1", server.uri())),
                     credential_type: CredentialType::System,
                     system_key_id: Some(2),
+                    key_trust: None,
+                    self_hosted_capabilities: None,
                 },
                 kind,
                 id,

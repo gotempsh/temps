@@ -3679,6 +3679,7 @@ impl SandboxProvider for DockerSandboxProvider {
         }
     }
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
         // Resolve the request override exactly once. Provisioning, proxy
         // environment, and HostConfig must all use this same effective value;
@@ -3731,7 +3732,7 @@ impl SandboxProvider for DockerSandboxProvider {
                         return Err(AgentError::SandboxCreationFailed {
                             run_id: config.run_id,
                             provider: "docker".to_string(),
-                            reason: format!("Failed to pull image {}: {}", image, e),
+                            reason: crate::error::image_pull_failure_reason(image, &e.to_string()),
                         });
                     }
                 }
@@ -5632,6 +5633,7 @@ impl SandboxProvider for DockerSandboxProvider {
         artifact: &super::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let image_ref =
             artifact
                 .image_ref
@@ -6966,6 +6968,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(60),
@@ -7018,6 +7021,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(60),
@@ -7185,6 +7189,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -7548,6 +7553,7 @@ mod tests {
             memory_limit_mb: Some(512),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::from([("TEST_VAR".to_string(), "test_value".to_string())]),
             idle_timeout: Duration::from_secs(120),
@@ -7711,6 +7717,7 @@ mod tests {
                     memory_limit_mb: Some(512),
                     pids_limit: None,
                     disk_size_mb: None,
+                    allow_docker: false,
                     network_mode: Some("none".to_string()),
                     env_vars: HashMap::new(),
                     idle_timeout: Duration::from_secs(120),
@@ -7963,6 +7970,7 @@ mod tests {
                 memory_limit_mb: Some(512),
                 pids_limit: None,
                 disk_size_mb: None,
+                allow_docker: false,
                 network_mode: Some("none".to_string()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(120),
@@ -8331,6 +8339,7 @@ mod tests {
             memory_limit_mb: Some(256),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -8554,6 +8563,7 @@ mod tests {
             memory_limit_mb: Some(256),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -8706,6 +8716,7 @@ mod tests {
                 memory_limit_mb: Some(256),
                 pids_limit: None,
                 disk_size_mb: None,
+                allow_docker: false,
                 network_mode: Some("none".to_string()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(60),

@@ -17,6 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-projects = { path = "../temps-projects" }
+temps-domains = { path = "../temps-domains" }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
@@ -33,13 +34,17 @@ http = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
+arc-swap = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
+temps-routes = { path = "../temps-routes" }
+tower = { workspace = true, features = ["util"] }
 tokio-test = "0.4"
 wiremock = "0.6"
-hex = { workspace = true }
-async-trait = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

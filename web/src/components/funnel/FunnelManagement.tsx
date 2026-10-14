@@ -115,7 +115,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
             className="shrink-0"
           >
             <Plus className="h-4 w-4 sm:mr-2" />
-            <span className="hidden sm:inline">Create Funnel</span>
+            <span className="max-sm:sr-only">Create Funnel</span>
             <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
           </Button>
         </div>
