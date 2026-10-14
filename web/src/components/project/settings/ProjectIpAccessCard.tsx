@@ -68,8 +68,11 @@ import {
   hostCidr,
   ipAccessFormSchema,
   modeLabel,
+  initialFormMode,
   policySummary,
+  showsEntries,
   type IpAccessFormValues,
+  type IpAccessFormMode,
   type IpAccessMode,
 } from './ip-access'
 
@@ -79,7 +82,12 @@ interface ProjectIpAccessCardProps {
   environmentId?: number
 }
 
-const MODES: { value: IpAccessMode; hint: string }[] = [
+const INHERIT_MODE: { value: IpAccessFormMode; hint: string } = {
+  value: 'inherit',
+  hint: 'Use whatever the project-wide list says. Pick Off to exempt this environment from it.',
+}
+
+const MODES: { value: IpAccessFormMode; hint: string }[] = [
   { value: 'disabled', hint: 'Anyone can reach it. This is the default.' },
   {
     value: 'allow',
@@ -88,12 +96,14 @@ const MODES: { value: IpAccessMode; hint: string }[] = [
   { value: 'deny', hint: 'Listed addresses get a 403, everyone else is fine.' },
 ]
 
+/**
+ * The 409 for "this save would lock you out". Another 409 (a concurrent
+ * update) must not offer the "Save anyway" override, so the title decides.
+ */
 function isLockoutError(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { status?: unknown }).status === 409
-  )
+  if (typeof error !== 'object' || error === null) return false
+  const problem = error as { status?: unknown; title?: unknown }
+  return problem.status === 409 && problem.title === 'Policy Would Lock You Out'
 }
 
 export function ProjectIpAccessCard({
@@ -129,7 +139,12 @@ export function ProjectIpAccessCard({
 
   const form = useForm<IpAccessFormValues>({
     resolver: zodResolver(ipAccessFormSchema),
-    defaultValues: { mode: 'disabled', cidrs: [] },
+    // What an unconfigured scope looks like; the effect below swaps in the
+    // saved policy once it has loaded.
+    defaultValues: {
+      mode: isEnvironment ? 'inherit' : 'disabled',
+      cidrs: [],
+    },
   })
   const { fields, append, remove, replace } = useFieldArray({
     control: form.control,
@@ -143,7 +158,7 @@ export function ProjectIpAccessCard({
   useEffect(() => {
     if (!policy) return
     form.reset({
-      mode: policy.mode,
+      mode: initialFormMode(policy, environmentId !== undefined),
       cidrs: policy.cidrs.map((entry) => ({
         cidr: entry.cidr,
         description: entry.description ?? '',
@@ -260,7 +275,7 @@ export function ProjectIpAccessCard({
   })
 
   const toRequest = (
-    values: IpAccessFormValues,
+    values: { mode: IpAccessMode; cidrs: IpAccessFormValues['cidrs'] },
     acknowledgeLockout: boolean
   ): SetProjectIpAccessRequest => ({
     mode: values.mode,
@@ -272,7 +287,12 @@ export function ProjectIpAccessCard({
   })
 
   const onSubmit = form.handleSubmit((values) => {
-    save.mutate(toRequest(values, false))
+    if (values.mode === 'inherit') {
+      // "Follow the project list" is the absence of a row, not a mode.
+      remove_.mutate()
+      return
+    }
+    save.mutate(toRequest({ ...values, mode: values.mode }, false))
   })
 
   const runProbe = () => {
@@ -284,9 +304,9 @@ export function ProjectIpAccessCard({
     const draft = ipAccessFormSchema.safeParse(values)
     probeMutation.mutate({
       ip: address,
-      ...(draft.success
+      ...(draft.success && draft.data.mode !== 'inherit'
         ? {
-            mode: draft.data.mode,
+            mode: draft.data.mode as IpAccessMode,
             cidrs: draft.data.cidrs.map((entry) => ({
               cidr: entry.cidr.trim(),
               description: entry.description?.trim() || null,
@@ -355,11 +375,14 @@ export function ProjectIpAccessCard({
       <form onSubmit={onSubmit} className="space-y-5" noValidate>
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={policy.mode === 'disabled' ? 'secondary' : 'default'}>
-            {policySummary(policy.mode, policy.cidrs.length)}
+            {isEnvironment && !policy.configured
+              ? 'Follows the project list'
+              : policySummary(policy.mode, policy.cidrs.length)}
           </Badge>
           {isEnvironment && !policy.configured && (
             <span className="text-sm text-muted-foreground">
-              No list of its own: this environment follows the project list.
+              No list of its own. Choose a mode below to override the project
+              list for this environment; Off exempts it.
             </span>
           )}
         </div>
@@ -371,152 +394,162 @@ export function ProjectIpAccessCard({
             <RadioGroup
               value={field.value}
               onValueChange={field.onChange}
-              className="grid grid-cols-1 gap-2 md:grid-cols-3"
+              className={
+                isEnvironment
+                  ? 'grid grid-cols-1 gap-2 md:grid-cols-2'
+                  : 'grid grid-cols-1 gap-2 md:grid-cols-3'
+              }
               aria-label="IP access mode"
             >
-              {MODES.map((option) => (
-                <Label
-                  key={option.value}
-                  htmlFor={`ip-access-mode-${option.value}`}
-                  className="flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal has-[[data-state=checked]]:border-primary"
-                >
-                  <RadioGroupItem
-                    id={`ip-access-mode-${option.value}`}
-                    value={option.value}
-                    className="mt-0.5"
-                  />
-                  <span className="space-y-0.5">
-                    <span className="block text-sm font-medium">
-                      {modeLabel(option.value)}
+              {(isEnvironment ? [INHERIT_MODE, ...MODES] : MODES).map(
+                (option) => (
+                  <Label
+                    key={option.value}
+                    htmlFor={`ip-access-mode-${option.value}`}
+                    className="flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal has-[[data-state=checked]]:border-primary"
+                  >
+                    <RadioGroupItem
+                      id={`ip-access-mode-${option.value}`}
+                      value={option.value}
+                      className="mt-0.5"
+                    />
+                    <span className="space-y-0.5">
+                      <span className="block text-sm font-medium">
+                        {modeLabel(option.value)}
+                      </span>
+                      <span className="block text-sm text-muted-foreground">
+                        {option.hint}
+                      </span>
                     </span>
-                    <span className="block text-sm text-muted-foreground">
-                      {option.hint}
-                    </span>
-                  </span>
-                </Label>
-              ))}
+                  </Label>
+                )
+              )}
             </RadioGroup>
           )}
         />
 
-        <div className="space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <Label>
-              Addresses and ranges{' '}
-              <span className="font-normal text-muted-foreground">
-                ({fields.length} / {MAX_CIDRS})
-              </span>
-            </Label>
-            <div className="flex flex-wrap gap-2">
-              {yourIp && !yourIpListed && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={atLimit}
-                  onClick={() =>
-                    append({
-                      cidr: hostCidr(yourIp),
-                      description: 'My current address',
-                    })
-                  }
-                >
-                  <UserRound className="mr-2 h-4 w-4" />
-                  Add my IP ({yourIp})
-                </Button>
-              )}
-              {canAddPresets && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={atLimit}
-                  onClick={addPresets}
-                >
-                  <Network className="mr-2 h-4 w-4" />
-                  Add Tailscale ranges
-                </Button>
-              )}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={atLimit}
-                onClick={() => append({ cidr: '', description: '' })}
-              >
-                <Plus className="mr-2 h-4 w-4" />
-                Add range
-              </Button>
-            </div>
-          </div>
-
-          {fields.length === 0 ? (
-            <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-              {mode === 'allow'
-                ? 'An allow list needs at least one entry, e.g. 203.0.113.0/24, or 2001:db8::/32 for IPv6. Use "Add Tailscale ranges" to admit your tailnet.'
-                : 'No addresses yet. Enter a single address (203.0.113.9) or a range (203.0.113.0/24, 2001:db8::/32).'}
-            </p>
-          ) : (
-            <ul className="space-y-2">
-              {fields.map((field, index) => {
-                const rowErrors = form.formState.errors.cidrs?.[index]
-                return (
-                  <li
-                    key={field.id}
-                    className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+        {showsEntries(mode) && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label>
+                Addresses and ranges{' '}
+                <span className="font-normal text-muted-foreground">
+                  ({fields.length} / {MAX_CIDRS})
+                </span>
+              </Label>
+              <div className="flex flex-wrap gap-2">
+                {yourIp && !yourIpListed && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={atLimit}
+                    onClick={() =>
+                      append({
+                        cidr: hostCidr(yourIp),
+                        description: 'My current address',
+                      })
+                    }
                   >
-                    <div className="space-y-1">
-                      <Input
-                        aria-label={`Address or range ${index + 1}`}
-                        aria-invalid={rowErrors?.cidr ? true : undefined}
-                        placeholder="203.0.113.0/24"
-                        className="font-mono"
-                        {...form.register(`cidrs.${index}.cidr` as const)}
-                      />
-                      {rowErrors?.cidr?.message && (
-                        <p className="text-sm text-destructive">
-                          {rowErrors.cidr.message}
-                        </p>
-                      )}
-                    </div>
-                    <div className="space-y-1">
-                      <Input
-                        aria-label={`Note for range ${index + 1}`}
-                        aria-invalid={rowErrors?.description ? true : undefined}
-                        placeholder="Note (optional)"
-                        maxLength={MAX_DESCRIPTION_LENGTH}
-                        {...form.register(
-                          `cidrs.${index}.description` as const
-                        )}
-                      />
-                      {rowErrors?.description?.message && (
-                        <p className="text-sm text-destructive">
-                          {rowErrors.description.message}
-                        </p>
-                      )}
-                    </div>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`Remove range ${index + 1}`}
-                      onClick={() => remove(index)}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-          {cidrsError && (
-            <p className="text-sm text-destructive" role="alert">
-              {cidrsError}
-            </p>
-          )}
-        </div>
+                    <UserRound className="mr-2 h-4 w-4" />
+                    Add my IP ({yourIp})
+                  </Button>
+                )}
+                {canAddPresets && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={atLimit}
+                    onClick={addPresets}
+                  >
+                    <Network className="mr-2 h-4 w-4" />
+                    Add Tailscale ranges
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={atLimit}
+                  onClick={() => append({ cidr: '', description: '' })}
+                >
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add range
+                </Button>
+              </div>
+            </div>
 
-        {mode !== 'disabled' && yourIp && (
+            {fields.length === 0 ? (
+              <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                {mode === 'allow'
+                  ? 'An allow list needs at least one entry, e.g. 203.0.113.0/24, or 2001:db8::/32 for IPv6. Use "Add Tailscale ranges" to admit your tailnet.'
+                  : 'No addresses yet. Enter a single address (203.0.113.9) or a range (203.0.113.0/24, 2001:db8::/32).'}
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {fields.map((field, index) => {
+                  const rowErrors = form.formState.errors.cidrs?.[index]
+                  return (
+                    <li
+                      key={field.id}
+                      className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                    >
+                      <div className="space-y-1">
+                        <Input
+                          aria-label={`Address or range ${index + 1}`}
+                          aria-invalid={rowErrors?.cidr ? true : undefined}
+                          placeholder="203.0.113.0/24"
+                          className="font-mono"
+                          {...form.register(`cidrs.${index}.cidr` as const)}
+                        />
+                        {rowErrors?.cidr?.message && (
+                          <p className="text-sm text-destructive">
+                            {rowErrors.cidr.message}
+                          </p>
+                        )}
+                      </div>
+                      <div className="space-y-1">
+                        <Input
+                          aria-label={`Note for range ${index + 1}`}
+                          aria-invalid={
+                            rowErrors?.description ? true : undefined
+                          }
+                          placeholder="Note (optional)"
+                          maxLength={MAX_DESCRIPTION_LENGTH}
+                          {...form.register(
+                            `cidrs.${index}.description` as const
+                          )}
+                        />
+                        {rowErrors?.description?.message && (
+                          <p className="text-sm text-destructive">
+                            {rowErrors.description.message}
+                          </p>
+                        )}
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Remove range ${index + 1}`}
+                        onClick={() => remove(index)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+            {cidrsError && (
+              <p className="text-sm text-destructive" role="alert">
+                {cidrsError}
+              </p>
+            )}
+          </div>
+        )}
+
+        {mode !== 'disabled' && mode !== 'inherit' && yourIp && (
           <Alert>
             <CircleAlert className="h-4 w-4" />
             <AlertTitle>Your address: {yourIp}</AlertTitle>
@@ -594,7 +627,7 @@ export function ProjectIpAccessCard({
               variant="ghost"
               onClick={() => {
                 form.reset({
-                  mode: policy.mode,
+                  mode: initialFormMode(policy, isEnvironment),
                   cidrs: policy.cidrs.map((entry) => ({
                     cidr: entry.cidr,
                     description: entry.description ?? '',

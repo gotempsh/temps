@@ -90,8 +90,42 @@ pub enum ProjectIpAccessError {
     #[error("'{input}' is not a valid IPv4 or IPv6 address")]
     InvalidIpAddress { input: String },
 
+    #[error(
+        "The IP access policy for {scope} was changed by another request at the same time; \
+         reload it and try again"
+    )]
+    ConcurrentUpdate { scope: String },
+
     #[error("Database error: {0}")]
-    Database(#[from] sea_orm::DbErr),
+    Database(sea_orm::DbErr),
+}
+
+/// Whether `error` is a violation of a unique index. Postgres reports it as
+/// SQLSTATE 23505, which sea-orm exposes through `sql_err()`; the text match
+/// covers drivers and mocks that surface only the message.
+fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
+    matches!(
+        error.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    ) || {
+        let text = error.to_string();
+        text.contains("duplicate key value violates unique constraint")
+            || text.contains("UNIQUE constraint failed")
+    }
+}
+
+impl From<sea_orm::DbErr> for ProjectIpAccessError {
+    fn from(error: sea_orm::DbErr) -> Self {
+        // The only unique index on the table is one policy per scope, so a
+        // violation means two writers raced to create the same scope. The
+        // scope is not known here; `set` re-labels it before returning.
+        if is_unique_violation(&error) {
+            return ProjectIpAccessError::ConcurrentUpdate {
+                scope: "this scope".to_string(),
+            };
+        }
+        ProjectIpAccessError::Database(error)
+    }
 }
 
 /// Human-readable scope used in error messages.
@@ -289,6 +323,10 @@ fn validate_policy(
 }
 
 /// Evaluate one address against a validated policy: `(allowed, matched_cidr)`.
+///
+/// `entries[i]` must be the entry `networks[i]` was parsed from (see
+/// [`aligned_policy`]); the verdict itself comes from the production matcher,
+/// the entry only labels which CIDR matched.
 fn evaluate(
     mode: IpAccessMode,
     entries: &[IpAccessCidrEntry],
@@ -299,17 +337,22 @@ fn evaluate(
     let matched = networks
         .iter()
         .position(|network| network.contains(ip))
-        .map(|index| entries[index].cidr.clone());
-    let allowed = match mode {
-        IpAccessMode::Disabled => true,
-        IpAccessMode::Allow => matched.is_some(),
-        IpAccessMode::Deny => matched.is_none(),
-    };
-    (allowed, matched)
+        .and_then(|index| entries.get(index))
+        .map(|entry| entry.cidr.clone());
+    (evaluate_with_set(mode, networks, ip), matched)
 }
 
-/// Same decision as [`evaluate`] through the production matcher, so the test
-/// endpoint cannot drift from what the proxy does.
+/// Pair each stored entry with its parsed network, dropping any entry that no
+/// longer parses (the gate skips those too), so indexes stay aligned.
+fn aligned_policy(stored: Vec<IpAccessCidrEntry>) -> (Vec<IpAccessCidrEntry>, Vec<IpNetwork>) {
+    stored
+        .into_iter()
+        .filter_map(|entry| parse_cidr(&entry.cidr).ok().map(|network| (entry, network)))
+        .unzip()
+}
+
+/// The verdict through the production matcher, so the test endpoint cannot
+/// drift from what the proxy does.
 fn evaluate_with_set(mode: IpAccessMode, networks: &[IpNetwork], ip: IpAddr) -> bool {
     let set = CidrSet::from_networks(networks);
     match mode {
@@ -436,6 +479,41 @@ impl ProjectIpAccessService {
 
         self.ensure_scope_exists(project_id, environment_id).await?;
 
+        let cidrs = IpAccessCidrs(policy.entries);
+        // Two writers creating the same scope at once both see no row and both
+        // insert; the unique index rejects the second. That writer retries
+        // once, finds the row the first one made, and updates it.
+        let saved = match self
+            .upsert(project_id, environment_id, policy.mode, &cidrs, updated_by)
+            .await
+        {
+            Err(ProjectIpAccessError::ConcurrentUpdate { .. }) => {
+                self.upsert(project_id, environment_id, policy.mode, &cidrs, updated_by)
+                    .await
+            }
+            other => other,
+        }
+        .map_err(|error| match error {
+            ProjectIpAccessError::ConcurrentUpdate { .. } => {
+                ProjectIpAccessError::ConcurrentUpdate {
+                    scope: scope.clone(),
+                }
+            }
+            other => other,
+        })?;
+
+        Ok(ProjectIpAccessResponse::from(saved))
+    }
+
+    /// Insert or update the single row for a scope inside one transaction.
+    async fn upsert(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        mode: IpAccessMode,
+        cidrs: &IpAccessCidrs,
+        updated_by: Option<i32>,
+    ) -> Result<project_ip_access_rules::Model, ProjectIpAccessError> {
         let txn = self.db.begin().await?;
         let mut query = project_ip_access_rules::Entity::find()
             .filter(project_ip_access_rules::Column::ProjectId.eq(project_id));
@@ -447,12 +525,11 @@ impl ProjectIpAccessService {
         };
         let existing = query.one(&txn).await?;
 
-        let cidrs = IpAccessCidrs(policy.entries);
         let saved = match existing {
             Some(row) => {
                 let mut active: project_ip_access_rules::ActiveModel = row.into();
-                active.mode = Set(policy.mode.as_str().to_string());
-                active.cidrs = Set(cidrs);
+                active.mode = Set(mode.as_str().to_string());
+                active.cidrs = Set(cidrs.clone());
                 active.updated_by = Set(updated_by);
                 active.update(&txn).await?
             }
@@ -460,8 +537,8 @@ impl ProjectIpAccessService {
                 project_ip_access_rules::ActiveModel {
                     project_id: Set(project_id),
                     environment_id: Set(environment_id),
-                    mode: Set(policy.mode.as_str().to_string()),
-                    cidrs: Set(cidrs),
+                    mode: Set(mode.as_str().to_string()),
+                    cidrs: Set(cidrs.clone()),
                     updated_by: Set(updated_by),
                     ..Default::default()
                 }
@@ -470,8 +547,7 @@ impl ProjectIpAccessService {
             }
         };
         txn.commit().await?;
-
-        Ok(ProjectIpAccessResponse::from(saved))
+        Ok(saved)
     }
 
     /// Remove one scope's policy. For an environment this returns it to
@@ -542,11 +618,7 @@ impl ProjectIpAccessService {
                 match row {
                     Some(row) => {
                         let mode = IpAccessMode::parse(&row.mode).unwrap_or(IpAccessMode::Allow);
-                        let entries = row.cidrs.0;
-                        let networks = entries
-                            .iter()
-                            .filter_map(|entry| parse_cidr(&entry.cidr).ok())
-                            .collect::<Vec<_>>();
+                        let (entries, networks) = aligned_policy(row.cidrs.0);
                         (source, mode, entries, networks)
                     }
                     None => (
@@ -970,6 +1042,121 @@ mod tests {
             .expect("set succeeds");
         assert!(response.configured);
         assert_eq!(response.mode, IpAccessMode::Allow);
+    }
+
+    #[test]
+    fn aligned_policy_drops_unparsable_entries_without_shifting_labels() {
+        let (entries, networks) = aligned_policy(vec![
+            entry("bogus"),
+            entry("10.0.0.0/8"),
+            entry("2001:db8::/32"),
+        ]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(networks.len(), 2);
+
+        let (allowed, matched) = evaluate(IpAccessMode::Allow, &entries, &networks, ip("10.1.2.3"));
+        assert!(allowed);
+        assert_eq!(matched.as_deref(), Some("10.0.0.0/8"));
+
+        let (allowed, matched) =
+            evaluate(IpAccessMode::Deny, &entries, &networks, ip("2001:db8::7"));
+        assert!(!allowed);
+        assert_eq!(matched.as_deref(), Some("2001:db8::/32"));
+    }
+
+    #[test]
+    fn unique_violations_are_recognised_from_the_driver_message() {
+        let duplicate = sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
+            "duplicate key value violates unique constraint \"project_ip_access_rules_scope_unique\""
+                .to_string(),
+        ));
+        assert!(is_unique_violation(&duplicate));
+        assert!(!is_unique_violation(&sea_orm::DbErr::Custom(
+            "connection reset".to_string()
+        )));
+        assert!(matches!(
+            ProjectIpAccessError::from(duplicate),
+            ProjectIpAccessError::ConcurrentUpdate { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_retries_once_when_another_writer_created_the_scope_first() {
+        let duplicate = sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
+            "duplicate key value violates unique constraint \"project_ip_access_rules_scope_unique\""
+                .to_string(),
+        ));
+        let stored = rule_row(5, None, "deny", &["198.51.100.0/24"]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // ensure_scope_exists: project
+            .append_query_results(vec![vec![id_row(5)]])
+            // first attempt: no row yet ...
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            // ... and the INSERT loses the race
+            .append_query_errors(vec![duplicate])
+            // retry: the winner's row is now visible
+            .append_query_results(vec![vec![stored.clone()]])
+            // UPDATE ... RETURNING
+            .append_query_results(vec![vec![stored]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let response = service
+            .set(
+                5,
+                None,
+                SetProjectIpAccessRequest {
+                    mode: IpAccessMode::Deny,
+                    cidrs: vec![entry("198.51.100.0/24")],
+                    acknowledge_lockout: true,
+                },
+                None,
+                Some(1),
+            )
+            .await
+            .expect("the retry updates the row the other writer created");
+        assert!(response.configured);
+        assert_eq!(response.mode, IpAccessMode::Deny);
+    }
+
+    #[tokio::test]
+    async fn set_reports_a_repeated_unique_violation_as_a_conflict_with_the_scope() {
+        let duplicate = || {
+            sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
+                "duplicate key value violates unique constraint".to_string(),
+            ))
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            // ensure_scope_exists: environment
+            .append_query_results(vec![vec![id_row(9)]])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_errors(vec![duplicate()])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_errors(vec![duplicate()])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let err = service
+            .set(
+                5,
+                Some(9),
+                SetProjectIpAccessRequest {
+                    mode: IpAccessMode::Deny,
+                    cidrs: vec![entry("198.51.100.0/24")],
+                    acknowledge_lockout: true,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ProjectIpAccessError::ConcurrentUpdate { scope } => {
+                assert!(scope.contains("environment 9"), "{scope}");
+            }
+            other => panic!("expected ConcurrentUpdate, got {other:?}"),
+        }
     }
 
     #[tokio::test]

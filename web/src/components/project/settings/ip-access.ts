@@ -9,6 +9,14 @@ export const MAX_DESCRIPTION_LENGTH = 120
 
 export type IpAccessMode = 'disabled' | 'allow' | 'deny'
 
+/**
+ * What the form edits. `inherit` is console-only: an environment with no list
+ * of its own follows the project's, and choosing it removes the stored row.
+ * It is distinct from `disabled`, which is a saved override that exempts the
+ * environment from the project-wide list.
+ */
+export type IpAccessFormMode = IpAccessMode | 'inherit'
+
 export interface CidrEntry {
   cidr: string
   description?: string | null
@@ -78,7 +86,7 @@ const entrySchema = z.object({
 
 export const ipAccessFormSchema = z
   .object({
-    mode: z.enum(['disabled', 'allow', 'deny']),
+    mode: z.enum(['inherit', 'disabled', 'allow', 'deny']),
     cidrs: z
       .array(entrySchema)
       .max(MAX_CIDRS, `At most ${MAX_CIDRS} entries are allowed`),
@@ -135,8 +143,10 @@ export function hostCidr(ip: string): string {
   return ip.includes(':') ? `${ip}/128` : `${ip}/32`
 }
 
-export function modeLabel(mode: IpAccessMode): string {
+export function modeLabel(mode: IpAccessFormMode): string {
   switch (mode) {
+    case 'inherit':
+      return 'Follow the project list'
     case 'allow':
       return 'Only allow listed addresses'
     case 'deny':
@@ -144,6 +154,19 @@ export function modeLabel(mode: IpAccessMode): string {
     case 'disabled':
       return 'Off'
   }
+}
+
+/** The mode a scope's form starts in for the policy the server returned. */
+export function initialFormMode(
+  policy: { configured: boolean; mode: IpAccessMode },
+  isEnvironment: boolean
+): IpAccessFormMode {
+  return isEnvironment && !policy.configured ? 'inherit' : policy.mode
+}
+
+/** Entries are only meaningful for a list that is kept (anything but inherit). */
+export function showsEntries(mode: IpAccessFormMode): boolean {
+  return mode !== 'inherit'
 }
 
 /** One-line description of what the saved policy does, for status badges. */

@@ -63,6 +63,11 @@ impl From<ProjectIpAccessError> for Problem {
                     .with_title("Invalid IP Access Policy")
                     .with_detail(error.to_string())
             }
+            ProjectIpAccessError::ConcurrentUpdate { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("IP Access Policy Changed")
+                    .with_detail(error.to_string())
+            }
             ProjectIpAccessError::WouldLockOutCaller { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Policy Would Lock You Out")
@@ -643,6 +648,12 @@ mod tests {
                 scope: "project 3".into(),
                 caller_ip: "203.0.113.9".into(),
                 effect: "exclude"
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            problem_status(ProjectIpAccessError::ConcurrentUpdate {
+                scope: "project 3".into()
             }),
             StatusCode::CONFLICT
         );

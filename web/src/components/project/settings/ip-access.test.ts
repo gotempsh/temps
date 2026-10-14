@@ -8,7 +8,9 @@ import {
   cidrSyntaxError,
   hasAllPresets,
   hostCidr,
+  initialFormMode,
   ipAccessFormSchema,
+  showsEntries,
   policySummary,
   withPresets,
 } from './ip-access'
@@ -114,6 +116,31 @@ describe('presets', () => {
       '203.0.113.0/24',
       'fd7a:115c:a1e0::/48',
     ])
+  })
+})
+
+describe('scope modes', () => {
+  test('an environment without its own list starts by following the project', () => {
+    const unconfigured = { configured: false, mode: 'disabled' as const }
+    expect(initialFormMode(unconfigured, true)).toBe('inherit')
+    expect(initialFormMode(unconfigured, false)).toBe('disabled')
+  })
+
+  test('a saved environment override keeps its mode, including off', () => {
+    expect(initialFormMode({ configured: true, mode: 'disabled' }, true)).toBe(
+      'disabled'
+    )
+    expect(initialFormMode({ configured: true, mode: 'allow' }, true)).toBe(
+      'allow'
+    )
+  })
+
+  test('inherit is a valid form value with no entries and hides the editor', () => {
+    expect(
+      ipAccessFormSchema.safeParse({ mode: 'inherit', cidrs: [] }).success
+    ).toBe(true)
+    expect(showsEntries('inherit')).toBe(false)
+    expect(showsEntries('disabled')).toBe(true)
   })
 })
 

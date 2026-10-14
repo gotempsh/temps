@@ -97,8 +97,13 @@ test('an environment without its own list says it follows the project', () => {
     environmentId: 7,
     data: { ...unconfigured, environment_id: 7 },
   })
-  expect(markup).toContain('follows the project list')
+  expect(markup).toContain('Follows the project list')
+  expect(markup).toContain('Follow the project list')
+  // Off must be reachable as an explicit override of the project list.
+  expect(markup).toContain('Off')
   expect(markup).not.toContain('Use project list')
+  // Nothing to edit until the environment picks its own mode.
+  expect(markup).not.toContain('Add range')
 })
 
 test('a load failure is reported with a retry', () => {
