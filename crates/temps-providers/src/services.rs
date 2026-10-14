@@ -808,11 +808,14 @@ pub enum ExternalServiceError {
     /// A database lock this operation needs was still held by another
     /// transaction after `timeout_secs`. The wait is bounded so a stuck
     /// holder surfaces as this error naming the service and the operation,
-    /// not as a request that never returns. Nothing was changed.
+    /// not as a request that never returns. Only the database write was
+    /// refused: a caller that saves after Docker work (an upgrade, say) may
+    /// already have changed the container, so this does not promise the
+    /// service is untouched.
     #[error(
         "Timed out after {timeout_secs}s waiting for a database lock while {operation} \
-         service {service_id}: another operation is holding it. Nothing was changed; \
-         retry once it finishes"
+         service {service_id}: another operation is holding it. The database change was \
+         not applied; check the service's state, and retry once the other operation finishes"
     )]
     LockTimeout {
         service_id: i32,
