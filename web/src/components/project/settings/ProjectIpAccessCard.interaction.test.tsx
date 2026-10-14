@@ -149,6 +149,44 @@ test('an invalid draft is reported instead of silently testing the saved list', 
   api.restore()
 })
 
+test('the draft error goes away once the draft is discarded or fixed', async () => {
+  const api = mockApi({})
+  const { view } = mount({ data: base })
+
+  const check = async () => {
+    fireEvent.change(view.getByLabelText('Try an address'), {
+      target: { value: '10.1.1.1' },
+    })
+    fireEvent.click(view.getByRole('button', { name: 'Check' }))
+    expect(
+      await view.findByText(/Fix the list before trying an address/)
+    ).toBeTruthy()
+  }
+
+  fireEvent.click(view.getByRole('button', { name: /Add range/ }))
+  fireEvent.change(view.getByLabelText('Address or range 2'), {
+    target: { value: 'not-a-cidr' },
+  })
+  await check()
+  fireEvent.click(view.getByRole('button', { name: 'Discard changes' }))
+  await waitFor(() =>
+    expect(view.queryByText(/Fix the list before trying an address/)).toBeNull()
+  )
+
+  fireEvent.click(view.getByRole('button', { name: /Add range/ }))
+  fireEvent.change(view.getByLabelText('Address or range 2'), {
+    target: { value: 'not-a-cidr' },
+  })
+  await check()
+  fireEvent.change(view.getByLabelText('Address or range 2'), {
+    target: { value: '192.168.0.0/16' },
+  })
+  await waitFor(() =>
+    expect(view.queryByText(/Fix the list before trying an address/)).toBeNull()
+  )
+  api.restore()
+})
+
 test('a background change to the saved list does not erase unsaved edits', async () => {
   const { client, queryKey, view } = mount({ data: base })
 

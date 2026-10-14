@@ -30,13 +30,20 @@
 //! enforced within [`POLL_INTERVAL`] in every process, including a standalone
 //! `temps proxy`.
 //!
-//! A full reload runs every [`FULL_RELOAD_INTERVAL`] as a separate safety
-//! floor: a transaction that commits late can carry a revision below the one
-//! already applied, and the delta read would never see it.
+//! The triggers serialise writers on one advisory lock held until commit, so
+//! revisions become visible in order. The gate therefore advances its cursor
+//! to the newest revision it actually *read*, never to the sequence head: a
+//! writer that has drawn a revision but not committed yet is picked up by a
+//! later poll instead of being skipped. A rolled-back writer leaves a gap in
+//! the sequence; the poll then costs two empty indexed reads until the next
+//! write, which is still independent of the number of rules.
 //!
-//! The revision is read **before** the rows it describes, so a write that
-//! lands between startup's load and the first poll has a higher revision and
-//! is picked up by that poll.
+//! A full reload (O(rules)) is not part of the steady state. It runs at
+//! startup, when the sequence head is *behind* the cursor (the database was
+//! restored), when no poll has succeeded for [`STALE_AFTER`] (the tombstones a
+//! missed deletion would need are pruned after an hour), and every
+//! [`FULL_RELOAD_INTERVAL`] as a rare safety net for edits made with triggers
+//! disabled.
 //!
 //! * The **initial load must succeed**: [`ProjectIpAccessGate::hydrate`]
 //!   errors are returned to the caller, which aborts startup rather than
@@ -66,8 +73,14 @@ use tracing::{debug, error, info, warn};
 /// How often the change feed head is read. One sequence read.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Floor between full snapshot rebuilds even when the change feed is quiet.
-pub const FULL_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+/// Safety-net interval between full snapshot rebuilds. The change feed is the
+/// normal path; this only covers edits that bypassed its triggers.
+pub const FULL_RELOAD_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// A gate that has not completed a poll for this long rebuilds from scratch:
+/// deletions are only recorded for an hour, so a longer silence could have
+/// missed one.
+pub const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Error)]
 pub enum IpAccessGateError {
@@ -130,8 +143,16 @@ struct Snapshot {
 }
 
 /// A scope whose rule was deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromQueryResult)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RemovedScope {
+    project_id: i32,
+    environment_id: Option<i32>,
+}
+
+/// One tombstone as stored: the scope plus the revision that deleted it.
+#[derive(Debug, FromQueryResult)]
+struct TombstoneRow {
+    revision: i64,
     project_id: i32,
     environment_id: Option<i32>,
 }
@@ -275,13 +296,16 @@ impl ProjectIpAccessGate {
 
     async fn run_refresh_loop(self: Arc<Self>) {
         let mut last_full_reload = Instant::now();
+        let mut last_success = Instant::now();
         let mut consecutive_failures: u64 = 0;
 
         loop {
             // Poll first: the startup load may already be a poll behind.
-            let force_full = last_full_reload.elapsed() >= FULL_RELOAD_INTERVAL;
+            let force_full = last_full_reload.elapsed() >= FULL_RELOAD_INTERVAL
+                || last_success.elapsed() >= STALE_AFTER;
             match self.refresh(force_full).await {
                 Ok(outcome) => {
+                    last_success = Instant::now();
                     if consecutive_failures > 0 {
                         info!(
                             failed_polls = consecutive_failures,
@@ -331,17 +355,16 @@ impl ProjectIpAccessGate {
         Ok(row.map_or(0, |row| row.revision))
     }
 
-    /// Bring the snapshot up to date. A full reload when `force_full` or when
-    /// nothing has been loaded yet; otherwise a delta that costs one sequence
+    /// Bring the snapshot up to date. A full reload when `force_full`, when
+    /// nothing has been loaded yet, or when the database's sequence is behind
+    /// what was applied (a restore); otherwise a delta that costs one sequence
     /// read when nothing changed. Nothing is published unless every read
     /// succeeds, so a failure keeps the last good snapshot.
     async fn refresh(&self, force_full: bool) -> Result<Refresh, IpAccessGateError> {
-        // Before any rows are read: whatever commits after this point has a
-        // higher revision and is picked up by the next poll.
         let head = self.read_revision().await?;
         let applied = self.applied_revision.load(Ordering::Acquire);
 
-        if force_full || applied == NO_REVISION {
+        if force_full || applied == NO_REVISION || head < applied {
             let rows = project_ip_access_rules::Entity::find()
                 .all(self.db.as_ref())
                 .await
@@ -350,10 +373,19 @@ impl ProjectIpAccessGate {
                     source,
                 })?;
             let rules = rows.len();
+            // The newest revision actually seen, not `head`: a writer that has
+            // drawn a revision but not committed is not in `rows`, and must be
+            // found by the next delta.
+            let seen = rows.iter().map(|row| row.revision).max().unwrap_or(0);
             self.snapshot
                 .store(Arc::new(Snapshot::default().patched(&[], &rows)));
-            self.applied_revision.store(head, Ordering::Release);
-            debug!(rules, head, "Published project IP access snapshot");
+            self.applied_revision.store(seen, Ordering::Release);
+            debug!(
+                rules,
+                head,
+                applied = seen,
+                "Published project IP access snapshot"
+            );
             return Ok(Refresh::Reloaded { rules });
         }
 
@@ -361,9 +393,10 @@ impl ProjectIpAccessGate {
             return Ok(Refresh::Unchanged);
         }
 
-        let removed = RemovedScope::find_by_statement(Statement::from_sql_and_values(
+        let tombstones = TombstoneRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT project_id, environment_id FROM project_ip_access_rule_tombstones \
+            "SELECT revision, project_id, environment_id \
+             FROM project_ip_access_rule_tombstones \
              WHERE revision > $1 ORDER BY revision",
             [applied.into()],
         ))
@@ -383,9 +416,28 @@ impl ProjectIpAccessGate {
                 source,
             })?;
 
+        let newest = changed
+            .iter()
+            .map(|row| row.revision)
+            .chain(tombstones.iter().map(|tombstone| tombstone.revision))
+            .max();
+        let Some(newest) = newest else {
+            // The head moved but nothing is visible: a writer that has not
+            // committed yet, or one that rolled back. Keep the cursor.
+            return Ok(Refresh::Unchanged);
+        };
+
+        let removed: Vec<RemovedScope> = tombstones
+            .iter()
+            .map(|tombstone| RemovedScope {
+                project_id: tombstone.project_id,
+                environment_id: tombstone.environment_id,
+            })
+            .collect();
         let next = self.snapshot.load().patched(&removed, &changed);
         self.snapshot.store(Arc::new(next));
-        self.applied_revision.store(head, Ordering::Release);
+        self.applied_revision
+            .store(newest.max(applied), Ordering::Release);
         Ok(Refresh::Patched {
             changed: changed.len(),
             removed: removed.len(),
@@ -566,11 +618,17 @@ mod tests {
         std::collections::BTreeMap::from([("revision", sea_orm::Value::BigInt(Some(revision)))])
     }
 
+    fn no_tombstones() -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        Vec::new()
+    }
+
     fn removed_row(
+        revision: i64,
         project_id: i32,
         environment_id: Option<i32>,
     ) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
         std::collections::BTreeMap::from([
+            ("revision", sea_orm::Value::BigInt(Some(revision))),
             ("project_id", sea_orm::Value::Int(Some(project_id))),
             ("environment_id", sea_orm::Value::Int(environment_id)),
         ])
@@ -877,7 +935,7 @@ mod tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
             // hydrate: head, then rows
             .append_query_results(vec![vec![revision_row(4)]])
-            .append_query_results(vec![vec![row(1, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![vec![row(4, 7, None, "allow", &["10.0.0.0/8"])]])
             // poll: head only
             .append_query_results(vec![vec![revision_row(4)]])
             .into_connection();
@@ -909,7 +967,7 @@ mod tests {
             ]])
             // poll: head moved; tombstones, then changed rows
             .append_query_results(vec![vec![revision_row(5)]])
-            .append_query_results(vec![vec![removed_row(8, None)]])
+            .append_query_results(vec![vec![removed_row(4, 8, None)]])
             .append_query_results(vec![vec![row(5, 7, None, "allow", &["172.16.0.0/12"])]])
             .into_connection();
         let gate = ProjectIpAccessGate::new(Arc::new(db));
@@ -949,17 +1007,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_revision_is_read_before_the_rows_it_describes() {
-        // A rule saved after the head was read but before the rows were
-        // loaded is included in the snapshot *and* above the recorded
-        // revision, so the next poll re-reads it instead of missing it.
+    async fn the_cursor_is_the_newest_revision_read_not_the_head() {
+        // Head is 7 but only rows up to 5 are visible: revision 6 or 7 belongs
+        // to a writer that has not committed. The cursor stays at 5 so the
+        // next poll still sees it when it lands.
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![revision_row(7)]])
-            .append_query_results(vec![vec![row(9, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![vec![row(5, 7, None, "allow", &["10.0.0.0/8"])]])
+            // poll 1: head still 7, nothing above 5 is committed yet
+            .append_query_results(vec![vec![revision_row(7)]])
+            .append_query_results(vec![no_tombstones()])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            // poll 2: the writer committed revision 7
+            .append_query_results(vec![vec![revision_row(7)]])
+            .append_query_results(vec![no_tombstones()])
+            .append_query_results(vec![vec![row(7, 8, None, "allow", &["192.168.0.0/16"])]])
             .into_connection();
         let gate = ProjectIpAccessGate::new(Arc::new(db));
         gate.hydrate().await.expect("hydrate succeeds");
+        assert_eq!(gate.applied_revision.load(Ordering::Acquire), 5);
+
+        assert!(matches!(
+            gate.refresh(false).await.expect("poll succeeds"),
+            Refresh::Unchanged
+        ));
+        assert_eq!(gate.applied_revision.load(Ordering::Acquire), 5);
+        assert!(gate.is_allowed(8, 80, ip("10.1.1.1")));
+
+        assert!(matches!(
+            gate.refresh(false).await.expect("poll succeeds"),
+            Refresh::Patched {
+                changed: 1,
+                removed: 0
+            }
+        ));
         assert_eq!(gate.applied_revision.load(Ordering::Acquire), 7);
+        assert!(!gate.is_allowed(8, 80, ip("10.1.1.1")));
+    }
+
+    #[tokio::test]
+    async fn a_sequence_behind_the_cursor_forces_a_full_reload() {
+        // A restore rewound the sequence; deltas keyed on the old cursor
+        // would never fire again.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![revision_row(9)]])
+            .append_query_results(vec![vec![row(9, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![vec![revision_row(2)]])
+            .append_query_results(vec![vec![row(2, 8, None, "allow", &["192.168.0.0/16"])]])
+            .into_connection();
+        let gate = ProjectIpAccessGate::new(Arc::new(db));
+        gate.hydrate().await.expect("hydrate succeeds");
+
+        assert!(matches!(
+            gate.refresh(false).await.expect("poll succeeds"),
+            Refresh::Reloaded { rules: 1 }
+        ));
+        assert_eq!(gate.applied_revision.load(Ordering::Acquire), 2);
+        assert!(gate.is_allowed(7, 70, ip("203.0.113.1")));
+        assert!(!gate.is_allowed(8, 80, ip("203.0.113.1")));
     }
 
     #[tokio::test]

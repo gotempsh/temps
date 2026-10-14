@@ -17,8 +17,15 @@
 //! every delete draws one into a short-lived tombstone. A proxy polls the
 //! sequence head (O(1)) and, only when it moved, reads the rows and tombstones
 //! above the revision it last applied. Tombstones are pruned after an hour by
-//! the delete trigger itself; a proxy that was away longer than a minute does
-//! a full reload anyway.
+//! the delete trigger itself; a proxy that was away for half an hour does a
+//! full reload anyway.
+//!
+//! Both triggers first take one transaction-scoped advisory lock, so writers
+//! to this table are serialised until they commit. That makes revisions
+//! visible in commit order: a reader that has seen revision N has seen every
+//! revision below it, which is what lets it advance by the revisions it read
+//! rather than rescanning the table to be safe. Writes here are rare operator
+//! actions, so the serialisation costs nothing.
 
 use sea_orm_migration::prelude::*;
 
@@ -81,6 +88,7 @@ CREATE INDEX project_ip_access_rule_tombstones_deleted_at
 
 CREATE FUNCTION project_ip_access_rules_assign_revision() RETURNS trigger AS $$
 BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('project_ip_access_rules_revision_seq'));
     NEW.revision := nextval('project_ip_access_rules_revision_seq');
     RETURN NEW;
 END;
@@ -92,6 +100,7 @@ CREATE TRIGGER project_ip_access_rules_assign_revision
 
 CREATE FUNCTION project_ip_access_rules_record_delete() RETURNS trigger AS $$
 BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('project_ip_access_rules_revision_seq'));
     DELETE FROM project_ip_access_rule_tombstones
         WHERE deleted_at < NOW() - INTERVAL '1 hour';
     INSERT INTO project_ip_access_rule_tombstones

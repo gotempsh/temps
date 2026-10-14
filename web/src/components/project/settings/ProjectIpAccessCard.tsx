@@ -206,7 +206,16 @@ export function ProjectIpAccessCard({
   const [probe, setProbe] = useState('')
   const [probeResult, setProbeResult] =
     useState<TestProjectIpAccessResponse | null>(null)
-  const [probeDraftError, setProbeDraftError] = useState<string | null>(null)
+  const [probeDraftError, setProbeDraftError] = useState<{
+    message: string
+    draftKey: string
+  } | null>(null)
+  // The message describes the draft as it was when checked. It is shown only
+  // while the form still holds that draft, so an edit, Discard changes or a
+  // successful save retires it without any state to keep in sync.
+  const draftKey = JSON.stringify({ mode, cidrs: currentCidrs })
+  const visibleProbeDraftError =
+    probeDraftError?.draftKey === draftKey ? probeDraftError.message : null
 
   const save = useMutation({
     mutationFn: async (body: SetProjectIpAccessRequest) => {
@@ -344,7 +353,10 @@ export function ProjectIpAccessCard({
     const draft = probeDraft(values)
     if (draft.kind === 'invalid') {
       setProbeResult(null)
-      setProbeDraftError(draft.message)
+      setProbeDraftError({
+        message: draft.message,
+        draftKey: JSON.stringify({ mode: values.mode, cidrs: values.cidrs }),
+      })
       return
     }
     setProbeDraftError(null)
@@ -653,9 +665,9 @@ export function ProjectIpAccessCard({
             {probeMutation.isPending ? 'Checking…' : 'Check'}
           </Button>
         </div>
-        {probeDraftError && (
+        {visibleProbeDraftError && (
           <p className="text-sm text-destructive" role="alert">
-            Fix the list before trying an address: {probeDraftError}
+            Fix the list before trying an address: {visibleProbeDraftError}
           </p>
         )}
         {probeResult && (
