@@ -6,6 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
+import type { UserResponse } from '@/api/client/types.gen'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { listTeamsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Teams } from './Teams'
@@ -31,16 +33,46 @@ function fail(client: QueryClient, queryKey: QueryKey, error: unknown) {
     .setState({ status: 'error', error: error as Error, fetchStatus: 'idle' })
 }
 
-function render(client: QueryClient) {
+function signedInAs(role: string): UserResponse {
+  return {
+    id: 3,
+    name: 'Example User',
+    username: 'example',
+    avatar_url: '',
+    mfa_enabled: false,
+    role,
+  }
+}
+
+function render(client: QueryClient, role?: string) {
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <BreadcrumbProvider>
-          <Teams />
-        </BreadcrumbProvider>
+        <AuthContext.Provider
+          value={{
+            user: role ? signedInAs(role) : null,
+            isLoading: false,
+            error: null,
+            logout: async () => {},
+            refetch: () => {},
+          }}
+        >
+          <BreadcrumbProvider>
+            <Teams />
+          </BreadcrumbProvider>
+        </AuthContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
+}
+
+/** The opening tag of the first `<button>` whose content mentions `label`. */
+function buttonTag(html: string, label: string): string | undefined {
+  const match = new RegExp(
+    `<button[^>]*>(?:(?!</button>).)*${label}`,
+    's'
+  ).exec(html)
+  return match ? /<button[^>]*>/.exec(match[0])?.[0] : undefined
 }
 
 const teamsKey = listTeamsOptions({
@@ -69,5 +101,36 @@ test('a failed teams read is not an empty team list', () => {
   expect(html).toContain('Teams unavailable')
   expect(html).toContain('teams table unavailable')
   expect(html).not.toContain('No teams yet')
+  client.clear()
+})
+
+const noTeams = { teams: [], total: 0, page: 1, page_size: 100 }
+
+test('a non-admin sees Create team disabled with the reason spelled out', () => {
+  const client = createClient()
+  client.setQueryData(teamsKey, noTeams)
+  const html = render(client, 'user')
+  expect(buttonTag(html, 'Create team')).toContain('disabled=""')
+  expect(html).toContain('data-admin-only-note')
+  expect(html).toContain('Only administrators can create or delete teams')
+  expect(html).toContain('Your role is &quot;user&quot;')
+  client.clear()
+})
+
+test('an administrator keeps Create team enabled and sees no restriction note', () => {
+  const client = createClient()
+  client.setQueryData(teamsKey, noTeams)
+  const html = render(client, 'admin')
+  expect(buttonTag(html, 'Create team')).not.toContain('disabled=""')
+  expect(html).not.toContain('data-admin-only-note')
+  client.clear()
+})
+
+test('a refused teams read has no Retry for a role that can never pass it', () => {
+  const client = createClient()
+  fail(client, teamsKey, refused)
+  const html = render(client, 'user')
+  expect(html).toContain('Teams: access denied')
+  expect(html).not.toContain('Retry')
   client.clear()
 })

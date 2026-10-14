@@ -32,6 +32,7 @@ import {
 } from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -43,7 +44,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Plus, Trash2, Users } from 'lucide-react'
@@ -222,6 +226,10 @@ export function Teams() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
   const [teamToDelete, setTeamToDelete] = useState<TeamResponse | null>(null)
+  const currentRole = useCurrentUserRole()
+  // Creating and deleting teams needs `users:write` / `users:delete`, which
+  // only instance administrators hold.
+  const canManageTeams = useIsInstanceAdmin()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -236,7 +244,7 @@ export function Teams() {
   // dialog. Deriving it beats mirroring the param into state via an effect:
   // no cascading render, and it still reacts when the palette navigates here
   // while this page is already mounted.
-  const createOpen = searchParams.get('new') === '1'
+  const createOpen = canManageTeams && searchParams.get('new') === '1'
   const setCreateOpen = (open: boolean) => {
     const next = new URLSearchParams(searchParams)
     if (open) next.set('new', '1')
@@ -285,8 +293,13 @@ export function Teams() {
           onClick={() => setCreateOpen(true)}
           label="Create team"
           className="self-start"
+          disabled={!canManageTeams}
         />
       </div>
+
+      {!canManageTeams && (
+        <AdminOnlyNote action="create or delete teams" role={currentRole} />
+      )}
 
       <Card>
         <CardContent className="pt-6">
@@ -296,7 +309,9 @@ export function Teams() {
             <ReadFailure
               resource="Teams"
               error={error}
-              onRetry={() => void refetch()}
+              onRetry={
+                isForbiddenRead(error) ? undefined : () => void refetch()
+              }
               retrying={isFetching}
               embedded
             />
@@ -306,7 +321,10 @@ export function Teams() {
               title="No teams yet"
               description="Create a team, add members, then grant it access to a service from that service's Access tab."
               action={
-                <Button onClick={() => setCreateOpen(true)}>
+                <Button
+                  disabled={!canManageTeams}
+                  onClick={() => setCreateOpen(true)}
+                >
                   <Plus className="mr-2 h-4 w-4" />
                   Create team
                 </Button>
@@ -350,6 +368,7 @@ export function Teams() {
                           variant="ghost"
                           size="sm"
                           aria-label={`Delete team ${team.name}`}
+                          disabled={!canManageTeams}
                           onClick={(e) => {
                             // Don't trigger the row's navigate.
                             e.stopPropagation()

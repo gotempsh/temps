@@ -10,6 +10,7 @@ import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { Badge } from '@/components/ui/badge'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -20,7 +21,10 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   DNS_PROVIDERS_QUERY_KEY,
@@ -76,6 +80,10 @@ export function DnsProviders() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  // Adding, testing and deleting providers needs `dns_providers:write`, which
+  // only instance administrators hold.
+  const canManageProviders = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
   const [providerToDelete, setProviderToDelete] =
     useState<DnsProviderResponse | null>(null)
 
@@ -170,16 +178,24 @@ export function DnsProviders() {
                 size="sm"
                 onClick={() => navigate('/dns-providers/add')}
                 label="Add DNS Provider"
+                disabled={!canManageProviders}
               />
             )}
           </div>
         </div>
 
+        {!canManageProviders && (
+          <AdminOnlyNote
+            action="add, test or delete DNS providers"
+            role={currentRole}
+          />
+        )}
+
         {error ? (
           <ReadFailure
             resource="DNS providers"
             error={error}
-            onRetry={() => void refetch()}
+            onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
             retrying={isFetching}
           />
         ) : isLoading ? (
@@ -203,7 +219,10 @@ export function DnsProviders() {
             title="No DNS providers found"
             description="Get started by adding a DNS provider like Cloudflare or Namecheap to enable automatic DNS record management"
           >
-            <Button onClick={() => navigate('/dns-providers/add')}>
+            <Button
+              disabled={!canManageProviders}
+              onClick={() => navigate('/dns-providers/add')}
+            >
               <Plus className="mr-2 h-4 w-4" />
               Add DNS Provider
             </Button>
@@ -277,7 +296,9 @@ export function DnsProviders() {
                       variant="outline"
                       size="sm"
                       onClick={() => handleTestConnection(provider)}
-                      disabled={testConnectionMut.isPending}
+                      disabled={
+                        testConnectionMut.isPending || !canManageProviders
+                      }
                       className="hidden gap-2 sm:inline-flex"
                     >
                       {testConnectionMut.isPending ? (
@@ -307,6 +328,7 @@ export function DnsProviders() {
                           View Details
                         </DropdownMenuItem>
                         <DropdownMenuItem
+                          disabled={!canManageProviders}
                           onClick={() => handleTestConnection(provider)}
                         >
                           <TestTube2 className="h-4 w-4 mr-2" />
@@ -315,6 +337,7 @@ export function DnsProviders() {
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           className="text-destructive cursor-pointer"
+                          disabled={!canManageProviders}
                           onSelect={(e) => {
                             e.preventDefault()
                             setProviderToDelete(provider)

@@ -6,6 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
+import type { UserResponse } from '@/api/client/types.gen'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { client } from '@/api/client/client.gen'
 import { attachHttpStatus } from '@/lib/http-error-status'
@@ -36,13 +38,33 @@ function fail(client: QueryClient, queryKey: QueryKey, error: unknown) {
     .setState({ status: 'error', error: error as Error, fetchStatus: 'idle' })
 }
 
-function render(client: QueryClient) {
+function render(client: QueryClient, role?: string) {
+  const user: UserResponse | null = role
+    ? {
+        id: 3,
+        name: 'Example User',
+        username: 'example',
+        avatar_url: '',
+        mfa_enabled: false,
+        role,
+      }
+    : null
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <BreadcrumbProvider>
-          <DnsProviders />
-        </BreadcrumbProvider>
+        <AuthContext.Provider
+          value={{
+            user,
+            isLoading: false,
+            error: null,
+            logout: async () => {},
+            refetch: () => {},
+          }}
+        >
+          <BreadcrumbProvider>
+            <DnsProviders />
+          </BreadcrumbProvider>
+        </AuthContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -108,4 +130,35 @@ test('a real HTTP 403 reaches the page as access denied with the server reason',
   expect(html).toContain('DNS providers: access denied')
   expect(html).toContain('Requires dns_providers:read permission')
   client_.clear()
+})
+
+test('a non-admin sees the add-provider action disabled with the reason spelled out', () => {
+  const client = createClient()
+  client.setQueryData(providersKey, [])
+  const html = render(client, 'user')
+  expect(html).toContain('data-admin-only-note')
+  expect(html).toContain('Only administrators can add, test or delete')
+  // The empty-state action is the only Add control with no providers listed.
+  const tag = /<button[^>]*>(?:(?!<\/button>).)*Add DNS Provider/s.exec(html)
+  expect(tag?.[0]).toContain('disabled=""')
+  client.clear()
+})
+
+test('an administrator gets an enabled add-provider action and no note', () => {
+  const client = createClient()
+  client.setQueryData(providersKey, [])
+  const html = render(client, 'admin')
+  expect(html).not.toContain('data-admin-only-note')
+  const tag = /<button[^>]*>(?:(?!<\/button>).)*Add DNS Provider/s.exec(html)
+  expect(tag?.[0]).not.toContain('disabled=""')
+  client.clear()
+})
+
+test('a refused provider read offers no Retry', () => {
+  const client = createClient()
+  fail(client, providersKey, refused)
+  const html = render(client, 'user')
+  expect(html).toContain('DNS providers: access denied')
+  expect(html).not.toContain('Retry')
+  client.clear()
 })
