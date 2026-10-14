@@ -12,6 +12,7 @@ import { toast } from 'sonner'
 import { format } from 'date-fns'
 import {
   createProjectFromTemplateMutation,
+  getProjectsQueryKey,
   listConnectionsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -552,8 +553,9 @@ export function TemplateConfigurator({
   const createFromTemplateMutation = useMutation({
     ...createProjectFromTemplateMutation(),
     onSuccess: async (data) => {
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
+      // Generated SDK keys are `[{ _id: 'getProjects', ... }]`; a string-array
+      // key matches none of them, so the project lists stayed stale.
+      await queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() })
       if (data.deployment_queued === false) {
         toast.warning(
           data.deployment_error ??
