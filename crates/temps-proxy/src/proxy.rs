@@ -3698,6 +3698,12 @@ fn ip_restriction_denies(
     }
 }
 
+/// Caps "denied by project IP restriction" log lines at 20 per 10 seconds,
+/// process-wide. Denials are always counted in
+/// `proxy.ip_access_denied`; only the log line is limited.
+static IP_DENY_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
+    crate::ip_access::DenyLogLimiter::new(10, 20);
+
 fn legacy_ip_gate_denies(
     decision: temps_core::RequestPolicyDecision,
     gate: &dyn temps_core::ProjectIpGate,
@@ -5781,12 +5787,26 @@ impl ProxyHttp for LoadBalancer {
                         revision,
                         "Request denied by project policy"
                     ),
-                    _ => warn!(
-                        environment_id = project_ctx.environment.id,
-                        project_id = project_ctx.project.id,
-                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                        "Request denied by project IP restriction"
-                    ),
+                    _ => {
+                        // Counted for every denial; logged through a
+                        // process-wide limiter so a scan against a locked
+                        // project cannot flood the log (the counter keeps
+                        // the true rate).
+                        self.proxy_metrics.record_ip_access_denied();
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if let Some(suppressed) = IP_DENY_LOG_LIMITER.admit(now_secs) {
+                            warn!(
+                                environment_id = project_ctx.environment.id,
+                                project_id = project_ctx.project.id,
+                                ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                                suppressed_since_last_log = suppressed,
+                                "Request denied by project IP restriction"
+                            );
+                        }
+                    }
                 }
                 let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
                 response.insert_header("Cache-Control", "no-store")?;
@@ -9484,6 +9504,89 @@ mod ip_restriction_fail_closed_tests {
         ) -> bool {
             ip.is_none() || ip == Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)))
         }
+    }
+
+    fn allow_list_gate() -> crate::ip_access::ProjectIpAccessGate {
+        use temps_entities::project_ip_access_rules::{IpAccessCidrEntry, IpAccessCidrs, Model};
+        let now = chrono::Utc::now();
+        crate::ip_access::ProjectIpAccessGate::from_rows_for_tests(vec![Model {
+            id: 1,
+            project_id: 1,
+            environment_id: None,
+            mode: "allow".to_string(),
+            cidrs: IpAccessCidrs(vec![IpAccessCidrEntry {
+                cidr: "100.64.0.0/10".to_string(),
+                description: None,
+            }]),
+            updated_by: None,
+            created_at: now,
+            updated_at: now,
+        }])
+    }
+
+    /// Mirrors `resolve_session_client_ip` for a peer that is neither
+    /// loopback nor a trusted CDN: the forwarding headers must be ignored and
+    /// the socket peer used.
+    fn resolved_client_ip(
+        peer: IpAddr,
+        headers: &axum::http::HeaderMap,
+        trust_loopback: bool,
+    ) -> IpAddr {
+        normalize_client_ip(
+            crate::client_ip::resolve_loopback_client_ip(peer, headers, trust_loopback)
+                .unwrap_or(peer),
+        )
+    }
+
+    #[test]
+    fn spoofed_forwarding_headers_from_an_untrusted_peer_cannot_bypass_an_allow_list() {
+        let gate = allow_list_gate();
+        let mut headers = axum::http::HeaderMap::new();
+        // The attacker claims to be an address on the allow-list.
+        headers.insert("x-forwarded-for", "100.64.0.5".parse().unwrap());
+        headers.insert("x-real-ip", "100.64.0.5".parse().unwrap());
+        headers.insert("cf-connecting-ip", "100.64.0.5".parse().unwrap());
+        let peer: IpAddr = "198.51.100.9".parse().unwrap();
+
+        for trust_loopback in [false, true] {
+            let ip = resolved_client_ip(peer, &headers, trust_loopback);
+            assert_eq!(ip, peer, "headers from a public peer must be ignored");
+            assert!(ip_restriction_denies(&gate, 1, 10, Some(ip)));
+        }
+    }
+
+    #[test]
+    fn loopback_forwarded_ip_is_only_honoured_when_opted_in() {
+        let gate = allow_list_gate();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "100.64.0.5".parse().unwrap());
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Default: the loopback peer is what is evaluated, and is not allowed.
+        let ip = resolved_client_ip(peer, &headers, false);
+        assert!(ip_restriction_denies(&gate, 1, 10, Some(ip)));
+        // Opt-in: the local proxy's appended entry is the client.
+        let ip = resolved_client_ip(peer, &headers, true);
+        assert!(!ip_restriction_denies(&gate, 1, 10, Some(ip)));
+    }
+
+    #[test]
+    fn v4_mapped_peer_is_matched_as_its_v4_address() {
+        let gate = allow_list_gate();
+        let mapped: IpAddr = "::ffff:100.64.0.5".parse().unwrap();
+        assert!(!ip_restriction_denies(
+            &gate,
+            1,
+            10,
+            Some(normalize_client_ip(mapped))
+        ));
+        let mapped_denied: IpAddr = "::ffff:198.51.100.9".parse().unwrap();
+        assert!(ip_restriction_denies(
+            &gate,
+            1,
+            10,
+            Some(normalize_client_ip(mapped_denied))
+        ));
     }
 
     #[test]

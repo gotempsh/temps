@@ -119,6 +119,10 @@ pub const METRIC_STREAMING_SESSIONS: &str = "proxy.streaming_sessions";
 /// Requests rejected by an instance or project rate limit, or by a
 /// rate-limit blacklist entry (issue #1288).
 pub const METRIC_RATE_LIMITED: &str = "proxy.rate_limited";
+/// Requests refused (403) by a project/environment IP allow/deny list. One
+/// series for the whole proxy: the client IP, project and mode are
+/// deliberately not dimensions, so a flood cannot grow cardinality.
+pub const METRIC_IP_ACCESS_DENIED: &str = "proxy.ip_access_denied";
 pub const METRIC_STREAMING_DURATION_AVG: &str = "proxy.streaming_duration_avg_ms";
 
 /// Where a request was routed. The three variants are mutually exclusive and
@@ -193,6 +197,8 @@ pub struct ProxyMetrics {
     streaming_sum_ms: AtomicU64,
     /// Requests rejected by rate limiting (429) or a rate-limit blacklist (403).
     rate_limited: AtomicU64,
+    /// Requests refused by a project/environment IP access policy (403).
+    ip_access_denied: AtomicU64,
 }
 
 /// Find the histogram bucket for a duration.
@@ -301,6 +307,12 @@ impl ProxyMetrics {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one request refused by a project/environment IP access policy.
+    /// One relaxed atomic add.
+    pub fn record_ip_access_denied(&self) {
+        self.ip_access_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read a consistent-enough view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -322,6 +334,7 @@ impl ProxyMetrics {
             streaming_sessions: self.streaming_sessions.load(Ordering::Relaxed),
             streaming_sum_ms: self.streaming_sum_ms.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            ip_access_denied: self.ip_access_denied.load(Ordering::Relaxed),
         }
     }
 }
@@ -343,6 +356,7 @@ pub struct MetricsSnapshot {
     streaming_sessions: u64,
     streaming_sum_ms: u64,
     rate_limited: u64,
+    ip_access_denied: u64,
 }
 
 impl MetricsSnapshot {
@@ -379,6 +393,7 @@ impl MetricsSnapshot {
                 .saturating_sub(prev.streaming_sessions),
             streaming_sum_ms: self.streaming_sum_ms.saturating_sub(prev.streaming_sum_ms),
             rate_limited: self.rate_limited.saturating_sub(prev.rate_limited),
+            ip_access_denied: self.ip_access_denied.saturating_sub(prev.ip_access_denied),
         }
     }
 }
@@ -409,6 +424,7 @@ pub struct MetricsDelta {
     streaming_sessions: u64,
     streaming_sum_ms: u64,
     rate_limited: u64,
+    ip_access_denied: u64,
 }
 
 impl MetricsDelta {
@@ -483,6 +499,11 @@ impl MetricsDelta {
             ProxySample {
                 name: METRIC_RATE_LIMITED,
                 value: self.rate_limited as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_IP_ACCESS_DENIED,
+                value: self.ip_access_denied as f64,
                 is_counter: true,
             },
         ];
@@ -713,7 +734,7 @@ mod tests {
     fn test_samples_idle_interval_emits_only_counters() {
         let delta = MetricsDelta::default();
         let samples = delta.samples();
-        assert_eq!(samples.len(), 11);
+        assert_eq!(samples.len(), 12);
         assert!(samples.iter().all(|s| s.is_counter && s.value == 0.0));
     }
 
@@ -730,6 +751,22 @@ mod tests {
             .find(|s| s.name == METRIC_RATE_LIMITED)
             .map(|s| (s.value, s.is_counter));
         assert_eq!(rate_limited, Some((2.0, true)));
+    }
+
+    #[test]
+    fn test_ip_access_denials_are_counted_per_interval() {
+        let m = ProxyMetrics::default();
+        let first = m.snapshot();
+        m.record_ip_access_denied();
+        m.record_ip_access_denied();
+        m.record_ip_access_denied();
+        let delta = m.snapshot().delta_since(&first);
+        let denied = delta
+            .samples()
+            .into_iter()
+            .find(|s| s.name == METRIC_IP_ACCESS_DENIED)
+            .map(|s| (s.value, s.is_counter));
+        assert_eq!(denied, Some((3.0, true)));
     }
 
     /// Regression: a long-lived WebSocket/SSE session must not be booked as
