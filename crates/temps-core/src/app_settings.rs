@@ -1808,6 +1808,14 @@ pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 90;
 /// Default for [`AnalyticsRetentionSettings::unreferenced_ip_days`].
 pub const DEFAULT_UNREFERENCED_IP_RETENTION_DAYS: u32 = 30;
 
+/// Days added to the proxy-log window before a stored IP address may be
+/// deleted. An address's `last_used_at` is refreshed at most every 12 hours
+/// and a cached lookup reuses its id for 6 more, so the last log that points
+/// at an address can be written up to ~18 hours after the timestamp the
+/// sweep reads. A whole day covers that lag and the delay before the proxy
+/// applies a newly saved window.
+pub const IP_REFERENCE_SLACK_DAYS: u32 = 1;
+
 /// How long product analytics data, and the identifiers attached to it, are
 /// kept.
 ///
@@ -1896,7 +1904,10 @@ impl AnalyticsRetentionSettings {
     ) -> Self {
         let mut hold = stored_hold.filter(|until| *until > now);
         if next_days < previous_days {
-            let until = now + chrono::Duration::days(i64::from(previous_days));
+            let until = now
+                + chrono::Duration::days(
+                    i64::from(previous_days) + i64::from(IP_REFERENCE_SLACK_DAYS),
+                );
             hold = Some(hold.map_or(until, |existing| existing.max(until)));
         }
         self.ip_hold_until = hold;
@@ -2655,7 +2666,7 @@ mod tests {
 
         assert_eq!(
             settings.ip_hold_until,
-            Some(now + chrono::Duration::days(90)),
+            Some(now + chrono::Duration::days(90 + i64::from(IP_REFERENCE_SLACK_DAYS))),
             "logs written under the 90-day window can outlive the new 7-day one"
         );
     }

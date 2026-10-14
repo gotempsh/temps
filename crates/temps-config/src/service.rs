@@ -1687,6 +1687,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // a stale snapshot can neither erase a check the job just recorded nor
         // revert a key that was stored while this request was in flight.
         preserve_geo_recorded_state(&mut settings, &locked_settings, geo_license_key_intent);
+        // Lowering the proxy-log window must not delete addresses that older
+        // logs still point at. The hold is derived here, from the row this
+        // transaction locked, never from the handler's snapshot or the client:
+        // two saves racing from the same snapshot would otherwise compute the
+        // hold from a window one of them had already replaced.
+        settings.analytics_retention = settings.analytics_retention.clone().with_ip_hold(
+            locked_settings.analytics_retention.ip_hold_until,
+            locked_settings.observability_retention.proxy_logs_days,
+            settings.observability_retention.proxy_logs_days,
+            now,
+        );
 
         let previous_compression = existing
             .as_ref()
@@ -4516,6 +4527,48 @@ mod tests {
             .find(|s| s.starts_with("UPDATE "))
             .expect("settings update");
         assert!(update.contains(r#""allowed_node_ids":[0,3]"#), "{update}");
+    }
+
+    #[tokio::test]
+    async fn the_ip_hold_is_derived_from_the_locked_proxy_log_window() {
+        // The caller's snapshot may be older than the row this save locks: the
+        // window it lowers is the one stored, not the one it last read.
+        let mut locked = settings_row("old.example.test");
+        locked.data["observability_retention"] = serde_json::json!({ "proxy_logs_days": 90 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([vec![locked.clone()], vec![locked.clone()], vec![locked]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+        let mut lowered = AppSettings {
+            preview_domain: "new.example.test".into(),
+            ..Default::default()
+        };
+        lowered.observability_retention.proxy_logs_days = 7;
+        // A client-supplied hold is replaced, never trusted.
+        lowered.analytics_retention.ip_hold_until = Some(Utc::now() + chrono::Duration::days(1));
+
+        service
+            .update_settings(lowered)
+            .await
+            .expect("settings save lowering the window");
+        let saved = service.get_settings().await.expect("saved settings");
+
+        let hold = saved
+            .analytics_retention
+            .ip_hold_until
+            .expect("lowering the window from 90 days holds addresses");
+        let held_for = hold - Utc::now();
+        assert!(
+            held_for > chrono::Duration::days(90)
+                && held_for <= chrono::Duration::days(91) + chrono::Duration::minutes(1),
+            "held for the locked 90-day window plus the lookup slack, got {held_for}"
+        );
     }
 
     #[tokio::test]

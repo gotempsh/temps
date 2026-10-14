@@ -3528,14 +3528,6 @@ async fn update_settings(
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
     validate_analytics_retention(&settings.analytics_retention)?;
-    // Lowering the proxy-log window must not delete addresses that older logs
-    // still point at; the hold is derived here, never taken from the client.
-    settings.analytics_retention = settings.analytics_retention.clone().with_ip_hold(
-        stored_settings.analytics_retention.ip_hold_until,
-        stored_settings.observability_retention.proxy_logs_days,
-        settings.observability_retention.proxy_logs_days,
-        chrono::Utc::now(),
-    );
     validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
     normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;

@@ -6,11 +6,16 @@
 //! `updated_at` only advances once per `geo.stale_lookup_days`, so it cannot
 //! tell the retention cleanup that an address is still being looked up and
 //! cached by the proxy. `last_used_at` can: the lookup service advances it at
-//! most once an hour, and the cleanup only deletes addresses it has not
+//! most once every twelve hours, and the cleanup only deletes addresses it has not
 //! advanced within the retention window.
 //!
-//! The column is nullable with no default, which is a catalog-only change on
-//! PostgreSQL: no table rewrite, no lock held beyond the `ALTER`.
+//! The column is nullable with no default, so the `ALTER` is catalog-only. Rows
+//! that already exist are then stamped with the migration time: `updated_at`
+//! only advances every `geo.stale_lookup_days`, so it says nothing about when
+//! an address was last handed to a proxy log that may still be retained
+//! outside PostgreSQL. Treating it as the last use would let the first sweep
+//! delete addresses that logs written days ago still point at. Stamping gives
+//! every existing address one full retention window to be seen again.
 
 use sea_orm_migration::prelude::*;
 
@@ -29,6 +34,8 @@ impl MigrationTrait for Migration {
                                 AND table_name = 'ip_geolocations') THEN \
                      ALTER TABLE ip_geolocations \
                        ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ; \
+                     UPDATE ip_geolocations SET last_used_at = NOW() \
+                       WHERE last_used_at IS NULL; \
                    END IF; \
                  END $$",
             )

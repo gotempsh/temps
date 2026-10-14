@@ -32,7 +32,9 @@ use sea_orm::{
     TransactionTrait,
 };
 use serde::Serialize;
-use temps_core::{AnalyticsRetentionSettings, AuditLogger, AuditOperation};
+use temps_core::{
+    AnalyticsRetentionSettings, AuditLogger, AuditOperation, IP_REFERENCE_SLACK_DAYS,
+};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -247,18 +249,32 @@ impl AnalyticsRetentionService {
         // Visitors before addresses: a deleted visitor releases its address.
         if let Some(days) = settings.visitor_days {
             let cutoff = now - chrono::Duration::days(i64::from(days));
-            match self.purge_visitors(cutoff).await {
-                Ok(deleted) => report.visitors_deleted = deleted,
-                Err(error) => warn!(retention_days = days, %error, "visitor retention pass failed"),
+            // Counted into the report as each batch commits, so a later failure
+            // cannot erase the record of rows that are already gone.
+            if let Err(error) = self
+                .purge_visitors_counting(cutoff, &mut report.visitors_deleted)
+                .await
+            {
+                warn!(
+                    retention_days = days,
+                    visitors_deleted = report.visitors_deleted,
+                    %error,
+                    "visitor retention pass failed"
+                );
             }
         }
         if let Some(days) = settings.unreferenced_ip_days {
             let cutoff = now - chrono::Duration::days(i64::from(days));
-            match self.purge_unreferenced_ips(cutoff).await {
-                Ok(deleted) => report.ip_addresses_deleted = deleted,
-                Err(error) => {
-                    warn!(retention_days = days, %error, "IP address retention pass failed")
-                }
+            if let Err(error) = self
+                .purge_unreferenced_ips_counting(cutoff, &mut report.ip_addresses_deleted)
+                .await
+            {
+                warn!(
+                    retention_days = days,
+                    ip_addresses_deleted = report.ip_addresses_deleted,
+                    %error,
+                    "IP address retention pass failed"
+                );
             }
         }
 
@@ -390,6 +406,17 @@ impl AnalyticsRetentionService {
         cutoff: DateTime<Utc>,
     ) -> Result<u64, AnalyticsRetentionError> {
         let mut total = 0u64;
+        self.purge_visitors_counting(cutoff, &mut total).await?;
+        Ok(total)
+    }
+
+    /// [`Self::purge_visitors`], adding each committed batch to `total` as it
+    /// goes so the caller still has the count when a later batch fails.
+    async fn purge_visitors_counting(
+        &self,
+        cutoff: DateTime<Utc>,
+        total: &mut u64,
+    ) -> Result<(), AnalyticsRetentionError> {
         let mut batch_size = BATCH_SIZE;
         // Held for the whole pass, like the IP cursor: only one pass runs.
         let mut state = self.visitor_sweep.lock().await;
@@ -411,7 +438,7 @@ impl AnalyticsRetentionService {
                     deleted,
                     candidates,
                 } => {
-                    total += deleted;
+                    *total += deleted;
                     if (candidates as i64) < batch_size {
                         break;
                     }
@@ -448,7 +475,7 @@ impl AnalyticsRetentionService {
                 tokio::time::sleep(BATCH_PAUSE).await;
             }
         }
-        Ok(total)
+        Ok(())
     }
 
     async fn purge_visitor_batch(
@@ -531,9 +558,21 @@ impl AnalyticsRetentionService {
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<u64, AnalyticsRetentionError> {
+        let mut total = 0u64;
+        self.purge_unreferenced_ips_counting(cutoff, &mut total)
+            .await?;
+        Ok(total)
+    }
+
+    /// [`Self::purge_unreferenced_ips`], adding each committed batch to
+    /// `total` as it goes so the caller keeps the count across a later failure.
+    async fn purge_unreferenced_ips_counting(
+        &self,
+        cutoff: DateTime<Utc>,
+        total: &mut u64,
+    ) -> Result<(), AnalyticsRetentionError> {
         let references = self.existing_reference_columns().await?;
         let mut cursor = self.ip_cursor.lock().await;
-        let mut total = 0u64;
 
         for batch in 0..MAX_BATCHES_PER_RUN {
             let window = IpWindowRow::find_by_statement(Statement::from_sql_and_values(
@@ -584,7 +623,7 @@ impl AnalyticsRetentionService {
                         source,
                     )
                 })?;
-            total += deleted.len() as u64;
+            *total += deleted.len() as u64;
             *cursor = next;
 
             if reached_end {
@@ -595,7 +634,7 @@ impl AnalyticsRetentionService {
                 tokio::time::sleep(BATCH_PAUSE).await;
             }
         }
-        Ok(total)
+        Ok(())
     }
 
     /// The subset of [`IP_REFERENCES`] present in this database.
@@ -676,8 +715,11 @@ fn delete_unreferenced_sql(ids: &[i32], references: &[(&str, &str)]) -> String {
 /// an `ip_geolocation_id` that [`IP_REFERENCES`] cannot see. `last_used_at`
 /// advances whenever such a log is written, so keeping an address for at least
 /// the proxy-log window after its last lookup keeps it for as long as any of
-/// those logs can still point at it. The floor is the same whichever store is
-/// in use, so it needs no knowledge of which one that is.
+/// those logs can still point at it, plus [`IP_REFERENCE_SLACK_DAYS`]: the
+/// timestamp is refreshed at most every 12 hours and a cached lookup reuses
+/// the id for 6 more, so it can trail the newest log by that much. The floor
+/// is the same whichever store is in use, so it needs no knowledge of which
+/// one that is.
 ///
 /// Logs keep the window they were written with, so after the window is lowered
 /// the older logs outlive the new floor: while `ip_hold_until` is in the
@@ -694,7 +736,7 @@ pub fn effective_windows(
         } else {
             analytics
                 .unreferenced_ip_days
-                .map(|days| days.max(proxy_logs_days))
+                .map(|days| days.max(proxy_logs_days.saturating_add(IP_REFERENCE_SLACK_DAYS)))
         },
         ..analytics.clone()
     }
@@ -828,8 +870,9 @@ mod tests {
 
         assert_eq!(
             effective_windows(&settings, 90, Utc::now()).unreferenced_ip_days,
-            Some(90),
-            "logs kept for 90 days can still point at the address"
+            Some(90 + IP_REFERENCE_SLACK_DAYS),
+            "logs kept for 90 days can still point at the address, and last_used_at \
+             can trail the newest of them by up to a day"
         );
         assert_eq!(
             effective_windows(&settings, 7, Utc::now()).unreferenced_ip_days,
@@ -1051,6 +1094,60 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("deadlock detected"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_later_batch_failing_keeps_the_count_of_the_batches_already_committed() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([id_rows(1..=BATCH_SIZE as i32), id_rows([501])])
+            .append_exec_results([exec_ok(0), exec_ok(BATCH_SIZE as u64), exec_ok(0)])
+            .append_exec_errors([DbErr::Custom("deadlock detected".into())])
+            .into_connection();
+        let service = mock_service(db);
+        let mut deleted = 0u64;
+
+        let error = service
+            .purge_visitors_counting(Utc::now(), &mut deleted)
+            .await
+            .expect_err("the second batch fails");
+
+        assert!(error.to_string().contains("deadlock detected"), "{error}");
+        assert_eq!(
+            deleted, BATCH_SIZE as u64,
+            "the first batch is committed and must still be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_ip_batch_failing_keeps_the_count_of_the_batches_already_deleted() {
+        let window = |count: i32| -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+            (1..=count)
+                .map(|id| {
+                    std::collections::BTreeMap::from([
+                        ("id", sea_orm::Value::Int(Some(id))),
+                        ("updated_at", sea_orm::Value::from(Utc::now())),
+                    ])
+                })
+                .collect()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                Vec::<std::collections::BTreeMap<&'static str, sea_orm::Value>>::new(),
+                window(BATCH_SIZE as i32),
+                id_rows(1..=BATCH_SIZE as i32),
+            ])
+            .append_query_errors([DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let service = mock_service(db);
+        let mut deleted = 0u64;
+
+        let error = service
+            .purge_unreferenced_ips_counting(Utc::now(), &mut deleted)
+            .await
+            .expect_err("the second window query fails");
+
+        assert!(error.to_string().contains("connection reset"), "{error}");
+        assert_eq!(deleted, BATCH_SIZE as u64);
     }
 
     #[tokio::test]
