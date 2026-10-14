@@ -876,6 +876,7 @@ mod tests {
             mode: mode.into(),
             cidrs: IpAccessCidrs(cidrs.iter().map(|c| entry(c)).collect()),
             updated_by: None,
+            revision: 1,
             created_at: now,
             updated_at: now,
         }

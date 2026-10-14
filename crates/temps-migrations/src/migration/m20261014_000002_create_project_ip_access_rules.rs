@@ -8,6 +8,17 @@
 //! (including `mode = 'disabled'`, which exempts the environment from a
 //! project-wide list). The proxy loads every row into an in-memory snapshot,
 //! so the table is only ever read off the request path.
+//!
+//! # Change feed
+//!
+//! Proxies must notice a write within seconds without rescanning the table.
+//! Every insert/update draws a value from `project_ip_access_rules_revision_seq`
+//! into the row's `revision` (by trigger, so a manual edit is covered too), and
+//! every delete draws one into a short-lived tombstone. A proxy polls the
+//! sequence head (O(1)) and, only when it moved, reads the rows and tombstones
+//! above the revision it last applied. Tombstones are pruned after an hour by
+//! the delete trigger itself; a proxy that was away longer than a minute does
+//! a full reload anyway.
 
 use sea_orm_migration::prelude::*;
 
@@ -21,6 +32,8 @@ impl MigrationTrait for Migration {
             .get_connection()
             .execute_unprepared(
                 r#"
+CREATE SEQUENCE project_ip_access_rules_revision_seq;
+
 CREATE TABLE project_ip_access_rules (
     id SERIAL PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -32,6 +45,8 @@ CREATE TABLE project_ip_access_rules (
     -- service validates, canonicalises and bounds it before every write.
     cidrs JSONB NOT NULL DEFAULT '[]'::jsonb,
     updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    -- Change-feed position; assigned by trigger on every insert and update.
+    revision BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT project_ip_access_rules_mode_valid
@@ -46,9 +61,50 @@ CREATE TABLE project_ip_access_rules (
 CREATE UNIQUE INDEX project_ip_access_rules_scope_unique
     ON project_ip_access_rules (project_id, COALESCE(environment_id, 0));
 
--- The proxy's change-detection poll reads count + max(updated_at).
-CREATE INDEX project_ip_access_rules_updated_at
-    ON project_ip_access_rules (updated_at);
+-- Delta reads: rows changed since a proxy's last applied revision.
+CREATE INDEX project_ip_access_rules_revision
+    ON project_ip_access_rules (revision);
+
+-- A deleted rule leaves a scope behind so a proxy can drop it without
+-- listing every surviving rule. No foreign keys: the referenced rows are gone
+-- by definition (and project/environment deletes cascade through here).
+CREATE TABLE project_ip_access_rule_tombstones (
+    revision BIGINT PRIMARY KEY,
+    rule_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    environment_id INTEGER,
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX project_ip_access_rule_tombstones_deleted_at
+    ON project_ip_access_rule_tombstones (deleted_at);
+
+CREATE FUNCTION project_ip_access_rules_assign_revision() RETURNS trigger AS $$
+BEGIN
+    NEW.revision := nextval('project_ip_access_rules_revision_seq');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER project_ip_access_rules_assign_revision
+    BEFORE INSERT OR UPDATE ON project_ip_access_rules
+    FOR EACH ROW EXECUTE FUNCTION project_ip_access_rules_assign_revision();
+
+CREATE FUNCTION project_ip_access_rules_record_delete() RETURNS trigger AS $$
+BEGIN
+    DELETE FROM project_ip_access_rule_tombstones
+        WHERE deleted_at < NOW() - INTERVAL '1 hour';
+    INSERT INTO project_ip_access_rule_tombstones
+        (revision, rule_id, project_id, environment_id)
+        VALUES (nextval('project_ip_access_rules_revision_seq'),
+                OLD.id, OLD.project_id, OLD.environment_id);
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER project_ip_access_rules_record_delete
+    AFTER DELETE ON project_ip_access_rules
+    FOR EACH ROW EXECUTE FUNCTION project_ip_access_rules_record_delete();
 "#,
             )
             .await?;
@@ -58,7 +114,15 @@ CREATE INDEX project_ip_access_rules_updated_at
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .get_connection()
-            .execute_unprepared("DROP TABLE IF EXISTS project_ip_access_rules;")
+            .execute_unprepared(
+                r#"
+DROP TABLE IF EXISTS project_ip_access_rules;
+DROP TABLE IF EXISTS project_ip_access_rule_tombstones;
+DROP FUNCTION IF EXISTS project_ip_access_rules_assign_revision();
+DROP FUNCTION IF EXISTS project_ip_access_rules_record_delete();
+DROP SEQUENCE IF EXISTS project_ip_access_rules_revision_seq;
+"#,
+            )
             .await?;
         Ok(())
     }

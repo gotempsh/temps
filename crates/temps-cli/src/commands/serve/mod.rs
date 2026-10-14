@@ -1624,12 +1624,16 @@ mod serve_profile_tests {
         }
     }
 
-    /// Database for tests that resolve the built-in project IP gate: it
-    /// hydrates from `project_ip_access_rules` at startup, and an empty
-    /// table means no project has a policy.
+    /// Database for tests that resolve the built-in project IP gate: at
+    /// startup it reads the change-feed head, then loads
+    /// `project_ip_access_rules`; an empty table means no project has a
+    /// policy.
     fn db_with_no_ip_rules() -> Arc<temps_database::DbConnection> {
+        let head =
+            std::collections::BTreeMap::from([("revision", sea_orm::Value::BigInt(Some(0)))]);
         Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![head]])
                 .append_query_results(
                     [Vec::<temps_entities::project_ip_access_rules::Model>::new()],
                 )

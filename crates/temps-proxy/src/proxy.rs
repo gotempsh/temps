@@ -10122,6 +10122,7 @@ mod ip_restriction_fail_closed_tests {
                 description: None,
             }]),
             updated_by: None,
+            revision: 1,
             created_at: now,
             updated_at: now,
         }])

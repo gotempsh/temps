@@ -45,6 +45,9 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     pub cidrs: IpAccessCidrs,
     pub updated_by: Option<i32>,
+    /// Change-feed position, assigned by a database trigger on every write.
+    /// Read-only here: the proxy polls it to pick up edits made by any writer.
+    pub revision: i64,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -89,7 +92,7 @@ impl ActiveModelBehavior for ActiveModel {
         if insert && self.created_at.is_not_set() {
             self.created_at = Set(now);
         }
-        // Always bump: the proxy's change detection keys on max(updated_at).
+        // Always bump so `updated_at` reflects every save, even a no-op one.
         self.updated_at = Set(now);
         Ok(self)
     }
