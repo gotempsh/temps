@@ -211,10 +211,14 @@ function EnvironmentVariableRow({
   useEffect(() => {
     const guard = createCredentialRevealGuard()
     revealGuard.current = guard
-    // Drop plaintext whenever this row changes project, identity, or version.
+    // Drop revealed plaintext whenever this row changes project, identity, or
+    // version. The edit draft is deliberately left alone: the list polls, so
+    // `updated_at` can change while the editor is open, and clearing the draft
+    // there would leave `valueLoaded` true with an empty box that Save sends
+    // as an explicit empty value. The editor clears its own draft when it
+    // closes or saves.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setRevealedValue(undefined)
-    setEditValue('')
     return () => guard.invalidate()
   }, [revealScope])
 

@@ -22,6 +22,13 @@ export const ACTIVE_LIST_POLL_MS = 3_000
 export const IDLE_LIST_POLL_MS = 15_000
 
 /**
+ * Idle cadence for a list whose endpoint returns the whole history rather than
+ * a bounded page (a source's backups): each poll costs O(total), so it backs
+ * off further than {@link IDLE_LIST_POLL_MS}.
+ */
+export const UNBOUNDED_LIST_IDLE_POLL_MS = 30_000
+
+/**
  * A tab regaining focus refetches only data older than this. Quick alt-tabs
  * (and focus events fired by dialogs or iframes) therefore cost nothing, while
  * a list looked at again after a pause is never older than this.
@@ -39,15 +46,18 @@ const IN_PROGRESS_BACKUP_STATES = new Set(['pending', 'running'])
  * Poll interval for a source's Recent Backups list.
  *
  * A backup started by a schedule, the CLI or another operator has to appear
- * without a reload, and a running one has to reach its final state.
+ * without a reload, and a running one has to reach its final state. The
+ * listing is not paged server-side, so the idle cadence is the slower
+ * {@link UNBOUNDED_LIST_IDLE_POLL_MS}; polling stays fast only while something
+ * is actually running.
  */
 export function sourceBackupsRefetchInterval(
   backups: readonly { state: string }[] | undefined
 ): number {
-  return liveListInterval(
+  const inProgress =
     backups?.some((backup) => IN_PROGRESS_BACKUP_STATES.has(backup.state)) ??
-      false
-  )
+    false
+  return inProgress ? ACTIVE_LIST_POLL_MS : UNBOUNDED_LIST_IDLE_POLL_MS
 }
 
 /**
