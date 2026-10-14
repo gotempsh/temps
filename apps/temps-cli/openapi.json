@@ -17078,6 +17078,66 @@
         ],
         "type": "string"
       },
+      "DirectoryEntry": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/DirectoryEntryKind"
+          },
+          "name": {
+            "description": "Name within the directory, without any path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "DirectoryEntryKind": {
+        "description": "What a directory entry is. Symlinks are reported, never followed.",
+        "enum": [
+          "file",
+          "directory",
+          "symlink",
+          "other"
+        ],
+        "type": "string"
+      },
+      "DirectoryListingResponse": {
+        "properties": {
+          "entries": {
+            "description": "Directories first, then names in byte order.",
+            "items": {
+              "$ref": "#/components/schemas/DirectoryEntry"
+            },
+            "type": "array"
+          },
+          "exists": {
+            "description": "`false` when the path does not exist (not an error).",
+            "type": "boolean"
+          },
+          "is_dir": {
+            "description": "`false` when the path exists but is not a directory.",
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "truncated": {
+            "description": "More than the listing cap exist; `entries` holds the first of them.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "exists",
+          "is_dir",
+          "entries",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "DisableBlobResponse": {
         "description": "Response after disabling Blob service",
         "properties": {
@@ -133132,6 +133192,57 @@
           },
           "404": {
             "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/{id}/fs/list": {
+      "get": {
+        "operationId": "list_dir",
+        "parameters": [
+          {
+            "description": "Absolute path of a directory inside the sandbox",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryListingResponse"
+                }
+              }
+            },
+            "description": "Directory entries (exists=false when missing, is_dir=false for a file — not errors)"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "404": {
+            "description": "Sandbox not found"
           }
         },
         "security": [

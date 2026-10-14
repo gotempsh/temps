@@ -38,6 +38,7 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { problemDetail } from '@/lib/api-problem'
+import { SandboxDirectoryBrowser } from './SandboxDirectoryBrowser'
 import {
   DEFAULT_FILE_MODE,
   MAX_EDITABLE_BYTES,
@@ -81,8 +82,8 @@ interface SandboxFilesCardProps {
 /**
  * Open, edit and save one text file in a sandbox (`fs/read`, `fs/write`).
  *
- * There is no directory-listing endpoint yet, so files are addressed by
- * path rather than browsed.
+ * Directories are browsed through `fs/list`; a file can also be addressed
+ * by its absolute path.
  */
 export function SandboxFilesCard({
   sandboxId,
@@ -192,8 +193,8 @@ export function SandboxFilesCard({
           Open a text file by its absolute path, edit it and save it back into
           the sandbox; its permissions are kept, and you are asked first when a
           save would change ownership or a symbolic link. Opening a file again
-          reloads it and discards unsaved edits. Browsing directories needs a
-          listing endpoint that does not exist yet.
+          reloads it and discards unsaved edits. Pick a file from the directory
+          listing, or type its path.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -203,6 +204,15 @@ export function SandboxFilesCard({
             <AlertDescription>{blocked}</AlertDescription>
           </Alert>
         )}
+        <SandboxDirectoryBrowser
+          sandboxId={sandboxId}
+          workDir={workDir}
+          blocked={blocked !== null}
+          onOpenFile={(path) => {
+            form.setValue('path', path, { shouldValidate: true })
+            void openFile(path)
+          }}
+        />
         <Form {...form}>
           <form
             onSubmit={form.handleSubmit((values) =>

@@ -1035,6 +1035,67 @@ impl From<StatInfo> for StatResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ListDirQuery {
+    pub path: String,
+}
+
+/// What a directory entry is. Symlinks are reported, never followed.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DirectoryEntry {
+    /// Name within the directory, without any path.
+    pub name: String,
+    pub kind: DirectoryEntryKind,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DirectoryListingResponse {
+    pub path: String,
+    /// `false` when the path does not exist (not an error).
+    pub exists: bool,
+    /// `false` when the path exists but is not a directory.
+    pub is_dir: bool,
+    /// Directories first, then names in byte order.
+    pub entries: Vec<DirectoryEntry>,
+    /// More than the listing cap exist; `entries` holds the first of them.
+    pub truncated: bool,
+}
+
+impl From<crate::services::fs::DirListing> for DirectoryListingResponse {
+    fn from(listing: crate::services::fs::DirListing) -> Self {
+        use crate::services::fs::DirEntryKind;
+        Self {
+            path: listing.path,
+            exists: listing.exists,
+            is_dir: listing.is_dir,
+            entries: listing
+                .entries
+                .into_iter()
+                .map(|entry| DirectoryEntry {
+                    name: entry.name,
+                    kind: match entry.kind {
+                        DirEntryKind::File => DirectoryEntryKind::File,
+                        DirEntryKind::Directory => DirectoryEntryKind::Directory,
+                        DirEntryKind::Symlink => DirectoryEntryKind::Symlink,
+                        DirEntryKind::Other => DirectoryEntryKind::Other,
+                    },
+                })
+                .collect(),
+            truncated: listing.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainQuery {
     pub port: u16,
 }
@@ -2495,6 +2556,32 @@ pub async fn stat_path(
 
 #[utoipa::path(
     tag = "Sandboxes",
+    get,
+    path = "/v1/sandboxes/{id}/fs/list",
+    params(("path" = String, Query, description = "Absolute path of a directory inside the sandbox")),
+    responses(
+        (status = 200, description = "Directory entries (exists=false when missing, is_dir=false for a file — not errors)", body = DirectoryListingResponse),
+        (status = 400, description = "Validation error"),
+        (status = 404, description = "Sandbox not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_dir(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ListDirQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::ProjectsRead)?;
+    let listing = state
+        .sandbox_service
+        .fs_list(&id, auth.user_id(), &q.path)
+        .await?;
+    Ok(Json(DirectoryListingResponse::from(listing)))
+}
+
+#[utoipa::path(
+    tag = "Sandboxes",
     post,
     path = "/v1/sandboxes/{id}/fs/mkdir",
     request_body = MkdirBody,
@@ -2838,6 +2925,7 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
             post(write_files).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/v1/sandboxes/{id}/fs/stat", get(stat_path))
+        .route("/v1/sandboxes/{id}/fs/list", get(list_dir))
         .route("/v1/sandboxes/{id}/fs/mkdir", post(mkdir))
         .route("/v1/sandboxes/{id}/domain", get(domain))
         .route(
@@ -3231,6 +3319,36 @@ mod tests {
     #[test]
     fn stat_query_rejects_unknown_field() {
         assert_rejects_unknown::<StatQuery>(r#"{"path":"/a","extra":"b"}"#);
+    }
+
+    #[test]
+    fn list_dir_query_rejects_unknown_field() {
+        assert_rejects_unknown::<ListDirQuery>(r#"{"path":"/a","extra":"b"}"#);
+    }
+
+    #[test]
+    fn list_dir_response_uses_snake_case_kinds_and_keeps_order() {
+        use crate::services::fs::{DirEntry, DirEntryKind, DirListing};
+        let response = DirectoryListingResponse::from(DirListing {
+            path: "/work".into(),
+            exists: true,
+            is_dir: true,
+            entries: vec![
+                DirEntry {
+                    name: "src".into(),
+                    kind: DirEntryKind::Directory,
+                },
+                DirEntry {
+                    name: "link".into(),
+                    kind: DirEntryKind::Symlink,
+                },
+            ],
+            truncated: true,
+        });
+        let json = serde_json::to_value(&response).expect("serializes");
+        assert_eq!(json["entries"][0]["kind"], "directory");
+        assert_eq!(json["entries"][1]["kind"], "symlink");
+        assert_eq!(json["truncated"], true);
     }
 
     #[test]

@@ -30,6 +30,40 @@ pub struct StatInfo {
     pub size: u64,
 }
 
+/// Most entries one directory listing returns. A directory with more is
+/// reported as `truncated` rather than streamed without bound: the listing is
+/// held in memory on the control plane and rendered by a browser.
+pub const MAX_LIST_ENTRIES: usize = 1000;
+
+/// What a directory entry is, without following a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// One name in a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: DirEntryKind,
+}
+
+/// Output of `list_dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirListing {
+    pub path: String,
+    pub exists: bool,
+    pub is_dir: bool,
+    /// Directories first, then names in byte order. At most
+    /// [`MAX_LIST_ENTRIES`].
+    pub entries: Vec<DirEntry>,
+    /// The directory holds more than [`MAX_LIST_ENTRIES`] entries.
+    pub truncated: bool,
+}
+
 /// One entry in a batched filesystem write.
 #[derive(Debug, Clone)]
 pub struct BatchWriteEntry {
@@ -199,6 +233,46 @@ impl SandboxService {
         Ok(info)
     }
 
+    /// List the entries of a directory inside the sandbox.
+    ///
+    /// Like `stat`, a missing path is not an error (`exists: false`), and a
+    /// path that is not a directory reports `is_dir: false` with no entries.
+    /// Symlinks are reported as such and never followed, so a link cannot make
+    /// the listing wander outside the directory that was asked for.
+    pub async fn fs_list(
+        &self,
+        public_id: &str,
+        user_id: i32,
+        path: &str,
+    ) -> Result<DirListing, SandboxError> {
+        validate_absolute(path, "list")?;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
+        let handle = self
+            .registry()
+            .get(internal_id, public_id)
+            .await
+            .map_err(|e| Self::provider_err(public_id, e))?;
+
+        let cmd = vec!["sh".into(), "-c".into(), list_script(path)];
+        let result = self
+            .registry()
+            .provider()
+            .exec(&handle, cmd, HashMap::new(), None)
+            .await
+            .map_err(|e| file_op_err(public_id, "list", path.to_string(), e))?;
+
+        if result.exit_code != 0 {
+            return Err(SandboxError::FileOp {
+                sandbox_id: public_id.to_string(),
+                op: "list".into(),
+                path: path.to_string(),
+                reason: format!("list exited {}: {}", result.exit_code, result.stdout.trim()),
+            });
+        }
+        Ok(parse_list_output(path, &result.stdout))
+    }
+
     /// Write multiple files in one call. Mirrors `@vercel/sandbox`'s
     /// `writeFiles()`, which is the hot path for seeding project
     /// scaffolding (e.g. a generated Next.js app). Semantics:
@@ -316,6 +390,89 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
         });
     }
     Ok(())
+}
+
+/// Shell script that prints `missing`, `notdir`, `denied`, or `ok` followed by
+/// one `<k> <name>` line per entry (`k` is `f`, `d`, `l` or `o`).
+///
+/// Written for busybox `sh`: no `find -printf`, no arrays. Names are expanded
+/// by the shell's own globbing relative to the directory, so none of them is
+/// ever re-parsed as part of a command line. A name containing a newline would
+/// break the line framing and is skipped. One entry past the cap is emitted so
+/// the caller can tell "exactly the cap" from "more than the cap".
+fn list_script(path: &str) -> String {
+    format!(
+        "d={p}\n\
+         if [ ! -e \"$d\" ]; then echo missing; exit 0; fi\n\
+         if [ ! -d \"$d\" ]; then echo notdir; exit 0; fi\n\
+         cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
+         echo ok\n\
+         n=0\n\
+         for f in .[!.]* ..?* *; do\n\
+           if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi\n\
+           case \"$f\" in *'\n'*) continue;; esac\n\
+           if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; elif [ -f \"$f\" ]; then k=f; else k=o; fi\n\
+           printf '%s %s\\n' \"$k\" \"$f\"\n\
+           n=$((n+1))\n\
+           if [ \"$n\" -gt {cap} ]; then break; fi\n\
+         done\n",
+        p = shell_quote(path),
+        cap = MAX_LIST_ENTRIES,
+    )
+}
+
+/// Turn the output of [`list_script`] into a [`DirListing`].
+fn parse_list_output(path: &str, stdout: &str) -> DirListing {
+    let mut lines = stdout.lines();
+    let status = lines.next().map(str::trim).unwrap_or("");
+    let listing = |exists: bool, is_dir: bool| DirListing {
+        path: path.to_string(),
+        exists,
+        is_dir,
+        entries: Vec::new(),
+        truncated: false,
+    };
+    match status {
+        "missing" => return listing(false, false),
+        // A directory the sandbox user cannot enter: it exists and is a
+        // directory, its contents just are not visible.
+        "denied" => return listing(true, true),
+        "notdir" => return listing(true, false),
+        _ => {}
+    }
+
+    let mut entries: Vec<DirEntry> = lines
+        .filter_map(|line| {
+            let (kind, name) = line.split_once(' ')?;
+            if name.is_empty() {
+                return None;
+            }
+            let kind = match kind {
+                "f" => DirEntryKind::File,
+                "d" => DirEntryKind::Directory,
+                "l" => DirEntryKind::Symlink,
+                "o" => DirEntryKind::Other,
+                _ => return None,
+            };
+            Some(DirEntry {
+                name: name.to_string(),
+                kind,
+            })
+        })
+        .collect();
+
+    let truncated = entries.len() > MAX_LIST_ENTRIES;
+    entries.truncate(MAX_LIST_ENTRIES);
+    entries.sort_by(|a, b| {
+        let a_dir = a.kind == DirEntryKind::Directory;
+        let b_dir = b.kind == DirEntryKind::Directory;
+        b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
+    });
+    DirListing {
+        entries,
+        truncated,
+        ..listing(true, true)
+    }
 }
 
 /// POSIX single-quote escape — see `exec::shell_escape`. Duplicated here
@@ -447,5 +604,74 @@ mod tests {
             size: 0,
         };
         assert!(!s.exists);
+    }
+
+    #[test]
+    fn list_script_quotes_the_path_and_caps_the_listing() {
+        let script = list_script("/work space/it's");
+        assert!(script.starts_with("d='/work space/it'\\''s'\n"), "{script}");
+        assert!(script.contains("-gt 1000"), "{script}");
+    }
+
+    #[test]
+    fn parse_list_reports_missing_and_not_a_directory() {
+        let missing = parse_list_output("/nope", "missing\n");
+        assert!(!missing.exists && !missing.is_dir && missing.entries.is_empty());
+
+        let file = parse_list_output("/etc/hosts", "notdir\n");
+        assert!(file.exists && !file.is_dir && file.entries.is_empty());
+
+        let denied = parse_list_output("/root", "denied\n");
+        assert!(denied.exists && denied.is_dir && denied.entries.is_empty());
+    }
+
+    #[test]
+    fn parse_list_sorts_directories_first_and_keeps_awkward_names() {
+        let listing = parse_list_output(
+            "/work",
+            "ok\nf zebra.txt\nd src\nl current\nf  leading space\no fifo\nd .git\n",
+        );
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                ".git",
+                "src",
+                " leading space",
+                "current",
+                "fifo",
+                "zebra.txt"
+            ]
+        );
+        assert_eq!(listing.entries[3].kind, DirEntryKind::Symlink);
+        assert!(!listing.truncated);
+        assert!(listing.exists && listing.is_dir);
+    }
+
+    #[test]
+    fn parse_list_ignores_malformed_lines() {
+        let listing = parse_list_output("/work", "ok\nx unknown-kind\nnospace\nf \nf real\n");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "real");
+    }
+
+    #[test]
+    fn parse_list_flags_a_listing_over_the_cap() {
+        let mut out = String::from("ok\n");
+        for i in 0..=MAX_LIST_ENTRIES {
+            out.push_str(&format!("f file-{i:05}\n"));
+        }
+        let listing = parse_list_output("/big", &out);
+        assert!(listing.truncated);
+        assert_eq!(listing.entries.len(), MAX_LIST_ENTRIES);
+
+        let exact = parse_list_output(
+            "/big",
+            &out.lines()
+                .take(MAX_LIST_ENTRIES + 1)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(!exact.truncated, "exactly the cap is not truncated");
     }
 }

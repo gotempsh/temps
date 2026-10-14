@@ -8198,6 +8198,39 @@ export type DigestSections = {
  */
 export type Direction = 'both' | 'above' | 'below';
 
+export type DirectoryEntry = {
+    kind: DirectoryEntryKind;
+    /**
+     * Name within the directory, without any path.
+     */
+    name: string;
+};
+
+/**
+ * What a directory entry is. Symlinks are reported, never followed.
+ */
+export type DirectoryEntryKind = 'file' | 'directory' | 'symlink' | 'other';
+
+export type DirectoryListingResponse = {
+    /**
+     * Directories first, then names in byte order.
+     */
+    entries: Array<DirectoryEntry>;
+    /**
+     * `false` when the path does not exist (not an error).
+     */
+    exists: boolean;
+    /**
+     * `false` when the path exists but is not a directory.
+     */
+    is_dir: boolean;
+    path: string;
+    /**
+     * More than the listing cap exist; `entries` holds the first of them.
+     */
+    truncated: boolean;
+};
+
 /**
  * Response after disabling Blob service
  */
@@ -72513,6 +72546,40 @@ export type ExtendTimeoutResponses = {
 };
 
 export type ExtendTimeoutResponse = ExtendTimeoutResponses[keyof ExtendTimeoutResponses];
+
+export type ListDirData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query: {
+        /**
+         * Absolute path of a directory inside the sandbox
+         */
+        path: string;
+    };
+    url: '/v1/sandboxes/{id}/fs/list';
+};
+
+export type ListDirErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+};
+
+export type ListDirResponses = {
+    /**
+     * Directory entries (exists=false when missing, is_dir=false for a file — not errors)
+     */
+    200: DirectoryListingResponse;
+};
+
+export type ListDirResponse = ListDirResponses[keyof ListDirResponses];
 
 export type MkdirData = {
     body: MkdirBody;

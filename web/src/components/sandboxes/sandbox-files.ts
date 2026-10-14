@@ -43,6 +43,26 @@ export function defaultFilePath(workDir: string | null | undefined): string {
   return dir.startsWith('/') ? `${dir}/` : '/'
 }
 
+/** The directory the browser starts in: the work dir, else the root. */
+export function initialDirectory(workDir: string | null | undefined): string {
+  const dir = (workDir ?? '').trim().replace(/\/+$/, '')
+  return dir.startsWith('/') ? dir : '/'
+}
+
+/** The directory containing `path`; the root is its own parent. */
+export function parentDirectory(path: string): string {
+  const trimmed = path.replace(/\/+$/, '')
+  const cut = trimmed.lastIndexOf('/')
+  return cut <= 0 ? '/' : trimmed.slice(0, cut)
+}
+
+/** `name` inside `directory`, without doubling the separator at the root. */
+export function joinSandboxPath(directory: string, name: string): string {
+  return directory === '/' || directory === ''
+    ? `/${name}`
+    : `${directory.replace(/\/+$/, '')}/${name}`
+}
+
 /** UTF-8 text to base64, without `btoa` choking on non-Latin-1 text. */
 export function encodeText(text: string): string {
   const bytes = new TextEncoder().encode(text)

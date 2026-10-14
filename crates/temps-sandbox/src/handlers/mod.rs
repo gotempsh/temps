@@ -87,6 +87,7 @@ pub struct SandboxAppState {
         sandboxes::write_file,
         sandboxes::write_files,
         sandboxes::stat_path,
+        sandboxes::list_dir,
         sandboxes::mkdir,
         sandboxes::domain,
         sandboxes::set_preview_password,
@@ -133,6 +134,9 @@ pub struct SandboxAppState {
         sandboxes::ReadFileResponse,
         sandboxes::MkdirBody,
         sandboxes::StatResponse,
+        sandboxes::DirectoryListingResponse,
+        sandboxes::DirectoryEntry,
+        sandboxes::DirectoryEntryKind,
         sandboxes::SandboxDomainResponse,
         sandboxes::SetPreviewPasswordBody,
         sandboxes::PreviewShareLinkBody,
@@ -283,6 +287,7 @@ mod tests {
             "/v1/sandboxes/{id}/fs/write",
             "/v1/sandboxes/{id}/fs/write-batch",
             "/v1/sandboxes/{id}/fs/stat",
+            "/v1/sandboxes/{id}/fs/list",
             "/v1/sandboxes/{id}/fs/mkdir",
             "/v1/sandboxes/{id}/domain",
             "/v1/sandboxes/{id}/preview-password",
@@ -315,6 +320,7 @@ mod tests {
             "ExecBody",
             "SandboxResponse",
             "StatResponse",
+            "DirectoryListingResponse",
         ] {
             assert!(
                 components.schemas.contains_key(expected),

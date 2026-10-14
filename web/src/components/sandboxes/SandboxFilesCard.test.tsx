@@ -765,3 +765,120 @@ test('a backend with undocumented write semantics gets a hedged warning', async 
   expect(writes).toHaveLength(0)
   api.restore()
 })
+
+const WORK_DIR = '/home/temps/workspace'
+
+function listing(path: string, entries: { name: string; kind: string }[]) {
+  return jsonResponse({
+    path,
+    exists: true,
+    is_dir: true,
+    entries,
+    truncated: false,
+  })
+}
+
+function listedPath(request: Request) {
+  return new URL(request.url).searchParams.get('path')
+}
+
+test('the browser lists the work dir, enters a directory and opens a file from it', async () => {
+  const api = mockApi({
+    ...modeRoute(),
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) =>
+      listedPath(request) === WORK_DIR
+        ? listing(WORK_DIR, [
+            { name: 'src', kind: 'directory' },
+            { name: 'notes.txt', kind: 'file' },
+          ])
+        : listing(`${WORK_DIR}/src`, [{ name: 'main.ts', kind: 'file' }]),
+    'GET /v1/sandboxes/sbx_1/fs/stat': (request) =>
+      jsonResponse({
+        path: listedPath(request),
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 3,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': (request) =>
+      jsonResponse({
+        path: listedPath(request),
+        size: 3,
+        contents_b64: encodeText('hi\n'),
+      }),
+  })
+  const view = renderCard()
+
+  // Directories come first in the order the server returns them.
+  fireEvent.click(await view.findByRole('button', { name: /src/ }))
+  fireEvent.click(await view.findByRole('button', { name: /main\.ts/ }))
+
+  const editor = (await view.findByLabelText(
+    `Contents of ${WORK_DIR}/src/main.ts`
+  )) as HTMLTextAreaElement
+  expect(editor.value).toBe('hi\n')
+  expect((view.getByLabelText('File path') as HTMLInputElement).value).toBe(
+    `${WORK_DIR}/src/main.ts`
+  )
+  api.restore()
+})
+
+test('the up button climbs one directory and stops at the root', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) =>
+      listing(listedPath(request) ?? '', []),
+  })
+  const view = renderCard()
+
+  await view.findByText('This directory is empty.')
+  const up = view.getByRole('button', {
+    name: 'Up one directory',
+  }) as HTMLButtonElement
+  fireEvent.click(up)
+  await waitFor(() => expect(view.getByTitle('/home/temps')).toBeTruthy())
+  fireEvent.click(up)
+  fireEvent.click(up)
+  await waitFor(() => expect(view.getByTitle('/')).toBeTruthy())
+  expect(up.disabled).toBe(true)
+  api.restore()
+})
+
+test('a listing that failed says why instead of showing an empty folder', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      jsonResponse({ title: 'File Operation Failed', detail: 'boom' }, 500),
+  })
+  const view = renderCard()
+
+  await view.findByText(/Could not list \/home\/temps\/workspace/)
+  expect(view.queryByText('This directory is empty.')).toBeNull()
+  api.restore()
+})
+
+test('a stopped sandbox is never asked for a listing', () => {
+  const api = mockApi({})
+  const view = renderCard({ status: 'stopped', lifecycle: 'ephemeral' })
+
+  expect(
+    view.getByText('Directories can be browsed once the sandbox is running.')
+  ).toBeTruthy()
+  expect(api.called('GET', '/v1/sandboxes/sbx_1/fs/list')).toBe(false)
+  api.restore()
+})
+
+test('a truncated listing tells the operator the rest is not shown', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      jsonResponse({
+        path: WORK_DIR,
+        exists: true,
+        is_dir: true,
+        entries: [{ name: 'a.txt', kind: 'file' }],
+        truncated: true,
+      }),
+  })
+  const view = renderCard()
+
+  await view.findByText(/Only the first 1 entries are shown/)
+  api.restore()
+})
