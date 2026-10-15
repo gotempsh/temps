@@ -1773,7 +1773,9 @@ export function EnvironmentVariablesSettings({
     return <EnvironmentVariablesLoadingState />
   }
 
-  if (variablesFailed)
+  // A failed background refresh keeps the rows already loaded: replacing the
+  // table with this error view would unmount an open editor and its draft.
+  if (variablesFailed && envVariables === undefined)
     return (
       <div role="alert" className="space-y-3">
         <p>Could not load environment variables for {project.name}.</p>

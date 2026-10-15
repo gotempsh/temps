@@ -184,7 +184,14 @@ export function S3SourceDetail() {
   const runningBackupQueries = useQueries({
     queries: runningBackupIds.map((backupId) => ({
       ...getBackupOptions({ path: { id: backupId } }),
-      refetchInterval: ACTIVE_LIST_POLL_MS,
+      // Stop once the record is terminal (its cached state still feeds the
+      // overlay below); the listing refetch that follows drops it from here.
+      refetchInterval: (query: {
+        state: { data: { state: string } | undefined }
+      }) =>
+        query.state.data && !isBackupInProgress(query.state.data)
+          ? (false as const)
+          : ACTIVE_LIST_POLL_MS,
     })),
   })
   const settledRunningBackups = runningBackupQueries
