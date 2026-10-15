@@ -71,10 +71,13 @@ fn sorted_domains_query(
         DomainSortDirection::Asc => Order::Desc,
         DomainSortDirection::Desc => Order::Asc,
     };
-    query
-        .order_by_with_nulls(column, order, NullOrdering::Last)
-        .order_by(domains::Column::Domain, tiebreak.clone())
-        .order_by(domains::Column::Id, tiebreak)
+    let mut query = query.order_by_with_nulls(column, order, NullOrdering::Last);
+    // Sorting by the domain name already orders by that column; repeating it
+    // as a tiebreaker would only add a redundant key.
+    if !matches!(sort, DomainSort::Domain) {
+        query = query.order_by(domains::Column::Domain, tiebreak.clone());
+    }
+    query.order_by(domains::Column::Id, tiebreak)
 }
 
 #[derive(Error, Debug)]
@@ -2219,6 +2222,16 @@ mod tests {
             assert!(sql.contains("LIKE '%example%'"), "{sql}");
             assert!(sql.contains("LIMIT 20 OFFSET 20"), "{sql}");
         }
+        // Sorting by name must not repeat the column as its own tiebreaker.
+        let by_name = sorted_domains_query(None, DomainSort::Domain, DomainSortDirection::Asc)
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(
+            by_name.contains(
+                "ORDER BY \"domains\".\"domain\" ASC NULLS LAST, \"domains\".\"id\" DESC"
+            ),
+            "{by_name}"
+        );
         for (sort, column) in [
             (DomainSort::Domain, "domain"),
             (DomainSort::Status, "status"),

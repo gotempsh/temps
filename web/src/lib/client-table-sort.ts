@@ -19,6 +19,16 @@ export function nextTableSort<Key extends string>(
   }
 }
 
+/**
+ * Sort rows by `value`, with missing values last in both directions.
+ *
+ * Ties are not "stable in both directions": descending keeps the incoming
+ * order and ascending reverses it, so a header click that flips the direction
+ * always visibly reorders rows that compare equal. Callers that need a
+ * specific secondary order should fold it into `value` (for example by
+ * returning a composite string) rather than rely on the incoming order.
+ * Rows whose value is missing keep their incoming order in both directions.
+ */
 export function sortTableRows<Row>(
   rows: readonly Row[],
   value: (row: Row) => string | number | null | undefined,
