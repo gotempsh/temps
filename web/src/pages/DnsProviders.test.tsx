@@ -159,3 +159,27 @@ test('a refused provider read offers no Retry', () => {
   expect(html).not.toContain('Retry')
   client.clear()
 })
+
+test('a downgraded role loses Test and Delete on already-fetched providers', () => {
+  const client = createClient()
+  client.setQueryData(providersKey, [
+    {
+      id: 4,
+      name: 'Example DNS',
+      provider_type: 'cloudflare',
+      description: null,
+      is_active: true,
+      flat_hostnames_supported: false,
+      credentials: {},
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    },
+  ])
+  const restricted = render(client, 'user')
+  expect(restricted).toContain('Example DNS')
+  expect(restricted).not.toContain('>Test<')
+  const admin = render(client, 'admin')
+  expect(admin).toContain('Example DNS')
+  expect(admin).toContain('Test')
+  client.clear()
+})
