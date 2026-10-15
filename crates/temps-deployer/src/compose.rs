@@ -72,6 +72,9 @@ struct SnapshotInterpolation {
     /// See [`ComposeCheckInput::defer_unknown_required`].
     defer_required: bool,
     deferred_required: BTreeSet<String>,
+    /// Services the deployment removes; see
+    /// [`compose_interpolation::interpolate_project_document`].
+    excluded_services: Vec<String>,
     /// Referenced files as written, before interpolation; see
     /// [`ResolvedComposeConfiguration::referenced_sources`].
     sources: Vec<String>,
@@ -89,18 +92,24 @@ impl SnapshotInterpolation {
 }
 
 /// Interpolate one document, deferring unset required variables when the
-/// check runs without the deployment's generated variables.
+/// check runs without the deployment's generated variables. `excluded` lists
+/// the excluded services when the document's `services` are project services
+/// (the root file, the override, an include, the merged model), and is empty
+/// for an `extends` source, whose services a kept service may inherit.
 fn interpolate_for_check(
     document: &str,
     content: &str,
     variables: &HashMap<String, String>,
     defer_required: bool,
+    excluded: &[String],
 ) -> Result<compose_interpolation::InterpolatedDocument, InterpolationError> {
-    if defer_required {
-        compose_interpolation::interpolate_document_deferring_required(document, content, variables)
-    } else {
-        compose_interpolation::interpolate_document(document, content, variables)
-    }
+    compose_interpolation::interpolate_project_document(
+        document,
+        content,
+        variables,
+        defer_required,
+        excluded,
+    )
 }
 
 struct ComposeReferenceSnapshots {
@@ -108,7 +117,9 @@ struct ComposeReferenceSnapshots {
     interpolation: SnapshotInterpolation,
     files: Vec<tempfile::NamedTempFile>,
     remote: HashMap<String, (PathBuf, PathBuf)>,
-    resolved: HashMap<(PathBuf, PathBuf, u64), PathBuf>,
+    /// Keyed by file, working directory, include scope, and whether the
+    /// file's services are project services (see [`interpolate_for_check`]).
+    resolved: HashMap<(PathBuf, PathBuf, u64, bool), PathBuf>,
     active: HashSet<PathBuf>,
     bytes: usize,
 }
@@ -3696,15 +3707,22 @@ impl ComposeExecutor {
         variables: &HashMap<String, String>,
     ) -> Result<ResolvedComposeConfiguration, ComposeError> {
         let defer = input.defer_unknown_required;
-        let content = interpolate_for_check("compose file", input.content, variables, defer)?;
+        let excluded = input.excluded_services;
+        let content =
+            interpolate_for_check("compose file", input.content, variables, defer, excluded)?;
         let mut unset_variables = content.unset_variables;
         let mut referenced_variables = content.referenced_variables;
         let mut deferred_required_variables = content.deferred_required;
         let content = content.content;
         let override_content = match input.override_content {
             Some(override_content) if !override_content.trim().is_empty() => {
-                let interpolated =
-                    interpolate_for_check("compose override", override_content, variables, defer)?;
+                let interpolated = interpolate_for_check(
+                    "compose override",
+                    override_content,
+                    variables,
+                    defer,
+                    excluded,
+                )?;
                 unset_variables.extend(interpolated.unset_variables);
                 referenced_variables.extend(interpolated.referenced_variables);
                 deferred_required_variables.extend(interpolated.deferred_required);
@@ -3742,6 +3760,7 @@ impl ComposeExecutor {
             return Ok(resolved);
         }
         let mut snapshots_variables = SnapshotInterpolation::new(variables.clone(), defer);
+        snapshots_variables.excluded_services = excluded.to_vec();
         let (merged, command) = self
             .run_compose_config(
                 input,
@@ -4276,6 +4295,7 @@ impl ComposeExecutor {
             &resolved,
             &interpolation.variables,
             interpolation.defer_required,
+            &interpolation.excluded_services,
         )?;
         interpolation
             .deferred_required
@@ -4482,7 +4502,7 @@ impl ComposeExecutor {
                     .get_mut("extends")
                     .and_then(|v| v.get_mut("file"))
                 {
-                    self.snapshot_compose_reference(scope, base, file, None, snapshots)
+                    self.snapshot_compose_reference(scope, base, file, None, false, snapshots)
                         .await?;
                 }
             }
@@ -4557,7 +4577,7 @@ impl ComposeExecutor {
         snapshots: &mut ComposeReferenceSnapshots,
     ) -> Result<(), ComposeError> {
         if include.is_string() {
-            self.snapshot_compose_reference(scope, base, include, None, snapshots)
+            self.snapshot_compose_reference(scope, base, include, None, true, snapshots)
                 .await?;
             return Ok(());
         }
@@ -4588,6 +4608,7 @@ impl ComposeExecutor {
                             base,
                             path,
                             working_directory.as_deref(),
+                            true,
                             snapshots,
                         )
                         .await?;
@@ -4601,6 +4622,7 @@ impl ComposeExecutor {
                     base,
                     path,
                     project_directory.as_deref(),
+                    true,
                     snapshots,
                 )
                 .await?;
@@ -4782,6 +4804,7 @@ impl ComposeExecutor {
         base: &Path,
         reference: &mut Value,
         working_directory: Option<&Path>,
+        project_services: bool,
         snapshots: &mut ComposeReferenceSnapshots,
     ) -> Result<PathBuf, ComposeError> {
         let file = reference
@@ -4806,6 +4829,7 @@ impl ComposeExecutor {
             path.clone(),
             directory.clone(),
             snapshots.interpolation.scope_id,
+            project_services,
         );
         let snapshot = if let Some(snapshot) = snapshots.resolved.get(&key) {
             snapshot.clone()
@@ -4841,11 +4865,17 @@ impl ComposeExecutor {
             // Referenced files are interpolated with the variables in scope
             // (the root file's, plus an include's env file), so their values
             // are validated as deployed.
+            let excluded: &[String] = if project_services {
+                &snapshots.interpolation.excluded_services
+            } else {
+                &[]
+            };
             let interpolated = interpolate_for_check(
                 "Compose reference",
                 &content,
                 &snapshots.interpolation.variables,
                 snapshots.interpolation.defer_required,
+                excluded,
             )?;
             snapshots
                 .interpolation
@@ -17305,6 +17335,132 @@ services:
             "{}",
             resolved.content
         );
+    }
+
+    fn excluded_db_input<'a>(
+        project_dir: Option<&'a Path>,
+        content: &'a str,
+        override_content: Option<&'a str>,
+        excluded_services: &'a [String],
+        environment: &'a HashMap<String, String>,
+        allow_cli: bool,
+    ) -> ComposeCheckInput<'a> {
+        ComposeCheckInput {
+            project_name: "temps-excluded-required-test",
+            project_dir,
+            compose_file: "compose.yml",
+            content,
+            override_content,
+            excluded_services,
+            environment,
+            repository_env: None,
+            filesystem_checks: false,
+            allow_cli,
+            defer_unknown_required: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_services_never_block_on_their_required_variables() {
+        let executor = executor_with_checks_disabled(&[]);
+        let content = "services:\n  app:\n    image: nginx:alpine\n  db:\n    image: postgres:16\n    environment:\n      POSTGRES_PASSWORD: ${DB_PASSWORD:?required}\n";
+        let excluded = vec!["db".to_string()];
+        let environment = HashMap::new();
+        let checked = executor
+            .check_configuration(&excluded_db_input(
+                None,
+                content,
+                None,
+                &excluded,
+                &environment,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert!(!checked.content.contains("postgres"), "{}", checked.content);
+        // Discovery still sees every service.
+        assert!(checked.resolved_content.contains("postgres:16"));
+        assert!(checked.resolution.unset_variables.is_empty());
+        assert!(!checked
+            .resolution
+            .referenced_variables
+            .contains("DB_PASSWORD"));
+
+        // A service that runs still requires its variables.
+        let error = executor
+            .check_configuration(&excluded_db_input(
+                None,
+                content,
+                None,
+                &[],
+                &environment,
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn excluded_included_services_never_block_but_extends_sources_still_do() {
+        if !compose_cli_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("stack")).unwrap();
+        std::fs::write(
+            root.path().join("stack/db.yaml"),
+            "services:\n  db:\n    image: postgres:16\n    environment:\n      POSTGRES_PASSWORD: ${DB_PASSWORD:?required}\n",
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include, PolicyCheck::Extends]);
+        let excluded = vec!["db".to_string()];
+        let environment = HashMap::new();
+        let included = "include: [stack/db.yaml]\nservices:\n  app:\n    image: nginx:alpine\n";
+        let checked = executor
+            .check_configuration(&excluded_db_input(
+                Some(root.path()),
+                included,
+                None,
+                &excluded,
+                &environment,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert!(!checked.content.contains("postgres"), "{}", checked.content);
+
+        // The override may configure the excluded service too.
+        let override_content =
+            "services:\n  db:\n    environment:\n      EXTRA: ${DB_EXTRA:?required}\n";
+        let checked = executor
+            .check_configuration(&excluded_db_input(
+                Some(root.path()),
+                "services:\n  app:\n    image: nginx:alpine\n  db:\n    image: postgres:16\n",
+                Some(override_content),
+                &excluded,
+                &environment,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert!(!checked.content.contains("postgres"), "{}", checked.content);
+
+        // `app` inherits the extended service's values, so they must resolve
+        // even though a project service of the same name is excluded.
+        let extended = "services:\n  app:\n    image: nginx:alpine\n    extends:\n      file: stack/db.yaml\n      service: db\n";
+        let error = executor
+            .check_configuration(&excluded_db_input(
+                Some(root.path()),
+                extended,
+                None,
+                &excluded,
+                &environment,
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
     }
 
     #[tokio::test]

@@ -82,6 +82,10 @@ struct Substitution<'a> {
     /// When present, unset required variables are recorded here and
     /// substituted as empty instead of failing.
     deferred: Option<&'a mut BTreeSet<String>>,
+    /// Inside a service the deployment excludes: an unsatisfied required
+    /// variable resolves to its current value (empty) instead of failing,
+    /// because that service is removed before anything runs.
+    ignore_required: bool,
     remaining: usize,
 }
 
@@ -115,7 +119,7 @@ pub fn interpolate_document(
     content: &str,
     variables: &HashMap<String, String>,
 ) -> Result<InterpolatedDocument, InterpolationError> {
-    interpolate(document, content, variables, false)
+    interpolate(document, content, variables, false, &[])
 }
 
 /// [`interpolate_document`] for checks that run without the deployment's
@@ -130,7 +134,29 @@ pub fn interpolate_document_deferring_required(
     content: &str,
     variables: &HashMap<String, String>,
 ) -> Result<InterpolatedDocument, InterpolationError> {
-    interpolate(document, content, variables, true)
+    interpolate(document, content, variables, true, &[])
+}
+
+/// Interpolate a document whose `services` are project services, of which
+/// `excluded_services` will be removed before anything is validated or run.
+/// Their values are still substituted, so the resolved document lists every
+/// service, but nothing in them can fail the resolution or be reported: an
+/// unsatisfied required variable resolves to its current (empty) value, and
+/// their variables are not counted as referenced, unset or deferred.
+pub fn interpolate_project_document(
+    document: &str,
+    content: &str,
+    variables: &HashMap<String, String>,
+    defer_required: bool,
+    excluded_services: &[String],
+) -> Result<InterpolatedDocument, InterpolationError> {
+    interpolate(
+        document,
+        content,
+        variables,
+        defer_required,
+        excluded_services,
+    )
 }
 
 fn interpolate(
@@ -138,6 +164,7 @@ fn interpolate(
     content: &str,
     variables: &HashMap<String, String>,
     defer_required: bool,
+    excluded_services: &[String],
 ) -> Result<InterpolatedDocument, InterpolationError> {
     if !content.contains('$') {
         return Ok(InterpolatedDocument {
@@ -161,6 +188,8 @@ fn interpolate(
         remaining: MAX_INTERPOLATED_BYTES,
         defer_required,
         deferred: BTreeSet::new(),
+        excluded_services,
+        in_excluded_service: false,
     };
     let mut location = String::new();
     state.walk(&mut root, &mut location)?;
@@ -195,6 +224,9 @@ struct WalkState<'a> {
     remaining: usize,
     defer_required: bool,
     deferred: BTreeSet<String>,
+    /// See [`interpolate_project_document`].
+    excluded_services: &'a [String],
+    in_excluded_service: bool,
 }
 
 impl WalkState<'_> {
@@ -213,6 +245,7 @@ impl WalkState<'_> {
                     unset: &mut self.unset,
                     referenced: &mut self.referenced,
                     deferred: self.defer_required.then_some(&mut self.deferred),
+                    ignore_required: self.in_excluded_service,
                     remaining: self.remaining,
                 };
                 let resolved = substitute(text, &mut substitution, 0)?;
@@ -248,7 +281,15 @@ impl WalkState<'_> {
                     }
                     push_location(location, &key);
                     let had_template = matches!(item, Value::String(text) if text.contains('$'));
-                    self.walk(item, location)?;
+                    let excluded = !self.in_excluded_service
+                        && location.len() == "services.".len() + key.len()
+                        && location.starts_with("services.")
+                        && self.excluded_services.contains(&key);
+                    if excluded {
+                        self.walk_excluded_service(item, location)?;
+                    } else {
+                        self.walk(item, location)?;
+                    }
                     if had_template && !free_form_parent {
                         cast_resolved_scalar(&key, item);
                     }
@@ -259,6 +300,25 @@ impl WalkState<'_> {
             Value::Tagged(tagged) => self.walk(&mut tagged.value, location),
             Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
         }
+    }
+
+    /// Walk a service the deployment excludes, keeping what it records out
+    /// of the document's results.
+    fn walk_excluded_service(
+        &mut self,
+        value: &mut Value,
+        location: &mut String,
+    ) -> Result<(), InterpolationError> {
+        let unset = std::mem::take(&mut self.unset);
+        let referenced = std::mem::take(&mut self.referenced);
+        let deferred = std::mem::take(&mut self.deferred);
+        self.in_excluded_service = true;
+        let result = self.walk(value, location);
+        self.in_excluded_service = false;
+        self.unset = unset;
+        self.referenced = referenced;
+        self.deferred = deferred;
+        result
     }
 }
 
@@ -516,7 +576,7 @@ fn resolve_braced(
         } else {
             set
         };
-        if satisfied {
+        if satisfied || state.ignore_required {
             return Ok(current);
         }
         if !set {
@@ -732,6 +792,7 @@ fn expand_dotenv_value(
         unset: &mut unset,
         referenced: &mut referenced,
         deferred: None,
+        ignore_required: false,
         remaining: *remaining,
     };
     match substitute(raw, &mut state, 0) {
@@ -773,6 +834,7 @@ mod tests {
             unset: &mut unset,
             referenced: &mut referenced,
             deferred: None,
+            ignore_required: false,
             remaining: MAX_INTERPOLATED_BYTES,
         };
         substitute(input, &mut state, 0)
@@ -998,5 +1060,43 @@ mod tests {
             interpolate_document_deferring_required("compose file", content, &empty),
             Err(InterpolationError::RequiredVariableMissing { .. })
         ));
+    }
+
+    #[test]
+    fn excluded_services_never_fail_or_report_their_variables() {
+        let content = "services:\n  app:\n    image: nginx:${TAG}\n  db:\n    image: postgres:${DB_TAG}\n    environment:\n      POSTGRES_PASSWORD: ${DB_PASSWORD:?required}\n      EMPTY: ${DB_EMPTY:?required}\nx-db:\n  password: ${OTHER:?required}\n";
+        let variables = vars(&[("TAG", "1"), ("DB_EMPTY", "")]);
+        let excluded = vec!["db".to_string()];
+        // A top-level extension is not a service: it still fails.
+        assert!(matches!(
+            interpolate_project_document("compose file", content, &variables, false, &excluded),
+            Err(InterpolationError::RequiredVariableMissing { variable, .. }) if variable == "OTHER"
+        ));
+        let content = content.split("x-db:").next().unwrap_or_default();
+        for defer in [false, true] {
+            let resolved =
+                interpolate_project_document("compose file", content, &variables, defer, &excluded)
+                    .unwrap();
+            assert!(resolved.content.contains("nginx:1"));
+            // The excluded service is still listed for discovery.
+            assert!(resolved.content.contains("postgres:"));
+            assert_eq!(
+                resolved.referenced_variables,
+                vars(&[("TAG", "")]).into_keys().collect()
+            );
+            assert!(resolved.unset_variables.is_empty());
+            assert!(resolved.deferred_required.is_empty());
+        }
+        // Without the exclusion the same service fails deployment.
+        assert!(matches!(
+            interpolate_project_document("compose file", content, &variables, false, &[]),
+            Err(InterpolationError::RequiredVariableMissing { .. })
+        ));
+        // A service merely named like an excluded one elsewhere is not exempt.
+        let nested = "services:\n  app:\n    image: nginx\n    labels:\n      db: ${DB_PASSWORD:?required}\n";
+        assert!(
+            interpolate_project_document("compose file", nested, &variables, false, &excluded)
+                .is_err()
+        );
     }
 }
