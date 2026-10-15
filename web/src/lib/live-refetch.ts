@@ -75,6 +75,56 @@ export function inProgressBackupIds(
 }
 
 /**
+ * Rows of a source's listing with the final state of any backup that has
+ * settled according to its own followed record.
+ *
+ * The listing is refetched once when a followed backup settles, but that
+ * refetch can fail (and a heavy history no longer polls on a timer), which
+ * would leave a finished backup showing as running. Overlaying the record's
+ * state makes the row correct regardless; the next successful listing fetch
+ * replaces it with the server's copy.
+ */
+export function withSettledBackupStates<
+  T extends {
+    backup_id: string
+    state: string
+    size_bytes?: number | null
+  },
+>(
+  backups: readonly T[],
+  records: readonly (
+    | {
+        backup_id: string
+        state: string
+        size_bytes?: number | null
+      }
+    | undefined
+  )[]
+): T[] {
+  const settled = new Map<
+    string,
+    { state: string; size_bytes?: number | null }
+  >()
+  for (const record of records) {
+    if (record && !isBackupInProgress(record)) {
+      settled.set(record.backup_id, record)
+    }
+  }
+  if (settled.size === 0) return backups as T[]
+  return backups.map((backup) => {
+    const final = settled.get(backup.backup_id)
+    if (!final || !backup.backup_id || !isBackupInProgress(backup)) {
+      return backup
+    }
+    return {
+      ...backup,
+      state: final.state,
+      size_bytes: final.size_bytes ?? backup.size_bytes,
+    }
+  })
+}
+
+/**
  * Poll interval for a source's Recent Backups list itself.
  *
  * A backup started by a schedule, the CLI or another operator has to appear

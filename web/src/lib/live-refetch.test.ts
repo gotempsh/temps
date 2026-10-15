@@ -13,6 +13,7 @@ import {
   liveListInterval,
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
+  withSettledBackupStates,
 } from './live-refetch'
 
 describe('liveListInterval', () => {
@@ -82,5 +83,40 @@ describe('refetchOnFocusWhenStale', () => {
     expect(refetchOnFocusWhenStale({ state: { dataUpdatedAt: 0 } }, now)).toBe(
       false
     )
+  })
+})
+
+describe('withSettledBackupStates', () => {
+  const rows = [
+    { backup_id: 'a', state: 'running', size_bytes: null },
+    { backup_id: 'b', state: 'completed', size_bytes: 5 },
+    { backup_id: '', state: 'running', size_bytes: null },
+  ]
+
+  test('shows the final state of a backup that settled on its own record', () => {
+    const result = withSettledBackupStates(rows, [
+      { backup_id: 'a', state: 'completed', size_bytes: 42 },
+    ])
+    expect(result[0]).toEqual({
+      backup_id: 'a',
+      state: 'completed',
+      size_bytes: 42,
+    })
+    expect(result[1]).toBe(rows[1])
+  })
+
+  test('keeps rows whose record is still in progress or unknown', () => {
+    const result = withSettledBackupStates(rows, [
+      { backup_id: 'a', state: 'running' },
+      undefined,
+    ])
+    expect(result).toBe(rows)
+  })
+
+  test('never rewrites rows without a database id', () => {
+    const result = withSettledBackupStates(rows, [
+      { backup_id: '', state: 'failed' },
+    ])
+    expect(result[2]).toBe(rows[2])
   })
 })

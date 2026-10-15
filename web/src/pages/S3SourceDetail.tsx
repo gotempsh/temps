@@ -102,6 +102,7 @@ import {
   ACTIVE_LIST_POLL_MS,
   inProgressBackupIds,
   isBackupInProgress,
+  withSettledBackupStates,
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
 } from '@/lib/live-refetch'
@@ -321,13 +322,20 @@ export function S3SourceDetail() {
 
   usePageTitle(source?.name || 'S3 Source Details')
 
+  // Rows of a backup that has settled on its own record show the final state
+  // even when the listing refetch that follows has not (yet) succeeded.
   const sortedBackups = useMemo(
     () =>
-      [...(backupIndex?.backups || [])].sort(
+      [
+        ...withSettledBackupStates(
+          backupIndex?.backups ?? [],
+          runningBackupQueries.map((result) => result.data)
+        ),
+      ].sort(
         (a, b) =>
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
       ),
-    [backupIndex]
+    [backupIndex, runningBackupQueries]
   )
 
   // Client-side filter + pagination over the recent-backups list. The list
