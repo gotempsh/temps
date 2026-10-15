@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { Eye, EyeOff } from 'lucide-react'
-import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
-import {
-  createCredentialRevealGuard,
-  credentialValueForScope,
-  type ScopedCredentialValue,
-} from '@/lib/credential-reveal-state'
 import { getEnvVarValue } from '@/lib/resolved-env-vars'
+import {
+  createValueReveal,
+  type ValueRevealState,
+} from '@/lib/value-reveal-controller'
 import { EnvironmentVariableValue } from './EnvironmentVariableValue'
 
 const MASK = '••••••••••••'
@@ -34,26 +32,6 @@ export function EnvironmentVariableRevealValue({
   /** Changes whenever the stored value changes, so stale plaintext is dropped. */
   version: string
 }) {
-  const [isVisible, setIsVisible] = useState(false)
-  const [revealed, setRevealed] = useState<ScopedCredentialValue | undefined>()
-  const scope = `${projectId}:${variableId}:${version}`
-  const guard = useRef(createCredentialRevealGuard())
-
-  useEffect(() => {
-    const next = createCredentialRevealGuard()
-    guard.current = next
-    // Drop plaintext whenever the variable changes identity or version.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setRevealed(undefined)
-    setIsVisible(false)
-    return () => next.invalidate()
-  }, [scope])
-
-  const reveal = useMutation({
-    mutationFn: () => getEnvVarValue(projectId, name, variableId),
-    meta: { errorTitle: `Failed to reveal ${name}` },
-  })
-
   if (isSecret) {
     return (
       <>
@@ -62,49 +40,78 @@ export function EnvironmentVariableRevealValue({
       </>
     )
   }
+  // Keyed so a new project, variable or version starts hidden with no value.
+  return (
+    <RevealableValue
+      key={`${projectId}:${variableId}:${version}`}
+      projectId={projectId}
+      variableId={variableId}
+      name={name}
+    />
+  )
+}
 
-  const value = credentialValueForScope(revealed, scope)
+function RevealableValue({
+  projectId,
+  variableId,
+  name,
+}: {
+  projectId: number
+  variableId: number
+  name: string
+}) {
+  // The app's default mutation error handler reports a failed reveal (using
+  // `errorTitle`), so the controller only resets state and never toasts.
+  const reveal = useMutation({
+    mutationFn: () => getEnvVarValue(projectId, name, variableId),
+    meta: { errorTitle: `Failed to reveal ${name}` },
+  })
+  const [controller] = useState(() =>
+    createValueReveal(() => reveal.mutateAsync())
+  )
+  useEffect(() => () => controller.dispose(), [controller])
+  const state = useSyncExternalStore(
+    controller.subscribe,
+    controller.getState,
+    controller.getState
+  )
+  return (
+    <EnvironmentVariableRevealView
+      name={name}
+      state={state}
+      onReveal={() => void controller.reveal()}
+      onHide={() => controller.hide()}
+    />
+  )
+}
 
-  const hide = () => {
-    guard.current.cancel('value')
-    setIsVisible(false)
-    setRevealed(undefined)
-  }
-
-  const show = async () => {
-    // Captured once: the guard is swapped when the variable's scope changes.
-    const current = guard.current
-    setIsVisible(true)
-    const request = current.begin('value')
-    try {
-      const result = await reveal.mutateAsync()
-      if (!current.isCurrent('value', request)) return
-      setRevealed({ value: result, scope })
-    } catch {
-      if (current.isCurrent('value', request)) {
-        setIsVisible(false)
-        toast.error(`Failed to reveal ${name}`)
-      }
-    } finally {
-      current.finish('value', request)
-    }
-  }
-
+export function EnvironmentVariableRevealView({
+  name,
+  state,
+  onReveal,
+  onHide,
+}: {
+  name: string
+  state: ValueRevealState
+  onReveal: () => void
+  onHide: () => void
+}) {
+  const isVisible = state.phase !== 'hidden'
   return (
     <>
       <dd className="mt-1 flex min-w-0 items-center gap-2">
-        {isVisible && value !== undefined ? (
-          <EnvironmentVariableValue name={name} value={value} />
+        {state.phase === 'revealed' ? (
+          <EnvironmentVariableValue name={name} value={state.value} />
         ) : (
           <span className="font-mono">
-            {isVisible && reveal.isPending ? 'Revealing…' : MASK}
+            {state.phase === 'revealing' ? 'Revealing…' : MASK}
           </span>
         )}
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => (isVisible ? hide() : void show())}
-          disabled={reveal.isPending}
+          onClick={isVisible ? onHide : onReveal}
+          disabled={state.phase === 'revealing'}
           aria-label={isVisible ? `Hide ${name}` : `Reveal ${name}`}
           title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
         >
