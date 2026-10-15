@@ -1707,6 +1707,7 @@ export function GitProviderFlow({
                             size="sm"
                             variant="ghost"
                             className="shrink-0 h-7 w-7 p-0"
+                            aria-label="Copy callback URL"
                             onClick={handleCopyCallback}
                           >
                             {copiedCallback ? (

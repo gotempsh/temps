@@ -584,7 +584,10 @@ function GettingStartedNavItem() {
               tooltip={`Platform setup — ${completedCount}/${totalCount}`}
               className="justify-center"
             >
-              <Link to="/setup">
+              <Link
+                to="/setup"
+                aria-label={`Platform setup, ${completedCount} of ${totalCount} steps complete`}
+              >
                 <BadgeCheck />
               </Link>
             </SidebarMenuButton>

@@ -196,7 +196,12 @@ export function ApiKeyCreateModal({
                     readOnly
                     className="font-mono text-sm"
                   />
-                  <Button size="sm" variant="outline" onClick={handleCopyKey}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    aria-label="Copy API key"
+                    onClick={handleCopyKey}
+                  >
                     {copiedKey ? (
                       <Check className="h-4 w-4" />
                     ) : (
