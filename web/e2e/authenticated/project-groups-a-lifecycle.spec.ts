@@ -212,9 +212,9 @@ test('group lifecycle through the console', async ({ page }) => {
     // "Delete project" is a collapsed section; open it, then use the button
     await page.getByText('Delete project', { exact: true }).first().click()
     await page.getByRole('button', { name: 'Delete project' }).click({ timeout: 10_000 })
-    await expect(page.getByRole('alertdialog')).toContainText(`Delete project “${G1_RENAMED}”?`)
+    await expect(page.getByRole('alertdialog')).toContainText(`Delete project ${G1_RENAMED}?`)
     await shot(page, '13-delete-confirm')
-    await page.getByRole('alertdialog').getByRole('button', { name: 'Delete project' }).click()
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Delete', exact: true }).click()
     await expect(page.getByText(`Project “${G1_RENAMED}” deleted`)).toBeVisible()
     await page.waitForURL(/\/projects(?:[?#]|$)/)
     await shot(page, '14-after-delete')
