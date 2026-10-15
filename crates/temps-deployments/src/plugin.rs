@@ -666,6 +666,32 @@ impl TempsPlugin for DeploymentsPlugin {
                 ),
             }
 
+            // Rescans (daily, manual) know only a deployment id. Tell the scan
+            // service how to find the build node that holds a worker-built
+            // image, which this process may not have a copy of. Needs the node
+            // scheduler, so it is wired once that exists.
+            match (
+                context.get_service::<temps_vulnerability_scanner::VulnerabilityScanService>(),
+                context.get_service::<WorkflowExecutionService>(),
+            ) {
+                (Some(scan_service), Some(workflow_execution_service)) => {
+                    match workflow_execution_service.build_node_scanner_resolver() {
+                        Some(resolver) => {
+                            scan_service.set_deployment_scanner_resolver(resolver);
+                            tracing::debug!("Build-node scanner wired into vulnerability scans");
+                        }
+                        None => tracing::warn!(
+                            "Build nodes are not reachable from this process yet; rescans of \
+                             worker-built images will be scanned on this host"
+                        ),
+                    }
+                }
+                _ => tracing::debug!(
+                    "Vulnerability scan service is not registered; rescans are not routed to \
+                     build nodes"
+                ),
+            }
+
             // Last, and deliberately so: every wire-up above must be in place
             // before the first queued deployment can be picked up. Starting
             // the processor in `register_services` meant a deployment queued

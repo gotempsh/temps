@@ -283,6 +283,124 @@ impl NodeImageScanner {
     }
 }
 
+/// Where a deployment's image was built, read back from its build job's
+/// saved outputs. Only the fields a later scan needs.
+#[derive(Debug, Deserialize)]
+struct RecordedBuild {
+    image_tag: String,
+    #[serde(default)]
+    image_id: String,
+    #[serde(default)]
+    image_tags_by_platform: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    image_ids_by_platform: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    builder_node_id: Option<i32>,
+}
+
+impl RecordedBuild {
+    /// The node that holds `image_name`, with the id it was built as; `None`
+    /// for a build on this host, or outputs that describe another image.
+    fn node_holding(
+        outputs: &serde_json::Value,
+        image_name: &str,
+    ) -> Option<(i32, Option<String>)> {
+        let build: RecordedBuild = serde_json::from_value(outputs.clone()).ok()?;
+        if build.image_tag != image_name {
+            return None;
+        }
+        let node_id = build.builder_node_id?;
+        let expected = super::build_image::primary_image_id(
+            &build.image_tag,
+            &build.image_id,
+            &build.image_tags_by_platform,
+            &build.image_ids_by_platform,
+        )
+        .map(str::to_string);
+        Some((node_id, expected))
+    }
+}
+
+/// Points scans that run after the deployment -- the daily rescan, a manual
+/// one -- at the build node that holds a worker-built image.
+///
+/// The deployment-time scan knows the node from its workflow context; these
+/// have only a deployment id, so the node is read back from the build job's
+/// persisted outputs.
+pub struct BuildNodeScannerResolver {
+    db: Arc<DbConnection>,
+    image_builder: Arc<dyn ImageBuilder>,
+    nodes: Arc<dyn BuilderNodeResolver>,
+    local: Arc<dyn VulnerabilityScanner>,
+}
+
+impl BuildNodeScannerResolver {
+    pub fn new(
+        db: Arc<DbConnection>,
+        image_builder: Arc<dyn ImageBuilder>,
+        nodes: Arc<dyn BuilderNodeResolver>,
+        docker_handle: Arc<DockerHandle>,
+    ) -> Self {
+        Self {
+            db,
+            image_builder,
+            nodes,
+            local: Arc::new(TrivyScanner::new(docker_handle)),
+        }
+    }
+}
+
+#[async_trait]
+impl temps_vulnerability_scanner::service::DeploymentScannerResolver for BuildNodeScannerResolver {
+    async fn scanner_for_deployment(
+        &self,
+        deployment_id: i32,
+        image_name: &str,
+    ) -> Option<Arc<dyn VulnerabilityScanner>> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+        use temps_entities::deployment_jobs;
+
+        let outputs = match deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
+            .filter(deployment_jobs::Column::Outputs.is_not_null())
+            .order_by_desc(deployment_jobs::Column::Id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(job) => job.and_then(|job| job.outputs),
+            Err(error) => {
+                warn!(
+                    deployment_id,
+                    "Cannot read the build of deployment {deployment_id} to find the node \
+                     holding '{image_name}'; scanning on this host: {error}"
+                );
+                return None;
+            }
+        }?;
+        let (node_id, expected_image_id) = RecordedBuild::node_holding(&outputs, image_name)?;
+        let node = match self.nodes.image_builder_for_node(node_id).await {
+            Ok(node) => node,
+            Err(error) => {
+                warn!(
+                    deployment_id,
+                    node_id,
+                    "Cannot reach build node {node_id} holding '{image_name}' of deployment \
+                     {deployment_id}; scanning on this host: {error}"
+                );
+                return None;
+            }
+        };
+        Some(Arc::new(NodeImageScanner {
+            node,
+            node_id,
+            expected_image_id,
+            local: self.local.clone(),
+            local_builder: self.image_builder.clone(),
+        }))
+    }
+}
+
 #[async_trait]
 impl WorkflowTask for ScanVulnerabilitiesJob {
     fn job_id(&self) -> &str {
@@ -721,5 +839,155 @@ mod tests {
         let node = ScanningNode::new(FakeImageStore::default(), Ok(None));
         let fixture = fixture(node);
         assert_eq!(fixture.scanner.version().await.unwrap(), None);
+    }
+
+    // ---- rescans: the build node is read back from the persisted build ----
+
+    fn build_outputs(node: Option<i32>) -> serde_json::Value {
+        serde_json::json!({
+            "image_tag": "app:1",
+            "image_id": "sha256:built",
+            "builder_node_id": node,
+        })
+    }
+
+    #[test]
+    fn recorded_build_names_the_node_and_the_id_it_was_built_as() {
+        let outputs = build_outputs(Some(7));
+        assert_eq!(
+            RecordedBuild::node_holding(&outputs, "app:1"),
+            Some((7, Some("sha256:built".to_string())))
+        );
+    }
+
+    #[test]
+    fn recorded_build_of_another_image_or_the_control_plane_names_no_node() {
+        assert_eq!(
+            RecordedBuild::node_holding(&build_outputs(Some(7)), "app:2"),
+            None
+        );
+        assert_eq!(
+            RecordedBuild::node_holding(&build_outputs(None), "app:1"),
+            None
+        );
+        assert_eq!(
+            RecordedBuild::node_holding(&serde_json::json!({"unrelated": true}), "app:1"),
+            None
+        );
+    }
+
+    /// A mixed-architecture build keeps one image id per platform; the one
+    /// for the tag being scanned is the identity to require.
+    #[test]
+    fn recorded_mixed_architecture_build_uses_its_own_platform_id() {
+        let outputs = serde_json::json!({
+            "image_tag": "app:1",
+            "image_id": "sha256:other",
+            "builder_node_id": 7,
+            "image_tags_by_platform": {"linux/amd64": "app:1", "linux/arm64": "app:1-arm64"},
+            "image_ids_by_platform": {"linux/amd64": "sha256:amd", "linux/arm64": "sha256:arm"},
+        });
+        assert_eq!(
+            RecordedBuild::node_holding(&outputs, "app:1"),
+            Some((7, Some("sha256:amd".to_string())))
+        );
+    }
+
+    fn deployment_build_job(
+        outputs: Option<serde_json::Value>,
+    ) -> temps_entities::deployment_jobs::Model {
+        temps_entities::deployment_jobs::Model {
+            id: 1,
+            deployment_id: 42,
+            job_id: "build_image".to_string(),
+            job_type: "BuildImageJob".to_string(),
+            name: "build_image".to_string(),
+            description: None,
+            status: temps_entities::types::JobStatus::Success,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            log_id: "log".to_string(),
+            error_message: None,
+            job_config: None,
+            outputs,
+            dependencies: None,
+            execution_order: None,
+        }
+    }
+
+    fn rescan_resolver(
+        jobs: Vec<temps_entities::deployment_jobs::Model>,
+        node: Arc<ScanningNode>,
+        local_scanner: Arc<RecordingScanner>,
+    ) -> BuildNodeScannerResolver {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_core::{DockerHandle, PROFILE_CONTROL_PLANE};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![jobs])
+            .into_connection();
+        let nodes: Arc<dyn BuilderNodeResolver> = Arc::new(
+            crate::jobs::builder_node::tests::StaticResolver::new(7, node),
+        );
+        let mut resolver = BuildNodeScannerResolver::new(
+            Arc::new(db),
+            Arc::new(FakeImageStore::default()),
+            nodes,
+            Arc::new(DockerHandle::disabled(PROFILE_CONTROL_PLANE, "unit test")),
+        );
+        resolver.local = local_scanner;
+        resolver
+    }
+
+    /// The daily and manual rescans have only a deployment id. For a
+    /// worker-built image whose copy never came to the control plane, the
+    /// scan must go to the build node instead of failing "not found locally".
+    #[tokio::test]
+    async fn rescan_of_a_worker_built_image_is_routed_to_its_build_node() {
+        use temps_vulnerability_scanner::service::DeploymentScannerResolver;
+        let node = ScanningNode::new(
+            FakeImageStore::holding("app:1", "sha256:built"),
+            Ok(Some(report(2))),
+        );
+        let local_scanner = Arc::new(RecordingScanner::default());
+        let resolver = rescan_resolver(
+            vec![deployment_build_job(Some(build_outputs(Some(7))))],
+            node.clone(),
+            local_scanner.clone(),
+        );
+
+        let scanner = resolver
+            .scanner_for_deployment(42, "app:1")
+            .await
+            .expect("a node holds this image");
+        let result = scanner.scan_image("app:1").await.unwrap();
+
+        assert_eq!(result.total_count, 2);
+        assert_eq!(
+            *node.requests.lock().unwrap(),
+            vec![("app:1".to_string(), Some("sha256:built".to_string()))]
+        );
+        assert!(local_scanner.scanned.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rescan_of_a_control_plane_build_keeps_the_local_scanner() {
+        use temps_vulnerability_scanner::service::DeploymentScannerResolver;
+        let node = ScanningNode::new(FakeImageStore::default(), Ok(None));
+        let resolver = rescan_resolver(
+            vec![deployment_build_job(Some(build_outputs(None)))],
+            node,
+            Arc::new(RecordingScanner::default()),
+        );
+        assert!(resolver.scanner_for_deployment(42, "app:1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rescan_of_a_deployment_without_a_build_keeps_the_local_scanner() {
+        use temps_vulnerability_scanner::service::DeploymentScannerResolver;
+        let node = ScanningNode::new(FakeImageStore::default(), Ok(None));
+        let resolver = rescan_resolver(Vec::new(), node, Arc::new(RecordingScanner::default()));
+        assert!(resolver.scanner_for_deployment(42, "app:1").await.is_none());
     }
 }

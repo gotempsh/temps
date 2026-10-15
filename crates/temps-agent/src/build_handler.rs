@@ -657,8 +657,12 @@ pub async fn scan_image(
             "This node has no Docker client to scan '{image}' with"
         ))
     })?;
+    // Waiting for capacity has its own bound; the scan's deadline starts once
+    // it holds a slot, so a scan admitted late still gets its full time.
+    let admission_deadline = tokio::time::Instant::now() + SCAN_DEADLINE;
+    let _permit =
+        acquire_image_slot(&limits, admission_deadline, &format!("Scan of '{image}'")).await?;
     let deadline = tokio::time::Instant::now() + SCAN_DEADLINE;
-    let _permit = acquire_image_slot(&limits, deadline, &format!("Scan of '{image}'")).await?;
 
     // Identity first: the report must describe the image that was built, and
     // a tag can be re-pointed by a later build on the same node.

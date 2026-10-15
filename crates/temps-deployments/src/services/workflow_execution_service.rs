@@ -3047,6 +3047,24 @@ impl WorkflowExecutionService {
         }))
     }
 
+    /// Routes scans that run after a deployment (the daily rescan, a manual
+    /// one) to the build node holding a worker-built image. `None` before
+    /// the scheduler and encryption service are wired, which is also before
+    /// any worker build can exist.
+    pub fn build_node_scanner_resolver(
+        &self,
+    ) -> Option<Arc<crate::jobs::scan_vulnerabilities::BuildNodeScannerResolver>> {
+        let nodes = self.builder_node_resolver()?;
+        Some(Arc::new(
+            crate::jobs::scan_vulnerabilities::BuildNodeScannerResolver::new(
+                self.db.clone(),
+                self.image_builder.clone(),
+                nodes,
+                self.docker_handle.clone(),
+            ),
+        ))
+    }
+
     async fn select_node_builder(
         &self,
         deployment_id: i32,

@@ -576,17 +576,34 @@ struct PerArchitectureBuild {
     image_ids_by_platform: HashMap<String, String>,
 }
 
+/// The id a build recorded for `image_tag`: its own platform's entry on a
+/// mixed-architecture build, otherwise `image_id`. `None` when none was
+/// recorded.
+pub(crate) fn primary_image_id<'a>(
+    image_tag: &str,
+    image_id: &'a str,
+    image_tags_by_platform: &HashMap<String, String>,
+    image_ids_by_platform: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    image_tags_by_platform
+        .iter()
+        .find(|(_, built)| built.as_str() == image_tag)
+        .and_then(|(platform, _)| image_ids_by_platform.get(platform))
+        .map(String::as_str)
+        .or_else(|| (!image_id.trim().is_empty()).then_some(image_id))
+}
+
 impl ImageOutput {
     /// The id the build recorded for the primary image: its own platform's
     /// entry on a mixed-architecture build, otherwise the build's `image_id`.
     /// `None` when none was recorded.
     pub fn expected_image_id(&self) -> Option<&str> {
-        self.image_tags_by_platform
-            .iter()
-            .find(|(_, built)| built.as_str() == self.image_tag)
-            .and_then(|(platform, _)| self.image_ids_by_platform.get(platform))
-            .map(String::as_str)
-            .or_else(|| (!self.image_id.trim().is_empty()).then_some(self.image_id.as_str()))
+        primary_image_id(
+            &self.image_tag,
+            &self.image_id,
+            &self.image_tags_by_platform,
+            &self.image_ids_by_platform,
+        )
     }
 
     /// Extract ImageOutput from WorkflowContext
