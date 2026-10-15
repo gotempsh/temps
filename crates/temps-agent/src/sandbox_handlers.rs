@@ -1366,6 +1366,7 @@ pub async fn kill_sandbox_processes(
         (status = 200, description = "Destroyed (or already gone)", body = RemoteOkResponse),
         (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "The sandbox is being created or released right now, or its container reappeared; retry", body = RemoteErrorBody),
         (status = 500, description = "Destroy failed", body = RemoteErrorBody),
         (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
     ),

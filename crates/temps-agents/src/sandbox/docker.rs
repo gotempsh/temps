@@ -671,8 +671,16 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// happens to copy the label is left alone), it is labelled for this
 /// instance's preview gateway (another Temps instance sharing this Docker
 /// daemon may be recreating that sandbox, which this instance's bookkeeping
-/// cannot see), and it is at least `min_age` old. Whether the owner's container still
-/// exists is checked by the caller.
+/// cannot see), and it is at least `min_age` old.
+///
+/// The gateway name is the instance scope: `DockerSandboxConfig` documents it
+/// as the gateway "owned by this Temps instance", and the gateway reconciler
+/// leaves a gateway container carrying another instance's secret alone, so
+/// two instances on one daemon are expected to use different names. Two
+/// instances configured with the *same* name are not separable by this
+/// bookkeeping and must not both run automatic reaping against one daemon.
+///
+/// Whether the owner's container still exists is checked by the caller.
 fn orphan_candidate_owner<'a>(
     network: &'a bollard::models::Network,
     gateway: &str,
