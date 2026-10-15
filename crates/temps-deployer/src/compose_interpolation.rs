@@ -14,7 +14,7 @@
 //! that are deployed — the guarantee does not depend on this module matching
 //! Compose's interpolation byte for byte.
 
-use serde_yaml::Value;
+use yaml_serde::Value;
 use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
 
@@ -149,7 +149,7 @@ fn interpolate(
         });
     }
     let mut root: Value =
-        serde_yaml::from_str(content).map_err(|error| InterpolationError::Yaml {
+        yaml_serde::from_str(content).map_err(|error| InterpolationError::Yaml {
             document: document.to_string(),
             reason: error.to_string(),
         })?;
@@ -173,7 +173,7 @@ fn interpolate(
             deferred_required: state.deferred,
         });
     }
-    let content = serde_yaml::to_string(&root).map_err(|error| InterpolationError::Yaml {
+    let content = yaml_serde::to_string(&root).map_err(|error| InterpolationError::Yaml {
         document: document.to_string(),
         reason: format!("failed to serialize the resolved document: {error}"),
     })?;
@@ -843,7 +843,7 @@ mod tests {
         let variables = vars(&[("PRICE", "5$USD")]);
         let resolved = interpolate_document("compose file", content, &variables).unwrap();
         assert!(resolved.changed);
-        let value: Value = serde_yaml::from_str(&resolved.content).unwrap();
+        let value: Value = yaml_serde::from_str(&resolved.content).unwrap();
         let app = &value["services"]["app"];
         assert_eq!(app["image"].as_str(), Some("ghcr.io/o/a:1"));
         // The resolved literal `$` is escaped so Compose cannot expand `$USD`.
@@ -862,7 +862,7 @@ mod tests {
         let content = "services:\n  app:\n    image: nginx\n    privileged: ${P:-false}\n    read_only: '${RO}'\n    deploy:\n      replicas: ${N:-2}\n    labels:\n      privileged: ${P:-false}\n    environment:\n      FLAG: ${P:-false}\n";
         let variables = vars(&[("RO", "maybe")]);
         let resolved = interpolate_document("compose file", content, &variables).unwrap();
-        let value: Value = serde_yaml::from_str(&resolved.content).unwrap();
+        let value: Value = yaml_serde::from_str(&resolved.content).unwrap();
         let app = &value["services"]["app"];
         assert_eq!(app["privileged"], Value::Bool(false));
         // Not a boolean word: left as a string for the validator to reject.

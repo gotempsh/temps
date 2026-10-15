@@ -43,6 +43,20 @@ pub enum GitOpsError {
 
     #[error("Failed to read the checked-out commit in {repo_path}: {reason}")]
     ReadHeadFailed { repo_path: String, reason: String },
+
+    #[error("Ref '{ref_name}' not found in {url}: {detail}")]
+    RefNotFound {
+        url: String,
+        ref_name: String,
+        detail: String,
+    },
+
+    #[error("Cannot check out ref '{ref_name}' from {url}: {reason}")]
+    InvalidRef {
+        url: String,
+        ref_name: String,
+        reason: String,
+    },
 }
 
 /// The commit a working copy has checked out, read from its own `.git`.
@@ -282,16 +296,162 @@ fn clone_repo_with_credentials_inner(
         .map_err(|e| clone_failed(url, e.message().to_string()))
 }
 
-/// Clone a named branch or tag shallowly, with cancellable transport processes.
-/// Credentials use process-local Git configuration, never argv or repository config.
-pub async fn clone_named_ref_with_credentials(
+/// What kind of ref [`clone_ref`] resolved a name to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClonedRefKind {
+    Branch,
+    Tag,
+    Commit,
+    /// A fully qualified ref outside `refs/heads/` and `refs/tags/`
+    /// (for example `refs/pull/1/head`), checked out detached.
+    Other,
+}
+
+impl ClonedRefKind {
+    /// Lowercase noun for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClonedRefKind::Branch => "branch",
+            ClonedRefKind::Tag => "tag",
+            ClonedRefKind::Commit => "commit",
+            ClonedRefKind::Other => "ref",
+        }
+    }
+}
+
+/// The result of [`clone_ref`]: what was checked out and the commit it is at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClonedRef {
+    pub kind: ClonedRefKind,
+    /// Full object id `HEAD` points at after the checkout.
+    pub commit_sha: String,
+}
+
+/// Reject a ref that could be read as an option or smuggle a second refspec
+/// into the `git fetch` it is interpolated into.
+fn validate_clone_ref(url: &str, reference: &str) -> Result<(), GitOpsError> {
+    let invalid = |reason: &str| GitOpsError::InvalidRef {
+        url: temps_core::url_validation::redact_url_password(url),
+        ref_name: reference.chars().take(200).collect(),
+        reason: reason.to_string(),
+    };
+    if reference.is_empty() {
+        return Err(invalid("the ref is empty"));
+    }
+    // The bare name after `refs/heads/` or `refs/tags/` reaches `git checkout`
+    // as an argument, so it is held to the same rule as the whole ref.
+    let bare = reference
+        .strip_prefix("refs/heads/")
+        .or_else(|| reference.strip_prefix("refs/tags/"))
+        .unwrap_or(reference);
+    if reference.starts_with('-') || bare.starts_with('-') || reference.starts_with('/') {
+        return Err(invalid("a ref cannot start with '-' or '/'"));
+    }
+    if reference.chars().any(|c| {
+        c.is_control() || c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return Err(invalid(
+            "a ref cannot contain whitespace, control characters or any of ~ ^ : ? * [ \\",
+        ));
+    }
+    if reference.contains("..")
+        || reference.contains("@{")
+        || reference.contains("//")
+        || reference.ends_with('/')
+        || reference.ends_with('.')
+        || reference.ends_with(".lock")
+    {
+        return Err(invalid("not a valid git ref name"));
+    }
+    Ok(())
+}
+
+/// `git fetch origin <refspecs>` into `target`, optionally shallow.
+async fn fetch_refspecs(
+    target: &Path,
+    credentials: Option<(&str, &str)>,
+    shallow: bool,
+    refspecs: &[String],
+) -> Result<(), String> {
+    let mut command = git_command();
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Fall-through below keys on git's "couldn't find remote ref" text.
+        .env("LC_ALL", "C")
+        .arg("-C")
+        .arg(target)
+        .args(["fetch", "--no-tags"]);
+    if shallow {
+        command.arg("--depth=1");
+    }
+    command.arg("origin").args(refspecs);
+    apply_git_http_credentials(&mut command, credentials);
+    run_git(command, "fetch checkout ref").await
+}
+
+/// Whether a failed fetch means the remote has no such ref (as opposed to the
+/// remote being unreachable or refusing access).
+fn is_missing_remote_ref(fetch_error: &str) -> bool {
+    fetch_error.contains("couldn't find remote ref")
+}
+
+/// Resolve `git rev-parse --verify <rev>` in `target`.
+async fn rev_parse(target: &Path, rev: &str) -> Result<String, String> {
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(target)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(rev);
+    run_git_stdout(command, &format!("resolve {rev}")).await
+}
+
+/// Check out a branch, a tag or a commit of `url` into `target`, fetching as
+/// little history as the remote allows.
+///
+/// A plain name is tried as a branch first, then as a tag, then (when it is
+/// 7 to 40 hexadecimal characters) as a commit, so a branch always wins over
+/// a tag or abbreviated id of the same spelling. `refs/heads/x` and
+/// `refs/tags/x` pin the kind; any other `refs/...` is fetched as given and
+/// checked out detached.
+///
+/// * Branch: shallow (depth 1) fetch, left on a local branch of that name.
+/// * Tag: shallow fetch, detached at the tag's commit (annotated tags are
+///   peeled).
+/// * Commit: a full id is fetched shallow when the server allows fetching it
+///   by id (GitHub and GitLab do); an abbreviated id, or a server that
+///   refuses, falls back to fetching every branch and tag in full, because a
+///   short id cannot be asked for by name.
+///
+/// Only "the remote has no such ref" moves on to the next kind; transport and
+/// authentication failures stop at once so they are not retried three times
+/// and misreported as a missing ref. When nothing matches the error is
+/// [`GitOpsError::RefNotFound`]. After the checkout, `HEAD` is read back and
+/// compared with the commit the ref resolved to.
+///
+/// Credentials are HTTP Basic via a process-local `http.extraHeader`, never
+/// argv or repository config. Dropping the future kills the `git` process
+/// group, so callers can bound it with `tokio::time::timeout`.
+pub async fn clone_ref(
     url: &str,
     target: &Path,
-    username: &str,
-    token: &str,
+    credentials: Option<(&str, &str)>,
     reference: &str,
-) -> Result<(), GitOpsError> {
-    let credentials = Some((username, token));
+) -> Result<ClonedRef, GitOpsError> {
+    validate_clone_ref(url, reference)?;
+    if url.starts_with('-') {
+        return Err(clone_failed(
+            url,
+            "a remote URL cannot start with '-'".to_string(),
+        ));
+    }
+    let redacted_url = temps_core::url_validation::redact_url_password(url);
+    let not_found = |detail: String| GitOpsError::RefNotFound {
+        url: redacted_url.clone(),
+        ref_name: reference.to_string(),
+        detail,
+    };
+
     let mut init = git_command();
     init.args(["init", "--quiet", "--"]).arg(target);
     run_git(init, "initialize shallow checkout")
@@ -306,45 +466,164 @@ pub async fn clone_named_ref_with_credentials(
         .await
         .map_err(|e| clone_failed(url, e))?;
 
-    let fetch = |selected: String| async move {
-        let mut command = git_command();
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .arg("-C")
-            .arg(target)
-            .args(["fetch", "--depth=1", "--no-tags", "origin"])
-            .arg(format!("+{selected}:{selected}"));
-        apply_git_http_credentials(&mut command, credentials);
-        run_git(command, "fetch shallow checkout ref").await
-    };
-    let selected = if reference.starts_with("refs/") {
-        fetch(reference.to_string())
-            .await
-            .map_err(|e| clone_failed(url, e))?;
-        reference.to_string()
+    let (pinned, name) = if let Some(name) = reference.strip_prefix("refs/heads/") {
+        (Some(ClonedRefKind::Branch), name)
+    } else if let Some(name) = reference.strip_prefix("refs/tags/") {
+        (Some(ClonedRefKind::Tag), name)
+    } else if reference.starts_with("refs/") {
+        (Some(ClonedRefKind::Other), reference)
     } else {
-        let branch = format!("refs/heads/{reference}");
-        match fetch(branch.clone()).await {
-            Ok(()) => branch,
-            Err(branch_error) => {
-                let tag = format!("refs/tags/{reference}");
-                fetch(tag.clone()).await.map_err(|tag_error| {
-                    clone_failed(url, format!("{branch_error}; {tag_error}"))
-                })?;
-                tag
+        (None, reference)
+    };
+
+    let mut resolved: Option<(ClonedRefKind, String)> = None;
+
+    if pinned.is_none_or(|kind| kind == ClonedRefKind::Branch) {
+        let remote_branch = format!("refs/remotes/origin/{name}");
+        let refspec = format!("+refs/heads/{name}:{remote_branch}");
+        match fetch_refspecs(target, credentials, true, &[refspec]).await {
+            Ok(()) => {
+                let sha = rev_parse(target, &format!("{remote_branch}^{{commit}}"))
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                let mut checkout = git_command();
+                checkout.arg("-C").arg(target).args([
+                    "checkout",
+                    "--quiet",
+                    "-B",
+                    name,
+                    &remote_branch,
+                ]);
+                run_git(checkout, "checkout branch")
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                resolved = Some((ClonedRefKind::Branch, sha));
             }
+            Err(e) if is_missing_remote_ref(&e) => {}
+            Err(e) => return Err(clone_failed(url, e)),
         }
-    };
-    let mut checkout = git_command();
-    checkout.arg("-C").arg(target).arg("checkout");
-    if let Some(branch) = selected.strip_prefix("refs/heads/") {
-        checkout.args(["-B", branch, &selected]);
-    } else {
-        checkout.args(["--detach", &selected]);
     }
-    run_git(checkout, "checkout shallow ref")
+
+    if resolved.is_none() && pinned.is_none_or(|kind| kind == ClonedRefKind::Tag) {
+        let local_tag = format!("refs/tags/{name}");
+        let refspec = format!("+{local_tag}:{local_tag}");
+        match fetch_refspecs(target, credentials, true, &[refspec]).await {
+            Ok(()) => {
+                let sha = rev_parse(target, &format!("{local_tag}^{{commit}}"))
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                let mut checkout = git_command();
+                checkout
+                    .arg("-C")
+                    .arg(target)
+                    .args(["checkout", "--quiet", "--detach", &sha]);
+                run_git(checkout, "checkout tag")
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                resolved = Some((ClonedRefKind::Tag, sha));
+            }
+            Err(e) if is_missing_remote_ref(&e) => {}
+            Err(e) => return Err(clone_failed(url, e)),
+        }
+    }
+
+    if resolved.is_none() && pinned == Some(ClonedRefKind::Other) {
+        let refspec = format!("+{name}:refs/temps/fetched");
+        match fetch_refspecs(target, credentials, true, &[refspec]).await {
+            Ok(()) => {
+                let sha = rev_parse(target, "refs/temps/fetched^{commit}")
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                let mut checkout = git_command();
+                checkout
+                    .arg("-C")
+                    .arg(target)
+                    .args(["checkout", "--quiet", "--detach", &sha]);
+                run_git(checkout, "checkout ref")
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                resolved = Some((ClonedRefKind::Other, sha));
+            }
+            Err(e) if is_missing_remote_ref(&e) => {}
+            Err(e) => return Err(clone_failed(url, e)),
+        }
+    }
+
+    let is_commit_like =
+        (7..=40).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit());
+    if resolved.is_none() && pinned.is_none() && is_commit_like {
+        // A full id can be requested directly, which keeps the fetch shallow.
+        // Anything else (an abbreviated id, or a server that will not serve
+        // unadvertised objects) needs every advertised ref to find the commit.
+        let direct = if name.len() == 40 {
+            fetch_refspecs(target, credentials, true, &[name.to_string()]).await
+        } else {
+            Err("abbreviated commit id".to_string())
+        };
+        if direct.is_err() {
+            let everything = [
+                "+refs/heads/*:refs/remotes/origin/*".to_string(),
+                "+refs/tags/*:refs/tags/*".to_string(),
+            ];
+            fetch_refspecs(target, credentials, false, &everything)
+                .await
+                .map_err(|e| clone_failed(url, e))?;
+        }
+        match rev_parse(target, &format!("{name}^{{commit}}")).await {
+            Ok(sha) if !sha.is_empty() => {
+                let mut checkout = git_command();
+                checkout
+                    .arg("-C")
+                    .arg(target)
+                    .args(["checkout", "--quiet", "--detach", &sha]);
+                run_git(checkout, "checkout commit")
+                    .await
+                    .map_err(|e| clone_failed(url, e))?;
+                resolved = Some((ClonedRefKind::Commit, sha));
+            }
+            // `--quiet` makes an unknown id exit non-zero with no output.
+            _ => {}
+        }
+    }
+
+    let Some((kind, expected)) = resolved else {
+        return Err(not_found(
+            "it is not a branch, tag or commit of the repository".to_string(),
+        ));
+    };
+
+    let head = rev_parse(target, "HEAD")
         .await
-        .map_err(|e| clone_failed(url, e))
+        .map_err(|e| clone_failed(url, e))?;
+    if head != expected {
+        return Err(clone_failed(
+            url,
+            format!(
+                "checked out {head} for {} '{reference}', expected {expected}",
+                kind.as_str()
+            ),
+        ));
+    }
+    Ok(ClonedRef {
+        kind,
+        commit_sha: head,
+    })
+}
+
+/// Clone a named branch or tag shallowly, with cancellable transport processes.
+/// Credentials use process-local Git configuration, never argv or repository config.
+///
+/// Thin wrapper over [`clone_ref`] with HTTP Basic credentials.
+pub async fn clone_named_ref_with_credentials(
+    url: &str,
+    target: &Path,
+    username: &str,
+    token: &str,
+    reference: &str,
+) -> Result<(), GitOpsError> {
+    clone_ref(url, target, Some((username, token)), reference)
+        .await
+        .map(|_| ())
 }
 
 /// Create a new local branch at HEAD and check it out. Equivalent to
@@ -574,7 +853,15 @@ fn apply_git_http_credentials(
         );
 }
 
-async fn run_git(mut command: tokio::process::Command, action: &str) -> Result<(), String> {
+async fn run_git(command: tokio::process::Command, action: &str) -> Result<(), String> {
+    run_git_stdout(command, action).await.map(|_| ())
+}
+
+/// Run `command` to completion and return its trimmed standard output.
+async fn run_git_stdout(
+    mut command: tokio::process::Command,
+    action: &str,
+) -> Result<String, String> {
     command.stdin(Stdio::null());
     let child = command
         .spawn()
@@ -587,7 +874,7 @@ async fn run_git(mut command: tokio::process::Command, action: &str) -> Result<(
     let output = child.wait_with_output().await;
     let output = output.map_err(|e| format!("failed to run git ({action}): {e}"))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1010,6 +1297,268 @@ mod tests {
                 "{reference}"
             );
         }
+    }
+
+    /// A bare-bones origin built with the `git` CLI, addressed over `file://`:
+    /// `master` (three commits), `feature` (one extra commit off the second),
+    /// an annotated tag `v1.0.0` and a lightweight tag `light` on earlier
+    /// commits, and a branch and a tag that share the name `dual`.
+    struct OriginFixture {
+        _dir: TempDir,
+        url: String,
+        commits: [String; 3],
+        feature_commit: String,
+        annotated_tag_object: String,
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn origin_fixture() -> Option<OriginFixture> {
+        if !git_available() {
+            println!("git CLI not available, skipping");
+            return None;
+        }
+        let dir = TempDir::new().ok()?;
+        let path = dir.path().join("origin");
+        std::fs::create_dir_all(&path).ok()?;
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "tag.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |content: &str, message: &str| -> String {
+            std::fs::write(path.join("file.txt"), content).unwrap();
+            git(&["add", "file.txt"]);
+            git(&["commit", "--quiet", "-m", message]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "--quiet", "--initial-branch=master"]);
+        let first = commit("one", "first");
+        git(&["tag", "light"]);
+        git(&["tag", "dual"]);
+        let second = commit("two", "second");
+        git(&["tag", "-a", "-m", "release", "v1.0.0"]);
+        let annotated_tag_object = git(&["rev-parse", "refs/tags/v1.0.0"]);
+        git(&["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(path.join("feature.txt"), "feature").unwrap();
+        git(&["add", "feature.txt"]);
+        git(&["commit", "--quiet", "-m", "feature work"]);
+        let feature_commit = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--quiet", "master"]);
+        let third = commit("three", "third");
+        git(&["branch", "dual"]);
+        Some(OriginFixture {
+            url: format!("file://{}", path.display()),
+            _dir: dir,
+            commits: [first, second, third],
+            feature_commit,
+            annotated_tag_object,
+        })
+    }
+
+    async fn checkout(origin: &OriginFixture, reference: &str) -> (TempDir, ClonedRef) {
+        let target = TempDir::new().unwrap();
+        let cloned = clone_ref(&origin.url, target.path(), None, reference)
+            .await
+            .unwrap_or_else(|e| panic!("clone_ref({reference}) failed: {e}"));
+        (target, cloned)
+    }
+
+    fn file(target: &TempDir, name: &str) -> Option<String> {
+        std::fs::read_to_string(target.path().join(name)).ok()
+    }
+
+    #[tokio::test]
+    async fn clone_ref_checks_out_a_branch_shallow_and_on_that_branch() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        // `master` is also git's default initial branch, which a fetch into
+        // the checked-out branch would refuse.
+        for (branch, expected_commit, expected_file) in [
+            ("master", &origin.commits[2], "three"),
+            ("feature", &origin.feature_commit, "two"),
+            ("refs/heads/master", &origin.commits[2], "three"),
+        ] {
+            let (target, cloned) = checkout(&origin, branch).await;
+            assert_eq!(cloned.kind, ClonedRefKind::Branch, "{branch}");
+            assert_eq!(&cloned.commit_sha, expected_commit, "{branch}");
+            assert_eq!(file(&target, "file.txt").as_deref(), Some(expected_file));
+            let repo = Repository::open(target.path()).unwrap();
+            assert!(repo.is_shallow(), "{branch} must be a shallow checkout");
+            assert!(repo.head().unwrap().is_branch(), "{branch}");
+            assert_eq!(
+                read_head_commit(target.path()).unwrap().unwrap().sha,
+                *expected_commit
+            );
+        }
+        let (target, _) = checkout(&origin, "feature").await;
+        assert_eq!(file(&target, "feature.txt").as_deref(), Some("feature"));
+    }
+
+    #[tokio::test]
+    async fn clone_ref_checks_out_annotated_and_lightweight_tags_at_their_commit() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        let (target, cloned) = checkout(&origin, "v1.0.0").await;
+        assert_eq!(cloned.kind, ClonedRefKind::Tag);
+        // The commit, not the tag object.
+        assert_eq!(cloned.commit_sha, origin.commits[1]);
+        assert_ne!(cloned.commit_sha, origin.annotated_tag_object);
+        assert_eq!(file(&target, "file.txt").as_deref(), Some("two"));
+        let repo = Repository::open(target.path()).unwrap();
+        assert!(repo.head_detached().unwrap());
+        assert!(repo.is_shallow());
+
+        let (target, cloned) = checkout(&origin, "light").await;
+        assert_eq!(cloned.kind, ClonedRefKind::Tag);
+        assert_eq!(cloned.commit_sha, origin.commits[0]);
+        assert_eq!(file(&target, "file.txt").as_deref(), Some("one"));
+
+        let (_, cloned) = checkout(&origin, "refs/tags/v1.0.0").await;
+        assert_eq!(cloned.kind, ClonedRefKind::Tag);
+        assert_eq!(cloned.commit_sha, origin.commits[1]);
+    }
+
+    #[tokio::test]
+    async fn clone_ref_checks_out_full_and_abbreviated_commits() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        // The first commit is no branch tip, so only a by-id fetch (or the
+        // full fallback) can reach it.
+        let (target, cloned) = checkout(&origin, &origin.commits[0]).await;
+        assert_eq!(cloned.kind, ClonedRefKind::Commit);
+        assert_eq!(cloned.commit_sha, origin.commits[0]);
+        assert_eq!(file(&target, "file.txt").as_deref(), Some("one"));
+        assert!(Repository::open(target.path())
+            .unwrap()
+            .head_detached()
+            .unwrap());
+
+        for length in [7, 12] {
+            let short = &origin.commits[1][..length];
+            let (target, cloned) = checkout(&origin, short).await;
+            assert_eq!(cloned.kind, ClonedRefKind::Commit, "{short}");
+            assert_eq!(cloned.commit_sha, origin.commits[1], "{short}");
+            assert_eq!(file(&target, "file.txt").as_deref(), Some("two"));
+        }
+
+        // A commit only reachable from another branch.
+        let short = &origin.feature_commit[..10];
+        let (target, cloned) = checkout(&origin, short).await;
+        assert_eq!(cloned.commit_sha, origin.feature_commit);
+        assert_eq!(file(&target, "feature.txt").as_deref(), Some("feature"));
+    }
+
+    #[tokio::test]
+    async fn clone_ref_prefers_a_branch_over_a_tag_of_the_same_name() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        let (target, cloned) = checkout(&origin, "dual").await;
+        assert_eq!(cloned.kind, ClonedRefKind::Branch);
+        assert_eq!(cloned.commit_sha, origin.commits[2]);
+        assert_eq!(file(&target, "file.txt").as_deref(), Some("three"));
+
+        let (target, cloned) = checkout(&origin, "refs/tags/dual").await;
+        assert_eq!(cloned.kind, ClonedRefKind::Tag);
+        assert_eq!(cloned.commit_sha, origin.commits[0]);
+        assert_eq!(file(&target, "file.txt").as_deref(), Some("one"));
+    }
+
+    #[tokio::test]
+    async fn clone_ref_names_the_repository_and_ref_when_nothing_matches() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        for reference in [
+            "no-such-ref",
+            "v9.9.9",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "deadbee",
+            "refs/tags/master",
+        ] {
+            let target = TempDir::new().unwrap();
+            let error = clone_ref(&origin.url, target.path(), None, reference)
+                .await
+                .expect_err(reference);
+            assert!(
+                matches!(&error, GitOpsError::RefNotFound { ref_name, .. } if ref_name == reference),
+                "{reference}: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(reference), "{message}");
+            assert!(message.contains(&origin.url), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_ref_rejects_refs_that_could_inject_options_or_refspecs() {
+        for reference in [
+            "",
+            "--upload-pack=touch /tmp/pwned",
+            "main:refs/heads/other",
+            "a b",
+            "a..b",
+            "x^{commit}",
+            "refs/heads/",
+            "refs/heads/--detach",
+        ] {
+            let target = TempDir::new().unwrap();
+            let error = clone_ref("file:///nonexistent", target.path(), None, reference)
+                .await
+                .expect_err(reference);
+            assert!(
+                matches!(error, GitOpsError::InvalidRef { .. }),
+                "{reference:?}: {error:?}"
+            );
+            assert!(
+                std::fs::read_dir(target.path()).unwrap().next().is_none(),
+                "an invalid ref must be refused before anything touches the target"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_ref_reports_an_unreachable_remote_as_a_clone_failure_not_a_missing_ref() {
+        if !git_available() {
+            return;
+        }
+        let target = TempDir::new().unwrap();
+        let error = clone_ref("file:///nonexistent/origin", target.path(), None, "main")
+            .await
+            .expect_err("no such remote");
+        assert!(
+            matches!(error, GitOpsError::CloneFailed { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]

@@ -877,6 +877,200 @@ pub fn defined_migration_count() -> usize {
 
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
 
+/// An index on a column that references `ip_geolocations` (or on
+/// `visitor.last_seen`), built after boot rather than inside a migration.
+///
+/// Deleting stored IP addresses makes PostgreSQL look for referencing rows,
+/// and the retention job asks the same question per candidate, so each
+/// referencing column needs an index. On a large install a plain
+/// `CREATE INDEX` holds a `SHARE` lock that stops ingestion for the whole
+/// build, which is why these are not in a migration (SeaORM wraps migrations
+/// in a transaction, where `CONCURRENTLY` is illegal).
+struct ReferenceIndex {
+    name: &'static str,
+    table: &'static str,
+    column: &'static str,
+    /// Index only rows where the column is set. Most rows of the high-volume
+    /// tables carry no address, so a partial index costs them nothing.
+    partial: bool,
+    /// TimescaleDB does not support `CREATE INDEX CONCURRENTLY` on a
+    /// hypertable; it builds one chunk per transaction instead, so a write is
+    /// only ever blocked behind a single chunk's build. Must match the
+    /// migrations: `error_events` and `proxy_logs` are hypertables
+    /// (`m20250101_000001_initial_schema`), the other tables are not.
+    hypertable: bool,
+}
+
+const REFERENCE_INDEXES: &[ReferenceIndex] = &[
+    ReferenceIndex {
+        name: "idx_visitor_last_seen",
+        table: "visitor",
+        column: "last_seen",
+        partial: false,
+        hypertable: false,
+    },
+    ReferenceIndex {
+        name: "idx_error_events_ip_geolocation",
+        table: "error_events",
+        column: "ip_geolocation_id",
+        partial: true,
+        hypertable: true,
+    },
+    ReferenceIndex {
+        name: "idx_proxy_logs_ip_geolocation",
+        table: "proxy_logs",
+        column: "ip_geolocation_id",
+        partial: true,
+        hypertable: true,
+    },
+    ReferenceIndex {
+        name: "idx_visitor_ip_address",
+        table: "visitor",
+        column: "ip_address_id",
+        partial: true,
+        hypertable: false,
+    },
+    ReferenceIndex {
+        name: "idx_performance_metrics_ip_address",
+        table: "performance_metrics",
+        column: "ip_address_id",
+        partial: true,
+        hypertable: false,
+    },
+    ReferenceIndex {
+        name: "idx_audit_logs_ip_address",
+        table: "audit_logs",
+        column: "ip_address_id",
+        partial: true,
+        hypertable: false,
+    },
+];
+
+impl ReferenceIndex {
+    fn create_sql(&self) -> String {
+        let predicate = if self.partial {
+            format!(" WHERE {} IS NOT NULL", self.column)
+        } else {
+            String::new()
+        };
+        if self.hypertable {
+            // `WITH (...)` precedes `WHERE` in the CREATE INDEX grammar.
+            format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} ({column}) \
+                 WITH (timescaledb.transaction_per_chunk){predicate}",
+                name = self.name,
+                table = self.table,
+                column = self.column,
+            )
+        } else {
+            format!(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({column}){predicate}",
+                name = self.name,
+                table = self.table,
+                column = self.column,
+            )
+        }
+    }
+
+    /// Removes the invalid leftover of a cancelled or failed build, which
+    /// `IF NOT EXISTS` would otherwise accept forever.
+    fn drop_invalid_sql(&self) -> String {
+        if self.hypertable {
+            format!("DROP INDEX IF EXISTS {}", self.name)
+        } else {
+            format!("DROP INDEX CONCURRENTLY IF EXISTS {}", self.name)
+        }
+    }
+}
+
+/// Build every [`REFERENCE_INDEXES`] entry whose column exists, on the
+/// maintenance connection. Each index is attempted even if an earlier one
+/// failed; the failures are reported together so the caller retries the set
+/// (every statement is idempotent).
+async fn build_reference_indexes<F>(
+    connection: &mut sqlx::PgConnection,
+    on_progress: &F,
+) -> ServiceResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    let mut failures: Vec<String> = Vec::new();
+    for index in REFERENCE_INDEXES {
+        let column_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = $1 AND column_name = $2)",
+        )
+        .bind(index.table)
+        .bind(index.column)
+        .fetch_one(&mut *connection)
+        .await;
+        match column_exists {
+            Ok(true) => {}
+            // A table or column that this installation does not have.
+            Ok(false) => continue,
+            Err(error) => {
+                failures.push(format!(
+                    "{} (checking {}.{}): {error}",
+                    index.name, index.table, index.column
+                ));
+                continue;
+            }
+        }
+
+        let invalid = sqlx::query_scalar::<_, bool>(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        )
+        .bind(index.name)
+        .fetch_optional(&mut *connection)
+        .await;
+        match invalid {
+            Ok(Some(false)) => {
+                if let Err(error) = sqlx::query(&index.drop_invalid_sql())
+                    .execute(&mut *connection)
+                    .await
+                {
+                    failures.push(format!(
+                        "{} (removing an invalid earlier build): {error}",
+                        index.name
+                    ));
+                    continue;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(format!("{} (inspecting it): {error}", index.name));
+                continue;
+            }
+        }
+
+        on_progress(MaintenanceProgress::IndexStarted { name: index.name });
+        let started = std::time::Instant::now();
+        match sqlx::query(&index.create_sql())
+            .execute(&mut *connection)
+            .await
+        {
+            Ok(_) => on_progress(MaintenanceProgress::IndexFinished {
+                name: index.name,
+                elapsed: started.elapsed(),
+            }),
+            Err(error) => failures.push(format!(
+                "{} on {}({}): {error}",
+                index.name, index.table, index.column
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::Database(format!(
+            "Failed to build {} post-migration reference index(es): {}",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+}
+
 /// Live progress events from post-migration maintenance (concurrent index
 /// builds and continuous-aggregate backfill).
 ///
@@ -1041,6 +1235,21 @@ where
             name: PERMISSION_DENIED_RETENTION_INDEX,
             elapsed: started.elapsed(),
         });
+
+        // The reference indexes scan whole tables and run without a
+        // statement timeout: a build that is cut off at a fixed limit would
+        // be restarted from nothing on every retry and never finish on a
+        // large history. They do not block writes (see `ReferenceIndex`), and
+        // the lock timeout above still bounds waiting for a lock.
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to lift the statement timeout for reference index builds: {error}"
+                ))
+            })?;
+        build_reference_indexes(&mut connection, &on_progress).await?;
 
         Ok(())
     }
@@ -1429,6 +1638,70 @@ pub async fn reconcile_otel_trace_summaries(db: &DatabaseConnection) -> ServiceR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_table_reference_indexes_build_concurrently() {
+        for index in REFERENCE_INDEXES.iter().filter(|i| !i.hypertable) {
+            let sql = index.create_sql();
+            assert!(
+                sql.starts_with("CREATE INDEX CONCURRENTLY IF NOT EXISTS "),
+                "{sql}"
+            );
+            assert!(!sql.contains("transaction_per_chunk"), "{sql}");
+            assert!(
+                index
+                    .drop_invalid_sql()
+                    .starts_with("DROP INDEX CONCURRENTLY IF EXISTS "),
+                "dropping a leftover must not take a write-blocking lock"
+            );
+        }
+    }
+
+    /// TimescaleDB rejects `CREATE INDEX CONCURRENTLY` on a hypertable.
+    #[test]
+    fn hypertable_reference_indexes_build_one_chunk_per_transaction() {
+        // TimescaleDB rejects CREATE INDEX CONCURRENTLY on these; this list is
+        // the hypertables among the indexed tables (see the migrations).
+        let mut hypertables: Vec<_> = REFERENCE_INDEXES
+            .iter()
+            .filter(|i| i.hypertable)
+            .map(|i| i.table)
+            .collect();
+        hypertables.sort_unstable();
+        assert_eq!(hypertables, ["error_events", "proxy_logs"]);
+
+        for index in REFERENCE_INDEXES.iter().filter(|i| i.hypertable) {
+            let sql = index.create_sql();
+            assert!(!sql.contains("CONCURRENTLY"), "{sql}");
+            assert!(
+                sql.contains("WITH (timescaledb.transaction_per_chunk)"),
+                "{sql}"
+            );
+            // `WITH` must come before `WHERE` in the CREATE INDEX grammar.
+            assert!(
+                sql.find("WITH (").expect("with") < sql.find("WHERE").expect("where"),
+                "{sql}"
+            );
+            assert_eq!(
+                index.drop_invalid_sql(),
+                format!("DROP INDEX IF EXISTS {}", index.name)
+            );
+        }
+    }
+
+    #[test]
+    fn reference_indexes_are_partial_except_last_seen_and_names_are_unique() {
+        for index in REFERENCE_INDEXES {
+            let sql = index.create_sql();
+            let partial = sql.contains(&format!("WHERE {} IS NOT NULL", index.column));
+            assert_eq!(partial, index.column != "last_seen", "{sql}");
+            assert!(sql.contains("IF NOT EXISTS"), "{sql}");
+        }
+        let mut names: Vec<_> = REFERENCE_INDEXES.iter().map(|i| i.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), REFERENCE_INDEXES.len());
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 

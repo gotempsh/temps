@@ -17,7 +17,12 @@ import path from 'node:path'
 
 const SRC = path.resolve(import.meta.dir, '../..')
 const OPEN = /<(Button|button)\b/g
-const ONLY_ICON = /^<([A-Z][A-Za-z0-9]*)\b[^<>]*\/>$/s
+const ICON = String.raw`<([A-Z][A-Za-z0-9]*)\b[^<>]*\/>`
+const ONLY_ICON = new RegExp(`^${ICON}$`, 's')
+// `{loading ? <Loader2 /> : <RefreshCw />}`: still nothing but an icon.
+const ONLY_ICON_CONDITIONAL = new RegExp(
+  String.raw`^\{[\s\S]*?\?\s*${ICON}\s*:\s*${ICON}\s*\}$`
+)
 const NAMED = /aria-label|aria-labelledby|\btitle=/
 
 function* sourceFiles(dir: string): Generator<string> {
@@ -69,7 +74,7 @@ function unnamedIconButtons(src: string): string[] {
     const close = src.indexOf(`</${tag}>`, end)
     if (close < 0) continue
     const inner = src.slice(end, close).trim()
-    const icon = ONLY_ICON.exec(inner)
+    const icon = ONLY_ICON.exec(inner) ?? ONLY_ICON_CONDITIONAL.exec(inner)
     if (!icon) continue
     const opening = src.slice(match.index ?? 0, end)
     if (NAMED.test(opening)) continue
@@ -88,6 +93,17 @@ test('the scan recognises an unnamed icon-only button', () => {
   expect(
     unnamedIconButtons(
       '<Button aria-label="Back" onClick={() => go(-1)}><ArrowLeft /></Button>'
+    )
+  ).toHaveLength(0)
+  // A conditional between two icons is still icon-only.
+  expect(
+    unnamedIconButtons(
+      '<Button onClick={go}>\n  {busy ? <Loader2 className="h-3 animate-spin" /> : <RefreshCw className="h-3" />}\n</Button>'
+    )
+  ).toHaveLength(1)
+  expect(
+    unnamedIconButtons(
+      '<Button aria-label="Refresh" onClick={go}>{busy ? <Loader2 /> : <RefreshCw />}</Button>'
     )
   ).toHaveLength(0)
   // Visible text or an sr-only label already names the button.

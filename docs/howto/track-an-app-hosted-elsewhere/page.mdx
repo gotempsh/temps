@@ -1,0 +1,83 @@
+export const metadata = {
+  title: 'Track an App Hosted Elsewhere',
+  description:
+    'Add an app that runs on Vercel, Netlify or your own server as an External service: Temps collects its analytics, errors and traces and never deploys it.',
+  alternates: {
+    canonical: '/docs/track-an-app-hosted-elsewhere',
+  },
+}
+
+export const sections = [
+  { title: 'What External means', id: 'what-external-means' },
+  { title: 'Create an External service', id: 'create-an-external-service' },
+  { title: 'Switch an existing service', id: 'switch-an-existing-service' },
+  { title: 'Send telemetry', id: 'send-telemetry' },
+]
+
+# Track an App Hosted Elsewhere
+
+Some of your apps may run outside Temps: a marketing site on Vercel, a legacy app on a VPS. Add each one as an **External** service to see its analytics, errors and traces next to the services Temps runs, and to put it in the same Project. {{ className: 'lead' }}
+
+---
+
+## What External means {{ anchor: true, id: 'what-external-means' }}
+
+An External service is labelled **External** in the console and:
+
+- is **never deployed** by Temps. Deploy, redeploy, rollback and promote are refused with a message that says why, and pushes to a connected repository do not trigger builds.
+- still has analytics, session replay, error tracking and OpenTelemetry traces.
+- can be a member of a Project like any other service, so a project can hold both the services Temps runs and the ones it only observes.
+
+You can switch a service between **Hosted** and **External** at any time. Switching to External does not stop deployments that are already running: stop them yourself once the app has moved. Switching back lets Temps deploy it again.
+
+---
+
+## Create an External service {{ anchor: true, id: 'create-an-external-service' }}
+
+1. Open **Projects** and click **New service**.
+2. Choose **Hosted elsewhere**.
+3. Enter a **Service name** (for example `marketing-site`) and click **Create service**.
+
+Temps opens the service's analytics page, where you create the key your app sends data with.
+
+With the CLI:
+
+```bash
+bunx @temps-sdk/cli projects create --external --name marketing-site
+```
+
+With `--yes`, `--name` is required; the command exits with an error without it. To put the service in a project, add it afterwards:
+
+```bash
+bunx @temps-sdk/cli project-groups add acme-shop marketing-site
+```
+
+---
+
+## Switch an existing service {{ anchor: true, id: 'switch-an-existing-service' }}
+
+In the console, open the service's **Settings** > **Build & deploy**, find **Where it runs** in the **Source** section, choose **It runs elsewhere** and click **Mark as running elsewhere**. To let Temps deploy it again, choose **Temps runs it** and click **Let Temps host it**.
+
+```bash
+# Show the current setting
+bunx @temps-sdk/cli projects hosting -p marketing-site
+
+# Mark it External, or hosted again
+bunx @temps-sdk/cli projects hosting external -p marketing-site
+bunx @temps-sdk/cli projects hosting hosted -p marketing-site
+```
+
+---
+
+## Send telemetry {{ anchor: true, id: 'send-telemetry' }}
+
+An External service does not receive variables from Temps, because Temps never starts its containers. Configure its SDKs with values you copy:
+
+- **Analytics**: create an ingest key and use it with the analytics SDK.
+
+  ```bash
+  bunx @temps-sdk/cli analytics keys create -p marketing-site --allowed-origins https://www.example.com
+  ```
+
+- **Errors**: use the service's DSN with any Sentry SDK (`bunx @temps-sdk/cli dsn` shows it). See [Error Tracking](/docs/error-tracking).
+- **Traces and metrics**: point the OpenTelemetry exporter at Temps. See [OpenTelemetry](/docs/opentelemetry).

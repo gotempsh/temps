@@ -51,7 +51,7 @@ export function RichProjectPicker({
   projects,
   value,
   onValueChange,
-  placeholder = 'Choose a project…',
+  placeholder = 'Choose a service…',
   disabled,
   ariaLabel,
   className,
@@ -91,10 +91,10 @@ export function RichProjectPicker({
         className="w-[min(calc(100vw-2rem),22rem)] min-w-[var(--radix-popover-trigger-width)] p-0"
       >
         <Command>
-          <CommandInput name="project-filter" placeholder="Find a project…" />
+          <CommandInput name="project-filter" placeholder="Find a service…" />
           <CommandList className="max-h-80">
-            <CommandEmpty>No projects found.</CommandEmpty>
-            <CommandGroup heading="Projects">
+            <CommandEmpty>No services found.</CommandEmpty>
+            <CommandGroup heading="Services">
               {projects.map((project) => (
                 <CommandItem
                   className="items-start gap-2 p-2"

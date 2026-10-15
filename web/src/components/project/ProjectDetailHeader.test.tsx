@@ -18,7 +18,12 @@ function renderHeader(
   {
     activeVisitors,
     containers,
-  }: { activeVisitors?: number; containers?: { status: string }[] } = {}
+    hosting = 'hosted',
+  }: {
+    activeVisitors?: number
+    containers?: { status: string }[]
+    hosting?: ProjectResponse['hosting']
+  } = {}
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -48,7 +53,12 @@ function renderHeader(
       <MemoryRouter>
         <ProjectDetailHeader
           project={
-            { id: 1, slug: 'temps-cloud-api', name: 'Temps' } as ProjectResponse
+            {
+              id: 1,
+              slug: 'temps-cloud-api',
+              name: 'Temps',
+              hosting,
+            } as ProjectResponse
           }
           lastDeployment={
             { id: 3513, status, is_current: false } as DeploymentResponse
@@ -131,3 +141,9 @@ for (const activeVisitors of [0, 3]) {
     expect(pill).toContain('cursor-pointer')
   })
 }
+test('a service hosted elsewhere shows External and no deploy button', () => {
+  const html = renderHeader('completed', null, { hosting: 'external' })
+  expect(html).toContain('External')
+  expect(html).not.toContain('Not deployed')
+  expect(html).not.toContain('>Deploy<')
+})

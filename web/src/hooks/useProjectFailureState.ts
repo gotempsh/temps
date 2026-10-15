@@ -21,6 +21,15 @@ import { useMemo } from 'react'
 /** How often live container state is re-read for the Degraded check. */
 const CONTAINER_HEALTH_REFETCH_MS = 30_000
 
+export interface UseProjectFailureStateOptions {
+  /**
+   * Set to `false` for projects Temps never deploys (hosted externally): there
+   * are no environments to poll every few seconds and nothing to be degraded.
+   * Defaults to `true`.
+   */
+  enabled?: boolean
+}
+
 /**
  * Everything the project header and overview need to say "this project is
  * failing, and here is what to do": the header status (now including Failed
@@ -32,10 +41,13 @@ const CONTAINER_HEALTH_REFETCH_MS = 30_000
  */
 export function useProjectFailureState(
   projectId: number,
-  lastDeployment: DeploymentResponse | undefined
+  lastDeployment: DeploymentResponse | undefined,
+  options: UseProjectFailureStateOptions = {}
 ) {
+  const { enabled = true } = options
   const environmentsQuery = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: projectId } }),
+    enabled,
     refetchInterval: 5_000,
   })
   const environment = healthEnvironment(environmentsQuery.data)

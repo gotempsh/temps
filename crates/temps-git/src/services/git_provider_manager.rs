@@ -188,6 +188,14 @@ pub enum GitProviderManagerError {
     OAuthStateInvalid(String),
 }
 
+/// A connection the caller may not use: the same answer whether it is missing
+/// or another user's, so this does not reveal which connections exist.
+fn foreign_or_missing_connection(connection_id: i32) -> GitProviderManagerError {
+    GitProviderManagerError::ConnectionNotFound(format!(
+        "Git connection {connection_id} does not exist or is not one of yours"
+    ))
+}
+
 impl GitProviderManagerError {
     /// Whether the provider reported that the requested file does not exist,
     /// as opposed to failing to answer.
@@ -1782,7 +1790,7 @@ impl GitProviderManager {
             .filter(git_provider_connections::Column::UserId.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| GitProviderManagerError::ConnectionNotFound(connection_id.to_string()))
+            .ok_or_else(|| foreign_or_missing_connection(connection_id))
     }
 
     /// Set syncing status for a connection. When flipping to `true`, we also
@@ -5331,9 +5339,7 @@ impl GitProviderManager {
         // MockDatabase does not apply query predicates, and this defense also
         // protects future alternative data-access implementations.
         if connection.user_id != Some(user_id) {
-            return Err(GitProviderManagerError::ConnectionNotFound(
-                connection_id.to_string(),
-            ));
+            return Err(foreign_or_missing_connection(connection_id));
         }
         if !connection.is_active || connection.is_expired {
             return Err(GitProviderManagerError::InvalidConfiguration(format!(
@@ -5514,7 +5520,83 @@ impl GitProviderManager {
             new_repo.full_name
         );
 
+        // Record the new repository in the `repositories` table so that
+        // `set_repository` / `validate_connected` can find it by name without
+        // waiting for the next full sync. An existing row (e.g. from a
+        // partially completed retry) is left as-is. This is a hard error: if
+        // recording fails the caller cannot locate the repository on resume,
+        // so the fork step must not succeed silently. The instantiation engine
+        // stores the outcome before advancing; the user can safely retry and
+        // the engine will detect the already-created repository on resume.
+        self.record_repository(connection_id, &new_repo)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    connection_id,
+                    repo = %new_repo.full_name,
+                    error = %e,
+                    "Created repository but failed to record it; the fork step will fail so \
+                     the instantiation can be retried safely"
+                );
+                e
+            })?;
+
         Ok(new_repo)
+    }
+
+    /// Inserts `repo` into the `repositories` table for `connection_id`, so
+    /// `find_repository` / `validate_connected` can locate it immediately
+    /// without waiting for the next full sync. If a row for this connection
+    /// and `full_name` already exists (e.g. from a prior partially-completed
+    /// attempt), the existing row is left unchanged.
+    pub async fn record_repository(
+        &self,
+        connection_id: i32,
+        repo: &super::git_provider::Repository,
+    ) -> Result<(), GitProviderManagerError> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter, Set};
+        // Skip the insert when a row is already there (resume-after-crash).
+        let already_exists = repositories::Entity::find()
+            .filter(repositories::Column::GitProviderConnectionId.eq(connection_id))
+            .filter(repositories::Column::FullName.eq(&repo.full_name))
+            .one(self.db.as_ref())
+            .await
+            .map_err(GitProviderManagerError::DatabaseError)?
+            .is_some();
+        if already_exists {
+            return Ok(());
+        }
+        let now = chrono::Utc::now();
+        let new_row = repositories::ActiveModel {
+            git_provider_connection_id: Set(connection_id),
+            owner: Set(repo.owner.clone()),
+            name: Set(repo.name.clone()),
+            full_name: Set(repo.full_name.clone()),
+            description: Set(repo.description.clone()),
+            private: Set(repo.private),
+            fork: Set(false),
+            size: Set(0),
+            stargazers_count: Set(0),
+            watchers_count: Set(0),
+            language: Set(None),
+            default_branch: Set(repo.default_branch.clone()),
+            open_issues_count: Set(0),
+            topics: Set(String::new()),
+            repo_object: Set(String::new()),
+            created_at: Set(repo.created_at),
+            updated_at: Set(repo.updated_at),
+            pushed_at: Set(repo.pushed_at.unwrap_or(now)),
+            clone_url: Set(Some(repo.clone_url.clone())),
+            ssh_url: Set(Some(repo.ssh_url.clone())),
+            installation_id: Set(None),
+            preset: Set(None),
+            ..Default::default()
+        };
+        new_row
+            .insert(self.db.as_ref())
+            .await
+            .map(|_| ())
+            .map_err(GitProviderManagerError::DatabaseError)
     }
 }
 
@@ -6971,7 +7053,7 @@ mod tests {
             } else {
                 assert!(matches!(
                     error,
-                    GitProviderManagerError::ConnectionNotFound(id) if id == "11"
+                    GitProviderManagerError::ConnectionNotFound(message) if message.contains("connection 11")
                 ));
             }
         }

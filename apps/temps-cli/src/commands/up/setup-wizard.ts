@@ -440,10 +440,11 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
         // Wait for deployment to start and get the deployment ID
         let deploymentId: number | null = null
         for (let attempt = 0; attempt < 30; attempt++) {
-          const { data: deployment } = await getLastDeployment({
+          const { data: lastDeployment } = await getLastDeployment({
             client,
             path: { id: project.id },
           })
+          const deployment = lastDeployment?.deployment
 
           if (deployment?.id) {
             deploymentId = deployment.id

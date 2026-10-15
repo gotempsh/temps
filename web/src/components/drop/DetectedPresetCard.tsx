@@ -31,10 +31,10 @@ export function DetectedPresetCard({
   }, [isDetecting])
 
   const detectionTitle =
-    phase === 'packing' ? 'Packaging project files' : 'Inspecting project files'
+    phase === 'packing' ? 'Packaging source files' : 'Inspecting source files'
   const detectionDescription =
     elapsedSeconds >= 5
-      ? `Still working — larger projects can take a little longer. ${elapsedSeconds}s elapsed. You can cancel with the X.`
+      ? `Still working — larger codebases can take a little longer. ${elapsedSeconds}s elapsed. You can cancel with the X.`
       : phase === 'packing'
         ? 'Creating a secure archive in your browser…'
         : 'Uploading the archive and reading framework manifests…'
@@ -72,7 +72,7 @@ export function DetectedPresetCard({
                   className={cn(
                     'rounded-full px-2 py-0.5 text-[10px] font-medium capitalize',
                     candidate.confidence.toLowerCase() === 'high'
-                      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
                       : 'bg-amber-500/10 text-amber-700 dark:text-amber-400'
                   )}
                 >

@@ -10,25 +10,18 @@ import {
   createProjectMutation,
   getPublicBranchesOptions,
   listProjectTemplatesOptions,
-  listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ReadFailure } from '@/components/ui/read-failure'
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectItem,
-  SelectContent,
-} from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
-import { RepositoryList } from '@/components/repositories/RepositoryList'
+import { GitConnectionRepositoryPicker } from '@/components/repositories/GitConnectionRepositoryPicker'
 import { TemplateList, TemplateConfigurator } from '@/components/templates'
 import { ManualProjectConfigurator } from '@/components/project/ManualProjectConfigurator'
+import { ExternalProjectConfigurator } from './ExternalProjectConfigurator'
 import type {
   RepositoryResponse,
   TemplateResponse,
@@ -42,11 +35,11 @@ import {
 } from 'lucide-react'
 import Github from '@/icons/Github'
 import Gitlab from '@/icons/Gitlab'
-import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   NewProjectShell,
   type ProjectSource,
 } from '@/components/project/NewProjectShell'
+import { useJoinGroupAfterCreate } from '@/components/project-groups/useJoinGroupAfterCreate'
 import { MonitorProjectForm } from './MonitorProjectForm'
 import { Drop } from '@/pages/Drop'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
@@ -272,29 +265,6 @@ export function GitImportClone({
     !connectionsQuery.isError &&
     (connections?.connections.length ?? 0) === 0
 
-  // Providers list lets us pick the right icon per connection (a GitLab
-  // connection should not render the GitHub mark).
-  const { data: gitProviders } = useQuery({
-    ...listGitProvidersOptions(),
-  })
-
-  const providerTypeForConnectionId = (
-    providerId: number
-  ): string | undefined =>
-    gitProviders?.find((p) => p.id === providerId)?.provider_type
-
-  const renderProviderIcon = (
-    providerId: number | undefined | null,
-    className = 'h-4 w-4'
-  ) => (
-    <ProviderLogo
-      providerType={
-        providerId != null ? providerTypeForConnectionId(providerId) : undefined
-      }
-      className={className}
-    />
-  )
-
   // Optional `?connection=<id>` param lets callers deep-link straight to a
   // specific connection's repository list — used by the first-run "connect a
   // Git provider" happy path, which sends the user here right after creating a
@@ -364,12 +334,6 @@ export function GitImportClone({
     }
   }, [connections, selectedConnection, isInitialLoad, connectionIdFromUrl])
 
-  const selectedConnectionDetails = connections?.connections.find(
-    (connection) => connection.id.toString() === selectedConnection
-  )
-  const selectedConnectionProviderType = selectedConnectionDetails
-    ? providerTypeForConnectionId(selectedConnectionDetails.provider_id)
-    : undefined
   const parsedGitUrlPreview =
     gitUrl && !isValidatingUrl ? parseGitUrl(gitUrl) : null
 
@@ -419,15 +383,22 @@ export function GitImportClone({
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
+  // `?group=<id>`: the new service joins that project.
+  const {
+    groupId: targetGroupId,
+    finish,
+    joinGroupDialog,
+  } = useJoinGroupAfterCreate()
+
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
-      errorTitle: 'Failed to create project',
+      errorTitle: 'Failed to create service',
     },
     onSuccess: async (data) => {
-      toast.success('Project created successfully')
+      toast.success('Service created')
       onProjectCreated?.()
-      navigate(`/projects/${data.slug}?new=true`)
+      await finish(data, `/projects/${data.slug}?new=true`)
     },
   })
 
@@ -546,7 +517,11 @@ export function GitImportClone({
         toast.error('Repository is missing an id; cannot import')
         return
       }
-      navigate(`/projects/import/${repo.id}`)
+      navigate(
+        targetGroupId === null
+          ? `/projects/import/${repo.id}`
+          : `/projects/import/${repo.id}?group=${targetGroupId}`
+      )
     } else {
       // Inline mode: show configurator
       setSelectedRepository(repo)
@@ -621,11 +596,12 @@ export function GitImportClone({
         onSelectSource={setSelectedSource}
       >
         {verificationDialog}
+        {joinGroupDialog}
         <div className="space-y-6">
           <div className="flex items-center gap-4">
             <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
               <ChevronLeft className="h-4 w-4 mr-2" />
-              {useGitUrl ? 'Back to Git URL' : 'Back to Create Project'}
+              {useGitUrl ? 'Back to Git URL' : 'Back to New service'}
             </Button>
           </div>
 
@@ -725,7 +701,7 @@ export function GitImportClone({
                   if (handleSensitiveActionError(error, () => void submit())) {
                     return
                   }
-                  console.error('Project creation error:', error)
+                  console.error('Service creation error:', error)
                 }
               }
               await submit()
@@ -808,7 +784,7 @@ export function GitImportClone({
               onTemplateSelect={selectTemplate}
               selectedTemplate={selectedTemplate}
               showFeaturedFirst={true}
-              kind="service"
+              kind="app"
               showTagFilter={false}
             />
           </CardContent>
@@ -850,62 +826,14 @@ export function GitImportClone({
       {selectedSource === 'browse' && connectionCount > 0 && (
         <Card>
           <CardContent className="pt-6 space-y-3">
-            <Select
-              value={selectedConnection}
-              onValueChange={setSelectedConnection}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Select Connection">
-                  {selectedConnection &&
-                    connections &&
-                    (selectedConnectionDetails ? (
-                      <div className="flex items-center gap-2">
-                        {renderProviderIcon(
-                          selectedConnectionDetails.provider_id
-                        )}
-                        <span className="font-medium">
-                          {selectedConnectionDetails.account_name}
-                        </span>
-                        <span className="text-xs text-muted-foreground">
-                          ({selectedConnectionDetails.account_type})
-                        </span>
-                      </div>
-                    ) : (
-                      'Select Connection'
-                    ))}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {connections?.connections?.map((connection) => (
-                  <SelectItem
-                    key={connection.id}
-                    value={connection.id.toString()}
-                  >
-                    <div className="flex items-center gap-2">
-                      {renderProviderIcon(connection.provider_id)}
-                      <span className="font-medium">
-                        {connection.account_name}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        ({connection.account_type})
-                      </span>
-                    </div>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            {selectedConnection && (
-              <RepositoryList
-                connectionId={Number(selectedConnection)}
-                onRepositorySelect={handleRepositoryClick}
-                showSelection={false}
-                itemsPerPage={15}
-                showHeader={true}
-                compactMode
-                providerType={selectedConnectionProviderType}
-              />
-            )}
+            <GitConnectionRepositoryPicker
+              connections={connections?.connections ?? []}
+              connectionId={
+                selectedConnection ? Number(selectedConnection) : null
+              }
+              onConnectionChange={(id) => setSelectedConnection(String(id))}
+              onRepositorySelect={handleRepositoryClick}
+            />
           </CardContent>
         </Card>
       )}
@@ -937,7 +865,7 @@ export function GitImportClone({
                   <Gitlab className="h-3 w-3" />
                   <span>GitLab</span>
                 </div>
-                <span className="text-muted-foreground/60">supported</span>
+                <span className="text-muted-foreground">supported</span>
               </div>
             </div>
             <Button
@@ -991,11 +919,23 @@ export function GitImportClone({
       )}
 
       {selectedSource === 'drop' && <Drop embedded />}
-      {selectedSource === 'monitor' && (
-        <MonitorProjectForm
-          onCreated={mode === 'inline' ? onProjectCreated : undefined}
-        />
-      )}
+      {selectedSource === 'monitor' &&
+        (targetGroupId === null ? (
+          <MonitorProjectForm
+            onCreated={mode === 'inline' ? onProjectCreated : undefined}
+          />
+        ) : (
+          // `?group=<id>`: the monitored service joins that project once
+          // created, which MonitorProjectForm (no created-project callback)
+          // cannot do.
+          <Card>
+            <CardContent className="pt-6">
+              <ExternalProjectConfigurator
+                onCancel={() => setSelectedSource(null)}
+              />
+            </CardContent>
+          </Card>
+        ))}
     </>
   )
 

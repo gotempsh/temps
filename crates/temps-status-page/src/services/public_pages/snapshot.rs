@@ -67,8 +67,24 @@ pub struct PublishedSnapshot {
     /// Internal bookkeeping only; never serialized.
     pub(crate) status_page_id: i32,
     pub(crate) project_id: i32,
+    /// Custom hostnames (#1412) whose ownership is proven. A request tagged by
+    /// the proxy with a hostname not in this set gets the 404, so removing a
+    /// hostname takes effect here before the proxy's route table reloads.
+    pub(crate) custom_hosts: HashSet<String>,
     pub json: Bytes,
     pub html: Bytes,
+}
+
+impl PublishedSnapshot {
+    /// Whether this page may be served for a request tagged with
+    /// `custom_host` (the proxy's `x-temps-status-host`), or for an untagged
+    /// request to its slug URL.
+    pub fn serves_host(&self, custom_host: Option<&str>) -> bool {
+        match custom_host {
+            None => true,
+            Some(host) => self.custom_hosts.contains(host),
+        }
+    }
 }
 
 /// Which pages a rebuild covers.
@@ -293,6 +309,7 @@ impl StatusSnapshotCache {
             .into_iter()
             .collect();
         let data = load_refresh_data(db, &mut state, &monitor_ids, &page_ids, now).await?;
+        let mut verified_hosts = super::domains::load_verified_hosts(db, &page_ids).await?;
         if matches!(scope, Scope::All) {
             let live: HashSet<i32> = monitor_ids.iter().copied().collect();
             state
@@ -318,6 +335,7 @@ impl StatusSnapshotCache {
                     Arc::new(PublishedSnapshot {
                         status_page_id: page.id,
                         project_id: page.project_id,
+                        custom_hosts: verified_hosts.remove(&page.id).unwrap_or_default(),
                         json: Bytes::from(json),
                         html: Bytes::from(render_public_page_html(&response)),
                     }),

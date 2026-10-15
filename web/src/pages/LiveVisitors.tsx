@@ -29,7 +29,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
 
   const project = projectProp || queriedProject
 
-  usePageTitle(`${project?.slug || 'Project'} - Live Visitors`)
+  usePageTitle(`${project?.slug || 'Service'} - Live Visitors`)
 
   if (isLoading) {
     return (
@@ -37,7 +37,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
         <div className="p-4 sm:p-6 space-y-6">
           <Button variant="outline" size="sm" disabled>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Project
+            Back to Service
           </Button>
           <div className="space-y-4">
             <Skeleton className="h-8 w-48" />
@@ -59,7 +59,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
             </Link>
           </Button>
           <div className="text-center py-12">
-            <p className="text-muted-foreground">Project not found</p>
+            <p className="text-muted-foreground">Service not found</p>
           </div>
         </div>
       </div>
@@ -72,7 +72,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
         <Button variant="outline" size="sm" asChild>
           <Link to={`/projects/${project.slug}`}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Project
+            Back to Service
           </Link>
         </Button>
 

@@ -20,6 +20,7 @@ import type {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -45,7 +46,7 @@ import {
   ShieldCheck,
   Unplug,
 } from 'lucide-react'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
@@ -73,6 +74,7 @@ export function CloudSettingsPage() {
     refetchInterval: 5_000,
     retry: false,
   })
+  const [confirmDisconnectOpen, setConfirmDisconnectOpen] = useState(false)
   const enroll = useMutation(enrollCloudMutation())
   const disconnect = useMutation(disconnectCloudMutation())
   const updateFeatures = useMutation(updateCloudFeaturesMutation())
@@ -360,7 +362,7 @@ export function CloudSettingsPage() {
                   Connection state
                 </p>
                 <div className="flex items-center gap-3">
-                  <span className="grid size-9 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-500">
+                  <span className="grid size-9 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500">
                     <Check className="size-4" />
                   </span>
                   <div>
@@ -379,7 +381,7 @@ export function CloudSettingsPage() {
               <div className="border-t border-border p-6 md:border-l md:border-t-0">
                 <Button
                   variant="outline"
-                  onClick={remove}
+                  onClick={() => setConfirmDisconnectOpen(true)}
                   disabled={disconnect.isPending}
                 >
                   <Unplug /> Disconnect
@@ -520,7 +522,7 @@ export function CloudSettingsPage() {
                 <p>
                   Disconnecting disables Cloud exports, removes managed backup
                   schedules, and revokes Cloud console access and its sessions.
-                  It removes the saved Cloud credential. Local projects and
+                  It removes the saved Cloud credential. Local services and
                   deployments remain available. After reconnecting, review your
                   Cloud exports and backup schedule.
                 </p>
@@ -541,7 +543,7 @@ export function CloudSettingsPage() {
             <Button
               type="button"
               variant="outline"
-              onClick={() => void remove()}
+              onClick={() => setConfirmDisconnectOpen(true)}
               disabled={disconnect.isPending}
             >
               {disconnect.isPending ? (
@@ -666,6 +668,19 @@ export function CloudSettingsPage() {
           </aside>
         </div>
       )}
+      <ConfirmDeleteDialog
+        open={confirmDisconnectOpen}
+        onOpenChange={setConfirmDisconnectOpen}
+        resourceType="Temps Cloud account"
+        resourceName={status.data?.account_email || cloudConsoleUrl}
+        verb="Disconnect"
+        irreversible={false}
+        consequences="Disconnecting disables Cloud exports, removes managed backup schedules, and revokes Cloud console access and its sessions. It removes the saved Cloud credential. Local services and deployments remain available. To reconnect you need a new enrollment code from Temps Cloud."
+        isPending={disconnect.isPending}
+        onConfirm={() => {
+          void remove().finally(() => setConfirmDisconnectOpen(false))
+        }}
+      />
     </div>
   )
 }

@@ -2771,17 +2771,17 @@ services:
         // `ComposeExecutor::write_compose_files` performs this same rewrite
         // before layering an override that defines `ports`, preventing Compose
         // from retaining both the base and override port mappings.
-        let mut prepared: serde_yaml::Value = serde_yaml::from_str(&stripped).unwrap();
+        let mut prepared: yaml_serde::Value = yaml_serde::from_str(&stripped).unwrap();
         prepared["services"]["web"]
             .as_mapping_mut()
             .expect("web service should be a mapping")
             .remove("ports");
-        let prepared = serde_yaml::to_string(&prepared).unwrap();
+        let prepared = yaml_serde::to_string(&prepared).unwrap();
 
         let preview =
             temps_presets::render_effective_compose_preview(base, Some(override_yaml), &excluded)
                 .expect("preview should render");
-        let preview_value: serde_yaml::Value = serde_yaml::from_str(&preview.yaml).unwrap();
+        let preview_value: yaml_serde::Value = yaml_serde::from_str(&preview.yaml).unwrap();
 
         let temp = tempfile::tempdir().unwrap();
         let base_path = temp.path().join("compose.yml");

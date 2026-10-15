@@ -39,6 +39,7 @@ import {
   type ClusterMemberHealth,
   type MemberHealthBucket,
 } from '@/lib/cluster-health'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 
 interface Props {
   serviceId: number
@@ -226,7 +227,7 @@ export function ClusterHealthPanel({
             Monitor reports zero data nodes registered yet.
           </p>
         ) : (
-          <div className="overflow-x-auto">
+          <ScrollRegion regionLabel="Cluster members, scrollable">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
@@ -245,7 +246,7 @@ export function ClusterHealthPanel({
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollRegion>
         )}
       </CardContent>
     </Card>
@@ -303,6 +304,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
       <td className="py-2.5 pr-3">
         <div className="flex items-center gap-2">
           <span
+            role="img"
             className={`h-2.5 w-2.5 rounded-full ${DOT_CLASS[bucket]}`}
             aria-label={dotTitle}
             title={dotTitle}
@@ -318,7 +320,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
             {bucket === 'unreachable' && (
               <>
                 {' · '}
-                <span className="text-rose-400">
+                <span className="text-rose-700 dark:text-rose-400">
                   no report {formatLastSeen(member.seconds_since_report)}
                 </span>
               </>
@@ -341,6 +343,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
           {transitioning && (
             <>
               <span
+                role="img"
                 className="text-muted-foreground"
                 aria-label="transitioning to"
               >
@@ -386,7 +389,7 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
           </span>
         ) : member.replication_quorum ? (
           <span
-            className="text-emerald-500"
+            className="text-emerald-700 dark:text-emerald-500"
             title="Member of the synchronous quorum"
           >
             ●

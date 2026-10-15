@@ -74,7 +74,7 @@ export function CreateEnvironmentDialog({
             <DialogHeader>
               <DialogTitle>Create Environment</DialogTitle>
               <DialogDescription>
-                Add a new environment to your project for different deployment
+                Add a new environment to your service for different deployment
                 stages.
               </DialogDescription>
             </DialogHeader>

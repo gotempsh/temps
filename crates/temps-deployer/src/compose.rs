@@ -12,9 +12,6 @@ use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_yaml::value::{Tag, TaggedValue};
-use serde_yaml::Value as YamlValue;
-use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -33,6 +30,9 @@ use crate::compose_interpolation::{self, InterpolationError};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
+use yaml_serde::value::{Tag, TaggedValue};
+use yaml_serde::Value as YamlValue;
+use yaml_serde::{Mapping, Value};
 
 /// Owns the inspected local inputs until `compose config` finishes. Remote
 /// archives are retained only after validation, because effective runtime paths
@@ -2100,7 +2100,7 @@ impl ComposeExecutor {
             if document.trim().is_empty() {
                 continue;
             }
-            let Ok(mut root) = serde_yaml::from_str::<YamlValue>(document) else {
+            let Ok(mut root) = yaml_serde::from_str::<YamlValue>(document) else {
                 continue;
             };
             let _ = root.apply_merge();
@@ -2216,11 +2216,11 @@ impl ComposeExecutor {
             Value::String("services".to_string()),
             Value::Mapping(services_map),
         );
-        // Built through serde_yaml rather than string formatting so a service
+        // Built through yaml_serde rather than string formatting so a service
         // name or host path containing YAML metacharacters is quoted, not
         // injected as structure.
         (
-            serde_yaml::to_string(&Value::Mapping(root)).unwrap_or_default(),
+            yaml_serde::to_string(&Value::Mapping(root)).unwrap_or_default(),
             mounted,
         )
     }
@@ -3366,7 +3366,7 @@ impl ComposeExecutor {
         compose_base: &Path,
         persistent_bind_root: &Path,
     ) -> Result<String, ComposeError> {
-        let mut root: YamlValue = serde_yaml::from_str(compose_content).map_err(|error| {
+        let mut root: YamlValue = yaml_serde::from_str(compose_content).map_err(|error| {
             ComposeError::InvalidComposeYaml {
                 compose_source: "compose file".to_string(),
                 reason: error.to_string(),
@@ -3446,7 +3446,7 @@ impl ComposeExecutor {
         }
 
         if changed {
-            serde_yaml::to_string(&root).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::to_string(&root).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "compose file".to_string(),
                 reason: format!("failed to render persistent relative bind mounts: {error}"),
             })
@@ -3502,7 +3502,7 @@ impl ComposeExecutor {
             return Ok(compose_content.to_string());
         }
 
-        let mut root: YamlValue = serde_yaml::from_str(compose_content).map_err(|e| {
+        let mut root: YamlValue = yaml_serde::from_str(compose_content).map_err(|e| {
             ComposeError::InvalidComposeYaml {
                 compose_source: "compose file".to_string(),
                 reason: e.to_string(),
@@ -3546,7 +3546,7 @@ impl ComposeExecutor {
             }
         }
 
-        serde_yaml::to_string(&root).map_err(|e| ComposeError::InvalidComposeYaml {
+        yaml_serde::to_string(&root).map_err(|e| ComposeError::InvalidComposeYaml {
             compose_source: "compose file".to_string(),
             reason: format!("failed to re-serialize compose file after excluding services: {e}"),
         })
@@ -3562,7 +3562,7 @@ impl ComposeExecutor {
         if override_content.is_some_and(|content| !content.trim().is_empty()) {
             reasons.push("project override");
         }
-        let Ok(mut root) = serde_yaml::from_str::<Value>(content) else {
+        let Ok(mut root) = yaml_serde::from_str::<Value>(content) else {
             // Invalid YAML is reported by validation with its own message.
             return reasons;
         };
@@ -3745,8 +3745,8 @@ impl ComposeExecutor {
         override_content: &str,
     ) -> Result<String, ComposeError> {
         let (Ok(mut base), Ok(mut overlay)) = (
-            serde_yaml::from_str::<Value>(content),
-            serde_yaml::from_str::<Value>(override_content),
+            yaml_serde::from_str::<Value>(content),
+            yaml_serde::from_str::<Value>(override_content),
         ) else {
             // Malformed YAML is reported by validation with its own message.
             return Ok(override_content.to_string());
@@ -3759,7 +3759,7 @@ impl ComposeExecutor {
         if overlay == before {
             return Ok(override_content.to_string());
         }
-        serde_yaml::to_string(&overlay).map_err(|error| ComposeError::InvalidOverride {
+        yaml_serde::to_string(&overlay).map_err(|error| ComposeError::InvalidOverride {
             project: project_name.to_string(),
             reason: format!(
                 "failed to re-serialize the override after removing duplicate list items: {error}"
@@ -4332,7 +4332,7 @@ impl ComposeExecutor {
         cache_name: &str,
     ) -> Result<(), ComposeError> {
         let yaml: Value =
-            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "resolved Compose configuration".to_string(),
                 reason: error.to_string(),
             })?;
@@ -4410,7 +4410,7 @@ impl ComposeExecutor {
             Self::confined_reference(scope, base, ".env")?;
         }
         let mut yaml: Value =
-            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "Compose reference".to_string(),
                 reason: error.to_string(),
             })?;
@@ -4465,7 +4465,7 @@ impl ComposeExecutor {
             .tempfile_in(base)?;
         let path = file.path().to_path_buf();
         let serialized =
-            serde_yaml::to_string(&yaml).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::to_string(&yaml).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "Compose reference".to_string(),
                 reason: error.to_string(),
             })?;
@@ -4909,7 +4909,7 @@ impl ComposeExecutor {
 
     fn validate_source_security(&self, content: &str) -> Result<(), ComposeError> {
         let mut source: Value =
-            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "Compose source".to_string(),
                 reason: error.to_string(),
             })?;
@@ -4940,7 +4940,7 @@ impl ComposeExecutor {
             root.remove("networks");
         }
         let source =
-            serde_yaml::to_string(&source).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::to_string(&source).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: "Compose source".to_string(),
                 reason: error.to_string(),
             })?;
@@ -5046,7 +5046,7 @@ impl ComposeExecutor {
             return Ok(());
         }
 
-        let mut root: YamlValue = serde_yaml::from_str(compose_content).map_err(|e| {
+        let mut root: YamlValue = yaml_serde::from_str(compose_content).map_err(|e| {
             ComposeError::InvalidComposeYaml {
                 compose_source: source.to_string(),
                 reason: e.to_string(),
@@ -5655,7 +5655,7 @@ impl ComposeExecutor {
     /// Reject privileged build options before `docker compose build` runs them.
     fn validate_build_options(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         let Some(build) = service.get(YamlValue::String("build".to_string())) else {
@@ -5838,7 +5838,7 @@ impl ComposeExecutor {
     /// same host-accelerator passthrough the `gpus` guard is meant to prevent.
     fn reject_deploy_devices(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         if !self.enforced(PolicyCheck::Gpu) {
@@ -5866,7 +5866,7 @@ impl ComposeExecutor {
 
     fn validate_replica_count(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         if !self.enforced(PolicyCheck::Replicas) {
@@ -5917,7 +5917,7 @@ impl ComposeExecutor {
 
     fn validate_service_image(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         let has_build = service.contains_key(YamlValue::String("build".to_string()));
@@ -6011,7 +6011,7 @@ impl ComposeExecutor {
 
     fn validate_env_files(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         let Some(env_file) = service.get(YamlValue::String("env_file".to_string())) else {
@@ -6074,7 +6074,7 @@ impl ComposeExecutor {
 
     fn validate_published_ports(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         if !self.enforced(PolicyCheck::PublishedPorts) {
@@ -6225,7 +6225,7 @@ impl ComposeExecutor {
     /// security-guarded field's value (recursing into sequences and mappings).
     fn reject_interpolation_in_guarded_fields(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
         if !self.enforced(PolicyCheck::Interpolation) {
@@ -6264,7 +6264,7 @@ impl ComposeExecutor {
 
     fn reject_bool(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
         field: &str,
         rejected: bool,
@@ -6297,7 +6297,7 @@ impl ComposeExecutor {
 
     fn reject_present(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
         field: &str,
         reason: &str,
@@ -6317,9 +6317,9 @@ impl ComposeExecutor {
 
     fn validate_network_mode(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
-        declared_services: &serde_yaml::Mapping,
+        declared_services: &yaml_serde::Mapping,
     ) -> Result<(), ComposeError> {
         let Some(value) = service.get(YamlValue::String("network_mode".to_string())) else {
             return Ok(());
@@ -6362,7 +6362,7 @@ impl ComposeExecutor {
 
     fn reject_host_namespace(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
         field: &str,
     ) -> Result<(), ComposeError> {
@@ -6466,7 +6466,7 @@ impl ComposeExecutor {
 
     fn validate_service_volumes(
         &self,
-        service: &serde_yaml::Mapping,
+        service: &yaml_serde::Mapping,
         service_name: &str,
         forbidden_named_volumes: &HashSet<String>,
     ) -> Result<(), ComposeError> {
@@ -6789,7 +6789,7 @@ impl ComposeExecutor {
             });
         }
 
-        let mut root: YamlValue = serde_yaml::from_str(compose_content).map_err(|e| {
+        let mut root: YamlValue = yaml_serde::from_str(compose_content).map_err(|e| {
             ComposeError::InvalidComposeYaml {
                 compose_source: source.to_string(),
                 reason: e.to_string(),
@@ -7432,7 +7432,7 @@ impl ComposeExecutor {
         if !changed {
             return Ok(override_content.to_string());
         }
-        serde_yaml::to_string(&override_yaml).map_err(|error| ComposeError::InvalidOverride {
+        yaml_serde::to_string(&override_yaml).map_err(|error| ComposeError::InvalidOverride {
             project: project_name.to_string(),
             reason: format!("failed to serialize inline override after merging extends: {error}"),
         })
@@ -7470,7 +7470,7 @@ impl ComposeExecutor {
             Value::String("services".to_string()),
             Value::Mapping(reset_services),
         );
-        serde_yaml::to_string(&Value::Mapping(root))
+        yaml_serde::to_string(&Value::Mapping(root))
             .map(Some)
             .map_err(|error| ComposeError::InvalidOverride {
                 project: project_name.to_string(),
@@ -7484,7 +7484,7 @@ impl ComposeExecutor {
         label: &str,
     ) -> Result<Value, ComposeError> {
         let mut compose =
-            serde_yaml::from_str::<Value>(content).map_err(|e| ComposeError::InvalidOverride {
+            yaml_serde::from_str::<Value>(content).map_err(|e| ComposeError::InvalidOverride {
                 project: project_name.to_string(),
                 reason: format!("failed to parse {label} YAML: {e}"),
             })?;
@@ -7961,7 +7961,7 @@ impl ComposeExecutor {
         }
 
         let resolved: YamlValue =
-            serde_yaml::from_slice(&stdout).map_err(|error| ComposeError::InvalidComposeYaml {
+            yaml_serde::from_slice(&stdout).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: format!("resolved Compose config for project '{project_name}'"),
                 reason: error.to_string(),
             })?;
@@ -8620,7 +8620,7 @@ impl ComposeExecutor {
             reasons.insert(service.clone(), "receives the deployment's public traffic");
         }
         for document in std::iter::once(compose_content).chain(compose_override) {
-            let mut root: YamlValue = match serde_yaml::from_str(document) {
+            let mut root: YamlValue = match yaml_serde::from_str(document) {
                 Ok(root) => root,
                 Err(_) => return ReadinessExpectations::all_long_running(),
             };
@@ -9143,7 +9143,7 @@ impl ComposeExecutor {
             Value::Mapping(services_map),
         );
 
-        serde_yaml::to_string(&Value::Mapping(root)).unwrap_or_default()
+        yaml_serde::to_string(&Value::Mapping(root)).unwrap_or_default()
     }
 
     /// For each service, the set of env var keys its own inline `environment:`
@@ -9157,7 +9157,7 @@ impl ComposeExecutor {
         compose_content: &str,
     ) -> HashMap<String, HashSet<String>> {
         let mut result = HashMap::new();
-        let Ok(mut root) = serde_yaml::from_str::<YamlValue>(compose_content) else {
+        let Ok(mut root) = yaml_serde::from_str::<YamlValue>(compose_content) else {
             return result;
         };
         if root.apply_merge().is_err() {
@@ -9212,7 +9212,7 @@ impl ComposeExecutor {
     /// an empty map, so no build args are injected rather than failing here.
     fn service_build_arg_keys(compose_content: &str) -> HashMap<String, HashSet<String>> {
         let mut result = HashMap::new();
-        let Ok(mut root) = serde_yaml::from_str::<YamlValue>(compose_content) else {
+        let Ok(mut root) = yaml_serde::from_str::<YamlValue>(compose_content) else {
             return result;
         };
         if root.apply_merge().is_err() {
@@ -9282,7 +9282,7 @@ impl ComposeExecutor {
             Value::Mapping(external),
         );
 
-        let mut parsed: Value = serde_yaml::from_str(compose_content).unwrap_or(Value::Null);
+        let mut parsed: Value = yaml_serde::from_str(compose_content).unwrap_or(Value::Null);
         // Security validation has already rejected malformed merge keys.
         let _ = parsed.apply_merge();
         let mut services_map = Mapping::new();
@@ -9316,7 +9316,7 @@ impl ComposeExecutor {
             Value::Mapping(services_map),
         );
 
-        serde_yaml::to_string(&Value::Mapping(root)).unwrap_or_default()
+        yaml_serde::to_string(&Value::Mapping(root)).unwrap_or_default()
     }
 
     /// Minimal Linux capabilities official image entrypoints commonly need to
@@ -9468,7 +9468,7 @@ impl ComposeExecutor {
     }
 
     fn services_with_build(compose_content: &str) -> HashSet<String> {
-        let Ok(mut root) = serde_yaml::from_str::<Value>(compose_content) else {
+        let Ok(mut root) = yaml_serde::from_str::<Value>(compose_content) else {
             return HashSet::new();
         };
         if root.apply_merge().is_err() {
@@ -9489,7 +9489,7 @@ impl ComposeExecutor {
     }
 
     fn services_with_image_owned_init(compose_content: &str) -> std::collections::HashSet<String> {
-        let Ok(mut root) = serde_yaml::from_str::<Value>(compose_content) else {
+        let Ok(mut root) = yaml_serde::from_str::<Value>(compose_content) else {
             return std::collections::HashSet::new();
         };
         if root.apply_merge().is_err() {
@@ -9526,7 +9526,7 @@ impl ComposeExecutor {
             .into_iter()
             .flatten()
         {
-            let Ok(mut root) = serde_yaml::from_str::<YamlValue>(document) else {
+            let Ok(mut root) = yaml_serde::from_str::<YamlValue>(document) else {
                 continue;
             };
             if root.apply_merge().is_err() {
@@ -9672,7 +9672,7 @@ impl ComposeExecutor {
 
     /// Every `env_file` path exactly as written, de-duplicated, unvalidated.
     fn raw_env_file_refs(compose_content: &str) -> Vec<String> {
-        let mut root: YamlValue = match serde_yaml::from_str(compose_content) {
+        let mut root: YamlValue = match yaml_serde::from_str(compose_content) {
             Ok(value) => value,
             Err(_) => return Vec::new(),
         };
@@ -9787,7 +9787,7 @@ impl ComposeExecutor {
     }
 
     fn parse_service_names_yaml(&self, compose_content: &str) -> Vec<String> {
-        let mut root: YamlValue = match serde_yaml::from_str(compose_content) {
+        let mut root: YamlValue = match yaml_serde::from_str(compose_content) {
             Ok(value) => value,
             Err(_) => return self.parse_service_names(compose_content),
         };
@@ -10536,7 +10536,7 @@ services:
         ]);
 
         let override_yaml = executor.generate_env_override(compose, ".env.temps", &project_vars);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&override_yaml).unwrap();
         let args = |service: &str| {
             parsed
                 .get("services")
@@ -10599,7 +10599,7 @@ services:
         project_vars.insert("UNRELATED_VAR".to_string(), "value".to_string());
 
         let override_yaml = executor.generate_env_override(compose, ".env.temps", &project_vars);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&override_yaml).unwrap();
         let hub_env = parsed
             .get("services")
             .and_then(|s| s.get("hub"))
@@ -10647,7 +10647,7 @@ services:
         );
 
         let override_yaml = executor.generate_env_override(compose, ".env.temps", &project_vars);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&override_yaml).unwrap();
         let secret = parsed
             .get("services")
             .and_then(|s| s.get("app"))
@@ -10680,7 +10680,7 @@ services:
         );
 
         let override_yaml = executor.generate_env_override(compose, ".env.temps", &project_vars);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&override_yaml).unwrap();
         let app_env = parsed
             .get("services")
             .and_then(|s| s.get("app"))
@@ -11098,7 +11098,7 @@ services:
     image: postgres:17-alpine
 "#;
         let override_yaml = executor.generate_network_override(compose);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&override_yaml).unwrap();
 
         let network_name = temps_core::NETWORK_NAME.as_str();
         let top_level_networks = parsed.get("networks").expect("top-level networks: block");
@@ -11241,7 +11241,7 @@ services:
         let result = executor
             .strip_excluded_services(compose, &["db".to_string()])
             .unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&result).unwrap();
         let services = parsed.get("services").unwrap().as_mapping().unwrap();
         assert!(!services.contains_key("db"));
         assert!(services.contains_key("redis"));
@@ -11277,7 +11277,7 @@ services:
         let result = executor
             .strip_excluded_services(compose, &["db".to_string()])
             .unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&result).unwrap();
         let services = parsed.get("services").unwrap().as_mapping().unwrap();
         assert!(!services.contains_key("db"));
         let depends_on = services
@@ -11306,7 +11306,7 @@ services:
         let result = executor
             .strip_excluded_services(compose, &["nonexistent".to_string()])
             .unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&result).unwrap();
         assert!(parsed
             .get("services")
             .unwrap()
@@ -11501,7 +11501,7 @@ services:
             &HashSet::new(),
             &overrides,
         );
-        let parsed: YamlValue = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: YamlValue = yaml_serde::from_str(&override_yaml).unwrap();
         assert_eq!(parsed["services"]["web"].get("privileged"), None);
         let test = parsed["services"]["web"]["healthcheck"]["test"]
             .as_sequence()
@@ -11527,7 +11527,7 @@ services:
         let override_yaml =
             executor.generate_security_override(compose, &["webserver".to_string()]);
 
-        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let override_value: Value = yaml_serde::from_str(&override_yaml).unwrap();
         let webserver = override_value["services"]["webserver"]
             .as_mapping()
             .unwrap();
@@ -11561,7 +11561,7 @@ services:
 "#;
 
         let override_yaml = executor.generate_security_override(compose, &[]);
-        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let override_value: Value = yaml_serde::from_str(&override_yaml).unwrap();
         let budge = override_value["services"]["budge"].as_mapping().unwrap();
         let worker = override_value["services"]["worker"].as_mapping().unwrap();
 
@@ -11632,7 +11632,7 @@ services:
             &detected,
             &HashMap::new(),
         );
-        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let override_value: Value = yaml_serde::from_str(&override_yaml).unwrap();
         let image_init = override_value["services"]["image-init"]
             .as_mapping()
             .unwrap();
@@ -11735,7 +11735,7 @@ services:
         assert_eq!(override_yaml.matches("pids_limit: 512").count(), 2);
         assert_eq!(override_yaml.matches("init: true").count(), 1);
 
-        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let override_value: Value = yaml_serde::from_str(&override_yaml).unwrap();
         let webserver = override_value["services"]["webserver"]
             .as_mapping()
             .unwrap();
@@ -12249,28 +12249,28 @@ services:
         ]);
 
         let rendered = executor.generate_labels_override(compose, &labels);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&rendered).unwrap();
         let services = parsed
             .get("services")
-            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(yaml_serde::Value::as_mapping)
             .unwrap();
 
         for service in ["web", "worker"] {
             let service_config = services
-                .get(serde_yaml::Value::String(service.to_string()))
-                .and_then(serde_yaml::Value::as_mapping)
+                .get(yaml_serde::Value::String(service.to_string()))
+                .and_then(yaml_serde::Value::as_mapping)
                 .unwrap();
             let generated_labels = service_config
-                .get(serde_yaml::Value::String("labels".to_string()))
-                .and_then(serde_yaml::Value::as_mapping)
+                .get(yaml_serde::Value::String("labels".to_string()))
+                .and_then(yaml_serde::Value::as_mapping)
                 .unwrap();
             assert_eq!(
-                generated_labels.get(serde_yaml::Value::String("sh.temps.managed".to_string())),
-                Some(&serde_yaml::Value::String("true".to_string()))
+                generated_labels.get(yaml_serde::Value::String("sh.temps.managed".to_string())),
+                Some(&yaml_serde::Value::String("true".to_string()))
             );
             assert_eq!(
-                generated_labels.get(serde_yaml::Value::String("sh.temps.service".to_string())),
-                Some(&serde_yaml::Value::String(service.to_string()))
+                generated_labels.get(yaml_serde::Value::String("sh.temps.service".to_string())),
+                Some(&yaml_serde::Value::String(service.to_string()))
             );
         }
     }
@@ -12285,7 +12285,7 @@ services:
         let override_yaml =
             executor.generate_security_override(compose, &["webserver".to_string()]);
 
-        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let override_value: Value = yaml_serde::from_str(&override_yaml).unwrap();
         let webserver = override_value["services"]["webserver"]
             .as_mapping()
             .unwrap();
@@ -12591,8 +12591,8 @@ services:
             );
         }
 
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&override_yaml).expect("generated override is valid YAML");
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&override_yaml).expect("generated override is valid YAML");
         for service in ["db", "web"] {
             let caps = parsed["services"][service]["cap_add"]
                 .as_sequence()
@@ -12688,7 +12688,7 @@ services:
             tokio::fs::read_to_string(project_dir.path().join(TEMPS_SECRETS_OVERRIDE))
                 .await
                 .unwrap();
-        let parsed: YamlValue = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: YamlValue = yaml_serde::from_str(&override_yaml).unwrap();
         for service in ["web", "worker"] {
             let volumes = parsed["services"][service]["volumes"]
                 .as_sequence()
@@ -13078,7 +13078,7 @@ services:
             .await
             .unwrap();
 
-        let parsed: YamlValue = serde_yaml::from_str(
+        let parsed: YamlValue = yaml_serde::from_str(
             &tokio::fs::read_to_string(project_dir.path().join(TEMPS_SECRETS_OVERRIDE))
                 .await
                 .unwrap(),
@@ -13355,7 +13355,7 @@ services:
             .await
             .unwrap();
 
-        let parsed: YamlValue = serde_yaml::from_str(
+        let parsed: YamlValue = yaml_serde::from_str(
             &tokio::fs::read_to_string(project_dir.path().join(TEMPS_SECRETS_OVERRIDE))
                 .await
                 .unwrap(),
@@ -13892,7 +13892,7 @@ volumes:
         };
         let compose = "services:\n  image_app:\n    image: alpine\n  built_app:\n    build: .\n";
         let override_yaml = executor.generate_security_override(compose, &[]);
-        let parsed: YamlValue = serde_yaml::from_str(&override_yaml).unwrap();
+        let parsed: YamlValue = yaml_serde::from_str(&override_yaml).unwrap();
 
         for service in ["image_app", "built_app"] {
             // A platform-injected four-core cap prevents deployment on two-core hosts.
@@ -16172,12 +16172,12 @@ services:
             (PolicyCheck::Init, "init"),
             (PolicyCheck::PullPolicy, "pull_policy"),
         ] {
-            let strict: Value = serde_yaml::from_str(
+            let strict: Value = yaml_serde::from_str(
                 &executor_with_checks_disabled(&[]).generate_security_override(compose, &[]),
             )
             .unwrap();
             assert!(strict["services"]["app"].get(field).is_some());
-            let relaxed: Value = serde_yaml::from_str(
+            let relaxed: Value = yaml_serde::from_str(
                 &executor_with_checks_disabled(&[check]).generate_security_override(compose, &[]),
             )
             .unwrap();
@@ -16197,7 +16197,7 @@ services:
     #[test]
     fn allowed_host_network_does_not_receive_a_conflicting_network_override() {
         let executor = executor_with_checks_disabled(&[PolicyCheck::HostNetwork]);
-        let yaml: Value = serde_yaml::from_str(&executor.generate_network_override(
+        let yaml: Value = yaml_serde::from_str(&executor.generate_network_override(
             "services: {host: {image: nginx, network_mode: host}, web: {image: nginx}}",
         ))
         .unwrap();
@@ -16499,7 +16499,7 @@ services:
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let yaml: Value = serde_yaml::from_slice(&output.stdout).unwrap();
+            let yaml: Value = yaml_serde::from_slice(&output.stdout).unwrap();
             if let Some(env_path) = yaml["services"]["app"]["env_file"][0]["path"].as_str() {
                 assert_eq!(
                     std::fs::canonicalize(compose_base.join(env_path)).unwrap(),
@@ -16550,7 +16550,7 @@ services:
             )
             .await
             .unwrap();
-        let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+        let yaml: Value = yaml_serde::from_str(&resolved).unwrap();
         assert!(yaml["services"]["app"].get("shm_size").is_none());
         assert!(yaml["services"]["app"].get("mem_limit").is_none());
         assert!(yaml["services"].get("unused").is_none());
@@ -16611,7 +16611,7 @@ services:
             )
             .await
             .unwrap();
-        let value: Value = serde_yaml::from_str(&resolved).unwrap();
+        let value: Value = yaml_serde::from_str(&resolved).unwrap();
         assert_eq!(
             value["services"]["web"]["image"].as_str(),
             Some("nginx:alpine")
@@ -16633,7 +16633,7 @@ services:
         let source = "services: {app: {extends: {file: common.yml, service: base}}}";
         let same = "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8191:8191']}}";
         let normalized = ComposeExecutor::without_duplicate_extends("test", source, same).unwrap();
-        let yaml: Value = serde_yaml::from_str(&normalized).unwrap();
+        let yaml: Value = yaml_serde::from_str(&normalized).unwrap();
         assert!(yaml["services"]["app"].get("extends").is_none());
         assert_eq!(
             yaml["services"]["app"]["ports"][0].as_str(),
@@ -16654,7 +16654,7 @@ services:
             .unwrap()
             .unwrap();
         assert!(reset.contains("!reset []"));
-        let yaml: Value = serde_yaml::from_str(&reset).unwrap();
+        let yaml: Value = yaml_serde::from_str(&reset).unwrap();
         assert!(yaml["services"]["app"].get("ports").is_some());
         assert!(yaml["services"].get("worker").is_none());
         assert!(ComposeExecutor::port_reset_override(
@@ -16704,7 +16704,7 @@ services:
                 .await
                 .unwrap();
             assert!(override_content.is_none());
-            let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+            let yaml: Value = yaml_serde::from_str(&resolved).unwrap();
             let ports = yaml["services"]["app"]["ports"].as_sequence().unwrap();
             assert_eq!(ports.len(), 1, "{resolved}");
             assert_eq!(ports[0]["published"].as_str(), Some("8194"));
@@ -16722,7 +16722,7 @@ services:
                 )
                 .await
                 .unwrap();
-            let cleared: Value = serde_yaml::from_str(&cleared).unwrap();
+            let cleared: Value = yaml_serde::from_str(&cleared).unwrap();
             assert!(cleared["services"]["app"].get("ports").is_none());
 
             let public_inline = "services: {app: {ports: ['0.0.0.0:8194:8191']}}";
@@ -16772,7 +16772,7 @@ services:
             .await
             .unwrap();
         assert!(override_content.is_none());
-        let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+        let yaml: Value = yaml_serde::from_str(&resolved).unwrap();
         assert!(yaml["services"]["app"]["depends_on"].get("redis").is_none());
         assert!(yaml["services"]["app"]["depends_on"].get("warp").is_some());
         assert_eq!(
@@ -16843,7 +16843,7 @@ services:
     fn acknowledged_policy_overrides_legacy_sandbox_grants() {
         let executor = executor_with_checks_disabled(&[]);
         let yaml: Value =
-            serde_yaml::from_str(&executor.generate_security_override(
+            yaml_serde::from_str(&executor.generate_security_override(
                 "services: {app: {image: nginx}}",
                 &["app".to_string()],
             ))
@@ -17010,7 +17010,7 @@ services:
             )
             .await
             .unwrap();
-        let value: Value = serde_yaml::from_str(&resolved).unwrap();
+        let value: Value = yaml_serde::from_str(&resolved).unwrap();
         assert_eq!(
             value["services"]["proxy"]["image"].as_str(),
             Some("nginx:alpine")
@@ -17077,7 +17077,7 @@ services:
                 )
                 .await
                 .unwrap_or_else(|error| panic!("{content}: {error}"));
-            let value: Value = serde_yaml::from_str(&resolved).unwrap();
+            let value: Value = yaml_serde::from_str(&resolved).unwrap();
             let env = &value["services"]["child"]["environment"];
             assert_eq!(env["GREETING"].as_str(), Some("from-child"), "{content}");
             assert_eq!(env["REQUIRED"].as_str(), Some("present"), "{content}");
@@ -17775,7 +17775,7 @@ services:
     }
 
     fn resolved_service(content: &str) -> Value {
-        let model: Value = serde_yaml::from_str(content).unwrap();
+        let model: Value = yaml_serde::from_str(content).unwrap();
         model["services"]["app"].clone()
     }
 
@@ -18010,18 +18010,18 @@ services:
     fn missing_env_files_become_optional_for_the_config_step() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("present.env"), "A=1\n").unwrap();
-        let mut definition: Value = serde_yaml::from_str(
+        let mut definition: Value = yaml_serde::from_str(
             "env_file: [.env, present.env, {path: other.env}, {path: present.env, required: true}]",
         )
         .unwrap();
         ComposeExecutor::tolerate_missing_env_files(root.path(), &mut definition);
-        let expected: Value = serde_yaml::from_str(
+        let expected: Value = yaml_serde::from_str(
             "env_file: [{path: .env, required: false}, present.env, {path: other.env, required: false}, {path: present.env, required: true}]",
         )
         .unwrap();
         assert_eq!(definition, expected);
 
-        let mut single: Value = serde_yaml::from_str("env_file: .env").unwrap();
+        let mut single: Value = yaml_serde::from_str("env_file: .env").unwrap();
         ComposeExecutor::tolerate_missing_env_files(root.path(), &mut single);
         assert_eq!(single["env_file"][0]["required"], Value::Bool(false));
     }
@@ -18147,14 +18147,14 @@ services:
             .await
             .unwrap();
         let overlay: Value =
-            serde_yaml::from_str(resolved.override_content.as_deref().unwrap()).unwrap();
+            yaml_serde::from_str(resolved.override_content.as_deref().unwrap()).unwrap();
         assert!(
             overlay["services"]["app"].get("env_file").is_none(),
             "{overlay:?}"
         );
         assert_eq!(
             overlay["services"]["app"]["volumes"],
-            serde_yaml::from_str::<Value>("[cache:/cache]").unwrap()
+            yaml_serde::from_str::<Value>("[cache:/cache]").unwrap()
         );
         assert_eq!(resolved.notes.len(), 1);
     }

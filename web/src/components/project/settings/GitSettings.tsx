@@ -15,7 +15,6 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
-  getComposeSecurityOptions,
   getProjectComposeValidationOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
@@ -25,6 +24,8 @@ import {
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
+import { FollowedRepositoryNotice } from '@/components/project-groups/FollowedRepositoryNotice'
+import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
@@ -176,7 +177,7 @@ function GitSettingsInline({
   })
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
-    meta: { errorTitle: 'Failed to update project settings' },
+    meta: { errorTitle: 'Failed to update service settings' },
   })
   const updateAutomaticDeploy = useMutation({
     ...updateAutomaticDeployMutation(),
@@ -528,8 +529,9 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
-  const composeSecurityQuery = useQuery(
-    getComposeSecurityOptions({ path: { id: project.id } })
+  const composeSecurityQuery = useComposeSecurityPolicy(
+    project.id,
+    isComposePreset
   )
   const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
     null
@@ -657,7 +659,7 @@ function GitSettingsInline({
                 No repository connected
               </h3>
               <p className="text-sm text-muted-foreground">
-                Connect a Git repository to enable deployments for this project.
+                Connect a Git repository to enable deployments for this service.
               </p>
             </div>
             <Button onClick={goToChangeRepo}>
@@ -839,7 +841,7 @@ function GitSettingsInline({
               No Git repository connected
             </CardTitle>
             <CardDescription>
-              This project currently deploys source archives uploaded through
+              This service currently deploys source archives uploaded through
               Drop. Connect a repository to enable deployments from commits and
               branches.
             </CardDescription>
@@ -1564,7 +1566,7 @@ function GitSettingsInline({
                       {composeSecurityQuery.isError ? (
                         <div className="flex h-[360px] flex-col items-center justify-center gap-3 p-6 text-center">
                           <p className="text-sm text-destructive">
-                            Could not load this project&apos;s Compose security
+                            Could not load this service&apos;s Compose security
                             policy.
                           </p>
                           <Button
@@ -1613,7 +1615,7 @@ function GitSettingsInline({
                                 <p className="text-sm text-muted-foreground">
                                   If you trust this stack, an instance
                                   administrator can disable this check for this
-                                  project.
+                                  service.
                                 </p>
                                 <Button
                                   size="sm"
@@ -1729,6 +1731,7 @@ function GitSettingsInline({
           <CardContent className="p-0 divide-y">
             <div className="flex items-center gap-4 p-6">
               <Switch
+                aria-label="Automatic deployments"
                 checked={autoDeployOn}
                 onCheckedChange={handleAutoDeployToggle}
               />
@@ -2961,6 +2964,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 
   return (
     <div className="space-y-5">
+      <FollowedRepositoryNotice project={project} onChanged={refetch} />
       <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-xl font-semibold">Connect repository</h2>
@@ -3294,7 +3298,15 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 }
 
 export function GitSettings(props: GitSettingsProps & { embedded?: boolean }) {
-  return <GitSettingsInline {...props} view="git" />
+  return (
+    <div className="space-y-4">
+      <FollowedRepositoryNotice
+        project={props.project}
+        onChanged={props.refetch}
+      />
+      <GitSettingsInline {...props} view="git" />
+    </div>
+  )
 }
 
 export function BuildSettings(

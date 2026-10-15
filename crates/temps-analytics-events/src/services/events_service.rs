@@ -1561,7 +1561,7 @@ WHERE project_id = $1
         // Get visitor from visitor_id from visitors table
         // Convert visitor_id (String) to Option<i32> by looking up the visitor in the database
         let visitor_id_i32 = if let Some(ref visitor_id) = visitor_id {
-            use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter};
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
             use temps_entities::visitor;
 
             // `visitor` is uniquely keyed on (visitor_id, project_id) — the
@@ -1579,7 +1579,7 @@ WHERE project_id = $1
                 .await
                 .map_err(EventsError::Database)?;
 
-            match visitor_record {
+            let touched: Option<i32> = match visitor_record {
                 Some(v) => {
                     // Keep `visitor.last_seen` fresh on every ingested event so
                     // the "live visitors" list (which queries
@@ -1640,10 +1640,16 @@ WHERE project_id = $1
                                 sea_orm::ActiveValue::Set(Some(c.clone()));
                         }
                     }
-                    let _ = active_visitor.update(self.db.as_ref()).await;
-
-                    Some(v.id)
+                    // The retention sweep can delete a visitor between the
+                    // read above and this write; see `touch_visitor`.
+                    self.touch_visitor(active_visitor, v.id, visitor_id, project_id)
+                        .await
                 }
+                None => None,
+            };
+
+            match touched {
+                Some(id) => Some(id),
                 None if !self
                     .visitor_creation_limiter
                     .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
@@ -1899,6 +1905,53 @@ WHERE project_id = $1
         }
 
         Ok(result)
+    }
+
+    /// Write the refreshed visitor row for an event, returning its id, or
+    /// `None` when the row is gone.
+    ///
+    /// The retention sweep can delete a visitor between the read in
+    /// `record_event` and this write. Updating a row that is gone reports
+    /// `RecordNotUpdated`, and the event must not then be inserted under the
+    /// stale id: its foreign key would reject the insert and the event would be
+    /// lost. `None` makes the caller resolve the visitor again through the same
+    /// upsert a lookup miss uses, which re-creates the row.
+    ///
+    /// Any other failure (a timeout, a dropped connection) says nothing about
+    /// the row, which still exists: it keeps its id rather than being sent
+    /// through the new-visitor limit and possibly stored without a visitor.
+    async fn touch_visitor(
+        &self,
+        active_visitor: temps_entities::visitor::ActiveModel,
+        row_id: i32,
+        visitor_id: &str,
+        project_id: i32,
+    ) -> Option<i32> {
+        use sea_orm::ActiveModelTrait;
+
+        match active_visitor.update(self.db.as_ref()).await {
+            Ok(_) => Some(row_id),
+            Err(sea_orm::DbErr::RecordNotUpdated) => {
+                tracing::warn!(
+                    visitor_id = %visitor_id,
+                    project_id,
+                    visitor_row_id = row_id,
+                    "Visitor row was removed (retention) before the event could refresh it; \
+                     resolving it again"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    visitor_id = %visitor_id,
+                    project_id,
+                    visitor_row_id = row_id,
+                    error = %e,
+                    "Could not refresh an existing visitor row; recording the event against it"
+                );
+                Some(row_id)
+            }
+        }
     }
 
     /// Upsert a visitor row when an ingested event's cookie doesn't yet have a
@@ -2316,6 +2369,99 @@ mod tests {
 
     async fn setup_test_db() -> Result<DatabaseConnection, DbErr> {
         Database::connect("sqlite::memory:").await
+    }
+
+    // ── touch_visitor ────────────────────────────────────────────────────
+
+    fn visitor_row(id: i32) -> temps_entities::visitor::Model {
+        let now = Utc::now();
+        temps_entities::visitor::Model {
+            id,
+            visitor_id: "visitor-uuid".to_string(),
+            project_id: 7,
+            environment_id: 1,
+            first_seen: now,
+            last_seen: now,
+            user_agent: None,
+            ip_address_id: None,
+            is_crawler: false,
+            crawler_name: None,
+            custom_data: None,
+            has_activity: true,
+            first_referrer: None,
+            first_referrer_hostname: None,
+            first_channel: None,
+            first_utm_source: None,
+            first_utm_medium: None,
+            first_utm_campaign: None,
+        }
+    }
+
+    /// The retention sweep can delete a returning visitor between the read and
+    /// the `last_seen` write. The event must not keep the stale row id.
+    #[tokio::test]
+    async fn a_visitor_deleted_before_the_touch_is_not_returned() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::visitor::Model>::new()])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let row = visitor_row(31);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, None, "a row that is gone must be resolved again");
+    }
+
+    /// A transient failure says nothing about the row: it must keep its id and
+    /// not be sent through the new-visitor limit.
+    #[tokio::test]
+    async fn a_failed_touch_that_is_not_a_missing_row_keeps_the_id() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let row = visitor_row(31);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, Some(31));
+    }
+
+    #[tokio::test]
+    async fn a_touched_visitor_keeps_its_id() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let row = visitor_row(31);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row.clone()]])
+                .into_connection(),
+        );
+        let service = AnalyticsEventsService::new(db);
+        let mut active: temps_entities::visitor::ActiveModel = row.clone().into();
+        active.last_seen = sea_orm::ActiveValue::Set(Utc::now());
+
+        let id = service
+            .touch_visitor(active, row.id, "visitor-uuid", 7)
+            .await;
+
+        assert_eq!(id, Some(31));
     }
 
     // ── resolve_site_hostname ────────────────────────────────────────────

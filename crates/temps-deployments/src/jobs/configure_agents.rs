@@ -132,7 +132,7 @@ impl ConfigureAgentsJob {
             }
 
             match fs::read_to_string(&path) {
-                Ok(contents) => match serde_yaml::from_str::<AgentYamlConfig>(&contents) {
+                Ok(contents) => match yaml_serde::from_str::<AgentYamlConfig>(&contents) {
                     Ok(agent) => {
                         info!("Loaded agent '{}' from {:?}", agent.name, path);
                         agents.push(agent);
@@ -181,7 +181,7 @@ impl ConfigureAgentsJob {
             }
 
             match fs::read_to_string(&path) {
-                Ok(contents) => match serde_yaml::from_str::<WorkflowYamlConfig>(&contents) {
+                Ok(contents) => match yaml_serde::from_str::<WorkflowYamlConfig>(&contents) {
                     Ok(workflow) => {
                         info!("Loaded workflow '{}' from {:?}", workflow.name, path);
                         workflows.push(workflow_to_agent(workflow));

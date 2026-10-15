@@ -229,7 +229,7 @@ for (const width of [1440, 390]) {
         reveals.push(path)
         body = { value: 'https://example.com' }
       } else if (path.endsWith('/last-deployment')) {
-        await route.fulfill({ status: 404, json: { detail: 'No deployments' } })
+        await route.fulfill({ json: { deployment: null } })
         return
       } else if (path.includes('active-visitors')) body = { count: 0 }
       // The header's operations tray reads a page object; the default `[]`
@@ -499,7 +499,11 @@ for (const width of [1440, 390]) {
       fullPage: true,
     })
     await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
-    await dialog.getByRole('button', { name: 'Confirm delete' }).click()
+    // The confirmation is an alert dialog portalled outside the region.
+    await page
+      .getByRole('alertdialog')
+      .getByRole('button', { name: 'Delete', exact: true })
+      .click()
     await expect(dialog.getByRole('button', { name: 'Check now' })).toHaveCount(
       0
     )

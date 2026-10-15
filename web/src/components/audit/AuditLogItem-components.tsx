@@ -14,6 +14,7 @@ import {
   describeVisitorEnrichment,
   type DeploymentTokenAuditActor,
 } from '@/lib/visitor-enrich-audit'
+import { groupHref } from '@/lib/terminology'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
 import { ChevronDown, ChevronRight, KeyRound, Plug } from 'lucide-react'
@@ -45,15 +46,163 @@ function projectLink(slug: string): ReactNode {
   )
 }
 
+/** A project (group) by slug; linked unless it no longer exists. */
+function groupRef(slug: string | undefined, linked = true): ReactNode {
+  if (!slug) return 'a project'
+  if (!linked) return `project ${slug}`
+  return (
+    <>
+      project{' '}
+      <Link to={groupHref(slug)} className="text-primary hover:underline">
+        {slug}
+      </Link>
+    </>
+  )
+}
+
+/**
+ * Project group events. They carry the group's slug, and service ids (not
+ * slugs) for the services involved.
+ */
+function describeGroupEvent(
+  op: string,
+  data?: Record<string, unknown>
+): ReactNode | undefined {
+  const group = get<string>(data, 'group_slug')
+  const serviceId = get<number>(data, 'project_id')
+  const serviceIds = get<number[]>(data, 'project_ids') ?? []
+  const variable = get<string>(data, 'variable_key')
+  const repository = get<string>(data, 'repository')
+  const route = get<string>(data, 'path_route')
+  const service = serviceId != null ? `service (ID: ${serviceId})` : 'a service'
+  const services = (n: number) => `${n} ${n === 1 ? 'service' : 'services'}`
+  const template = get<string>(data, 'template')
+  const run = get<number>(data, 'instantiation_id')
+  const runLabel = `${template ? `template ${template}` : 'a template'}${run != null ? ` (run #${run})` : ''}`
+
+  switch (op) {
+    case 'TEMPLATE_INSTANTIATION_STARTED':
+      return group ? (
+        <>
+          Started creating {runLabel} in {groupRef(group)}
+        </>
+      ) : (
+        `Started creating ${runLabel}`
+      )
+    case 'TEMPLATE_INSTANTIATION_RETRIED':
+      return group ? (
+        <>
+          Retried {runLabel} in {groupRef(group)}
+        </>
+      ) : (
+        `Retried ${runLabel}`
+      )
+    case 'PROJECT_GROUP_CREATED':
+      return (
+        <>
+          Created {groupRef(group)}
+          {serviceIds.length > 0 ? ` with ${services(serviceIds.length)}` : ''}
+        </>
+      )
+    case 'PROJECT_GROUP_UPDATED':
+      return <>Updated {groupRef(group)}</>
+    case 'PROJECT_GROUP_DELETED':
+      return `Deleted ${groupRef(group, false)}${serviceIds.length > 0 ? `; its ${services(serviceIds.length)} are now ungrouped` : ''}`
+    case 'PROJECT_GROUP_PROJECT_ADDED': {
+      const previous = get<number>(data, 'previous_group_id')
+      return (
+        <>
+          Added {service} to {groupRef(group)}
+          {previous != null ? ` (moved from project ID ${previous})` : ''}
+        </>
+      )
+    }
+    case 'PROJECT_GROUP_PROJECT_REMOVED':
+      return (
+        <>
+          Removed {service} from {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_ENV_VAR_CREATED':
+      return (
+        <>
+          Created shared variable{variable ? ` ${variable}` : ''} in{' '}
+          {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_ENV_VAR_UPDATED':
+      return (
+        <>
+          Updated shared variable{variable ? ` ${variable}` : ''} in{' '}
+          {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_ENV_VAR_DELETED':
+      return (
+        <>
+          Deleted shared variable{variable ? ` ${variable}` : ''} from{' '}
+          {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_REPOSITORY_SET':
+      return (
+        <>
+          Set the repository of {groupRef(group)}
+          {repository ? ` to ${repository}` : ''}
+          {serviceIds.length > 0
+            ? ` and pointed ${services(serviceIds.length)} at it`
+            : ''}
+        </>
+      )
+    case 'PROJECT_GROUP_REPOSITORY_CLEARED':
+      return <>Disconnected the repository of {groupRef(group)}</>
+    case 'PROJECT_GROUP_PROJECT_FOLLOWS_REPOSITORY':
+      return (
+        <>
+          Made {service} follow the repository of {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_PROJECT_UNFOLLOWS_REPOSITORY':
+      return (
+        <>
+          Stopped {service} following the repository of {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_ROUTE_ADDED':
+      return (
+        <>
+          Added route{route ? ` ${route}` : ''} to {groupRef(group)}
+        </>
+      )
+    case 'PROJECT_GROUP_ROUTE_REMOVED':
+      return (
+        <>
+          Removed route{route ? ` ${route}` : ''} from {groupRef(group)}
+        </>
+      )
+    default:
+      return undefined
+  }
+}
+
 function describe(
   op: string,
   data?: Record<string, unknown>,
   user?: AuditLogUserInfo
 ): ReactNode {
+  if (
+    op.startsWith('PROJECT_GROUP_') ||
+    op.startsWith('TEMPLATE_INSTANTIATION_')
+  ) {
+    const described = describeGroupEvent(op, data)
+    if (described !== undefined) return described
+  }
   const slug = get<string>(data, 'slug')
   const name = get<string>(data, 'name')
   const projectSlug = get<string>(data, 'project_slug')
   const scope = get<string>(data, 'scope') // "global" | "project"
+  // The API's "project" scope is a single service in console wording.
+  const scopeLabel = !scope || scope === 'project' ? 'service' : scope
   const serviceName = get<string>(data, 'service_name')
   const sourceName = get<string>(data, 'source_name')
   const username = get<string>(data, 'username')
@@ -132,6 +281,8 @@ function describe(
       return `Reset the password of ${username ?? 'a user'}`
 
     // MFA
+    case 'MFA_SETUP_STARTED':
+      return `${user?.name ?? 'User'} started multi-factor authentication setup`
     case 'MFA_ENABLED':
       return `${user?.name ?? 'User'} enabled multi-factor authentication`
     case 'MFA_DISABLED':
@@ -152,43 +303,43 @@ function describe(
       return `Changed status of external service${serviceName ? ` "${serviceName}"` : ''} to ${status ?? 'unknown'}`
     case 'EXTERNAL_SERVICE_PROJECT_LINKED':
       return projectSlug ? (
-        <>Linked external service to project {projectLink(projectSlug)}</>
+        <>Linked external service to {projectLink(projectSlug)}</>
       ) : (
-        'Linked external service to a project'
+        'Linked external service to a service'
       )
     case 'EXTERNAL_SERVICE_PROJECT_UNLINKED':
       return projectSlug ? (
-        <>Unlinked external service from project {projectLink(projectSlug)}</>
+        <>Unlinked external service from {projectLink(projectSlug)}</>
       ) : (
-        'Unlinked external service from a project'
+        'Unlinked external service from a service'
       )
 
     // Projects
     case 'PROJECT_CREATED':
       return projectSlug ? (
-        <>Created project {projectLink(projectSlug)}</>
+        <>Created service {projectLink(projectSlug)}</>
       ) : (
-        'Created a new project'
+        'Created a new service'
       )
     case 'PROJECT_UPDATED':
       return projectSlug ? (
-        <>Updated project {projectLink(projectSlug)}</>
+        <>Updated service {projectLink(projectSlug)}</>
       ) : (
-        'Updated a project'
+        'Updated a service'
       )
     case 'PROJECT_DELETED':
-      return `Deleted project ${projectSlug ?? 'unknown'}`
+      return `Deleted service ${projectSlug ?? 'unknown'}`
     case 'PROJECT_GITHUB_UPDATED':
       return projectSlug ? (
         <>Updated GitHub settings for {projectLink(projectSlug)}</>
       ) : (
-        'Updated project GitHub settings'
+        'Updated service GitHub settings'
       )
     case 'PROJECT_SETTINGS_UPDATED':
       return projectSlug ? (
         <>Updated settings for {projectLink(projectSlug)}</>
       ) : (
-        'Updated project settings'
+        'Updated service settings'
       )
     case 'ENVIRONMENT_SETTINGS_UPDATED':
       return projectSlug ? (
@@ -219,21 +370,21 @@ function describe(
 
     // Skills (new)
     case 'SKILL_CREATED':
-      return `Created ${scope ?? 'project'} skill${slug ? ` "${slug}"` : ''}`
+      return `Created ${scopeLabel} skill${slug ? ` "${slug}"` : ''}`
     case 'SKILL_UPDATED':
-      return `Updated ${scope ?? 'project'} skill${slug ? ` "${slug}"` : ''}`
+      return `Updated ${scopeLabel} skill${slug ? ` "${slug}"` : ''}`
     case 'SKILL_DELETED':
-      return `Deleted ${scope ?? 'project'} skill${slug ? ` "${slug}"` : ''}`
+      return `Deleted ${scopeLabel} skill${slug ? ` "${slug}"` : ''}`
     case 'SKILL_UPLOADED':
-      return `Uploaded archive for ${scope ?? 'project'} skill${slug ? ` "${slug}"` : ''}`
+      return `Uploaded archive for ${scopeLabel} skill${slug ? ` "${slug}"` : ''}`
 
     // MCP servers (new)
     case 'MCP_CREATED':
-      return `Created ${scope ?? 'project'} MCP server${slug ? ` "${slug}"` : ''}`
+      return `Created ${scopeLabel} MCP server${slug ? ` "${slug}"` : ''}`
     case 'MCP_UPDATED':
-      return `Updated ${scope ?? 'project'} MCP server${slug ? ` "${slug}"` : ''}`
+      return `Updated ${scopeLabel} MCP server${slug ? ` "${slug}"` : ''}`
     case 'MCP_DELETED':
-      return `Deleted ${scope ?? 'project'} MCP server${slug ? ` "${slug}"` : ''}`
+      return `Deleted ${scopeLabel} MCP server${slug ? ` "${slug}"` : ''}`
 
     // Secrets
     case 'SECRET_UPSERTED':

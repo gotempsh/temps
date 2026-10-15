@@ -1,0 +1,337 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Builds and publishes the managed-database images (images/*-walg,
+# images/postgres-ha) to GHCR. What gets built is decided by
+# .github/scripts/database_image_matrix.py:
+#
+# * floating tags (18-bookworm, pg18, 8.0) are rebuilt on every run, so the
+#   weekly schedule picks up upstream security rebuilds of the base images;
+# * pinned PostgreSQL minors (18.3-bookworm, ...) are discovered from the
+#   upstream registry, so a new minor is published by the next scheduled run
+#   without a code change. Frozen older minors are only built when missing.
+#
+# Every image is verified before it is pushed: `wal-g --version`, and for
+# PostgreSQL-based images that `postgres --version` reports the tagged version.
+#
+# release.yml calls this with `ensure: true`: it publishes only tags that are
+# absent (a release never moves a tag under a running database), then fails
+# the release unless every required tag is anonymously pullable -- the way a
+# fresh install will pull it.
+
+name: Database images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'images/postgres-walg/**'
+      - 'images/postgres-ha/**'
+      - 'images/pgvector-walg/**'
+      - 'images/timescaledb-walg/**'
+      - 'images/redis-walg/**'
+      - 'images/mongodb-walg/**'
+      - '.github/workflows/database-images.yml'
+      - '.github/scripts/database_image_matrix.py'
+  pull_request:
+    paths:
+      - 'images/postgres-walg/**'
+      - 'images/postgres-ha/**'
+      - 'images/pgvector-walg/**'
+      - 'images/timescaledb-walg/**'
+      - 'images/redis-walg/**'
+      - 'images/mongodb-walg/**'
+      - '.github/workflows/database-images.yml'
+      - '.github/scripts/database_image_matrix.py'
+      - '.github/scripts/test_database_image_matrix.py'
+  schedule:
+    # Weekly. PostgreSQL minors ship quarterly and Debian security rebuilds of
+    # the upstream bases land within days, so weekly bounds staleness to 7 days.
+    - cron: '23 4 * * 1'
+  workflow_call:
+    inputs:
+      ensure:
+        description: 'Publish only missing tags, then require every tag to be publicly pullable'
+        required: true
+        type: boolean
+      dry_run:
+        description: 'Build and verify without publishing'
+        required: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      rebuild_all:
+        description: 'Rebuild every tag, including frozen PostgreSQL minors already on GHCR'
+        type: boolean
+        default: false
+
+# Every run that can publish shares ONE group, whatever its ref. A release
+# (refs/tags/...) and the weekly or push-triggered run (refs/heads/main) used
+# to get different groups, so they could overlap: a release that planned an
+# alias copy from the old image could write it over tags a scheduled build
+# had published in between. Serializing planning and publishing together
+# means each run plans against what the previous one actually left behind.
+# Runs that publish nothing (pull requests, dry runs) only supersede
+# themselves. Queued publishers wait; GitHub keeps one pending run per group,
+# so a third arrival replaces the pending one -- re-run it if that happens.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' || inputs.dry_run == true) && format('database-images-verify-{0}', github.ref) || 'database-images-publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Forks publish only to their own namespace.
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  plan:
+    name: Plan image builds
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      retags: ${{ steps.plan.outputs.retags }}
+      retag_count: ${{ steps.plan.outputs.retag_count }}
+      publish: ${{ steps.mode.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Test the planner
+        working-directory: .github/scripts
+        run: python3 -m unittest test_database_image_matrix -v
+
+      - name: Decide which images changed
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          ENSURE: ${{ inputs.ensure }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          REBUILD_ALL: ${{ inputs.rebuild_all }}
+        run: |
+          set -euo pipefail
+          base=""
+          if [[ "$ENSURE" == "true" ]]; then
+            echo "Release run: publishing only tags missing from GHCR"
+          elif [[ "$EVENT" == "push" ]]; then
+            base="$BEFORE"
+          elif [[ "$EVENT" == "pull_request" ]]; then
+            base="$PR_BASE"
+          fi
+          images=""
+          if [[ "$base" =~ ^0+$ ]]; then
+            echo "No previous commit for this push; rebuilding every image"
+            images="*"
+          elif [[ -n "$base" ]]; then
+            # Diffing two trees needs only the base commit, not the history.
+            git fetch --no-tags --depth=1 origin "$base"
+            images=$(git diff --name-only "$base" HEAD \
+              | sed -nE 's#^images/([a-z0-9-]+)/.*#\1#p' \
+              | grep -vx 'mariadb-walg' | sort -u | paste -sd, - || true)
+          fi
+          echo "Images whose build context changed: ${images:-none}"
+          {
+            echo "images=$images"
+            if [[ "$EVENT" == "pull_request" || "$DRY_RUN" == "true" ]]; then
+              echo "publish=false"
+            else
+              echo "publish=true"
+            fi
+            if [[ "$REBUILD_ALL" == "true" ]]; then echo "force_all=true"; fi
+            if [[ "$ENSURE" == "true" ]]; then echo "ensure=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          IMAGES: ${{ steps.mode.outputs.images }}
+          FORCE_ALL: ${{ steps.mode.outputs.force_all }}
+          ENSURE: ${{ steps.mode.outputs.ensure }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          owner=$(printf '%s' "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')
+          args=(--owner "$owner")
+          if [[ "$ENSURE" == "true" ]]; then
+            args+=(--missing-only)
+          elif [[ "$EVENT" == "pull_request" ]]; then
+            # PRs only verify the images they touch; nothing is pushed.
+            if [[ -z "$IMAGES" ]]; then
+              {
+                echo "matrix={\"include\":[]}"
+                echo "count=0"
+                echo "retags=[]"
+                echo "retag_count=0"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            args+=(--only "$IMAGES" --force-all)
+          elif [[ "$FORCE_ALL" == "true" || "$IMAGES" == "*" ]]; then
+            args+=(--force-all)
+          elif [[ -n "$IMAGES" ]]; then
+            args+=(--force "$IMAGES")
+          fi
+          python3 .github/scripts/database_image_matrix.py "${args[@]}"
+
+  build:
+    name: ${{ matrix.image }}:${{ matrix.tag }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        if: env.PUBLISH == 'true'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build amd64 image for verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          build-args: ${{ matrix.build_arg }}
+          load: true
+          push: false
+          tags: database-image-verify:ci
+          cache-from: type=gha,scope=db-${{ matrix.image }}-${{ matrix.version }}
+
+      - name: Verify image contents
+        env:
+          EXPECT_POSTGRES: ${{ matrix.expect_postgres }}
+          IMAGE_REF: ${{ matrix.repository }}:${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint wal-g database-image-verify:ci --version
+          if [[ -n "$EXPECT_POSTGRES" ]]; then
+            reported=$(docker run --rm --entrypoint postgres database-image-verify:ci --version)
+            echo "$IMAGE_REF reports: $reported"
+            if ! grep -Eq "$EXPECT_POSTGRES" <<<"$reported"; then
+              echo "::error title=PostgreSQL version mismatch::$IMAGE_REF reports '$reported', expected /$EXPECT_POSTGRES/. The build likely pulled a different server package than the base image tag; refusing to publish a mislabeled image."
+              exit 1
+            fi
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish multi-architecture image
+        if: env.PUBLISH == 'true'
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          build-args: ${{ matrix.build_arg }}
+          push: true
+          tags: ${{ matrix.refs }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ matrix.tag }}
+            org.opencontainers.image.title=Temps ${{ matrix.image }}
+          cache-from: type=gha,scope=db-${{ matrix.image }}-${{ matrix.version }}
+          cache-to: type=gha,scope=db-${{ matrix.image }}-${{ matrix.version }},mode=max
+          provenance: true
+          sbom: true
+
+      - name: Set up Cosign
+        if: env.PUBLISH == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign published image digest
+        if: env.PUBLISH == 'true'
+        env:
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          IMAGE_TAG: ${{ join(matrix.tags, ', ') }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published digest '$IMAGE_DIGEST' for $IMAGE_REPOSITORY:$IMAGE_TAG" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+          echo "- \`$IMAGE_REPOSITORY:$IMAGE_TAG\` → \`$IMAGE_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+  retag:
+    # An image published under some of its tags but not all (a newly added
+    # alias) gets the missing tags pointed at the existing digest. Rebuilding
+    # it instead would replace the tags that are already published.
+    name: Publish missing aliases
+    needs: plan
+    if: needs.plan.outputs.retag_count != '0' && needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point missing tags at the published image
+        env:
+          RETAGS: ${{ needs.plan.outputs.retags }}
+        run: |
+          set -euo pipefail
+          jq -r '.[] | [.source, .target] | @tsv' <<<"$RETAGS" \
+            | while IFS=$'\t' read -r source target; do
+                # Copies the manifest list as-is: same digest, so the existing
+                # signature and attestations cover the new tag too.
+                docker buildx imagetools create --tag "$target" "$source"
+                echo "- \`$target\` → same image as \`$source\`" >> "$GITHUB_STEP_SUMMARY"
+              done
+
+  verify-published:
+    name: Required tags are publicly pullable
+    needs: [plan, build, retag]
+    # Runs after a skipped build (nothing missing) too, but not after a
+    # failed plan, and never on pull requests, which publish nothing.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check every required tag anonymously
+        run: |
+          set -euo pipefail
+          owner=$(printf '%s' "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')
+          python3 .github/scripts/database_image_matrix.py --owner "$owner" --check

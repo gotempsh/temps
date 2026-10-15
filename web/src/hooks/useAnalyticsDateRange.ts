@@ -22,6 +22,23 @@ export interface AnalyticsDateFilter {
   dateRange: DateRange | undefined
 }
 
+/** The analytics date filter described by the `filter`/`from`/`to` params. */
+export function dateFilterFromParams(
+  filter: string | null,
+  from: string | null,
+  to: string | null
+): AnalyticsDateFilter {
+  if (filter === 'custom' && from && to) {
+    return {
+      quickFilter: 'custom',
+      dateRange: { from: new Date(from), to: new Date(to) },
+    }
+  }
+  const quick = QUICK_FILTERS.find((f) => f.value === filter)
+  if (quick) return { quickFilter: quick.value, dateRange: undefined }
+  return { quickFilter: '24hours', dateRange: undefined }
+}
+
 export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {
   startDate: Date | undefined
   endDate: Date | undefined

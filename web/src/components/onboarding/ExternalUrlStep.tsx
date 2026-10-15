@@ -134,9 +134,9 @@ export function ExternalUrlStep({
                   </code>
                 </li>
                 <li>
-                  • Project deployments:{' '}
+                  • Service deployments:{' '}
                   <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
-                    project-name.{baseDomain}
+                    service-name.{baseDomain}
                   </code>
                 </li>
                 <li>

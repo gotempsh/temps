@@ -19,14 +19,14 @@ import {
   listApiKeysOptions,
   listApiKeysQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ApiKeyTable, ApiKeyDeleteModal } from '@/components/api-keys'
+import { ApiKeyTable } from '@/components/api-keys'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 export default function ApiKeys() {
   usePageTitle('API Keys')
   const navigate = useNavigate()
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false)
-  const [selectedKey, setSelectedKey] = useState<ApiKeyResponse | null>(null)
+  const [keyToDelete, setKeyToDelete] = useState<ApiKeyResponse | null>(null)
   const queryClient = useQueryClient()
 
   // The generated options throw the server's Problem Details on a non-2xx
@@ -47,8 +47,7 @@ export default function ApiKeys() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
-      setDeleteModalOpen(false)
-      setSelectedKey(null)
+      setKeyToDelete(null)
       toast.success('API key deleted successfully')
     },
   })
@@ -87,12 +86,7 @@ export default function ApiKeys() {
   }
 
   const handleDelete = (key: ApiKeyResponse) => {
-    setSelectedKey(key)
-    setDeleteModalOpen(true)
-  }
-
-  const handleDeleteConfirm = (id: number) => {
-    deleteMutation.mutate(id)
+    setKeyToDelete(key)
   }
 
   const handleCreateClick = () => {
@@ -180,16 +174,22 @@ export default function ApiKeys() {
         </CardContent>
       </Card>
 
-      {/* Delete Modal */}
-      <ApiKeyDeleteModal
-        open={deleteModalOpen}
+      <ConfirmDeleteDialog
+        open={keyToDelete !== null}
         onOpenChange={(open) => {
-          setDeleteModalOpen(open)
-          if (!open) setSelectedKey(null)
+          if (!open) setKeyToDelete(null)
         }}
-        apiKey={selectedKey}
-        onConfirm={handleDeleteConfirm}
+        resourceType="API key"
+        resourceName={keyToDelete?.name ?? ''}
+        consequences={
+          keyToDelete
+            ? `Key ${keyToDelete.key_prefix}... (${keyToDelete.role_type}) stops working immediately; any application using it loses access.`
+            : undefined
+        }
         isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (keyToDelete) deleteMutation.mutate(keyToDelete.id)
+        }}
       />
     </div>
   )

@@ -302,7 +302,10 @@ export function EmailTrackingSetup({ providerId }: { providerId: number }) {
               </p>
               <CopyButton value={SETUP_IAM_POLICY} className="h-6 w-6" />
             </div>
-            <pre className="max-h-48 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug">
+            <pre
+              tabIndex={0}
+              className="max-h-48 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug"
+            >
               <HighlightedCode code={SETUP_IAM_POLICY} language="json" />
             </pre>
             <p className="text-muted-foreground">

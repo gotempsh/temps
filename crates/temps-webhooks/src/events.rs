@@ -8,32 +8,53 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// All supported webhook event types
+///
+/// The serialized form is the dotted name (`deployment.succeeded`): the same
+/// string used to subscribe, in the `X-Webhook-Event` header and in the
+/// payload's `event_type`. The legacy snake_case spelling
+/// (`deployment_succeeded`) is still accepted on deserialization so stored
+/// subscriptions and stored delivery payloads written before the names were
+/// aligned keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum WebhookEventType {
     // Deployment events
+    #[serde(rename = "deployment.created", alias = "deployment_created")]
     DeploymentCreated,
+    #[serde(rename = "deployment.succeeded", alias = "deployment_succeeded")]
     DeploymentSucceeded,
+    #[serde(rename = "deployment.failed", alias = "deployment_failed")]
     DeploymentFailed,
+    #[serde(rename = "deployment.cancelled", alias = "deployment_cancelled")]
     DeploymentCancelled,
+    #[serde(rename = "deployment.ready", alias = "deployment_ready")]
     DeploymentReady,
 
     // Project events
+    #[serde(rename = "project.created", alias = "project_created")]
     ProjectCreated,
+    #[serde(rename = "project.deleted", alias = "project_deleted")]
     ProjectDeleted,
 
     // Domain events
+    #[serde(rename = "domain.created", alias = "domain_created")]
     DomainCreated,
+    #[serde(rename = "domain.provisioned", alias = "domain_provisioned")]
     DomainProvisioned,
 
     // Backup events
+    #[serde(rename = "backup.started", alias = "backup_started")]
     BackupStarted,
+    #[serde(rename = "backup.completed", alias = "backup_completed")]
     BackupCompleted,
+    #[serde(rename = "backup.failed", alias = "backup_failed")]
     BackupFailed,
 
     // Email events
+    #[serde(rename = "email.delivered", alias = "email_delivered")]
     EmailDelivered,
+    #[serde(rename = "email.bounced", alias = "email_bounced")]
     EmailBounced,
+    #[serde(rename = "email.complained", alias = "email_complained")]
     EmailComplained,
 }
 
@@ -229,7 +250,43 @@ mod tests {
     fn test_event_type_serialization() {
         let event_type = WebhookEventType::DeploymentCreated;
         let json = serde_json::to_string(&event_type).unwrap();
-        assert_eq!(json, "\"deployment_created\"");
+        assert_eq!(json, "\"deployment.created\"");
+    }
+
+    #[test]
+    fn serialized_event_name_matches_subscription_and_header_name_for_every_event() {
+        for event_type in WebhookEventType::all() {
+            let json = serde_json::to_string(&event_type).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{}\"", event_type.as_str()),
+                "body event_type must equal the X-Webhook-Event / subscription name"
+            );
+            // from_str is the parser used for subscriptions: it must accept
+            // exactly the name that is emitted.
+            assert_eq!(
+                WebhookEventType::from_str(event_type.as_str()),
+                Some(event_type)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snake_case_event_names_still_deserialize() {
+        for event_type in WebhookEventType::all() {
+            let legacy = event_type.as_str().replace('.', "_");
+            let parsed: WebhookEventType = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            assert_eq!(parsed, event_type, "legacy name {legacy} must keep parsing");
+        }
+    }
+
+    #[test]
+    fn stored_legacy_event_payload_still_parses() {
+        let legacy = r#"{"id":"evt-1","event_type":"deployment_succeeded","timestamp":"2025-11-24T18:38:10Z","project_id":1,"payload":{"project_id":1,"project_name":"p","slug":"p","repo_url":null}}"#;
+        let event: WebhookEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(event.event_type, WebhookEventType::DeploymentSucceeded);
+        let reserialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(reserialized["event_type"], "deployment.succeeded");
     }
 
     #[test]

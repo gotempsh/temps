@@ -28,6 +28,9 @@ pub mod managed_environment_variables;
 pub use managed_environment_variables::*;
 
 pub mod env_resolver;
+
+/// Variables inherited from the service's project (group)
+pub mod group_env;
 pub use env_resolver::*;
 
 pub mod port_resolver;

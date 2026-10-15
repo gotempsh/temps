@@ -65,6 +65,7 @@ members = [
     "crates/temps-import-kamal",
     "crates/temps-captcha-wasm",
     "crates/temps-teams",
+    "crates/temps-project-groups",
     "crates/temps-webhooks",
     "crates/temps-email",
     "crates/temps-email-tracking",
@@ -132,7 +133,12 @@ async-stream = "0.3"
 serde = { version = "=1.0.228", features = ["derive", "rc"] }
 serde_derive = "1.0"
 serde_json = "1.0.140"
-serde_yaml = "0.9"
+# The YAML organization's maintained continuation of `serde_yaml` (same API).
+# `serde_yaml` and its `unsafe-libyaml` parser are unmaintained
+# (RUSTSEC-2024-0449); `yaml_serde` parses with the maintained `libyaml-rs`.
+# Do not reintroduce `serde_yaml` -- the only remaining copy in Cargo.lock is
+# Pingora's, which Temps never feeds YAML (see dependency-scan.yml).
+yaml_serde = "0.10"
 serde_urlencoded = "0.7.1"
 serde_bytes = "0.11.17"
 serde_path_to_error = "0.1.20"
@@ -249,7 +255,7 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 instant-acme = "0.8.5"
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 # RUSTSEC-2026-0285: reject TLS 1.3 handshake messages across key changes.
-rustls = { version = "0.23.45", default-features = false, features = [
+rustls = { version = "0.23.46", default-features = false, features = [
     "ring",
     "std",
     "tls12",
@@ -330,7 +336,7 @@ flate2 = "1.0"
 tar = "0.4.45"
 walkdir = "2"
 include_dir = "0.7"
-zip = "8.6"
+zip = "9.0"
 zstd = "0.14"
 
 # ============================================================================

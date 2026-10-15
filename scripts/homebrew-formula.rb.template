@@ -29,6 +29,8 @@ class Temps < Formula
 
       def install
         bin.install "temps"
+        # Firecracker guest agent; `temps firecracker setup` looks for it next to temps.
+        bin.install "temps-vm-agent" if File.exist?("temps-vm-agent")
       end
     else
       url "https://github.com/gotempsh/temps/releases/download/v{{VERSION}}/temps-linux-amd64.tar.gz"
@@ -36,6 +38,8 @@ class Temps < Formula
 
       def install
         bin.install "temps"
+        # Firecracker guest agent; `temps firecracker setup` looks for it next to temps.
+        bin.install "temps-vm-agent" if File.exist?("temps-vm-agent")
       end
     end
   end

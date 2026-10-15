@@ -429,6 +429,7 @@ export function WorkspaceFileExplorer({
                 <span className="min-w-0 flex-1 truncate">{entry.name}</span>
                 {status && (
                   <span
+                    role="img"
                     aria-label={`${status} file`}
                     className="shrink-0 font-sans text-[8px] font-semibold uppercase text-amber-700 dark:text-amber-300"
                   >
@@ -581,7 +582,7 @@ export function WorkspaceFileExplorer({
           {transferError}
         </p>
       )}
-      <div className="max-h-72 overflow-auto p-1.5">
+      <div tabIndex={0} className="max-h-72 overflow-auto p-1.5">
         {renderDirectory('', 0)}
       </div>
       {(selectedPath || previewLoading || previewError) && (
@@ -663,7 +664,10 @@ export function WorkspaceFileExplorer({
             </p>
           ) : (
             <>
-              <pre className="max-h-80 overflow-auto whitespace-pre bg-white p-3 font-mono text-[10px] leading-4 dark:bg-zinc-900">
+              <pre
+                tabIndex={0}
+                className="max-h-80 overflow-auto whitespace-pre bg-white p-3 font-mono text-[10px] leading-4 dark:bg-zinc-900"
+              >
                 <HighlightedCode
                   code={preview?.content ?? ''}
                   language={workspaceFileLanguage(selectedPath ?? '')}

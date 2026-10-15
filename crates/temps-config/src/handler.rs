@@ -19,11 +19,12 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
-    AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings,
-    ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings,
-    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, OnDemandTlsSettings, PublicHostnameStrategy, RateLimitSettings,
-    RequestMetadata, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings,
+    ClickHouseCompression, CloudSettings, ClusterDnsSettings, ContainerLogSettings,
+    DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind,
+    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    OnDemandTlsSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
 use tracing::{error, info, warn};
@@ -47,6 +48,9 @@ pub struct SettingsState {
     /// update endpoints then report the feature as unsupported here rather
     /// than pretending it is merely misconfigured.
     pub self_updater: Option<Arc<dyn temps_core::SelfUpdater>>,
+    /// Last result of the background ClickHouse preflight probe. `None` when
+    /// ClickHouse is not configured on this instance.
+    pub clickhouse_health: Option<Arc<temps_clickhouse::ClickHouseHealth>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -218,6 +222,39 @@ struct ForwardedIpTrustUpdatedAudit {
 impl AuditOperation for ForwardedIpTrustUpdatedAudit {
     fn operation_type(&self) -> String {
         "FORWARDED_IP_TRUST_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// `CLICKHOUSE_COMPRESSION_UPDATED` — the wire compression Temps uses to talk
+/// to ClickHouse changed.
+///
+/// A separate event from `SETTINGS_UPDATED` because the wrong mode makes every
+/// ClickHouse-backed feature (analytics, traces, proxy logs, metrics) return
+/// nothing once the process restarts, and the trail must say who chose it and
+/// what it replaced.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClickHouseCompressionUpdatedAudit {
+    context: AuditContext,
+    previous_compression: ClickHouseCompression,
+    new_compression: ClickHouseCompression,
+}
+
+impl AuditOperation for ClickHouseCompressionUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "CLICKHOUSE_COMPRESSION_UPDATED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -446,6 +483,16 @@ pub struct AppSettingsResponse {
     /// Retention windows for raw proxy logs and OpenTelemetry data.
     pub observability_retention: ObservabilityRetentionSettings,
 
+    /// Retention of analytics events and of the visitors and client IP
+    /// addresses attached to them.
+    pub analytics_retention: temps_core::AnalyticsRetentionSettings,
+
+    /// ClickHouse wire compression: the stored choice, the mode the running
+    /// process actually uses, and what the startup probe found. Always
+    /// present; `configured: false` explains what is missing instead of the
+    /// section disappearing.
+    pub clickhouse: ClickHouseSettingsResponse,
+
     /// Geolocation refresh policy and freshness, with the MaxMind license key
     /// reported only as a boolean.
     pub geo: GeoSettingsMasked,
@@ -635,6 +682,206 @@ impl From<temps_core::GeoSettings> for GeoSettingsMasked {
 
 fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Where the connection to the instance's ClickHouse server stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickHouseConnectionState {
+    /// `TEMPS_CLICKHOUSE_*` is not (fully) set; ClickHouse-backed features use
+    /// TimescaleDB.
+    NotConfigured,
+    /// Configured, but no probe has finished yet (startup, or the probe task
+    /// is not running in this process).
+    NotChecked,
+    /// The server answered and its response decoded.
+    Reachable,
+    /// The last probe failed. See `failure_kind` and `detail`.
+    Failing,
+}
+
+/// Why the last ClickHouse probe failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickHouseFailureKind {
+    /// The server answered in a codec the client cannot decode. Waiting does
+    /// not help: change the server's `network_compression_method` or set
+    /// Temps' compression to `none`.
+    Decode,
+    /// Connection refused/reset, DNS failure or timeout.
+    Unreachable,
+    /// The server answered and rejected the request.
+    Server,
+    Other,
+}
+
+impl From<temps_clickhouse::FailureKind> for ClickHouseFailureKind {
+    fn from(kind: temps_clickhouse::FailureKind) -> Self {
+        match kind {
+            temps_clickhouse::FailureKind::Decode => ClickHouseFailureKind::Decode,
+            temps_clickhouse::FailureKind::Unreachable => ClickHouseFailureKind::Unreachable,
+            temps_clickhouse::FailureKind::Server => ClickHouseFailureKind::Server,
+            temps_clickhouse::FailureKind::Other => ClickHouseFailureKind::Other,
+        }
+    }
+}
+
+/// Result of the ClickHouse startup/background probe. Carries no credentials:
+/// `host` is `host[:port]` only.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClickHouseConnectionStatus {
+    pub state: ClickHouseConnectionState,
+    /// `host[:port]` of the configured server.
+    pub host: Option<String>,
+    pub database: Option<String>,
+    /// Server version from the last successful probe, e.g. `26.9.17`.
+    pub server_version: Option<String>,
+    /// Set when `state` is `failing`.
+    pub failure_kind: Option<ClickHouseFailureKind>,
+    /// Full operator-facing description of the failure.
+    pub detail: Option<String>,
+    /// For decode failures: the compression method byte seen on the wire,
+    /// e.g. `zstd (0x90)`.
+    pub observed_compression_method: Option<String>,
+    /// What to do about the failure, when there is a known remedy.
+    pub remedy: Option<String>,
+    /// When the last probe finished (ISO 8601, `Z`).
+    pub last_checked_at: Option<String>,
+}
+
+impl ClickHouseConnectionStatus {
+    fn not_configured() -> Self {
+        Self {
+            state: ClickHouseConnectionState::NotConfigured,
+            host: None,
+            database: None,
+            server_version: None,
+            failure_kind: None,
+            detail: None,
+            observed_compression_method: None,
+            remedy: None,
+            last_checked_at: None,
+        }
+    }
+
+    fn from_snapshot(snapshot: temps_clickhouse::HealthSnapshot) -> Self {
+        use temps_clickhouse::ConnectionState;
+
+        let mut status = Self {
+            state: ClickHouseConnectionState::NotChecked,
+            host: Some(snapshot.host),
+            database: Some(snapshot.database),
+            server_version: None,
+            failure_kind: None,
+            detail: None,
+            observed_compression_method: None,
+            remedy: None,
+            last_checked_at: snapshot.last_checked_at.map(iso8601),
+        };
+        match snapshot.state {
+            ConnectionState::NotChecked => {}
+            ConnectionState::Reachable { server_version } => {
+                status.state = ClickHouseConnectionState::Reachable;
+                status.server_version = Some(server_version);
+            }
+            ConnectionState::Failing {
+                kind,
+                message,
+                observed_method,
+                remedy,
+            } => {
+                status.state = ClickHouseConnectionState::Failing;
+                status.failure_kind = Some(kind.into());
+                status.detail = Some(message);
+                status.observed_compression_method = observed_method.map(|m| m.to_string());
+                status.remedy = remedy.map(str::to_string);
+            }
+        }
+        status
+    }
+}
+
+/// ClickHouse wire compression and connection state, as the settings page
+/// needs them. Not a credential holder: the connection string is never echoed.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClickHouseSettingsResponse {
+    /// Whether the instance has a ClickHouse connection
+    /// (`TEMPS_CLICKHOUSE_*`). When `false` the compression setting is stored
+    /// but has nothing to apply to yet.
+    pub configured: bool,
+    /// Why ClickHouse is unavailable, when `configured` is `false`.
+    pub reason: Option<String>,
+    /// Console path where the operator manages this, when `configured` is
+    /// `false` or the probe is failing.
+    pub setup_path: Option<String>,
+    /// The stored mode: what the next start will use.
+    pub compression: ClickHouseCompression,
+    /// The mode the running process built its ClickHouse clients with.
+    /// `None` when ClickHouse is not configured.
+    pub effective_compression: Option<ClickHouseCompression>,
+    /// True when `compression` differs from `effective_compression`: the
+    /// stored change takes effect on the next restart.
+    pub restart_required: bool,
+    /// The modes that can be chosen.
+    pub available_compressions: Vec<ClickHouseCompression>,
+    /// Result of the last connection probe.
+    pub connection: ClickHouseConnectionStatus,
+}
+
+/// Console path of the settings page where ClickHouse is managed.
+const CLICKHOUSE_SETTINGS_PATH: &str = "/settings/metrics-monitoring";
+
+impl ClickHouseSettingsResponse {
+    fn from_stored(compression: ClickHouseCompression) -> Self {
+        Self {
+            configured: false,
+            reason: None,
+            setup_path: None,
+            compression,
+            effective_compression: None,
+            restart_required: false,
+            available_compressions: ClickHouseCompression::ALL.to_vec(),
+            connection: ClickHouseConnectionStatus::not_configured(),
+        }
+    }
+
+    /// Fill in what the running process knows. `effective` and `health` are
+    /// `None` when ClickHouse is not configured.
+    fn with_runtime_state(
+        mut self,
+        configured: bool,
+        effective: ClickHouseCompression,
+        health: Option<temps_clickhouse::HealthSnapshot>,
+    ) -> Self {
+        self.configured = configured;
+        if !configured {
+            self.reason = Some(
+                "ClickHouse is not configured on this instance. Set TEMPS_CLICKHOUSE_URL, \
+                 TEMPS_CLICKHOUSE_USER and TEMPS_CLICKHOUSE_PASSWORD (TEMPS_CLICKHOUSE_DATABASE \
+                 is optional) and restart Temps; until then analytics, traces, proxy logs and \
+                 metrics use TimescaleDB. The compression mode below is stored and applied once \
+                 ClickHouse is configured."
+                    .to_string(),
+            );
+            self.setup_path = Some(CLICKHOUSE_SETTINGS_PATH.to_string());
+            return self;
+        }
+
+        self.effective_compression = Some(effective);
+        self.restart_required = self.compression != effective;
+        self.connection = match health {
+            Some(snapshot) => ClickHouseConnectionStatus::from_snapshot(snapshot),
+            None => {
+                let mut status = ClickHouseConnectionStatus::not_configured();
+                status.state = ClickHouseConnectionState::NotChecked;
+                status
+            }
+        };
+        if self.connection.state == ClickHouseConnectionState::Failing {
+            self.setup_path = Some(CLICKHOUSE_SETTINGS_PATH.to_string());
+        }
+        self
+    }
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -884,6 +1131,8 @@ impl From<AppSettings> for AppSettingsResponse {
             monitored_services_count: None,
             observability_compression: settings.observability_compression,
             observability_retention: settings.observability_retention,
+            analytics_retention: settings.analytics_retention,
+            clickhouse: ClickHouseSettingsResponse::from_stored(settings.clickhouse.compression),
             geo: GeoSettingsMasked::from(settings.geo),
             insecure_tls: settings.insecure_tls,
             trusted_private_networks: settings.trusted_private_networks,
@@ -912,6 +1161,18 @@ impl AppSettingsResponse {
             allocation_count: state.allocation_count,
             locked: state.allocation_count > 0,
         });
+        self
+    }
+
+    fn with_clickhouse_runtime_state(
+        mut self,
+        configured: bool,
+        effective: ClickHouseCompression,
+        health: Option<temps_clickhouse::HealthSnapshot>,
+    ) -> Self {
+        self.clickhouse = self
+            .clickhouse
+            .with_runtime_state(configured, effective, health);
         self
     }
 
@@ -1031,6 +1292,13 @@ impl AppSettingsResponse {
         MonitoringSettingsMasked,
         ObservabilityCompressionSettings,
         ObservabilityRetentionSettings,
+        temps_core::AnalyticsRetentionSettings,
+        ClickHouseSettingsResponse,
+        ClickHouseConnectionStatus,
+        ClickHouseConnectionState,
+        ClickHouseFailureKind,
+        ClickHouseCompression,
+        temps_core::ClickHouseSettings,
         MetricsStoreKind,
         SettingsUpdateResponse,
         GenerateJoinTokenResponse,
@@ -2013,6 +2281,11 @@ async fn get_settings(
                 .ok();
             let response = AppSettingsResponse::from(settings)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
+                .with_clickhouse_runtime_state(
+                    app_state.config_service.is_clickhouse_enabled(),
+                    app_state.config_service.clickhouse_compression(),
+                    app_state.clickhouse_health.as_ref().map(|h| h.snapshot()),
+                )
                 .with_effective_timescale_state(policies, monitored_services_count)
                 .with_cluster_network_state(cluster_network_state)
                 .with_proxy_port(app_state.config_service.proxy_port());
@@ -2843,6 +3116,22 @@ fn authorize_bulk_activation_guard_change(
         .build())
 }
 
+fn validate_analytics_retention(
+    retention: &temps_core::AnalyticsRetentionSettings,
+) -> Result<(), Problem> {
+    if let Some((field, days)) = retention.out_of_range() {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "analytics_retention.{field} must be between {} and {} days (got {days}); \
+                 use null to keep the data",
+                temps_core::MIN_ANALYTICS_RETENTION_DAYS,
+                temps_core::MAX_ANALYTICS_RETENTION_DAYS,
+            ))
+            .build());
+    }
+    Ok(())
+}
+
 fn validate_observability_retention(
     retention: &ObservabilityRetentionSettings,
 ) -> Result<(), Problem> {
@@ -3238,6 +3527,7 @@ async fn update_settings(
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
+    validate_analytics_retention(&settings.analytics_retention)?;
     validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
     normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;
@@ -3303,6 +3593,8 @@ async fn update_settings(
     normalize_edge_target(&mut settings);
 
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
+    let previous_clickhouse_compression = stored_settings.clickhouse.compression;
+    let next_clickhouse_compression = settings.clickhouse.compression;
     let trusted_private_networks_intent = if trusted_private_networks_sent {
         TrustedPrivateNetworksIntent::Replace(settings.trusted_private_networks.clone())
     } else {
@@ -3394,6 +3686,35 @@ async fn update_settings(
                     {
                         error!("Failed to create the MaxMind license key audit log: {}", e);
                     }
+                }
+            }
+
+            if next_clickhouse_compression != previous_clickhouse_compression {
+                // Clients carry their codec, so the change is applied by the
+                // next restart; say so in the log the operator will read.
+                warn!(
+                    previous = %previous_clickhouse_compression,
+                    new = %next_clickhouse_compression,
+                    "ClickHouse compression mode changed; it applies after Temps restarts"
+                );
+                let compression_audit = ClickHouseCompressionUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_compression: previous_clickhouse_compression,
+                    new_compression: next_clickhouse_compression,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&compression_audit)
+                    .await
+                {
+                    error!(
+                        "Failed to create the ClickHouse compression audit log: {}",
+                        e
+                    );
                 }
             }
 
@@ -3494,6 +3815,20 @@ async fn update_settings(
                     message: "Settings updated successfully".to_string(),
                 }),
             ))
+        }
+        Err(crate::ConfigServiceError::PublicIngressHostnameInUse { hostname }) => {
+            // A status page claimed the hostname after this request checked
+            // it. Same response as the up-front check (owner not disclosed
+            // beyond the kind of resource).
+            Err(ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Public Ingress Hostname In Use")
+                .detail(format!(
+                    "'{hostname}' is already used by a status page custom domain. The public \
+                     ingress hostname is reserved for Temps itself. Choose another hostname, or \
+                     remove it from the status page first."
+                ))
+                .value("field", "public_ingress_url")
+                .build())
         }
         Err(e) => {
             tracing::error!("Failed to update settings: {}", e);
@@ -3986,6 +4321,10 @@ mod tests {
             .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
             .append_query_results(vec![Vec::<environment_domains::Model>::new()])
             .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
     }
 
     #[tokio::test]
@@ -5543,6 +5882,57 @@ mod tests {
     }
 
     #[test]
+    fn analytics_retention_validation_accepts_keep_and_boundaries() {
+        use temps_core::AnalyticsRetentionSettings;
+
+        validate_analytics_retention(&AnalyticsRetentionSettings::default())
+            .expect("defaults are valid");
+        validate_analytics_retention(&AnalyticsRetentionSettings {
+            events_days: 1,
+            error_events_days: Some(3650),
+            visitor_days: None,
+            unreferenced_ip_days: None,
+            ip_hold_until: None,
+        })
+        .expect("boundaries and null (keep) are valid");
+    }
+
+    #[test]
+    fn analytics_retention_validation_names_the_offending_window() {
+        use temps_core::AnalyticsRetentionSettings;
+
+        let error = validate_analytics_retention(&AnalyticsRetentionSettings {
+            visitor_days: Some(0),
+            ..Default::default()
+        })
+        .expect_err("a zero-day window must be rejected");
+        let detail = error
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("analytics_retention.visitor_days"),
+            "detail should name the field, got: {detail}"
+        );
+        assert!(
+            detail.contains("null"),
+            "detail should mention null: {detail}"
+        );
+    }
+
+    #[test]
+    fn response_surfaces_analytics_retention_settings() {
+        let mut settings = AppSettings::default();
+        settings.analytics_retention.visitor_days = Some(425);
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(response.analytics_retention.visitor_days, Some(425));
+        assert_eq!(response.analytics_retention.events_days, 90);
+    }
+
+    #[test]
     fn container_log_budgets_are_bounded() {
         use temps_core::ContainerLogSettings;
         let ok = ContainerLogSettings::default();
@@ -5823,6 +6213,183 @@ mod tests {
         assert_eq!(response.observability_retention.otel_spans_days, 60);
         assert_eq!(response.observability_retention.otel_logs_days, 90);
         assert_eq!(response.observability_retention.otel_metrics_days, 90);
+    }
+
+    fn clickhouse_snapshot(
+        state: temps_clickhouse::ConnectionState,
+    ) -> temps_clickhouse::HealthSnapshot {
+        temps_clickhouse::HealthSnapshot {
+            host: "clickhouse.internal:8123".to_string(),
+            database: "temps".to_string(),
+            mode: ClickHouseCompression::Lz4,
+            state,
+            last_checked_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-13T11:00:00Z")
+                    .expect("valid timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+        }
+    }
+
+    #[test]
+    fn clickhouse_section_defaults_to_lz4_and_lists_both_modes() {
+        let response = AppSettingsResponse::from(AppSettings::default());
+
+        assert_eq!(response.clickhouse.compression, ClickHouseCompression::Lz4);
+        assert_eq!(
+            response.clickhouse.available_compressions,
+            vec![ClickHouseCompression::Lz4, ClickHouseCompression::None]
+        );
+        assert!(!response.clickhouse.restart_required);
+    }
+
+    #[test]
+    fn unconfigured_clickhouse_onboards_instead_of_disappearing() {
+        let mut settings = AppSettings::default();
+        settings.clickhouse.compression = ClickHouseCompression::None;
+
+        let response = AppSettingsResponse::from(settings).with_clickhouse_runtime_state(
+            false,
+            ClickHouseCompression::Lz4,
+            None,
+        );
+
+        let clickhouse = response.clickhouse;
+        assert!(!clickhouse.configured);
+        assert_eq!(clickhouse.compression, ClickHouseCompression::None);
+        assert_eq!(clickhouse.effective_compression, None);
+        assert!(!clickhouse.restart_required);
+        assert_eq!(
+            clickhouse.connection.state,
+            ClickHouseConnectionState::NotConfigured
+        );
+        let reason = clickhouse.reason.expect("a reason is given");
+        assert!(reason.contains("TEMPS_CLICKHOUSE_URL"), "{reason}");
+        assert_eq!(
+            clickhouse.setup_path.as_deref(),
+            Some("/settings/metrics-monitoring")
+        );
+    }
+
+    #[test]
+    fn a_stored_change_is_flagged_as_needing_a_restart() {
+        let mut settings = AppSettings::default();
+        settings.clickhouse.compression = ClickHouseCompression::None;
+
+        let response = AppSettingsResponse::from(settings).with_clickhouse_runtime_state(
+            true,
+            ClickHouseCompression::Lz4,
+            Some(clickhouse_snapshot(
+                temps_clickhouse::ConnectionState::Reachable {
+                    server_version: "26.9.17".to_string(),
+                },
+            )),
+        );
+
+        let clickhouse = response.clickhouse;
+        assert!(clickhouse.configured);
+        assert_eq!(clickhouse.compression, ClickHouseCompression::None);
+        assert_eq!(
+            clickhouse.effective_compression,
+            Some(ClickHouseCompression::Lz4)
+        );
+        assert!(clickhouse.restart_required);
+        assert_eq!(
+            clickhouse.connection.state,
+            ClickHouseConnectionState::Reachable
+        );
+        assert_eq!(
+            clickhouse.connection.server_version.as_deref(),
+            Some("26.9.17")
+        );
+        assert_eq!(
+            clickhouse.connection.last_checked_at.as_deref(),
+            Some("2026-10-13T11:00:00Z")
+        );
+        assert_eq!(clickhouse.setup_path, None);
+    }
+
+    #[test]
+    fn a_decode_failure_reports_the_observed_codec_and_both_fixes() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_clickhouse_runtime_state(
+                true,
+                ClickHouseCompression::Lz4,
+                Some(clickhouse_snapshot(
+                    temps_clickhouse::ConnectionState::Failing {
+                        kind: temps_clickhouse::FailureKind::Decode,
+                        message: "decompression error: incorrect magic number".to_string(),
+                        observed_method: Some(temps_clickhouse::CompressionMethod::Zstd),
+                        remedy: Some(temps_clickhouse::COMPRESSION_REMEDY),
+                    },
+                )),
+            );
+
+        let connection = response.clickhouse.connection;
+        assert_eq!(connection.state, ClickHouseConnectionState::Failing);
+        assert_eq!(connection.failure_kind, Some(ClickHouseFailureKind::Decode));
+        assert_eq!(
+            connection.observed_compression_method.as_deref(),
+            Some("zstd (0x90)")
+        );
+        let remedy = connection.remedy.expect("decode failures carry a remedy");
+        assert!(remedy.contains("network_compression_method"), "{remedy}");
+        assert!(remedy.contains("`none`"), "{remedy}");
+        assert_eq!(
+            response.clickhouse.setup_path.as_deref(),
+            Some("/settings/metrics-monitoring")
+        );
+    }
+
+    #[test]
+    fn a_transport_failure_has_no_compression_remedy() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_clickhouse_runtime_state(
+                true,
+                ClickHouseCompression::Lz4,
+                Some(clickhouse_snapshot(
+                    temps_clickhouse::ConnectionState::Failing {
+                        kind: temps_clickhouse::FailureKind::Unreachable,
+                        message: "network error: connection refused".to_string(),
+                        observed_method: None,
+                        remedy: None,
+                    },
+                )),
+            );
+
+        let connection = response.clickhouse.connection;
+        assert_eq!(
+            connection.failure_kind,
+            Some(ClickHouseFailureKind::Unreachable)
+        );
+        assert_eq!(connection.remedy, None);
+        assert_eq!(connection.observed_compression_method, None);
+    }
+
+    #[test]
+    fn a_configured_server_with_no_probe_yet_is_not_checked() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_clickhouse_runtime_state(true, ClickHouseCompression::Lz4, None);
+
+        assert_eq!(
+            response.clickhouse.connection.state,
+            ClickHouseConnectionState::NotChecked
+        );
+    }
+
+    #[test]
+    fn clickhouse_response_never_carries_connection_credentials() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_clickhouse_runtime_state(
+                true,
+                ClickHouseCompression::Lz4,
+                Some(clickhouse_snapshot(
+                    temps_clickhouse::ConnectionState::NotChecked,
+                )),
+            );
+        let json = serde_json::to_string(&response.clickhouse).expect("serializes");
+        assert!(json.contains("clickhouse.internal:8123"));
+        assert!(!json.contains("password"), "{json}");
     }
 
     #[test]

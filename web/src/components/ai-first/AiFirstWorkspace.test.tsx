@@ -72,6 +72,7 @@ describe('HarnessPicker', () => {
       permission_modes: [],
       runtime_models: [],
       supports_max_turns: false,
+      login_supported: false,
       workspace_readiness_hint: null,
     } satisfies Omit<ProviderCatalogDto, 'id' | 'name' | 'workspace_ready'>
     const harnesses = workspaceHarnessOptions([

@@ -409,6 +409,10 @@ export function registerSandboxCommands(program: Command): void {
       '--backend <backend>',
       `Isolation backend: ${SANDBOX_BACKENDS.join(', ')}. Omit for the host default. An unavailable backend fails instead of downgrading`,
     )
+    .option(
+      '--allow-docker',
+      'Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox',
+    )
     .option('--json', 'Output as JSON')
     .action(createAction)
 
@@ -688,6 +692,7 @@ interface CreateOptions {
   fromSnapshot?: string
   node?: string
   backend?: string
+  allowDocker?: boolean
   json?: boolean
 }
 
@@ -791,6 +796,12 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (options.fromSnapshot) body.from_snapshot = options.fromSnapshot
   if (options.node) body.node = options.node
   if (options.backend !== undefined) body.backend = parseSandboxBackend(options.backend)
+  if (options.allowDocker) {
+    if (body.backend !== 'microsandbox') {
+      throw new Error('--allow-docker requires --backend microsandbox')
+    }
+    body.allow_docker = true
+  }
   if (options.image) body.image = options.image
   if (options.name) body.name = options.name
   if (options.timeout !== undefined) body.timeout_secs = Number(options.timeout)

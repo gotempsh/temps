@@ -105,7 +105,17 @@ impl DeployStaticFromSourceJob {
         } else {
             LogLevel::Info
         };
+        self.log_at(context, level, message).await
+    }
 
+    /// Write a log message at an explicit level, bypassing content sniffing
+    /// (a skipped path named `failed.map` must not turn a warning into an error).
+    async fn log_at(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_structured_log(log_id, level, message.clone())
@@ -168,14 +178,13 @@ impl DeployStaticFromSourceJob {
     ///
     /// A raw git checkout routinely carries files like `.gitignore` or
     /// `.github/` that were never meant to be served and are never something
-    /// the repository owner is asking to publish — unlike an uploaded
-    /// archive or a build tool's output directory, where the same policy
-    /// violation in `StaticDeployer::deploy` hard-fails the deployment on
-    /// purpose (there, a stray `.env` is a real red flag worth surfacing).
-    /// The policy predicate itself is untouched and still enforced a second
-    /// time by `StaticDeployer::deploy` on whatever survives this filter, and
-    /// a third time per-request by the proxy — this only changes the failure
-    /// mode for the *first* of those three checks.
+    /// the repository owner is asking to publish. `StaticDeployer::deploy`
+    /// applies the same skip-and-report behavior to whatever it is given;
+    /// filtering here additionally keeps `.git/` and friends out of this
+    /// staging copy, where they would otherwise count against the size and
+    /// entry limits for files that will never be published. The policy
+    /// predicate itself is untouched and still enforced a second time by
+    /// `StaticDeployer::deploy`, and a third time per-request by the proxy.
     ///
     /// Enforces the same `MAX_STATIC_ENTRIES`/`MAX_STATIC_ENTRY_BYTES`/
     /// `MAX_STATIC_TOTAL_BYTES` bounds `StaticDeployer::deploy` enforces on its
@@ -242,6 +251,7 @@ impl DeployStaticFromSourceJob {
                         )));
                     }
                     tokio::fs::copy(&source_path, &dest_path).await?;
+                    stats.file_count = stats.file_count.saturating_add(1);
                 }
             }
             Ok(())
@@ -257,6 +267,11 @@ impl DeployStaticFromSourceJob {
 struct CopyStats {
     skipped: Vec<String>,
     entry_count: u32,
+    /// Files actually staged. Needed here because this copy removes the
+    /// sensitive entries before `StaticDeployer::deploy` runs, so the deployer
+    /// sees an empty tree with nothing skipped and its own "nothing was
+    /// published" guard cannot fire.
+    file_count: u32,
     total_bytes: u64,
 }
 
@@ -341,8 +356,9 @@ impl WorkflowTask for DeployStaticFromSourceJob {
         }
 
         if !stats.skipped.is_empty() {
-            self.log(
+            self.log_at(
                 &context,
+                LogLevel::Warning,
                 format!(
                     "⏭️  Skipped {} non-publishable path(s), e.g. {}",
                     stats.skipped.len(),
@@ -356,6 +372,29 @@ impl WorkflowTask for DeployStaticFromSourceJob {
                 ),
             )
             .await?;
+
+            // Mirrors `ensure_something_published` in the deployers: a tree
+            // whose every entry was filtered out must not "succeed" with an
+            // empty site that serves only 404s.
+            if stats.file_count == 0 {
+                return Err(self
+                    .log_and_fail(
+                        &context,
+                        format!(
+                            "❌ No publishable files found in '{}': {} path(s) were skipped as not eligible for publishing (e.g. {})",
+                            source_dir.display(),
+                            stats.skipped.len(),
+                            stats
+                                .skipped
+                                .iter()
+                                .take(5)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
+                    .await);
+            }
         }
 
         let request = StaticDeployRequest {
@@ -373,6 +412,13 @@ impl WorkflowTask for DeployStaticFromSourceJob {
                     .await);
             }
         };
+
+        // Entries the staging copy above could not see (e.g. created between
+        // the copy and the deploy) are still reported, never silently dropped.
+        if let Some(summary) = result.skipped_summary() {
+            self.log_at(&context, LogLevel::Warning, format!("⚠️ {summary}"))
+                .await?;
+        }
 
         self.log(&context, format!("📍 Deployed to: {}", result.storage_path))
             .await?;
@@ -501,6 +547,63 @@ mod tests {
         // ordinary (if surprising) publishable content, same as it would be
         // if this repo were deployed via an uploaded archive instead.
         assert!(full_path.join("README.md").exists());
+    }
+
+    fn job_for(deployer: Arc<FilesystemStaticDeployer>) -> DeployStaticFromSourceJob {
+        DeployStaticFromSourceJob::new(
+            "deploy_static".to_string(),
+            "download_repo".to_string(),
+            ".".to_string(),
+            "docs-site".to_string(),
+            "production".to_string(),
+            "deploy-empty".to_string(),
+            deployer,
+        )
+    }
+
+    #[tokio::test]
+    async fn fails_when_every_entry_is_filtered_out_instead_of_deploying_an_empty_site() {
+        let repo = tempfile::tempdir().unwrap();
+        write_file(&repo.path().join(".gitignore"), "node_modules\n");
+        write_file(&repo.path().join(".github/workflows/ci.yml"), "name: ci\n");
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+        let job = job_for(deployer);
+
+        let error = job
+            .execute(context_with_repo_dir(repo.path()))
+            .await
+            .expect_err("a source tree with no publishable file must not deploy");
+
+        let message = error.to_string();
+        assert!(message.contains("No publishable files"), "{message}");
+        assert!(message.contains(".gitignore"), "{message}");
+        assert!(
+            !base_dir.path().join("projects").exists(),
+            "nothing may be written to static storage for a rejected tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_source_tree_without_skips_keeps_deploying() {
+        // Same contract as `StaticDeployer::deploy`: only a tree that had
+        // entries skipped *and* nothing left is rejected.
+        let repo = tempfile::tempdir().unwrap();
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+        let job = job_for(deployer);
+
+        let context = job
+            .execute(context_with_repo_dir(repo.path()))
+            .await
+            .expect("an empty tree with nothing skipped keeps the existing behavior")
+            .context;
+        let file_count: u32 = context
+            .get_output("deploy_static", "file_count")
+            .unwrap()
+            .unwrap();
+        assert_eq!(file_count, 0);
     }
 
     #[tokio::test]

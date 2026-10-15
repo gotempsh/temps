@@ -18,18 +18,9 @@ import {
   listTeamsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamResponse } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
@@ -40,6 +31,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -51,7 +44,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Plus, Trash2, Users } from 'lucide-react'
@@ -127,7 +123,7 @@ function CreateTeamDialog({ open, onOpenChange }: CreateTeamDialogProps) {
           <DialogTitle>Create team</DialogTitle>
           <DialogDescription>
             Teams group users. Once created, grant the team access to the
-            projects its members should reach.
+            services its members should reach.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
@@ -230,6 +226,10 @@ export function Teams() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
   const [teamToDelete, setTeamToDelete] = useState<TeamResponse | null>(null)
+  const currentRole = useCurrentUserRole()
+  // Creating and deleting teams needs `users:write` / `users:delete`, which
+  // only instance administrators hold.
+  const canManageTeams = useIsInstanceAdmin()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -244,7 +244,7 @@ export function Teams() {
   // dialog. Deriving it beats mirroring the param into state via an effect:
   // no cascading render, and it still reacts when the palette navigates here
   // while this page is already mounted.
-  const createOpen = searchParams.get('new') === '1'
+  const createOpen = canManageTeams && searchParams.get('new') === '1'
   const setCreateOpen = (open: boolean) => {
     const next = new URLSearchParams(searchParams)
     if (open) next.set('new', '1')
@@ -252,7 +252,7 @@ export function Teams() {
     setSearchParams(next, { replace: !open })
   }
 
-  const { data, isLoading, isError, error } = useQuery(
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery(
     listTeamsOptions({ query: { page: 1, page_size: 100 } })
   )
 
@@ -285,41 +285,50 @@ export function Teams() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Teams</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Group users, then grant each team access to the projects it should
-            reach. Projects with no grants stay open to everyone.
+            Group users, then grant each team access to the services it should
+            reach. Services with no grants stay open to everyone.
           </p>
         </div>
-        <CreateActionButton
-          onClick={() => setCreateOpen(true)}
-          label="Create team"
-          className="self-start"
-        />
+        {canManageTeams && (
+          <CreateActionButton
+            onClick={() => setCreateOpen(true)}
+            label="Create team"
+            className="self-start"
+          />
+        )}
       </div>
+
+      {!canManageTeams && (
+        <AdminOnlyNote action="create or delete teams" role={currentRole} />
+      )}
 
       <Card>
         <CardContent className="pt-6">
           {isLoading ? (
             <TeamsTableSkeleton />
           ) : isError ? (
-            <EmptyState
-              icon={Users}
-              title="Couldn't load teams"
-              description={
-                error instanceof Error
-                  ? error.message
-                  : 'The teams API did not respond.'
+            <ReadFailure
+              resource="Teams"
+              error={error}
+              onRetry={
+                isForbiddenRead(error) ? undefined : () => void refetch()
               }
+              retrying={isFetching}
+              embedded
             />
           ) : teams.length === 0 ? (
             <EmptyState
+              size="compact"
               icon={Users}
               title="No teams yet"
-              description="Create a team, add members, then grant it access to a project from that project's Access tab."
+              description="Create a team, add members, then grant it access to a service from that service's Access tab."
               action={
-                <Button onClick={() => setCreateOpen(true)}>
-                  <Plus className="mr-2 h-4 w-4" />
-                  Create team
-                </Button>
+                canManageTeams ? (
+                  <Button onClick={() => setCreateOpen(true)}>
+                    <Plus className="mr-2 h-4 w-4" />
+                    Create team
+                  </Button>
+                ) : undefined
               }
             />
           ) : (
@@ -356,19 +365,21 @@ export function Teams() {
                         <MemberCount teamId={team.id} />
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          aria-label={`Delete team ${team.name}`}
-                          onClick={(e) => {
-                            // Don't trigger the row's navigate.
-                            e.stopPropagation()
-                            setTeamToDelete(team)
-                          }}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4 text-destructive" />
-                          Delete
-                        </Button>
+                        {canManageTeams && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`Delete team ${team.name}`}
+                            onClick={(e) => {
+                              // Don't trigger the row's navigate.
+                              e.stopPropagation()
+                              setTeamToDelete(team)
+                            }}
+                          >
+                            <Trash2 className="mr-2 h-4 w-4 text-destructive" />
+                            Delete
+                          </Button>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -383,43 +394,24 @@ export function Teams() {
 
       {verificationDialog}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={teamToDelete !== null}
         onOpenChange={(open) => {
           if (!open) setTeamToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete team?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This permanently deletes the team
-              {teamToDelete ? ` "${teamToDelete.name}"` : ''} along with its
-              memberships and project-access grants. Members lose access to
-              every project they could only reach through this team. This cannot
-              be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                if (teamToDelete) {
-                  deleteMutation.mutate({
-                    path: { team_id: teamToDelete.id },
-                  })
-                }
-              }}
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete team'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="team"
+        resourceName={teamToDelete?.name ?? ''}
+        consequences="Its memberships and service-access grants are deleted with it. Members lose access to every service they could only reach through this team."
+        confirmLabel="Delete team"
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (teamToDelete) {
+            deleteMutation.mutate({
+              path: { team_id: teamToDelete.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

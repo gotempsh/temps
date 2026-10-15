@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -443,12 +443,71 @@ async fn send_error(
     let _ = write_json_frame(&mut *writer.lock().await, OP_ERROR, &payload).await;
 }
 
+/// How long the startup probe waits for an existing socket to accept.
+const LIVE_AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a startup connection attempt says about the socket path.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketProbe {
+    /// A listener accepted: another agent is running.
+    Live,
+    /// Nothing answers (no file, or the connection was refused): stale.
+    Stale,
+    /// The connection neither completed nor failed within the deadline, or
+    /// the kernel said it would block: a listener exists but is not
+    /// accepting, so the socket is not provably stale.
+    Busy,
+}
+
+/// Classify a connection attempt to an existing socket, bounded by
+/// `deadline` so a listener that stopped accepting cannot hold startup.
+async fn probe_socket<F>(connect: F, deadline: Duration) -> SocketProbe
+where
+    F: std::future::Future<Output = io::Result<()>>,
+{
+    match tokio::time::timeout(deadline, connect).await {
+        Ok(Ok(())) => SocketProbe::Live,
+        Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => SocketProbe::Busy,
+        Ok(Err(_)) => SocketProbe::Stale,
+        Err(_) => SocketProbe::Busy,
+    }
+}
+
 /// Top-level: bind the Unix socket and accept forever. Returns only on bind
 /// error or explicit shutdown (SIGTERM from docker-init).
 pub async fn run(socket_path: &str) -> io::Result<()> {
-    // Clean stale socket from a previous run. Safe because the agent is
-    // the only process that binds here; if another instance is actually
-    // running, `bind` below will fail with EADDRINUSE which we surface.
+    // Refuse to displace a live agent. Removing the socket file and binding
+    // a new one would succeed even with another instance running, silently
+    // orphaning every tab it owns — a second `temps-pty-agent` started by a
+    // careless bootstrap must be a no-op, not an outage. Only a socket that
+    // nothing answers on is stale and safe to clear.
+    let probe = probe_socket(
+        async { UnixStream::connect(socket_path).await.map(drop) },
+        LIVE_AGENT_PROBE_TIMEOUT,
+    )
+    .await;
+    match probe {
+        SocketProbe::Stale => {}
+        SocketProbe::Live => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("a temps-pty-agent is already listening on {socket_path}"),
+            ));
+        }
+        SocketProbe::Busy => {
+            // Something owns the socket but is not accepting right now (a
+            // full backlog, a stopped process). It is not provably stale, so
+            // it must not be displaced.
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the socket {socket_path} did not accept a probe connection within {}s; \
+                     refusing to displace what may be a live temps-pty-agent",
+                    LIVE_AGENT_PROBE_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+    }
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     // 0600 — only the `temps` user should be able to connect. docker exec
@@ -477,6 +536,127 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_refuses_to_displace_a_live_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let _live = tokio::net::UnixListener::bind(&path).expect("bind");
+
+        let err = run(&path.to_string_lossy())
+            .await
+            .expect_err("a second agent must not start");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        // The live listener's socket file must be untouched.
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_completes_is_busy_not_a_hang() {
+        let started = std::time::Instant::now();
+        let probe = probe_socket(
+            std::future::pending::<io::Result<()>>(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(probe, SocketProbe::Busy);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_accept_refusal_and_would_block() {
+        let d = Duration::from_secs(5);
+        assert_eq!(probe_socket(async { Ok(()) }, d).await, SocketProbe::Live);
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            assert_eq!(
+                probe_socket(async move { Err(io::Error::from(kind)) }, d).await,
+                SocketProbe::Stale,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            probe_socket(async { Err(io::Error::from(io::ErrorKind::WouldBlock)) }, d).await,
+            SocketProbe::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_treats_a_dead_agents_leftover_socket_as_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        // Bind then drop: the file remains but nothing listens on it.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists());
+
+        // Other tests in this process spawn children, and a child forked
+        // just before `exec` still holds a copy of the closed listener's fd
+        // (CLOEXEC only takes effect at exec), so the socket keeps answering
+        // until that window closes. Wait it out rather than assume the close
+        // is instantaneous.
+        let mut probe = SocketProbe::Live;
+        for _ in 0..100 {
+            probe = probe_socket(
+                async { UnixStream::connect(&path).await.map(drop) },
+                LIVE_AGENT_PROBE_TIMEOUT,
+            )
+            .await;
+            if probe == SocketProbe::Stale {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(probe, SocketProbe::Stale);
+    }
+
+    /// A listener that never accepts, with its backlog full: on Linux a
+    /// blocking `connect(2)` to it waits for the peer forever. Startup must
+    /// still return, and must leave the occupied socket alone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_does_not_hang_on_a_listener_with_a_full_backlog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let wedged = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Shrink the backlog so the queue fills well inside the test's
+        // file-descriptor budget (std's default is the system maximum).
+        // SAFETY: `listen` on a descriptor `wedged` owns for this whole test.
+        let rc = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&wedged), 1) };
+        assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
+
+        // Fill the accept queue; the kernel pushes back once it is full.
+        let mut held = Vec::new();
+        let mut saturated = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(&path)).await
+            {
+                Ok(Ok(stream)) => held.push(stream),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!(
+                    "unexpected connect error after {} connects: {e}",
+                    held.len()
+                ),
+                Err(_) => {
+                    saturated = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saturated,
+            "the accept queue never filled after {} connects",
+            held.len()
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(20), run(&path.to_string_lossy()))
+            .await
+            .expect("startup must not hang on a listener that stopped accepting");
+        let err = result.expect_err("a wedged listener must not be displaced");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(path.exists(), "the occupied socket file must be untouched");
+    }
 
     #[test]
     fn ring_push_and_tail_under_capacity() {

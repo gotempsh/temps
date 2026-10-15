@@ -1,16 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -232,47 +223,20 @@ export function AgentSecrets() {
         isPending={upsertMutation.isPending}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={secretToDelete !== null}
         onOpenChange={(open) => {
           if (!open) setSecretToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete secret?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete{' '}
-              <code className="bg-muted px-1 rounded font-mono text-xs">
-                {secretToDelete?.name}
-              </code>
-              . Any agent or sandbox referencing it via{' '}
-              <code className="bg-muted px-1 rounded font-mono text-xs">
-                ${'{TEMPS_SECRET:'}
-                {secretToDelete?.name}
-                {'}'}
-              </code>{' '}
-              will fail to resolve it.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                if (secretToDelete)
-                  deleteMutation.mutate({ path: { name: secretToDelete.name } })
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="secret"
+        resourceName={secretToDelete?.name ?? ''}
+        consequences={`Any agent or sandbox referencing it via \${TEMPS_SECRET:${secretToDelete?.name ?? ''}} will fail to resolve it.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (secretToDelete)
+            deleteMutation.mutate({ path: { name: secretToDelete.name } })
+        }}
+      />
     </Card>
   )
 }

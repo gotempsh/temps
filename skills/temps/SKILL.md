@@ -70,6 +70,8 @@ When the user opts in:
 |---|---|
 | Authenticate, select a server, or execute CLI operations | [references/cli-runtime.md](references/cli-runtime.md), then [references/commands/INDEX.md](references/commands/INDEX.md) |
 | Create, link, deploy, or migrate an application | [howtos/deploy-application.md](howtos/deploy-application.md), [references/runtime-contract.md](references/runtime-contract.md) |
+| Group services into a project (the console's "Project"), import apps from a monorepo, share variables, or route `/api` to another service | [howtos/projects-and-monorepos.md](howtos/projects-and-monorepos.md) |
+| Create a multi-service app from a template, or follow/retry an import | [howtos/projects-and-monorepos.md](howtos/projects-and-monorepos.md), then [references/commands/templates.md](references/commands/templates.md) or [references/commands/instantiations.md](references/commands/instantiations.md) |
 | Configure a database, cache, or object store | [howtos/managed-services.md](howtos/managed-services.md) |
 | Copy an existing database into a managed service | [howtos/managed-services.md](howtos/managed-services.md#import-an-existing-database-into-a-managed-service) |
 | Configure, verify, or restore backups | [howtos/backup-recovery.md](howtos/backup-recovery.md) |

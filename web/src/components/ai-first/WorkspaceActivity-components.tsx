@@ -4,6 +4,7 @@
 import { CircleAlert, Folder, Loader2, MessageSquare } from 'lucide-react'
 import type { WorkspaceHarnessActivity } from '@/api/client'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
+import { serviceCount } from '@/lib/terminology'
 import { cn } from '@/lib/utils'
 import { aiHarnessName } from '@/components/ui/ai-harness-brand'
 import { states, groupHarnessActivity } from './WorkspaceActivity-shared'
@@ -31,9 +32,10 @@ export function WorkspaceActivity({
     >
       {projectCount !== undefined && (
         <span
+          role="img"
           className="inline-flex shrink-0 items-center gap-1"
-          title={`${projectCount} project${projectCount === 1 ? '' : 's'}`}
-          aria-label={`${projectCount} project${projectCount === 1 ? '' : 's'}`}
+          title={serviceCount(projectCount)}
+          aria-label={serviceCount(projectCount)}
         >
           <Folder className="size-3.5 shrink-0" aria-hidden="true" />
           <span aria-hidden="true">{projectCount}</span>
@@ -52,6 +54,7 @@ export function WorkspaceRunningIndicator({
   if (!harnesses?.some((harness) => harness.running > 0)) return null
   return (
     <span
+      role="img"
       title="Threads running"
       aria-label="Threads running"
       className="inline-flex size-3.5 shrink-0 overflow-hidden text-blue-600 dark:text-blue-400"
@@ -76,6 +79,7 @@ function WorkspaceThreadActivity({
   if (error || (!loading && !harnesses)) {
     return (
       <span
+        role="img"
         className="flex shrink-0"
         title="Activity unavailable"
         aria-label="Activity unavailable"
@@ -90,6 +94,7 @@ function WorkspaceThreadActivity({
   if (loading) {
     return (
       <span
+        role="status"
         aria-label="Loading workspace activity"
         className="h-4 w-24 shrink-0 animate-pulse rounded bg-muted"
       />
@@ -99,6 +104,7 @@ function WorkspaceThreadActivity({
   if (!grouped.length) {
     return (
       <span
+        role="img"
         className="flex shrink-0 items-center gap-1 text-muted-foreground"
         title="No threads yet"
         aria-label="No threads yet"
@@ -113,6 +119,7 @@ function WorkspaceThreadActivity({
       <span className="flex shrink-0 items-center gap-2">
         {grouped.map((harness) => (
           <span
+            role="img"
             key={harness.ai_provider}
             className="inline-flex shrink-0 items-center gap-1"
             title={`${aiHarnessName(harness.ai_provider)}: ${harness.total} thread${harness.total === 1 ? '' : 's'}`}
@@ -131,6 +138,7 @@ function WorkspaceThreadActivity({
           if (!count) return null
           return (
             <span
+              role="img"
               key={key}
               className={`inline-flex shrink-0 items-center gap-0.5 ${className}`}
               title={`${count} ${label.toLowerCase()} thread${count === 1 ? '' : 's'} · latest turn status`}

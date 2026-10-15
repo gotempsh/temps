@@ -11,6 +11,8 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
@@ -19,7 +21,7 @@ import {
   patchAdminGateMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, Loader2, Lock, Save, Shield } from 'lucide-react'
+import { Loader2, Lock, Save, Shield } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 
@@ -35,7 +37,7 @@ import { toast } from 'sonner'
  */
 export function AdminGateCard() {
   const queryClient = useQueryClient()
-  const { data, isLoading, error } = useQuery(getAdminGateOptions())
+  const { data, isLoading, error, refetch } = useQuery(getAdminGateOptions())
 
   const [allowedIpsText, setAllowedIpsText] = useState('')
   const [allowedHostsText, setAllowedHostsText] = useState('')
@@ -102,14 +104,11 @@ export function AdminGateCard() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <Alert variant="destructive">
-            <AlertTriangle className="h-4 w-4" />
-            <AlertTitle>Failed to load admin gate settings</AlertTitle>
-            <AlertDescription>
-              The server returned an error. Check console logs or contact your
-              administrator.
-            </AlertDescription>
-          </Alert>
+          <ReadFailure
+            resource="Admin access gate"
+            error={error}
+            onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+          />
         </CardContent>
       </Card>
     )

@@ -675,10 +675,14 @@ function ActionButton({
 
 function Field({ children, label }: { children: ReactNode; label: string }) {
   return (
-    <div className="space-y-1.5">
-      <Label>{label}</Label>
+    // A wrapping <label> names the control it contains, whatever that is
+    // (select or input), without needing an id on every call site.
+    <label className="block space-y-1.5">
+      <Label asChild>
+        <span className="block">{label}</span>
+      </Label>
       {children}
-    </div>
+    </label>
   )
 }
 

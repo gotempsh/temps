@@ -229,9 +229,9 @@ pub struct ComposeLocalReferences {
 /// directory are not listed; resolution rejects or fetches those itself,
 /// exactly as it does for a checkout.
 pub fn compose_local_references(base: &str, content: &str) -> ComposeLocalReferences {
-    use serde_yaml::Value;
+    use yaml_serde::Value;
     let mut references = ComposeLocalReferences::default();
-    let Ok(mut root) = serde_yaml::from_str::<Value>(content) else {
+    let Ok(mut root) = yaml_serde::from_str::<Value>(content) else {
         return references;
     };
     let _ = root.apply_merge();
@@ -431,8 +431,8 @@ pub fn override_redundancy(
     if override_yaml.trim().is_empty() {
         return None;
     }
-    let mut base: serde_yaml::Value = serde_yaml::from_str(repository_yaml).ok()?;
-    let mut overlay: serde_yaml::Value = serde_yaml::from_str(override_yaml).ok()?;
+    let mut base: yaml_serde::Value = yaml_serde::from_str(repository_yaml).ok()?;
+    let mut overlay: yaml_serde::Value = yaml_serde::from_str(override_yaml).ok()?;
     base.apply_merge().ok()?;
     overlay.apply_merge().ok()?;
     let services = base.get("services")?.as_mapping()?;
@@ -446,8 +446,8 @@ pub fn override_redundancy(
 }
 
 /// Whether every key, item and scalar of `small` is present in `large`.
-fn is_yaml_subset(small: &serde_yaml::Value, large: &serde_yaml::Value) -> bool {
-    use serde_yaml::Value;
+fn is_yaml_subset(small: &yaml_serde::Value, large: &yaml_serde::Value) -> bool {
+    use yaml_serde::Value;
     match (small, large) {
         (Value::Mapping(small), Value::Mapping(large)) => small.iter().all(|(key, value)| {
             large
@@ -477,8 +477,8 @@ pub const DEDUPLICATED_SERVICE_LISTS: &[&str] = &["env_file", "volumes", "enviro
 /// `ports` is only de-duplicated within the overlay: Temps replaces a
 /// service's ports with the override's list rather than appending, so
 /// removing an item there would drop a port instead of a duplicate.
-pub fn deduplicate_override_lists(base: &serde_yaml::Value, overlay: &mut serde_yaml::Value) {
-    use serde_yaml::Value;
+pub fn deduplicate_override_lists(base: &yaml_serde::Value, overlay: &mut yaml_serde::Value) {
+    use yaml_serde::Value;
     let Some(overlay_services) = overlay
         .get_mut("services")
         .and_then(Value::as_mapping_mut)
@@ -529,8 +529,8 @@ pub fn deduplicate_override_lists(base: &serde_yaml::Value, overlay: &mut serde_
 
 /// Comparison key for a list item: `env_file: .env` and
 /// `env_file: [{path: .env}]` name the same file.
-fn list_identity(item: &serde_yaml::Value) -> serde_yaml::Value {
-    use serde_yaml::Value;
+fn list_identity(item: &yaml_serde::Value) -> yaml_serde::Value {
+    use yaml_serde::Value;
     if let Some(mapping) = item.as_mapping() {
         if mapping.len() == 1 {
             if let Some(path) = mapping.get(Value::String("path".to_string())) {
@@ -574,24 +574,24 @@ mod tests {
 
     #[test]
     fn duplicate_list_items_are_merged_once() {
-        let base: serde_yaml::Value = serde_yaml::from_str(REPO).unwrap();
-        let mut overlay: serde_yaml::Value = serde_yaml::from_str(
+        let base: yaml_serde::Value = yaml_serde::from_str(REPO).unwrap();
+        let mut overlay: yaml_serde::Value = yaml_serde::from_str(
             "services:\n  app:\n    env_file:\n      - path: .env\n      - extra.env\n      - extra.env\n    volumes:\n      - data:/data\n      - ./conf:/conf\n    environment:\n      - A=1\n      - A=1\n    ports:\n      - \"8080:80\"\n      - \"8080:80\"\n",
         )
         .unwrap();
         deduplicate_override_lists(&base, &mut overlay);
         let app = &overlay["services"]["app"];
-        assert_eq!(app["env_file"], serde_yaml::from_str::<serde_yaml::Value>("[extra.env]").unwrap());
-        assert_eq!(app["volumes"], serde_yaml::from_str::<serde_yaml::Value>("[./conf:/conf]").unwrap());
-        assert_eq!(app["environment"], serde_yaml::from_str::<serde_yaml::Value>("[A=1]").unwrap());
+        assert_eq!(app["env_file"], yaml_serde::from_str::<yaml_serde::Value>("[extra.env]").unwrap());
+        assert_eq!(app["volumes"], yaml_serde::from_str::<yaml_serde::Value>("[./conf:/conf]").unwrap());
+        assert_eq!(app["environment"], yaml_serde::from_str::<yaml_serde::Value>("[A=1]").unwrap());
         // Ports keep replacement semantics: only internal duplicates go.
-        assert_eq!(app["ports"], serde_yaml::from_str::<serde_yaml::Value>("[\"8080:80\"]").unwrap());
+        assert_eq!(app["ports"], yaml_serde::from_str::<yaml_serde::Value>("[\"8080:80\"]").unwrap());
     }
 
     #[test]
     fn a_full_copy_override_merges_without_duplicates() {
-        let base: serde_yaml::Value = serde_yaml::from_str(REPO).unwrap();
-        let mut overlay: serde_yaml::Value = serde_yaml::from_str(REPO).unwrap();
+        let base: yaml_serde::Value = yaml_serde::from_str(REPO).unwrap();
+        let mut overlay: yaml_serde::Value = yaml_serde::from_str(REPO).unwrap();
         deduplicate_override_lists(&base, &mut overlay);
         let app = overlay["services"]["app"].as_mapping().unwrap();
         assert!(app.get("env_file").is_none());

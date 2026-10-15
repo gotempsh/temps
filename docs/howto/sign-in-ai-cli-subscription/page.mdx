@@ -1,0 +1,86 @@
+export const metadata = {
+  title: 'Sign in an AI CLI with your subscription',
+  description:
+    'Connect Claude Code or Codex to Temps with the ChatGPT or Claude subscription you already pay for: one-click sign-in from the console or `bunx @temps-sdk/cli ai provider login`, with no API key to paste.',
+  alternates: {
+    canonical: '/docs/sign-in-ai-cli-subscription',
+  },
+}
+
+export const sections = [
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: 'Sign in from the console', id: 'sign-in-from-the-console' },
+  { title: 'Sign in from the CLI', id: 'sign-in-from-the-cli' },
+  { title: 'What Temps stores', id: 'what-temps-stores' },
+  { title: 'Paste a token instead', id: 'paste-a-token-instead' },
+  { title: 'Troubleshooting', id: 'troubleshooting' },
+]
+
+# Sign in an AI CLI with your subscription
+
+Claude Code and Codex can run on your Claude or ChatGPT subscription instead of a pay-per-use API key. Temps signs the CLI in for you: you open a link, approve access in your own browser, and Temps takes care of the rest. {{ className: 'lead' }}
+
+---
+
+## Before you start {{ anchor: true, id: 'before-you-start' }}
+
+- The provider's CLI must be installed on the machine running Temps (`claude` for Claude Code, `codex` for Codex). The sign-in button is always visible; when the CLI is missing it tells you which command installs it.
+- You need the **Settings write** permission, plus **AI gateway write** for Claude Code or **system administrator** for Codex.
+- Temps keeps the CLI's credential in a private directory under its data directory. If Temps runs as `root` and drops privileges to run the CLI, that directory must be reachable by the CLI's user; if it is not, the sign-in stops immediately and says which user needs access.
+
+---
+
+## Sign in from the console {{ anchor: true, id: 'sign-in-from-the-console' }}
+
+1. Open **Settings → AI Agents**, choose the harness, and pick **Sign in with Claude** (or **Sign in with Codex**).
+2. Open the sign-in page it shows and approve access.
+3. **Claude Code:** paste the code shown after approval into the dialog and press **Submit**.
+   **Codex:** enter the device code shown in the dialog on the page you opened; Temps continues by itself.
+4. The dialog follows the sign-in live (starting → waiting → verifying → signed in) with elapsed time. **Cancel sign-in** stops the CLI on the server immediately.
+
+A sign-in is abandoned after 10 minutes, and at most four run at once per server. If it fails, **Try again** starts a fresh one; a failed attempt never replaces a working sign-in.
+
+---
+
+## Sign in from the CLI {{ anchor: true, id: 'sign-in-from-the-cli' }}
+
+<CodeGroup title="Sign in an AI CLI">
+
+```bash {{ title: 'Claude Code' }}
+bunx @temps-sdk/cli ai provider login claude_cli
+```
+
+```bash {{ title: 'Codex' }}
+bunx @temps-sdk/cli ai provider login codex_cli
+```
+
+</CodeGroup>
+
+The command prints the link to open and, for Claude Code, asks for the code (the input is hidden). Press `Ctrl-C` to cancel; the server stops the CLI process. It exits non-zero if the sign-in fails.
+
+---
+
+## What Temps stores {{ anchor: true, id: 'what-temps-stores' }}
+
+- The provider CLI owns the sign-in. While the flow runs Temps does not read token files, and it never logs or saves what the CLI prints or the code you paste. Once the CLI reports success and the sign-in is confirmed, Temps reads the credential file once to take the access-token snapshot described below; that read does not follow symlinks and the refresh token is discarded.
+- The refresh token stays in the CLI's own directory on the Temps host. Subscription refresh tokens rotate, so copying one into several sandboxes would let the copies invalidate each other; Temps never does.
+- Settings (encrypted) and sandboxes receive only a short-lived **access token**. When it is close to expiring, the host CLI refreshes itself and Temps re-reads the result.
+- Sign-in links are only shown when they point at the provider's own domains.
+
+---
+
+## Paste a token instead {{ anchor: true, id: 'paste-a-token-instead' }}
+
+Pasting remains available under **Paste token (advanced)**: a long-lived token from `claude setup-token`, a Codex `auth.json`, or an API key. Use it when the server has no browser-reachable network path to the provider, or in automation that cannot answer an interactive prompt.
+
+---
+
+## Troubleshooting {{ anchor: true, id: 'troubleshooting' }}
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "`claude` is not installed on this server" | The CLI is not on the `PATH` of the Temps process | Install it with the command shown, then refresh the page |
+| "did not offer a sign-in link" | The CLI could not reach the provider | Check the server's outbound HTTPS access and retry |
+| "left no credential file" | The host keeps CLI credentials in a system keychain (for example macOS) | Use a Linux host, or paste a token instead |
+| "not writable by the user the CLI runs as" | Temps runs as root and the CLI's user cannot reach the data directory | Give that user access to the Temps data directory, or run Temps as that user |
+| Signed in, but runs say the sign-in expired | The access token expired and the host CLI could not refresh it | Sign in again |

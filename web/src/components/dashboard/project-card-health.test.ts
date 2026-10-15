@@ -67,7 +67,7 @@ describe('projectHealthIndicator', () => {
 
     expect(indicator.tone).toBe('idle')
     expect(indicator.label).toBe('No traffic')
-    expect(indicator.detail).toContain('No user requests reached this project')
+    expect(indicator.detail).toContain('No user requests reached this service')
   })
 
   test('never reports an unreachable health service as idle', () => {

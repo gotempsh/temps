@@ -111,3 +111,84 @@ export function providerKeyFormToRequest(
     capabilities: values.capabilities,
   }
 }
+
+/** A provider as offered by the add-key dialog's provider choice. */
+export interface ProviderKeyChoice {
+  id: string
+  name: string
+}
+
+/**
+ * The display name pre-filled for a new key: the provider's name, numbered
+ * once the provider already has keys so rows stay distinguishable.
+ */
+export function defaultProviderKeyDisplayName(
+  providerName: string,
+  existingKeyCount: number
+): string {
+  return existingKeyCount > 0
+    ? `${providerName} (key ${existingKeyCount + 1})`
+    : providerName
+}
+
+/** The form state for adding a key to one specific, preselected provider. */
+export function providerKeyFormForProvider(
+  provider: ProviderKeyChoice,
+  existingKeyCount: number
+): ProviderKeyFormValues {
+  return {
+    ...EMPTY_PROVIDER_KEY_FORM,
+    provider: provider.id,
+    display_name: defaultProviderKeyDisplayName(
+      provider.name,
+      existingKeyCount
+    ),
+  }
+}
+
+/** Whether a display name is one the form pre-filled rather than the user. */
+function isPrefilledDisplayName(
+  displayName: string,
+  providerNames: readonly string[]
+): boolean {
+  const trimmed = displayName.trim()
+  if (!trimmed) return true
+  return providerNames.some(
+    (name) =>
+      trimmed === name ||
+      (trimmed.startsWith(`${name} (key `) && trimmed.endsWith(')'))
+  )
+}
+
+/**
+ * Apply a provider chosen inside the dialog. Everything specific to the
+ * previous provider (key, base URL, discovered models, trust) is dropped so
+ * it can never be submitted against the wrong provider; a display name the
+ * user typed is kept.
+ */
+export function selectProviderKeyFormProvider(
+  values: ProviderKeyFormValues,
+  provider: ProviderKeyChoice,
+  existingKeyCount: number,
+  knownProviderNames: readonly string[]
+): ProviderKeyFormValues {
+  if (values.provider === provider.id) return values
+  const keepName = !isPrefilledDisplayName(
+    values.display_name,
+    knownProviderNames
+  )
+  return {
+    ...EMPTY_PROVIDER_KEY_FORM,
+    provider: provider.id,
+    display_name: keepName
+      ? values.display_name
+      : defaultProviderKeyDisplayName(provider.name, existingKeyCount),
+  }
+}
+
+/** Submitting needs a chosen provider; the schema reports the rest. */
+export function canSubmitProviderKeyForm(
+  values: Pick<ProviderKeyFormValues, 'provider'>
+): boolean {
+  return values.provider.trim() !== ''
+}

@@ -105,6 +105,17 @@ const routeCloudLifecycle = async (page: Page, rejected = false) => {
   return { enrollmentCodes, featureUpdates, operations }
 }
 
+/**
+ * Disconnecting asks for confirmation in an alert dialog that names the
+ * instance; the trigger on the page is inert while it is open.
+ */
+async function confirmDisconnect(page: Page) {
+  await page
+    .getByRole('alertdialog')
+    .getByRole('button', { name: 'Disconnect', exact: true })
+    .click()
+}
+
 test.describe('Temps Cloud activation onboarding', () => {
   test('connects and disconnects an instance from the two-step setup', async ({
     page,
@@ -158,6 +169,7 @@ test.describe('Temps Cloud activation onboarding', () => {
     ])
 
     await page.getByRole('button', { name: 'Disconnect' }).click()
+    await confirmDisconnect(page)
     await expect(
       page.getByRole('heading', { name: 'Connect this instance' })
     ).toBeVisible()
@@ -217,6 +229,7 @@ test.describe('Temps Cloud activation onboarding', () => {
     })
 
     await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+    await confirmDisconnect(page)
     await expect(
       page
         .getByRole('alert')
@@ -230,6 +243,7 @@ test.describe('Temps Cloud activation onboarding', () => {
 
     failDisconnect = false
     await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+    await confirmDisconnect(page)
     await expect(
       page.getByRole('heading', { name: 'Connect this instance' })
     ).toBeVisible()
@@ -295,6 +309,7 @@ test.describe('Temps Cloud activation onboarding', () => {
       await page
         .getByRole('button', { name: 'Disconnect', exact: true })
         .click()
+      await confirmDisconnect(page)
       await expect(
         page.getByRole('heading', { name: 'Connect this instance' })
       ).toBeVisible()
@@ -365,7 +380,8 @@ test.describe('Temps Cloud activation onboarding', () => {
     ).toBeVisible()
     await expect(
       page.getByText(
-        'Cloud capability checks timed out. Check connectivity and retry.'
+        'Cloud capability checks timed out. Check connectivity and retry.',
+        { exact: true }
       )
     ).toBeVisible()
 

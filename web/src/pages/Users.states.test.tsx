@@ -7,7 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { listUsersOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { RouteUserWithRoles } from '@/api/client/types.gen'
+import type { RouteUserWithRoles, UserResponse } from '@/api/client/types.gen'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { Users } from './Users'
@@ -23,6 +23,16 @@ const forbidden = {
   title: 'Forbidden',
   status: 403,
   detail: 'Requires UsersRead permission',
+}
+
+/** Only instance admins are offered "Add User", so render the page as one. */
+const admin: UserResponse = {
+  id: 1,
+  name: 'Admin',
+  username: 'admin',
+  avatar_url: '',
+  mfa_enabled: false,
+  role: 'admin',
 }
 
 function createClient() {
@@ -46,7 +56,7 @@ function render(client: QueryClient) {
       <MemoryRouter initialEntries={['/settings/users']}>
         <AuthContext.Provider
           value={{
-            user: null,
+            user: admin,
             isLoading: false,
             error: null,
             logout: async () => {},
