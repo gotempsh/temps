@@ -9,6 +9,7 @@ import {
   IDLE_LIST_POLL_MS,
   UNBOUNDED_LIST_IDLE_POLL_MS,
   UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS,
+  inProgressBackupIds,
   liveListInterval,
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
@@ -26,25 +27,10 @@ describe('liveListInterval', () => {
 })
 
 describe('sourceBackupsRefetchInterval', () => {
-  test('polls fast while a backup is pending or running', () => {
-    expect(
-      sourceBackupsRefetchInterval([
-        { state: 'completed' },
-        { state: 'running' },
-      ])
-    ).toBe(ACTIVE_LIST_POLL_MS)
-    expect(sourceBackupsRefetchInterval([{ state: 'pending' }])).toBe(
-      ACTIVE_LIST_POLL_MS
+  test('uses the slow idle cadence, even while a backup is running', () => {
+    expect(sourceBackupsRefetchInterval([{ state: 'running' }])).toBe(
+      UNBOUNDED_LIST_IDLE_POLL_MS
     )
-  })
-
-  test('keeps the slower idle cadence once every backup is final or none exist', () => {
-    expect(
-      sourceBackupsRefetchInterval([
-        { state: 'completed' },
-        { state: 'failed' },
-      ])
-    ).toBe(UNBOUNDED_LIST_IDLE_POLL_MS)
     expect(sourceBackupsRefetchInterval([])).toBe(UNBOUNDED_LIST_IDLE_POLL_MS)
     expect(sourceBackupsRefetchInterval(undefined)).toBe(
       UNBOUNDED_LIST_IDLE_POLL_MS
@@ -52,15 +38,30 @@ describe('sourceBackupsRefetchInterval', () => {
     expect(UNBOUNDED_LIST_IDLE_POLL_MS).toBeGreaterThan(IDLE_LIST_POLL_MS)
   })
 
-  test('stops idle polling a heavy history but still follows running work', () => {
+  test('stops polling a heavy history', () => {
     const heavy = Array.from(
       { length: UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS + 1 },
       () => ({ state: 'completed' })
     )
     expect(sourceBackupsRefetchInterval(heavy)).toBe(false)
     expect(sourceBackupsRefetchInterval([...heavy, { state: 'running' }])).toBe(
-      ACTIVE_LIST_POLL_MS
+      false
     )
+  })
+})
+
+describe('inProgressBackupIds', () => {
+  test('returns only pending and running backups that have a DB row', () => {
+    expect(
+      inProgressBackupIds([
+        { backup_id: 'a', state: 'completed' },
+        { backup_id: 'b', state: 'running' },
+        { backup_id: 'c', state: 'pending' },
+        { backup_id: '', state: 'running' },
+        { backup_id: 'd', state: 'failed' },
+      ])
+    ).toEqual(['b', 'c'])
+    expect(inProgressBackupIds(undefined)).toEqual([])
   })
 })
 

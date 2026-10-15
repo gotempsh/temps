@@ -353,12 +353,24 @@ function EnvironmentVariableRow({
   // accidentally expose it as a regular value.
   const [convertToSecret, setConvertToSecret] = useState(false)
 
-  // Update selected environments and preview flag when variable changes (after refetch)
+  // Keep the editor's environment and preview choices in step with the stored
+  // variable, but never while the editor is open: the list polls, so a refetch
+  // (even one returning the same values in a fresh array) would otherwise wipe
+  // what the user just picked and Save would send the reset choices. Closing
+  // the editor re-syncs, which also discards an abandoned draft. Keyed on the
+  // ids rather than the array identity for the same reason.
+  const storedEnvironmentIds = variable.environments
+    .map((env) => env.id)
+    .join(',')
+  const storedIncludeInPreview = variable.include_in_preview ?? false
   useEffect(() => {
+    if (isEditModalOpen) return
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSelectedEditEnvironments(variable.environments.map((env) => env.id))
-    setEditIncludeInPreview(variable.include_in_preview ?? false)
-  }, [variable.environments, variable.include_in_preview])
+    setSelectedEditEnvironments(
+      storedEnvironmentIds ? storedEnvironmentIds.split(',').map(Number) : []
+    )
+    setEditIncludeInPreview(storedIncludeInPreview)
+  }, [storedEnvironmentIds, storedIncludeInPreview, isEditModalOpen])
 
   const openEditDialog = async () => {
     setIsEditModalOpen(true)

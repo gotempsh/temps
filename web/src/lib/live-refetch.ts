@@ -34,7 +34,7 @@ export const UNBOUNDED_LIST_IDLE_POLL_MS = 30_000
 
 /**
  * Past this many rows an unbounded listing stops idle polling altogether: it
- * still refreshes on focus, on mutation, and fast while something is running,
+ * still refreshes on focus, on mutation, and when a followed backup settles,
  * but a heavy history is not re-read every {@link UNBOUNDED_LIST_IDLE_POLL_MS}.
  */
 export const UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS = 200
@@ -53,22 +53,40 @@ export function liveListInterval(hasInProgressRows: boolean): number {
 
 const IN_PROGRESS_BACKUP_STATES = new Set(['pending', 'running'])
 
+/** Whether a backup row is still being worked on. */
+export function isBackupInProgress(backup: { state: string }): boolean {
+  return IN_PROGRESS_BACKUP_STATES.has(backup.state)
+}
+
 /**
- * Poll interval for a source's Recent Backups list.
+ * Ids of the backups in a source's listing that are still running.
+ *
+ * The listing endpoint returns the whole retained history, so re-reading it on
+ * a fast cadence would cost O(total rows) per poll. Instead the running ones are
+ * followed individually (O(running)) and the listing is refetched once when one
+ * of them settles. S3-scan entries have no DB row (empty id) and are skipped.
+ */
+export function inProgressBackupIds(
+  backups: readonly { backup_id: string; state: string }[] | undefined
+): string[] {
+  return (backups ?? [])
+    .filter((backup) => backup.backup_id && isBackupInProgress(backup))
+    .map((backup) => backup.backup_id)
+}
+
+/**
+ * Poll interval for a source's Recent Backups list itself.
  *
  * A backup started by a schedule, the CLI or another operator has to appear
- * without a reload, and a running one has to reach its final state. The
- * listing is not paged server-side, so the idle cadence is the slower
- * {@link UNBOUNDED_LIST_IDLE_POLL_MS}; polling stays fast only while something
- * is actually running.
+ * without a reload. The listing is not paged server-side, so the cadence is the
+ * slow {@link UNBOUNDED_LIST_IDLE_POLL_MS}, and it stops past
+ * {@link UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS} rows (it still refreshes on focus
+ * and when a followed backup settles). Following a running backup is done per
+ * record, never by speeding this up.
  */
 export function sourceBackupsRefetchInterval(
-  backups: readonly { state: string }[] | undefined
+  backups: readonly unknown[] | undefined
 ): number | false {
-  const inProgress =
-    backups?.some((backup) => IN_PROGRESS_BACKUP_STATES.has(backup.state)) ??
-    false
-  if (inProgress) return ACTIVE_LIST_POLL_MS
   if ((backups?.length ?? 0) > UNBOUNDED_LIST_MAX_IDLE_POLLED_ROWS) return false
   return UNBOUNDED_LIST_IDLE_POLL_MS
 }

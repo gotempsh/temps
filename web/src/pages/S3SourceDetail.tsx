@@ -7,6 +7,7 @@ import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
   enableBackupScheduleMutation,
+  getBackupOptions,
   getS3SourceOptions,
   listBackupSchedulesOptions,
   listSourceBackupsOptions,
@@ -67,7 +68,12 @@ import {
   useUrlState,
   type DetailFact,
 } from '@temps-sdk/ds'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
@@ -93,6 +99,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
+  ACTIVE_LIST_POLL_MS,
+  inProgressBackupIds,
+  isBackupInProgress,
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
 } from '@/lib/live-refetch'
@@ -158,10 +167,30 @@ export function S3SourceDetail() {
     enabled: !!sourceId,
     refetchOnWindowFocus: refetchOnFocusWhenStale,
     // A backup started by a schedule, the CLI or another operator must show
-    // up in Recent Backups, and a running one must reach its final state.
+    // up in Recent Backups. The listing returns the whole history, so it is
+    // only polled slowly; running backups are followed per record below.
     refetchInterval: (query) =>
       sourceBackupsRefetchInterval(query.state.data?.backups),
   })
+
+  // Follow each running backup on its own record (O(running)) instead of
+  // re-reading the whole listing every few seconds, and refetch the listing
+  // once when one of them settles so its row shows the final state.
+  const runningBackupIds = useMemo(
+    () => inProgressBackupIds(backupIndex?.backups),
+    [backupIndex]
+  )
+  const runningBackupQueries = useQueries({
+    queries: runningBackupIds.map((backupId) => ({
+      ...getBackupOptions({ path: { id: backupId } }),
+      refetchInterval: ACTIVE_LIST_POLL_MS,
+    })),
+  })
+  const settledRunningBackups = runningBackupQueries
+    .map((result) => result.data)
+    .filter((backup) => backup && !isBackupInProgress(backup))
+    .map((backup) => backup!.backup_id)
+    .join(',')
 
   const {
     data: schedules = [],
@@ -215,6 +244,13 @@ export function S3SourceDetail() {
   })
 
   const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (!settledRunningBackups || !sourceId) return
+    void queryClient.invalidateQueries({
+      queryKey: listSourceBackupsOptions({ path: { id: sourceId } }).queryKey,
+    })
+  }, [settledRunningBackups, sourceId, queryClient])
 
   // "Discover orphan backups" — explicit opt-in S3 scan. Slow on some
   // endpoints (5-30 s on OVH); only triggered by user action.
