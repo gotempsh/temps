@@ -77,13 +77,16 @@ export function PublicCallbackUrl({
 
   return (
     <div className={cn('flex min-w-0 items-center gap-2', className)}>
+      {/* codeClassName lands on the element that owns the background and
+          padding, so callers can still replace them (`bg-transparent p-0`). */}
       <ScrollRegion
-        className="min-w-0 flex-1 rounded bg-muted px-2 py-1"
+        className={cn(
+          'min-w-0 flex-1 rounded bg-muted px-2 py-1 text-xs',
+          codeClassName
+        )}
         regionLabel={`${prefix ? `${prefix} ` : ''}callback URL, scrollable`}
       >
-        <code
-          className={cn('block w-max whitespace-nowrap text-xs', codeClassName)}
-        >
+        <code className="block w-max whitespace-nowrap">
           {prefix ? `${prefix} ` : ''}
           {url}
         </code>

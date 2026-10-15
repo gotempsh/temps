@@ -251,7 +251,13 @@ describe('label-title-only', () => {
     for (const tag of tags(src, 'Input|input|Textarea|textarea')) {
       if (!/\btitle=/.test(tag.text)) continue
       if (/\baria-label=|\baria-labelledby=|\{\.\.\./.test(tag.text)) continue
-      if (/\bid=/.test(tag.text)) continue
+      // An id only names the field when a <Label htmlFor> points at it.
+      const id = /\bid=(?:"([^"]+)"|\{([^}]+)\})/.exec(tag.text)
+      if (id) {
+        const value = (id[1] ?? id[2]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const label = new RegExp(`htmlFor=(?:"${value}"|\\{${value}\\})`)
+        if (label.test(src)) continue
+      }
       if (/\btype="(hidden|checkbox|radio|submit|button)"/.test(tag.text)) {
         continue
       }
@@ -271,6 +277,27 @@ describe('label-title-only', () => {
         '<Input value={v} aria-label="Working directory" title="Working directory" />'
       )
     ).toHaveLength(0)
+  })
+
+  test('an id without a matching htmlFor does not name the field', () => {
+    expect(
+      titleOnly('<Input id="cwd" title="Working directory" />')
+    ).toHaveLength(1)
+    expect(
+      titleOnly(
+        '<Label htmlFor="cwd">Directory</Label><Input id="cwd" title="Working directory" />'
+      )
+    ).toHaveLength(0)
+    expect(
+      titleOnly(
+        '<Label htmlFor={fieldId}>Directory</Label><Input id={fieldId} title="Working directory" />'
+      )
+    ).toHaveLength(0)
+    expect(
+      titleOnly(
+        '<Label htmlFor="other">Other</Label><Input id="cwd" title="Working directory" />'
+      )
+    ).toHaveLength(1)
   })
 
   test('no text field relies on title alone for its name', () => {
