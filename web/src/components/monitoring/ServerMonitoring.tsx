@@ -58,6 +58,7 @@ import {
   formatBytesPerSecond,
   diskProjectionCaption,
   formatPercent,
+  currentDiskPercent,
   formatRateTick,
   hasNoNodeSamples,
   isMetricsUnavailable,
@@ -553,8 +554,11 @@ export function ServerMonitoring() {
   const diskUsed = g('node.disk_used_bytes')
   const cpuNow = g('node.cpu_percent') ?? lastValue(cpu.data)
   const memPct = g('node.memory_percent') ?? lastValue(memory.data)
-  const diskPct =
-    g('node.disk_percent') ?? usagePercent(lastValue(disk.data), diskTotal)
+  const diskPct = currentDiskPercent(
+    g('node.disk_percent'),
+    lastValue(disk.data),
+    diskTotal
+  )
 
   const cpuPeak = peakOf(cpu.data)
   const memPeak = peakOf(memory.data)

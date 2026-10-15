@@ -328,6 +328,24 @@ export function isMetricsUnavailable(err: unknown): boolean {
 }
 
 /**
+ * The current disk share: the snapshot's figure when present, otherwise the
+ * latest used-bytes sample over the total. `null` when neither exists, so a
+ * missing reading stays distinguishable from a genuine 0 % (`usagePercent`
+ * clamps a missing pair to 0 for the progress bar, which is not a reading).
+ */
+export function currentDiskPercent(
+  snapshotPercent: number | null,
+  lastUsedBytes: number | null,
+  totalBytes: number | null
+): number | null {
+  if (snapshotPercent != null) return snapshotPercent
+  if (lastUsedBytes == null || totalBytes == null || !(totalBytes > 0)) {
+    return null
+  }
+  return usagePercent(lastUsedBytes, totalBytes)
+}
+
+/**
  * Whether the metrics store answered but has not received a single node
  * sample yet: every usage series is empty and the latest snapshot carries no
  * figure. This is the first minutes after metric collection is switched on,

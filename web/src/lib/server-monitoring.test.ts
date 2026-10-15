@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   CPU_THRESHOLDS,
+  currentDiskPercent,
   formatBytesBinary,
   formatBytesDecimal,
   formatBytesPerSecond,
@@ -265,5 +266,30 @@ describe('hasNoNodeSamples', () => {
 
   test('no series at all is not evidence of an empty store', () => {
     expect(hasNoNodeSamples({ series: [], current: [] })).toBe(false)
+  })
+})
+
+describe('currentDiskPercent', () => {
+  test('a missing reading stays null instead of becoming 0 %', () => {
+    expect(currentDiskPercent(null, null, null)).toBeNull()
+    expect(currentDiskPercent(null, null, 1000)).toBeNull()
+    expect(currentDiskPercent(null, 500, null)).toBeNull()
+    expect(currentDiskPercent(null, 500, 0)).toBeNull()
+  })
+
+  test('prefers the snapshot figure, then derives from the latest sample', () => {
+    expect(currentDiskPercent(42, 500, 1000)).toBe(42)
+    expect(currentDiskPercent(null, 250, 1000)).toBe(25)
+    expect(currentDiskPercent(null, 0, 1000)).toBe(0)
+  })
+
+  test('an empty store, as ServerMonitoring derives it, counts as no samples', () => {
+    const diskPct = currentDiskPercent(null, null, null)
+    expect(
+      hasNoNodeSamples({
+        series: [[], [], [], [], []],
+        current: [null, null, diskPct],
+      })
+    ).toBe(true)
   })
 })
