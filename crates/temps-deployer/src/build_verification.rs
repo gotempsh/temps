@@ -19,7 +19,10 @@
 //!   ([`VerifiedBuild::image_reference`]).
 //! - The reported digest, platforms and run handle are compared with what was
 //!   dispatched and with a digest the control plane observed on its own
-//!   ([`verify_runner_report`]).
+//!   ([`verify_runner_report`]). What was observed is typed
+//!   ([`ObservedImage`]): a registry manifest digest is deployed as
+//!   `<repository>@<digest>`, while the id a daemon assigns to a tar-imported
+//!   image is not a manifest digest and is deployed by that id.
 //! - An integrity or identity failure is never eligible for fallback to a
 //!   local build, whatever the policy says ([`RemoteBuildFailure::disposition`]):
 //!   a failed check has to fail the deployment, not quietly build something
@@ -121,12 +124,38 @@ pub struct RunnerReport {
     pub platforms: Vec<String>,
 }
 
+/// What the control plane saw for itself, and so what kind of identifier the
+/// digest is. The kinds are not interchangeable: a daemon assigns an image id
+/// (the digest of the image config) to a tar-imported image, which has no
+/// manifest digest until it is pushed somewhere, so `<repository>@<image id>`
+/// would not resolve against anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservedImage {
+    /// A manifest digest the control plane resolved from a registry.
+    RegistryDigest(ImageDigest),
+    /// The image id the local daemon assigned when the control plane imported
+    /// the runner's tar.
+    ImportedImageId(ImageDigest),
+}
+
+impl ObservedImage {
+    pub fn digest(&self) -> &ImageDigest {
+        match self {
+            Self::RegistryDigest(digest) | Self::ImportedImageId(digest) => digest,
+        }
+    }
+}
+
 /// A report that passed every check, with the reference built server-side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBuild {
     pub digest: ImageDigest,
-    /// `<repository>@<digest>`, never taken from the runner.
+    /// How the image is addressed, never taken from the runner:
+    /// `<repository>@<digest>` for a registry digest, the image id itself for
+    /// a tar import.
     pub image_reference: String,
+    /// The kind of identifier `digest` is.
+    pub artifact: ObservedImage,
     /// Canonical platforms, equal to what was dispatched.
     pub platforms: BTreeSet<String>,
 }
@@ -186,16 +215,24 @@ pub enum BuildVerificationError {
     },
 
     #[error(
-        "Runner reported {count} platform(s) for build '{build_id}' of deployment \
-         {deployment_id} (longest {longest} bytes); at most {max_count} platforms of \
-         {max_len} bytes are accepted"
+        "Runner reported {count} platforms for build '{build_id}' of deployment \
+         {deployment_id}; at most {max_count} are accepted"
     )]
-    PlatformReportTooLarge {
+    TooManyPlatforms {
         deployment_id: i32,
         build_id: String,
         count: usize,
-        longest: usize,
         max_count: usize,
+    },
+
+    #[error(
+        "Runner reported a {longest}-byte platform for build '{build_id}' of deployment \
+         {deployment_id}; at most {max_len} bytes are accepted"
+    )]
+    PlatformTooLong {
+        deployment_id: i32,
+        build_id: String,
+        longest: usize,
         max_len: usize,
     },
 
@@ -220,7 +257,7 @@ pub enum BuildVerificationError {
 pub fn verify_runner_report(
     dispatched: &DispatchedBuild,
     report: &RunnerReport,
-    observed: &ImageDigest,
+    observed: &ObservedImage,
 ) -> Result<VerifiedBuild, BuildVerificationError> {
     let deployment_id = dispatched.deployment_id;
     validate_repository(deployment_id, &dispatched.image_repository)?;
@@ -254,25 +291,32 @@ pub fn verify_runner_report(
     }
 
     let reported_digest = ImageDigest::parse(&report.digest)?;
-    if &reported_digest != observed {
+    if &reported_digest != observed.digest() {
         return Err(BuildVerificationError::DigestMismatch {
             deployment_id,
             build_id: dispatched.build_id.clone(),
             reported: reported_digest,
-            observed: observed.clone(),
+            observed: observed.digest().clone(),
         });
     }
 
     // Bound the runner-controlled list before doing any work proportional to
-    // it, and so that the mismatch diagnostic below is bounded too.
-    let longest = report.platforms.iter().map(String::len).max().unwrap_or(0);
-    if report.platforms.len() > MAX_REPORTED_PLATFORMS || longest > MAX_REPORTED_PLATFORM_LEN {
-        return Err(BuildVerificationError::PlatformReportTooLarge {
+    // it, and so that the mismatch diagnostic below is bounded too. The
+    // count goes first: the length scan only ever sees an accepted count.
+    if report.platforms.len() > MAX_REPORTED_PLATFORMS {
+        return Err(BuildVerificationError::TooManyPlatforms {
             deployment_id,
             build_id: dispatched.build_id.clone(),
             count: report.platforms.len(),
-            longest,
             max_count: MAX_REPORTED_PLATFORMS,
+        });
+    }
+    let longest = report.platforms.iter().map(String::len).max().unwrap_or(0);
+    if longest > MAX_REPORTED_PLATFORM_LEN {
+        return Err(BuildVerificationError::PlatformTooLong {
+            deployment_id,
+            build_id: dispatched.build_id.clone(),
+            longest,
             max_len: MAX_REPORTED_PLATFORM_LEN,
         });
     }
@@ -302,9 +346,17 @@ pub fn verify_runner_report(
         });
     }
 
+    let image_reference = match observed {
+        ObservedImage::RegistryDigest(_) => {
+            format!("{}@{}", dispatched.image_repository, reported_digest)
+        }
+        // Docker resolves a full image id as a reference.
+        ObservedImage::ImportedImageId(_) => reported_digest.to_string(),
+    };
     Ok(VerifiedBuild {
-        image_reference: format!("{}@{}", dispatched.image_repository, reported_digest),
+        image_reference,
         digest: reported_digest,
+        artifact: observed.clone(),
         platforms: expected_platforms,
     })
 }
@@ -543,8 +595,16 @@ mod tests {
         }
     }
 
-    fn observed() -> ImageDigest {
-        ImageDigest::parse(DIGEST_A).expect("fixture digest is canonical")
+    fn observed() -> ObservedImage {
+        ObservedImage::RegistryDigest(
+            ImageDigest::parse(DIGEST_A).expect("fixture digest is canonical"),
+        )
+    }
+
+    fn imported() -> ObservedImage {
+        ObservedImage::ImportedImageId(
+            ImageDigest::parse(DIGEST_A).expect("fixture digest is canonical"),
+        )
     }
 
     #[test]
@@ -561,6 +621,35 @@ mod tests {
             verified.platforms,
             BTreeSet::from(["linux/amd64".to_string()])
         );
+        assert_eq!(verified.artifact, observed());
+    }
+
+    #[test]
+    fn a_tar_import_is_referenced_by_image_id_never_as_repository_at_id() {
+        let verified = verify_runner_report(&dispatched(), &report(), &imported())
+            .expect("a matching tar import is accepted");
+
+        assert_eq!(verified.image_reference, DIGEST_A);
+        assert!(
+            !verified.image_reference.contains('@'),
+            "an image id is not a manifest digest: {}",
+            verified.image_reference
+        );
+        assert_eq!(verified.artifact, imported());
+    }
+
+    #[test]
+    fn an_imported_image_id_is_still_checked_against_the_report() {
+        let mut reported = report();
+        reported.digest = DIGEST_B.into();
+
+        let error = verify_runner_report(&dispatched(), &reported, &imported())
+            .expect_err("a different id is refused");
+
+        assert!(matches!(
+            error,
+            BuildVerificationError::DigestMismatch { .. }
+        ));
     }
 
     #[test]
@@ -859,7 +948,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            BuildVerificationError::PlatformReportTooLarge { count: 10_000, .. }
+            BuildVerificationError::TooManyPlatforms { count: 10_000, .. }
         ));
         assert!(error.to_string().len() < 300, "{error}");
     }
@@ -874,7 +963,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            BuildVerificationError::PlatformReportTooLarge {
+            BuildVerificationError::PlatformTooLong {
                 longest: 1_000_000,
                 ..
             }

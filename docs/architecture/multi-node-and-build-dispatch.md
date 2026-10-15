@@ -179,12 +179,16 @@ dispatched (control plane records, before handing off)
     build_id, deployment_id, run_id (provider handle), platforms, image_repository
 runner reports
     build_id, run_id, digest, platforms
-control plane observes, independently
-    digest (registry resolve, or the id the daemon assigns on import)
+control plane observes, independently, and says what kind of identifier it is
+    RegistryDigest    a manifest digest resolved from a registry
+    ImportedImageId   the id the local daemon assigned on tar import
 ```
 
-The reference that is deployed is `<image_repository>@<digest>`, built server-side from a
-repository the control plane chose before dispatch. Verification
+The two are not interchangeable. A tar-imported image has an image id (the digest of its
+config) and no manifest digest, so `<repository>@<image id>` resolves against nothing. The
+reference is therefore built server-side from the kind that was observed:
+`<image_repository>@<digest>` for a registry digest, from a repository the control plane
+chose before dispatch, and the image id itself for a tar import. Verification
 (`build_verification::verify_runner_report`) refuses, with an error that names the
 deployment and build:
 
@@ -193,8 +197,9 @@ deployment and build:
 - a digest that is not `sha256:` plus 64 lowercase hex;
 - a reported digest that is not the digest the control plane observed;
 - a platform set that is not exactly the requested set, in either direction, and a
-  platform list longer than 16 entries or with an entry over 64 bytes (rejected before
-  any work proportional to it, so the diagnostic is bounded too);
+  platform list longer than 16 entries or with an entry over 64 bytes (the count is
+  checked first and rejected before any work proportional to the list, so the diagnostic
+  is bounded too);
 - a dispatch record whose repository carries a tag or digest, or whose registry host or
   any path component does not follow the distribution grammar (so `team:tag/app`, `..`
   and `-app` are refused rather than yielding an undeployable reference).
