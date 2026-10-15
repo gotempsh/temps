@@ -1531,46 +1531,94 @@ pub struct DockerSandboxProvider {
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
     network_lock: tokio::sync::Mutex<()>,
-    /// Sandboxes whose `create` is running, with a count per name. Their
-    /// isolated network may be reused from an earlier incarnation and so be
-    /// arbitrarily old, yet their container does not exist until the very
-    /// end of `create`; the orphan reaper must not mistake that gap for an
-    /// abandoned network.
-    creates_in_flight: std::sync::Mutex<HashMap<String, usize>>,
+    /// Which sandboxes are being created and which are being reaped, so the
+    /// two can never overlap. A creating sandbox's isolated network may be
+    /// reused from an earlier incarnation and so be arbitrarily old, yet its
+    /// container does not exist until the very end of `create`; the orphan
+    /// reaper must not mistake that gap for an abandoned network, and a
+    /// `create` must not start reusing a network the reaper is tearing down.
+    creates_in_flight: std::sync::Mutex<SandboxLifecycle>,
+}
+
+/// Per-sandbox-name bookkeeping behind
+/// [`DockerSandboxProvider::creates_in_flight`]. One lock covers both sets so
+/// "no create is running, so claim it for reaping" is a single atomic step.
+#[derive(Default)]
+struct SandboxLifecycle {
+    /// Running creates, with a count per name (overlapping creates of one
+    /// sandbox are possible).
+    creating: HashMap<String, usize>,
+    /// Names whose leftovers the reaper is currently removing.
+    reaping: std::collections::HashSet<String>,
+}
+
+type LifecycleRegistry = std::sync::Mutex<SandboxLifecycle>;
+
+fn lock_lifecycle(registry: &LifecycleRegistry) -> std::sync::MutexGuard<'_, SandboxLifecycle> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Marks a sandbox as being created for as long as it lives. See
 /// [`DockerSandboxProvider::creates_in_flight`].
 struct CreateInFlight<'a> {
-    registry: &'a std::sync::Mutex<HashMap<String, usize>>,
+    registry: &'a LifecycleRegistry,
     name: String,
 }
 
 impl<'a> CreateInFlight<'a> {
-    fn new(registry: &'a std::sync::Mutex<HashMap<String, usize>>, name: &str) -> Self {
-        let mut names = registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *names.entry(name.to_string()).or_insert(0) += 1;
-        Self {
+    /// Register a create, or `None` while the reaper holds this name.
+    fn try_new(registry: &'a LifecycleRegistry, name: &str) -> Option<Self> {
+        let mut state = lock_lifecycle(registry);
+        if state.reaping.contains(name) {
+            return None;
+        }
+        *state.creating.entry(name.to_string()).or_insert(0) += 1;
+        Some(Self {
             registry,
             name: name.to_string(),
-        }
+        })
     }
 }
 
 impl Drop for CreateInFlight<'_> {
     fn drop(&mut self) {
-        let mut names = self
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = names.get_mut(&self.name) {
+        let mut state = lock_lifecycle(self.registry);
+        if let Some(count) = state.creating.get_mut(&self.name) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                names.remove(&self.name);
+                state.creating.remove(&self.name);
             }
         }
+    }
+}
+
+/// Held by the reaper while it removes a sandbox's leftovers; creates of the
+/// same name wait until it drops.
+struct ReapClaim<'a> {
+    registry: &'a LifecycleRegistry,
+    name: String,
+}
+
+impl<'a> ReapClaim<'a> {
+    /// Claim a name for reaping, or `None` if a create (or another reap) of
+    /// it is running.
+    fn try_new(registry: &'a LifecycleRegistry, name: &str) -> Option<Self> {
+        let mut state = lock_lifecycle(registry);
+        if state.creating.contains_key(name) || !state.reaping.insert(name.to_string()) {
+            return None;
+        }
+        Some(Self {
+            registry,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for ReapClaim<'_> {
+    fn drop(&mut self) {
+        lock_lifecycle(self.registry).reaping.remove(&self.name);
     }
 }
 
@@ -1708,16 +1756,8 @@ impl DockerSandboxProvider {
             docker,
             config,
             network_lock: tokio::sync::Mutex::new(()),
-            creates_in_flight: std::sync::Mutex::new(HashMap::new()),
+            creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),
         }
-    }
-
-    /// Whether a `create` for this sandbox is running right now.
-    fn create_in_flight(&self, container_name: &str) -> bool {
-        self.creates_in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(container_name)
     }
 
     /// Run a command as root inside a freshly-started sandbox container,
@@ -2725,9 +2765,12 @@ impl DockerSandboxProvider {
             let Some(owner) = orphan_candidate_owner(network, now_unix, min_age) else {
                 continue;
             };
-            if self.create_in_flight(owner) {
+            // Claim the owner before looking at its container: from here a
+            // create of the same name waits for this reap, so it cannot
+            // start reusing the network between the check and the removal.
+            let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, owner) else {
                 continue;
-            }
+            };
             match self
                 .docker
                 .inspect_container(
@@ -2745,11 +2788,6 @@ impl DockerSandboxProvider {
                     );
                     continue;
                 }
-            }
-            // A create may have started (and reused this old network) while
-            // the owner was being inspected.
-            if self.create_in_flight(owner) {
-                continue;
             }
             if self.remove_isolated_sandbox_network(owner).await.is_empty() {
                 tracing::info!(
@@ -3873,7 +3911,13 @@ impl SandboxProvider for DockerSandboxProvider {
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
         // Held until the container exists: from here on this sandbox's
         // network may be in use although no container carries its name.
-        let _create_in_flight = CreateInFlight::new(&self.creates_in_flight, &container_name);
+        // A create never overlaps a reap of the same name: wait it out.
+        let _create_in_flight = loop {
+            if let Some(guard) = CreateInFlight::try_new(&self.creates_in_flight, &container_name) {
+                break guard;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         // Resolve the request override exactly once. Provisioning, proxy
         // environment, and HostConfig must all use this same effective value;
         // otherwise `none -> full` references a bridge that was never created
@@ -10290,12 +10334,12 @@ function response() {{
 
     #[test]
     fn a_create_stays_in_flight_until_the_last_guard_for_its_name_drops() {
-        let registry = std::sync::Mutex::new(HashMap::new());
-        let in_flight = |name: &str| registry.lock().unwrap().contains_key(name);
+        let registry = LifecycleRegistry::default();
+        let in_flight = |name: &str| lock_lifecycle(&registry).creating.contains_key(name);
 
-        let first = CreateInFlight::new(&registry, "temps-sandbox-a");
-        let second = CreateInFlight::new(&registry, "temps-sandbox-a");
-        let other = CreateInFlight::new(&registry, "temps-sandbox-b");
+        let first = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        let second = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        let other = CreateInFlight::try_new(&registry, "temps-sandbox-b").unwrap();
         assert!(in_flight("temps-sandbox-a") && in_flight("temps-sandbox-b"));
 
         // Two overlapping creates of one sandbox: the first to finish must
@@ -10306,7 +10350,28 @@ function response() {{
         assert!(!in_flight("temps-sandbox-a"));
         assert!(in_flight("temps-sandbox-b"));
         drop(other);
-        assert!(registry.lock().unwrap().is_empty());
+        assert!(lock_lifecycle(&registry).creating.is_empty());
+    }
+
+    #[test]
+    fn a_reap_and_a_create_of_the_same_sandbox_exclude_each_other() {
+        let registry = LifecycleRegistry::default();
+
+        // A running create blocks the reaper from claiming the name.
+        let create = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-a").is_none());
+        // Other sandboxes are unaffected.
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-b").is_some());
+        drop(create);
+
+        // A held reap claim blocks a create (and a second reap) of the name,
+        // until it is released.
+        let claim = ReapClaim::try_new(&registry, "temps-sandbox-a").unwrap();
+        assert!(CreateInFlight::try_new(&registry, "temps-sandbox-a").is_none());
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-a").is_none());
+        drop(claim);
+        assert!(CreateInFlight::try_new(&registry, "temps-sandbox-a").is_some());
+        assert!(lock_lifecycle(&registry).reaping.is_empty());
     }
 
     #[tokio::test]

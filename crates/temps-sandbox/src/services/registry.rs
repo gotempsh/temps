@@ -1251,6 +1251,34 @@ mod tests {
         assert!(provider.released.lock().expect("released").is_empty());
     }
 
+    /// A cached handle whose container was removed behind the registry's
+    /// back still goes through `provider.destroy`, which owns removing the
+    /// sandbox's network and proxy (the worker does so even when the
+    /// container is already absent). The registry must drop its entry and
+    /// not double-release through the orphan path.
+    #[tokio::test]
+    async fn destroy_with_a_stale_cached_handle_goes_through_the_provider() {
+        let provider = Arc::new(FakeProvider::new()); // The container is not known.
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+        reg.handles.write().await.insert(
+            42,
+            SandboxHandle {
+                node_id: None,
+                sandbox_id: "stale-docker-id".to_string(),
+                sandbox_name: "temps-sandbox-abc123".to_string(),
+                work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
+            },
+        );
+
+        reg.destroy(42, "sbx_abc123").await.expect("destroy");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 1);
+        assert!(provider.released.lock().expect("released").is_empty());
+        assert!(!reg.handles.read().await.contains_key(&42));
+    }
+
     /// Warm-path check: when the handle IS in the map, lifecycle ops use
     /// it directly without touching `recover_by_name`. The fake
     /// provider's `known` map is empty here — if the registry fell back

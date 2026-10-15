@@ -1378,12 +1378,25 @@ pub async fn destroy_sandbox(
     let host = host(&state)?;
     let label = label_of(&req.handle).map(str::to_string);
     // Already gone is fine: destroy is idempotent, and the work dir below is
-    // still cleaned up.
-    if let Some(handle) = resolve_handle(host, req.handle).await? {
-        host.provider
-            .destroy(&handle, req.purge_volumes)
-            .await
-            .map_err(provider_err)?;
+    // still cleaned up. With no container there is nothing for the provider's
+    // destroy to act on, but the sandbox's network and egress proxy may have
+    // outlived it (a crashed create, a reaper that removed only the
+    // container), so those are released here instead of leaking.
+    match resolve_handle(host, req.handle).await? {
+        Some(handle) => {
+            host.provider
+                .destroy(&handle, req.purge_volumes)
+                .await
+                .map_err(provider_err)?;
+        }
+        None => {
+            if let Some(label) = label.as_deref().filter(|l| is_valid_sandbox_label(l)) {
+                host.provider
+                    .release_orphaned_resources(label)
+                    .await
+                    .map_err(provider_err)?;
+            }
+        }
     }
     if let Some(label) = label.as_deref() {
         remove_work_dir(&work_dir_for(&state, label)).await;
@@ -2188,8 +2201,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!dir.exists());
-        // The container was already gone, so the provider was never asked.
+        // The container was already gone, so the provider was never asked to
+        // destroy it, but its network and proxy leftovers were released.
         assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+        assert!(n.provider.destroyed.lock().unwrap().is_empty());
+        assert_eq!(*n.provider.released.lock().unwrap(), vec!["gone"]);
     }
 
     #[tokio::test]
