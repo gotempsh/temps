@@ -668,18 +668,25 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// The sandbox a network belongs to, when the network is a candidate for
 /// being reaped as orphaned: it carries the ownership label, its name is the
 /// one this provider derives for that owner (so a user's own network that
-/// happens to copy the label is left alone), and it is at least `min_age`
-/// old. Whether the owner's container still exists is checked by the caller.
-fn orphan_candidate_owner(
-    network: &bollard::models::Network,
+/// happens to copy the label is left alone), it is not labelled for another
+/// preview gateway (another Temps instance sharing this Docker daemon may be
+/// recreating that sandbox, which this instance's bookkeeping cannot see),
+/// and it is at least `min_age` old. Whether the owner's container still
+/// exists is checked by the caller.
+fn orphan_candidate_owner<'a>(
+    network: &'a bollard::models::Network,
+    gateway: &str,
     now_unix: i64,
     min_age: std::time::Duration,
-) -> Option<&str> {
-    let owner = network
-        .labels
-        .as_ref()?
-        .get(SANDBOX_NETWORK_OWNER_LABEL)?
-        .as_str();
+) -> Option<&'a str> {
+    let labels = network.labels.as_ref()?;
+    if labels
+        .get(SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .is_some_and(|labelled| labelled != gateway)
+    {
+        return None;
+    }
+    let owner = labels.get(SANDBOX_NETWORK_OWNER_LABEL)?.as_str();
     if owner.is_empty() || network.name.as_deref() != Some(sandbox_network_name(owner).as_str()) {
         return None;
     }
@@ -2502,8 +2509,14 @@ impl DockerSandboxProvider {
         // Networks of sandboxes removed while Temps was down (or whose
         // teardown failed) would otherwise keep their subnets until Docker
         // runs out of address pools.
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
         let reaped = self
-            .reap_orphaned_sandbox_networks(ORPHANED_NETWORK_MIN_AGE)
+            .reap_orphaned_sandbox_networks(&gateway, ORPHANED_NETWORK_MIN_AGE)
             .await;
         if reaped > 0 {
             tracing::info!(
@@ -2544,7 +2557,7 @@ impl DockerSandboxProvider {
                     .err()
                     .is_some_and(|source| is_network_pool_exhausted(&source.to_string()))
                     && self
-                        .reap_orphaned_sandbox_networks(ORPHANED_NETWORK_MIN_AGE)
+                        .reap_orphaned_sandbox_networks(gateway, ORPHANED_NETWORK_MIN_AGE)
                         .await
                         > 0
                 {
@@ -2734,9 +2747,15 @@ impl DockerSandboxProvider {
     /// part-way) leaves its network, and the subnet, behind. Only networks
     /// carrying this provider's ownership label whose name matches the owner
     /// are candidates, and a network younger than `min_age` is skipped
-    /// because its container may not have been created yet. Best effort:
+    /// because its container may not have been created yet. Networks
+    /// labelled for a preview gateway other than `gateway` belong to another
+    /// Temps instance on this daemon and are left alone. Best effort:
     /// failures are logged and never block the caller.
-    async fn reap_orphaned_sandbox_networks(&self, min_age: std::time::Duration) -> usize {
+    async fn reap_orphaned_sandbox_networks(
+        &self,
+        gateway: &str,
+        min_age: std::time::Duration,
+    ) -> usize {
         let networks = match self
             .docker
             .list_networks(Some(
@@ -2762,7 +2781,7 @@ impl DockerSandboxProvider {
             });
         let mut reaped = 0;
         for network in &networks {
-            let Some(owner) = orphan_candidate_owner(network, now_unix, min_age) else {
+            let Some(owner) = orphan_candidate_owner(network, gateway, now_unix, min_age) else {
                 continue;
             };
             // Claim the owner before looking at its container: from here a
@@ -5276,6 +5295,67 @@ impl SandboxProvider for DockerSandboxProvider {
 
     async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
         let full_name = format!("{}{}", SANDBOX_NAME_PREFIX, container_name);
+        // Same exclusion the automatic reaper uses: refuse while a create of
+        // this name is running (it may already have reused the network), and
+        // keep creates of this name waiting until the release is done.
+        let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, &full_name) else {
+            return Err(AgentError::SandboxConflictOnNode {
+                sandbox: full_name,
+                node_name: "this node".to_string(),
+                reason: "the sandbox is being created or released right now; its network and egress proxy are in use".to_string(),
+            });
+        };
+        // The container may have been created since the caller looked.
+        match self
+            .docker
+            .inspect_container(
+                &full_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(_) => {
+                return Err(AgentError::SandboxConflictOnNode {
+                    sandbox: full_name,
+                    node_name: "this node".to_string(),
+                    reason: "the sandbox's container exists, so its network is in use; destroy the sandbox instead".to_string(),
+                });
+            }
+            Err(error) if docker_error_is_not_found(&error) => {}
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect sandbox '{full_name}' before releasing its leftover resources: {source}"
+                    ),
+                });
+            }
+        }
+        // A network labelled for another Temps instance's gateway is not
+        // ours to remove even when it carries this sandbox's name.
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        if let Ok(network) = self
+            .docker
+            .inspect_network(
+                &sandbox_network_name(&full_name),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            if let Some(labelled) = network_labelled_for_another_gateway(&network, &gateway) {
+                tracing::warn!(
+                    sandbox = %full_name,
+                    network_gateway = %labelled,
+                    "Leaving the network of a sandbox that belongs to another Temps instance's preview gateway"
+                );
+                return Ok(());
+            }
+        }
         let errors = self.remove_isolated_sandbox_network(&full_name).await;
         if errors.is_empty() {
             return Ok(());
@@ -10271,6 +10351,8 @@ function response() {{
         );
     }
 
+    const TEST_GATEWAY: &str = "temps-preview-gateway-test";
+
     fn labelled_network(
         name: &str,
         owner: Option<&str>,
@@ -10282,7 +10364,13 @@ function response() {{
                 bollard::models::BollardDate::from_unix_timestamp(secs).expect("valid timestamp")
             }),
             labels: owner.map(|owner| {
-                HashMap::from([(SANDBOX_NETWORK_OWNER_LABEL.to_string(), owner.to_string())])
+                HashMap::from([
+                    (SANDBOX_NETWORK_OWNER_LABEL.to_string(), owner.to_string()),
+                    (
+                        SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                        TEST_GATEWAY.to_string(),
+                    ),
+                ])
             }),
             ..Default::default()
         }
@@ -10298,36 +10386,73 @@ function response() {{
 
         // A leftover network of a long-gone sandbox is reapable.
         assert_eq!(
-            orphan_candidate_owner(&labelled_network(&name, Some(owner), old), now, min_age),
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
             Some(owner)
+        );
+        // Labelled for another Temps instance's preview gateway: that
+        // instance may be recreating the sandbox, and this one cannot see it.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), old),
+                "another-instances-gateway",
+                now,
+                min_age
+            ),
+            None
         );
         // Younger than the grace period: its container may be mid-create.
         let fresh = Some(now - 30);
         assert_eq!(
-            orphan_candidate_owner(&labelled_network(&name, Some(owner), fresh), now, min_age),
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), fresh),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
             None
         );
         // No creation time reported: cannot prove it is old, so keep it.
         assert_eq!(
-            orphan_candidate_owner(&labelled_network(&name, Some(owner), None), now, min_age),
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), None),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
             None
         );
         // Not carrying the ownership label: not one of ours.
         assert_eq!(
-            orphan_candidate_owner(&labelled_network(&name, None, old), now, min_age),
+            orphan_candidate_owner(
+                &labelled_network(&name, None, old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
             None
         );
         // Name does not match what this provider derives for that owner.
         assert_eq!(
             orphan_candidate_owner(
                 &labelled_network("someone-elses-network", Some(owner), old),
+                TEST_GATEWAY,
                 now,
                 min_age
             ),
             None
         );
         assert_eq!(
-            orphan_candidate_owner(&labelled_network(&name, Some(""), old), now, min_age),
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(""), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
             None
         );
     }
@@ -10421,6 +10546,28 @@ function response() {{
             )
             .await
             .is_ok());
+
+        // A create of this sandbox is running: it may have reused the
+        // network, so the release must refuse and touch nothing.
+        let busy = {
+            let _create = CreateInFlight::try_new(&provider.creates_in_flight, &container)
+                .expect("no reap is running");
+            provider.release_orphaned_resources(&label).await
+        };
+        assert!(
+            matches!(busy, Err(AgentError::SandboxConflictOnNode { .. })),
+            "release must refuse while a create is in flight: {busy:?}"
+        );
+        assert!(
+            docker
+                .inspect_network(
+                    &network,
+                    None::<bollard::query_parameters::InspectNetworkOptions>
+                )
+                .await
+                .is_ok(),
+            "the network of a sandbox being created must survive a release"
+        );
 
         let released = provider.release_orphaned_resources(&label).await;
         let after = docker

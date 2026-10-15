@@ -57,7 +57,11 @@ use utoipa::ToSchema;
 /// `build_node_unreachable`, and any other extraction or publish error is
 /// `static_deploy_failed`. A Docker archive download is no longer reported as a
 /// dependency download.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 6;
+///
+/// v7: a static bundle entry refused for its path (absolute, escaping the
+/// extraction directory, or a link) is `static_output_rejected` rather than
+/// `static_deploy_failed`.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 7;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
