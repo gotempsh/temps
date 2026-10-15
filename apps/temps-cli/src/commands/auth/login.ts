@@ -6,8 +6,9 @@ import { upsertContext, defaultContextName } from '../../config/contexts.js'
 import { promptPassword } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { info, icons, colors, newline, box } from '../../ui/output.js'
-import { setupClient, client } from '../../lib/api-client.js'
+import { setupClient, client, ApiResponseError } from '../../lib/api-client.js'
 import { getCurrentUser } from '../../api/sdk.gen.js'
+import type { UserResponse } from '../../api/types.gen.js'
 import { AuthenticationError } from '../../utils/errors.js'
 import { hostname, platform } from 'node:os'
 import { spawn } from 'node:child_process'
@@ -105,6 +106,16 @@ async function debugFetch(
  *
  * Returns the `/api`-suffixed base, with no trailing slash.
  */
+/** A decoded `GET /user/me` reply: an object that carries the user's id. */
+export function isUserObject(value: unknown): value is UserResponse {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'id' in value &&
+    typeof value.id === 'number'
+  )
+}
+
 export function serverBaseUrl(rawApiUrl: string): string {
   const trimmed = rawApiUrl.replace(/\/+$/, '')
   return /\/api$/.test(trimmed) ? trimmed : `${trimmed}/api`
@@ -534,15 +545,23 @@ export async function loginWithApiKey(
       async () => {
         const { data, error } = await getCurrentUser({ client })
         if (error) {
-          throw new AuthenticationError('Invalid API key')
+          // A reply that is not a Temps API answer (wrong URL, unreachable
+          // host) is not an invalid key; say what actually went wrong.
+          throw new AuthenticationError(
+            error instanceof ApiResponseError ? error.message : 'Invalid API key'
+          )
+        }
+        // A 2xx without a user object is not a Temps server vouching for the
+        // key, so nothing may be stored for it.
+        if (!isUserObject(data)) {
+          throw new AuthenticationError(
+            `The server at ${baseUrl} answered but did not return a Temps user. Check the URL.`
+          )
         }
         return data
       },
       { successText: 'API key validated' }
     )
-    if (!result) {
-      throw new AuthenticationError('Invalid API key')
-    }
 
     await credentials.setAll({
       apiKey: key,

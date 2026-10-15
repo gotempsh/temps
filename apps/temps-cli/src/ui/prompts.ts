@@ -11,6 +11,7 @@ import {
 } from '@inquirer/prompts'
 import search from '@inquirer/search'
 import { colors, icons } from './output.js'
+import { isTTY } from '../utils/tty.js'
 
 export interface TextPromptOptions {
   message: string
@@ -83,6 +84,14 @@ export async function promptPassword(options: PasswordPromptOptions): Promise<st
 }
 
 export async function promptConfirm(options: ConfirmPromptOptions): Promise<boolean> {
+  // With no terminal the prompt can never be answered: Bun would exit 0 with
+  // nothing done and Node would report a force-closed prompt. Fail loudly so a
+  // pipeline step that forgot `--yes` is not reported as a success.
+  if (!isTTY()) {
+    throw new Error(
+      `Cannot ask "${options.message}" without an interactive terminal. Pass --yes to confirm non-interactively.`
+    )
+  }
   const result = await confirm({
     message: options.message,
     default: options.default ?? false,
