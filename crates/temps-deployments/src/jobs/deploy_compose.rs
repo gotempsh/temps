@@ -108,6 +108,40 @@ fn health_check_path_for_public_route(
 /// come from the project, the repository `.env` or an include's env files, so
 /// none can be ruled out. The route then falls back to `/`, as it does for
 /// any unsafe path.
+/// The service list saved on the project for the settings page, from the
+/// resolved model so it shows what deploys. Readers of the project need not
+/// be allowed to reveal environment values, so nothing substituted reaches
+/// it: images pass through `redact`, and a health path is kept only when it
+/// is written literally (see [`snapshot_health_check_path`]). Detection runs
+/// on the resolved image first, so a masked image is still recognised.
+/// Best-effort: a parse failure yields an empty list rather than failing the
+/// deployment, since this only feeds a UI convenience.
+fn compose_service_snapshots(
+    resolved_content: &str,
+    override_content: Option<&str>,
+    health_path_sources: &[&str],
+    redact: impl Fn(&str) -> String,
+) -> Vec<temps_entities::preset::ComposeServiceSnapshot> {
+    temps_presets::list_compose_services_with_override(resolved_content, override_content)
+        .map(|services| {
+            services
+                .into_iter()
+                .map(|s| temps_entities::preset::ComposeServiceSnapshot {
+                    name: s.name,
+                    image: s.image.as_deref().map(&redact),
+                    looks_like_database: s.looks_like_database,
+                    detected_service_type: s.detected_service_type,
+                    ports: s.ports,
+                    health_check_path: snapshot_health_check_path(
+                        s.health_check_path,
+                        health_path_sources,
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn snapshot_health_check_path(path: Option<String>, sources: &[&str]) -> Option<String> {
     let path = path?;
     (is_safe_health_check_path(&path)
@@ -1024,12 +1058,9 @@ impl DeployComposeJob {
         };
         self.log_compose_resolution(&checked.resolution).await;
 
-        // Full service list from the raw compose file, *before* exclusion
-        // stripping — so excluded services still show up as re-includable
-        // options in the settings-page checklist. Best-effort: a parse
-        // failure degrades to an empty snapshot rather than failing the
-        // deploy, since this only feeds a UI convenience, not the deploy
-        // itself.
+        // Full service list, *before* exclusion stripping — so excluded
+        // services still show up as re-includable options in the
+        // settings-page checklist.
         // The files as written, before substitution (including those pulled
         // in by include/extends): a health path found there literally
         // carries no variable value.
@@ -1043,28 +1074,12 @@ impl DeployComposeJob {
                     .map(String::as_str),
             )
             .collect();
-        let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
-            temps_presets::list_compose_services_with_override(
-                &checked.resolved_content,
-                checked.override_content.as_deref(),
-            )
-            .map(|services| {
-                services
-                    .into_iter()
-                    .map(|s| temps_entities::preset::ComposeServiceSnapshot {
-                        name: s.name,
-                        image: s.image,
-                        looks_like_database: s.looks_like_database,
-                        detected_service_type: s.detected_service_type,
-                        ports: s.ports,
-                        health_check_path: snapshot_health_check_path(
-                            s.health_check_path,
-                            &health_path_sources,
-                        ),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let compose_services = compose_service_snapshots(
+            &checked.resolved_content,
+            checked.override_content.as_deref(),
+            &health_path_sources,
+            |text| checked.resolution.substituted_values.redact(text),
+        );
         // Resolve and validate before Docker or database mutations. Explicit
         // route configuration is authoritative; unsafe auto-detected paths
         // fall back to the secret-free deployment root.
@@ -1094,12 +1109,11 @@ impl DeployComposeJob {
                 temps_entities::preset::ComposeServiceFamily::S3 => ("S3 / RustFS", "s3"),
             };
             if let Some(ref log_id) = self.log_id {
+                // Already masked; see `compose_service_snapshots`.
                 let image_suffix = service
                     .image
                     .as_deref()
-                    .map(|image| {
-                        format!(" ({})", checked.resolution.substituted_values.redact(image))
-                    })
+                    .map(|image| format!(" ({image})"))
                     .unwrap_or_default();
                 let message = format!(
                     "Service '{}'{} looks like a {} container running unmanaged in this \
@@ -2522,6 +2536,34 @@ mod tests {
             ),
             Some("/health".to_string())
         );
+    }
+
+    #[test]
+    fn service_snapshots_mask_substituted_images() {
+        let resolved = "services:\n  web:\n    image: registry.example.com/private-token/web:1\n  db:\n    image: postgres:16-private-tag\n";
+        let redact = |text: &str| {
+            text.replace("private-token", "***")
+                .replace("private-tag", "***")
+        };
+        let services = compose_service_snapshots(resolved, None, &[resolved], redact);
+        let image = |name: &str| {
+            services
+                .iter()
+                .find(|service| service.name == name)
+                .and_then(|service| service.image.clone())
+        };
+        assert_eq!(
+            image("web").as_deref(),
+            Some("registry.example.com/***/web:1")
+        );
+        assert_eq!(image("db").as_deref(), Some("postgres:16-***"));
+        // Detection saw the resolved image.
+        let db = services.iter().find(|service| service.name == "db");
+        assert_eq!(
+            db.and_then(|service| service.detected_service_type),
+            Some(temps_entities::preset::ComposeServiceFamily::Postgres)
+        );
+        assert!(compose_service_snapshots("not: [valid", None, &[], redact).is_empty());
     }
 
     #[test]
