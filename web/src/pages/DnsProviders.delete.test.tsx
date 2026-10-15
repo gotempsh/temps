@@ -11,6 +11,7 @@ import {
   render,
   waitFor,
 } from '@testing-library/react'
+import { Toaster, toast } from 'sonner'
 import type { UserResponse } from '@/api/client/types.gen'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
@@ -19,7 +20,11 @@ import { installBrowserWindow } from '@/test/dom'
 import { DnsProviders } from './DnsProviders'
 
 installBrowserWindow()
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  // Sonner keeps its toasts in a module-level store shared by every test.
+  toast.dismiss()
+})
 
 const PROVIDER = {
   id: 4,
@@ -63,6 +68,7 @@ function renderPage(role: string) {
           <BreadcrumbProvider>
             <DnsProviders />
           </BreadcrumbProvider>
+          <Toaster />
         </AuthContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
@@ -132,6 +138,13 @@ test('a refused delete keeps the confirmation open and the list unrefreshed', as
     expect(view.getByText('Delete DNS provider Example DNS?')).toBeTruthy()
   )
   expect(api.calls.filter((c) => c.method === 'GET').length).toBe(1)
+
+  // The failure is reported with the server's own reason, never as a success.
+  expect(await view.findByText('Failed to delete DNS provider')).toBeTruthy()
+  expect(
+    await view.findByText('Requires dns_providers:write permission')
+  ).toBeTruthy()
+  expect(view.queryByText('DNS provider deleted successfully')).toBeNull()
   api.restore()
 })
 
@@ -160,6 +173,9 @@ test('a delete the server accepts closes the confirmation and refreshes the list
   await waitFor(() =>
     expect(api.calls.filter((c) => c.method === 'GET').length).toBe(2)
   )
+  expect(
+    await view.findByText('DNS provider deleted successfully')
+  ).toBeTruthy()
   api.restore()
 })
 
@@ -185,6 +201,7 @@ test('losing write access while the confirmation is open closes it', async () =>
           <BreadcrumbProvider>
             <DnsProviders />
           </BreadcrumbProvider>
+          <Toaster />
         </AuthContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
