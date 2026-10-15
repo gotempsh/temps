@@ -41,11 +41,17 @@ docker network create ${PFX}-lan >/dev/null
 subnet() { docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$1"; }
 under_cidr=$(subnet ${PFX}-under)
 LAN_CIDR=$(subnet ${PFX}-lan)
-host_in() { # CIDR, host number: a.b.c.N within the network's first /24
-  printf '%s' "${1%/*}" | awk -F. -v n="$2" '{print $1"."$2"."$3"."n}'
+host_in() { # CIDR, offset: the address `offset` above the network address
+  # Plain integer arithmetic on the whole address, so a /25 or a /29 (whose
+  # network address is not .0) stays inside its subnet. Offset 1 is Docker's
+  # gateway, so callers use 2 and up.
+  printf '%s' "${1%/*}" | awk -F. -v off="$2" '{
+    n = (($1 * 256 + $2) * 256 + $3) * 256 + $4 + off
+    printf "%d.%d.%d.%d", int(n / 16777216) % 256, int(n / 65536) % 256, int(n / 256) % 256, n % 256
+  }'
 }
-A_UNDER=$(host_in "$under_cidr" 10); B_UNDER=$(host_in "$under_cidr" 11)
-A_LAN=$(host_in "$LAN_CIDR" 10);     C_LAN=$(host_in "$LAN_CIDR" 20)
+A_UNDER=$(host_in "$under_cidr" 2); B_UNDER=$(host_in "$under_cidr" 3)
+A_LAN=$(host_in "$LAN_CIDR" 2);     C_LAN=$(host_in "$LAN_CIDR" 3)
 
 for n in a b c; do
   docker run -d --name ${PFX}-$n --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
