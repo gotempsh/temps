@@ -771,9 +771,17 @@ impl ProxyLogService {
             _ => proxy_logs::Column::Timestamp,
         };
 
+        // `id` is the unique tiebreaker. Without it, rows that share the sort
+        // value (a status code, a method, a host) come back in an unspecified
+        // order, so LIMIT/OFFSET pages overlap or skip rows and "Next page"
+        // shows the same rows again.
         query = match filters.sort_order.as_deref() {
-            Some("asc") => query.order_by_asc(sort_col),
-            _ => query.order_by_desc(sort_col),
+            Some("asc") => query
+                .order_by_asc(sort_col)
+                .order_by_asc(proxy_logs::Column::Id),
+            _ => query
+                .order_by_desc(sort_col)
+                .order_by_desc(proxy_logs::Column::Id),
         };
 
         (query, has_filters)
@@ -3135,6 +3143,47 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{pg_exec_error, pg_query_error};
     use super::*;
+    use crate::handler::proxy_logs::ProxyLogsQuery;
+    use sea_orm::{DatabaseBackend, QueryTrait};
+
+    fn list_sql(sort_by: Option<&str>, sort_order: Option<&str>) -> String {
+        let filters = ProxyLogsQuery {
+            sort_by: sort_by.map(str::to_string),
+            sort_order: sort_order.map(str::to_string),
+            ..Default::default()
+        };
+        let (query, _) = ProxyLogService::build_list_query(None, None, filters);
+        query.build(DatabaseBackend::Postgres).to_string()
+    }
+
+    #[test]
+    fn list_order_breaks_ties_on_id_so_pages_do_not_overlap() {
+        // Sorting by a low-cardinality column must still be a total order,
+        // otherwise OFFSET pages repeat rows.
+        let sql = list_sql(Some("status_code"), Some("asc"));
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."status_code" ASC, "proxy_logs"."id" ASC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn list_order_tiebreaker_follows_the_requested_direction() {
+        let sql = list_sql(Some("method"), Some("desc"));
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."method" DESC, "proxy_logs"."id" DESC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn default_list_order_is_newest_first_with_id_tiebreaker() {
+        let sql = list_sql(None, None);
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."timestamp" DESC, "proxy_logs"."id" DESC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
 
     #[test]
     fn deadlock_detected_is_a_transient_write_conflict() {
