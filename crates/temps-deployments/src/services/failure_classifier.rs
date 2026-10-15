@@ -661,7 +661,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::StaticOutputRejected => (
             "Static output cannot be published",
-            "The build produced files the platform refuses to publish as a static site: the output is larger than the static size or file-count limits, or it contains symbolic links, special files or sensitive files such as .env. Remove them from the output directory (or exclude them in the build), or point the output directory at the folder that holds only the site.",
+            "The build produced files the platform refuses to publish as a static site: the output is larger than the static size or file-count limits, or it contains symbolic links, special files, sensitive files such as .env, or entries whose paths are absolute or escape the output directory. Remove them from the output directory (or exclude them in the build), or point the output directory at the folder that holds only the site.",
             Some(S::Build),
         ),
         C::BuildNodeUnreachable => (
@@ -1364,6 +1364,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "is not publishable",
                 "unsafe entry",
                 "path traversal",
+                // A bundle entry refused for its path or type: the message
+                // names the entry and what to change.
+                "rejected archive entry",
                 "did not resolve to a confined directory",
             ],
         ) {
@@ -2602,6 +2605,20 @@ mod tests {
             "❌ Failed to deploy static files: Static deployment source contains a symbolic link: /tmp/x/dist/link",
         );
         assert_class(&publish, S::Deploy, C::StaticOutputRejected);
+    }
+
+    #[test]
+    fn bundle_entries_refused_for_their_path_are_rejected_output() {
+        // The exact text `WorkflowError::InvalidArchiveEntry` renders, so a
+        // reworded error cannot silently fall back to `static_deploy_failed`.
+        let entry = temps_core::WorkflowError::InvalidArchiveEntry {
+            path: "../escape.txt".to_string(),
+            reason: "a '..' path component would write outside the extraction directory; use paths relative to the archive root".to_string(),
+        }
+        .to_string();
+        assert!(entry.contains("'../escape.txt'"), "{entry}");
+        let reason = wrapped("deploy_static_bundle", &entry);
+        assert_class(&reason, S::Deploy, C::StaticOutputRejected);
     }
 
     #[test]

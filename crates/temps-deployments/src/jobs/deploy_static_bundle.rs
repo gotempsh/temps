@@ -129,13 +129,15 @@ fn validate_archive_entry_path(path: &Path) -> Result<(), WorkflowError> {
             Component::ParentDir => {
                 return Err(WorkflowError::InvalidArchiveEntry {
                     path: path.display().to_string(),
-                    reason: "contains parent directory reference (..)".into(),
+                    reason: "a '..' path component would write outside the extraction directory; use paths relative to the archive root".into(),
                 });
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(WorkflowError::InvalidArchiveEntry {
                     path: path.display().to_string(),
-                    reason: "absolute path entries not allowed".into(),
+                    reason:
+                        "absolute paths are not allowed; use a path relative to the archive root"
+                            .into(),
                 });
             }
             Component::Normal(_) | Component::CurDir => {} // safe
@@ -159,7 +161,8 @@ fn validate_zip_entry_name(name: &str) -> Result<(), WorkflowError> {
     if has_root || has_windows_drive_prefix {
         return Err(WorkflowError::InvalidArchiveEntry {
             path: name.to_string(),
-            reason: "absolute path entries not allowed".into(),
+            reason: "absolute paths are not allowed; use a path relative to the archive root"
+                .into(),
         });
     }
 
@@ -178,7 +181,7 @@ fn confined_static_source(root: &Path, source_directory: &str) -> Result<PathBuf
     if !canonical_source.starts_with(&canonical_root) || !canonical_source.is_dir() {
         return Err(WorkflowError::InvalidArchiveEntry {
             path: source_directory.to_string(),
-            reason: "detected static project directory escapes the archive root".to_string(),
+            reason: "the detected static project directory resolves outside the archive root; check the output directory setting".to_string(),
         });
     }
     Ok(canonical_source)
@@ -320,7 +323,7 @@ impl DeployStaticBundleJob {
             if !dest_path.starts_with(target_dir) {
                 return Err(WorkflowError::InvalidArchiveEntry {
                     path: path.display().to_string(),
-                    reason: "resolved path escapes extraction directory".into(),
+                    reason: "it resolves outside the extraction directory; use paths relative to the archive root".into(),
                 });
             }
 
@@ -455,7 +458,7 @@ impl DeployStaticBundleJob {
             if !outpath.starts_with(target_dir) {
                 return Err(WorkflowError::InvalidArchiveEntry {
                     path: entry_path.display().to_string(),
-                    reason: "resolved path escapes extraction directory".into(),
+                    reason: "it resolves outside the extraction directory; use paths relative to the archive root".into(),
                 });
             }
 
