@@ -121,7 +121,7 @@
     },
     "packages/plugin-sdk": {
       "name": "@temps-sdk/plugin",
-      "version": "0.0.1",
+      "version": "0.1.0-beta.2",
       "devDependencies": {
         "@types/bun": "latest",
         "@types/node": "^22.0.0",

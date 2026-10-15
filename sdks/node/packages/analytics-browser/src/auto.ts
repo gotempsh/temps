@@ -12,7 +12,7 @@ import { init } from "./index";
  * Usage:
  *   <script
  *     defer
- *     src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.6/dist/temps.min.js">
+ *     src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.7/dist/temps.min.js">
  *   </script>
  */
 
