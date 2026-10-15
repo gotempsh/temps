@@ -804,7 +804,7 @@ function IntegrationRow({
             path={revenueWebhookPath(integration.webhook_path)}
             label="Copy webhook URL"
             className="flex-1"
-            codeClassName="truncate bg-transparent p-0"
+            codeClassName="bg-transparent p-0"
           />
         </div>
       </div>
@@ -1720,7 +1720,7 @@ function SuccessStep({
               path={revenueWebhookPath(integration.webhook_path)}
               label="Copy webhook URL"
               className="flex-1"
-              codeClassName="truncate bg-transparent p-0"
+              codeClassName="bg-transparent p-0"
             />
           </div>
         </div>

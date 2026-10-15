@@ -1421,6 +1421,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           />
           <Button
             size="sm"
+            aria-label="Send context"
             onClick={onSendContext}
             disabled={!contextInput.trim() || isSendingContext}
           >

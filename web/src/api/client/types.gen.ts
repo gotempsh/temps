@@ -1250,6 +1250,24 @@ export type AnalyticsCapability = {
 export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
 
 /**
+ * The public address an app Temps does not deploy should send analytics to.
+ *
+ * Served separately from the platform settings because `GET /settings`
+ * needs `settings:read`, which a project member does not hold, while the
+ * install snippet this value goes into is shown to every role that can read
+ * the project's analytics. Only the one address the snippet embeds is
+ * exposed; no other setting travels with it.
+ */
+export type AnalyticsIngestEndpoint = {
+    /**
+     * The configured external URL, without a trailing slash. `null` when no
+     * external URL is stored (or no settings service is available), in which
+     * case the caller must decide what to show instead; it is never guessed.
+     */
+    external_url?: string | null;
+};
+
+/**
  * An analytics ingest key as returned by the admin API.
  *
  * `public_key` is present in full on every response — see the module docs.
@@ -57301,6 +57319,42 @@ export type RunActivityReportResponses = {
 };
 
 export type RunActivityReportResponse = RunActivityReportResponses[keyof RunActivityReportResponses];
+
+export type GetAnalyticsIngestKeyEndpointData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-endpoint';
+};
+
+export type GetAnalyticsIngestKeyEndpointErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsIngestKeyEndpointResponses = {
+    /**
+     * The configured external URL, or null when none is stored
+     */
+    200: AnalyticsIngestEndpoint;
+};
+
+export type GetAnalyticsIngestKeyEndpointResponse = GetAnalyticsIngestKeyEndpointResponses[keyof GetAnalyticsIngestKeyEndpointResponses];
 
 export type ListAnalyticsIngestKeysData = {
     body?: never;

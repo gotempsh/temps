@@ -16,6 +16,7 @@ import {
   getHourlyVisitsOptions,
   hasAnalyticsEventsOptions,
   listAnalyticsIngestKeysOptions,
+  getAnalyticsIngestKeyEndpointOptions,
   revokeAnalyticsIngestKeyMutation,
   rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -107,7 +108,11 @@ import {
   TabsTrigger,
 } from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useSettings } from '@/hooks/useSettings'
+import {
+  analyticsIngestBaseUrl,
+  INGEST_URL_PLACEHOLDER,
+  type IngestBaseUrlSource,
+} from '@/lib/analytics-ingest-url'
 import { cn } from '@/lib/utils'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
@@ -142,6 +147,7 @@ import {
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import {
+  Link,
   Route,
   Routes,
   useLocation,
@@ -1767,24 +1773,53 @@ function FunnelAnalytics({ project }: ProjectAnalyticsProps) {
 }
 
 /**
- * ADR-040: apps Temps neither serves nor proxies have no `Host` route-table
- * entry to resolve a project from, so ingest needs a project-scoped key
- * instead. `basePath` in the snippets below must be an absolute URL (not the
- * `/api/_temps`-relative default) since the request leaves the app's own
- * origin entirely.
+ * Says what `basePath` in the snippets is when it is not the configured
+ * external URL, so it is never mistaken for the endpoint to use.
  */
-function analyticsIngestBaseUrl(
-  externalUrl: string | null | undefined
-): string {
-  return `${externalUrl || window.location.origin}/api/_temps`
+function renderBaseUrlNote(source: IngestBaseUrlSource, readFailed: boolean) {
+  if (source === 'console_origin') {
+    return (
+      <p className="text-xs text-muted-foreground">
+        No external URL is configured, so <code>basePath</code> uses the address
+        this console is open at. An app hosted elsewhere needs an address it can
+        reach — an administrator can set one in{' '}
+        <Link to="/settings" className="underline">
+          Settings
+        </Link>
+        .
+      </p>
+    )
+  }
+  if (source === 'placeholder' && readFailed) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Could not read this instance&apos;s public URL. Replace{' '}
+        <code>{INGEST_URL_PLACEHOLDER}</code> with the address your apps use to
+        reach Temps.
+      </p>
+    )
+  }
+  return null
 }
 
 function IngestKeySetup({ project }: ProjectAnalyticsProps) {
   const queryClient = useQueryClient()
   const [revokeTarget, setRevokeTarget] =
     React.useState<AnalyticsIngestKey | null>(null)
-  const { data: settings } = useSettings()
-  const baseUrl = analyticsIngestBaseUrl(settings?.external_url)
+  // The public address comes from the project's own analytics endpoint, not
+  // from `GET /settings`: that one needs `settings:read`, which a project
+  // member does not hold, so a non-admin would otherwise get the address bar.
+  const ingestEndpoint = useQuery({
+    ...getAnalyticsIngestKeyEndpointOptions({
+      path: { project_id: project.id },
+    }),
+  })
+  const ingestBase = analyticsIngestBaseUrl({
+    externalUrl: ingestEndpoint.data?.external_url,
+    isLoaded: ingestEndpoint.isSuccess,
+    origin: window.location.origin,
+  })
+  const baseUrl = ingestBase.url
 
   const keysQueryKey = listAnalyticsIngestKeysOptions({
     path: { project_id: project.id },
@@ -2058,6 +2093,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             />
           </TabsContent>
         </Tabs>
+        {renderBaseUrlNote(ingestBase.source, ingestEndpoint.isError)}
         <p className="text-xs text-muted-foreground">
           Works for any host — Vercel, Netlify, GitHub Pages, a static bucket,
           or anywhere else this app doesn&apos;t run on Temps. Manage this key

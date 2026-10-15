@@ -19,10 +19,22 @@ const SRC = path.resolve(import.meta.dir, '../..')
 const OPEN = /<(Button|button)\b/g
 const ICON = String.raw`<([A-Z][A-Za-z0-9]*)\b[^<>]*\/>`
 const ONLY_ICON = new RegExp(`^${ICON}$`, 's')
-// `{loading ? <Loader2 /> : <RefreshCw />}`: still nothing but an icon.
-const ONLY_ICON_CONDITIONAL = new RegExp(
-  String.raw`^\{[\s\S]*?\?\s*${ICON}\s*:\s*${ICON}\s*\}$`
-)
+// `{loading ? <Loader2 /> : <RefreshCw />}`, with or without parentheses
+// around each branch and any nesting: once every icon, `cond ?` head, `:` and
+// `&&` is removed nothing is left, so the button still has no text.
+function onlyIconsInExpression(inner: string): RegExpExecArray | null {
+  // A swap between two icons is short; anything longer has real content.
+  if (inner.length > 400) return null
+  if (!inner.startsWith('{') || !inner.endsWith('}')) return null
+  const first = new RegExp(ICON, 's').exec(inner)
+  if (!first) return null
+  const rest = inner
+    .replace(new RegExp(ICON, 'gs'), '')
+    // Condition heads of any shape (`a ?`, `n > 0 ?`, `s === 'x' ?`, `f(a) ?`).
+    .replace(/[^?:{}]*\?/g, '')
+    .replace(/&&|[{}():\s]/g, '')
+  return rest === '' ? first : null
+}
 const NAMED = /aria-label|aria-labelledby|\btitle=/
 
 function* sourceFiles(dir: string): Generator<string> {
@@ -74,7 +86,7 @@ function unnamedIconButtons(src: string): string[] {
     const close = src.indexOf(`</${tag}>`, end)
     if (close < 0) continue
     const inner = src.slice(end, close).trim()
-    const icon = ONLY_ICON.exec(inner) ?? ONLY_ICON_CONDITIONAL.exec(inner)
+    const icon = ONLY_ICON.exec(inner) ?? onlyIconsInExpression(inner)
     if (!icon) continue
     const opening = src.slice(match.index ?? 0, end)
     if (NAMED.test(opening)) continue
@@ -104,6 +116,40 @@ test('the scan recognises an unnamed icon-only button', () => {
   expect(
     unnamedIconButtons(
       '<Button aria-label="Refresh" onClick={go}>{busy ? <Loader2 /> : <RefreshCw />}</Button>'
+    )
+  ).toHaveLength(0)
+  // Parenthesised branches, as prettier formats a multi-line swap.
+  expect(
+    unnamedIconButtons(
+      '<Button onClick={copy}>\n  {copied ? (\n    <Check className="h-4 w-4" />\n  ) : (\n    <Copy className="h-4 w-4" />\n  )}\n</Button>'
+    )
+  ).toHaveLength(1)
+  // Comparison and call conditions are still just a condition.
+  expect(
+    unnamedIconButtons(
+      "<Button onClick={go}>{status === 'open' ? <ChevronUp /> : <ChevronDown />}</Button>"
+    )
+  ).toHaveLength(1)
+  expect(
+    unnamedIconButtons(
+      '<Button onClick={go}>{rows.length > 0 ? (<Trash />) : (<Plus />)}</Button>'
+    )
+  ).toHaveLength(1)
+  expect(
+    unnamedIconButtons(
+      '<Button onClick={go}>{isOn(id) ? (<Eye />) : n >= 2 ? (<EyeOff />) : (<Lock />)}</Button>'
+    )
+  ).toHaveLength(1)
+  // A text branch names the button.
+  expect(
+    unnamedIconButtons(
+      "<Button onClick={go}>{count > 0 ? <Check /> : 'Close'}</Button>"
+    )
+  ).toHaveLength(0)
+  // Text next to the swap names the button.
+  expect(
+    unnamedIconButtons(
+      '<Button>{open ? <ChevronUp /> : <ChevronDown />} Details</Button>'
     )
   ).toHaveLength(0)
   // Visible text or an sr-only label already names the button.

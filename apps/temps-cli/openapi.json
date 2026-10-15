@@ -2820,6 +2820,19 @@
         ],
         "type": "string"
       },
+      "AnalyticsIngestEndpoint": {
+        "description": "The public address an app Temps does not deploy should send analytics to.\n\nServed separately from the platform settings because `GET /settings`\nneeds `settings:read`, which a project member does not hold, while the\ninstall snippet this value goes into is shown to every role that can read\nthe project's analytics. Only the one address the snippet embeds is\nexposed; no other setting travels with it.",
+        "properties": {
+          "external_url": {
+            "description": "The configured external URL, without a trailing slash. `null` when no\nexternal URL is stored (or no settings service is available), in which\ncase the caller must decide what to show instead; it is never guessed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AnalyticsIngestKey": {
         "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
         "properties": {
@@ -108983,6 +108996,54 @@
         ],
         "tags": [
           "Visitor Activity"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-endpoint": {
+      "get": {
+        "description": "This is the `basePath` of the install snippet. It is its own endpoint\nbecause `GET /settings` needs `settings:read`, which a project member does\nnot hold; this one needs only `AnalyticsRead` on the project, exactly like\nlisting the keys the same snippet embeds, and exposes nothing but the one\naddress. `external_url: null` means none is stored.",
+        "operationId": "get_analytics_ingest_key_endpoint",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestEndpoint"
+                }
+              }
+            },
+            "description": "The configured external URL, or null when none is stored"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The public address an app Temps does not deploy should send analytics to.",
+        "tags": [
+          "Analytics Ingest Keys"
         ]
       }
     },

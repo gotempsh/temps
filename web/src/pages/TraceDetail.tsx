@@ -176,6 +176,11 @@ function FacetToggle({ attributeKey }: { attributeKey: string }) {
         <TooltipTrigger asChild>
           <button
             type="button"
+            aria-label={
+              isFaceted
+                ? `Unpin attribute ${attributeKey}`
+                : `Pin attribute ${attributeKey}`
+            }
             disabled={isPending || (!isFaceted && atCapacity)}
             onClick={(e) => {
               e.stopPropagation()

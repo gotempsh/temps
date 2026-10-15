@@ -12,7 +12,9 @@ import {
 import {
   createDefaultOidcProviderForm,
   getOidcRedirectUri,
-  isOidcFormValid,
+  OIDC_REQUIRED_FIELDS,
+  oidcFormFieldErrors,
+  type OidcFieldErrors,
   problemMessage,
 } from '@/components/settings/oidc-provider-constants'
 import { Button } from '@/components/ui/button'
@@ -74,6 +76,20 @@ export function CreateOidcProviderPage() {
     }
   })
 
+  const [fieldErrors, setFieldErrors] = useState<OidcFieldErrors>({})
+
+  // Editing a field withdraws only that field's message.
+  const handleFormChange = (next: OidcProviderFormValues) => {
+    setFieldErrors((current) => {
+      const remaining = { ...current }
+      for (const { field } of OIDC_REQUIRED_FIELDS) {
+        if (next[field] !== form[field]) delete remaining[field]
+      }
+      return remaining
+    })
+    setForm(next)
+  }
+
   const redirectUri = useMemo(() => getOidcRedirectUri(), [])
 
   const createProvider = useMutation({
@@ -106,8 +122,11 @@ export function CreateOidcProviderPage() {
   }, [setBreadcrumbs])
 
   const handleSubmit = () => {
-    if (!isOidcFormValid(createFormToRequest(form))) {
-      toast.error('Fill in name, issuer URL, client ID, and client secret')
+    const errors = oidcFormFieldErrors(createFormToRequest(form))
+    setFieldErrors(errors)
+    const firstInvalid = OIDC_REQUIRED_FIELDS.find(({ field }) => errors[field])
+    if (firstInvalid) {
+      document.getElementById(firstInvalid.inputId)?.focus()
       return
     }
     createProvider.mutate({ body: createFormToRequest(form) })
@@ -147,7 +166,8 @@ export function CreateOidcProviderPage() {
           <OidcProviderForm
             mode="create"
             value={form}
-            onChange={setForm}
+            onChange={handleFormChange}
+            errors={fieldErrors}
             redirectUri={redirectUri}
             onCancel={() => navigate('/settings/auth')}
             onSubmit={handleSubmit}
