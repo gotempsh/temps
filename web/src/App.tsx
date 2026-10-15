@@ -46,6 +46,7 @@ import { attachHttpStatus } from './lib/http-error-status'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
+import { ComposeVersionAlert } from './components/alerts/ComposeVersionAlert'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
@@ -579,6 +580,8 @@ const FullAppRoutes = () => {
               version dismissible, links the upgrade docs. */}
               <UpdateAvailableBanner />
               <AiHarnessPendingBanner />
+              {/* Docker Compose CLI too old/missing for Compose deployments. */}
+              <ComposeVersionAlert />
               {/* Wrap header with independent error boundary */}
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (

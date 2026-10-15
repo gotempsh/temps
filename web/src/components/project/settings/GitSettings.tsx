@@ -16,6 +16,7 @@ import {
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
   getComposeSecurityOptions,
+  getProjectComposeValidationOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -83,10 +84,13 @@ import {
 } from '@/lib/compose-port-discovery'
 import {
   composePreviewErrorMessage,
+  composePreviewFailedCheck,
   composePreviewPolicyCheck,
   fetchComposePreview,
   isPublicRepositoryRateLimitError,
 } from '@/lib/compose-preview'
+import { composeValidationWarning } from '@/lib/compose-check'
+import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
 import {
   normalizePresetPath,
@@ -564,6 +568,9 @@ function GitSettingsInline({
           composeOverride: debouncedOverrideDraft || undefined,
           excludedServices: excludedComposeServices,
           previewPolicy: composeSecurityQuery.data?.policy,
+          // Connected repositories run the deploy-time check with the saved
+          // policy and the production environment's variables.
+          projectId: isPublicRepo ? undefined : project.id,
         },
         signal
       ),
@@ -578,6 +585,18 @@ function GitSettingsInline({
   })
   const composePreviewRateLimited =
     isPublicRepo && isPublicRepositoryRateLimitError(composePreviewQuery.error)
+  const composePreviewCheckFailure = composePreviewFailedCheck(
+    composePreviewQuery.error
+  )
+  const composeValidationQuery = useQuery({
+    ...getProjectComposeValidationOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: isComposePreset,
+  })
+  const storedComposeWarning = composeValidationWarning(
+    composeValidationQuery.data
+  )
 
   const navigate = useNavigate()
   const goToChangeRepo = () =>
@@ -1346,6 +1365,22 @@ function GitSettingsInline({
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
+            {storedComposeWarning && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm dark:border-amber-400/30 dark:bg-amber-950/20">
+                <p className="font-medium text-amber-800 dark:text-amber-300">
+                  {storedComposeWarning.title}
+                </p>
+                <p className="mt-1 break-words text-muted-foreground">
+                  {storedComposeWarning.detail}
+                </p>
+                {storedComposeWarning.hint && (
+                  <p className="mt-1 text-muted-foreground">
+                    {storedComposeWarning.hint}
+                  </p>
+                )}
+              </div>
+            )}
+
             <PublicPortsInline project={project} saveGitField={saveGitField} />
 
             <ExcludedServicesInline
@@ -1406,7 +1441,22 @@ function GitSettingsInline({
                       <EyeOff className="size-3" />
                       Environment values redacted
                     </Badge>
+                    {composePreviewQuery.data?.check?.passed && (
+                      <Badge
+                        variant="outline"
+                        className="gap-1.5 border-emerald-500/30 bg-emerald-500/5 font-normal text-emerald-700 dark:text-emerald-300"
+                      >
+                        <ShieldCheck className="size-3" />
+                        Passes deploy checks
+                      </Badge>
+                    )}
                   </div>
+
+                  {composePreviewQuery.data?.overrideWarning && (
+                    <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-amber-800 dark:border-amber-400/30 dark:bg-amber-950/20 dark:text-amber-300">
+                      {composePreviewQuery.data.overrideWarning}
+                    </div>
+                  )}
 
                   <div className="overflow-hidden rounded-lg border bg-background text-foreground lg:grid lg:grid-cols-2 lg:divide-x lg:divide-border dark:bg-zinc-950 dark:text-zinc-100 dark:lg:divide-white/10">
                     <section className="min-w-0">
@@ -1638,12 +1688,25 @@ function GitSettingsInline({
                     </section>
                   </div>
 
+                  {composePreviewCheckFailure && (
+                    <ComposeCheckReportView
+                      report={composePreviewCheckFailure}
+                      className="rounded-lg border p-3"
+                    />
+                  )}
+
                   <p className="text-[11px] leading-relaxed text-muted-foreground">
                     This preview applies disabled services and your override.
                     Temps-managed security, network, labels, and runtime
                     environment layers are added during deployment and cannot be
-                    edited here. Deployment validates referenced files and the
-                    full Compose security policy. Environment and build-argument
+                    edited here. For a connected repository the preview also
+                    runs the deployment&apos;s Compose check: it resolves{' '}
+                    <span className="font-mono">
+                      ${'{'}VAR{'}'}
+                    </span>{' '}
+                    with the production environment&apos;s variables and applies
+                    the saved security policy. Deployment additionally validates
+                    referenced files on disk. Environment and build-argument
                     values are always replaced with{' '}
                     <span className="font-mono text-foreground">
                       &lt;redacted&gt;

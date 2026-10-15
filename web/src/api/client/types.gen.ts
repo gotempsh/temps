@@ -4265,6 +4265,103 @@ export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 export type Comparison = 'below' | 'above';
 
 /**
+ * The `docker compose` invocation a check ran, sanitized for display.
+ */
+export type ComposeCheckCommand = {
+    /**
+     * Program and arguments. Contains paths and option names only; no
+     * variable values are passed on the command line.
+     */
+    argv: Array<string>;
+    /**
+     * Process exit code; `None` when it was killed or did not start.
+     */
+    exit_code?: number | null;
+    /**
+     * The tail of stderr with variable values, quoted text, assignments,
+     * URLs and absolute paths removed. Line numbers and error wording are
+     * kept.
+     */
+    stderr?: string | null;
+};
+
+/**
+ * Stable, user-facing class of a Compose check failure. The deploy job, the
+ * preview and the check action all report the same class for the same input.
+ */
+export type ComposeCheckErrorClass = 'interpolation' | 'policy_violation' | 'invalid_path' | 'invalid_yaml' | 'invalid_override' | 'unsupported_compose_version' | 'config_resolution' | 'compose_unavailable' | 'internal';
+
+/**
+ * Result of running the deploy-time resolution and policy validation.
+ */
+export type ComposeCheckReport = {
+    command?: ComposeCheckCommand | null;
+    /**
+     * The same message the deployment would fail with. Variable values are
+     * redacted.
+     */
+    error?: string | null;
+    error_class?: ComposeCheckErrorClass | null;
+    /**
+     * Caveats about what this check could not cover.
+     */
+    notes: Array<string>;
+    /**
+     * Whether the configuration would pass the deploy-time checks.
+     */
+    passed: boolean;
+    /**
+     * Variables the file references, in sorted order. Names only.
+     */
+    referenced_variables: Array<string>;
+    /**
+     * Whether `docker compose config` actually ran for this check.
+     */
+    resolution_ran: boolean;
+    /**
+     * Why `docker compose config` had to run (project override, include,
+     * extends, YAML tags). Empty when the file was validated directly.
+     */
+    resolution_reasons: Array<string>;
+    /**
+     * Variables referenced without a default that are not set; Compose
+     * substitutes an empty string for each.
+     */
+    unset_variables: Array<string>;
+};
+
+/**
+ * The host's Docker Compose CLI as probed at startup.
+ */
+export type ComposeHostStatusResponse = {
+    /**
+     * Whether the Compose CLI ran.
+     */
+    available: boolean;
+    checked_at?: string | null;
+    minimum_version: string;
+    missing_flags: Array<string>;
+    /**
+     * False until the startup probe finishes.
+     */
+    probed: boolean;
+    /**
+     * Operator-facing explanation when not supported.
+     */
+    problem?: string | null;
+    /**
+     * Whether every `docker compose config` option Temps needs is present.
+     */
+    supported: boolean;
+    version?: string | null;
+};
+
+/**
+ * How a saved project override relates to the repository Compose file.
+ */
+export type ComposeOverrideRedundancy = 'identical' | 'superset';
+
+/**
  * A Docker Compose service port mapping, reduced to the information the UI
  * needs to build a public route without confusing host and container ports.
  */
@@ -4287,27 +4384,48 @@ export type ComposePortMapping = {
  * Problem Details returned when a Compose preview cannot be rendered.
  */
 export type ComposePreviewProblemResponse = ProblemDetails & {
+    compose_check?: ComposeCheckReport | null;
+    error_class?: ComposeCheckErrorClass | null;
     policy_check?: ComposeSecurityCheck | null;
 };
 
 export type ComposePreviewRequest = {
     branch?: string | null;
     composeOverride?: string | null;
+    /**
+     * Environment whose variables resolve `${VAR}`; defaults to the
+     * project's production environment. Requires `project_id`.
+     */
+    environmentId?: number | null;
     excludedServices?: Array<string>;
     path: string;
     /**
      * Advisory preview only. Deployment reloads the saved project policy.
+     * Ignored when `project_id` is set: the saved policy is used instead.
      */
     previewPolicy?: ComposeSecurityPolicy;
+    /**
+     * The project this Compose file deploys. When set, the preview runs the
+     * deploy job's check with that project's saved security policy and the
+     * environment's variables (values are never returned), so it fails with
+     * the same error class a deployment would.
+     */
+    projectId?: number | null;
 };
 
 export type ComposePreviewResponse = {
+    check?: ComposeCheckReport | null;
     disabledServices: Array<string>;
     /**
      * Effective user-controlled Compose YAML with sensitive values redacted.
      */
     effectiveCompose: string;
     enabledServices: Array<string>;
+    overrideRedundancy?: ComposeOverrideRedundancy | null;
+    /**
+     * What to do about `override_redundancy`.
+     */
+    overrideWarning?: string | null;
     path: string;
     redactedValues: number;
     repositoryId: number;
@@ -4391,6 +4509,22 @@ export type ComposeServicePreviewResponse = {
      * is only the optional host-side Docker port.
      */
     ports: Array<ComposePortMapping>;
+};
+
+/**
+ * The last stored Compose check for a project.
+ */
+export type ComposeValidationReportResponse = {
+    checked_at: string;
+    error?: string | null;
+    error_class?: ComposeCheckErrorClass | null;
+    /**
+     * True when the check ran under an older validation revision than this
+     * server's and has not been repeated yet.
+     */
+    outdated: boolean;
+    passed: boolean;
+    project_id: number;
 };
 
 /**
@@ -51831,6 +51965,35 @@ export type GetAccessInfoResponses = {
 
 export type GetAccessInfoResponse = GetAccessInfoResponses[keyof GetAccessInfoResponses];
 
+export type GetComposeStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/platform/compose-status';
+};
+
+export type GetComposeStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetComposeStatusError = GetComposeStatusErrors[keyof GetComposeStatusErrors];
+
+export type GetComposeStatusResponses = {
+    /**
+     * Docker Compose CLI status
+     */
+    200: ComposeHostStatusResponse;
+};
+
+export type GetComposeStatusResponse = GetComposeStatusResponses[keyof GetComposeStatusResponses];
+
 export type GetPlatformFeaturesData = {
     body?: never;
     path?: never;
@@ -55341,6 +55504,44 @@ export type UpdateAutomaticDeployResponses = {
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
 
+export type GetProjectComposeValidationData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/compose-validation';
+};
+
+export type GetProjectComposeValidationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectComposeValidationError = GetProjectComposeValidationErrors[keyof GetProjectComposeValidationErrors];
+
+export type GetProjectComposeValidationResponses = {
+    /**
+     * Last stored check, or null
+     */
+    200: ComposeValidationReportResponse | null;
+};
+
+export type GetProjectComposeValidationResponse = GetProjectComposeValidationResponses[keyof GetProjectComposeValidationResponses];
+
 export type ListCustomDomainsForProjectData = {
     body?: never;
     path: {
@@ -56061,6 +56262,60 @@ export type CancelDeploymentResponses = {
 };
 
 export type CancelDeploymentResponse = CancelDeploymentResponses[keyof CancelDeploymentResponses];
+
+export type RunDeploymentComposeCheckData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/compose-check';
+};
+
+export type RunDeploymentComposeCheckErrors = {
+    /**
+     * Not a Docker Compose project
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, deployment or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * The Compose file could not be read from the Git provider
+     */
+    502: ProblemDetails;
+};
+
+export type RunDeploymentComposeCheckError = RunDeploymentComposeCheckErrors[keyof RunDeploymentComposeCheckErrors];
+
+export type RunDeploymentComposeCheckResponses = {
+    /**
+     * Check result (passed or the failure)
+     */
+    200: ComposeCheckReport;
+};
+
+export type RunDeploymentComposeCheckResponse = RunDeploymentComposeCheckResponses[keyof RunDeploymentComposeCheckResponses];
 
 export type ListDeploymentContainerLogsData = {
     body?: never;
