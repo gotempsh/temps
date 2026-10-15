@@ -73,6 +73,25 @@ export function composeHostWarning(
     : 'Docker Compose v2 is not installed on the Temps host; Compose deployments will fail.'
 }
 
+/** How often a probed host status is refreshed, in milliseconds. */
+export const COMPOSE_STATUS_REFRESH_MS = 10 * 60 * 1000
+
+/** How often to poll while the startup probe has not finished. */
+export const COMPOSE_STATUS_PENDING_POLL_MS = 5 * 1000
+
+/**
+ * Refetch interval for the host status: poll quickly until the server's
+ * asynchronous startup probe reports, then refresh slowly so a restart with a
+ * different Compose installation is noticed.
+ */
+export function composeStatusRefetchInterval(
+  status: ComposeHostStatusResponse | null | undefined
+): number {
+  return status?.probed
+    ? COMPOSE_STATUS_REFRESH_MS
+    : COMPOSE_STATUS_PENDING_POLL_MS
+}
+
 export interface ComposeValidationWarning {
   title: string
   detail: string

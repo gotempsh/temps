@@ -28,6 +28,12 @@ const MAX_NESTING_DEPTH: usize = 16;
 /// Largest repository `.env` read for interpolation.
 pub const MAX_DOTENV_BYTES: usize = 1024 * 1024;
 
+/// Most bytes substitution may produce for one document or one `.env` file.
+/// `A2=${A1}${A1}`, `A3=${A2}${A2}`, ... doubles with every line, so a file
+/// of a few hundred bytes could otherwise allocate gigabytes; the input size
+/// limit alone does not bound the output.
+pub const MAX_INTERPOLATED_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum InterpolationError {
     #[error(
@@ -43,6 +49,40 @@ pub enum InterpolationError {
 
     #[error("Failed to parse {document} as YAML before interpolation: {reason}")]
     Yaml { document: String, reason: String },
+
+    #[error(
+        "Compose interpolation at {location} expands to more than {limit} bytes; variables that \
+         repeat other variables must not grow without bound"
+    )]
+    TooLarge { location: String, limit: usize },
+}
+
+/// Variables visible to a substitution: `primary` first, then `fallback`.
+#[derive(Clone, Copy)]
+struct Lookup<'a> {
+    primary: &'a HashMap<String, String>,
+    fallback: Option<&'a HashMap<String, String>>,
+}
+
+impl<'a> Lookup<'a> {
+    fn get(&self, name: &str) -> Option<&'a String> {
+        self.primary
+            .get(name)
+            .or_else(|| self.fallback.and_then(|fallback| fallback.get(name)))
+    }
+}
+
+/// Bookkeeping shared by one substitution: names seen, names unset, and the
+/// bytes still allowed.
+struct Substitution<'a> {
+    variables: Lookup<'a>,
+    location: &'a str,
+    unset: &'a mut BTreeSet<String>,
+    referenced: &'a mut BTreeSet<String>,
+    /// When present, unset required variables are recorded here and
+    /// substituted as empty instead of failing.
+    deferred: Option<&'a mut BTreeSet<String>>,
+    remaining: usize,
 }
 
 /// A document after interpolation.
@@ -60,6 +100,10 @@ pub struct InterpolatedDocument {
     pub unset_variables: BTreeSet<String>,
     /// Every variable name the document referenced, set or not.
     pub referenced_variables: BTreeSet<String>,
+    /// Required variables (`${VAR:?}` / `${VAR?}`) that were unset and
+    /// substituted as empty because the caller deferred them; see
+    /// [`interpolate_document_deferring_required`].
+    pub deferred_required: BTreeSet<String>,
 }
 
 /// Resolve every interpolation in `content` against `variables`.
@@ -71,12 +115,37 @@ pub fn interpolate_document(
     content: &str,
     variables: &HashMap<String, String>,
 ) -> Result<InterpolatedDocument, InterpolationError> {
+    interpolate(document, content, variables, false)
+}
+
+/// [`interpolate_document`] for checks that run without the deployment's
+/// generated variables (linked services, secrets bindings, deployment
+/// tokens). A required variable that is not set at all is recorded in
+/// [`InterpolatedDocument::deferred_required`] and substituted as empty
+/// instead of failing, because the deployment may supply it. A required
+/// variable that is set but empty still fails: an explicit project value
+/// overrides every generated one. Deployments never use this.
+pub fn interpolate_document_deferring_required(
+    document: &str,
+    content: &str,
+    variables: &HashMap<String, String>,
+) -> Result<InterpolatedDocument, InterpolationError> {
+    interpolate(document, content, variables, true)
+}
+
+fn interpolate(
+    document: &str,
+    content: &str,
+    variables: &HashMap<String, String>,
+    defer_required: bool,
+) -> Result<InterpolatedDocument, InterpolationError> {
     if !content.contains('$') {
         return Ok(InterpolatedDocument {
             content: content.to_string(),
             changed: false,
             unset_variables: BTreeSet::new(),
             referenced_variables: BTreeSet::new(),
+            deferred_required: BTreeSet::new(),
         });
     }
     let mut root: Value =
@@ -89,6 +158,9 @@ pub fn interpolate_document(
         unset: BTreeSet::new(),
         referenced: BTreeSet::new(),
         changed: false,
+        remaining: MAX_INTERPOLATED_BYTES,
+        defer_required,
+        deferred: BTreeSet::new(),
     };
     let mut location = String::new();
     state.walk(&mut root, &mut location)?;
@@ -98,6 +170,7 @@ pub fn interpolate_document(
             changed: false,
             unset_variables: state.unset,
             referenced_variables: state.referenced,
+            deferred_required: state.deferred,
         });
     }
     let content = serde_yaml::to_string(&root).map_err(|error| InterpolationError::Yaml {
@@ -109,6 +182,7 @@ pub fn interpolate_document(
         changed: true,
         unset_variables: state.unset,
         referenced_variables: state.referenced,
+        deferred_required: state.deferred,
     })
 }
 
@@ -117,6 +191,10 @@ struct WalkState<'a> {
     unset: BTreeSet<String>,
     referenced: BTreeSet<String>,
     changed: bool,
+    /// Bytes substitution may still produce in this document.
+    remaining: usize,
+    defer_required: bool,
+    deferred: BTreeSet<String>,
 }
 
 impl WalkState<'_> {
@@ -126,14 +204,19 @@ impl WalkState<'_> {
                 if !text.contains('$') {
                     return Ok(());
                 }
-                let resolved = substitute(
-                    text,
-                    self.variables,
+                let mut substitution = Substitution {
+                    variables: Lookup {
+                        primary: self.variables,
+                        fallback: None,
+                    },
                     location,
-                    &mut self.unset,
-                    &mut self.referenced,
-                    0,
-                )?;
+                    unset: &mut self.unset,
+                    referenced: &mut self.referenced,
+                    deferred: self.defer_required.then_some(&mut self.deferred),
+                    remaining: self.remaining,
+                };
+                let resolved = substitute(text, &mut substitution, 0)?;
+                self.remaining = substitution.remaining;
                 let escaped = resolved.replace('$', "$$");
                 if escaped != *text {
                     self.changed = true;
@@ -277,31 +360,28 @@ fn is_name_char(ch: char) -> bool {
 /// * A `$` followed by anything else is a literal `$`, as in Compose.
 fn substitute(
     input: &str,
-    variables: &HashMap<String, String>,
-    location: &str,
-    unset: &mut BTreeSet<String>,
-    referenced: &mut BTreeSet<String>,
+    state: &mut Substitution<'_>,
     depth: usize,
 ) -> Result<String, InterpolationError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(InterpolationError::InvalidSyntax {
-            location: location_label(location),
+            location: location_label(state.location),
             reason: format!("variable defaults are nested more than {MAX_NESTING_DEPTH} levels"),
         });
     }
     let chars: Vec<char> = input.chars().collect();
-    let mut output = String::with_capacity(input.len());
+    let mut output = String::with_capacity(input.len().min(state.remaining));
     let mut index = 0;
     while index < chars.len() {
         let ch = chars[index];
         if ch != '$' {
-            output.push(ch);
+            push_bounded(&mut output, ch.encode_utf8(&mut [0; 4]), state)?;
             index += 1;
             continue;
         }
         match chars.get(index + 1).copied() {
             Some('$') => {
-                output.push('$');
+                push_bounded(&mut output, "$", state)?;
                 index += 2;
             }
             Some('{') => {
@@ -323,14 +403,13 @@ fn substitute(
                 }
                 if nesting != 0 {
                     return Err(InterpolationError::InvalidSyntax {
-                        location: location_label(location),
+                        location: location_label(state.location),
                         reason: "'${' has no closing '}'".to_string(),
                     });
                 }
                 let body: String = chars[body_start..cursor].iter().collect();
-                output.push_str(&resolve_braced(
-                    &body, variables, location, unset, referenced, depth,
-                )?);
+                let resolved = resolve_braced(&body, state, depth)?;
+                push_bounded(&mut output, &resolved, state)?;
                 index = cursor + 1;
             }
             Some(next) if is_name_start(next) => {
@@ -339,17 +418,17 @@ fn substitute(
                     cursor += 1;
                 }
                 let name: String = chars[index + 1..cursor].iter().collect();
-                referenced.insert(name.clone());
-                match variables.get(&name) {
-                    Some(value) => output.push_str(value),
+                state.referenced.insert(name.clone());
+                match state.variables.get(&name) {
+                    Some(value) => push_bounded(&mut output, value, state)?,
                     None => {
-                        unset.insert(name);
+                        state.unset.insert(name);
                     }
                 }
                 index = cursor;
             }
             _ => {
-                output.push('$');
+                push_bounded(&mut output, "$", state)?;
                 index += 1;
             }
         }
@@ -357,12 +436,28 @@ fn substitute(
     Ok(output)
 }
 
+/// Append `text`, failing once the substitution budget is spent. Nested
+/// defaults are charged when they are produced and again when copied into
+/// their parent, which only makes the bound stricter.
+fn push_bounded(
+    output: &mut String,
+    text: &str,
+    state: &mut Substitution<'_>,
+) -> Result<(), InterpolationError> {
+    if text.len() > state.remaining {
+        return Err(InterpolationError::TooLarge {
+            location: location_label(state.location),
+            limit: MAX_INTERPOLATED_BYTES,
+        });
+    }
+    state.remaining -= text.len();
+    output.push_str(text);
+    Ok(())
+}
+
 fn resolve_braced(
     body: &str,
-    variables: &HashMap<String, String>,
-    location: &str,
-    unset: &mut BTreeSet<String>,
-    referenced: &mut BTreeSet<String>,
+    state: &mut Substitution<'_>,
     depth: usize,
 ) -> Result<String, InterpolationError> {
     let name_len = body
@@ -379,32 +474,25 @@ fn resolve_braced(
         .unwrap_or(0);
     if name_len == 0 {
         return Err(InterpolationError::InvalidSyntax {
-            location: location_label(location),
+            location: location_label(state.location),
             reason: "'${...}' must start with a variable name".to_string(),
         });
     }
     let (name, modifier) = body.split_at(name_len);
-    referenced.insert(name.to_string());
-    let value = variables.get(name);
+    state.referenced.insert(name.to_string());
+    let value = state.variables.get(name);
     let set = value.is_some();
     let non_empty = value.is_some_and(|value| !value.is_empty());
     let current = value.cloned().unwrap_or_default();
 
-    let nested = |text: &str,
-                  unset: &mut BTreeSet<String>,
-                  referenced: &mut BTreeSet<String>|
-     -> Result<String, InterpolationError> {
-        substitute(text, variables, location, unset, referenced, depth + 1)
-    };
-
-    let required_missing = || InterpolationError::RequiredVariableMissing {
+    let required_missing = |location: &str| InterpolationError::RequiredVariableMissing {
         variable: name.to_string(),
         location: location_label(location),
     };
 
     if modifier.is_empty() {
         if !set {
-            unset.insert(name.to_string());
+            state.unset.insert(name.to_string());
         }
         return Ok(current);
     }
@@ -412,46 +500,49 @@ fn resolve_braced(
         return if non_empty {
             Ok(current)
         } else {
-            nested(default, unset, referenced)
+            substitute(default, state, depth + 1)
         };
     }
     if let Some(default) = modifier.strip_prefix('-') {
         return if set {
             Ok(current)
         } else {
-            nested(default, unset, referenced)
+            substitute(default, state, depth + 1)
         };
     }
-    if modifier.starts_with(":?") {
-        return if non_empty {
-            Ok(current)
+    if modifier.starts_with(":?") || modifier.starts_with('?') {
+        let satisfied = if modifier.starts_with(':') {
+            non_empty
         } else {
-            Err(required_missing())
+            set
         };
-    }
-    if modifier.starts_with('?') {
-        return if set {
-            Ok(current)
-        } else {
-            Err(required_missing())
-        };
+        if satisfied {
+            return Ok(current);
+        }
+        if !set {
+            if let Some(deferred) = state.deferred.as_deref_mut() {
+                deferred.insert(name.to_string());
+                return Ok(String::new());
+            }
+        }
+        return Err(required_missing(state.location));
     }
     if let Some(replacement) = modifier.strip_prefix(":+") {
         return if non_empty {
-            nested(replacement, unset, referenced)
+            substitute(replacement, state, depth + 1)
         } else {
             Ok(String::new())
         };
     }
     if let Some(replacement) = modifier.strip_prefix('+') {
         return if set {
-            nested(replacement, unset, referenced)
+            substitute(replacement, state, depth + 1)
         } else {
             Ok(String::new())
         };
     }
     Err(InterpolationError::InvalidSyntax {
-        location: location_label(location),
+        location: location_label(state.location),
         reason: format!(
             "unsupported modifier after variable {name}; use ':-', '-', ':?', '?', ':+' or '+'"
         ),
@@ -460,14 +551,41 @@ fn resolve_braced(
 
 /// Parse a dotenv file the way Compose reads `.env` for interpolation.
 ///
-/// Supports comments, `export KEY=...`, single-quoted literals, double-quoted
-/// values with escapes (both may span lines), unquoted values with trailing
-/// ` # comments`, and `${VAR}` references to keys defined earlier in the same
-/// file. A malformed line is skipped rather than failing the deployment:
-/// Compose's own parser is the authority on the file at runtime, and Temps
-/// only needs these values to resolve the Compose document.
-pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
-    let mut values: HashMap<String, String> = HashMap::new();
+/// Supports comments, `export KEY=...`, single-quoted literals (with `\'` for
+/// a quote), double-quoted values with escapes (both may span lines),
+/// unquoted values with trailing ` # comments`, and `${VAR}` references to
+/// keys defined earlier in the same file. A malformed line is skipped rather
+/// than failing the deployment: Compose's own parser is the authority on the
+/// file at runtime, and Temps only needs these values to resolve the Compose
+/// document. Expansion is bounded by [`MAX_INTERPOLATED_BYTES`] for the whole
+/// file.
+pub fn parse_dotenv(content: &str) -> Result<HashMap<String, String>, InterpolationError> {
+    parse_dotenv_with(content, &HashMap::new())
+}
+
+/// [`parse_dotenv`] where `${VAR}` references see `environment` first and
+/// keys defined earlier in the file second, as Compose resolves an
+/// `include` entry's `env_file` against the including project's variables.
+pub fn parse_dotenv_with(
+    content: &str,
+    environment: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, InterpolationError> {
+    parse_dotenv_layered(content, environment, HashMap::new())
+}
+
+/// [`parse_dotenv_with`] for the next file of an ordered `env_file` list.
+/// `earlier` holds what the files before it loaded: `${VAR}` references see
+/// `environment` first, then `earlier` and this file's own earlier keys, and
+/// the result is `earlier` overridden by this file. This is how Compose
+/// layers an `include` entry's `env_file` list, so a later file may build on
+/// a value an earlier one set.
+pub fn parse_dotenv_layered(
+    content: &str,
+    environment: &HashMap<String, String>,
+    earlier: HashMap<String, String>,
+) -> Result<HashMap<String, String>, InterpolationError> {
+    let mut values = earlier;
+    let mut remaining = MAX_INTERPOLATED_BYTES;
     let chars: Vec<char> = content.chars().collect();
     let mut index = 0;
     while index < chars.len() {
@@ -513,13 +631,20 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
         let value = match chars.get(index).copied() {
             Some('\'') => {
                 index += 1;
-                let start = index;
+                let mut value = String::new();
                 while index < chars.len() && chars[index] != '\'' {
+                    // `\'` is a quote inside the value, as in Compose.
+                    if chars[index] == '\\' && chars.get(index + 1) == Some(&'\'') {
+                        value.push('\'');
+                        index += 2;
+                        continue;
+                    }
+                    value.push(chars[index]);
                     index += 1;
                 }
-                let value: String = chars[start..index.min(chars.len())].iter().collect();
                 index += 1;
                 skip_to_line_end(&chars, &mut index);
+                charge_dotenv(&mut remaining, value.len())?;
                 value
             }
             Some('"') => {
@@ -549,7 +674,7 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
                 }
                 index += 1;
                 skip_to_line_end(&chars, &mut index);
-                expand_dotenv_value(&raw, &values)
+                expand_dotenv_value(&raw, environment, &values, &mut remaining)?
             }
             _ => {
                 let start = index;
@@ -559,12 +684,22 @@ pub fn parse_dotenv(content: &str) -> HashMap<String, String> {
                     Some(position) => &line[..position],
                     None => line.as_str(),
                 };
-                expand_dotenv_value(without_comment.trim(), &values)
+                expand_dotenv_value(without_comment.trim(), environment, &values, &mut remaining)?
             }
         };
         values.insert(key, value);
     }
-    values
+    Ok(values)
+}
+
+fn charge_dotenv(remaining: &mut usize, bytes: usize) -> Result<(), InterpolationError> {
+    *remaining = remaining
+        .checked_sub(bytes)
+        .ok_or_else(|| InterpolationError::TooLarge {
+            location: ".env".to_string(),
+            limit: MAX_INTERPOLATED_BYTES,
+        })?;
+    Ok(())
 }
 
 fn skip_to_line_end(chars: &[char], index: &mut usize) {
@@ -573,14 +708,43 @@ fn skip_to_line_end(chars: &[char], index: &mut usize) {
     }
 }
 
-fn expand_dotenv_value(raw: &str, defined: &HashMap<String, String>) -> String {
+/// Expand one value, charging what it produces to the file's budget. A
+/// malformed template keeps its raw text (Compose decides at runtime); an
+/// expansion over budget fails the whole file.
+fn expand_dotenv_value(
+    raw: &str,
+    environment: &HashMap<String, String>,
+    defined: &HashMap<String, String>,
+    remaining: &mut usize,
+) -> Result<String, InterpolationError> {
     if !raw.contains('$') {
-        return raw.to_string();
+        charge_dotenv(remaining, raw.len())?;
+        return Ok(raw.to_string());
     }
     let mut unset = BTreeSet::new();
     let mut referenced = BTreeSet::new();
-    substitute(raw, defined, ".env", &mut unset, &mut referenced, 0)
-        .unwrap_or_else(|_| raw.to_string())
+    let mut state = Substitution {
+        variables: Lookup {
+            primary: environment,
+            fallback: Some(defined),
+        },
+        location: ".env",
+        unset: &mut unset,
+        referenced: &mut referenced,
+        deferred: None,
+        remaining: *remaining,
+    };
+    match substitute(raw, &mut state, 0) {
+        Ok(value) => {
+            *remaining = state.remaining;
+            Ok(value)
+        }
+        Err(error @ InterpolationError::TooLarge { .. }) => Err(error),
+        Err(_) => {
+            charge_dotenv(remaining, raw.len())?;
+            Ok(raw.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -600,14 +764,18 @@ mod tests {
     ) -> Result<String, InterpolationError> {
         let mut unset = BTreeSet::new();
         let mut referenced = BTreeSet::new();
-        substitute(
-            input,
-            variables,
-            "services.app.image",
-            &mut unset,
-            &mut referenced,
-            0,
-        )
+        let mut state = Substitution {
+            variables: Lookup {
+                primary: variables,
+                fallback: None,
+            },
+            location: "services.app.image",
+            unset: &mut unset,
+            referenced: &mut referenced,
+            deferred: None,
+            remaining: MAX_INTERPOLATED_BYTES,
+        };
+        substitute(input, &mut state, 0)
     }
 
     #[test]
@@ -732,7 +900,8 @@ mod tests {
     fn dotenv_parsing_matches_compose_forms() {
         let parsed = parse_dotenv(
             "# comment\nexport A=1\nB = two # trailing\nC='lit $A'\nD=\"x\\ny $A\"\nE=${A}-e\nnot a line\nF=\"multi\nline\"\n",
-        );
+        )
+        .unwrap();
         assert_eq!(parsed["A"], "1");
         assert_eq!(parsed["B"], "two");
         assert_eq!(parsed["C"], "lit $A");
@@ -740,5 +909,94 @@ mod tests {
         assert_eq!(parsed["E"], "1-e");
         assert_eq!(parsed["F"], "multi\nline");
         assert_eq!(parsed.len(), 6);
+    }
+
+    #[test]
+    fn single_quoted_dotenv_values_keep_escaped_quotes() {
+        let parsed = parse_dotenv("PASSWORD='Let\\'sGo!'\nNEXT=after\nPLAIN='a\\b'\n").unwrap();
+        assert_eq!(parsed["PASSWORD"], "Let'sGo!");
+        assert_eq!(parsed["NEXT"], "after");
+        // Any other backslash stays literal in a single-quoted value.
+        assert_eq!(parsed["PLAIN"], "a\\b");
+    }
+
+    #[test]
+    fn dotenv_expansion_that_doubles_per_line_is_bounded() {
+        let mut content = String::from("A0=xxxxxxxxxxxxxxxx\n");
+        for line in 1..40 {
+            content.push_str(&format!("A{line}=${{A{}}}${{A{}}}\n", line - 1, line - 1));
+        }
+        assert!(content.len() < 1024);
+        let error = parse_dotenv(&content).unwrap_err();
+        assert!(
+            matches!(error, InterpolationError::TooLarge { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn document_values_repeating_a_large_variable_are_bounded() {
+        let variables = vars(&[("BIG", &"x".repeat(1024 * 1024))]);
+        let content =
+            "services:\n  app:\n    image: nginx\n    command: ${BIG}${BIG}${BIG}${BIG}${BIG}\n";
+        let error = interpolate_document("compose file", content, &variables).unwrap_err();
+        assert!(
+            matches!(error, InterpolationError::TooLarge { ref location, .. } if location == "services.app.command")
+        );
+    }
+
+    #[test]
+    fn later_env_files_build_on_values_earlier_files_set() {
+        let first = parse_dotenv_layered(
+            "BASE=from-first\nKEEP=first\n",
+            &HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("first file parses");
+        let layered = parse_dotenv_layered(
+            "RESULT=${BASE}-second\nKEEP=second\nPARENT=${OWNER}\n",
+            &vars(&[("OWNER", "parent"), ("BASE", "from-parent")]),
+            first,
+        )
+        .expect("second file parses");
+        // The including environment is consulted first, as in Compose.
+        assert_eq!(layered["RESULT"], "from-parent-second");
+        let layered = parse_dotenv_layered(
+            "RESULT=${BASE}-second\nKEEP=second\n",
+            &vars(&[("OWNER", "parent")]),
+            parse_dotenv("BASE=from-first\nKEEP=first\n").expect("first file parses"),
+        )
+        .expect("second file parses");
+        assert_eq!(layered["RESULT"], "from-first-second");
+        assert_eq!(layered["BASE"], "from-first");
+        // Later files override earlier ones.
+        assert_eq!(layered["KEEP"], "second");
+    }
+
+    #[test]
+    fn include_env_files_see_the_including_environment_first() {
+        let parent = vars(&[("REGION", "eu")]);
+        let parsed = parse_dotenv_with("REGION=us\nHOST=api.${REGION}\n", &parent).unwrap();
+        assert_eq!(parsed["HOST"], "api.eu");
+    }
+
+    #[test]
+    fn deferred_checks_record_unset_required_variables_only() {
+        let content = "services:\n  app:\n    image: nginx\n    environment:\n      DB: ${POSTGRES_URL:?database required}\n";
+        let strict = interpolate_document("compose file", content, &HashMap::new()).unwrap_err();
+        assert!(matches!(
+            strict,
+            InterpolationError::RequiredVariableMissing { .. }
+        ));
+        let deferred =
+            interpolate_document_deferring_required("compose file", content, &HashMap::new())
+                .unwrap();
+        assert!(deferred.deferred_required.contains("POSTGRES_URL"));
+        // An explicit empty value overrides any generated one, so it still fails.
+        let empty = vars(&[("POSTGRES_URL", "")]);
+        assert!(matches!(
+            interpolate_document_deferring_required("compose file", content, &empty),
+            Err(InterpolationError::RequiredVariableMissing { .. })
+        ));
     }
 }

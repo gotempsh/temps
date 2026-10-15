@@ -188,6 +188,17 @@ pub enum GitProviderManagerError {
     OAuthStateInvalid(String),
 }
 
+impl GitProviderManagerError {
+    /// Whether the provider reported that the requested file does not exist,
+    /// as opposed to failing to answer.
+    pub fn is_file_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::ProviderError(GitProviderError::FileNotFound { .. })
+        )
+    }
+}
+
 /// Hard ceiling on a single sync run. If we haven't finished within this
 /// window something has gone badly wrong (stuck HTTPS connection, provider
 /// outage with retries spinning, etc) and we'd rather abort and release

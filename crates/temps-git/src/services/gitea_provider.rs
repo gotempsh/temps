@@ -748,6 +748,11 @@ impl GitProviderService for GiteaProvider {
             .send_with_retry(|| client.get(&url).headers(headers.clone()))
             .await?;
 
+        if let Some(error) =
+            super::git_provider::file_not_found(response.status(), owner, repo, path, branch)
+        {
+            return Err(error);
+        }
         if !response.status().is_success() {
             return Err(GitProviderError::ApiError(format!(
                 "Failed to get file content for {}/{}/{}: {}",
@@ -1698,6 +1703,56 @@ mod tests {
                 token: "test-token".to_string(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn file_reads_classify_a_404_as_a_missing_file() {
+        let mut server = mockito::Server::new_async().await;
+        let missing = server
+            .mock("GET", mockito::Matcher::Regex("missing".to_string()))
+            .with_status(404)
+            .with_body(r#"{"message":"404 File Not Found"}"#)
+            .create_async()
+            .await;
+        let denied = server
+            .mock("GET", mockito::Matcher::Regex("private".to_string()))
+            .with_status(403)
+            .with_body(r#"{"message":"403 Forbidden"}"#)
+            .create_async()
+            .await;
+        let provider = make_provider(&server.url());
+
+        let error = provider
+            .get_file_content(
+                "test-token",
+                "temps",
+                "example",
+                "stack/missing.yaml",
+                Some("main"),
+            )
+            .await
+            .expect_err("a 404 must fail");
+        assert!(
+            matches!(&error, GitProviderError::FileNotFound { path, git_ref, .. }
+                if path == "stack/missing.yaml" && git_ref == "main"),
+            "{error}"
+        );
+        let error = provider
+            .get_file_content(
+                "test-token",
+                "temps",
+                "example",
+                "private.yaml",
+                Some("main"),
+            )
+            .await
+            .expect_err("a 403 must fail");
+        assert!(
+            !matches!(error, GitProviderError::FileNotFound { .. }),
+            "{error}"
+        );
+        missing.assert_async().await;
+        denied.assert_async().await;
     }
 
     // ── api_base ──────────────────────────────────────────────────────────────

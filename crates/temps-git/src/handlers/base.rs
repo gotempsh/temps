@@ -211,6 +211,10 @@ impl From<GitProviderError> for Problem {
                         name
                     ))
             }
+            GitProviderError::FileNotFound { .. } => problem_new(StatusCode::NOT_FOUND)
+                .with_type("https://docs.temps.sh/errors/file_not_found")
+                .with_title("File Not Found")
+                .with_detail(error.to_string()),
             GitProviderError::NotImplemented => problem_new(StatusCode::NOT_IMPLEMENTED)
                 .with_type("https://docs.temps.sh/errors/not_implemented")
                 .with_title("Not Implemented")
@@ -2980,6 +2984,16 @@ pub async fn get_repository_compose_preview(
                 policy: scope.policy,
                 environment: scope.environment,
                 repository_env,
+                // The checker fetches the files `include`/`extends` reference
+                // at this same revision, so they resolve as in a checkout.
+                repository: Some(temps_presets::compose_check::ComposeRepositorySource {
+                    connection_id: source.connection_id,
+                    owner: source.owner.clone(),
+                    name: source.name.clone(),
+                    git_ref: source.git_ref.clone(),
+                    directory: scope.directory,
+                }),
+                reference_files: Default::default(),
             })
         }
         None => None,
@@ -3066,6 +3080,8 @@ struct ComposePreviewCheckScope {
     compose_file: String,
     /// Repository path of the `.env` Compose would read.
     env_path: String,
+    /// Compose project directory inside the repository; `.` for the root.
+    directory: String,
     policy: temps_entities::compose_security::ComposeSecurityPolicy,
     environment: HashMap<String, String>,
 }
@@ -3109,6 +3125,7 @@ async fn compose_preview_check_scope(
         project_name,
         compose_file: compose_file_in_directory(path, &directory),
         env_path,
+        directory,
         policy,
         environment,
     })
@@ -3657,6 +3674,26 @@ mod permission_error_tests {
             .get("detail")
             .and_then(|value| value.as_str())
             .is_some_and(|detail| detail.contains("Resource not accessible by integration")));
+    }
+
+    #[test]
+    fn missing_files_become_not_found_problems_naming_the_file() {
+        let problem = Problem::from(GitProviderError::FileNotFound {
+            repository: "owner/repo".to_string(),
+            path: "stack/shared.yaml".to_string(),
+            git_ref: "main".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("stack/shared.yaml"), "{detail}");
+        assert!(
+            detail.contains("owner/repo") && detail.contains("main"),
+            "{detail}"
+        );
     }
 }
 

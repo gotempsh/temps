@@ -37,16 +37,78 @@ use tracing::{debug, info, warn};
 /// Owns the inspected local inputs until `compose config` finishes. Remote
 /// archives are retained only after validation, because effective runtime paths
 /// can refer to their assets throughout the deployment.
-/// Variables for interpolating referenced files, plus the unset and
-/// referenced variable names collected while doing so.
-type SnapshotInterpolation = (HashMap<String, String>, BTreeSet<String>, BTreeSet<String>);
+/// Most bytes of variables (names and values) that `include` environments
+/// may hold across one resolution. Each distinct include scope holds the
+/// including document's variables plus its own env files; repeating an
+/// include reuses its scope and is not charged again.
+const MAX_INCLUDE_ENVIRONMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// An include scope: its variables and their identity, or `None` when the
+/// include's env files add nothing and it sees the including variables.
+type IncludeScope = Option<(Arc<HashMap<String, String>>, u64)>;
+
+/// Variables for interpolating referenced files, plus what was learned while
+/// doing so.
+#[derive(Default)]
+struct SnapshotInterpolation {
+    /// Variables the document being snapshotted is interpolated with. An
+    /// `include` entry layers its own `env_file` (or `.env`) underneath the
+    /// including document's variables for the files it includes.
+    variables: Arc<HashMap<String, String>>,
+    /// Identifies `variables`, so one file included under two different
+    /// environments is snapshotted once per environment.
+    scope_id: u64,
+    unset: BTreeSet<String>,
+    referenced: BTreeSet<String>,
+    /// Values loaded from include env files, redacted from diagnostics like
+    /// the root variables. Each distinct include scope contributes once.
+    loaded_values: Vec<String>,
+    /// Include scopes already built, keyed by the including scope and the
+    /// env files loaded on top of it, so a repeated include neither reparses
+    /// its env files nor holds another copy of their values.
+    include_scopes: HashMap<(u64, Vec<PathBuf>), IncludeScope>,
+    /// Bytes held by `include_scopes`; see [`MAX_INCLUDE_ENVIRONMENT_BYTES`].
+    include_bytes: usize,
+    /// See [`ComposeCheckInput::defer_unknown_required`].
+    defer_required: bool,
+    deferred_required: BTreeSet<String>,
+    /// Referenced files as written, before interpolation; see
+    /// [`ResolvedComposeConfiguration::referenced_sources`].
+    sources: Vec<String>,
+    sources_bytes: usize,
+}
+
+impl SnapshotInterpolation {
+    fn new(variables: HashMap<String, String>, defer_required: bool) -> Self {
+        Self {
+            variables: Arc::new(variables),
+            defer_required,
+            ..Default::default()
+        }
+    }
+}
+
+/// Interpolate one document, deferring unset required variables when the
+/// check runs without the deployment's generated variables.
+fn interpolate_for_check(
+    document: &str,
+    content: &str,
+    variables: &HashMap<String, String>,
+    defer_required: bool,
+) -> Result<compose_interpolation::InterpolatedDocument, InterpolationError> {
+    if defer_required {
+        compose_interpolation::interpolate_document_deferring_required(document, content, variables)
+    } else {
+        compose_interpolation::interpolate_document(document, content, variables)
+    }
+}
 
 struct ComposeReferenceSnapshots {
     cache: tempfile::TempDir,
     interpolation: SnapshotInterpolation,
     files: Vec<tempfile::NamedTempFile>,
     remote: HashMap<String, (PathBuf, PathBuf)>,
-    resolved: HashMap<(PathBuf, PathBuf), PathBuf>,
+    resolved: HashMap<(PathBuf, PathBuf, u64), PathBuf>,
     active: HashSet<PathBuf>,
     bytes: usize,
 }
@@ -427,6 +489,17 @@ pub const COMPOSE_CONFIG_FLAGS: &[&str] = &[
     "--no-interpolate",
 ];
 
+/// Options for the second, validation-only `docker compose config` pass:
+/// `--no-interpolate` skips Compose's model consistency checks, so this pass
+/// leaves interpolation on (there is nothing left to substitute) and discards
+/// the output.
+pub const COMPOSE_CONSISTENCY_FLAGS: &[&str] = &[
+    "--no-normalize",
+    "--no-path-resolution",
+    "--no-env-resolution",
+    "--quiet",
+];
+
 /// What the host's Docker Compose CLI supports, probed once at startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposeSupport {
@@ -458,6 +531,15 @@ pub struct ResolvedComposeConfiguration {
     pub command: Option<ComposeCommandDiagnostics>,
     pub unset_variables: BTreeSet<String>,
     pub referenced_variables: BTreeSet<String>,
+    /// Required variables the check could not see and substituted as empty;
+    /// see [`ComposeCheckInput::defer_unknown_required`]. Always empty for a
+    /// deployment.
+    pub deferred_required_variables: BTreeSet<String>,
+    /// The files `include` and `extends` pulled in, as written (before
+    /// interpolation), so callers can tell literal text in the merged model
+    /// from substituted values. At most [`MAX_RESOLVED_COMPOSE_CONFIG_BYTES`]
+    /// in total; files past that are left out.
+    pub referenced_sources: Vec<String>,
     /// Caveats, e.g. resolution skipped because no Compose CLI is present.
     pub notes: Vec<String>,
 }
@@ -493,6 +575,12 @@ pub struct ComposeCheckInput<'a> {
     /// Whether `docker compose config` may run. When false and resolution
     /// would be needed, the files are validated separately and a note says so.
     pub allow_cli: bool,
+    /// For checks outside a deployment, which cannot load the variables a
+    /// deployment generates (linked services, secrets bindings, deployment
+    /// tokens): a required `${VAR:?}` whose variable is not set at all is
+    /// reported in `deferred_required_variables` instead of failing. Always
+    /// false for a deployment, which fails on it.
+    pub defer_unknown_required: bool,
 }
 
 /// A failed Compose startup together with every container Docker managed to
@@ -922,6 +1010,19 @@ fn find_occurrences(haystack: &[u8], needle: &[u8]) -> Vec<std::ops::Range<usize
         }
     }
     found
+}
+
+/// Mask every occurrence of a variable value (of at least three bytes, as for
+/// configuration errors) and every credential-shaped token in `text`. For
+/// messages built outside the executor from interpolated Compose input,
+/// such as a referenced path that contains a substituted value.
+pub fn redact_variable_text(text: &str, values: &[String]) -> String {
+    let values: Vec<String> = values
+        .iter()
+        .filter(|value| value.len() >= 3)
+        .cloned()
+        .collect();
+    redact_compose_text(text, &values)
 }
 
 /// Mask every known sensitive value and credential-shaped token in `text`,
@@ -2301,6 +2402,7 @@ impl ComposeExecutor {
                 repository_env: None,
                 filesystem_checks: request.repo_dir.is_some(),
                 allow_cli: true,
+                defer_unknown_required: false,
             })
             .await?;
         let resolved_request = ComposeDeployRequest {
@@ -3499,10 +3601,10 @@ impl ComposeExecutor {
             (None, Some(dir)) => Self::read_repository_dotenv(dir)?,
             (None, None) => None,
         };
-        let mut variables = repository_env
-            .as_deref()
-            .map(compose_interpolation::parse_dotenv)
-            .unwrap_or_default();
+        let mut variables = match repository_env.as_deref() {
+            Some(content) => compose_interpolation::parse_dotenv(content)?,
+            None => HashMap::new(),
+        };
         variables.extend(
             input
                 .environment
@@ -3565,20 +3667,19 @@ impl ComposeExecutor {
         input: &ComposeCheckInput<'_>,
         variables: &HashMap<String, String>,
     ) -> Result<ResolvedComposeConfiguration, ComposeError> {
-        let content =
-            compose_interpolation::interpolate_document("compose file", input.content, variables)?;
+        let defer = input.defer_unknown_required;
+        let content = interpolate_for_check("compose file", input.content, variables, defer)?;
         let mut unset_variables = content.unset_variables;
         let mut referenced_variables = content.referenced_variables;
+        let mut deferred_required_variables = content.deferred_required;
         let content = content.content;
         let override_content = match input.override_content {
             Some(override_content) if !override_content.trim().is_empty() => {
-                let interpolated = compose_interpolation::interpolate_document(
-                    "compose override",
-                    override_content,
-                    variables,
-                )?;
+                let interpolated =
+                    interpolate_for_check("compose override", override_content, variables, defer)?;
                 unset_variables.extend(interpolated.unset_variables);
                 referenced_variables.extend(interpolated.referenced_variables);
+                deferred_required_variables.extend(interpolated.deferred_required);
                 Some(Self::deduplicate_override(
                     input.project_name,
                     &content,
@@ -3595,6 +3696,8 @@ impl ComposeExecutor {
             command: None,
             unset_variables,
             referenced_variables,
+            deferred_required_variables,
+            referenced_sources: Vec::new(),
             notes: Vec::new(),
         };
         if resolved.resolution_reasons.is_empty() {
@@ -3607,7 +3710,7 @@ impl ComposeExecutor {
             ));
             return Ok(resolved);
         }
-        let mut snapshots_variables = (variables.clone(), BTreeSet::new(), BTreeSet::new());
+        let mut snapshots_variables = SnapshotInterpolation::new(variables.clone(), defer);
         let (merged, command) = self
             .run_compose_config(
                 input,
@@ -3615,9 +3718,18 @@ impl ComposeExecutor {
                 resolved.override_content.as_deref(),
                 &mut snapshots_variables,
             )
-            .await?;
-        resolved.unset_variables.extend(snapshots_variables.1);
-        resolved.referenced_variables.extend(snapshots_variables.2);
+            .await
+            // Values loaded from include env files are redacted like the
+            // root variables (which the caller redacts).
+            .map_err(|error| Self::redact_values(error, &snapshots_variables.loaded_values))?;
+        resolved.unset_variables.extend(snapshots_variables.unset);
+        resolved
+            .deferred_required_variables
+            .extend(snapshots_variables.deferred_required);
+        resolved
+            .referenced_variables
+            .extend(snapshots_variables.referenced);
+        resolved.referenced_sources = snapshots_variables.sources;
         resolved.content = merged;
         resolved.override_content = None;
         resolved.command = Some(command);
@@ -3663,8 +3775,14 @@ impl ComposeExecutor {
         error: ComposeError,
         variables: &HashMap<String, String>,
     ) -> ComposeError {
-        let values: Vec<String> = variables
-            .values()
+        let values: Vec<String> = variables.values().cloned().collect();
+        Self::redact_values(error, &values)
+    }
+
+    /// [`Self::redact_variable_values`] for a list of values.
+    fn redact_values(error: ComposeError, values: &[String]) -> ComposeError {
+        let values: Vec<String> = values
+            .iter()
             .filter(|value| value.len() >= 3)
             .cloned()
             .collect();
@@ -3673,6 +3791,26 @@ impl ComposeExecutor {
         }
         let redact = |text: String| redact_compose_text(&text, &values);
         match error {
+            ComposeError::ConfigResolutionFailed {
+                project,
+                class,
+                exit_status,
+                cause,
+                diagnostics,
+            } => {
+                let diagnostics = *diagnostics;
+                ComposeError::ConfigResolutionFailed {
+                    project,
+                    class,
+                    exit_status,
+                    cause: redact(cause),
+                    diagnostics: Box::new(ComposeCommandDiagnostics {
+                        argv: diagnostics.argv.into_iter().map(redact).collect(),
+                        exit_code: diagnostics.exit_code,
+                        stderr: redact(diagnostics.stderr),
+                    }),
+                }
+            }
             ComposeError::SecurityPolicyViolation {
                 service,
                 field,
@@ -3782,6 +3920,7 @@ impl ComposeExecutor {
             repository_env: Some(request.repository_env.as_deref().unwrap_or_default()),
             filesystem_checks: false,
             allow_cli,
+            defer_unknown_required: true,
         };
         // The scratch directory only gives the config step somewhere to
         // write its temporary inputs; nothing in it is a checkout.
@@ -3795,7 +3934,10 @@ impl ComposeExecutor {
             ..self.clone_for_check()
         };
         let result = if parent_ok {
-            executor.check_configuration(&input).await
+            match Self::write_reference_files(workspace.path(), &request.reference_files) {
+                Ok(()) => executor.check_configuration(&input).await,
+                Err(error) => Err(error),
+            }
         } else {
             Err(ComposeError::InvalidComposePath {
                 field: "compose_path".to_string(),
@@ -3806,7 +3948,21 @@ impl ComposeExecutor {
         };
         match result {
             Ok(checked) => {
-                let resolution = checked.resolution;
+                let mut resolution = checked.resolution;
+                if !resolution.deferred_required_variables.is_empty() {
+                    let names: Vec<&str> = resolution
+                        .deferred_required_variables
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    resolution.notes.push(format!(
+                        "Required variable(s) {} are not set in the project environment or the repository .env. This check cannot see the values a deployment generates (linked services, secrets bindings, deployment tokens), so they were treated as supplied; the deployment fails if none of those provides them.",
+                        names.join(", ")
+                    ));
+                    resolution
+                        .unset_variables
+                        .extend(resolution.deferred_required_variables.iter().cloned());
+                }
                 ComposeCheckReport {
                     passed: true,
                     error_class: None,
@@ -3847,6 +4003,30 @@ impl ComposeExecutor {
         }
     }
 
+    /// Place the repository files a check fetched (include/extends targets
+    /// and include env files) into its scratch directory, so references
+    /// resolve as they would in a checkout. Paths are relative to the
+    /// Compose project directory and are written through the confined-write
+    /// guard.
+    fn write_reference_files(
+        workspace: &Path,
+        files: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), ComposeError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let root = std::fs::canonicalize(workspace)?;
+        for (path, content) in files {
+            Self::validate_relative_path(path, "Compose reference")?;
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(root.join(parent))?;
+            }
+            let target = Self::confined_write_path(&root, Path::new(path), "Compose reference")?;
+            std::fs::write(target, content)?;
+        }
+        Ok(())
+    }
+
     /// An executor sharing this one's Docker handle and data directory.
     fn clone_for_check(&self) -> Self {
         Self {
@@ -3879,6 +4059,7 @@ impl ComposeExecutor {
                 repository_env: None,
                 filesystem_checks: project_dir.is_some(),
                 allow_cli: true,
+                defer_unknown_required: false,
             })
             .await?;
         Ok((checked.content, checked.override_content))
@@ -3991,77 +4172,84 @@ impl ComposeExecutor {
             .prefix(".temps-compose-env-")
             .tempfile_in(&base)?;
         std::fs::write(variables.path(), render_env_file(input.environment)?)?;
-        let mut cmd = isolated_docker_command();
-        cmd.args(["compose", "-p", project_name, "--project-directory"])
-            .arg(&base)
-            .arg("-f")
-            .arg(&input_file);
-        if let Some(reset) = &port_reset {
-            cmd.arg("-f").arg(reset.path());
-        }
-        if let Some(inline) = inline {
-            cmd.arg("-f").arg(inline);
-        }
-        let env = canonical_root.join(".env");
-        if env.exists() {
-            let env = Self::confined_reference(&canonical_root, &canonical_root, ".env")?;
-            cmd.arg("--env-file").arg(env);
-        }
-        // Platform environment values override repository defaults, matching deployment.
-        cmd.arg("--env-file").arg(variables.path());
-        // Values were substituted (and `$` escaped) before this step;
-        // `--no-interpolate` keeps Compose from substituting a second time.
-        cmd.arg("config")
-            .args(COMPOSE_CONFIG_FLAGS)
-            .current_dir(&base);
-        let redact_values: Vec<String> = input
-            .environment
+        let repository_env = if canonical_root.join(".env").exists() {
+            Some(Self::confined_reference(
+                &canonical_root,
+                &canonical_root,
+                ".env",
+            )?)
+        } else {
+            None
+        };
+        let config_command = |flags: &[&str]| {
+            let mut cmd = isolated_docker_command();
+            cmd.args(["compose", "-p", project_name, "--project-directory"])
+                .arg(&base)
+                .arg("-f")
+                .arg(&input_file);
+            if let Some(reset) = &port_reset {
+                cmd.arg("-f").arg(reset.path());
+            }
+            if let Some(inline) = &inline {
+                cmd.arg("-f").arg(inline);
+            }
+            if let Some(env) = &repository_env {
+                cmd.arg("--env-file").arg(env);
+            }
+            // Platform environment values override repository defaults, matching deployment.
+            cmd.arg("--env-file").arg(variables.path());
+            cmd.arg("config").args(flags).current_dir(&base);
+            cmd
+        };
+        // Every value Compose could echo back: the repository `.env` values
+        // as well as the project environment, since both were substituted.
+        let redact_values: Vec<String> = interpolation
+            .variables
             .values()
+            .chain(&interpolation.loaded_values)
+            .chain(input.environment.values())
             .filter(|value| !value.is_empty())
             .cloned()
             .collect();
-        let argv = command_argv(&cmd, &redact_values);
-        let output = Self::bounded_command_output(
-            cmd,
-            COMPOSE_CONFIG_TIMEOUT,
+        // Values were substituted (and `$` escaped) before this step;
+        // `--no-interpolate` keeps Compose from substituting a second time.
+        let (resolved, diagnostics) = self
+            .run_config_pass(
+                config_command(COMPOSE_CONFIG_FLAGS),
+                project_name,
+                &redact_values,
+            )
+            .await?;
+        // `--no-interpolate` also skips Compose's model consistency checks
+        // (undefined `depends_on` targets, networks, volumes, secrets), so
+        // the same files are validated once more with interpolation on.
+        // Nothing is left to substitute, so this only adds those checks.
+        self.run_config_pass(
+            config_command(COMPOSE_CONSISTENCY_FLAGS),
             project_name,
-            "resolve Compose security configuration",
+            &redact_values,
         )
         .await?;
-        let diagnostics = ComposeCommandDiagnostics {
-            argv,
-            exit_code: output.status.code(),
-            stderr: sanitize_config_stderr(&output.stderr, &redact_values),
-        };
-        if !output.status.success() {
-            let (class, cause) =
-                classify_compose_config_failure_with_status(&output.stderr, output.status.code());
-            return Err(ComposeError::ConfigResolutionFailed {
-                project: project_name.to_string(),
-                class,
-                exit_status: output
-                    .status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "terminated by signal".to_string()),
-                cause,
-                diagnostics: Box::new(diagnostics),
-            });
-        }
         let resolved =
-            String::from_utf8(output.stdout).map_err(|error| ComposeError::InvalidComposeYaml {
+            String::from_utf8(resolved).map_err(|error| ComposeError::InvalidComposeYaml {
                 compose_source: project_name.to_string(),
                 reason: format!("resolved configuration is not UTF-8: {error}"),
             })?;
         // Idempotent for the substituted files; resolves anything Compose
         // pulled in that was not snapshotted (none today, defensively).
-        let reinterpolated = compose_interpolation::interpolate_document(
+        let reinterpolated = interpolate_for_check(
             "resolved Compose configuration",
             &resolved,
-            &interpolation.0,
+            &interpolation.variables,
+            interpolation.defer_required,
         )?;
-        interpolation.1.extend(reinterpolated.unset_variables);
-        interpolation.2.extend(reinterpolated.referenced_variables);
+        interpolation
+            .deferred_required
+            .extend(reinterpolated.deferred_required);
+        interpolation.unset.extend(reinterpolated.unset_variables);
+        interpolation
+            .referenced
+            .extend(reinterpolated.referenced_variables);
         let resolved = reinterpolated.content;
         self.validate_compose_security_policy("resolved Compose configuration", &resolved)?;
         if input.filesystem_checks || project_dir.is_none() {
@@ -4093,6 +4281,46 @@ impl ComposeExecutor {
             }
         }
         Ok((resolved, diagnostics))
+    }
+
+    /// Run one `docker compose config` invocation with a bounded timeout.
+    /// Returns stdout and the sanitized diagnostics, or a classified
+    /// [`ComposeError::ConfigResolutionFailed`] carrying them.
+    async fn run_config_pass(
+        &self,
+        cmd: tokio::process::Command,
+        project_name: &str,
+        redact_values: &[String],
+    ) -> Result<(Vec<u8>, ComposeCommandDiagnostics), ComposeError> {
+        let argv = command_argv(&cmd, redact_values);
+        let output = Self::bounded_command_output(
+            cmd,
+            COMPOSE_CONFIG_TIMEOUT,
+            project_name,
+            "resolve Compose security configuration",
+        )
+        .await?;
+        let diagnostics = ComposeCommandDiagnostics {
+            argv,
+            exit_code: output.status.code(),
+            stderr: sanitize_config_stderr(&output.stderr, redact_values),
+        };
+        if !output.status.success() {
+            let (class, cause) =
+                classify_compose_config_failure_with_status(&output.stderr, output.status.code());
+            return Err(ComposeError::ConfigResolutionFailed {
+                project: project_name.to_string(),
+                class,
+                exit_status: output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string()),
+                cause,
+                diagnostics: Box::new(diagnostics),
+            });
+        }
+        Ok((output.stdout, diagnostics))
     }
 
     /// The workflow removes its checkout after deployment. Image builds and env
@@ -4227,63 +4455,8 @@ impl ComposeExecutor {
         }
         if let Some(includes) = yaml.get_mut("include").and_then(Value::as_sequence_mut) {
             for include in includes {
-                if include.is_string() {
-                    self.snapshot_compose_reference(scope, base, include, None, snapshots)
-                        .await?;
-                } else {
-                    let project_directory = include
-                        .get("project_directory")
-                        .and_then(Value::as_str)
-                        .map(|directory| Self::confined_reference(scope, base, directory))
-                        .transpose()?;
-                    if let Some(directory) = &project_directory {
-                        if self.enforced(PolicyCheck::EnvFiles)
-                            && directory.join(".env").symlink_metadata().is_ok()
-                        {
-                            Self::confined_reference(scope, directory, ".env")?;
-                        }
-                    }
-                    if self.enforced(PolicyCheck::EnvFiles) {
-                        if let Some(env) = include.get("env_file") {
-                            for file in env.as_str().into_iter().chain(
-                                env.as_sequence()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(Value::as_str),
-                            ) {
-                                Self::confined_reference(scope, base, file)?;
-                            }
-                        }
-                    }
-                    if let Some(path) = include.get_mut("path") {
-                        if let Some(paths) = path.as_sequence_mut() {
-                            let mut working_directory = project_directory.clone();
-                            for path in paths {
-                                let snapshot = self
-                                    .snapshot_compose_reference(
-                                        scope,
-                                        base,
-                                        path,
-                                        working_directory.as_deref(),
-                                        snapshots,
-                                    )
-                                    .await?;
-                                if working_directory.is_none() {
-                                    working_directory = snapshot.parent().map(Path::to_path_buf);
-                                }
-                            }
-                        } else {
-                            self.snapshot_compose_reference(
-                                scope,
-                                base,
-                                path,
-                                project_directory.as_deref(),
-                                snapshots,
-                            )
-                            .await?;
-                        }
-                    }
-                }
+                self.snapshot_include(scope, base, include, snapshots)
+                    .await?;
             }
         }
         let file = tempfile::Builder::new()
@@ -4299,6 +4472,274 @@ impl ComposeExecutor {
         std::fs::write(&path, serialized)?;
         snapshots.files.push(file);
         Ok(path)
+    }
+
+    /// Snapshot the files one `include` item pulls in. They are interpolated
+    /// with this document's variables plus the item's own env files, as
+    /// Compose does. The main file is located first: a remote include's
+    /// project directory, and so its `.env`, exist only once materialized.
+    async fn snapshot_include(
+        &self,
+        scope: &Path,
+        base: &Path,
+        include: &mut Value,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<(), ComposeError> {
+        let main = include
+            .as_str()
+            .or_else(|| {
+                include.get("path").and_then(|path| {
+                    path.as_str()
+                        .or_else(|| path.as_sequence()?.first()?.as_str())
+                })
+            })
+            .map(str::to_string);
+        let located = match &main {
+            Some(file) => Some(self.locate_reference(scope, base, file, snapshots).await?),
+            None => None,
+        };
+        let scoped = Self::include_variables(scope, base, include, located.as_ref(), snapshots)?;
+        let previous = scoped.map(|(variables, scope_id)| {
+            (
+                std::mem::replace(&mut snapshots.interpolation.variables, variables),
+                std::mem::replace(&mut snapshots.interpolation.scope_id, scope_id),
+            )
+        });
+        let result = self
+            .snapshot_include_files(scope, base, include, snapshots)
+            .await;
+        if let Some((variables, scope_id)) = previous {
+            snapshots.interpolation.variables = variables;
+            snapshots.interpolation.scope_id = scope_id;
+        }
+        result
+    }
+
+    async fn snapshot_include_files(
+        &self,
+        scope: &Path,
+        base: &Path,
+        include: &mut Value,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<(), ComposeError> {
+        if include.is_string() {
+            self.snapshot_compose_reference(scope, base, include, None, snapshots)
+                .await?;
+            return Ok(());
+        }
+        let project_directory = include
+            .get("project_directory")
+            .and_then(Value::as_str)
+            .map(|directory| Self::confined_reference(scope, base, directory))
+            .transpose()?;
+        if let Some(directory) = &project_directory {
+            if self.enforced(PolicyCheck::EnvFiles)
+                && directory.join(".env").symlink_metadata().is_ok()
+            {
+                Self::confined_reference(scope, directory, ".env")?;
+            }
+        }
+        if self.enforced(PolicyCheck::EnvFiles) {
+            for file in Self::include_env_files(include) {
+                Self::confined_reference(scope, base, file)?;
+            }
+        }
+        if let Some(path) = include.get_mut("path") {
+            if let Some(paths) = path.as_sequence_mut() {
+                let mut working_directory = project_directory.clone();
+                for path in paths {
+                    let snapshot = self
+                        .snapshot_compose_reference(
+                            scope,
+                            base,
+                            path,
+                            working_directory.as_deref(),
+                            snapshots,
+                        )
+                        .await?;
+                    if working_directory.is_none() {
+                        working_directory = snapshot.parent().map(Path::to_path_buf);
+                    }
+                }
+            } else {
+                self.snapshot_compose_reference(
+                    scope,
+                    base,
+                    path,
+                    project_directory.as_deref(),
+                    snapshots,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `env_file` entries of a long-form `include` item.
+    fn include_env_files(include: &Value) -> Vec<&str> {
+        let Some(env) = include.get("env_file") else {
+            return Vec::new();
+        };
+        env.as_str()
+            .into_iter()
+            .chain(
+                env.as_sequence()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .collect()
+    }
+
+    /// Variables for the files an `include` item pulls in: the including
+    /// document's variables, plus the item's `env_file` entries (relative to
+    /// the including file) or else the `.env` in the item's project directory
+    /// (`project_directory`, or the main file's directory, which for a remote
+    /// include is inside its materialized source). As in Compose, values the
+    /// including document already sets win, and each env file sees the values
+    /// earlier ones loaded. `None` when no env file adds anything, in which
+    /// case the included files see the including document's variables.
+    ///
+    /// Scopes are cached for the whole resolution and their combined size is
+    /// bounded by [`MAX_INCLUDE_ENVIRONMENT_BYTES`].
+    fn include_variables(
+        scope: &Path,
+        base: &Path,
+        include: &Value,
+        main: Option<&(PathBuf, PathBuf)>,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<IncludeScope, ComposeError> {
+        let Some((main_path, main_scope)) = main else {
+            return Ok(None);
+        };
+        let explicit = Self::include_env_files(include);
+        let files: Vec<PathBuf> = if explicit.is_empty() {
+            let (directory, directory_scope) =
+                match include.get("project_directory").and_then(Value::as_str) {
+                    Some(directory) => (
+                        Self::confined_reference(scope, base, directory)?,
+                        scope.to_path_buf(),
+                    ),
+                    None => match main_path.parent() {
+                        Some(parent) => (parent.to_path_buf(), std::fs::canonicalize(main_scope)?),
+                        None => return Ok(None),
+                    },
+                };
+            if directory.join(".env").symlink_metadata().is_err() {
+                return Ok(None);
+            }
+            vec![Self::confined_reference(
+                &directory_scope,
+                &directory,
+                ".env",
+            )?]
+        } else {
+            explicit
+                .into_iter()
+                .filter(|file| *file != "/dev/null")
+                .map(|file| Self::confined_reference(scope, base, file))
+                .collect::<Result<_, _>>()?
+        };
+        let interpolation = &mut snapshots.interpolation;
+        let key = (interpolation.scope_id, files);
+        if let Some(cached) = interpolation.include_scopes.get(&key) {
+            return Ok(cached.clone());
+        }
+        let mut loaded: HashMap<String, String> = HashMap::new();
+        for file in &key.1 {
+            let metadata = std::fs::metadata(file)?;
+            if !metadata.is_file()
+                || metadata.len() > compose_interpolation::MAX_DOTENV_BYTES as u64
+            {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "include.env_file".to_string(),
+                    path: file
+                        .strip_prefix(scope)
+                        .unwrap_or(file)
+                        .display()
+                        .to_string(),
+                    reason: format!(
+                        "include env files must be regular files of at most {} bytes",
+                        compose_interpolation::MAX_DOTENV_BYTES
+                    ),
+                });
+            }
+            let content = std::fs::read_to_string(file)?;
+            loaded = compose_interpolation::parse_dotenv_layered(
+                &content,
+                &interpolation.variables,
+                loaded,
+            )?;
+        }
+        let scoped = if loaded.is_empty() {
+            None
+        } else {
+            let mut variables = HashMap::clone(&interpolation.variables);
+            let mut values = Vec::new();
+            for (key, value) in loaded {
+                if !value.is_empty() {
+                    values.push(value.clone());
+                }
+                variables.entry(key).or_insert(value);
+            }
+            let size: usize = variables
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .chain(values.iter().map(String::len))
+                .sum();
+            interpolation.include_bytes = interpolation.include_bytes.saturating_add(size);
+            if interpolation.include_bytes > MAX_INCLUDE_ENVIRONMENT_BYTES {
+                return Err(ComposeError::Interpolation(InterpolationError::TooLarge {
+                    location: "include env_file".to_string(),
+                    limit: MAX_INCLUDE_ENVIRONMENT_BYTES,
+                }));
+            }
+            interpolation.loaded_values.extend(values);
+            let mut entries: Vec<(&String, &String)> = variables.iter().collect();
+            entries.sort();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&entries, &mut hasher);
+            Some((Arc::new(variables), std::hash::Hasher::finish(&hasher)))
+        };
+        interpolation.include_scopes.insert(key, scoped.clone());
+        Ok(scoped)
+    }
+
+    /// Where a Compose reference lives: `(file, scope)`, with remote sources
+    /// materialized (once per resolution) and local files confined to the
+    /// checkout.
+    async fn locate_reference(
+        &self,
+        scope: &Path,
+        base: &Path,
+        file: &str,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<(PathBuf, PathBuf), ComposeError> {
+        if Self::contains_interpolation(file) {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<reference>".to_string(),
+                reason: "Compose reference paths must not contain interpolation".to_string(),
+            });
+        }
+        if file.contains("://") || file.starts_with("git@") {
+            if let Some(paths) = snapshots.remote.get(file) {
+                return Ok(paths.clone());
+            }
+            if snapshots.remote.len() >= 4 {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(), path: "<remote sources>".to_string(),
+                    reason: "at most four remote Compose sources may be resolved per deployment; vendor additional sources into the checkout".to_string(),
+                });
+            }
+            let paths = crate::compose_remote::materialize(file, snapshots.cache.path()).await?;
+            snapshots.remote.insert(file.to_string(), paths.clone());
+            return Ok(paths);
+        }
+        Ok((
+            Self::confined_reference(scope, base, file)?,
+            scope.to_path_buf(),
+        ))
     }
 
     async fn snapshot_compose_reference(
@@ -4317,34 +4758,7 @@ impl ComposeExecutor {
                 reason: "Compose reference must be a literal file path or supported HTTPS Git URL"
                     .to_string(),
             })?;
-        if Self::contains_interpolation(file) {
-            return Err(ComposeError::InvalidComposePath {
-                field: "Compose reference".to_string(),
-                path: "<reference>".to_string(),
-                reason: "Compose reference paths must not contain interpolation".to_string(),
-            });
-        }
-        let (path, scope) = if file.contains("://") || file.starts_with("git@") {
-            if let Some(paths) = snapshots.remote.get(file) {
-                paths.clone()
-            } else {
-                if snapshots.remote.len() >= 4 {
-                    return Err(ComposeError::InvalidComposePath {
-                        field: "Compose reference".to_string(), path: "<remote sources>".to_string(),
-                        reason: "at most four remote Compose sources may be resolved per deployment; vendor additional sources into the checkout".to_string(),
-                    });
-                }
-                let paths =
-                    crate::compose_remote::materialize(file, snapshots.cache.path()).await?;
-                snapshots.remote.insert(file.to_string(), paths.clone());
-                paths
-            }
-        } else {
-            (
-                Self::confined_reference(scope, base, file)?,
-                scope.to_path_buf(),
-            )
-        };
+        let (path, scope) = self.locate_reference(scope, base, file, snapshots).await?;
         let scope = std::fs::canonicalize(scope)?;
         let directory = working_directory.or_else(|| path.parent()).ok_or_else(|| {
             ComposeError::InvalidComposePath {
@@ -4354,7 +4768,11 @@ impl ComposeExecutor {
             }
         })?;
         let directory = Self::confined_reference(&scope, &scope, &directory.to_string_lossy())?;
-        let key = (path.clone(), directory.clone());
+        let key = (
+            path.clone(),
+            directory.clone(),
+            snapshots.interpolation.scope_id,
+        );
         let snapshot = if let Some(snapshot) = snapshots.resolved.get(&key) {
             snapshot.clone()
         } else {
@@ -4381,20 +4799,31 @@ impl ComposeExecutor {
                 });
             }
             let content = std::fs::read_to_string(&path)?;
-            // Referenced files are interpolated with the same variables as
-            // the root file, so their values are validated as deployed.
-            let interpolated = compose_interpolation::interpolate_document(
+            let interpolation = &mut snapshots.interpolation;
+            if interpolation.sources_bytes + content.len() <= MAX_RESOLVED_COMPOSE_CONFIG_BYTES {
+                interpolation.sources_bytes += content.len();
+                interpolation.sources.push(content.clone());
+            }
+            // Referenced files are interpolated with the variables in scope
+            // (the root file's, plus an include's env file), so their values
+            // are validated as deployed.
+            let interpolated = interpolate_for_check(
                 "Compose reference",
                 &content,
-                &snapshots.interpolation.0,
+                &snapshots.interpolation.variables,
+                snapshots.interpolation.defer_required,
             )?;
             snapshots
                 .interpolation
-                .1
+                .deferred_required
+                .extend(interpolated.deferred_required);
+            snapshots
+                .interpolation
+                .unset
                 .extend(interpolated.unset_variables);
             snapshots
                 .interpolation
-                .2
+                .referenced
                 .extend(interpolated.referenced_variables);
             let content = interpolated.content;
             let snapshot =
@@ -16606,6 +17035,295 @@ services:
         ));
     }
 
+    fn compose_cli_available() -> bool {
+        std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+    }
+
+    #[tokio::test]
+    async fn included_files_are_interpolated_with_their_own_env_file() {
+        if !compose_cli_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        std::fs::write(
+            root.path().join("child/compose.yml"),
+            "services:\n  child:\n    image: nginx:alpine\n    environment:\n      GREETING: ${GREETING:-fallback}\n      REQUIRED: ${REQUIRED:?set it}\n      SHARED: ${SHARED}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("child/.env"),
+            "GREETING=from-child\nREQUIRED=present\nSHARED=from-child\n",
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        let environment = HashMap::from([("SHARED".to_string(), "from-project".to_string())]);
+        for content in [
+            "include: [child/compose.yml]",
+            "include:\n  - path: child/compose.yml\n",
+            "include:\n  - path: child/compose.yml\n    env_file: child/.env\n",
+        ] {
+            let (resolved, _) = executor
+                .resolve_security_configuration(
+                    "include-env-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    content,
+                    None,
+                    &environment,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{content}: {error}"));
+            let value: Value = serde_yaml::from_str(&resolved).unwrap();
+            let env = &value["services"]["child"]["environment"];
+            assert_eq!(env["GREETING"].as_str(), Some("from-child"), "{content}");
+            assert_eq!(env["REQUIRED"].as_str(), Some("present"), "{content}");
+            // The including project's variables win over the include's file.
+            assert_eq!(env["SHARED"].as_str(), Some("from-project"), "{content}");
+        }
+    }
+
+    /// Contents of every snapshot written so far.
+    fn snapshot_contents(snapshots: &ComposeReferenceSnapshots) -> Vec<String> {
+        snapshots
+            .files
+            .iter()
+            .map(|file| std::fs::read_to_string(file.path()).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn later_include_env_files_build_on_earlier_ones() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("child.yml"),
+            "services: {child: {image: alpine, environment: {RESULT: '${RESULT}'}}}",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("first.env"), "BASE=from-first\n").unwrap();
+        std::fs::write(root.path().join("second.env"), "RESULT=${BASE}-second\n").unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        snapshots.interpolation = SnapshotInterpolation::new(HashMap::new(), false);
+        executor
+            .snapshot_compose_document(
+                root.path(),
+                root.path(),
+                "include:\n  - path: child.yml\n    env_file: [first.env, second.env]\n",
+                &mut snapshots,
+            )
+            .await
+            .unwrap();
+        let contents = snapshot_contents(&snapshots).join("\n");
+        assert!(contents.contains("from-first-second"), "{contents}");
+    }
+
+    #[tokio::test]
+    async fn remote_includes_are_interpolated_with_their_own_environment() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("local.env"), "EXPLICIT=from-local\n").unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        for (content, expected) in [
+            // The materialized source's own `.env`.
+            ("include: ['https://github.com/example/stack.git']", "from-remote"),
+            // An explicit env_file, relative to the including file.
+            (
+                "include:\n  - path: https://github.com/example/stack.git\n    env_file: local.env\n",
+                "from-local",
+            ),
+        ] {
+            let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+            snapshots.interpolation = SnapshotInterpolation::new(HashMap::new(), false);
+            let remote = snapshots.cache.path().join("repository");
+            std::fs::create_dir(&remote).unwrap();
+            std::fs::write(
+                remote.join("compose.yml"),
+                "services: {child: {image: alpine, environment: {GREETING: '${GREETING:-fallback}', EXPLICIT: '${EXPLICIT:-fallback}', REQUIRED: '${REQUIRED:?set it}'}}}",
+            )
+            .unwrap();
+            std::fs::write(
+                remote.join(".env"),
+                "GREETING=from-remote\nEXPLICIT=from-remote\nREQUIRED=present\n",
+            )
+            .unwrap();
+            if content.contains("env_file") {
+                // With an explicit env_file the source's `.env` is not read.
+                std::fs::write(remote.join(".env"), "").unwrap();
+                std::fs::write(
+                    root.path().join("local.env"),
+                    "EXPLICIT=from-local\nREQUIRED=present\n",
+                )
+                .unwrap();
+            }
+            snapshots.remote.insert(
+                "https://github.com/example/stack.git".to_string(),
+                (remote.join("compose.yml"), remote.clone()),
+            );
+            executor
+                .snapshot_compose_document(root.path(), root.path(), content, &mut snapshots)
+                .await
+                .unwrap_or_else(|error| panic!("{content}: {error}"));
+            let contents = snapshot_contents(&snapshots).join("\n");
+            assert!(
+                contents.contains(&format!("EXPLICIT: {expected}")),
+                "{content}: {contents}"
+            );
+            assert!(contents.contains("REQUIRED: present"), "{content}: {contents}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_includes_reuse_one_bounded_environment() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        std::fs::write(
+            root.path().join("child/compose.yml"),
+            "services: {child: {image: alpine}}",
+        )
+        .unwrap();
+        // Each line doubles the previous value: ~2 MiB of values per parse.
+        let mut doubling = String::from("A0=xxxxxxxxxxxxxxxx\n");
+        for index in 1..=16 {
+            doubling.push_str(&format!(
+                "A{index}=${{A{}}}${{A{}}}\n",
+                index - 1,
+                index - 1
+            ));
+        }
+        std::fs::write(root.path().join("child/.env"), &doubling).unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+
+        // The same include repeated many times parses its env file once and
+        // holds its values once.
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        snapshots.interpolation = SnapshotInterpolation::new(HashMap::new(), false);
+        let repeated = format!("include:\n{}", "  - child/compose.yml\n".repeat(512));
+        executor
+            .snapshot_compose_document(root.path(), root.path(), &repeated, &mut snapshots)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.interpolation.include_scopes.len(), 1);
+        assert_eq!(snapshots.interpolation.loaded_values.len(), 17);
+
+        // Distinct environments are charged to one budget for the whole
+        // resolution.
+        for index in 0..8 {
+            std::fs::write(root.path().join(format!("child/{index}.env")), &doubling).unwrap();
+        }
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        snapshots.interpolation = SnapshotInterpolation::new(HashMap::new(), false);
+        let distinct: String = (0..8)
+            .map(|index| format!("  - path: child/compose.yml\n    env_file: child/{index}.env\n"))
+            .collect();
+        let error = executor
+            .snapshot_compose_document(
+                root.path(),
+                root.path(),
+                &format!("include:\n{distinct}"),
+                &mut snapshots,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ComposeError::Interpolation(InterpolationError::TooLarge { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_returns_the_referenced_files_as_written() {
+        if !compose_cli_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("stack")).unwrap();
+        let child = "services:\n  web:\n    image: nginx:alpine\n    environment:\n      NAME: ${APP_NAME}\n    healthcheck:\n      test: [CMD, curl, -f, 'http://localhost:8080/api/health']\n";
+        std::fs::write(root.path().join("stack/web.yaml"), child).unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        let environment = HashMap::from([("APP_NAME".to_string(), "api".to_string())]);
+        let resolved = executor
+            .resolve_configuration(&ComposeCheckInput {
+                project_name: "temps-referenced-sources-test",
+                project_dir: Some(root.path()),
+                compose_file: "compose.yml",
+                content: "include: [stack/web.yaml]\n",
+                override_content: None,
+                excluded_services: &[],
+                environment: &environment,
+                repository_env: None,
+                filesystem_checks: true,
+                allow_cli: true,
+                defer_unknown_required: false,
+            })
+            .await
+            .unwrap();
+        // The included file before substitution, so a literal health path
+        // there can be told apart from a substituted value.
+        assert_eq!(resolved.referenced_sources, vec![child.to_string()]);
+        assert!(
+            resolved.content.contains("NAME: api"),
+            "{}",
+            resolved.content
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_env_values_never_reach_config_diagnostics() {
+        if !compose_cli_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".env"), "PASSWORD=repo-only-secret\n").unwrap();
+        let executor = executor_with_checks_disabled(&[]);
+        let error = executor
+            .resolve_security_configuration(
+                "temps-config-redaction-test",
+                Some(root.path()),
+                "compose.yml",
+                "services: {web: {image: nginx, volumes: ['${PASSWORD}::']}}",
+                Some("services: {web: {environment: {CHECK: 'yes'}}}"),
+                &HashMap::from([("UNRELATED".to_string(), "platform-value".to_string())]),
+            )
+            .await
+            .unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains("repo-only-secret"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn resolution_keeps_compose_consistency_checks() {
+        if !compose_cli_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[]);
+        let error = executor
+            .resolve_security_configuration(
+                "temps-config-consistency-test",
+                Some(root.path()),
+                "compose.yml",
+                "services: {app: {image: nginx, depends_on: [missing]}}",
+                Some("services: {app: {environment: {CHECK: 'yes'}}}"),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        let ComposeError::ConfigResolutionFailed {
+            class, diagnostics, ..
+        } = &error
+        else {
+            panic!("expected a config resolution failure, got {error}");
+        };
+        assert_eq!(*class, ComposeConfigFailureClass::UndefinedDependency);
+        assert!(diagnostics.argv.iter().any(|arg| arg == "--quiet"));
+    }
+
     // ── Deploy-success regressions: anonymous volumes, one-shot services,
     //    subdirectory compose files, shared command inputs ─────────────────
 
@@ -17052,6 +17770,7 @@ services:
             repository_env: None,
             filesystem_checks: true,
             allow_cli: true,
+            defer_unknown_required: false,
         }
     }
 
@@ -17342,6 +18061,76 @@ services:
     }
 
     #[tokio::test]
+    async fn checks_without_a_checkout_resolve_fetched_reference_files() {
+        if !compose_cli_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executor = disabled_executor(root.path().join("data"));
+        let request =
+            |reference_files: std::collections::BTreeMap<String, String>| ComposeCheckRequest {
+                project_name: "temps-reference-check".to_string(),
+                compose_file: "compose.yaml".to_string(),
+                content: "include: [stack/shared.yaml]\n".to_string(),
+                policy: ComposeSecurityPolicy {
+                    disabled_checks: [PolicyCheck::Include].into_iter().collect(),
+                },
+                reference_files,
+                ..Default::default()
+            };
+        let files = std::collections::BTreeMap::from([
+            (
+                "stack/shared.yaml".to_string(),
+                "services:\n  proxy:\n    image: nginx:alpine\n    environment:\n      GREETING: ${GREETING:?set in stack/.env}\n".to_string(),
+            ),
+            ("stack/.env".to_string(), "GREETING=hello\n".to_string()),
+        ]);
+        let report = executor.check_report(request(files)).await;
+        assert!(report.passed, "{:?}", report.error);
+        assert!(report.resolution_ran);
+        // Without the referenced file the check fails exactly as a checkout
+        // missing it would.
+        let report = executor.check_report(request(Default::default())).await;
+        assert!(!report.passed);
+        assert_eq!(
+            report.error_class,
+            Some(ComposeCheckErrorClass::InvalidPath)
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_outside_a_deployment_defer_variables_only_it_can_supply() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = disabled_executor(root.path().join("data"));
+        let content = "services:\n  app:\n    image: ghcr.io/example/app:1\n    environment:\n      DATABASE_URL: ${POSTGRES_URL:?database required}\n";
+        let report = executor
+            .check_report(ComposeCheckRequest {
+                project_name: "temps-deferred-check".to_string(),
+                compose_file: "compose.yaml".to_string(),
+                content: content.to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(report.passed, "{:?}", report.error);
+        assert!(report.unset_variables.contains(&"POSTGRES_URL".to_string()));
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("POSTGRES_URL") && note.contains("linked services")));
+        // The deployment itself still fails on it.
+        let environment = HashMap::new();
+        let error = executor
+            .check_configuration(&ComposeCheckInput {
+                content,
+                allow_cli: false,
+                ..idiomatic_input(root.path(), &environment, None)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.class(), ComposeCheckErrorClass::Interpolation);
+    }
+
+    #[tokio::test]
     async fn override_lists_repeating_the_repository_file_are_not_duplicated() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".env"), "A=1\n").unwrap();
@@ -17352,6 +18141,7 @@ services:
             .resolve_configuration(&ComposeCheckInput {
                 content,
                 allow_cli: false,
+                defer_unknown_required: false,
                 ..idiomatic_input(root.path(), &environment, Some(override_content))
             })
             .await

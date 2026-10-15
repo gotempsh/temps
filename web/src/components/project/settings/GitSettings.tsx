@@ -537,6 +537,9 @@ function GitSettingsInline({
   const composePreviewQuery = useQuery({
     queryKey: [
       'effective-compose-preview',
+      // Connected previews check against this project's saved environment,
+      // so two projects on the same repository must not share a result.
+      project.id,
       repositoryData?.id,
       publicProvider,
       publicRepository?.instanceUrl,

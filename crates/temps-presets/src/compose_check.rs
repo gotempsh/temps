@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use temps_entities::compose_security::ComposeSecurityPolicy;
 use thiserror::Error;
 
@@ -161,6 +161,187 @@ pub struct ComposeCheckRequest {
     pub environment: HashMap<String, String>,
     /// Contents of the repository `.env`, when known.
     pub repository_env: Option<String>,
+    /// Where the files came from. When set, the checker fetches the files
+    /// `include` and `extends` reference (and include env files) at the same
+    /// revision before checking, so they resolve as they do in a checkout.
+    pub repository: Option<ComposeRepositorySource>,
+    /// Files the Compose file references, keyed by path relative to the
+    /// Compose project directory. Filled from `repository` by the checker.
+    pub reference_files: BTreeMap<String, String>,
+}
+
+/// A repository revision a check reads its files from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeRepositorySource {
+    pub connection_id: i32,
+    pub owner: String,
+    pub name: String,
+    pub git_ref: String,
+    /// Compose project directory inside the repository; `.` for the root.
+    pub directory: String,
+}
+
+/// A repository file a Compose document refers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeLocalReference {
+    /// Normalized path relative to the Compose project directory.
+    pub path: String,
+    /// Whether the file may be absent (an include's implicit `.env`).
+    pub optional: bool,
+}
+
+/// One `include` item's local files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeIncludeReference {
+    /// The included Compose files in order, normalized relative to the
+    /// Compose project directory. Remote and out-of-project paths are left
+    /// out; resolution fetches or rejects those itself.
+    pub paths: Vec<String>,
+    /// Directory the included files' own references resolve against (`""`
+    /// for the project directory itself). `None` when the main file is not
+    /// a local file.
+    pub project_directory: Option<String>,
+    /// The item's `env_file` entries in load order, or else the optional
+    /// `.env` in its project directory. Their values are visible to the
+    /// included files only, and never override the including document's.
+    pub env_files: Vec<ComposeLocalReference>,
+}
+
+/// Local files one Compose document pulls in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComposeLocalReferences {
+    /// `extends.file` documents, which resolve their references against
+    /// their own directory and share the document's variables.
+    pub extends: Vec<String>,
+    pub includes: Vec<ComposeIncludeReference>,
+}
+
+/// Local files a Compose document pulls in: `extends.file`, `include` paths
+/// and include `env_file` entries (or the implicit `.env` in the include's
+/// project directory). `base` is the directory the document's references
+/// resolve against, relative to the project directory (`""` for the
+/// project directory itself).
+///
+/// `content` must already be interpolated, as resolution interpolates a
+/// document before reading the paths it references; a path written as
+/// `${DIR:-stack}/shared.yaml` is only known once that has happened.
+/// Remote sources, absolute paths and paths that leave the project
+/// directory are not listed; resolution rejects or fetches those itself,
+/// exactly as it does for a checkout.
+pub fn compose_local_references(base: &str, content: &str) -> ComposeLocalReferences {
+    use serde_yaml::Value;
+    let mut references = ComposeLocalReferences::default();
+    let Ok(mut root) = serde_yaml::from_str::<Value>(content) else {
+        return references;
+    };
+    let _ = root.apply_merge();
+    if let Some(services) = root.get("services").and_then(Value::as_mapping) {
+        for service in services.values() {
+            if let Some(file) = service
+                .get("extends")
+                .and_then(|extends| extends.get("file"))
+                .and_then(Value::as_str)
+                .and_then(|file| join_file(base, file))
+            {
+                references.extends.push(file);
+            }
+        }
+    }
+    for include in root
+        .get("include")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+    {
+        let raw_paths: Vec<&str> = match include {
+            Value::String(path) => vec![path.as_str()],
+            _ => match include.get("path") {
+                Some(Value::String(path)) => vec![path.as_str()],
+                Some(Value::Sequence(paths)) => paths.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            },
+        };
+        let Some(main) = raw_paths.first() else {
+            continue;
+        };
+        let main = join_file(base, main);
+        let project_directory = match include.get("project_directory").and_then(Value::as_str) {
+            Some(directory) => join_directory(base, directory),
+            None => main.as_deref().map(parent_directory),
+        };
+        let explicit: Vec<&str> = match include.get("env_file") {
+            Some(Value::String(file)) => vec![file.as_str()],
+            Some(Value::Sequence(files)) => files.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let env_files = if explicit.is_empty() {
+            project_directory
+                .as_deref()
+                .and_then(|directory| join_file(directory, ".env"))
+                .map(|path| ComposeLocalReference {
+                    path,
+                    optional: true,
+                })
+                .into_iter()
+                .collect()
+        } else {
+            explicit
+                .into_iter()
+                .filter(|file| *file != "/dev/null")
+                .filter_map(|file| join_file(base, file))
+                .map(|path| ComposeLocalReference {
+                    path,
+                    optional: false,
+                })
+                .collect()
+        };
+        references.includes.push(ComposeIncludeReference {
+            paths: raw_paths
+                .into_iter()
+                .filter_map(|path| join_file(base, path))
+                .collect(),
+            project_directory,
+            env_files,
+        });
+    }
+    references
+}
+
+/// File `path` joined onto `base` and normalized, or `None` for a remote,
+/// escaped (`$$`), absolute or empty path, or one that leaves the project
+/// directory.
+fn join_file(base: &str, path: &str) -> Option<String> {
+    join_directory(base, path).filter(|path| !path.is_empty())
+}
+
+/// Directory `path` joined onto `base` and normalized; `""` is the project
+/// directory itself.
+fn join_directory(base: &str, path: &str) -> Option<String> {
+    if path.contains("://")
+        || path.starts_with("git@")
+        || path.contains('$')
+        || path.starts_with('/')
+        || path.contains('\\')
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in base.split('/').chain(path.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn parent_directory(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
 }
 
 /// Project configuration a check runs against, loaded from the database.
@@ -415,6 +596,80 @@ mod tests {
         let app = overlay["services"]["app"].as_mapping().unwrap();
         assert!(app.get("env_file").is_none());
         assert!(app.get("volumes").is_none());
+    }
+
+    #[test]
+    fn local_references_follow_include_and_extends_paths() {
+        let content = "include:\n  - shared.yaml\n  - path: [stack/a.yaml, stack/b.yaml]\n    env_file: [stack/first.env, stack/second.env]\n  - path: ../outside.yaml\n  - https://example.com/r.git\n  - $${DIR}/x.yaml\nservices:\n  app:\n    extends:\n      file: ./common/base.yaml\n      service: base\n";
+        let references = compose_local_references("", content);
+        assert_eq!(references.extends, vec!["common/base.yaml".to_string()]);
+        let env = |path: &str, optional| ComposeLocalReference {
+            path: path.to_string(),
+            optional,
+        };
+        assert_eq!(
+            references.includes[0],
+            ComposeIncludeReference {
+                paths: vec!["shared.yaml".to_string()],
+                project_directory: Some(String::new()),
+                env_files: vec![env(".env", true)],
+            }
+        );
+        assert_eq!(
+            references.includes[1],
+            ComposeIncludeReference {
+                paths: vec!["stack/a.yaml".to_string(), "stack/b.yaml".to_string()],
+                project_directory: Some("stack".to_string()),
+                env_files: vec![env("stack/first.env", false), env("stack/second.env", false)],
+            }
+        );
+        // Out-of-project, remote and escaped (literal `$`) paths are left to
+        // resolution, which rejects or fetches them itself.
+        for include in &references.includes[2..] {
+            assert!(include.paths.is_empty(), "{include:?}");
+        }
+        // Nested references resolve against the including document's base.
+        let nested = compose_local_references("stack", "include: [../shared.yaml, inner/c.yaml]");
+        assert_eq!(nested.includes[0].paths, vec!["shared.yaml".to_string()]);
+        assert_eq!(nested.includes[1].paths, vec!["stack/inner/c.yaml".to_string()]);
+        assert_eq!(
+            compose_local_references("", "not: [valid"),
+            ComposeLocalReferences::default()
+        );
+    }
+
+    #[test]
+    fn include_project_directories_may_be_the_project_root() {
+        // `project_directory: .` (or `..` back to the root) names the
+        // project directory itself; the include must still be fetched.
+        let root = compose_local_references(
+            "",
+            "include:\n  - path: stack/shared.yaml\n    project_directory: .\n",
+        );
+        assert_eq!(
+            root.includes[0],
+            ComposeIncludeReference {
+                paths: vec!["stack/shared.yaml".to_string()],
+                project_directory: Some(String::new()),
+                env_files: vec![ComposeLocalReference {
+                    path: ".env".to_string(),
+                    optional: true,
+                }],
+            }
+        );
+        let nested = compose_local_references(
+            "stack",
+            "include:\n  - path: inner.yaml\n    project_directory: ..\n",
+        );
+        assert_eq!(nested.includes[0].paths, vec!["stack/inner.yaml".to_string()]);
+        assert_eq!(nested.includes[0].project_directory, Some(String::new()));
+        // Leaving the project directory is still refused.
+        let escaping = compose_local_references(
+            "",
+            "include:\n  - path: shared.yaml\n    project_directory: ..\n",
+        );
+        assert_eq!(escaping.includes[0].project_directory, None);
+        assert!(escaping.includes[0].env_files.is_empty());
     }
 
     #[test]

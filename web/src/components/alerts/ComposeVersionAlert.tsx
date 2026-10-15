@@ -3,7 +3,11 @@
 
 import { getComposeStatusOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
-import { composeHostWarning } from '@/lib/compose-check'
+import {
+  COMPOSE_STATUS_REFRESH_MS,
+  composeHostWarning,
+  composeStatusRefetchInterval,
+} from '@/lib/compose-check'
 import { useQuery } from '@tanstack/react-query'
 import { TriangleAlert, X } from 'lucide-react'
 import { useState } from 'react'
@@ -15,11 +19,13 @@ import { useState } from 'react'
  * what is missing and the minimum version to install.
  */
 export function ComposeVersionAlert() {
-  // The probe runs once at startup, so there is nothing new to fetch until
-  // the server restarts.
+  // The server probes asynchronously after startup: poll until it reports a
+  // result, then refresh occasionally so a server restart (and a new probe,
+  // e.g. after upgrading Compose) is picked up without reloading the console.
   const { data } = useQuery({
     ...getComposeStatusOptions(),
-    staleTime: Infinity,
+    staleTime: COMPOSE_STATUS_REFRESH_MS,
+    refetchInterval: (query) => composeStatusRefetchInterval(query.state.data),
     retry: false,
   })
   const [isDismissed, setIsDismissed] = useState(false)

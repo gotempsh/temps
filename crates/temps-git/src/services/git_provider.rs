@@ -44,6 +44,16 @@ pub enum GitProviderError {
     #[error("A repository named '{name}' already exists on this account")]
     RepositoryAlreadyExists { name: String },
 
+    /// The provider answered that the file does not exist at the revision.
+    /// Distinct from [`Self::ApiError`] so callers can tell a missing file
+    /// from an unavailable provider.
+    #[error("File '{path}' was not found in repository '{repository}' at '{git_ref}'")]
+    FileNotFound {
+        repository: String,
+        path: String,
+        git_ref: String,
+    },
+
     #[error("Not implemented for this provider")]
     NotImplemented,
 
@@ -55,6 +65,23 @@ pub enum GitProviderError {
 
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// [`GitProviderError::FileNotFound`] when a provider answered a file read
+/// with HTTP 404, so callers can tell a missing file from a provider that
+/// failed to answer. `None` for every other status.
+pub(crate) fn file_not_found(
+    status: reqwest::StatusCode,
+    owner: &str,
+    repo: &str,
+    path: &str,
+    git_ref: Option<&str>,
+) -> Option<GitProviderError> {
+    (status == reqwest::StatusCode::NOT_FOUND).then(|| GitProviderError::FileNotFound {
+        repository: format!("{owner}/{repo}"),
+        path: path.to_string(),
+        git_ref: git_ref.unwrap_or("HEAD").to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -993,4 +1020,59 @@ pub trait GitProviderRepositoryService: Send + Sync {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<GitProviderTag>, GitProviderError>;
+}
+
+#[cfg(test)]
+mod file_not_found_tests {
+    use super::*;
+    use crate::services::git_provider_manager::GitProviderManagerError;
+
+    #[test]
+    fn only_a_404_is_a_missing_file() {
+        let error = file_not_found(
+            reqwest::StatusCode::NOT_FOUND,
+            "owner",
+            "repo",
+            "stack/shared.yaml",
+            Some("main"),
+        );
+        assert!(matches!(
+            &error,
+            Some(GitProviderError::FileNotFound { repository, path, git_ref })
+                if repository == "owner/repo" && path == "stack/shared.yaml" && git_ref == "main"
+        ));
+        for status in [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                file_not_found(status, "owner", "repo", "a.yaml", None).is_none(),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_manager_reports_missing_files_apart_from_provider_failures() {
+        let missing = GitProviderManagerError::ProviderError(GitProviderError::FileNotFound {
+            repository: "owner/repo".to_string(),
+            path: "a.yaml".to_string(),
+            git_ref: "HEAD".to_string(),
+        });
+        assert!(missing.is_file_not_found());
+        for failure in [
+            GitProviderManagerError::ProviderError(GitProviderError::ApiError(
+                "HTTP 500".to_string(),
+            )),
+            GitProviderManagerError::ProviderError(GitProviderError::RateLimitExceeded),
+            GitProviderManagerError::ConnectionNotFound("7".to_string()),
+            GitProviderManagerError::RepositoryNotFound("owner/repo".to_string()),
+        ] {
+            assert!(!failure.is_file_not_found(), "{failure}");
+        }
+    }
 }

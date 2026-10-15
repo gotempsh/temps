@@ -98,6 +98,33 @@ fn health_check_path_for_public_route(
         .to_string())
 }
 
+/// The detected health check path as stored in the service snapshot, which
+/// is persisted on the project and returned to anyone who can read it.
+/// Variables are substituted before detection, so a healthcheck such as
+/// `curl localhost/ready/${TOKEN}` would otherwise persist the secret.
+/// Only a path the public route could use is kept (no query, fragment,
+/// userinfo or scheme). A path written literally in the Compose `sources`
+/// was not substituted and is kept as is; any other path is dropped when it
+/// contains the value of a project variable. The route then falls back to
+/// `/`, as it does for any unsafe path.
+fn snapshot_health_check_path(
+    path: Option<String>,
+    environment: &HashMap<String, String>,
+    sources: &[&str],
+) -> Option<String> {
+    let path = path?;
+    if !is_safe_health_check_path(&path) {
+        return None;
+    }
+    if sources.iter().any(|source| source.contains(path.as_str())) {
+        return Some(path);
+    }
+    let embeds_variable = environment
+        .values()
+        .any(|value| value.len() >= 3 && path.contains(value.as_str()));
+    (!embeds_variable).then_some(path)
+}
+
 fn is_safe_health_check_path(path: &str) -> bool {
     path.starts_with('/')
         && path.len() <= 2048
@@ -986,6 +1013,7 @@ impl DeployComposeJob {
                 repository_env: None,
                 filesystem_checks: repo_path.is_some(),
                 allow_cli: true,
+                defer_unknown_required: false,
             })
             .await
         {
@@ -1012,6 +1040,19 @@ impl DeployComposeJob {
         // failure degrades to an empty snapshot rather than failing the
         // deploy, since this only feeds a UI convenience, not the deploy
         // itself.
+        // The files as written, before substitution (including those pulled
+        // in by include/extends): a health path found there literally
+        // carries no variable value.
+        let health_path_sources: Vec<&str> = std::iter::once(compose_content.as_str())
+            .chain(self.compose_override.as_deref())
+            .chain(
+                checked
+                    .resolution
+                    .referenced_sources
+                    .iter()
+                    .map(String::as_str),
+            )
+            .collect();
         let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
             temps_presets::list_compose_services_with_override(
                 &checked.resolved_content,
@@ -1026,7 +1067,11 @@ impl DeployComposeJob {
                         looks_like_database: s.looks_like_database,
                         detected_service_type: s.detected_service_type,
                         ports: s.ports,
-                        health_check_path: s.health_check_path,
+                        health_check_path: snapshot_health_check_path(
+                            s.health_check_path,
+                            &self.environment_vars,
+                            &health_path_sources,
+                        ),
                     })
                     .collect()
             })
@@ -2431,6 +2476,78 @@ mod tests {
         assert_eq!(
             health_check_path_for_public_route(&[], &[]).expect("missing route should use root"),
             "/"
+        );
+    }
+
+    #[test]
+    fn snapshot_health_paths_never_carry_substituted_secrets() {
+        let environment = HashMap::from([
+            ("HEALTH_TOKEN".to_string(), "s3cr3t-token".to_string()),
+            ("PORT".to_string(), "80".to_string()),
+        ]);
+        let source = "healthcheck: {test: [CMD, curl, 'http://localhost/ready/${HEALTH_TOKEN}']}";
+        // A query is never persisted, whatever it contains.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/ready?token=s3cr3t-token".to_string()),
+                &environment,
+                &[source]
+            ),
+            None
+        );
+        // Nor is a substituted path that embeds a project variable's value.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/ready/s3cr3t-token".to_string()),
+                &environment,
+                &[source]
+            ),
+            None
+        );
+        // Ordinary paths are kept; values shorter than three bytes are ignored.
+        assert_eq!(
+            snapshot_health_check_path(Some("/healthz80".to_string()), &environment, &[source]),
+            Some("/healthz80".to_string())
+        );
+        assert_eq!(
+            snapshot_health_check_path(None, &environment, &[source]),
+            None
+        );
+    }
+
+    #[test]
+    fn literal_health_paths_survive_matching_ordinary_variables() {
+        // APP_NAME=api and HEALTH_PATH=/health are ordinary settings; the
+        // healthcheck never referenced them, so its path is kept.
+        let environment = HashMap::from([
+            ("APP_NAME".to_string(), "api".to_string()),
+            ("HEALTH_PATH".to_string(), "/health".to_string()),
+        ]);
+        let source = "services:\n  web:\n    healthcheck:\n      test: [CMD, curl, -f, 'http://localhost:8080/api/health']\n";
+        assert_eq!(
+            snapshot_health_check_path(Some("/api/health".to_string()), &environment, &[source]),
+            Some("/api/health".to_string())
+        );
+        // The override is a source too.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/health".to_string()),
+                &environment,
+                &[
+                    "services: {}",
+                    "services: {web: {healthcheck: {test: 'curl localhost/health'}}}"
+                ]
+            ),
+            Some("/health".to_string())
+        );
+        // Without a literal occurrence the value check still applies.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/api/health".to_string()),
+                &environment,
+                &["services: {}"]
+            ),
+            None
         );
     }
 

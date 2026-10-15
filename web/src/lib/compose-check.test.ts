@@ -9,10 +9,13 @@ import type {
 } from '@/api/client'
 
 import {
+  COMPOSE_STATUS_PENDING_POLL_MS,
+  COMPOSE_STATUS_REFRESH_MS,
   composeCommandLine,
   composeErrorClassHint,
   composeErrorClassLabel,
   composeHostWarning,
+  composeStatusRefetchInterval,
   composeValidationWarning,
 } from './compose-check'
 
@@ -130,5 +133,19 @@ describe('Compose command line', () => {
       "docker compose -p temps-7-3 -f 'my compose.yaml' config --no-interpolate"
     )
     expect(composeCommandLine(["it's"])).toBe(`'it'\\''s'`)
+  })
+})
+
+describe('Compose host status refresh', () => {
+  test('polls until the startup probe reports, then refreshes slowly', () => {
+    expect(composeStatusRefetchInterval(undefined)).toBe(
+      COMPOSE_STATUS_PENDING_POLL_MS
+    )
+    expect(composeStatusRefetchInterval({ ...supported, probed: false })).toBe(
+      COMPOSE_STATUS_PENDING_POLL_MS
+    )
+    expect(composeStatusRefetchInterval(supported)).toBe(
+      COMPOSE_STATUS_REFRESH_MS
+    )
   })
 })
