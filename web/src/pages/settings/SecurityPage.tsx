@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -145,11 +146,7 @@ export function SecurityPage() {
   }
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className="h-8 w-8 animate-spin" />
-      </div>
-    )
+    return <SettingsFormSkeleton label="Loading security settings" />
   }
 
   if (error) {

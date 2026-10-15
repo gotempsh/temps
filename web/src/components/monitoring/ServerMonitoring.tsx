@@ -43,6 +43,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { useSettings } from '@/hooks/useSettings'
 import { NodeMetricsAccessDenied } from '@/components/monitoring/NodeMetricsAccessDenied'
+import { NoNodeSamplesState } from '@/components/monitoring/NoNodeSamplesState'
 import { refetchUnlessRefused } from '@/lib/query-retry'
 import {
   CONTROL_PLANE_NODE_ID,
@@ -58,6 +59,7 @@ import {
   diskProjectionCaption,
   formatPercent,
   formatRateTick,
+  hasNoNodeSamples,
   isMetricsUnavailable,
   mergeSeries,
   peakOf,
@@ -612,6 +614,15 @@ export function ServerMonitoring() {
     for (const q of queries) void q.refetch()
   }
 
+  // Only a settled, error-free read can mean "nothing recorded yet"; a failed
+  // request already has its own alert and Retry above.
+  const noSamples =
+    !firstError &&
+    hasNoNodeSamples({
+      series: [cpu.data, memory.data, disk.data, rx.data, tx.data],
+      current: [cpuNow, memPct, diskPct],
+    })
+
   const bucketCaption = `${step >= 3600 ? `${step / 3600} h` : `${step / 60} min`} buckets · last ${range} · kept ${retentionDays} days`
   const seriesError = (q: { isError: boolean }) =>
     q.isError ? 'Failed to load node metrics' : null
@@ -703,133 +714,148 @@ export function ServerMonitoring() {
         </Alert>
       )}
 
+      {noSamples && (
+        <NoNodeSamplesState
+          range={range}
+          scrapeInterval={scrapeInterval}
+          settingsPath={METRICS_SETTINGS_PATH}
+        />
+      )}
+
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <UsageCard
-          title="CPU usage"
-          description="All cores of the control-plane host"
-          percent={cpuNow}
-          absolute={null}
-          thresholds={CPU_THRESHOLDS}
-          sub={
-            cpuPeak
-              ? `Peak ${formatPercent(cpuPeak.value)} at ${label(cpuPeak.time)} in the last ${range}`
-              : null
-          }
-          isPending={latest.isPending && cpu.isPending}
-        />
-        <UsageCard
-          title="Memory usage"
-          description="Used memory, excluding reclaimable cache"
-          percent={memPct}
-          absolute={
-            memUsed != null && memTotal != null
-              ? `${formatBytesBinary(memUsed)} of ${formatBytesBinary(memTotal)}`
-              : null
-          }
-          thresholds={MEMORY_THRESHOLDS}
-          sub={
-            memPeak
-              ? `Peak ${formatPercent(memPeak.value)} at ${label(memPeak.time)} in the last ${range}`
-              : null
-          }
-          isPending={latest.isPending && memory.isPending}
-        />
-        <UsageCard
-          title="Disk space"
-          description="Volume under the Temps data directory"
-          percent={diskPct}
-          absolute={
-            diskUsed != null && diskTotal != null
-              ? `${formatBytesDecimal(diskUsed)} of ${formatBytesDecimal(diskTotal)}`
-              : null
-          }
-          thresholds={DISK_THRESHOLDS}
-          sub={
-            diskTotal != null && diskUsed != null
-              ? diskProjectionCaption(diskTotal - diskUsed, projection)
-              : null
-          }
-          isPending={latest.isPending && disk.isPending}
-        />
+        {!noSamples && (
+          <>
+            <UsageCard
+              title="CPU usage"
+              description="All cores of the control-plane host"
+              percent={cpuNow}
+              absolute={null}
+              thresholds={CPU_THRESHOLDS}
+              sub={
+                cpuPeak
+                  ? `Peak ${formatPercent(cpuPeak.value)} at ${label(cpuPeak.time)} in the last ${range}`
+                  : null
+              }
+              isPending={latest.isPending && cpu.isPending}
+            />
+            <UsageCard
+              title="Memory usage"
+              description="Used memory, excluding reclaimable cache"
+              percent={memPct}
+              absolute={
+                memUsed != null && memTotal != null
+                  ? `${formatBytesBinary(memUsed)} of ${formatBytesBinary(memTotal)}`
+                  : null
+              }
+              thresholds={MEMORY_THRESHOLDS}
+              sub={
+                memPeak
+                  ? `Peak ${formatPercent(memPeak.value)} at ${label(memPeak.time)} in the last ${range}`
+                  : null
+              }
+              isPending={latest.isPending && memory.isPending}
+            />
+            <UsageCard
+              title="Disk space"
+              description="Volume under the Temps data directory"
+              percent={diskPct}
+              absolute={
+                diskUsed != null && diskTotal != null
+                  ? `${formatBytesDecimal(diskUsed)} of ${formatBytesDecimal(diskTotal)}`
+                  : null
+              }
+              thresholds={DISK_THRESHOLDS}
+              sub={
+                diskTotal != null && diskUsed != null
+                  ? diskProjectionCaption(diskTotal - diskUsed, projection)
+                  : null
+              }
+              isPending={latest.isPending && disk.isPending}
+            />
+          </>
+        )}
+        {/* Docker's own `system df` answers without any recorded sample. */}
         <DockerDiskUsageCard />
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <ChartPanel
-          title="CPU usage"
-          description={`Share of all cores, per interval · busy above ${CPU_THRESHOLDS.warn}%, saturated above ${CPU_THRESHOLDS.poor}%`}
-          series={[{ dataKey: 'cpu', label: 'CPU', tone: 'primary' }]}
-          data={usageData}
-          thresholds={cpuBands}
-          valueFormatter={(v) => formatPercent(v, 0)}
-          isPending={cpu.isPending}
-          errorText={seriesError(cpu)}
-          emptyText="No CPU samples in this window yet"
-          footer={bucketCaption}
-        />
-        <ChartPanel
-          title="Memory usage"
-          description={
-            memTotal != null
-              ? `Share of ${formatBytesBinary(memTotal)}, per interval · tight above ${MEMORY_THRESHOLDS.warn}%, OOM risk above ${MEMORY_THRESHOLDS.poor}%`
-              : `Share of total memory, per interval · tight above ${MEMORY_THRESHOLDS.warn}%, OOM risk above ${MEMORY_THRESHOLDS.poor}%`
-          }
-          series={[{ dataKey: 'memory', label: 'Memory', tone: 'primary' }]}
-          data={usageData}
-          thresholds={memoryBands}
-          valueFormatter={(v) => formatPercent(v, 0)}
-          isPending={memory.isPending}
-          errorText={seriesError(memory)}
-          emptyText="No memory samples in this window yet"
-          footer={bucketCaption}
-        />
-        <ChartPanel
-          title="Disk space"
-          description={
-            diskTotal != null
-              ? `Share of ${formatBytesDecimal(diskTotal)} used, per interval · tight above ${DISK_THRESHOLDS.warn}%, writes stop near ${DISK_THRESHOLDS.poor}%`
-              : `Share of the volume used, per interval · tight above ${DISK_THRESHOLDS.warn}%, writes stop near ${DISK_THRESHOLDS.poor}%`
-          }
-          series={[{ dataKey: 'disk', label: 'Used', tone: 'primary' }]}
-          data={usageData}
-          thresholds={diskBands}
-          valueFormatter={(v) => formatPercent(v, 0)}
-          isPending={disk.isPending}
-          errorText={seriesError(disk)}
-          emptyText="No disk samples in this window yet"
-          footer={bucketCaption}
-        />
-        <ChartPanel
-          title="Network I/O"
-          description="Bytes per second on physical interfaces (loopback, bridges and tunnels excluded)"
-          series={[
-            { dataKey: 'in', label: 'In', tone: 'primary' },
-            { dataKey: 'out', label: 'Out', tone: 'good' },
-          ]}
-          data={networkData}
-          valueFormatter={formatBytesPerSecond}
-          tickFormatter={formatRateTick}
-          isPending={rx.isPending || tx.isPending}
-          errorText={seriesError(rx) ?? seriesError(tx)}
-          emptyText="No network samples in this window yet"
-          footer={bucketCaption}
-        />
-        <ChartPanel
-          title="Block I/O"
-          description="Bytes per second read from and written to physical disks (partitions, loop and device-mapper excluded)"
-          series={[
-            { dataKey: 'read', label: 'Read', tone: 'primary' },
-            { dataKey: 'write', label: 'Write', tone: 'good' },
-          ]}
-          data={blockIoData}
-          valueFormatter={formatBytesPerSecond}
-          tickFormatter={formatRateTick}
-          isPending={read.isPending || write.isPending}
-          errorText={seriesError(read) ?? seriesError(write)}
-          emptyText="No block I/O samples in this window yet"
-          footer={bucketCaption}
-        />
-      </div>
+      {!noSamples && (
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <ChartPanel
+            title="CPU usage"
+            description={`Share of all cores, per interval · busy above ${CPU_THRESHOLDS.warn}%, saturated above ${CPU_THRESHOLDS.poor}%`}
+            series={[{ dataKey: 'cpu', label: 'CPU', tone: 'primary' }]}
+            data={usageData}
+            thresholds={cpuBands}
+            valueFormatter={(v) => formatPercent(v, 0)}
+            isPending={cpu.isPending}
+            errorText={seriesError(cpu)}
+            emptyText="No CPU samples in this window yet"
+            footer={bucketCaption}
+          />
+          <ChartPanel
+            title="Memory usage"
+            description={
+              memTotal != null
+                ? `Share of ${formatBytesBinary(memTotal)}, per interval · tight above ${MEMORY_THRESHOLDS.warn}%, OOM risk above ${MEMORY_THRESHOLDS.poor}%`
+                : `Share of total memory, per interval · tight above ${MEMORY_THRESHOLDS.warn}%, OOM risk above ${MEMORY_THRESHOLDS.poor}%`
+            }
+            series={[{ dataKey: 'memory', label: 'Memory', tone: 'primary' }]}
+            data={usageData}
+            thresholds={memoryBands}
+            valueFormatter={(v) => formatPercent(v, 0)}
+            isPending={memory.isPending}
+            errorText={seriesError(memory)}
+            emptyText="No memory samples in this window yet"
+            footer={bucketCaption}
+          />
+          <ChartPanel
+            title="Disk space"
+            description={
+              diskTotal != null
+                ? `Share of ${formatBytesDecimal(diskTotal)} used, per interval · tight above ${DISK_THRESHOLDS.warn}%, writes stop near ${DISK_THRESHOLDS.poor}%`
+                : `Share of the volume used, per interval · tight above ${DISK_THRESHOLDS.warn}%, writes stop near ${DISK_THRESHOLDS.poor}%`
+            }
+            series={[{ dataKey: 'disk', label: 'Used', tone: 'primary' }]}
+            data={usageData}
+            thresholds={diskBands}
+            valueFormatter={(v) => formatPercent(v, 0)}
+            isPending={disk.isPending}
+            errorText={seriesError(disk)}
+            emptyText="No disk samples in this window yet"
+            footer={bucketCaption}
+          />
+          <ChartPanel
+            title="Network I/O"
+            description="Bytes per second on physical interfaces (loopback, bridges and tunnels excluded)"
+            series={[
+              { dataKey: 'in', label: 'In', tone: 'primary' },
+              { dataKey: 'out', label: 'Out', tone: 'good' },
+            ]}
+            data={networkData}
+            valueFormatter={formatBytesPerSecond}
+            tickFormatter={formatRateTick}
+            isPending={rx.isPending || tx.isPending}
+            errorText={seriesError(rx) ?? seriesError(tx)}
+            emptyText="No network samples in this window yet"
+            footer={bucketCaption}
+          />
+          <ChartPanel
+            title="Block I/O"
+            description="Bytes per second read from and written to physical disks (partitions, loop and device-mapper excluded)"
+            series={[
+              { dataKey: 'read', label: 'Read', tone: 'primary' },
+              { dataKey: 'write', label: 'Write', tone: 'good' },
+            ]}
+            data={blockIoData}
+            valueFormatter={formatBytesPerSecond}
+            tickFormatter={formatRateTick}
+            isPending={read.isPending || write.isPending}
+            errorText={seriesError(read) ?? seriesError(write)}
+            emptyText="No block I/O samples in this window yet"
+            footer={bucketCaption}
+          />
+        </div>
+      )}
     </div>
   )
 }

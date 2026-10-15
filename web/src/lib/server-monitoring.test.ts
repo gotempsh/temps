@@ -9,6 +9,7 @@ import {
   formatBytesPerSecond,
   formatDays,
   formatRateTick,
+  hasNoNodeSamples,
   isMetricsUnavailable,
   mergeSeries,
   peakOf,
@@ -237,5 +238,32 @@ describe('isMetricsUnavailable', () => {
     ).toBe(true)
     expect(isMetricsUnavailable({ status: 500, detail: 'boom' })).toBe(false)
     expect(isMetricsUnavailable(undefined)).toBe(false)
+  })
+})
+
+describe('hasNoNodeSamples', () => {
+  test('is true only once every series answered empty and no snapshot figure exists', () => {
+    expect(
+      hasNoNodeSamples({ series: [[], [], []], current: [null, null] })
+    ).toBe(true)
+  })
+
+  test('a pending or failed series is not an empty one', () => {
+    expect(
+      hasNoNodeSamples({ series: [[], undefined, []], current: [null] })
+    ).toBe(false)
+  })
+
+  test('a single sample or snapshot figure means collection is running', () => {
+    expect(
+      hasNoNodeSamples({ series: [[{ value: 1 }], [], []], current: [null] })
+    ).toBe(false)
+    expect(hasNoNodeSamples({ series: [[], [], []], current: [12.5] })).toBe(
+      false
+    )
+  })
+
+  test('no series at all is not evidence of an empty store', () => {
+    expect(hasNoNodeSamples({ series: [], current: [] })).toBe(false)
   })
 })

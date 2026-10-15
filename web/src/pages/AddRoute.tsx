@@ -37,6 +37,10 @@ import {
   Router,
   Server,
 } from 'lucide-react'
+import {
+  DomainFieldHint,
+  type ManagedDomainsStatus,
+} from '@/components/routes/DomainFieldHint'
 import { useEffect, useMemo } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
@@ -82,7 +86,11 @@ export function AddRoute() {
   const { accessMode } = usePlatformCapabilities()
   const isLocalMode = useMemo(() => accessMode === 'local', [accessMode])
 
-  const { data: domainsData } = useQuery({
+  const {
+    data: domainsData,
+    isPending: domainsPending,
+    isError: domainsFailed,
+  } = useQuery({
     ...listDomainsOptions({
       query: { page_size: 1 },
     }),
@@ -92,6 +100,15 @@ export function AddRoute() {
     () => (domainsData?.total ?? 0) > 0,
     [domainsData]
   )
+
+  // A failed or running read must not be worded as "you have no domains".
+  const managedDomainsStatus: ManagedDomainsStatus = domainsPending
+    ? 'pending'
+    : domainsFailed
+      ? 'error'
+      : hasAvailableDomains
+        ? 'available'
+        : 'empty'
 
   useEffect(() => {
     setBreadcrumbs([
@@ -436,13 +453,11 @@ export function AddRoute() {
                         )}
                       </FormControl>
                       <FormDescription>
-                        {isLocalMode
-                          ? 'Manual entry required in local development mode'
-                          : !hasAvailableDomains
-                            ? 'No managed domains available - enter domain manually'
-                            : watchedDomainInputType === 'select'
-                              ? 'Choose from your managed domains with SSL certificates'
-                              : 'Enter the full domain name for this route'}
+                        <DomainFieldHint
+                          isLocalMode={isLocalMode}
+                          status={managedDomainsStatus}
+                          inputType={watchedDomainInputType}
+                        />
                       </FormDescription>
                       <FormMessage />
                     </FormItem>

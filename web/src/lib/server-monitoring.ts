@@ -327,6 +327,28 @@ export function isMetricsUnavailable(err: unknown): boolean {
   return msg.includes('not enabled') || msg.includes('unavailable')
 }
 
+/**
+ * Whether the metrics store answered but has not received a single node
+ * sample yet: every usage series is empty and the latest snapshot carries no
+ * figure. This is the first minutes after metric collection is switched on,
+ * which the charts alone render as five unrelated "no samples" captions.
+ * A request that is still pending or failed is not "no samples".
+ */
+export function hasNoNodeSamples(state: {
+  /** Each series' points once it has answered; `undefined` while pending or failed. */
+  series: (readonly unknown[] | undefined)[]
+  /** Latest snapshot's usage figures; `null` when none is present. */
+  current: (number | null)[]
+}): boolean {
+  return (
+    state.series.length > 0 &&
+    state.series.every(
+      (points) => points !== undefined && points.length === 0
+    ) &&
+    state.current.every((value) => value === null)
+  )
+}
+
 /** Slices of the Docker disk-usage breakdown, in fixed order. */
 export const DOCKER_USAGE_SLICES = [
   { key: 'images', label: 'Images' },
