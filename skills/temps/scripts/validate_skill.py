@@ -18,7 +18,7 @@ PINNED_CLI = "@temps-sdk/cli@0.1.38"
 # commit that bumps PINNED_CLI, once the release is actually on npm — the value
 # has no version substring, so a find-and-replace bump silently leaves it stale
 # and every preflight guard below fails closed against the new release.
-PINNED_CLI_INTEGRITY = "sha512-JMAlVb21dV5UKXg64xoL0bEAzTa0XUEsO6e8Az4jNRy31MaiXqYtgQkcVviC/fgzZqmvdnpHt+K8N5gw6WYL7A=="
+PINNED_CLI_INTEGRITY = "sha512-JTCKsB4HKLRSOtlPn/HO2xOpnZnPqHonorIfHHWYJ26Wo6xmpBYTy2HYlSAlPzjQM/xiYbyoZMNFZcHb3ZhhTA=="
 INTEGRITY_PIN = re.compile(r"expected_temps_cli_integrity='([^']*)'")
 # Skills whose preflight guard installs the pinned CLI. They embed the same
 # hash independently, so they are validated together.
