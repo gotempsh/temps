@@ -90,7 +90,10 @@ export function ComposeCheckReportView({
             />
           </div>
           {report.command.stderr && (
-            <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs">
+            <pre
+              tabIndex={0}
+              className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs"
+            >
               {report.command.stderr}
             </pre>
           )}
