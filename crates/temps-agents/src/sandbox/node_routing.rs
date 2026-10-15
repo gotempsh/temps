@@ -350,6 +350,21 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
         Ok(recovered.map(|h| Self::stamp(h, node_id)))
     }
 
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        self.local.release_orphaned_resources(container_name).await
+    }
+
+    async fn release_orphaned_resources_on(
+        &self,
+        node_id: Option<i32>,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        self.for_node(node_id)
+            .await?
+            .release_orphaned_resources(container_name)
+            .await
+    }
+
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         self.local.supports_backend(backend)
     }

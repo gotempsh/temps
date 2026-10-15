@@ -1343,6 +1343,28 @@ done
         self.recover_by_name(container_name).await
     }
 
+    /// Release what a sandbox whose container is already gone may have left
+    /// behind (for Docker: its isolated network and egress proxy, which pin
+    /// a subnet from the daemon's finite address pool). Called when a
+    /// sandbox is destroyed and no container could be recovered for it, so
+    /// the normal `destroy` path never ran. Idempotent. Default: nothing to
+    /// release.
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        let _ = container_name;
+        Ok(())
+    }
+
+    /// [`release_orphaned_resources`](Self::release_orphaned_resources) on a
+    /// specific node (ADR-048). `None` = the local host.
+    async fn release_orphaned_resources_on(
+        &self,
+        node_id: Option<i32>,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        let _ = node_id;
+        self.release_orphaned_resources(container_name).await
+    }
+
     /// Whether this provider can create sandboxes on `backend`. Consumers
     /// call this before create so a request for an unprovisioned backend
     /// (e.g. `firecracker` on a Docker-only host) fails with a clear error

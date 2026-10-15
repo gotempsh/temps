@@ -136,6 +136,12 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Image Unavailable")
                     .with_detail(detail)
             }
+            SandboxError::NetworkCapacityExhausted { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/sandbox-network-capacity-exhausted")
+                    .with_title("Sandbox Network Capacity Exhausted")
+                    .with_detail(error.to_string())
+            }
             SandboxError::ExecFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Exec Failed")

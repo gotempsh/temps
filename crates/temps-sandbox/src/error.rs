@@ -185,6 +185,15 @@ pub enum SandboxError {
         reason: String,
     },
 
+    /// The container runtime has no address space left for the sandbox's
+    /// isolated network (Docker: every `default-address-pools` range is
+    /// subnetted). A capacity limit of the host, not a fault of the request
+    /// and not a server bug: nothing about the request can fix it, but
+    /// deleting unused sandboxes or widening the pools does. Mapped to HTTP
+    /// 503 with that guidance in `reason`.
+    #[error("Sandbox {sandbox_id} could not get an isolated network: {reason}")]
+    NetworkCapacityExhausted { sandbox_id: String, reason: String },
+
     /// The sandbox exists but is not in a state that allows the requested
     /// operation (e.g. exec on a stopped sandbox). Mapped to HTTP 409.
     #[error("Sandbox {sandbox_id} is in state '{state}' — cannot {operation}")]
@@ -365,6 +374,17 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             sandbox_id: sandbox_id.to_string(),
             image: image.to_string(),
             reason: reason.to_string(),
+        };
+    }
+    if let Some(reason) = err.network_pool_exhaustion() {
+        let reason = if reason.contains("default-address-pools") {
+            reason.to_string()
+        } else {
+            temps_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+        };
+        return SandboxError::NetworkCapacityExhausted {
+            sandbox_id: sandbox_id.to_string(),
+            reason,
         };
     }
     match err {
@@ -636,5 +656,59 @@ mod tests {
         };
         let err = from_agent_error("sbx_x", agent);
         assert!(matches!(err, SandboxError::ExecFailed { .. }));
+    }
+
+    #[test]
+    fn exhausted_address_pools_map_to_a_capacity_error_with_guidance() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".into(),
+                reason: "create isolated network for sandbox 'temps-sandbox-abc': Docker \
+                         responded with status code 400: all predefined address pools have \
+                         been fully subnetted"
+                    .into(),
+            },
+        );
+        match &err {
+            SandboxError::NetworkCapacityExhausted { sandbox_id, reason } => {
+                assert_eq!(sandbox_id, "sbx_abc");
+                assert!(reason.contains("default-address-pools"), "{reason}");
+                assert!(reason.contains("Delete sandboxes"), "{reason}");
+            }
+            other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
+        let reason = temps_agents::error::network_pool_exhausted_reason(
+            "temps-sandbox-abc",
+            "all predefined address pools have been fully subnetted",
+        );
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 7,
+                provider: "docker".into(),
+                reason: reason.clone(),
+            },
+        );
+        match err {
+            SandboxError::NetworkCapacityExhausted { reason: got, .. } => assert_eq!(got, reason),
+            other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_provider_unavailability_stays_a_generic_unavailable() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".into(),
+                reason: "daemon unreachable".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Unavailable { .. }), "{err:?}");
     }
 }

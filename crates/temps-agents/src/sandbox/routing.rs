@@ -337,6 +337,19 @@ impl SandboxProvider for RoutingSandboxProvider {
         Ok(None)
     }
 
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        // The container is gone, so the owning backend cannot be told from
+        // a handle: every backend gets the chance, and each is a no-op for a
+        // name it never created.
+        let mut first_error = None;
+        for provider in self.scan_order() {
+            if let Err(error) = provider.release_orphaned_resources(container_name).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Answers for exactly the backends registered on this host, so a
     /// request for an unprovisioned one is rejected before any work starts
     /// (the trait default is permissive).
