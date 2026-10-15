@@ -26,7 +26,7 @@ npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.9
 Before running the install, explain that it changes the application's
 dependencies and lockfile and ask for confirmation. The reviewed npm package
 integrity is
-`sha512-2b0N/9Ya/wyWLInMolj8jVSWiWOC5R6CkrXeCFdfv4hgUWcHtkgj+vFZdR+qxNGEDfYna4LbFShIimNxytbw7w==`.
+`sha512-qR2e1nBVc4YXxYAqmBsBpJN4wyGqv3lWh3rD+KPlo0tAQ5OS+dycqLW7W61up+76mFoeLnC1Eu74PIJcCyKoWQ==`.
 Verify that the resolved lockfile records this exact version and integrity.
 
 Peer deps: React 18 or 19 (`react`, `react-dom`).
