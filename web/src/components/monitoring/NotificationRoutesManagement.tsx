@@ -99,7 +99,7 @@ export function NotificationRoutesManagement({
   // A failed or refused read is never an empty list.
   const readError =
     (routesError && routes.length === 0 ? routesError : null) ??
-    (providersError && !providers ? providersError : null)
+    (providersError && !providers?.length ? providersError : null)
   const retryReads = () => {
     if (routesError) void refetchRoutes()
     if (providersError) void refetchProviders()

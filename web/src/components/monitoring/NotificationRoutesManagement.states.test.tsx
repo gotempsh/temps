@@ -145,6 +145,18 @@ test('failed route read is not reported as having no routes', () => {
   client.clear()
 })
 
+test('failed refresh over cached empty providers still shows the read failure', () => {
+  const client = createClient()
+  client.setQueryData(routesKey, emptyRoutes)
+  client.setQueryData(providersKey, [] as NotificationProviderResponse[])
+  fail(client, providersKey, serverError)
+  const html = render(client)
+  expect(html).toContain('Notification routes unavailable')
+  expect(html).toContain('Retry')
+  expect(html).not.toContain('Add a destination first')
+  client.clear()
+})
+
 test('failed provider read is not reported as having no providers', () => {
   const client = createClient()
   client.setQueryData(routesKey, emptyRoutes)
