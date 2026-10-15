@@ -3707,7 +3707,12 @@ impl ComposeExecutor {
         variables: &HashMap<String, String>,
     ) -> Result<ResolvedComposeConfiguration, ComposeError> {
         let defer = input.defer_unknown_required;
-        let excluded = input.excluded_services;
+        // Excluded services a kept service inherits from (through `extends`
+        // in the file or the override) still run, so they keep strict checks.
+        let excluded = &compose_interpolation::excluded_services_not_inherited(
+            &[input.content, input.override_content.unwrap_or_default()],
+            input.excluded_services,
+        );
         let content =
             interpolate_for_check("compose file", input.content, variables, defer, excluded)?;
         let mut unset_variables = content.unset_variables;
@@ -3760,7 +3765,7 @@ impl ComposeExecutor {
             return Ok(resolved);
         }
         let mut snapshots_variables = SnapshotInterpolation::new(variables.clone(), defer);
-        snapshots_variables.excluded_services = excluded.to_vec();
+        snapshots_variables.excluded_services = excluded.clone();
         let (merged, command) = self
             .run_compose_config(
                 input,
@@ -17399,6 +17404,31 @@ services:
             .await
             .unwrap_err();
         assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
+
+        // An excluded service a kept one inherits from still runs inside it,
+        // whether the file or the override adds the `extends`.
+        let inherited = content.replace(
+            "image: nginx:alpine\n",
+            "image: nginx:alpine\n    extends: db\n",
+        );
+        let override_extends = "services:\n  app:\n    extends:\n      service: db\n";
+        for (content, override_content) in [
+            (inherited.as_str(), None),
+            (content, Some(override_extends)),
+        ] {
+            let error = executor
+                .check_configuration(&excluded_db_input(
+                    None,
+                    content,
+                    override_content,
+                    &excluded,
+                    &environment,
+                    false,
+                ))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
+        }
     }
 
     #[tokio::test]

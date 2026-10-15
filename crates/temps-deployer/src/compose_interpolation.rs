@@ -159,6 +159,68 @@ pub fn interpolate_project_document(
     )
 }
 
+/// The `excluded` services that no kept service in `documents` inherits
+/// from through `extends`, directly or along a chain. An inherited service
+/// still runs as part of the service that extends it, so its required
+/// variables must keep failing. A target is matched by name even when the
+/// `extends` names another file: that only keeps a check strict. A target
+/// that is not a literal name protects every excluded service.
+pub fn excluded_services_not_inherited(documents: &[&str], excluded: &[String]) -> Vec<String> {
+    let parsed: Vec<Value> = documents
+        .iter()
+        .filter_map(|document| yaml_serde::from_str(document).ok())
+        .collect();
+    let parsed: Vec<&Value> = parsed.iter().collect();
+    uninherited_excluded_services(&parsed, excluded)
+}
+
+fn uninherited_excluded_services(documents: &[&Value], excluded: &[String]) -> Vec<String> {
+    if excluded.is_empty() {
+        return Vec::new();
+    }
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for services in documents
+        .iter()
+        .filter_map(|document| document.get("services")?.as_mapping())
+    {
+        for (name, service) in services {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            if !excluded.iter().any(|excluded| excluded == name) {
+                kept.push(name);
+            }
+            let Some(extends) = service.get("extends") else {
+                continue;
+            };
+            let target = extends
+                .as_str()
+                .or_else(|| extends.get("service").and_then(Value::as_str));
+            match target {
+                Some(target) if !target.contains('$') => {
+                    edges.entry(name).or_default().push(target)
+                }
+                _ => return Vec::new(),
+            }
+        }
+    }
+    let mut inherited: BTreeSet<&str> = BTreeSet::new();
+    let mut pending = kept;
+    while let Some(name) = pending.pop() {
+        for &target in edges.get(name).map(Vec::as_slice).unwrap_or_default() {
+            if inherited.insert(target) {
+                pending.push(target);
+            }
+        }
+    }
+    excluded
+        .iter()
+        .filter(|name| !inherited.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn interpolate(
     document: &str,
     content: &str,
@@ -180,6 +242,7 @@ fn interpolate(
             document: document.to_string(),
             reason: error.to_string(),
         })?;
+    let excluded_services = &uninherited_excluded_services(&[&root], excluded_services);
     let mut state = WalkState {
         variables,
         unset: BTreeSet::new(),
@@ -1092,6 +1155,37 @@ mod tests {
             interpolate_project_document("compose file", content, &variables, false, &[]),
             Err(InterpolationError::RequiredVariableMissing { .. })
         ));
+        // A kept service inheriting an excluded one, directly or through a
+        // chain, keeps its required variables checked.
+        for content in [
+            "services:\n  app:\n    image: nginx\n    extends: db\n  db:\n    environment:\n      P: ${DB_PASSWORD:?required}\n",
+            "services:\n  app:\n    image: nginx\n    extends:\n      service: base\n  base:\n    extends:\n      service: db\n  db:\n    environment:\n      P: ${DB_PASSWORD:?required}\n",
+            "services:\n  app:\n    image: nginx\n    extends:\n      service: ${BASE}\n  db:\n    environment:\n      P: ${DB_PASSWORD:?required}\n",
+        ] {
+            let excluded = vec!["db".to_string(), "base".to_string()];
+            assert!(
+                interpolate_project_document("compose file", content, &variables, false, &excluded)
+                    .is_err(),
+                "{content}"
+            );
+        }
+        // Only excluded services extending each other stay exempt.
+        let chain = "services:\n  app:\n    image: nginx\n  db:\n    extends: base\n  base:\n    environment:\n      P: ${DB_PASSWORD:?required}\n";
+        let both = vec!["db".to_string(), "base".to_string()];
+        assert!(
+            interpolate_project_document("compose file", chain, &variables, false, &both).is_ok()
+        );
+        // Across files: the override extends the root's excluded service.
+        assert_eq!(
+            excluded_services_not_inherited(
+                &[
+                    "services:\n  app:\n    image: nginx\n  db:\n    image: postgres\n",
+                    "services:\n  app:\n    extends: db\n"
+                ],
+                &both
+            ),
+            vec!["base".to_string()]
+        );
         // A service merely named like an excluded one elsewhere is not exempt.
         let nested = "services:\n  app:\n    image: nginx\n    labels:\n      db: ${DB_PASSWORD:?required}\n";
         assert!(
