@@ -5,6 +5,8 @@ import {
   applyOidcTemplate,
   getOidcTemplatePlaceholders,
   OIDC_TEMPLATE_OPTIONS,
+  type OidcFieldErrors,
+  type OidcRequiredField,
   type OidcTemplateId,
 } from '@/components/settings/oidc-provider-constants'
 import { Button } from '@/components/ui/button'
@@ -46,6 +48,12 @@ type OidcProviderFormProps = {
   onSubmit: () => void
   submitting?: boolean
   submitLabel?: string
+  /**
+   * Messages for required fields the last submit found empty. Each is shown
+   * under its field, which is marked `aria-invalid`. The owner of `value`
+   * sets and clears these.
+   */
+  errors?: OidcFieldErrors
   footer?: React.ReactNode
   /**
    * ADR-045 §4: true for the provider Temps Cloud provisions for console
@@ -72,6 +80,7 @@ export function OidcProviderForm({
   onSubmit,
   submitting = false,
   submitLabel,
+  errors = {},
   footer,
   disabled = false,
 }: OidcProviderFormProps) {
@@ -88,6 +97,21 @@ export function OidcProviderForm({
   ) => {
     onChange({ ...value, [key]: next })
   }
+
+  // `aria-invalid` / `aria-describedby` for a required field's input.
+  const fieldAria = (field: OidcRequiredField) =>
+    errors[field]
+      ? { 'aria-invalid': true, 'aria-describedby': `oidc-${field}-error` }
+      : {}
+  const fieldError = (field: OidcRequiredField) =>
+    errors[field] ? (
+      <p
+        id={`oidc-${field}-error`}
+        className="text-sm font-medium text-destructive"
+      >
+        {errors[field]}
+      </p>
+    ) : null
 
   const handleTemplateChange = (template: OidcTemplateId) => {
     onChange(
@@ -128,7 +152,9 @@ export function OidcProviderForm({
               onChange={(event) => update('name', event.target.value)}
               placeholder={placeholders.name}
               disabled={disabled}
+              {...fieldAria('name')}
             />
+            {fieldError('name')}
           </div>
           <div className="space-y-2">
             <Label htmlFor="oidc-protocol">Protocol</Label>
@@ -204,7 +230,9 @@ export function OidcProviderForm({
               onChange={(event) => update('issuer_url', event.target.value)}
               placeholder={placeholders.issuer_url}
               disabled={disabled}
+              {...fieldAria('issuer_url')}
             />
+            {fieldError('issuer_url')}
           </div>
           <div className="space-y-2">
             <Label htmlFor="oidc-client-id">Client ID</Label>
@@ -213,7 +241,9 @@ export function OidcProviderForm({
               value={value.client_id}
               onChange={(event) => update('client_id', event.target.value)}
               disabled={disabled}
+              {...fieldAria('client_id')}
             />
+            {fieldError('client_id')}
           </div>
           <div className="space-y-2">
             <Label htmlFor="oidc-client-secret">Client Secret</Label>
@@ -229,7 +259,9 @@ export function OidcProviderForm({
               }
               autoComplete="new-password"
               disabled={disabled}
+              {...fieldAria('client_secret')}
             />
+            {fieldError('client_secret')}
           </div>
           <div className="space-y-2 sm:col-span-2">
             <Label htmlFor="oidc-redirect">Redirect URL</Label>
