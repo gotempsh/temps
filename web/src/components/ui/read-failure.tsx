@@ -72,6 +72,9 @@ export function ReadFailure({
         )}
         {onRetry && (
           <Button
+            // Often rendered inside a form: a default submit button would
+            // save the form instead of replaying the read.
+            type="button"
             variant="outline"
             size="sm"
             aria-disabled={retrying}

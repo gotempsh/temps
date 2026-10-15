@@ -116,3 +116,20 @@ test('a failed provider read is explained and focus still lands on a field', asy
   expect(document.activeElement?.id).toBe('route-providers-failure')
   api.restore()
 })
+
+test('retrying a failed provider read reloads without submitting the form', async () => {
+  const api = mockApi({
+    'GET /notification-providers': () =>
+      jsonResponse({ title: 'Internal Server Error', detail: 'boom' }, 500),
+  })
+  const view = renderPage()
+  await view.findByText('Notification providers unavailable')
+
+  fireEvent.click(view.getByRole('button', { name: 'Retry' }))
+
+  // A submit would have validated the form and reported the missing fields.
+  expect(view.queryByText('Route name is required')).toBeNull()
+  expect(view.queryByText('Select at least one provider')).toBeNull()
+  expect(api.called('POST', '/notification-routes')).toBe(false)
+  api.restore()
+})
