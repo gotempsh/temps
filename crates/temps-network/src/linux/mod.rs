@@ -285,6 +285,10 @@ pub async fn preflight_mesh_routes(pool: ipnet::Ipv4Net) -> crate::Result<()> {
 
 /// The first IPv4 route (any table) overlapping `pool` that is not on one of
 /// `owned_devices`.
+///
+/// The dump is streamed: each route is judged as it arrives and the walk stops
+/// at the first collision, so memory does not grow with the host's route count
+/// (a router or VPN concentrator can carry hundreds of thousands).
 async fn route_overlapping(
     pool: ipnet::Ipv4Net,
     owned_devices: &[&str],
@@ -292,7 +296,6 @@ async fn route_overlapping(
     use futures::TryStreamExt;
     use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteType};
     use rtnetlink::RouteMessageBuilder;
-    use std::collections::HashMap;
     use std::net::Ipv4Addr;
 
     let (handle, _conn) = open_handle().await?;
@@ -307,8 +310,6 @@ async fn route_overlapping(
         .get(RouteMessageBuilder::<Ipv4Addr>::new().table_id(0).build())
         .execute();
 
-    let mut names: HashMap<u32, String> = HashMap::new();
-    let mut seen = Vec::new();
     while let Some(message) = routes.try_next().await.map_err(listing_error)? {
         // Only connected/static unicast routes can shadow the pool. `local`,
         // `broadcast`, `multicast`, `unreachable` and friends are not routes
@@ -316,70 +317,70 @@ async fn route_overlapping(
         if message.header.kind != RouteType::Unicast {
             continue;
         }
-        let prefix_len = message.header.destination_prefix_length;
         let destination = message.attributes.iter().find_map(|attr| match attr {
             RouteAttribute::Destination(RouteAddress::Inet(address)) => Some(*address),
             _ => None,
         });
-        let oif = message.attributes.iter().find_map(|attr| match attr {
+        // Judge the prefix first: almost every route on a busy host cannot
+        // overlap, and those never cost a device-name lookup.
+        let Some(existing) =
+            overlapping_prefix(pool, destination, message.header.destination_prefix_length)
+        else {
+            continue;
+        };
+        let device = match message.attributes.iter().find_map(|attr| match attr {
             RouteAttribute::Oif(index) => Some(*index),
             _ => None,
-        });
-        let device = match oif {
-            Some(index) => {
-                if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(index) {
-                    if let Some(name) = bridge::link_name_by_index(&handle, index)
-                        .await
-                        .unwrap_or(None)
-                    {
-                        slot.insert(name);
-                    }
-                }
-                names.get(&index).cloned()
-            }
+        }) {
+            Some(index) => bridge::link_name_by_index(&handle, index)
+                .await
+                .unwrap_or(None),
             None => None,
         };
-        seen.push((destination, prefix_len, device));
+        if let Some(collision) = unowned_collision(existing, device.as_deref(), owned_devices) {
+            return Ok(Some(collision));
+        }
     }
 
-    Ok(first_overlapping_route(pool, owned_devices, &seen))
+    Ok(None)
 }
 
-/// Pure half of [`route_overlapping`]: `routes` are `(destination, prefix
-/// length, device)` for the host's unicast IPv4 routes.
+/// The route's prefix as a network when it overlaps `pool`, else `None`.
 ///
-/// Default routes and host (/32) routes are not reported. That is what the
+/// Default routes and host (/32) routes are never reported. That is what the
 /// `ip route show` text this replaced did in effect (`default` is not a CIDR,
 /// and a /32 is printed as a bare address), and a restart of an existing node
 /// must keep passing exactly the checks it passed before.
-fn first_overlapping_route(
+fn overlapping_prefix(
     pool: ipnet::Ipv4Net,
-    owned_devices: &[&str],
-    routes: &[(Option<std::net::Ipv4Addr>, u8, Option<String>)],
-) -> Option<(ipnet::Ipv4Net, String)> {
-    for (destination, prefix_len, device) in routes {
-        let Some(destination) = destination else {
-            continue;
-        };
-        if *prefix_len == 0 || *prefix_len >= 32 {
-            continue;
-        }
-        let Ok(existing) = ipnet::Ipv4Net::new(*destination, *prefix_len) else {
-            continue;
-        };
-        let device = device.as_deref().unwrap_or("unknown");
-        if owned_devices.contains(&device) {
-            continue;
-        }
-        if pool.contains(&existing.network())
-            || pool.contains(&existing.broadcast())
-            || existing.contains(&pool.network())
-            || existing.contains(&pool.broadcast())
-        {
-            return Some((existing, device.to_owned()));
-        }
+    destination: Option<std::net::Ipv4Addr>,
+    prefix_len: u8,
+) -> Option<ipnet::Ipv4Net> {
+    let destination = destination?;
+    if prefix_len == 0 || prefix_len >= 32 {
+        return None;
     }
-    None
+    let existing = ipnet::Ipv4Net::new(destination, prefix_len).ok()?;
+    let overlaps = pool.contains(&existing.network())
+        || pool.contains(&existing.broadcast())
+        || existing.contains(&pool.network())
+        || existing.contains(&pool.broadcast());
+    overlaps.then_some(existing)
+}
+
+/// An overlapping route is a collision unless it is on a device the caller
+/// owns. A route whose device cannot be resolved is still a collision.
+fn unowned_collision(
+    existing: ipnet::Ipv4Net,
+    device: Option<&str>,
+    owned_devices: &[&str],
+) -> Option<(ipnet::Ipv4Net, String)> {
+    let device = device.unwrap_or("unknown");
+    if owned_devices.contains(&device) {
+        None
+    } else {
+        Some((existing, device.to_owned()))
+    }
 }
 
 /// Helper that opens an rtnetlink connection and spawns its background task
@@ -401,6 +402,20 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    type TestRoute = (Option<Ipv4Addr>, u8, Option<String>);
+
+    /// The streaming check applied to a fixed list of routes.
+    fn first_collision(
+        pool: ipnet::Ipv4Net,
+        owned_devices: &[&str],
+        routes: &[TestRoute],
+    ) -> Option<(ipnet::Ipv4Net, String)> {
+        routes.iter().find_map(|(destination, prefix_len, device)| {
+            let existing = overlapping_prefix(pool, *destination, *prefix_len)?;
+            unowned_collision(existing, device.as_deref(), owned_devices)
+        })
+    }
+
     fn route(cidr: &str, device: &str) -> (Option<Ipv4Addr>, u8, Option<String>) {
         let net: ipnet::Ipv4Net = cidr.parse().unwrap();
         (
@@ -418,7 +433,7 @@ mod tests {
             route("10.201.4.0/24", "tun0"),
         ];
         assert_eq!(
-            first_overlapping_route(pool, &[], &routes),
+            first_collision(pool, &[], &routes),
             Some(("10.201.4.0/24".parse().unwrap(), "tun0".to_owned()))
         );
     }
@@ -428,7 +443,7 @@ mod tests {
         let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
         let routes = [route("10.0.0.0/8", "wg-corp")];
         assert_eq!(
-            first_overlapping_route(pool, &[], &routes),
+            first_collision(pool, &[], &routes),
             Some(("10.0.0.0/8".parse().unwrap(), "wg-corp".to_owned()))
         );
     }
@@ -437,7 +452,7 @@ mod tests {
     fn routes_on_owned_devices_are_accepted_so_a_restart_passes() {
         let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
         let routes = [route("10.201.0.0/16", "temps-wg0")];
-        assert_eq!(first_overlapping_route(pool, &["temps-wg0"], &routes), None);
+        assert_eq!(first_collision(pool, &["temps-wg0"], &routes), None);
     }
 
     #[test]
@@ -452,7 +467,7 @@ mod tests {
                 Some("tun0".to_owned()),
             ),
         ];
-        assert_eq!(first_overlapping_route(pool, &[], &routes), None);
+        assert_eq!(first_collision(pool, &[], &routes), None);
     }
 
     #[test]
@@ -460,7 +475,7 @@ mod tests {
         let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
         let routes = [(Some(Ipv4Addr::new(10, 201, 0, 0)), 24, None)];
         assert_eq!(
-            first_overlapping_route(pool, &["temps-wg0"], &routes),
+            first_collision(pool, &["temps-wg0"], &routes),
             Some(("10.201.0.0/24".parse().unwrap(), "unknown".to_owned()))
         );
     }

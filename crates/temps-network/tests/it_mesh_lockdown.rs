@@ -10,6 +10,10 @@
 //! what the lockdown lets through. Run directly they only check the
 //! install/inspect/repair cycle.
 //!
+//! Every test builds the state it needs from scratch (and the table is shared
+//! by the whole host), so they pass in any order, alone or together; a lock
+//! serialises them because the default test runner is multi-threaded.
+//!
 //! Gated like the other kernel tests: `--features integration_kernel`, Linux
 //! only, and `TEMPS_RUN_DIND_TESTS=1`.
 
@@ -31,6 +35,15 @@ fn lockdown(node_api_port: Option<u16>, relay: bool) -> MeshLockdown {
     }
 }
 
+/// The lockdown is one host-wide table: tests must not interleave.
+static HOST_TABLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Start from no lockdown at all, whatever an earlier test left behind.
+fn remove_table() {
+    // Absent is fine: the point is only that it is gone afterwards.
+    let _ = nft(&["delete", "table", "inet", "temps_mesh"]);
+}
+
 fn nft(args: &[&str]) -> std::process::Output {
     std::process::Command::new("nft")
         .args(args)
@@ -43,6 +56,9 @@ async fn lockdown_installs_once_and_is_then_current() {
     if !enabled() {
         return;
     }
+    let _host = HOST_TABLE.lock().await;
+    remove_table();
+
     let wanted = lockdown(None, false);
     assert_eq!(
         lockdown_state(&wanted).await.unwrap(),
@@ -64,8 +80,12 @@ async fn a_changed_setting_replaces_the_table_atomically() {
     if !enabled() {
         return;
     }
+    let _host = HOST_TABLE.lock().await;
+    remove_table();
+
     let before = lockdown(None, false);
     let after = lockdown(Some(9999), false);
+    assert!(ensure_lockdown(&before).await.unwrap());
     assert_eq!(
         lockdown_state(&after).await.unwrap(),
         LockdownState::Outdated,
@@ -87,7 +107,11 @@ async fn a_flushed_table_is_repaired() {
     if !enabled() {
         return;
     }
+    let _host = HOST_TABLE.lock().await;
+    remove_table();
+
     let wanted = lockdown(Some(9999), false);
+    assert!(ensure_lockdown(&wanted).await.unwrap());
     let flushed = nft(&["flush", "table", "inet", "temps_mesh"]);
     assert!(
         flushed.status.success(),
@@ -111,9 +135,17 @@ async fn a_deleted_table_is_reinstalled() {
     if !enabled() {
         return;
     }
+    let _host = HOST_TABLE.lock().await;
+    remove_table();
+
     let wanted = lockdown(Some(9999), false);
+    assert!(ensure_lockdown(&wanted).await.unwrap());
     let deleted = nft(&["delete", "table", "inet", "temps_mesh"]);
-    assert!(deleted.status.success());
+    assert!(
+        deleted.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
     assert_eq!(
         lockdown_state(&wanted).await.unwrap(),
         LockdownState::Missing

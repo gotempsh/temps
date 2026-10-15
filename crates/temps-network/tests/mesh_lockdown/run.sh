@@ -34,17 +34,27 @@ check() { # description, expected (yes|no), command...
   else fail=$((fail+1)); printf 'FAIL  %s (reachable=%s, wanted %s)\n' "$desc" "$got" "$want"; fi
 }
 
-docker network create --subnet 172.30.1.0/24 ${PFX}-under >/dev/null
-docker network create --subnet 172.30.2.0/24 ${PFX}-lan >/dev/null
+# Let Docker pick unused subnets (a fixed range would collide with another run
+# or an existing network) and derive every address from what it chose.
+docker network create ${PFX}-under >/dev/null
+docker network create ${PFX}-lan >/dev/null
+subnet() { docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$1"; }
+under_cidr=$(subnet ${PFX}-under)
+LAN_CIDR=$(subnet ${PFX}-lan)
+host_in() { # CIDR, host number: a.b.c.N within the network's first /24
+  printf '%s' "${1%/*}" | awk -F. -v n="$2" '{print $1"."$2"."$3"."n}'
+}
+A_UNDER=$(host_in "$under_cidr" 10); B_UNDER=$(host_in "$under_cidr" 11)
+A_LAN=$(host_in "$LAN_CIDR" 10);     C_LAN=$(host_in "$LAN_CIDR" 20)
 
 for n in a b c; do
   docker run -d --name ${PFX}-$n --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
     -v "$BIN":/it/test:ro "$IMAGE" sleep 3600 >/dev/null
 done
-docker network connect --ip 172.30.1.10 ${PFX}-under ${PFX}-a
-docker network connect --ip 172.30.1.11 ${PFX}-under ${PFX}-b
-docker network connect --ip 172.30.2.10 ${PFX}-lan ${PFX}-a
-docker network connect --ip 172.30.2.20 ${PFX}-lan ${PFX}-c
+docker network connect --ip $A_UNDER ${PFX}-under ${PFX}-a
+docker network connect --ip $B_UNDER ${PFX}-under ${PFX}-b
+docker network connect --ip $A_LAN ${PFX}-lan ${PFX}-a
+docker network connect --ip $C_LAN ${PFX}-lan ${PFX}-c
 
 for n in a b c; do
   docker exec ${PFX}-$n sh -c 'apt-get update -qq >/dev/null && apt-get install -y -qq iproute2 nftables wireguard-tools netcat-openbsd iputils-ping libcap2-bin >/dev/null 2>&1'
@@ -61,12 +71,12 @@ docker exec ${PFX}-a sh -c "
   ip addr add 10.201.0.1/16 dev temps-wg0 && ip link set temps-wg0 up"
 docker exec ${PFX}-b sh -c "
   ip link add temps-wg0 type wireguard &&
-  wg set temps-wg0 private-key /k peer $PUBA endpoint 172.30.1.10:51820 allowed-ips 10.201.0.1/32,172.30.2.0/24 persistent-keepalive 1 &&
+  wg set temps-wg0 private-key /k peer $PUBA endpoint $A_UNDER:51820 allowed-ips 10.201.0.1/32,$LAN_CIDR persistent-keepalive 1 &&
   ip addr add 10.201.0.2/16 dev temps-wg0 && ip link set temps-wg0 up &&
-  ip route add 172.30.2.0/24 dev temps-wg0"
+  ip route add $LAN_CIDR dev temps-wg0"
 
 # C answers over the LAN: it needs a way back to the mesh, through A.
-docker exec ${PFX}-c ip route add 10.201.0.0/16 via 172.30.2.10
+docker exec ${PFX}-c ip route add 10.201.0.0/16 via $A_LAN
 
 # Services on A (never meant to be reachable over the mesh, except where the
 # lockdown says so) and on C.
@@ -94,7 +104,7 @@ it() { # run one integration test on A as uid 1000 holding only NET_ADMIN
 
 echo "== before any lockdown: the tunnel is an open door"
 check "mesh peer reaches an arbitrary service on A"          yes tcp 10.201.0.1 8080
-check "mesh peer reaches a service on A's private LAN via A" yes tcp 172.30.2.20 22
+check "mesh peer reaches a service on A's private LAN via A" yes tcp $C_LAN 22
 
 echo "== install the lockdown with the real code, no node API"
 it lockdown_installs_once_and_is_then_current
@@ -102,8 +112,8 @@ check "mesh peer reaches an arbitrary service on A"          no  tcp 10.201.0.1 
 check "mesh peer reaches the (unconfigured) node API port"   no  tcp 10.201.0.1 9999
 check "mesh peer's ping to A is answered"                    yes in_b ping -c 1 -W 3 10.201.0.1
 check "mesh peer's VXLAN datagrams reach A"                  yes udp_delivered
-check "mesh peer cannot reach A's private LAN through A"     no  tcp 172.30.2.20 22
-check "underlay path to A is untouched by the lockdown"      yes in_b sh -c 'nc -z -w 3 172.30.1.10 8080'
+check "mesh peer cannot reach A's private LAN through A"     no  tcp $C_LAN 22
+check "underlay path to A is untouched by the lockdown"      yes in_b sh -c "nc -z -w 3 $A_UNDER 8080"
 
 echo "== replies to connections A opens over the mesh are accepted"
 docker exec -d ${PFX}-b sh -c 'nc -lk -p 7000 -s 0.0.0.0'
@@ -119,9 +129,9 @@ echo "== a published container port (DNAT) stays reachable, its target does not"
 docker exec ${PFX}-a sh -c '
   nft add table ip pub &&
   nft "add chain ip pub pre { type nat hook prerouting priority -100; }" &&
-  nft add rule ip pub pre iifname temps-wg0 tcp dport 2222 dnat to 172.30.2.20:22'
+  nft add rule ip pub pre iifname temps-wg0 tcp dport 2222 dnat to '"$C_LAN"':22'
 check "DNAT'd port is reachable over the mesh"               yes tcp 10.201.0.1 2222
-check "its target is still not reachable directly"           no  tcp 172.30.2.20 22
+check "its target is still not reachable directly"           no  tcp $C_LAN 22
 docker exec ${PFX}-a nft delete table ip pub
 
 echo "== repair after the table is flushed behind its back"
@@ -134,7 +144,7 @@ check "after repair the node API port is open"               yes tcp 10.201.0.1 
 echo "== repair after the table is deleted"
 it a_deleted_table_is_reinstalled
 check "after reinstall other ports are closed"               no  tcp 10.201.0.1 8080
-check "private LAN is still not reachable through A"         no  tcp 172.30.2.20 22
+check "private LAN is still not reachable through A"         no  tcp $C_LAN 22
 
 echo
 echo "passed=$pass failed=$fail"
