@@ -40,9 +40,9 @@ const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// Slightly exceeds the worker's 30-minute export deadline.
 const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
-/// A node scan waits for an image-operation slot, then runs Trivy for up to
-/// ten minutes; this bounds both with room for the node's own deadline.
-const IMAGE_SCAN_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// A node scan waits for an image-operation slot, then runs the scanner;
+/// the request outlasts both of the agent's deadlines.
+const IMAGE_SCAN_REQUEST_TIMEOUT: Duration = crate::image_scan::SCAN_REQUEST_TIMEOUT;
 /// Longest agent error body quoted back into a deployment log.
 const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
 

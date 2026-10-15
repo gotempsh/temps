@@ -14,6 +14,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How long the agent lets a scan wait for an image-operation slot. Builds
+/// hold the same slot for up to their own 30-minute deadline.
+pub const SCAN_ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long a scan may run once it holds a slot.
+pub const SCAN_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// What the control plane waits for a scan answer: the agent's two
+/// deadlines in sequence, plus a minute of transfer and serialization. A
+/// client that gave up earlier would discard a scan the agent was still
+/// entitled to finish.
+pub const SCAN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    SCAN_ADMISSION_DEADLINE.as_secs() + SCAN_RUN_DEADLINE.as_secs() + 60,
+);
+
 /// Most findings one report may carry. A report over the limit is refused by
 /// the agent rather than truncated: a partial list would read as a clean
 /// bill of health for whatever fell off the end.
@@ -76,4 +91,16 @@ pub struct ImageScanReport {
     #[serde(default)]
     pub scanner_version: Option<String>,
     pub findings: Vec<ImageScanFinding>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The client must outwait the agent: a scan admitted at the end of the
+    /// admission window still gets its full run time before the request ends.
+    #[test]
+    fn request_timeout_covers_admission_plus_the_run() {
+        assert!(SCAN_REQUEST_TIMEOUT > SCAN_ADMISSION_DEADLINE + SCAN_RUN_DEADLINE);
+    }
 }

@@ -76,9 +76,6 @@ impl From<AgentImageError> for Problem {
 }
 
 const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-/// Capacity wait plus the scanner's own 10-minute limit, with headroom for the
-/// Trivy image pull and database download on a node's first scan.
-const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Own (rather than detach) the build future. Dropping it cancels the Docker
 /// request and releases its scratch directory and admission permit before the
@@ -659,10 +656,11 @@ pub async fn scan_image(
     })?;
     // Waiting for capacity has its own bound; the scan's deadline starts once
     // it holds a slot, so a scan admitted late still gets its full time.
-    let admission_deadline = tokio::time::Instant::now() + SCAN_DEADLINE;
+    let admission_deadline =
+        tokio::time::Instant::now() + temps_deployer::image_scan::SCAN_ADMISSION_DEADLINE;
     let _permit =
         acquire_image_slot(&limits, admission_deadline, &format!("Scan of '{image}'")).await?;
-    let deadline = tokio::time::Instant::now() + SCAN_DEADLINE;
+    let deadline = tokio::time::Instant::now() + temps_deployer::image_scan::SCAN_RUN_DEADLINE;
 
     // Identity first: the report must describe the image that was built, and
     // a tag can be re-pointed by a later build on the same node.

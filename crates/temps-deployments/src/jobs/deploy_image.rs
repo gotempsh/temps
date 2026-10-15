@@ -212,6 +212,10 @@ pub struct ReusedWorkerBuild {
     /// The id of each architecture's image as built; a reused tag is only
     /// fetched from a worker still holding exactly this image.
     pub image_ids_by_platform: HashMap<String, String>,
+    /// The image's configuration as the build node reported it. A rollback or
+    /// promotion has no workflow context from the original build and the
+    /// control plane may hold no copy to inspect, so the ports come from here.
+    pub image_config: Option<super::build_image::BuiltImageConfig>,
 }
 
 impl ReusedWorkerBuild {
@@ -265,6 +269,10 @@ impl ReusedWorkerBuild {
             builder_node_id: Some(builder_node_id),
             builder_node_ids_by_platform,
             image_ids_by_platform,
+            image_config: outputs
+                .get("image_config")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
         })
     }
 
@@ -2374,12 +2382,21 @@ impl DeployImageJob {
 
     /// The image configuration the build job recorded from its build node.
     /// `None` for an image built on the control plane, one deployed by
-    /// reference, and a node that did not report it.
+    /// reference with no worker build behind it, and a node that did not
+    /// report it.
     fn recorded_image_config(
         &self,
         context: &WorkflowContext,
     ) -> Option<super::build_image::BuiltImageConfig> {
-        if self.build_job_id.is_empty() || self.external_image_tag.is_some() {
+        if self.external_image_tag.is_some() {
+            // A rollback or promotion: what the original build's node
+            // reported travels with the reused worker build.
+            return self
+                .reused_worker_build
+                .as_ref()
+                .and_then(|reused| reused.image_config.clone());
+        }
+        if self.build_job_id.is_empty() {
             return None;
         }
         context
@@ -6361,6 +6378,43 @@ mod tests {
             .await;
 
         assert_eq!(port, 9090);
+    }
+
+    /// A rollback or promotion has no workflow context from the original
+    /// build; the ports its node reported travel with the reused worker
+    /// build, so the container port is still the image's own.
+    #[tokio::test]
+    async fn test_resolve_container_port_uses_the_config_of_a_reused_worker_build() {
+        let reused = ReusedWorkerBuild {
+            image_config: Some(super::super::build_image::BuiltImageConfig {
+                exposed_ports: vec![8080],
+                working_dir: None,
+                user: None,
+                entrypoint: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("external-image".to_string())
+        .external_image_tag("app:1".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(3000)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap()
+        .with_reused_worker_build(reused);
+        let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+
+        let port = job.resolve_container_port("app:1", &context).await;
+
+        assert_eq!(port, 8080);
     }
 
     #[test]

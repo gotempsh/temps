@@ -350,6 +350,61 @@ impl BuildNodeScannerResolver {
     }
 }
 
+/// Rollbacks and promotions chain to the deployment they reuse; a chain is
+/// a few hops at most, and a longer one is a cycle or corrupt metadata.
+const MAX_REUSE_HOPS: usize = 8;
+
+impl BuildNodeScannerResolver {
+    /// The persisted outputs of the build behind `deployment_id`. A
+    /// rollback or promotion has no build job of its own: its image is the
+    /// one built by the deployment named in its `source_deployment_id`
+    /// context, so follow that to the build.
+    async fn build_outputs_of(
+        &self,
+        deployment_id: i32,
+    ) -> Result<Option<serde_json::Value>, sea_orm::DbErr> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+        use temps_entities::{deployment_jobs, deployments};
+
+        let mut current = deployment_id;
+        let mut project_id = None;
+        for _ in 0..MAX_REUSE_HOPS {
+            let outputs = deployment_jobs::Entity::find()
+                .filter(deployment_jobs::Column::DeploymentId.eq(current))
+                .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
+                .filter(deployment_jobs::Column::Outputs.is_not_null())
+                .order_by_desc(deployment_jobs::Column::Id)
+                .one(self.db.as_ref())
+                .await?
+                .and_then(|job| job.outputs);
+            if outputs.is_some() {
+                return Ok(outputs);
+            }
+            let Some(deployment) = deployments::Entity::find_by_id(current)
+                .one(self.db.as_ref())
+                .await?
+            else {
+                return Ok(None);
+            };
+            // Only follow reuse within the project that owns the deployment.
+            if *project_id.get_or_insert(deployment.project_id) != deployment.project_id {
+                return Ok(None);
+            }
+            let source = deployment
+                .context_vars
+                .as_ref()
+                .and_then(|vars| vars.get("source_deployment_id"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok());
+            match source {
+                Some(source) if source != current => current = source,
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl temps_vulnerability_scanner::service::DeploymentScannerResolver for BuildNodeScannerResolver {
     async fn scanner_for_deployment(
@@ -357,18 +412,8 @@ impl temps_vulnerability_scanner::service::DeploymentScannerResolver for BuildNo
         deployment_id: i32,
         image_name: &str,
     ) -> Option<Arc<dyn VulnerabilityScanner>> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
-        use temps_entities::deployment_jobs;
-
-        let outputs = match deployment_jobs::Entity::find()
-            .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
-            .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
-            .filter(deployment_jobs::Column::Outputs.is_not_null())
-            .order_by_desc(deployment_jobs::Column::Id)
-            .one(self.db.as_ref())
-            .await
-        {
-            Ok(job) => job.and_then(|job| job.outputs),
+        let outputs = match self.build_outputs_of(deployment_id).await {
+            Ok(outputs) => outputs?,
             Err(error) => {
                 warn!(
                     deployment_id,
@@ -377,7 +422,7 @@ impl temps_vulnerability_scanner::service::DeploymentScannerResolver for BuildNo
                 );
                 return None;
             }
-        }?;
+        };
         let (node_id, expected_image_id) = RecordedBuild::node_holding(&outputs, image_name)?;
         let node = match self.nodes.image_builder_for_node(node_id).await {
             Ok(node) => node,
@@ -989,5 +1034,82 @@ mod tests {
         let node = ScanningNode::new(FakeImageStore::default(), Ok(None));
         let resolver = rescan_resolver(Vec::new(), node, Arc::new(RecordingScanner::default()));
         assert!(resolver.scanner_for_deployment(42, "app:1").await.is_none());
+    }
+
+    fn promoted_deployment(id: i32, source: i32) -> temps_entities::deployments::Model {
+        temps_entities::deployments::Model {
+            id,
+            project_id: 1,
+            environment_id: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: format!("d{id}"),
+            state: "deployed".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: Some(serde_json::json!({ "source_deployment_id": source })),
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: Some(source),
+            upload_request_id: None,
+            docker_socket_mounted: false,
+        }
+    }
+
+    /// A promoted or rolled-back deployment has no build job of its own: its
+    /// image is the one built by the deployment it reuses, which is where
+    /// the scan has to go.
+    #[tokio::test]
+    async fn rescan_of_a_reused_deployment_follows_it_to_the_original_build() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_core::{DockerHandle, PROFILE_CONTROL_PLANE};
+        use temps_vulnerability_scanner::service::DeploymentScannerResolver;
+
+        let node = ScanningNode::new(
+            FakeImageStore::holding("app:1", "sha256:built"),
+            Ok(Some(report(1))),
+        );
+        let local_scanner = Arc::new(RecordingScanner::default());
+        // Deployment 43 reuses 42: no build job of its own, then its
+        // context, then the original build's outputs.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::deployment_jobs::Model>::new()])
+            .append_query_results(vec![vec![promoted_deployment(43, 42)]])
+            .append_query_results(vec![vec![deployment_build_job(Some(build_outputs(Some(
+                7,
+            ))))]])
+            .into_connection();
+        let nodes: Arc<dyn BuilderNodeResolver> = Arc::new(
+            crate::jobs::builder_node::tests::StaticResolver::new(7, node.clone()),
+        );
+        let mut resolver = BuildNodeScannerResolver::new(
+            Arc::new(db),
+            Arc::new(FakeImageStore::default()),
+            nodes,
+            Arc::new(DockerHandle::disabled(PROFILE_CONTROL_PLANE, "unit test")),
+        );
+        resolver.local = local_scanner.clone();
+
+        let scanner = resolver
+            .scanner_for_deployment(43, "app:1")
+            .await
+            .expect("the original build ran on a node");
+        let result = scanner.scan_image("app:1").await.unwrap();
+
+        assert_eq!(result.total_count, 1);
+        assert_eq!(node.requests.lock().unwrap().len(), 1);
+        assert!(local_scanner.scanned.lock().unwrap().is_empty());
     }
 }
