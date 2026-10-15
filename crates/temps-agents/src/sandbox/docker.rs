@@ -681,9 +681,10 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// bookkeeping and must not both run automatic reaping against one daemon.
 /// The reaper additionally never removes a network that has any workload
 /// attached (`network_has_foreign_endpoints`), so even then a running sandbox
-/// is not disconnected (its removal never force-detaches an endpoint, so
-/// Docker refuses to remove a network a workload has attached); at worst a
-/// create in its first seconds fails and is retried.
+/// is not disconnected: removal detaches only the gateway
+/// (`NetworkDetach::OnlyGateway`), so Docker refuses to remove a network a
+/// workload has attached; at worst a create in its first seconds fails and is
+/// retried.
 ///
 /// Whether the owner's container still exists is checked by the caller.
 fn orphan_candidate_owner<'a>(
@@ -709,6 +710,17 @@ fn orphan_candidate_owner<'a>(
     }
     let age_secs = now_unix.checked_sub(network.created?.unix_timestamp())?;
     (u64::try_from(age_secs).ok()? >= min_age.as_secs()).then_some(owner)
+}
+
+/// Which endpoints [`DockerSandboxProvider::remove_isolated_sandbox_network_with`]
+/// disconnects before removing the network.
+#[derive(Clone, Copy)]
+enum NetworkDetach<'a> {
+    /// Every attached endpoint: the caller knows the sandbox is gone.
+    Everything,
+    /// Only the preview gateway with this container name; anything else is
+    /// left attached so Docker refuses to remove a network a workload uses.
+    OnlyGateway(&'a str),
 }
 
 /// Containers attached to `network` other than the sandbox's own egress proxy
@@ -2876,7 +2888,7 @@ impl DockerSandboxProvider {
                 }
             }
             if self
-                .remove_isolated_sandbox_network_with(owner, false)
+                .remove_isolated_sandbox_network_with(owner, NetworkDetach::OnlyGateway(gateway))
                 .await
                 .is_empty()
             {
@@ -2892,22 +2904,24 @@ impl DockerSandboxProvider {
     }
 
     async fn remove_isolated_sandbox_network(&self, container_name: &str) -> Vec<String> {
-        self.remove_isolated_sandbox_network_with(container_name, true)
+        self.remove_isolated_sandbox_network_with(container_name, NetworkDetach::Everything)
             .await
     }
 
     /// Remove a sandbox's egress proxy and isolated network.
     ///
-    /// `force_disconnect` detaches whatever is still attached before the
-    /// network is removed, which is right when the caller knows the sandbox
-    /// is gone. The orphan reaper passes `false`: it can only infer that,
-    /// and another Temps process may have started the sandbox meanwhile, so
-    /// it lets Docker refuse to remove a network that has a workload
-    /// attached instead of cutting that workload off.
+    /// `detach` decides which endpoints are disconnected before the network
+    /// is removed. [`NetworkDetach::Everything`] is right when the caller
+    /// knows the sandbox is gone. The orphan reaper can only infer that, and
+    /// another Temps process may have started the sandbox meanwhile, so it
+    /// passes [`NetworkDetach::OnlyGateway`]: the preview gateway is always
+    /// attached to a sandbox network and would otherwise pin the subnet
+    /// forever, while a workload that appeared since the check is left
+    /// attached and Docker refuses to remove the network under it.
     async fn remove_isolated_sandbox_network_with(
         &self,
         container_name: &str,
-        force_disconnect: bool,
+        detach: NetworkDetach<'_>,
     ) -> Vec<String> {
         let mut cleanup_errors = Vec::new();
         let proxy_name = sandbox_egress_proxy_name(container_name);
@@ -2975,11 +2989,16 @@ impl DockerSandboxProvider {
             );
             return cleanup_errors;
         }
-        let attached = if force_disconnect {
-            network.containers.unwrap_or_default().into_keys().collect()
-        } else {
-            Vec::new()
-        };
+        let attached: Vec<String> = network
+            .containers
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, endpoint)| match detach {
+                NetworkDetach::Everything => true,
+                NetworkDetach::OnlyGateway(gateway) => endpoint.name.as_deref() == Some(gateway),
+            })
+            .map(|(container_id, _)| container_id)
+            .collect();
         for container_id in attached {
             if let Err(error) = self
                 .docker
@@ -10734,6 +10753,194 @@ function response() {{
             "the leftover network must be gone: {after:?}"
         );
         again.expect("releasing twice is a no-op");
+    }
+    /// Starts a throwaway container named `name` from any image the daemon
+    /// already has, so the test never depends on a pull. `None` when none of
+    /// them can run `sleep`.
+    async fn start_throwaway_container(docker: &Docker, name: &str) -> Option<()> {
+        let images = docker
+            .list_images(None::<bollard::query_parameters::ListImagesOptions>)
+            .await
+            .ok()?;
+        for image in images
+            .iter()
+            .flat_map(|image| image.repo_tags.iter())
+            .filter(|tag| !tag.contains("<none>"))
+            .take(5)
+        {
+            let created = docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(name)
+                            .build(),
+                    ),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(image.clone()),
+                        entrypoint: Some(vec!["sleep".to_string()]),
+                        cmd: Some(vec!["120".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if created.is_err() {
+                continue;
+            }
+            let started = docker
+                .start_container(
+                    name,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await;
+            if started.is_ok() {
+                return Some(());
+            }
+            let _ = docker
+                .remove_container(
+                    name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn the_reaper_detaches_the_gateway_but_never_a_workload() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        // Unique per run, so the reaper only ever sees this test's networks.
+        let gateway = format!("reaper-test-gateway-{suffix}");
+        let workload = format!("reaper-test-workload-{suffix}");
+        let leftover = format!("{SANDBOX_NAME_PREFIX}reaper-leftover-{suffix}");
+        let busy = format!("{SANDBOX_NAME_PREFIX}reaper-busy-{suffix}");
+
+        let mut networks: Vec<(String, String)> = Vec::new();
+        for owner in [&leftover, &busy] {
+            let network = sandbox_network_name(owner);
+            let mut request = isolated_sandbox_network_request(&network, owner, &gateway);
+            let octet = 16 + rand::random::<u8>() % 200;
+            request.ipam = Some(bollard::models::Ipam {
+                config: Some(vec![bollard::models::IpamConfig {
+                    subnet: Some(format!("10.{octet}.{}.0/24", rand::random::<u8>())),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            if let Err(error) = create_host_isolated_network(&docker, request).await {
+                println!("Could not create a test network ({error}), skipping");
+                for (_, owner) in &networks {
+                    let _ = provider.remove_isolated_sandbox_network(owner).await;
+                }
+                return;
+            }
+            networks.push((network, owner.clone()));
+        }
+
+        let cleanup = |docker: Arc<Docker>, names: Vec<String>| async move {
+            for name in names {
+                let _ = docker
+                    .remove_container(
+                        &name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        };
+        let names = vec![gateway.clone(), workload.clone()];
+        if start_throwaway_container(&docker, &gateway).await.is_none()
+            || start_throwaway_container(&docker, &workload)
+                .await
+                .is_none()
+        {
+            println!("No local image can run a throwaway container, skipping");
+            cleanup(docker.clone(), names).await;
+            for (_, owner) in &networks {
+                let _ = provider.remove_isolated_sandbox_network(owner).await;
+            }
+            return;
+        }
+        let attach = |network: String, container: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .connect_network(
+                        &network,
+                        bollard::models::NetworkConnectRequest {
+                            container,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        };
+        // The leftover has only the gateway attached; the busy one also has a
+        // workload, which is what a sandbox started elsewhere looks like.
+        let attached = [
+            attach(sandbox_network_name(&leftover), gateway.clone()).await,
+            attach(sandbox_network_name(&busy), gateway.clone()).await,
+            attach(sandbox_network_name(&busy), workload.clone()).await,
+        ];
+
+        let reaped = if attached.iter().all(Result::is_ok) {
+            Some(
+                provider
+                    .reap_orphaned_sandbox_networks(&gateway, std::time::Duration::ZERO)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let inspect = |network: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .inspect_network(
+                        &network,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+            }
+        };
+        let leftover_after = inspect(sandbox_network_name(&leftover)).await;
+        let busy_after = inspect(sandbox_network_name(&busy)).await;
+
+        // Never leave anything behind, whatever the assertions say.
+        cleanup(docker.clone(), names).await;
+        for (_, owner) in &networks {
+            let _ = provider.remove_isolated_sandbox_network(owner).await;
+        }
+
+        assert!(
+            attached.iter().all(Result::is_ok),
+            "attach the test containers: {attached:?}"
+        );
+        assert_eq!(reaped, Some(1), "only the leftover network is reaped");
+        assert!(
+            matches!(&leftover_after, Err(error) if docker_error_is_not_found(error)),
+            "a network with only the gateway attached must be removed: {leftover_after:?}"
+        );
+        assert!(
+            busy_after.is_ok(),
+            "a network with a workload attached must be left alone"
+        );
     }
 }
 #[test]
