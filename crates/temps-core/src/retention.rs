@@ -83,6 +83,22 @@ pub trait RetentionResolver: Send + Sync {
     fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
         table.default_days()
     }
+
+    /// The longest `retention_days` this resolver has stamped, or will stamp
+    /// for any project, on rows of `table` that may still be stored; `None`
+    /// when that is not known.
+    ///
+    /// The stored-IP sweep reads it: a ClickHouse row refers to a PostgreSQL
+    /// IP-address row by id and nothing in PostgreSQL can see that reference,
+    /// so an address must outlive the longest-lived row that points at it.
+    /// `None` is the safe default and makes the sweep delete no addresses
+    /// while this resolver is installed. A resolver that applies different
+    /// windows per project overrides this with an upper bound that covers
+    /// every window it has stamped since the oldest row it can still be
+    /// holding, not just the one it would stamp today.
+    fn max_retention_days(&self, _table: RetentionTable) -> Option<u16> {
+        None
+    }
 }
 
 /// Default [`RetentionResolver`] that returns the ClickHouse table-level
@@ -97,6 +113,10 @@ pub struct FixedRetentionResolver;
 impl RetentionResolver for FixedRetentionResolver {
     fn resolve(&self, _project_id: i32, table: RetentionTable) -> u16 {
         table.default_days()
+    }
+
+    fn max_retention_days(&self, table: RetentionTable) -> Option<u16> {
+        Some(table.default_days())
     }
 }
 
@@ -175,6 +195,12 @@ impl RetentionResolver for SettingsRetentionResolver {
             RetentionTable::ProxyLogs => self.proxy_logs.load(Relaxed),
         }
     }
+
+    /// One window for every project; lowering it is covered by the stored-IP
+    /// hold the settings save records, so the current value is the bound.
+    fn max_retention_days(&self, table: RetentionTable) -> Option<u16> {
+        Some(self.resolve_unscoped(table))
+    }
 }
 
 fn clamp_retention_days(days: u32) -> u16 {
@@ -252,6 +278,10 @@ impl RetentionResolver for RetentionResolverSlot {
 
     fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
         self.resolver.load().resolve_unscoped(table)
+    }
+
+    fn max_retention_days(&self, table: RetentionTable) -> Option<u16> {
+        self.resolver.load().max_retention_days(table)
     }
 }
 
@@ -431,5 +461,49 @@ mod tests {
         // The default does not claim the slot: a plugin resolver still wins.
         assert!(slot.set(std::sync::Arc::new(AlwaysSeven)));
         assert_eq!(slot.resolve(1, RetentionTable::Spans), 7);
+    }
+
+    struct PerProject;
+    impl RetentionResolver for PerProject {
+        fn resolve(&self, project_id: i32, _table: RetentionTable) -> u16 {
+            if project_id == 1 {
+                90
+            } else {
+                30
+            }
+        }
+    }
+
+    #[test]
+    fn a_resolver_that_does_not_declare_a_bound_has_none() {
+        assert_eq!(
+            PerProject.max_retention_days(RetentionTable::ProxyLogs),
+            None
+        );
+    }
+
+    #[test]
+    fn the_built_in_resolvers_declare_the_window_they_stamp() {
+        assert_eq!(
+            FixedRetentionResolver.max_retention_days(RetentionTable::ProxyLogs),
+            Some(30)
+        );
+        let settings = SettingsRetentionResolver::new();
+        assert_eq!(
+            settings.max_retention_days(RetentionTable::ProxyLogs),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn the_slot_reports_the_bound_of_the_resolver_it_holds() {
+        let slot = RetentionResolverSlot::new_default();
+        assert_eq!(slot.max_retention_days(RetentionTable::ProxyLogs), Some(30));
+        assert!(slot.set(std::sync::Arc::new(PerProject)));
+        assert_eq!(
+            slot.max_retention_days(RetentionTable::ProxyLogs),
+            None,
+            "a plugin resolver that declares nothing makes the bound unknown"
+        );
     }
 }

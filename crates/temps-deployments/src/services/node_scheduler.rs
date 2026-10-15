@@ -616,6 +616,21 @@ impl NodeScheduler {
     /// whose output does not depend on the architecture (a static site,
     /// whose image never runs). Same deterministic lowest-id rule as
     /// [`Self::select_builder_node`].
+    /// Every build-only node of `platform`, lowest id first: the candidates,
+    /// in the order [`Self::select_builder_node`] would prefer them, for a
+    /// caller that falls back to the next one when a builder cannot be
+    /// reached.
+    pub async fn select_builder_nodes(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(builder_nodes_for(active_nodes, Some(platform)))
+    }
+
     pub async fn select_any_builder_node(&self) -> Result<Option<nodes::Model>, NodeError> {
         let active_nodes = self
             .node_service
@@ -1757,7 +1772,13 @@ fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::
 /// The lowest-id active build-only node whose architecture is buildable and,
 /// when `platform` is given, matches it.
 fn pick_builder_node_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Option<nodes::Model> {
-    nodes
+    builder_nodes_for(nodes, platform).into_iter().next()
+}
+
+/// Every active build-only node whose architecture is buildable and, when
+/// `platform` is given, matches it, lowest id first.
+fn builder_nodes_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Vec<nodes::Model> {
+    let mut builders: Vec<nodes::Model> = nodes
         .into_iter()
         .filter(|node| {
             is_build_only_node(node)
@@ -1769,7 +1790,9 @@ fn pick_builder_node_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Op
                         })
                 })
         })
-        .min_by_key(|node| node.id)
+        .collect();
+    builders.sort_by_key(|node| node.id);
+    builders
 }
 
 /// Check if a node's labels match a label selector.

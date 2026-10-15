@@ -176,6 +176,18 @@ pub struct ProxyCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADDRESS")]
     pub console_address: Option<String>,
 
+    /// Address of the console's public-only listener: the value given to
+    /// `temps serve --role=console --console-ingress-address`.
+    ///
+    /// With it, third-party callbacks (email tracking, provider webhooks)
+    /// reach the console's public routes even from clients the admin gate
+    /// denies, and the public ingress hostname is pinned to that listener.
+    /// Without it this proxy keeps answering gate-denied requests with a 404.
+    /// It must not be the `--console-address` listener, which serves more
+    /// than the public callback routes.
+    #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
+    pub console_ingress_address: Option<String>,
+
     /// Disable HTTP-to-HTTPS redirect (useful for local development without TLS)
     #[arg(long, env = "TEMPS_DISABLE_HTTPS_REDIRECT")]
     pub disable_https_redirect: bool,
@@ -188,8 +200,9 @@ pub struct ProxyCommand {
 /// standalone proxy has no plugin registry — the mechanism every other
 /// process uses to install a gate — but it *does* have the same database,
 /// so there is no structural reason it must under-enforce. A binary that
-/// knows how to build a gate passes one here; `execute` passes none and
-/// gets [`temps_core::OpenIpGate`].
+/// knows how to build a gate (e.g. one with its own policy templates) passes
+/// one here; `execute` passes none and gets the built-in per-project /
+/// per-environment allow/deny list gate.
 ///
 /// The runtime handle is part of the contract rather than an implementation
 /// detail: pingora owns the process runtime once the proxy starts, so a gate
@@ -242,6 +255,24 @@ impl ProxyCommand {
         ip_gate_builder: Option<FallibleProjectIpGateBuilder>,
         request_policy_gate_builder: Option<RequestPolicyGateBuilder>,
     ) -> anyhow::Result<()> {
+        // The public-only listener is where requests the admin gate denies
+        // are sent. Pointing it at the console listener would send them to
+        // the full console instead (in dual-listener mode: to the
+        // authenticated MCP endpoint), which is what the gate must prevent.
+        let ingress = self
+            .console_ingress_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|address| !address.is_empty());
+        if ingress.is_some() && ingress == self.console_address.as_deref().map(str::trim) {
+            anyhow::bail!(
+                "--console-ingress-address must not be the same address as --console-address.\n\n\
+                 It has to be the console's public-only listener: the value given to \
+                 `temps serve --role=console --console-ingress-address`. Omit the flag if the \
+                 console was started without one."
+            );
+        }
+
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
             warn!(
@@ -288,7 +319,14 @@ impl ProxyCommand {
                 debug!("proxy: enforcing project IP rules via a caller-supplied gate");
                 gate
             }
-            None => Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>,
+            // OSS default: the built-in per-project / per-environment allow
+            // and deny lists, hydrated before traffic is accepted.
+            None => {
+                temps_proxy::ip_access::ProjectIpAccessGate::start_blocking(db.clone(), rt.handle())
+                    .map_err(|error| {
+                        anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+                    })? as Arc<dyn temps_core::ProjectIpGate>
+            }
         };
         let request_policy_gate = match request_policy_gate_builder {
             Some(build) => build(db.clone(), rt.handle())?,
@@ -478,6 +516,10 @@ impl ProxyCommand {
         let proxy_config = temps_proxy::ProxyConfig {
             address,
             console_address,
+            console_ingress_address: self
+                .console_ingress_address
+                .clone()
+                .filter(|address| !address.is_empty()),
             internal_dns_sync_address,
             tls_address,
             preview_domain,
@@ -691,8 +733,9 @@ impl ProxyCommand {
             // proxy_logs_days`, refreshed in the background on `rt`.
             settings_retention,
             // Supplied by the caller when the embedding binary knows how to
-            // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
-            // which is what the plain `temps proxy` entrypoint passes.
+            // build one; the built-in per-project / per-environment allow and
+            // deny list gate otherwise, which is what the plain `temps proxy`
+            // entrypoint gets.
             project_ip_gate,
             request_policy_gate,
         ) {

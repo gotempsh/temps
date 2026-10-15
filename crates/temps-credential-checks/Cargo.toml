@@ -18,7 +18,7 @@ chrono = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 sha1 = "0.11"
 sha2 = { workspace = true }
 thiserror = { workspace = true }

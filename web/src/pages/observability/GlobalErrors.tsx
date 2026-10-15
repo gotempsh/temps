@@ -48,7 +48,7 @@ export default function GlobalErrors() {
   return (
     <GlobalPage
       title="Errors"
-      description="Review application issues across your projects. Event and user counts cover the selected time range."
+      description="Review application issues across your services. Event and user counts cover the selected time range."
       view={view}
       fetching={query.isFetching}
       refresh={() => void query.refetch()}
@@ -81,7 +81,7 @@ export default function GlobalErrors() {
             <TableHeader>
               <TableRow>
                 <TableHead>Issue</TableHead>
-                <TableHead className="hidden md:table-cell">Project</TableHead>
+                <TableHead className="hidden md:table-cell">Service</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="text-right">Events</TableHead>
                 <TableHead className="hidden md:table-cell text-right">

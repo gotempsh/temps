@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   clearFormDraft,
   mergeFormDraft,
@@ -23,6 +23,11 @@ class MemoryStorage {
 }
 
 describe('form drafts', () => {
+  const realWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  afterEach(() => {
+    if (realWindow) Object.defineProperty(globalThis, 'window', realWindow)
+    else Reflect.deleteProperty(globalThis, 'window')
+  })
   beforeEach(() => {
     Object.defineProperty(globalThis, 'window', {
       value: { sessionStorage: new MemoryStorage() },

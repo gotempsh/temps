@@ -52,6 +52,7 @@ import {
 import { useForm } from 'react-hook-form'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
+import { useUrlSearchText } from '@temps-sdk/ds'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 import {
@@ -332,7 +333,7 @@ export function AddDnsProvider() {
         (provider) => provider.type === searchParams.get('provider')
       )?.type ?? null
   )
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchQuery, setSearchQuery] = useUrlSearchText('q')
   const [error, setError] = useState<string | null>(null)
 
   // Filter providers based on search query

@@ -242,8 +242,10 @@ test.describe('AI entry and Cloud onboarding', () => {
       .getByRole('button', { name: 'AI assistant', exact: true })
       .click()
     await expect(page.getByText('AI availability is unknown')).toBeVisible()
+    // The read-failure alert repeats the server detail under "Server response:",
+    // so match the explanation paragraph exactly.
     await expect(
-      page.getByText('The managed capability check timed out.')
+      page.getByText('The managed capability check timed out.', { exact: true })
     ).toBeVisible()
 
     available = true

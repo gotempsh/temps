@@ -50,6 +50,7 @@ export const PROJECT_SECTION_LINKS: Partial<
   monitoring: [
     { title: 'Metrics', url: 'metrics', aliases: ['dashboards'] },
     { title: 'Uptime', url: 'monitors' },
+    { title: 'Status pages', url: 'status-pages' },
     { title: 'Alert rules', url: 'errors/alert-rules' },
   ],
   analytics: [
@@ -195,6 +196,7 @@ const EXTERNAL_PROJECT_PAGES = [
   'telemetry-logs',
   'metrics',
   'monitors',
+  'status-pages',
   'settings/general',
   'settings/telemetry',
 ] as const

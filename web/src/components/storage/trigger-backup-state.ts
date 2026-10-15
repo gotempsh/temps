@@ -244,3 +244,70 @@ export function canSubmitBackup<T extends DestinationLike>(
   if (!destinations) return false
   return selectionStatus(destinations, selectedId) === 'valid'
 }
+
+/** What the server said a backup run would do, as far as the dialog cares. */
+export interface RunPreflightLike {
+  restarts_database: boolean
+  reason?: string | null
+}
+
+/**
+ * Whether starting this backup needs the operator to acknowledge a database
+ * restart (#1415: the first WAL-G backup of a PostgreSQL service with
+ * archiving off recreates its container).
+ *
+ * - `checking`: the preflight is in flight; submitting is held until known.
+ * - `not-needed`: the backup does not restart anything.
+ * - `needs-confirmation`: it does; submit only once acknowledged.
+ * - `unknown`: the preflight failed. Submitting is allowed: the server
+ *   refuses an unacknowledged restart with a 409 and says why.
+ */
+export type RestartGate =
+  | { kind: 'checking' }
+  | { kind: 'not-needed' }
+  | { kind: 'needs-confirmation'; reason: string }
+  | { kind: 'unknown' }
+
+export const RESTART_REASON_FALLBACK =
+  'This backup restarts the database to turn on WAL archiving.'
+
+export function deriveRestartGate(query: {
+  data?: RunPreflightLike
+  isPending: boolean
+  isError: boolean
+}): RestartGate {
+  if (query.data) {
+    return query.data.restarts_database
+      ? {
+          kind: 'needs-confirmation',
+          reason: query.data.reason?.trim() || RESTART_REASON_FALLBACK,
+        }
+      : { kind: 'not-needed' }
+  }
+  if (query.isError) return { kind: 'unknown' }
+  return { kind: 'checking' }
+}
+
+/** Whether the gate lets the backup be submitted. */
+export function restartGateAllowsSubmit(
+  gate: RestartGate,
+  confirmed: boolean
+): boolean {
+  switch (gate.kind) {
+    case 'checking':
+      return false
+    case 'not-needed':
+    case 'unknown':
+      return true
+    case 'needs-confirmation':
+      return confirmed
+  }
+}
+
+/** The `confirm_restart` value to send for this gate. */
+export function confirmRestartParam(
+  gate: RestartGate,
+  confirmed: boolean
+): boolean | undefined {
+  return gate.kind === 'needs-confirmation' ? confirmed : undefined
+}

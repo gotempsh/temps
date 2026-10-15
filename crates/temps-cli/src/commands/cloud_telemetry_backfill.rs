@@ -187,7 +187,8 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
         temps_database::run_migrations(db.as_ref()).await?;
     }
     let link = load_cloud_link(&data_dir, db.clone(), &args.database_url, stateless).await?;
-    let source = build_source(&args, db.clone())?;
+    let compression = temps_config::stored_clickhouse_compression(db.as_ref()).await;
+    let source = build_source(&args, db.clone(), compression)?;
 
     // `resolve_project` rather than `policy_for`: the latter answers `Metered`
     // for a project that does not exist, which would send the operator off to
@@ -546,9 +547,13 @@ fn checkpoint_path(args: &CloudTelemetryBackfillArgs, data_dir: &Path) -> PathBu
 /// Pick the span source. ClickHouse when it is fully configured, Postgres
 /// otherwise — and the choice is printed, so a zero-row run is explainable
 /// rather than mysterious.
+///
+/// `compression` is the stored `clickhouse.compression` setting, so this
+/// client decodes the server the same way `temps serve` does.
 fn build_source(
     args: &CloudTelemetryBackfillArgs,
     db: Arc<sea_orm::DatabaseConnection>,
+    compression: temps_clickhouse::ClickHouseCompression,
 ) -> anyhow::Result<CloudBackfillSource> {
     match (
         &args.clickhouse_url,
@@ -563,7 +568,8 @@ fn build_source(
                     database.clone(),
                     user.clone(),
                     password.clone(),
-                ),
+                )
+                .with_compression(compression),
             );
             Ok(CloudBackfillSource::ClickHouse(Arc::new(
                 client.client().clone(),
@@ -983,7 +989,7 @@ mod tests {
         let mut args = args();
         args.clickhouse_url = Some("http://clickhouse:8123".into());
 
-        let error = build_source(&args, disconnected_db())
+        let error = build_source(&args, disconnected_db(), Default::default())
             .expect_err("partial ClickHouse config must be refused");
 
         assert!(
@@ -994,7 +1000,8 @@ mod tests {
 
     #[test]
     fn no_clickhouse_configuration_reads_the_postgres_span_table() {
-        let source = build_source(&args(), disconnected_db()).expect("default source must build");
+        let source = build_source(&args(), disconnected_db(), Default::default())
+            .expect("default source must build");
         assert_eq!(source.describe(), "PostgreSQL `otel_spans`");
     }
 
@@ -1006,7 +1013,8 @@ mod tests {
         args.clickhouse_user = Some("default".into());
         args.clickhouse_password = Some("secret".into());
 
-        let source = build_source(&args, disconnected_db()).expect("ClickHouse source must build");
+        let source = build_source(&args, disconnected_db(), Default::default())
+            .expect("ClickHouse source must build");
         assert_eq!(source.describe(), "ClickHouse `spans`");
     }
 

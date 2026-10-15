@@ -50,7 +50,7 @@ import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { AnalyticsOnboardingGate } from '@/components/analytics/AnalyticsOnboardingGate'
-import { requestLogsRedirectPath } from '@/components/analytics/analytics-legacy-routes'
+import { RequestLogsRedirect } from '@/components/analytics/RequestLogsRedirect'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Button } from '@/components/ui/button'
 import {
@@ -84,9 +84,11 @@ import {
   SetupWizardShell,
   WizardStepId,
 } from '@/components/project/setup/SetupWizardShell'
+import { useInvalidateGroups } from '@/components/project-groups/useProjectGroups'
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -113,7 +115,11 @@ import { EditFunnel } from '@/pages/EditFunnel'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { toast } from 'sonner'
+import { useUrlState } from '@temps-sdk/ds'
+import { setProjectHosting } from '@/api/client/sdk.gen'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
+  dateFilterFromParams,
   getDateRangeFromFilter,
   QUICK_FILTERS,
   type QuickFilter,
@@ -136,7 +142,6 @@ import {
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import {
-  Navigate,
   Route,
   Routes,
   useLocation,
@@ -255,7 +260,7 @@ export function AnalyticsFilters({
             onEnvironmentChange(value ? parseInt(value) : undefined)
           }
         >
-          <SelectTrigger className="w-[200px]">
+          <SelectTrigger aria-label="Environment" className="w-[200px]">
             <SelectValue placeholder="All environments" />
           </SelectTrigger>
           <SelectContent>
@@ -334,22 +339,15 @@ function PagesTab({ project }: PagesTabProps) {
   const selectedPagePath = searchParams.get('path')
 
   // Restore date filter from URL search params (preserves context from overview)
-  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-
-    if (filter === 'custom' && from && to) {
-      return {
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
-      }
-    }
-    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      return { quickFilter: filter, dateRange: undefined }
-    }
-    return { quickFilter: '24hours', dateRange: undefined }
-  }, [searchParams])
+  // Keyed on the three date parameters only: unrelated query parameters (the
+  // section page finder's `find`) must not recompute the rolling window.
+  const filterParam = searchParams.get('filter')
+  const fromParam = searchParams.get('from')
+  const toParam = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(
+    () => dateFilterFromParams(filterParam, fromParam, toParam),
+    [filterParam, fromParam, toParam]
+  )
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -1169,18 +1167,6 @@ interface ProjectAnalyticsProps {
   project: ProjectResponse
 }
 
-/**
- * Request logs used to be mounted a second time under analytics; keep old
- * links working by sending them to the canonical Request logs page.
- */
-function RequestLogsRedirect({ projectSlug }: { projectSlug: string }) {
-  const { '*': rest = '' } = useParams()
-  const { search } = useLocation()
-  return (
-    <Navigate to={requestLogsRedirectPath(projectSlug, rest, search)} replace />
-  )
-}
-
 export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
   return (
     <Routes>
@@ -1252,25 +1238,19 @@ interface ProjectAnalyticsOverviewProps {
 }
 function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams] = useSearchParams()
+  const { patch: patchUrl } = useUrlState<'filter' | 'from' | 'to'>()
 
   // Restore date filter from URL search params (enables browser back/forward)
-  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-
-    if (filter === 'custom' && from && to) {
-      return {
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
-      }
-    }
-    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      return { quickFilter: filter, dateRange: undefined }
-    }
-    return { quickFilter: '24hours', dateRange: undefined }
-  }, [searchParams])
+  // Keyed on the three date parameters only: unrelated query parameters (the
+  // section page finder's `find`) must not recompute the rolling window.
+  const filterParam = searchParams.get('filter')
+  const fromParam = searchParams.get('from')
+  const toParam = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(
+    () => dateFilterFromParams(filterParam, fromParam, toParam),
+    [filterParam, fromParam, toParam]
+  )
   const [pendingChartRange, setPendingChartRange] =
     React.useState<ChartDateRange | null>(null)
 
@@ -1278,19 +1258,22 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
       setPendingChartRange(null)
-      const params = new URLSearchParams()
-      params.set('filter', next.quickFilter)
-      if (
+      const custom =
         next.quickFilter === 'custom' &&
         next.dateRange?.from &&
         next.dateRange?.to
-      ) {
-        params.set('from', next.dateRange.from.toISOString())
-        params.set('to', next.dateRange.to.toISOString())
-      }
-      setSearchParams(params, { replace: false })
+      // Only the date keys are written, so unrelated parameters (the section
+      // page finder's `find`) survive a range change.
+      patchUrl(
+        {
+          filter: next.quickFilter,
+          from: custom ? next.dateRange?.from?.toISOString() : undefined,
+          to: custom ? next.dateRange?.to?.toISOString() : undefined,
+        },
+        { replace: false }
+      )
     },
-    [setSearchParams]
+    [patchUrl]
   )
 
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
@@ -1405,7 +1388,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                 <Button
                   variant="link"
                   size="sm"
-                  className="text-yellow-600 dark:text-yellow-400"
+                  className="text-yellow-700 dark:text-yellow-400"
                   onClick={() =>
                     navigate(`/projects/${project.slug}/analytics/setup`)
                   }
@@ -1798,6 +1781,8 @@ function analyticsIngestBaseUrl(
 
 function IngestKeySetup({ project }: ProjectAnalyticsProps) {
   const queryClient = useQueryClient()
+  const [revokeTarget, setRevokeTarget] =
+    React.useState<AnalyticsIngestKey | null>(null)
   const { data: settings } = useSettings()
   const baseUrl = analyticsIngestBaseUrl(settings?.external_url)
 
@@ -1935,6 +1920,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             <div className="space-y-1.5">
               <div className="flex gap-2">
                 <Input
+                  aria-label="Public key"
                   value={primaryKey.public_key}
                   readOnly
                   className="font-mono text-sm"
@@ -1974,48 +1960,40 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             </div>
           )}
 
-          {/* Always mounted for the same reason as the Rotate dialog above —
-              only the trigger's visibility depends on `primaryKey`. */}
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="ghost"
-                size="sm"
-                className={primaryKey ? 'text-muted-foreground' : 'hidden'}
-                disabled={revokeKey.isPending}
-              >
-                <Ban className="h-4 w-4 mr-2" />
-                Revoke key
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  Analytics from apps using this key stop being recorded
-                  immediately. The key stays listed here, marked revoked, so you
-                  can still tell which key ingested past data.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  disabled={revokeKey.isPending}
-                  onClick={() =>
-                    primaryKey &&
-                    revokeKey.mutate({
-                      path: {
-                        project_id: project.id,
-                        key_id: primaryKey.id,
-                      },
-                    })
-                  }
-                >
-                  {revokeKey.isPending ? 'Revoking…' : 'Revoke key'}
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={primaryKey ? 'text-muted-foreground' : 'hidden'}
+            disabled={revokeKey.isPending}
+            onClick={() => primaryKey && setRevokeTarget(primaryKey)}
+          >
+            <Ban className="h-4 w-4 mr-2" />
+            Revoke key
+          </Button>
+          <ConfirmDeleteDialog
+            open={revokeTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) setRevokeTarget(null)
+            }}
+            verb="Revoke"
+            confirmLabel="Revoke key"
+            resourceType="analytics ingest key"
+            resourceName={revokeTarget?.public_key ?? ''}
+            consequences="Analytics from apps using this key stop being recorded immediately. The key stays listed here, marked revoked, so you can still tell which key ingested past data."
+            isPending={revokeKey.isPending}
+            onConfirm={() => {
+              if (!revokeTarget) return
+              revokeKey.mutate(
+                {
+                  path: {
+                    project_id: project.id,
+                    key_id: revokeTarget.id,
+                  },
+                },
+                { onSettled: () => setRevokeTarget(null) }
+              )
+            }}
+          />
         </CardContent>
       </Card>
 
@@ -2095,8 +2073,55 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
 }
 
 // Analytics Setup Component
+/**
+ * Offered when a project Temps hosts is set up as "not hosted on Temps":
+ * marking it External labels it and stops Temps from trying to deploy it.
+ */
+function MarkExternalNotice({ project }: ProjectAnalyticsProps) {
+  // Hosting shows on the service and on its project's cards.
+  const invalidate = useInvalidateGroups()
+  const [saving, setSaving] = React.useState(false)
+  const markExternal = async () => {
+    setSaving(true)
+    try {
+      await setProjectHosting({
+        path: { id: project.id },
+        body: { hosting: 'external' },
+        throwOnError: true,
+      })
+      toast.success(`${project.name} is marked as running outside Temps`)
+      await invalidate()
+    } catch (err) {
+      toast.error(getErrorMessage(err, 'Could not mark it as external'))
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center">
+      <p className="flex-1 text-sm text-muted-foreground">
+        Is this app hosted outside Temps? Mark the service External so it is
+        labelled that way and Temps never tries to deploy it. You can change
+        this later in Settings.
+      </p>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={saving}
+        onClick={() => void markExternal()}
+      >
+        {saving && <Loader2 className="size-4 animate-spin" />}
+        Mark as External
+      </Button>
+    </div>
+  )
+}
+
 function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
-  const [selectedFramework, setSelectedFramework] = React.useState('nextjs-app')
+  // An app hosted elsewhere sends its data with an ingest key.
+  const [selectedFramework, setSelectedFramework] = React.useState(
+    project.hosting === 'external' ? 'external' : 'nextjs-app'
+  )
   const [selectedPackageManager, setSelectedPackageManager] =
     React.useState('npm')
 
@@ -2554,7 +2579,12 @@ After implementation:
           </div>
 
           {isExternal ? (
-            <IngestKeySetup project={project} />
+            <>
+              {project.hosting !== 'external' && (
+                <MarkExternalNotice project={project} />
+              )}
+              <IngestKeySetup project={project} />
+            </>
           ) : (
             <>
               <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">

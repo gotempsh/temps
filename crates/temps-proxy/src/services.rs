@@ -8,10 +8,21 @@ use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Error, ErrorType, Result as PingoraResult};
 use std::sync::Arc;
 use temps_routes::CachedPeerTable;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
 const ROUTE_PREFIX_OTEL: &str = "/api/otel";
+/// OTLP ingest. The rest of `/api/otel` is the console's authenticated query
+/// API and must keep reaching the full console listener.
+const ROUTE_PREFIX_OTEL_INGEST: &str = "/api/otel/v1/";
+
+/// Paths every route under which is a public ingest endpoint: served for any
+/// `Host`, never authenticated by session, and mounted on the console's
+/// public router. They are the only path-based routing left in the proxy,
+/// and they go to the public-only listener when one exists (ADR-051).
+pub fn is_public_ingest_path(path: &str) -> bool {
+    path.starts_with(ROUTE_PREFIX_TEMPS) || path.starts_with(ROUTE_PREFIX_OTEL_INGEST)
+}
 
 /// Match only the two authenticated DNS sync endpoints. Prefix matching would
 /// accidentally capture unrelated node APIs or attacker-controlled suffixes.
@@ -61,6 +72,16 @@ impl UpstreamResolverImpl {
             route_table,
         }
     }
+
+    /// Where requests that may only reach the console's public routes go:
+    /// the public-only listener when one exists, the console listener
+    /// otherwise (a split proxy started without an ingress address).
+    fn public_surface_address(&self) -> &str {
+        self.server_config
+            .console_ingress_address
+            .as_deref()
+            .unwrap_or(&self.server_config.console_address)
+    }
 }
 
 #[async_trait]
@@ -87,24 +108,54 @@ impl UpstreamResolver for UpstreamResolverImpl {
             host, path, sni_hostname
         );
 
-        // Route API and OTLP ingest paths directly to the console (API server),
-        // regardless of the Host header — needed for OTLP push from containers
-        // that use host.docker.internal as the host.
-        if path.starts_with(ROUTE_PREFIX_TEMPS) || path.starts_with(ROUTE_PREFIX_OTEL) {
-            debug!(
-                "Routing temps API request to console: {}",
-                self.server_config.console_address
+        // The public ingress hostname (ADR-051) is owned by the platform and
+        // may only ever reach the public-only listener: never a project
+        // route, and never the full console, whatever the path or client.
+        // Checked before the path prefixes below so `/api/otel/...` on this
+        // host cannot reach the console's authenticated query API.
+        if let Some(ingress_address) = self.server_config.console_ingress_address.as_deref() {
+            if self.route_table.is_public_ingress_hostname(host) {
+                debug!(
+                    "Routing public ingress host {} to the public-only listener: {}",
+                    host, ingress_address
+                );
+                return Ok(console_peer(ingress_address));
+            }
+        }
+
+        // A status page's custom hostname (#1412) is answered by the proxy's
+        // status-host branch in `request_filter`, which pins it to the
+        // public-only listener before peer resolution. Reaching this point
+        // with one means that branch was bypassed: refuse rather than let any
+        // path prefix below send the host to the console or a project.
+        if self.route_table.status_page_host(host).is_some()
+            || sni_hostname.is_some_and(|sni| self.route_table.status_page_host(sni).is_some())
+        {
+            warn!(
+                host,
+                "status-page hostname reached generic peer resolution; refusing"
             );
-            let peer = Box::new(HttpPeer::new(
-                self.server_config.console_address.clone(),
-                false,
-                "".to_string(),
+            return Err(Error::explain(
+                ErrorType::ConnectNoRoute,
+                format!("status-page hostname '{host}' is only served by the status-page branch"),
             ));
-            return Ok(PeerSelection {
-                peer,
-                container_id: None,
-                container_name: None,
-            });
+        }
+
+        // Route API and OTLP paths directly to the console (API server),
+        // regardless of the Host header — needed for OTLP push from containers
+        // that use host.docker.internal as the host. Public ingest paths go to
+        // the public-only listener, so "reachable from any host" is a property
+        // of what that listener mounts rather than of a path prefix. The OTLP
+        // query API shares the `/api/otel` prefix but is an authenticated
+        // console API, so it keeps going to the full console listener.
+        if path.starts_with(ROUTE_PREFIX_TEMPS) || path.starts_with(ROUTE_PREFIX_OTEL) {
+            let address = if is_public_ingest_path(path) {
+                self.public_surface_address()
+            } else {
+                self.server_config.console_address.as_str()
+            };
+            debug!("Routing temps API request to console: {}", address);
+            return Ok(console_peer(address));
         }
 
         // Try the in-memory route table across all three lookup strategies
@@ -295,6 +346,27 @@ impl UpstreamResolver for UpstreamResolverImpl {
     fn console_address(&self) -> &str {
         &self.server_config.console_address
     }
+
+    fn console_ingress_address(&self) -> Option<&str> {
+        self.server_config.console_ingress_address.as_deref()
+    }
+
+    fn is_public_ingress_host(&self, host: &str) -> bool {
+        self.route_table.is_public_ingress_hostname(host)
+    }
+
+    fn status_page_host(&self, host: &str) -> Option<temps_routes::StatusPageHostRoute> {
+        self.route_table.status_page_host(host)
+    }
+}
+
+/// A plain-HTTP peer for one of the console's loopback listeners.
+fn console_peer(address: &str) -> PeerSelection {
+    PeerSelection {
+        peer: Box::new(HttpPeer::new(address.to_string(), false, "".to_string())),
+        container_id: None,
+        container_name: None,
+    }
 }
 
 /// Implementation of ProjectContextResolver trait
@@ -372,6 +444,172 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
         // Use route_info.static_dir() to get static directory path
         let route_info = self.route_table.get_route(host)?;
         route_info.static_dir().map(|s| s.to_string())
+    }
+
+    fn match_path_route(&self, host: &str, path: &str) -> Option<temps_routes::PathRoute> {
+        self.route_table.match_path_route(host, path)
+    }
+}
+
+#[cfg(test)]
+mod public_ingress_tests {
+    use super::*;
+    use pingora_core::upstreams::peer::Peer;
+
+    const CONSOLE: &str = "127.0.0.1:18085";
+    const INGRESS: &str = "127.0.0.1:18086";
+    const INGRESS_HOST: &str = "hooks.example.com";
+
+    fn resolver(ingress_listener: bool, ingress_host: Option<&str>) -> UpstreamResolverImpl {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        // Loaded, so an unmatched host falls through without the startup wait.
+        route_table.insert_route_for_test(
+            "seed.example.com",
+            temps_routes::RouteInfo {
+                backend: temps_routes::BackendType::Upstream {
+                    backends: vec![temps_routes::BackendEntry {
+                        address: "127.0.0.1:18080".into(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: None,
+                deployment: None,
+                cert_eligible: false,
+            },
+        );
+        if let Some(host) = ingress_host {
+            route_table.reserve_public_ingress_hostname_for_test(host);
+        }
+        UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: CONSOLE.into(),
+                console_ingress_address: ingress_listener.then(|| INGRESS.into()),
+                ..ProxyConfig::default()
+            }),
+            Arc::new(LbService::new(db)),
+            route_table,
+        )
+    }
+
+    async fn peer(resolver: &UpstreamResolverImpl, host: &str, path: &str) -> String {
+        match resolver
+            .resolve_peer_for_request(host, path, "POST", None)
+            .await
+        {
+            Ok(selection) => selection.peer.address().to_string(),
+            Err(error) => panic!("{host}{path} must resolve to a peer: {error}"),
+        }
+    }
+
+    #[test]
+    fn only_ingest_paths_count_as_public() {
+        for path in [
+            "/api/_temps/event",
+            "/api/_temps/captcha/verify",
+            "/api/otel/v1/traces",
+            "/api/otel/v1/1/2/3/logs",
+        ] {
+            assert!(is_public_ingest_path(path), "{path}");
+        }
+        for path in [
+            "/api/otel/traces",
+            "/api/otel/metrics",
+            "/api/otel/v1",
+            "/api/settings",
+            "/",
+        ] {
+            assert!(!is_public_ingest_path(path), "{path}");
+        }
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn ingress_host_reaches_only_the_public_listener_whatever_the_path() {
+        let resolver = resolver(true, Some(INGRESS_HOST));
+        for path in [
+            "/",
+            "/api/settings",
+            "/api/webhook/git/gitlab/events",
+            "/api/emails/5b1f8f0e-6d0e-4a55-9f0c-2f6a3f4f7c11/track/open",
+            // Shares a prefix with the console's authenticated query API.
+            "/api/otel/traces",
+            "/api/_temps/event",
+        ] {
+            assert_eq!(
+                peer(&resolver, INGRESS_HOST, path).await,
+                INGRESS,
+                "{path} on the ingress host must never reach the console listener"
+            );
+        }
+        // A raw Host header with a port and different case is the same host.
+        assert_eq!(
+            peer(&resolver, "Hooks.Example.com:443", "/api/settings").await,
+            INGRESS
+        );
+        assert!(resolver.is_public_ingress_host("hooks.example.com."));
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn other_hosts_keep_falling_through_to_the_console() {
+        let resolver = resolver(true, Some(INGRESS_HOST));
+        assert_eq!(peer(&resolver, "console.example.com", "/").await, CONSOLE);
+        assert_eq!(
+            peer(&resolver, "console.example.com", "/api/settings").await,
+            CONSOLE
+        );
+        assert!(!resolver.is_public_ingress_host("console.example.com"));
+        // A project route is untouched by the ingress host existing.
+        assert_eq!(
+            peer(&resolver, "seed.example.com", "/").await,
+            "127.0.0.1:18080"
+        );
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn public_ingest_paths_use_the_public_listener_on_any_host() {
+        let resolver = resolver(true, None);
+        for host in [
+            "console.example.com",
+            "seed.example.com",
+            "host.docker.internal",
+        ] {
+            assert_eq!(peer(&resolver, host, "/api/_temps/event").await, INGRESS);
+            assert_eq!(peer(&resolver, host, "/api/otel/v1/traces").await, INGRESS);
+        }
+        // The OTLP query API is an authenticated console API: it must keep
+        // reaching the full console, or the dashboard's own requests 404.
+        assert_eq!(
+            peer(&resolver, "console.example.com", "/api/otel/traces").await,
+            CONSOLE
+        );
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn without_an_ingress_listener_routing_is_unchanged() {
+        let resolver = resolver(false, Some(INGRESS_HOST));
+        assert_eq!(resolver.console_ingress_address(), None);
+        assert_eq!(peer(&resolver, INGRESS_HOST, "/").await, CONSOLE);
+        assert_eq!(
+            peer(&resolver, "seed.example.com", "/api/_temps/event").await,
+            CONSOLE
+        );
+        assert_eq!(
+            peer(&resolver, "seed.example.com", "/api/otel/v1/traces").await,
+            CONSOLE
+        );
     }
 }
 
@@ -531,6 +769,71 @@ mod dns_sync_tests {
             },
         ))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod path_route_tests {
+    use super::*;
+    use temps_routes::{BackendType, PathRoute, RouteInfo};
+
+    fn environment(id: i32) -> Arc<temps_entities::environments::Model> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": "production", "slug": "production", "subdomain": "production",
+                "last_deployment": null, "host": "", "upstreams": [],
+                "created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
+                "project_id": 1, "current_deployment_id": null, "branch": null,
+                "deleted_at": null, "deployment_config": null, "is_preview": false,
+                "protected": false, "sleeping": false, "attack_mode": null,
+                "force_https": null, "last_activity_at": null
+            }))
+            .expect("environment fixture"),
+        )
+    }
+
+    /// The proxy resolves path routes through the context resolver, which
+    /// every proxy has; the load balancer's own route-table handle is only
+    /// wired when on-demand TLS is configured.
+    #[test]
+    fn context_resolver_matches_path_routes_in_memory() {
+        let table = Arc::new(CachedPeerTable::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        )));
+        table.insert_route_for_test(
+            "web.example.com",
+            RouteInfo {
+                backend: BackendType::StaticDir {
+                    path: "web".to_string(),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: Some(environment(10)),
+                deployment: None,
+                cert_eligible: true,
+            },
+        );
+        table.insert_path_routes_for_test(
+            10,
+            vec![PathRoute {
+                prefix: "/api".to_string(),
+                strip_prefix: false,
+                target_service: "api".to_string(),
+                target: None,
+                sleeping_environment_id: None,
+            }],
+        );
+        let resolver = ProjectContextResolverImpl::new(table);
+
+        let matched = resolver.match_path_route("web.example.com", "/api/status");
+        assert_eq!(matched.map(|r| r.prefix), Some("/api".to_string()));
+        assert!(resolver
+            .match_path_route("web.example.com", "/about")
+            .is_none());
+        assert!(resolver
+            .match_path_route("other.example.com", "/api/status")
+            .is_none());
     }
 }
 

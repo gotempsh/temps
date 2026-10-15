@@ -9,7 +9,11 @@ import {
   getEnvironmentOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VulnerabilityResponse } from '@/api/client'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -29,6 +33,7 @@ import {
   Detail,
   PageState,
   Status,
+  useUrlSearchText,
   useUrlState,
   type DetailFact,
   type StatusTone,
@@ -308,7 +313,7 @@ function scanFacts(
             {scan.critical_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-red-500/20 bg-red-500/10 text-red-500"
+                className="border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-500"
               >
                 {scan.critical_count} Critical
               </Badge>
@@ -316,7 +321,7 @@ function scanFacts(
             {scan.high_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-orange-500/20 bg-orange-500/10 text-orange-500"
+                className="border-orange-500/20 bg-orange-500/10 text-orange-700 dark:text-orange-500"
               >
                 {scan.high_count} High
               </Badge>
@@ -324,7 +329,7 @@ function scanFacts(
             {scan.medium_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-yellow-500/20 bg-yellow-500/10 text-yellow-500"
+                className="border-yellow-500/20 bg-yellow-500/10 text-yellow-700 dark:text-yellow-500"
               >
                 {scan.medium_count} Medium
               </Badge>
@@ -332,7 +337,7 @@ function scanFacts(
             {scan.low_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-blue-500/20 bg-blue-500/10 text-blue-500"
+                className="border-blue-500/20 bg-blue-500/10 text-blue-600 dark:text-blue-500"
               >
                 {scan.low_count} Low
               </Badge>
@@ -345,8 +350,12 @@ function scanFacts(
 
 function ScanDetailContent() {
   const { slug, scanId } = useParams<{ slug: string; scanId: string }>()
-  const { get, patch } = useUrlState<'q' | 'types' | 'tab'>()
-  const searchQuery = get('q') ?? ''
+  const urlState = useUrlState<'q' | 'types' | 'tab'>()
+  const { get, patch } = urlState
+  // Typed text stays local so the box never drops keystrokes while the URL
+  // catches up; `q` is the shareable, reload-safe copy. It shares this page's
+  // URL state so a type/tab click right after typing cannot drop the search.
+  const [searchQuery, setSearchQuery] = useUrlSearchText('q', { urlState })
   const selectedTypesParam = get('types') ?? ''
   const selectedTypes = useMemo(
     () => new Set(selectedTypesParam ? selectedTypesParam.split(',') : []),
@@ -355,7 +364,6 @@ function ScanDetailContent() {
   const activeTab = get('tab') ?? 'source-code'
   const [showTypeFilters, setShowTypeFilters] = useState(false)
 
-  const setSearchQuery = (value: string) => patch({ q: value || undefined })
   const setSelectedTypes = (types: Set<string>) =>
     patch({ types: types.size > 0 ? Array.from(types).join(',') : undefined })
 
@@ -559,7 +567,11 @@ function ScanDetailContent() {
                   Copy AI Prompt
                 </Button>
               </PopoverTrigger>
-              <PopoverContent align="end" className="w-64 space-y-2" aria-label="Copy vulnerability fix prompt">
+              <PopoverContent
+                align="end"
+                className="w-64 space-y-2"
+                aria-label="Copy vulnerability fix prompt"
+              >
                 <p className="text-sm font-medium">Copy fix prompt</p>
                 <CopyAction
                   value={generateVulnerabilityPrompt(vulnerabilities)}
@@ -570,9 +582,13 @@ function ScanDetailContent() {
                 </CopyAction>
                 {vulnerabilityTypes.length > 1 && (
                   <>
-                    <p className="pt-2 text-xs text-muted-foreground">By type</p>
+                    <p className="pt-2 text-xs text-muted-foreground">
+                      By type
+                    </p>
                     {vulnerabilityTypes.map((type) => {
-                      const typeVulns = vulnerabilities.filter((v) => v.type === type)
+                      const typeVulns = vulnerabilities.filter(
+                        (v) => v.type === type
+                      )
                       return (
                         <CopyAction
                           key={type}

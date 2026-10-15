@@ -12,6 +12,7 @@ import {
   FileText,
   Filter,
   Flag,
+  Globe,
   KeyRound,
   LineChart,
   Play,
@@ -125,6 +126,12 @@ export const projectToolGroups: ProjectToolGroup[] = [
         featureKey: 'otel-traces-metrics',
       },
       { title: 'Uptime', url: 'monitors', icon: Activity },
+      {
+        title: 'Status Pages',
+        url: 'status-pages',
+        icon: Globe,
+        featureKey: 'status-pages',
+      },
       { title: 'Request Logs', url: 'request-logs', icon: Rss },
       {
         title: 'AI Crawlers',
@@ -136,7 +143,7 @@ export const projectToolGroups: ProjectToolGroup[] = [
   },
   {
     label: 'Configure',
-    description: 'Connect runtime features and automate project workflows.',
+    description: 'Connect runtime features and automate service workflows.',
     items: [
       { title: 'Feature Flags', url: 'flags', icon: Flag },
       {
@@ -148,7 +155,7 @@ export const projectToolGroups: ProjectToolGroup[] = [
     ],
   },
   {
-    label: 'Project settings',
+    label: 'Service settings',
     description: 'Control secrets, access, schedules, and integrations.',
     items: [
       { title: 'General', url: 'settings/general', icon: SlidersHorizontal },

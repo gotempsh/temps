@@ -10,6 +10,7 @@ import {
   isApiHttpRequest,
   isApiWebSocket,
   isWebSocketUpgrade,
+  rewriteDevServerOrigin,
 } from './rsbuild.config'
 
 describe('deriveConsoleTarget', () => {
@@ -58,6 +59,28 @@ describe('API proxy routing', () => {
   it('leaves non-API sockets such as dev-server HMR alone', () => {
     expect(isApiWebSocket('/rsbuild-hmr', upgrade)).toBe(false)
     expect(isApiHttpRequest('/apiary', plain)).toBe(false)
+  })
+})
+
+describe('rewriteDevServerOrigin', () => {
+  const dev = 'http://127.0.0.1:5173'
+  const target = 'http://127.0.0.1:8080'
+
+  it('maps the dev server Origin and Referer onto the API target', () => {
+    expect(rewriteDevServerOrigin(dev, dev, target)).toBe(target)
+    expect(rewriteDevServerOrigin(`${dev}/email/domains/4`, dev, target)).toBe(
+      `${target}/email/domains/4`
+    )
+  })
+
+  it('leaves foreign and look-alike origins untouched', () => {
+    expect(
+      rewriteDevServerOrigin('https://attacker.example', dev, target)
+    ).toBeUndefined()
+    expect(
+      rewriteDevServerOrigin(`${dev}.attacker.example`, dev, target)
+    ).toBeUndefined()
+    expect(rewriteDevServerOrigin(undefined, dev, target)).toBeUndefined()
   })
 })
 

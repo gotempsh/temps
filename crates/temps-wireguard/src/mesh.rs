@@ -355,37 +355,31 @@ mod imp {
         })
     }
 
-    /// `ip` output for the mesh interface; used where defguard has no read API
-    /// (interface addresses) and to bring an existing link up.
-    fn ip(args: &[&str]) -> Result<String, WireGuardError> {
-        let output = std::process::Command::new("ip")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|error| WireGuardError::OperationFailed {
-                operation: format!("ip {}", args.join(" ")),
-                reason: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(WireGuardError::OperationFailed {
-                operation: format!("ip {}", args.join(" ")),
-                reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
     /// The IPv4 addresses on the interface, as `a.b.c.d/len`.
     fn interface_addresses() -> Result<Vec<String>, WireGuardError> {
-        let listing = ip(&["-4", "-o", "addr", "show", "dev", MESH_INTERFACE])?;
-        Ok(listing
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                fields.find(|field| *field == "inet")?;
-                fields.next().map(str::to_string)
-            })
-            .collect())
+        crate::link::ipv4_addresses(MESH_INTERFACE).map_err(|error| {
+            WireGuardError::OperationFailed {
+                operation: format!("read addresses of {MESH_INTERFACE}"),
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Bring the existing mesh link up. Done in-process: iproute2 drops every
+    /// capability unless euid is 0, so shelling out to `ip` fails for a
+    /// non-root process that holds only `CAP_NET_ADMIN`.
+    fn link_up() -> Result<(), WireGuardError> {
+        crate::link::set_up(MESH_INTERFACE).map_err(|error| WireGuardError::OperationFailed {
+            operation: format!("bring {MESH_INTERFACE} up"),
+            reason: error.to_string(),
+        })
+    }
+
+    fn set_link_mtu(mtu: u32) -> Result<(), WireGuardError> {
+        crate::link::set_mtu(MESH_INTERFACE, mtu).map_err(|error| WireGuardError::OperationFailed {
+            operation: format!("set {MESH_INTERFACE} MTU to {mtu}"),
+            reason: error.to_string(),
+        })
     }
 
     /// The interface MTU from sysfs.
@@ -421,16 +415,9 @@ mod imp {
                     let mtu_changed = interface_mtu()? != interface.mtu;
                     if mtu_changed {
                         // Settable in place, unlike key/address: no peer loss.
-                        ip(&[
-                            "link",
-                            "set",
-                            "dev",
-                            MESH_INTERFACE,
-                            "mtu",
-                            &interface.mtu.to_string(),
-                        ])?;
+                        set_link_mtu(interface.mtu)?;
                     }
-                    ip(&["link", "set", "dev", MESH_INTERFACE, "up"])?;
+                    link_up()?;
                     return Ok(mtu_changed);
                 }
             }
@@ -460,7 +447,7 @@ mod imp {
                 "cannot configure WireGuard interface {MESH_INTERFACE}: {error}"
             ))
         })?;
-        ip(&["link", "set", "dev", MESH_INTERFACE, "up"])?;
+        link_up()?;
         Ok(true)
     }
 

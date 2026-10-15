@@ -363,10 +363,10 @@ function Meter({
     <div className="min-w-0">
       <div className="flex items-baseline justify-between gap-2">
         <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
-          <span className="text-muted-foreground/80">{icon}</span>
+          <span className="text-muted-foreground">{icon}</span>
           {label}
           {hint && (
-            <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
               {hint}
             </span>
           )}
@@ -405,7 +405,7 @@ function LimitsInline({
 
   if (memory == null && nano == null && shm == null) {
     return (
-      <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
         Unlimited
       </span>
     )

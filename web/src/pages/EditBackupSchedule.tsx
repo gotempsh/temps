@@ -38,7 +38,9 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -67,6 +69,9 @@ export function EditBackupSchedule() {
     data: schedule,
     isLoading: isLoadingSchedule,
     isError: isScheduleError,
+    error: scheduleError,
+    isFetching: isFetchingSchedule,
+    refetch: refetchSchedule,
   } = useQuery({
     ...getBackupScheduleOptions({ path: { id: scheduleIdNum! } }),
     enabled: !!scheduleIdNum,
@@ -162,15 +167,19 @@ export function EditBackupSchedule() {
   }
 
   // Guard: the loaded schedule must belong to the source in the URL to prevent
-  // silently re-binding a schedule to a different source's detail page.
-  if (schedule && schedule.s3_source_id !== sourceId) {
+  // silently re-binding a schedule to a different source's detail page. An id
+  // the server verifiably does not know is the same "not found" outcome.
+  const scheduleMissing = isScheduleError && isVerifiedNotFound(scheduleError)
+  if (scheduleMissing || (schedule && schedule.s3_source_id !== sourceId)) {
     return (
       <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <Card>
           <CardHeader>
             <CardTitle>Schedule not found</CardTitle>
             <CardDescription>
-              Schedule {scheduleIdNum} does not belong to S3 source {sourceId}.
+              {scheduleMissing
+                ? `Schedule ${scheduleIdNum} does not exist.`
+                : `Schedule ${scheduleIdNum} does not belong to S3 source ${sourceId}.`}
             </CardDescription>
           </CardHeader>
           <CardFooter>
@@ -268,7 +277,7 @@ export function EditBackupSchedule() {
         </CardHeader>
 
         <CardContent className="space-y-6">
-          {isLoadingSchedule || !seeded ? (
+          {isLoadingSchedule || (!seeded && !isScheduleError) ? (
             // Skeleton placeholders that match the real form layout so the
             // page does not collapse then expand when data arrives.
             <div className="space-y-6">
@@ -300,9 +309,13 @@ export function EditBackupSchedule() {
               </div>
             </div>
           ) : isScheduleError ? (
-            <p className="text-sm text-destructive">
-              Failed to load schedule. Please go back and try again.
-            </p>
+            <ReadFailure
+              resource="Backup schedule"
+              error={scheduleError}
+              onRetry={() => void refetchSchedule()}
+              retrying={isFetchingSchedule}
+              embedded
+            />
           ) : (
             <>
               <div className="grid gap-2">

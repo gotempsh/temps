@@ -4,6 +4,9 @@
 pub mod catalog;
 pub mod claude;
 pub mod codex;
+pub mod credential_snapshot;
+pub mod host_cli;
+pub mod login;
 pub mod openai_compatible;
 pub mod opencode;
 
@@ -495,6 +498,33 @@ pub trait AiCliProvider: Send + Sync {
 
     async fn capabilities(&self) -> Option<temps_ai::ProviderCapabilities> {
         provider_capabilities_from_models(self.name(), self.discover_model_capabilities().await)
+    }
+    /// Whether this provider can sign in to a subscription from the Temps
+    /// console (see [`login`]). Providers that cannot keep the paste flow.
+    fn supports_login(&self) -> bool {
+        false
+    }
+    /// Start a console sign-in whose credential store is `config_dir`
+    /// (see [`host_cli::ProviderLocation`]). Resolves once the CLI has offered
+    /// the link or device code the operator must act on. The CLI owns the
+    /// credential store; nothing it prints is logged or persisted.
+    async fn begin_login(
+        &self,
+        _config_dir: &std::path::Path,
+    ) -> Result<login::LoginHandle, login::LoginError> {
+        Err(login::LoginError::NotSupported {
+            provider_id: self.name().to_string(),
+        })
+    }
+    /// Report the sign-in state of the credential store in `config_dir`, so a
+    /// finished sign-in can be confirmed before it replaces the live store.
+    async fn verify_login(
+        &self,
+        _config_dir: &std::path::Path,
+    ) -> Result<AiCliStatus, login::LoginError> {
+        Err(login::LoginError::NotSupported {
+            provider_id: self.name().to_string(),
+        })
     }
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError>;
     /// Execute one normalized chat turn. Most adapters use their regular run

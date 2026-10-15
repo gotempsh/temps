@@ -40,16 +40,16 @@ const options: Array<{
   },
   {
     mode: 'project',
-    title: 'Database per project',
+    title: 'Database per service',
     description:
-      'Every environment in this project connects to the same database.',
+      'Every environment in this service connects to the same database.',
     icon: Network,
   },
   {
     mode: 'custom',
     title: 'Custom database',
     description:
-      'Use an exact database name, including one shared by multiple projects.',
+      'Use an exact database name, including one shared by multiple services.',
     icon: Database,
   },
 ]

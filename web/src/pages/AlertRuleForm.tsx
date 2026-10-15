@@ -25,6 +25,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -109,7 +110,9 @@ const alertRuleSchema = z.object({
       threshold: z.number().min(1).optional(),
     })
     .optional(),
-  cooldown_minutes: z.number().min(0),
+  cooldown_minutes: z
+    .number({ message: 'Cooldown must be a number' })
+    .min(0, 'Cooldown cannot be negative'),
   notification_priority: z.string(),
   environment_filter: z.number().nullable().optional(),
   error_level_filter: z.string().nullable().optional(),
@@ -243,13 +246,13 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
-  const onSubmit = async (data: AlertRuleFormData) => {
+  const onSubmit = (data: AlertRuleFormData) => {
     const triggerConfig = needsConfig(data.trigger_type)
       ? data.trigger_config
       : undefined
 
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { project_id: projectId, rule_id: Number(ruleId) },
         body: {
           name: data.name,
@@ -263,7 +266,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
         },
       })
     } else {
-      await createMutation.mutateAsync({
+      createMutation.mutate({
         path: { project_id: projectId },
         body: {
           name: data.name,
@@ -514,10 +517,16 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                   <FormItem>
                     <FormLabel>Cooldown (minutes)</FormLabel>
                     <FormControl>
-                      <Input
-                        type="number"
-                        {...field}
-                        onChange={(e) => field.onChange(Number(e.target.value))}
+                      <NumberInput
+                        min={0}
+                        step={1}
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        value={field.value}
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
                       />
                     </FormControl>
                     <FormDescription>

@@ -36,6 +36,7 @@ import {
 import type { AgentRunResponse as AgentRun } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
+import { PublicCallbackUrl } from '@/components/settings/PublicCallbackUrl'
 
 interface AgentDetailPageProps {
   project: ProjectResponse
@@ -98,9 +99,18 @@ function PropertyRow({
 }
 
 const triggerColors = {
-  red: { enabled: 'bg-red-500/10 text-red-400', dot: 'bg-red-400' },
-  purple: { enabled: 'bg-purple-500/10 text-purple-400', dot: 'bg-purple-400' },
-  yellow: { enabled: 'bg-yellow-500/10 text-yellow-400', dot: 'bg-yellow-400' },
+  red: {
+    enabled: 'bg-red-500/10 text-red-700 dark:text-red-400',
+    dot: 'bg-red-400',
+  },
+  purple: {
+    enabled: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
+    dot: 'bg-purple-400',
+  },
+  yellow: {
+    enabled: 'bg-yellow-500/10 text-yellow-700 dark:text-yellow-400',
+    dot: 'bg-yellow-400',
+  },
   gray: {
     enabled: 'bg-muted text-muted-foreground',
     dot: 'bg-muted-foreground',
@@ -136,7 +146,7 @@ function TriggerRow({
               On
             </span>
           ) : (
-            <span className="text-xs text-muted-foreground/50">Off</span>
+            <span className="text-xs text-muted-foreground">Off</span>
           )}
         </div>
         <p className="text-xs text-muted-foreground mt-0.5">{description}</p>
@@ -164,7 +174,7 @@ function AgentProperties({ agent }: { agent: Agent }) {
           </PropertyRow>
           <PropertyRow label="Source">
             {agent.source === 'yaml' ? (
-              <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">
+              <span className="text-xs bg-blue-500/10 text-blue-600 dark:text-blue-400 px-1.5 py-0.5 rounded">
                 YAML
               </span>
             ) : (
@@ -175,7 +185,7 @@ function AgentProperties({ agent }: { agent: Agent }) {
           </PropertyRow>
           <PropertyRow label="Status">
             <span
-              className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-400' : 'bg-muted text-muted-foreground'}`}
+              className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-700 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}
             >
               {agent.enabled ? 'Active' : 'Disabled'}
             </span>
@@ -214,7 +224,7 @@ function AgentProperties({ agent }: { agent: Agent }) {
           </PropertyRow>
           <PropertyRow label="API Key">
             {agent.api_key_set ? (
-              <span className="text-xs bg-green-500/10 text-green-400 px-1.5 py-0.5 rounded">
+              <span className="text-xs bg-green-500/10 text-green-700 dark:text-green-400 px-1.5 py-0.5 rounded">
                 Set
               </span>
             ) : (
@@ -225,7 +235,10 @@ function AgentProperties({ agent }: { agent: Agent }) {
           </PropertyRow>
           {agent.prompt && (
             <PropertyRow label="Custom Prompt">
-              <pre className="whitespace-pre-wrap text-xs bg-muted p-3 rounded-md max-h-48 overflow-y-auto w-full">
+              <pre
+                tabIndex={0}
+                className="whitespace-pre-wrap text-xs bg-muted p-3 rounded-md max-h-48 overflow-y-auto w-full"
+              >
                 {agent.prompt}
               </pre>
             </PropertyRow>
@@ -324,25 +337,15 @@ function AgentProperties({ agent }: { agent: Agent }) {
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs text-muted-foreground">URL</label>
-                <div className="flex items-center gap-2">
-                  <code className="text-xs bg-muted px-2 py-1.5 rounded flex-1 overflow-x-auto">
-                    POST {window.location.origin}
-                    {agent.webhook_url}
-                  </code>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      navigator.clipboard.writeText(
-                        `${window.location.origin}${agent.webhook_url}`
-                      )
-                      toast.success('URL copied')
-                    }}
-                    className="text-muted-foreground hover:text-foreground p-1"
-                    title="Copy URL"
-                  >
-                    <Copy className="h-3.5 w-3.5" />
-                  </button>
-                </div>
+                {/* Whatever triggers the agent calls from outside, so the URL
+                    is built from the public ingress URL the API reports, not
+                    from the address being browsed. */}
+                <PublicCallbackUrl
+                  path={agent.webhook_url}
+                  prefix="POST"
+                  label="Copy webhook URL"
+                  codeClassName="py-1.5"
+                />
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs text-muted-foreground">
@@ -479,13 +482,14 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
           <Button variant="ghost" size="icon" asChild>
             <Link
               to={settingsSectionHref(project.slug, 'automation', 'agents')}
+              aria-label="Back to agents"
             >
               <ArrowLeft className="h-4 w-4" />
             </Link>
           </Button>
           <h1 className="text-xl font-semibold">{agent.name}</h1>
           <span
-            className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-400' : 'bg-muted text-muted-foreground'}`}
+            className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-700 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}
           >
             {agent.enabled ? 'Active' : 'Disabled'}
           </span>

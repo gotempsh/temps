@@ -60,9 +60,15 @@ fn resolve_independent_proxy_gates(
         Some(build) => Some(build(db.clone(), runtime).map_err(|error| {
             anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
         })?),
-        None if use_independent_proxy_gates => {
-            Some(Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>)
-        }
+        // OSS default: the built-in per-project / per-environment allow and
+        // deny lists. Hydrated here so a load failure aborts startup instead
+        // of serving a protected project through an open gate.
+        None if use_independent_proxy_gates => Some(
+            temps_proxy::ip_access::ProjectIpAccessGate::start_blocking(db.clone(), runtime)
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+                })? as Arc<dyn temps_core::ProjectIpGate>,
+        ),
         None => None,
     };
     let request_policy_gate = match request_policy_gate_builder {
@@ -270,6 +276,20 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
+    /// Address of a listener that serves only the console's public routes
+    /// (email tracking, provider webhooks, ingest) and nothing else.
+    ///
+    /// The proxy sends third-party callbacks here, so they can arrive while
+    /// the console itself stays restricted. The single-binary server picks a
+    /// loopback port for this automatically. Set it only in split topology
+    /// (`--role=console`), together with the same value on
+    /// `temps proxy --console-ingress-address`. It must be an address of its
+    /// own, also when `--console-admin-address` is set: `--console-address`
+    /// has no admin routes then, but still serves the authenticated MCP
+    /// endpoint.
+    #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
+    pub console_ingress_address: Option<String>,
+
     /// Forbid applying release updates from the console, permanently for the
     /// lifetime of this process.
     ///
@@ -279,7 +299,14 @@ pub struct ServeCommand {
     /// who keeps upgrades under configuration management (or policy) can rule
     /// the API path out entirely. The update banner still appears and still
     /// shows the manual command — only the "Update now" action is refused.
-    #[arg(long)]
+    ///
+    /// Also settable with `TEMPS_DISABLE_SELF_UPDATE=true`, for launchers that
+    /// can only pass environment variables.
+    #[arg(
+        long,
+        env = "TEMPS_DISABLE_SELF_UPDATE",
+        value_parser = crate::commands::parse_bool_setting
+    )]
     pub disable_self_update: bool,
 
     /// Before applying pending database migrations, dump the database to
@@ -290,7 +317,14 @@ pub struct ServeCommand {
     /// nothing to migrate never takes the backup, so this can stay in a
     /// service unit permanently. Also forwarded to the `temps migrate` run
     /// started by the console's "Update now".
-    #[arg(long, conflicts_with = "skip_pre_migration_backup")]
+    ///
+    /// Also settable with `TEMPS_PRE_MIGRATION_BACKUP=true`.
+    #[arg(
+        long,
+        env = "TEMPS_PRE_MIGRATION_BACKUP",
+        value_parser = crate::commands::parse_bool_setting,
+        conflicts_with = "skip_pre_migration_backup"
+    )]
     pub pre_migration_backup: bool,
 
     /// No-op, kept so existing service units keep starting: the
@@ -345,6 +379,26 @@ pub struct ServeCommand {
     /// exactly what the running process provides.
     #[arg(long, value_enum, default_value_t = ServeProfile::Full, env = "TEMPS_SERVE_PROFILE")]
     pub profile: ServeProfile,
+}
+
+/// Name the flag whose address the public-only listener would collide with,
+/// if any. Blank values count as unset.
+fn ingress_listener_clash(
+    ingress: Option<&str>,
+    console: Option<&str>,
+    admin: Option<&str>,
+) -> Option<&'static str> {
+    let ingress = ingress
+        .map(str::trim)
+        .filter(|address| !address.is_empty())?;
+    let same = |other: Option<&str>| other.map(str::trim) == Some(ingress);
+    if same(console) {
+        Some("--console-address")
+    } else if same(admin) {
+        Some("--console-admin-address")
+    } else {
+        None
+    }
 }
 
 impl ServeCommand {
@@ -415,6 +469,9 @@ impl ServeCommand {
         if let Some(ref admin) = self.console_admin_address {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
         }
+        if let Some(ref ingress) = self.console_ingress_address {
+            std::env::set_var("TEMPS_CONSOLE_INGRESS_ADDRESS", ingress);
+        }
 
         // Same bridge for the data directory. `ServerConfig::new` resolves it
         // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
@@ -445,6 +502,23 @@ impl ServeCommand {
             );
         }
 
+        // The public-only listener exists so that a request may reach the
+        // public routes and nothing else. Pointing it at a listener that
+        // serves more would quietly remove that guarantee (and fail to bind).
+        if let Some(clash) = ingress_listener_clash(
+            self.console_ingress_address.as_deref(),
+            self.console_address.as_deref(),
+            self.console_admin_address.as_deref(),
+        ) {
+            anyhow::bail!(
+                "--console-ingress-address must be an address of its own, but it is the same \
+                 as {clash}.\n\nThat listener serves more than the public callback routes, so \
+                 requests the admin gate denies would reach it. Give the public-only listener \
+                 a separate loopback port, e.g. `--console-ingress-address 127.0.0.1:8082`, or \
+                 omit the flag to let `temps serve` pick one."
+            );
+        }
+
         let (effective_proxy_address, effective_proxy_tls_address) = effective_proxy_listeners(
             self.role,
             &self.address,
@@ -455,12 +529,21 @@ impl ServeCommand {
 
         let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
 
-        let serve_config = Arc::new(temps_config::ServerConfig::new(
+        let serve_config = temps_config::ServerConfig::new(
             effective_proxy_address,
             self.database_url.clone(),
             effective_proxy_tls_address,
             self.console_address.clone(),
-        )?);
+        )?;
+        // ADR-051: the in-process proxy is handed the public-only listener's
+        // address directly, so it can live on a random loopback port. A split
+        // console only binds one when `--console-ingress-address` names it,
+        // because the sibling `temps proxy` could not discover a random port.
+        let serve_config = Arc::new(if self.role == ServeRole::Console {
+            serve_config
+        } else {
+            serve_config.with_default_ingress_listener()
+        });
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
             &serve_config.encryption_key,
         )?);
@@ -1107,10 +1190,10 @@ impl ServeCommand {
                 request_policy_gate_builder,
             )?;
         if use_independent_proxy_gates {
-            if has_ip_gate_builder {
-                if let Some(gate) = independent_project_ip_gate.as_ref() {
-                    let _ = project_ip_gate_slot.set(Arc::clone(gate));
-                }
+            // Always `Some` in independent mode: either the caller's gate or
+            // the built-in project IP access gate.
+            if let Some(gate) = independent_project_ip_gate.as_ref() {
+                let _ = project_ip_gate_slot.set(Arc::clone(gate));
             } else {
                 project_ip_gate_slot.finish_registration();
             }
@@ -1282,6 +1365,50 @@ impl ServeCommand {
 }
 
 #[cfg(test)]
+mod ingress_listener_tests {
+    use super::ingress_listener_clash;
+
+    #[test]
+    fn a_dedicated_ingress_address_does_not_clash() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8082"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            None
+        );
+        assert_eq!(
+            ingress_listener_clash(None, Some("127.0.0.1:8081"), None),
+            None
+        );
+        assert_eq!(ingress_listener_clash(Some("  "), Some("  "), None), None);
+    }
+
+    // Reusing the console listener is what let gate-denied requests reach
+    // authenticated MCP in dual-listener mode.
+    #[test]
+    fn reusing_the_console_or_admin_listener_is_refused() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-address")
+        );
+        assert_eq!(
+            ingress_listener_clash(
+                Some(" 127.0.0.1:9001 "),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-admin-address")
+        );
+    }
+}
+
+#[cfg(test)]
 mod serve_profile_tests {
     use super::*;
     use clap::Parser;
@@ -1312,6 +1439,206 @@ mod serve_profile_tests {
             parse(&["--database-startup-wait", "0"]).database_startup_wait,
             0
         );
+    }
+
+    /// Parses `ServeCommand` with `env` standing in for the process
+    /// environment. The real argument definitions (parser, action, conflicts)
+    /// are used; only the env variable *name* is swapped for one unique to
+    /// `case`, so tests neither touch real `TEMPS_*` variables nor race with
+    /// other tests parsing the same command in parallel.
+    fn parse_with_env(
+        case: &str,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<ServeCommand, clap::Error> {
+        use clap::{Args, FromArgMatches};
+        let mut command = ServeCommand::augment_args(clap::Command::new("temps"));
+        let mut names = Vec::new();
+        for (arg, value) in env {
+            let name = format!("TEMPS_TEST_{case}_{arg}").to_uppercase();
+            std::env::set_var(&name, value);
+            // clap wants a 'static name; leaking a test-only string is harmless.
+            let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+            command = command.mut_arg(*arg, move |a| a.env(leaked));
+            names.push(name);
+        }
+        let mut argv = vec!["temps", "--database-url", "postgres://localhost/temps"];
+        argv.extend_from_slice(args);
+        let result = command
+            .try_get_matches_from(argv)
+            .and_then(|matches| ServeCommand::from_arg_matches(&matches));
+        for name in names {
+            std::env::remove_var(name);
+        }
+        result
+    }
+
+    #[test]
+    fn self_update_and_backup_env_vars_are_the_documented_names() {
+        use clap::CommandFactory;
+        let command = TestCli::command();
+        let env_of = |id: &str| {
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .and_then(|arg| arg.get_env())
+                .map(|name| name.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            env_of("disable_self_update").as_deref(),
+            Some("TEMPS_DISABLE_SELF_UPDATE")
+        );
+        assert_eq!(
+            env_of("pre_migration_backup").as_deref(),
+            Some("TEMPS_PRE_MIGRATION_BACKUP")
+        );
+        // The retired no-op flag stays CLI-only.
+        assert_eq!(env_of("skip_pre_migration_backup"), None);
+    }
+
+    #[test]
+    fn disable_self_update_defaults_to_off_when_nothing_is_set() {
+        let serve = parse_with_env("dsu_unset", &[], &[]).expect("parses");
+        assert!(!serve.disable_self_update);
+    }
+
+    #[test]
+    fn disable_self_update_reads_its_env_var() {
+        for (value, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("on", true),
+            ("false", false),
+            ("False", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+            ("", false),
+        ] {
+            let serve = parse_with_env("dsu_value", &[("disable_self_update", value)], &[])
+                .unwrap_or_else(|e| panic!("TEMPS_DISABLE_SELF_UPDATE={value:?} must parse: {e}"));
+            assert_eq!(
+                serve.disable_self_update, expected,
+                "TEMPS_DISABLE_SELF_UPDATE={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_self_update_rejects_an_unrecognised_env_value() {
+        let error = match parse_with_env("dsu_invalid", &[("disable_self_update", "disabled")], &[])
+        {
+            Ok(_) => panic!("an unrecognised value must not silently become true"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--disable-self-update"), "{error}");
+        assert!(error.contains("'disabled' is not a boolean"), "{error}");
+    }
+
+    #[test]
+    fn disable_self_update_flag_still_works_and_wins_over_a_false_env() {
+        assert!(
+            parse_with_env("dsu_flag", &[], &["--disable-self-update"])
+                .expect("flag parses")
+                .disable_self_update
+        );
+        assert!(
+            parse_with_env(
+                "dsu_flag_env_false",
+                &[("disable_self_update", "false")],
+                &["--disable-self-update"],
+            )
+            .expect("flag parses next to a false env value")
+            .disable_self_update
+        );
+    }
+
+    #[test]
+    fn pre_migration_backup_defaults_to_off_when_nothing_is_set() {
+        let serve = parse_with_env("pmb_unset", &[], &[]).expect("parses");
+        assert!(!serve.pre_migration_backup);
+        assert!(!serve.skip_pre_migration_backup);
+    }
+
+    #[test]
+    fn pre_migration_backup_reads_its_env_var() {
+        for (value, expected) in [
+            ("true", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+            ("", false),
+        ] {
+            let serve = parse_with_env("pmb_value", &[("pre_migration_backup", value)], &[])
+                .unwrap_or_else(|e| panic!("TEMPS_PRE_MIGRATION_BACKUP={value:?} must parse: {e}"));
+            assert_eq!(
+                serve.pre_migration_backup, expected,
+                "TEMPS_PRE_MIGRATION_BACKUP={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_migration_backup_rejects_an_unrecognised_env_value() {
+        let error =
+            match parse_with_env("pmb_invalid", &[("pre_migration_backup", "sometimes")], &[]) {
+                Ok(_) => panic!("an unrecognised value must not silently become true"),
+                Err(error) => error.to_string(),
+            };
+        assert!(error.contains("--pre-migration-backup"), "{error}");
+        assert!(error.contains("'sometimes' is not a boolean"), "{error}");
+    }
+
+    #[test]
+    fn pre_migration_backup_flag_still_works() {
+        assert!(
+            parse_with_env("pmb_flag", &[], &["--pre-migration-backup"])
+                .expect("flag parses")
+                .pre_migration_backup
+        );
+    }
+
+    #[test]
+    fn retired_skip_flag_alone_still_parses_and_conflicts_with_the_backup_env_var() {
+        // Existing units that pass the no-op flag keep starting by itself.
+        let serve = parse_with_env("pmb_skip", &[], &["--skip-pre-migration-backup"])
+            .expect("old flag parses");
+        assert!(serve.skip_pre_migration_backup);
+        assert!(!serve.pre_migration_backup);
+        // clap counts an env-sourced value as present for `conflicts_with`,
+        // so the retired flag next to the env var is refused exactly like it
+        // is next to `--pre-migration-backup` -- with a message naming both.
+        for value in ["true", "false"] {
+            let error = match parse_with_env(
+                "pmb_skip_env",
+                &[("pre_migration_backup", value)],
+                &["--skip-pre-migration-backup"],
+            ) {
+                Ok(_) => panic!("TEMPS_PRE_MIGRATION_BACKUP={value} must conflict with the flag"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("--skip-pre-migration-backup"), "{error}");
+            assert!(error.contains("--pre-migration-backup"), "{error}");
+        }
+    }
+
+    /// Database for tests that resolve the built-in project IP gate: at
+    /// startup it reads the change-feed head, then loads
+    /// `project_ip_access_rules`; an empty table means no project has a
+    /// policy.
+    fn db_with_no_ip_rules() -> Arc<temps_database::DbConnection> {
+        let head =
+            std::collections::BTreeMap::from([("revision", sea_orm::Value::BigInt(Some(0)))]);
+        Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![head]])
+                .append_query_results(
+                    [Vec::<temps_entities::project_ip_access_rules::Model>::new()],
+                )
+                .into_connection(),
+        )
     }
 
     #[test]
@@ -1347,7 +1674,7 @@ mod serve_profile_tests {
     #[test]
     fn request_policy_builder_failure_aborts_before_console_startup() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = db_with_no_ip_rules();
         let error = resolve_independent_proxy_gates(
             db,
             runtime.handle(),
@@ -1368,7 +1695,7 @@ mod serve_profile_tests {
     #[test]
     fn oss_proxy_gates_are_ready_without_console_initialization() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = db_with_no_ip_rules();
         let (ip_gate, request_gate) =
             resolve_independent_proxy_gates(db, runtime.handle(), true, None, None)
                 .expect("OSS gates should resolve synchronously");
@@ -1412,7 +1739,7 @@ mod serve_profile_tests {
     #[test]
     fn custom_request_policy_remains_enforced_without_console_initialization() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let db = db_with_no_ip_rules();
         let (_, request_gate) = resolve_independent_proxy_gates(
             db,
             runtime.handle(),

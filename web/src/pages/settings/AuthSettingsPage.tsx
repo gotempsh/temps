@@ -9,19 +9,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OidcProviderResponse } from '@/api/client/types.gen'
 import { problemMessage } from '@/components/settings/oidc-provider-constants'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Card,
   CardContent,
@@ -47,7 +38,6 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  AlertCircle,
   ChevronRight,
   Cloud,
   EllipsisVertical,
@@ -142,6 +132,7 @@ export function AuthSettingsPage() {
       })
     },
     onError: (error) => {
+      setDeleteTarget(null)
       toast.error(problemMessage(error, 'Failed to delete SSO provider'))
     },
   })
@@ -154,12 +145,10 @@ export function AuthSettingsPage() {
   }, [setBreadcrumbs])
 
   const providers = providersQuery.data ?? []
-  const error = providersQuery.error
-    ? problemMessage(
-        providersQuery.error,
-        'Failed to load authentication settings'
-      )
-    : null
+  // The "no providers" empty state is a statement about the installation, so
+  // it needs a read that succeeded. A refused or failed read knows nothing.
+  const providersUnknown =
+    providersQuery.isError && providersQuery.data === undefined
 
   const handleToggle = (provider: OidcProviderResponse, enabled: boolean) => {
     updateProvider.mutate({
@@ -193,15 +182,17 @@ export function AuthSettingsPage() {
         )}
       </div>
 
-      {error && (
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>Could not load settings</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
+      {providersQuery.isError && (
+        <ReadFailure
+          resource="SSO providers"
+          error={providersQuery.error}
+          cached={!providersUnknown}
+          onRetry={() => void providersQuery.refetch()}
+          retrying={providersQuery.isFetching}
+        />
       )}
 
-      {providersQuery.isLoading ? (
+      {providersUnknown ? null : providersQuery.isLoading ? (
         <div className="space-y-2">
           {[0, 1, 2].map((idx) => (
             <Skeleton key={idx} className="h-14 w-full rounded-md" />
@@ -370,40 +361,24 @@ export function AuthSettingsPage() {
         </div>
       )}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteTarget !== null}
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete SSO provider?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Users that signed in via{' '}
-              <span className="font-medium">{deleteTarget?.name}</span> will no
-              longer be able to use SSO. Their Temps accounts stay intact and
-              can fall back to password login.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProvider.isPending}
-              onClick={() => {
-                if (deleteTarget) {
-                  deleteProvider.mutate({
-                    path: { provider_id: deleteTarget.id },
-                  })
-                }
-              }}
-            >
-              {deleteProvider.isPending ? 'Deleting…' : 'Delete provider'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="SSO provider"
+        resourceName={deleteTarget?.name ?? ''}
+        consequences="Users that signed in through it will no longer be able to use SSO. Their Temps accounts stay intact and can fall back to password login."
+        confirmLabel="Delete provider"
+        isPending={deleteProvider.isPending}
+        onConfirm={() => {
+          if (deleteTarget) {
+            deleteProvider.mutate({
+              path: { provider_id: deleteTarget.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

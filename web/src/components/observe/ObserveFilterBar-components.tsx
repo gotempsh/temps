@@ -69,7 +69,7 @@ export function ObserveFilterBar({
               )}
             >
               <Icon className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">{label}</span>
+              <span className="max-sm:sr-only">{label}</span>
             </Button>
           )
         })}

@@ -12,6 +12,7 @@ homepage.workspace = true
 
 [dev-dependencies]
 mockito = "1.5"
+tower = { workspace = true }
 bollard = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

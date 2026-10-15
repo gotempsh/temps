@@ -39,8 +39,12 @@ pub enum SandboxSnapshotError {
         target_backend: String,
     },
 
-    /// The backend does not support snapshots (for example, Local).
-    #[error("Snapshot is not supported by backend '{backend}'")]
+    /// The backend does not support snapshots (for example, Local or
+    /// microsandbox).
+    #[error(
+        "Snapshot is not supported by backend '{backend}'; \
+         use a 'firecracker' or 'docker' sandbox to take snapshots"
+    )]
     NotSupported { backend: String },
 
     /// Snapshots are not available yet for sandboxes on worker nodes
@@ -98,9 +102,11 @@ pub enum SandboxSnapshotError {
     #[error("Snapshot {snapshot_id} uses an unsupported legacy artifact format: {reason}")]
     LegacyArtifactUnsupported { snapshot_id: String, reason: String },
 
-    /// The source sandbox doesn't exist or was already destroyed.
-    #[error("Sandbox {sandbox_id} not found")]
-    SandboxNotFound { sandbox_id: String },
+    /// The source sandbox doesn't exist, was already destroyed, or its
+    /// provider handle could not be recovered (for example the VM is not
+    /// running). `reason` carries the registry's own explanation.
+    #[error("Sandbox {sandbox_id} not found: {reason}")]
+    SandboxNotFound { sandbox_id: String, reason: String },
 
     /// The sandbox is not running — snapshots require a live container.
     ///
@@ -167,6 +173,26 @@ pub enum SandboxError {
     /// path, etc.). Mapped to HTTP 400.
     #[error("Validation error: {message}")]
     Validation { message: String },
+
+    /// The container runtime could not pull the sandbox image: the tag is
+    /// not published, the registry is unreachable or access was denied.
+    /// Mapped to HTTP 503: the request is valid and retrying can succeed once
+    /// the image is available, but nothing about the request itself can fix it.
+    #[error("Sandbox image '{image}' could not be pulled for sandbox {sandbox_id}: {reason}")]
+    ImageUnavailable {
+        sandbox_id: String,
+        image: String,
+        reason: String,
+    },
+
+    /// The container runtime has no address space left for the sandbox's
+    /// isolated network (Docker: every `default-address-pools` range is
+    /// subnetted). A capacity limit of the host, not a fault of the request
+    /// and not a server bug: nothing about the request can fix it, but
+    /// deleting unused sandboxes or widening the pools does. Mapped to HTTP
+    /// 503 with that guidance in `reason`.
+    #[error("Sandbox {sandbox_id} could not get an isolated network: {reason}")]
+    NetworkCapacityExhausted { sandbox_id: String, reason: String },
 
     /// The sandbox exists but is not in a state that allows the requested
     /// operation (e.g. exec on a stopped sandbox). Mapped to HTTP 409.
@@ -343,6 +369,24 @@ pub enum SandboxError {
 /// caller is responsible for passing the public `sandbox_id` so users see
 /// the opaque ID, not the internal integer.
 pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
+    if let Some((image, reason)) = err.image_pull_failure() {
+        return SandboxError::ImageUnavailable {
+            sandbox_id: sandbox_id.to_string(),
+            image: image.to_string(),
+            reason: reason.to_string(),
+        };
+    }
+    if let Some(reason) = err.network_pool_exhaustion() {
+        let reason = if reason.contains("default-address-pools") {
+            reason.to_string()
+        } else {
+            temps_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+        };
+        return SandboxError::NetworkCapacityExhausted {
+            sandbox_id: sandbox_id.to_string(),
+            reason,
+        };
+    }
     match err {
         AgentError::SandboxNotFound { .. } => SandboxError::NotFound {
             sandbox_id: sandbox_id.to_string(),
@@ -407,6 +451,50 @@ mod tests {
         );
         let problem = temps_core::problemdetails::Problem::from(err);
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn image_pull_failures_become_image_unavailable_with_image_and_cause() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 3,
+                provider: "docker".into(),
+                reason: temps_agents::error::image_pull_failure_reason(
+                    "registry.example.test/team/img:9.9.9",
+                    "manifest unknown",
+                ),
+            },
+        );
+        match &err {
+            SandboxError::ImageUnavailable {
+                sandbox_id,
+                image,
+                reason,
+            } => {
+                assert_eq!(sandbox_id, "sbx_abc");
+                assert_eq!(image, "registry.example.test/team/img:9.9.9");
+                assert_eq!(reason, "manifest unknown");
+            }
+            other => panic!("expected ImageUnavailable, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("registry.example.test/team/img:9.9.9"));
+        assert!(message.contains("sbx_abc"));
+        assert!(message.contains("manifest unknown"));
+    }
+
+    #[test]
+    fn other_creation_failures_stay_generic_exec_failures() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 3,
+                provider: "docker".into(),
+                reason: "no space left on device".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::ExecFailed { .. }), "{err:?}");
     }
 
     #[test]
@@ -568,5 +656,59 @@ mod tests {
         };
         let err = from_agent_error("sbx_x", agent);
         assert!(matches!(err, SandboxError::ExecFailed { .. }));
+    }
+
+    #[test]
+    fn exhausted_address_pools_map_to_a_capacity_error_with_guidance() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".into(),
+                reason: "create isolated network for sandbox 'temps-sandbox-abc': Docker \
+                         responded with status code 400: all predefined address pools have \
+                         been fully subnetted"
+                    .into(),
+            },
+        );
+        match &err {
+            SandboxError::NetworkCapacityExhausted { sandbox_id, reason } => {
+                assert_eq!(sandbox_id, "sbx_abc");
+                assert!(reason.contains("default-address-pools"), "{reason}");
+                assert!(reason.contains("Delete sandboxes"), "{reason}");
+            }
+            other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
+        let reason = temps_agents::error::network_pool_exhausted_reason(
+            "temps-sandbox-abc",
+            "all predefined address pools have been fully subnetted",
+        );
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 7,
+                provider: "docker".into(),
+                reason: reason.clone(),
+            },
+        );
+        match err {
+            SandboxError::NetworkCapacityExhausted { reason: got, .. } => assert_eq!(got, reason),
+            other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_provider_unavailability_stays_a_generic_unavailable() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".into(),
+                reason: "daemon unreachable".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Unavailable { .. }), "{err:?}");
     }
 }

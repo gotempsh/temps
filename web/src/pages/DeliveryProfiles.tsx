@@ -45,6 +45,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
@@ -59,6 +60,9 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { zodResolver } from '@hookform/resolvers/zod'
 import {
   keepPreviousData,
@@ -89,7 +93,10 @@ export default function DeliveryProfiles() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const client = useQueryClient()
   const [open, setOpen] = useState(false)
-  const [deleteId, setDeleteId] = useState<number | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: number
+    name: string
+  } | null>(null)
   const [page, setPage] = useState(1)
   const listQuery = {
     page,
@@ -118,9 +125,13 @@ export default function DeliveryProfiles() {
     setPage(totalPages)
   const rows = profiles.data?.items ?? []
   const loadingRows = profiles.isPending || (total > 0 && rows.length === 0)
+  // `GET /settings` needs `settings:read`. A role without it is told so
+  // below at once instead of after the request has been refused and retried.
+  const canReadSettings = useIsInstanceAdmin()
   const platformSettings = useQuery({
     queryKey: ['platform-settings'],
     queryFn: getPlatformSettings,
+    enabled: canReadSettings,
   })
   const saveDefault = useMutation({
     mutationFn: (provider: DeliveryProviderChoiceValue) =>
@@ -212,7 +223,7 @@ export default function DeliveryProfiles() {
     },
     onSuccess: () => {
       client.invalidateQueries({ queryKey: [DELIVERY_PROFILES_QUERY_ROOT] })
-      setDeleteId(null)
+      setDeleteTarget(null)
       toast.success('Delivery profile deleted')
     },
   })
@@ -263,18 +274,31 @@ export default function DeliveryProfiles() {
             changed. Each project can override this choice during creation or in
             Domains.
           </p>
-          {platformSettings.isError && (
+          {(!canReadSettings || platformSettings.isError) && (
             <p className="text-sm text-muted-foreground">
               Instance settings access is required to change this default.
             </p>
           )}
-          {!cloudflareReady && (
+          {capabilities.isError && (
+            <div className="mt-2">
+              <ReadFailure
+                resource="Delivery capabilities"
+                error={capabilities.error}
+                onRetry={
+                  isForbiddenRead(capabilities.error)
+                    ? undefined
+                    : () => void capabilities.refetch()
+                }
+              />
+            </div>
+          )}
+          {capabilities.isSuccess && !cloudflareReady && (
             <p className="text-sm text-muted-foreground">
               Create a Cloudflare delivery profile and connect an active DNS
               provider first.
             </p>
           )}
-          {!bunnyReady && (
+          {capabilities.isSuccess && !bunnyReady && (
             <p className="text-sm text-muted-foreground">
               <Button
                 type="button"
@@ -310,6 +334,7 @@ export default function DeliveryProfiles() {
           cloudflareConfigured={cloudflareReady}
           bunnyConfigured={bunnyReady}
           disabled={
+            !canReadSettings ||
             platformSettings.isPending ||
             platformSettings.isError ||
             saveDefault.isPending
@@ -397,7 +422,7 @@ export default function DeliveryProfiles() {
                     aria-label={`Delete ${profile.name}`}
                     onClick={() => {
                       remove.reset()
-                      setDeleteId(profile.id)
+                      setDeleteTarget({ id: profile.id, name: profile.name })
                     }}
                   >
                     <Trash2 className="size-4" />
@@ -633,45 +658,29 @@ export default function DeliveryProfiles() {
           </Form>
         </DialogContent>
       </Dialog>
-      <Dialog
-        open={deleteId !== null}
+      <ConfirmDeleteDialog
+        open={deleteTarget !== null}
         onOpenChange={(value) => {
-          if (!value && !remove.isPending) setDeleteId(null)
+          if (!value) setDeleteTarget(null)
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete delivery profile?</DialogTitle>
-            <DialogDescription>
-              Profiles used by project defaults, environment overrides, or
-              domain bindings cannot be deleted.
-            </DialogDescription>
-          </DialogHeader>
-          {remove.isError && (
-            <Alert variant="destructive">
-              <AlertDescription>{deliveryError(remove.error)}</AlertDescription>
-            </Alert>
-          )}
-          <DialogFooter>
-            <Button
-              variant="outline"
-              disabled={remove.isPending}
-              onClick={() => setDeleteId(null)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={remove.isPending}
-              onClick={() => {
-                if (deleteId !== null) remove.mutate(deleteId)
-              }}
-            >
-              {remove.isPending ? 'Deleting…' : 'Delete profile'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        resourceType="delivery profile"
+        resourceName={deleteTarget?.name ?? ''}
+        consequences={
+          <>
+            Profiles used by project defaults, environment overrides, or domain
+            bindings cannot be deleted.
+            {remove.isError ? (
+              <span className="mt-2 block text-destructive">
+                {deliveryError(remove.error)}
+              </span>
+            ) : null}
+          </>
+        }
+        isPending={remove.isPending}
+        onConfirm={() => {
+          if (deleteTarget !== null) remove.mutate(deleteTarget.id)
+        }}
+      />
     </PageContainer>
   )
 }

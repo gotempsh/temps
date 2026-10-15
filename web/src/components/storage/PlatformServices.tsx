@@ -13,6 +13,10 @@ import {
   blobEnableMutation,
   blobDisableMutation,
   blobUpdateMutation,
+  kvGetSettingsOptions,
+  kvUpdateSettingsMutation,
+  blobGetSettingsOptions,
+  blobUpdateSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -49,8 +53,18 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from 'sonner'
 import { DEFAULT_RUSTFS_IMAGE } from '@/lib/service-images'
+import { problemDetail } from '@/lib/api-problem'
+import { ContainerNameField } from './ContainerNameField'
 
 type ServiceType = 'kv' | 'blob'
+
+/** The server's explanation when it refused (a 409 names the setting to change), else `fallback`. */
+function failureMessage(error: unknown, fallback: string): string {
+  return problemDetail(
+    error,
+    error instanceof Error && error.message ? error.message : fallback
+  )
+}
 
 interface EditDockerImageDialogProps {
   open: boolean
@@ -164,15 +178,52 @@ export function PlatformServices() {
     retry: false,
   })
 
+  // Container names (per-instance, so several Temps instances can share a
+  // Docker host)
+  const kvSettingsQuery = useQuery({ ...kvGetSettingsOptions(), retry: false })
+  const blobSettingsQuery = useQuery({
+    ...blobGetSettingsOptions(),
+    retry: false,
+  })
+
+  const kvSettingsMut = useMutation({
+    ...kvUpdateSettingsMutation(),
+    onSuccess: () => {
+      toast.success('KV Store container name saved')
+      queryClient.invalidateQueries({
+        queryKey: kvGetSettingsOptions().queryKey,
+      })
+    },
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to save the container name'))
+    },
+  })
+
+  const blobSettingsMut = useMutation({
+    ...blobUpdateSettingsMutation(),
+    onSuccess: () => {
+      toast.success('Blob Storage container name saved')
+      queryClient.invalidateQueries({
+        queryKey: blobGetSettingsOptions().queryKey,
+      })
+    },
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to save the container name'))
+    },
+  })
+
   // KV mutations
   const kvEnableMut = useMutation({
     ...kvEnableMutation(),
     onSuccess: () => {
       toast.success('KV Store enabled successfully')
       queryClient.invalidateQueries({ queryKey: kvStatusOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: kvGetSettingsOptions().queryKey,
+      })
     },
-    onError: (error: Error) => {
-      toast.error(error.message || 'Failed to enable KV Store')
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to enable KV Store'))
     },
   })
 
@@ -206,9 +257,12 @@ export function PlatformServices() {
     onSuccess: () => {
       toast.success('Blob Storage enabled successfully')
       queryClient.invalidateQueries({ queryKey: blobStatusOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: blobGetSettingsOptions().queryKey,
+      })
     },
-    onError: (error: Error) => {
-      toast.error(error.message || 'Failed to enable Blob Storage')
+    onError: (error: unknown) => {
+      toast.error(failureMessage(error, 'Failed to enable Blob Storage'))
     },
   })
 
@@ -269,9 +323,9 @@ export function PlatformServices() {
         <Info className="h-4 w-4" />
         <AlertTitle>Platform Services</AlertTitle>
         <AlertDescription>
-          These services are shared across all projects. Each project’s data is
-          isolated by namespace. Enable a service to make it available for all
-          projects.
+          Platform services are shared by every deployed service. Each service’s
+          data is isolated by namespace. Enable one to make it available
+          everywhere.
         </AlertDescription>
       </Alert>
 
@@ -297,6 +351,23 @@ export function PlatformServices() {
             'Atomic operations (INCR, DECR)',
             'Pattern-based key matching',
           ]}
+          containerName={
+            <ContainerNameField
+              serviceName="KV Store"
+              settings={kvSettingsQuery.data}
+              isLoading={kvSettingsQuery.isPending}
+              error={kvSettingsQuery.isError ? kvSettingsQuery.error : undefined}
+              canManage={canManage}
+              isSaving={kvSettingsMut.isPending}
+              onSave={(container_name, onSaved) =>
+                kvSettingsMut.mutate(
+                  { body: { container_name } },
+                  { onSuccess: onSaved }
+                )
+              }
+              onRetry={() => kvSettingsQuery.refetch()}
+            />
+          }
           onEnable={() => kvEnableMut.mutate({ body: {} })}
           onDisable={() => kvDisableMut.mutate({})}
           onEdit={handleEditKv}
@@ -325,6 +396,25 @@ export function PlatformServices() {
             'Streaming uploads/downloads',
             'Prefix-based listing',
           ]}
+          containerName={
+            <ContainerNameField
+              serviceName="Blob Storage"
+              settings={blobSettingsQuery.data}
+              isLoading={blobSettingsQuery.isPending}
+              error={
+                blobSettingsQuery.isError ? blobSettingsQuery.error : undefined
+              }
+              canManage={canManage}
+              isSaving={blobSettingsMut.isPending}
+              onSave={(container_name, onSaved) =>
+                blobSettingsMut.mutate(
+                  { body: { container_name } },
+                  { onSuccess: onSaved }
+                )
+              }
+              onRetry={() => blobSettingsQuery.refetch()}
+            />
+          }
           onEnable={() => blobEnableMut.mutate({ body: {} })}
           onDisable={() => blobDisableMut.mutate({})}
           onEdit={handleEditBlob}
@@ -369,6 +459,8 @@ interface ServiceCardProps {
   version?: string | null
   dockerImage?: string | null
   features: string[]
+  /** The container-name setting; shown whether or not the service is enabled. */
+  containerName: React.ReactNode
   onEnable: () => void
   onDisable: () => void
   onEdit: () => void
@@ -391,6 +483,7 @@ function ServiceCard({
   version,
   dockerImage,
   features,
+  containerName,
   onEnable,
   onDisable,
   onEdit,
@@ -509,6 +602,8 @@ function ServiceCard({
             </div>
           </div>
         )}
+
+        {containerName}
 
         <div>
           <h4 className="text-sm font-medium mb-2">Features</h4>

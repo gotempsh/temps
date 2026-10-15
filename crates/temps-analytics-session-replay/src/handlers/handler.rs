@@ -9,8 +9,8 @@ use crate::services::service::{
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
     http::{
-        header::{self, HeaderMap, HeaderName},
-        Method, StatusCode,
+        header::{self, HeaderMap},
+        StatusCode,
     },
     response::Json,
     routing::{get, post, put},
@@ -18,10 +18,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
 use temps_analytics::ingest_keys::{
-    extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
-    stamp_retry_after_on_rate_limited, ANALYTICS_INGEST_KEY_HEADER,
+    extract_analytics_key, keyed_ingest_cors, resolve_client_identity, resolve_keyed_ingest_scope,
+    stamp_retry_after_on_rate_limited, wildcard_ingest_cors, IngestBranch, IngestJson,
+    KeyedIngestCors,
 };
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
@@ -29,7 +29,6 @@ use temps_auth::{
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 use utoipa::{OpenApi, ToSchema};
 
@@ -814,7 +813,7 @@ pub async fn init_session_replay(
     Extension(metadata): Extension<RequestMetadata>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-    Json(request): Json<SessionReplayInitRequest>,
+    IngestJson(request): IngestJson<SessionReplayInitRequest>,
 ) -> Result<(StatusCode, Json<SessionReplayInitResponse>), Problem> {
     debug!(
         "Initializing session replay for session: {}",
@@ -843,7 +842,11 @@ pub async fn init_session_replay(
         }
         None => None,
     };
-    let is_keyed = keyed_scope.is_some();
+    let branch = if keyed_scope.is_some() {
+        IngestBranch::keyed(&headers)
+    } else {
+        IngestBranch::HostResolved
+    };
 
     // Only reject the request if the client sent neither a cookie nor a
     // fallback id, which means it's an SDK version too old to generate one
@@ -852,7 +855,7 @@ pub async fn init_session_replay(
     let visitor_id = resolve_client_identity(
         metadata.visitor_id_cookie,
         request.visitor_id.clone(),
-        is_keyed,
+        branch,
     )
     .ok_or_else(|| {
         ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -983,7 +986,7 @@ pub async fn add_session_replay_events(
     Extension(metadata): Extension<RequestMetadata>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-    Json(request): Json<SessionReplayEventsRequest>,
+    IngestJson(request): IngestJson<SessionReplayEventsRequest>,
 ) -> Result<Json<AddEventsResponse>, Problem> {
     debug!(
         "Adding events to session replay for session: {}",
@@ -1096,7 +1099,12 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 const SESSION_REPLAY_INGEST_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Public ingest routes for session replay — called directly by browser SDKs.
-pub fn configure_public_routes() -> Router<Arc<AppState>> {
+///
+/// CORS is two layers: the wildcard policy every request has always had, and,
+/// outside it, the keyed policy that grants credentialed CORS to the origins an
+/// ingest key admits (gotempsh/temps#1416). See
+/// [`temps_analytics::ingest_keys::cors`].
+pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/session-replay/init", post(init_session_replay))
         .route(
@@ -1107,36 +1115,11 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         .layer(axum::middleware::map_response(
             stamp_retry_after_on_rate_limited,
         ))
-        .layer(public_ingest_cors())
-}
-
-/// CORS for the public session-replay ingest routes.
-///
-/// Required by ADR-040: with an ingest key the request is cross-origin by
-/// definition, and without this layer the browser blocks it before it ever
-/// leaves the page.
-///
-/// `allow_credentials` stays at its default `false`, and must never be set
-/// true. Key-based ingest needs no cookies by design; credentialed CORS on a
-/// wildcard origin would be a real vulnerability, and browsers reject the
-/// combination outright.
-pub(crate) fn public_ingest_cors() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
-        ])
-        // `Retry-After` is not one of the seven CORS-safelisted response
-        // headers, so without this a cross-origin browser SDK — the stated
-        // consumer of keyed ingest — gets the 429 but cannot read the header
-        // that tells it when to come back, and falls back to guessing or
-        // hammering. Exposed explicitly rather than via `Any` because
-        // `Access-Control-Expose-Headers: *` is ignored by browsers for
-        // credentialed requests and is a wider grant than is needed.
-        .expose_headers([header::RETRY_AFTER])
-        .max_age(Duration::from_secs(600))
+        .layer(wildcard_ingest_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            cors,
+            keyed_ingest_cors,
+        ))
 }
 
 #[cfg(test)]
@@ -1351,7 +1334,11 @@ mod tests {
             },
         );
 
-        configure_public_routes()
+        let cors = KeyedIngestCors::new(
+            state.ingest_key_service.clone(),
+            state.ingest_rate_limiter.clone(),
+        );
+        configure_public_routes(cors)
             .layer(metadata_middleware)
             .with_state(state)
     }
@@ -2431,7 +2418,7 @@ mod tests {
                 "/_temps/session-replay/events",
                 axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
             )
-            .layer(public_ingest_cors());
+            .layer(wildcard_ingest_cors());
 
         let response = tower::ServiceExt::oneshot(
             app,
@@ -2459,5 +2446,101 @@ mod tests {
                 .any(|name| name == "retry-after"),
             "Retry-After must be in access-control-expose-headers, got {exposed:?}"
         );
+    }
+
+    /// gotempsh/temps#1416: the SDK flushes the final replay batch on unload
+    /// with a `text/plain` beacon, so it leaves the page cross-origin without
+    /// a preflight. The keyed events route must accept it, under the same
+    /// 4 MiB body limit as a JSON body.
+    #[tokio::test]
+    async fn keyed_session_replay_events_accept_a_text_plain_beacon() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+        let site = "https://shop.example.com";
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "analytics.temps.test")
+                    .header("origin", site)
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(init_payload("session-tp").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let beacon = |body: String| {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/_temps/session-replay/events?temps_key={}",
+                    key.public_key
+                ))
+                .header("host", "analytics.temps.test")
+                .header("origin", site)
+                .header("sec-fetch-site", "cross-site")
+                .header("content-type", "text/plain")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon(
+                serde_json::json!({
+                    "sessionId": "session-tp",
+                    "events": encoded_events(),
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // No allowlist on this key: the origin is mirrored, with credentials.
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some(site)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["event_count"], 1);
+
+        // Over the route's 4 MiB limit: rejected before parsing, as JSON is.
+        let oversized = serde_json::json!({
+            "sessionId": "session-tp",
+            "events": "a".repeat(SESSION_REPLAY_INGEST_BODY_LIMIT + 1),
+        })
+        .to_string();
+        let response = setup_public_app(state)
+            .oneshot(beacon(oversized))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        test_db.cleanup().await;
     }
 }

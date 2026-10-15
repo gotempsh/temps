@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod audit;
+pub mod public;
 pub mod status_page;
+pub mod status_pages;
 
 pub use status_page::*;

@@ -88,7 +88,7 @@ function renderPanel({
 
 test('renders team links and unchanged roles in the shared table', () => {
   const markup = renderPanel()
-  expect(markup).toContain('aria-label="Teams with project access"')
+  expect(markup).toContain('aria-label="Teams with service access"')
   expect(markup).toContain('href="/settings/teams/3"')
   expect(markup).toContain('viewer')
   expect(markup).toContain('Revoking the last grant makes it open again')
@@ -112,7 +112,7 @@ test('cached grants survive refresh failures', () => {
 })
 test('loading retains column headings without asserting open access', () => {
   const markup = renderPanel({ pending: true })
-  expect(markup).toContain('Role on this project')
+  expect(markup).toContain('Role on this service')
   expect(markup).toContain('aria-busy="true"')
   expect(markup).not.toContain('Open to everyone')
 })

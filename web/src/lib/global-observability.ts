@@ -125,7 +125,7 @@ export function facetProjectLabels(
     labels: Object.fromEntries(
       ids.map((id) => [
         String(id),
-        names[String(id)] ?? `Unknown project #${id}`,
+        names[String(id)] ?? `Unknown service #${id}`,
       ])
     ),
     existing: ids.filter((id) => String(id) in names),

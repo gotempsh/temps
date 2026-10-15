@@ -124,10 +124,12 @@ async function status(projectArg: string | undefined, options: StatusOptions): P
 
     // Fetch last deployment for this environment
     try {
-      const { data: deployment } = await getLastDeployment({
+      const { data: lastDeployment } = await getLastDeployment({
         client,
         path: { id: projectData.id },
       })
+      // `deployment` is null until the project's first deploy.
+      const deployment = lastDeployment?.deployment
 
       if (deployment && deployment.environment_id === env.id) {
         keyValue('  Status', statusBadge(deployment.status))

@@ -30,10 +30,6 @@ impl Default for JavaPreset {
 
 #[async_trait]
 impl Preset for JavaPreset {
-    fn uses_autopack(&self) -> bool {
-        true
-    }
-
     fn project_type(&self) -> ProjectType {
         ProjectType::Server
     }

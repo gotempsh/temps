@@ -34,7 +34,31 @@
 //!   recorded name as "this exact migration already ran" and skips it.
 //! - Only append new entries to the end of the list.
 
+//!
+//! # Wire compression is chosen here, never by the server default
+//!
+//! Every client for the instance's ClickHouse server must be built with
+//! [`build_client`] (or [`ClickHouseConfig::client`], which calls it). The
+//! `clickhouse` crate asks for compressed responses but only decodes LZ4, so a
+//! server whose `network_compression_method` default is anything else (ZSTD
+//! from ClickHouse 26.9) breaks every response that carries rows. See
+//! [`ClickHouseCompression`] for the two modes and [`client`] for exactly what
+//! each puts on the wire.
+
+pub mod client;
+pub mod diagnostics;
+pub mod health;
 pub mod migrations;
+pub mod retry;
+
+pub use client::{build_client, ClientWireSettings, NETWORK_COMPRESSION_METHOD_SETTING};
+pub use diagnostics::{
+    classify_error, classify_message, preflight, remedy_for, CompressionMethod, FailureKind,
+    COMPRESSION_REMEDY,
+};
+pub use health::{ClickHouseHealth, ConnectionState, HealthSnapshot};
+pub use retry::{retry_until_applied, spawn_retrying, MigrationRetryPolicy};
+pub use temps_core::{ClickHouseCompression, ParseClickHouseCompressionError};
 
 use clickhouse::error::Error as ChError;
 
@@ -53,6 +77,10 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression the clients built from this config use. Resolved by
+    /// the composition root from the stored `clickhouse.compression` setting;
+    /// [`ClickHouseConfig::new`] starts at the default ([`ClickHouseCompression::Lz4`]).
+    pub compression: ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs, panic
@@ -64,6 +92,7 @@ impl std::fmt::Debug for ClickHouseConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -83,17 +112,32 @@ impl ClickHouseConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: ClickHouseCompression::default(),
         }
     }
 
+    /// Use `compression` for every client built from this config.
+    pub fn with_compression(mut self, compression: ClickHouseCompression) -> Self {
+        self.compression = compression;
+        self
+    }
+
     /// Build a `clickhouse::Client` scoped to this config's URL, database,
-    /// and credentials.
+    /// credentials and compression mode. See [`build_client`].
     pub fn client(&self) -> clickhouse::Client {
-        clickhouse::Client::default()
-            .with_url(&self.url)
-            .with_database(&self.database)
-            .with_user(&self.user)
-            .with_password(&self.password)
+        build_client(
+            &self.url,
+            &self.database,
+            &self.user,
+            &self.password,
+            self.compression,
+        )
+    }
+
+    /// The host (and port) part of the URL, for log lines. Never includes the
+    /// userinfo, path or query, which may carry credentials.
+    pub fn host_for_logs(&self) -> String {
+        diagnostics::host_for_logs(&self.url)
     }
 }
 
@@ -115,6 +159,34 @@ pub enum ClickHouseError {
 
     #[error("failed to parse ClickHouse server version from '{0}'")]
     VersionParse(String),
+
+    /// The server answered, but with a body the client could not decode in
+    /// the configured compression mode. Retrying cannot fix this: the server
+    /// default or the Temps setting has to change. See [`COMPRESSION_REMEDY`].
+    #[error(
+        "ClickHouse at {host} (database '{database}') returned a response that could not be \
+         decoded in '{mode}' compression mode (compression method byte observed on the wire: \
+         {}): {source}. {}",
+        .observed.map_or_else(|| "unknown".to_string(), |m| m.to_string()),
+        remedy_for(*.mode, *.observed)
+    )]
+    ResponseDecode {
+        host: String,
+        database: String,
+        mode: ClickHouseCompression,
+        observed: Option<CompressionMethod>,
+        source: ChError,
+    },
+
+    #[error(
+        "ClickHouse at {host} (database '{database}') did not answer the startup probe within \
+         {timeout_secs}s"
+    )]
+    ProbeTimeout {
+        host: String,
+        database: String,
+        timeout_secs: u64,
+    },
 }
 
 impl ClickHouseError {

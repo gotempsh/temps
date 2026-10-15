@@ -77,6 +77,17 @@ pub enum AgentError {
     #[error("Sandbox not found: {sandbox}")]
     SandboxNotFound { run_id: i32, sandbox: String },
 
+    /// A guest did not answer a terminal request in time. Kept apart from
+    /// [`AgentError::SandboxExecFailed`] so callers can tell "the guest is
+    /// stalled" (retry, restart the sandbox: a 504) from "this sandbox has no
+    /// terminal support" (a setup problem: a 409 with the fix).
+    #[error("Terminal {operation} for sandbox {sandbox_id} did not finish within {timeout_secs}s")]
+    SandboxTerminalTimeout {
+        sandbox_id: String,
+        operation: String,
+        timeout_secs: u64,
+    },
+
     #[error("Sandbox exec failed for run {run_id} in sandbox {sandbox_id}: {reason}")]
     SandboxExecFailed {
         run_id: i32,
@@ -216,6 +227,98 @@ impl From<sea_orm::DbErr> for AgentError {
     }
 }
 
+/// Prefix of the [`AgentError::SandboxCreationFailed`] reason when the
+/// container runtime could not pull the sandbox image. The reason is a string
+/// because the error also crosses the worker-node HTTP boundary, so the pull
+/// failure is encoded and decoded in one place: [`image_pull_failure_reason`]
+/// builds it and [`AgentError::image_pull_failure`] reads it back.
+const IMAGE_PULL_REASON_PREFIX: &str = "Failed to pull image ";
+
+/// Build the `SandboxCreationFailed` reason for an image that could not be
+/// pulled. `cause` is the container runtime's own message.
+pub fn image_pull_failure_reason(image: &str, cause: &str) -> String {
+    format!("{IMAGE_PULL_REASON_PREFIX}{image}: {cause}")
+}
+
+/// Substrings (lower case) that identify Docker having no subnet left to hand
+/// to a new network. The first is the daemon's message when every
+/// `default-address-pools` range is carved up; the second is the same
+/// condition on older engines; the third is our own reworded message.
+const NETWORK_POOL_EXHAUSTED_MARKERS: [&str; 3] = [
+    "all predefined address pools have been fully subnetted",
+    "could not find an available, non-overlapping ipv4 address pool",
+    // What `network_pool_exhausted_reason` itself says, so the reworded
+    // message is still recognised once the daemon's text is not in it.
+    "docker has no free address pool left",
+];
+
+/// Whether `message` is the Docker daemon refusing to create a network
+/// because its address pools are exhausted.
+///
+/// The error also crosses the worker-node HTTP boundary as a string, so it
+/// is recognised by its text in one place, like the image pull failure.
+pub fn is_network_pool_exhausted(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    NETWORK_POOL_EXHAUSTED_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Build the reason for a sandbox whose isolated network could not be created
+/// because Docker has no free address pool left. `cause` is the daemon's own
+/// message. States what to do about it: the operator can widen the pools or
+/// remove sandboxes they no longer use.
+pub fn network_pool_exhausted_reason(sandbox: &str, cause: &str) -> String {
+    format!(
+        "Docker has no free address pool left for the isolated network of sandbox '{sandbox}' \
+         ({cause}). Delete sandboxes that are no longer needed to release their networks, or \
+         raise `default-address-pools` in the Docker daemon configuration (daemon.json, for \
+         example a larger `base` range with a `size` of 24) and restart Docker."
+    )
+}
+
+impl AgentError {
+    /// The reason, when this error is the Docker daemon running out of
+    /// address pools for the per-sandbox network. Callers answer it with a
+    /// capacity error instead of a server fault.
+    pub fn network_pool_exhaustion(&self) -> Option<&str> {
+        match self {
+            AgentError::SandboxProviderUnavailable { reason, .. }
+            | AgentError::SandboxCreationFailed { reason, .. } => {
+                is_network_pool_exhausted(reason).then_some(reason.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// A terminal request to the guest of `sandbox_id` that did not finish
+    /// within `timeout`; `operation` says which step ("agent handshake on
+    /// vsock port 5000", "agent bootstrap", …).
+    pub fn terminal_timeout(
+        sandbox_id: &str,
+        operation: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        AgentError::SandboxTerminalTimeout {
+            sandbox_id: sandbox_id.to_string(),
+            operation: operation.into(),
+            timeout_secs: timeout.as_secs().max(1),
+        }
+    }
+
+    /// When this error is a sandbox creation that failed because the image
+    /// could not be pulled, return `(image, cause)`.
+    pub fn image_pull_failure(&self) -> Option<(&str, &str)> {
+        match self {
+            AgentError::SandboxCreationFailed { reason, .. } => reason
+                .strip_prefix(IMAGE_PULL_REASON_PREFIX)
+                .and_then(|rest| rest.split_once(": "))
+                .filter(|(image, _)| !image.is_empty() && !image.contains(char::is_whitespace)),
+            _ => None,
+        }
+    }
+}
+
 /// Try to pull the slug out of a Postgres unique-violation message.
 /// Postgres includes `DETAIL: Key (slug)=(foo) already exists.` in its
 /// error body. Missing DETAIL just means we fall back to `None`.
@@ -225,4 +328,116 @@ fn extract_dup_slug(msg: &str) -> Option<String> {
     let val_start = rest.find(")=(")? + 3;
     let val_end = rest[val_start..].find(')')?;
     Some(rest[val_start..val_start + val_end].to_string())
+}
+
+#[cfg(test)]
+mod image_pull_tests {
+    use super::*;
+
+    fn creation_failed(reason: String) -> AgentError {
+        AgentError::SandboxCreationFailed {
+            run_id: 7,
+            provider: "docker".into(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn pull_failure_round_trips_image_and_cause() {
+        let error = creation_failed(image_pull_failure_reason(
+            "registry.example.test/team/img:1.2.3",
+            "Docker responded with status code 404: manifest unknown",
+        ));
+        assert_eq!(
+            error.image_pull_failure(),
+            Some((
+                "registry.example.test/team/img:1.2.3",
+                "Docker responded with status code 404: manifest unknown"
+            ))
+        );
+    }
+
+    #[test]
+    fn other_creation_failures_are_not_pull_failures() {
+        let error = creation_failed("inspect runtime image x:1: no such image".into());
+        assert_eq!(error.image_pull_failure(), None);
+        let error = creation_failed("Failed to pull image : empty".into());
+        assert_eq!(error.image_pull_failure(), None);
+    }
+
+    #[test]
+    fn terminal_timeout_names_the_sandbox_step_and_limit() {
+        let error = AgentError::terminal_timeout(
+            "sbx_test",
+            "agent handshake on vsock port 5000",
+            std::time::Duration::from_secs(10),
+        );
+        let message = error.to_string();
+        assert!(message.contains("sbx_test"), "{message}");
+        assert!(message.contains("vsock port 5000"), "{message}");
+        assert!(message.contains("10s"), "{message}");
+        // Kept apart from exec failures so a handler can answer 504, not 409.
+        assert!(!matches!(error, AgentError::SandboxExecFailed { .. }));
+    }
+
+    #[test]
+    fn terminal_timeout_never_reports_a_zero_second_limit() {
+        let error = AgentError::terminal_timeout(
+            "sbx_test",
+            "handshake",
+            std::time::Duration::from_millis(50),
+        );
+        assert!(error.to_string().contains("within 1s"), "{error}");
+    }
+
+    #[test]
+    fn non_creation_errors_are_not_pull_failures() {
+        let error = AgentError::SandboxProviderUnavailable {
+            provider: "docker".into(),
+            reason: "Failed to pull image a:1: boom".into(),
+        };
+        assert_eq!(error.image_pull_failure(), None);
+    }
+
+    #[test]
+    fn docker_address_pool_exhaustion_is_recognised() {
+        assert!(is_network_pool_exhausted(
+            "Docker responded with status code 400: all predefined address pools have been fully subnetted"
+        ));
+        assert!(is_network_pool_exhausted(
+            "Could not find an available, non-overlapping IPv4 address pool among the defaults to assign to the network"
+        ));
+        assert!(!is_network_pool_exhausted(
+            "network temps-sandbox-x already exists"
+        ));
+    }
+
+    #[test]
+    fn pool_exhaustion_reason_names_sandbox_cause_and_remedy() {
+        let reason = network_pool_exhausted_reason("temps-sandbox-abc", "pools fully subnetted");
+        assert!(reason.contains("temps-sandbox-abc"), "{reason}");
+        assert!(reason.contains("pools fully subnetted"), "{reason}");
+        assert!(reason.contains("default-address-pools"), "{reason}");
+        assert!(reason.contains("Delete sandboxes"), "{reason}");
+        let error = AgentError::SandboxProviderUnavailable {
+            provider: "docker".into(),
+            reason,
+        };
+        assert_eq!(
+            error
+                .network_pool_exhaustion()
+                .map(|r| r.contains("temps-sandbox-abc")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unrelated_errors_are_not_pool_exhaustion() {
+        let error = creation_failed("create container: no such image".into());
+        assert_eq!(error.network_pool_exhaustion(), None);
+        assert_eq!(
+            AgentError::RunNotFound { run_id: 1 }.network_pool_exhaustion(),
+            None
+        );
+    }
 }

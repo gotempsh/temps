@@ -46,8 +46,9 @@ const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
-    AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PreviewGatewaySettings,
-    PublicHostnameStrategy,
+    AgentSandboxSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
+    ClickHouseCompression, GeoLicenseKeyIntent, KvSettings, ObservabilityRetentionSettings,
+    PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
 /// Whether a settings write explicitly changes outbound private-network trust.
@@ -204,6 +205,11 @@ pub enum ConfigServiceError {
 
     #[error("Settings section '{section}' is malformed")]
     MalformedSettingsSection { section: &'static str },
+
+    /// The submitted public ingress hostname was claimed by a status page
+    /// while the settings save was in flight (#1412).
+    #[error("Public ingress hostname '{hostname}' is attached to a status page")]
+    PublicIngressHostnameInUse { hostname: String },
 
     #[error("Cluster CA is not initialized")]
     ClusterCaNotInitialized,
@@ -421,6 +427,17 @@ pub struct ServerConfig {
     // etc.). When unset, both surfaces share `console_address` for backwards
     // compatibility. See [admin-listener-split] for the route classification.
     pub console_admin_address: Option<String>,
+    /// Address of a listener that serves only the console's public routes
+    /// (ADR-051): health probes and the receivers third parties call (email
+    /// tracking, provider webhooks, ingest). The proxy sends the public
+    /// ingress hostname and admin-gate-denied requests here, so they cannot
+    /// reach an admin handler or the dashboard whatever their path.
+    ///
+    /// Bootstrap configuration, like `console_address`: it has to be known
+    /// before the listener binds. It is a listener of its own even when
+    /// `console_admin_address` is set — see
+    /// [`ServerConfig::public_surface_address`], which is what to read.
+    pub console_ingress_address: Option<String>,
     /// Comma-separated list of IPs / CIDRs allowed to reach the admin listener.
     /// Empty / unset = no IP allowlist (admin gated only by binding address).
     pub admin_allowed_ips: Vec<String>,
@@ -495,6 +512,14 @@ impl ServerConfig {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Public-only listener (ADR-051). Named explicitly only when the
+        // proxy is a separate process that must be told where it is; the
+        // single-binary server picks a loopback port for itself via
+        // `with_default_ingress_listener`.
+        let console_ingress_address = std::env::var("TEMPS_CONSOLE_INGRESS_ADDRESS")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         let admin_allowed_ips = std::env::var("TEMPS_ADMIN_ALLOWED_IPS")
             .ok()
             .map(|s| {
@@ -528,6 +553,7 @@ impl ServerConfig {
             tls_address,
             console_address,
             console_admin_address,
+            console_ingress_address,
             admin_allowed_ips,
             admin_allowed_hosts,
             admin_trust_forwarded_for,
@@ -605,6 +631,36 @@ impl ServerConfig {
             && self.clickhouse_database.is_some()
             && self.clickhouse_user.is_some()
             && self.clickhouse_password.is_some()
+    }
+
+    /// Reserve a loopback address for the public-only listener when the
+    /// operator named none.
+    ///
+    /// For the single-binary server, where the in-process proxy is handed the
+    /// address directly. A split console must not call this: a sibling
+    /// `temps proxy` cannot discover a random port, so there the listener is
+    /// only bound when `--console-ingress-address` names one.
+    pub fn with_default_ingress_listener(mut self) -> Self {
+        if self.public_surface_address().is_none() {
+            self.console_ingress_address = Some(Self::get_random_console_address());
+        }
+        self
+    }
+
+    /// The address of the listener that serves only the console's public
+    /// routes, when one exists (ADR-051). The console binds it, and the proxy
+    /// sends it every request that may reach nothing else.
+    ///
+    /// It is a listener of its own in every topology. In dual-listener mode
+    /// `console_address` looks like a candidate, since no admin route is
+    /// mounted there, but it also serves the MCP endpoint, whose operations
+    /// accept a session cookie or an API key. Reusing it would let a client
+    /// the admin gate denied run MCP operations with valid credentials, which
+    /// is exactly what the gate exists to prevent.
+    pub fn public_surface_address(&self) -> Option<&str> {
+        self.console_ingress_address
+            .as_deref()
+            .filter(|address| !address.is_empty())
     }
 
     /// Get a random available port for console address
@@ -739,6 +795,26 @@ pub async fn installation_mode(db: &DbConnection) -> Result<InstallationMode, Co
     })
 }
 
+/// Read the stored `clickhouse.compression` setting straight from the
+/// `settings` row, for one-shot CLI commands that talk to ClickHouse but have
+/// no [`ConfigService`] (the backfills). A missing row, an undecodable row or
+/// a failed read all yield the default (LZ4), with a warning for the last.
+pub async fn stored_clickhouse_compression(db: &DbConnection) -> ClickHouseCompression {
+    match settings::Entity::find_by_id(1).one(db).await {
+        Ok(record) => record
+            .map(|r| AppSettings::from_json(r.data).clickhouse.compression)
+            .unwrap_or_default(),
+        Err(error) => {
+            warn!(
+                %error,
+                default = %ClickHouseCompression::default(),
+                "Could not read the stored ClickHouse compression setting; using the default"
+            );
+            ClickHouseCompression::default()
+        }
+    }
+}
+
 /// Return the stable instance identifier for a stateless installation.
 pub async fn stateless_instance_id(
     db: &DbConnection,
@@ -820,6 +896,16 @@ struct SettingsCacheState {
     generation: u64,
 }
 
+/// What the analytics retention sweep needs from the settings row; see
+/// [`ConfigService::get_retention_policy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub analytics: AnalyticsRetentionSettings,
+    /// `observability_retention.proxy_logs_days`, the instance-wide window the
+    /// stored-IP floor is derived from.
+    pub proxy_logs_days: u32,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -837,6 +923,17 @@ pub struct ConfigService {
     /// this (via [`ConfigService::start_settings_listener`]); throwaway
     /// `ConfigService::new()` instances never start it.
     listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The ClickHouse wire-compression mode this process builds its clients
+    /// with. Resolved once at startup from the stored
+    /// `clickhouse.compression` setting (see
+    /// [`ConfigService::stored_clickhouse_compression`]) and fixed for the
+    /// life of the process: clients are cloned throughout the server and carry
+    /// their codec, so a changed setting is applied by the next restart. The
+    /// Settings API reports this next to the stored value.
+    ///
+    /// Defaults to [`ClickHouseCompression::Lz4`] for throwaway
+    /// `ConfigService::new()` instances that never build ClickHouse clients.
+    clickhouse_compression: ClickHouseCompression,
 }
 
 /// Publish the settings that sync call sites read from process-wide caches
@@ -873,6 +970,41 @@ impl ConfigService {
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
+            clickhouse_compression: ClickHouseCompression::default(),
+        }
+    }
+
+    /// Fix the ClickHouse compression mode this process builds clients with.
+    /// Called once by the composition root, with the value read from
+    /// [`ConfigService::stored_clickhouse_compression`].
+    pub fn with_clickhouse_compression(mut self, mode: ClickHouseCompression) -> Self {
+        self.clickhouse_compression = mode;
+        self
+    }
+
+    /// The ClickHouse compression mode this process's clients were built with
+    /// (not necessarily the stored setting: a change applies on restart).
+    pub fn clickhouse_compression(&self) -> ClickHouseCompression {
+        self.clickhouse_compression
+    }
+
+    /// Read the stored `clickhouse.compression` setting.
+    ///
+    /// A failed read falls back to the default (LZ4) with a warning rather
+    /// than failing startup: every other component that needs the database is
+    /// about to fail loudly on its own, and LZ4 is what the clients did before
+    /// the mode was configurable.
+    pub async fn stored_clickhouse_compression(&self) -> ClickHouseCompression {
+        match self.get_settings().await {
+            Ok(settings) => settings.clickhouse.compression,
+            Err(error) => {
+                warn!(
+                    %error,
+                    default = %ClickHouseCompression::default(),
+                    "Could not read the stored ClickHouse compression setting; using the default"
+                );
+                ClickHouseCompression::default()
+            }
         }
     }
 
@@ -1136,6 +1268,93 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .unwrap_or_else(|| "http://localho.st".to_string()))
     }
 
+    /// Base URL handed to third parties that call back into Temps (ADR-051):
+    /// `public_ingress_url` when set, `external_url` otherwise, the local
+    /// default when neither is. No trailing slash.
+    ///
+    /// Use this, not [`Self::get_external_url_or_default`], for any URL a
+    /// machine or person who is not an operator will request: tracking pixels
+    /// and click redirects, provider webhooks, a browser-SDK DSN. Links an
+    /// operator opens in the console keep using the external URL.
+    pub async fn get_public_ingress_url(&self) -> Result<String, ConfigServiceError> {
+        Ok(self.get_settings().await?.effective_public_ingress_url())
+    }
+
+    /// Name the kind of stored domain record that covers `host`, or `None`
+    /// when no record does.
+    ///
+    /// A record covers `host` when it names it exactly or is a single-label
+    /// wildcard over it (`*.example.com` covers `app.example.com`, matching
+    /// how the proxy resolves wildcards).
+    ///
+    /// This sees records the route table does not serve yet — a custom domain
+    /// on an environment that was never deployed — but it is not the whole
+    /// answer: names generated from an environment's subdomain are not stored
+    /// as domain rows at all. Callers that must know whether a hostname is in
+    /// use combine it with the route table's own check
+    /// (`RouteTableRefresher::application_serving_host`).
+    pub async fn hostname_claimed_by(
+        &self,
+        host: &str,
+    ) -> Result<Option<&'static str>, ConfigServiceError> {
+        Self::hostname_claimed_by_on(self.db.as_ref(), host).await
+    }
+
+    /// [`Self::hostname_claimed_by`] on a caller-supplied connection, so a
+    /// caller holding a transaction (and the hostname-claim lock in it) runs
+    /// the check on that same connection instead of taking a second one from
+    /// the pool while the first is held.
+    pub async fn hostname_claimed_by_on<C: ConnectionTrait>(
+        conn: &C,
+        host: &str,
+    ) -> Result<Option<&'static str>, ConfigServiceError> {
+        use temps_entities::{
+            custom_routes, environment_domains, project_custom_domains, status_page_domains,
+        };
+
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return Ok(None);
+        }
+        let mut candidates = vec![host.clone()];
+        if let Some((label, parent)) = host.split_once('.') {
+            if !label.is_empty() && !parent.is_empty() {
+                candidates.push(format!("*.{parent}"));
+            }
+        }
+
+        if project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.is_in(candidates.clone()))
+            .one(conn)
+            .await?
+            .is_some()
+        {
+            return Ok(Some("a project custom domain"));
+        }
+        if environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.is_in(candidates.clone()))
+            .one(conn)
+            .await?
+            .is_some()
+        {
+            return Ok(Some("an environment domain"));
+        }
+        if custom_routes::Entity::find()
+            .filter(custom_routes::Column::Domain.is_in(candidates))
+            .one(conn)
+            .await?
+            .is_some()
+        {
+            return Ok(Some("a custom route"));
+        }
+        // A hostname attached to a status page (#1412). Tombstones (removed
+        // hostnames) do not count: any application may claim those.
+        if status_page_domains::attached_hostname_conflict(conn, &host).await? {
+            return Ok(Some("a status page custom domain"));
+        }
+        Ok(None)
+    }
+
     /// Derive the URL scheme from `external_url` — returns "http" or "https".
     /// Defaults to "https" when no external_url is configured (production
     /// assumption) and to the actual scheme otherwise, so HTTP-only sslip.io
@@ -1235,6 +1454,52 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         };
         serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
             section: "agent_sandbox",
+        })
+    }
+
+    /// Load only the retention inputs the analytics sweep deletes by, straight
+    /// from the authoritative settings row.
+    ///
+    /// The sweep removes data permanently, so it must never run on a policy
+    /// that was invented rather than read. [`Self::get_settings`] returns the
+    /// whole default document when any field fails to decode, which would
+    /// replace a saved 365-day policy with the 90-day default (and a saved
+    /// "keep addresses" with the 30-day one) over an unrelated bad section.
+    /// Here an unrelated malformed section is ignored, while a missing section
+    /// is the default and a malformed retention section is an error, so the
+    /// caller skips the pass instead of acting.
+    pub async fn get_retention_policy(&self) -> Result<RetentionPolicy, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(data) = record.map(|row| row.data) else {
+            // No row yet: a fresh install running on defaults.
+            return Ok(RetentionPolicy {
+                analytics: AnalyticsRetentionSettings::default(),
+                proxy_logs_days: ObservabilityRetentionSettings::default().proxy_logs_days,
+            });
+        };
+        let section = |name: &'static str| data.get(name).filter(|value| !value.is_null()).cloned();
+        let analytics = match section("analytics_retention") {
+            None => AnalyticsRetentionSettings::default(),
+            Some(value) => serde_json::from_value(value).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "analytics_retention",
+                }
+            })?,
+        };
+        let observability: ObservabilityRetentionSettings = match section("observability_retention")
+        {
+            None => ObservabilityRetentionSettings::default(),
+            Some(value) => serde_json::from_value(value).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "observability_retention",
+                }
+            })?,
+        };
+        Ok(RetentionPolicy {
+            analytics,
+            proxy_logs_days: observability.proxy_logs_days,
         })
     }
 
@@ -1430,13 +1695,66 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // change the section outside that lock nor revert it from an older
         // snapshot.
         settings.preview_gateway = locked_settings.preview_gateway.clone();
+        // The KV and Blob container-name sections are owned by
+        // `update_kv_settings` / `update_blob_settings`, which their handlers
+        // call only while the service does not exist: a generic save built
+        // from an older snapshot must not rename a running service's container.
+        settings.kv = locked_settings.kv.clone();
+        settings.blob = locked_settings.blob.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
+
+        // The handler checked that a new public ingress hostname was free, but
+        // before this transaction. Status page hostnames (#1412) are claimed
+        // under a per-hostname advisory lock; take the same lock and repeat
+        // that check here, so a status page cannot claim the name between the
+        // handler's check and this commit (nor the other way round: an attach
+        // waiting on the lock reads the committed settings afterwards).
+        if self.is_postgres() {
+            if let Some(host) = settings.public_ingress_hostname().filter(|host| {
+                locked_settings.public_ingress_hostname().as_deref() != Some(host.as_str())
+            }) {
+                let claimed = async {
+                    temps_entities::status_page_domains::lock_hostname_claim(&txn, &host).await?;
+                    temps_entities::status_page_domains::attached_hostname_conflict(&txn, &host)
+                        .await
+                }
+                .await;
+                match claimed {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            warn!(%rollback, "Failed to roll back refused settings update");
+                        }
+                        return Err(ConfigServiceError::PublicIngressHostnameInUse {
+                            hostname: host,
+                        });
+                    }
+                    Err(error) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            warn!(%rollback, "Failed to roll back settings update");
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
         // Both are rebased here, under the lock, so a settings save built from
         // a stale snapshot can neither erase a check the job just recorded nor
         // revert a key that was stored while this request was in flight.
         preserve_geo_recorded_state(&mut settings, &locked_settings, geo_license_key_intent);
+        // Lowering the proxy-log window must not delete addresses that older
+        // logs still point at. The hold is derived here, from the row this
+        // transaction locked, never from the handler's snapshot or the client:
+        // two saves racing from the same snapshot would otherwise compute the
+        // hold from a window one of them had already replaced.
+        settings.analytics_retention = settings.analytics_retention.clone().with_ip_hold(
+            locked_settings.analytics_retention.ip_hold_until,
+            locked_settings.observability_retention.proxy_logs_days,
+            settings.observability_retention.proxy_logs_days,
+            now,
+        );
 
         let previous_compression = existing
             .as_ref()
@@ -1737,8 +2055,51 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     where
         F: FnOnce(&mut PreviewGatewaySettings),
     {
+        self.update_settings_section("preview_gateway", update_fn)
+            .await
+    }
+
+    /// Change the managed KV service settings under the settings-row lock and
+    /// return them as saved. Generic settings saves restore this section from
+    /// the locked row, so this is its only write path.
+    pub async fn update_kv_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<KvSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut KvSettings),
+    {
+        self.update_settings_section("kv", update_fn).await
+    }
+
+    /// Change the managed Blob service settings under the settings-row lock
+    /// and return them as saved. Same write-path contract as
+    /// [`Self::update_kv_settings`].
+    pub async fn update_blob_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<BlobSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut BlobSettings),
+    {
+        self.update_settings_section("blob", update_fn).await
+    }
+
+    /// Read-modify-write one top-level section of the settings document under
+    /// the settings-row lock. A missing section starts from its default; a
+    /// stored section that does not parse is reported rather than replaced, so
+    /// nothing in it is lost to a partial update.
+    async fn update_settings_section<T, F>(
+        &self,
+        section_name: &'static str,
+        update_fn: F,
+    ) -> Result<T, ConfigServiceError>
+    where
+        T: Default + serde::Serialize + serde::de::DeserializeOwned,
+        F: FnOnce(&mut T),
+    {
         let malformed = || ConfigServiceError::MalformedSettingsSection {
-            section: "preview_gateway",
+            section: section_name,
         };
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -1755,17 +2116,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .map(|model| model.data.clone())
             .unwrap_or_else(|| AppSettings::default().to_json());
         let fields = document.as_object_mut().ok_or_else(malformed)?;
-        let mut gateway = match fields.get("preview_gateway") {
-            None | Some(serde_json::Value::Null) => PreviewGatewaySettings::default(),
+        let mut value = match fields.get(section_name) {
+            None | Some(serde_json::Value::Null) => T::default(),
             Some(section) => serde_json::from_value(section.clone()).map_err(|_| malformed())?,
         };
-        update_fn(&mut gateway);
-        let section = serde_json::to_value(&gateway).map_err(|error| {
+        update_fn(&mut value);
+        let section = serde_json::to_value(&value).map_err(|error| {
             ConfigServiceError::Serialization(format!(
-                "Failed to serialize the preview gateway settings section: {error}"
+                "Failed to serialize the {section_name} settings section: {error}"
             ))
         })?;
-        fields.insert("preview_gateway".to_string(), section);
+        fields.insert(section_name.to_string(), section);
 
         if let Some(model) = existing {
             let mut active: settings::ActiveModel = model.into();
@@ -1785,7 +2146,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         transaction.commit().await?;
         self.invalidate_settings_cache().await;
-        Ok(gateway)
+        Ok(value)
     }
 
     /// Set the sandbox placement allow-list (ADR-048) under the settings-row
@@ -3952,6 +4313,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_and_blob_container_names_change_only_through_their_own_write_path() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping KV/Blob settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("KV/Blob settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert!(stale_bulk_document.kv.container_name.is_empty());
+        assert!(stale_bulk_document.blob.container_name.is_empty());
+
+        let kv = service
+            .update_kv_settings(|kv| kv.container_name = "redis-temps-kv-staging".into())
+            .await
+            .expect("save the KV container name");
+        let blob = service
+            .update_blob_settings(|blob| blob.container_name = "rustfs-files".into())
+            .await
+            .expect("save the Blob container name");
+        assert_eq!(kv.container_name, "redis-temps-kv-staging");
+        assert_eq!(blob.container_name, "rustfs-files");
+
+        // A settings-page save built before the change neither reverts the
+        // names nor, when it sets them itself, changes them.
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save");
+        let mut rewrite = stale_bulk_document;
+        rewrite.kv.container_name = "redis-rewritten".into();
+        rewrite.blob.container_name = "rustfs-rewritten".into();
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the KV and Blob sections");
+
+        let stored = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read settings")
+            .expect("settings row");
+        let stored = AppSettings::from_json(stored.data);
+        assert_eq!(stored.kv.container_name, "redis-temps-kv-staging");
+        assert_eq!(stored.blob.container_name, "rustfs-files");
+
+        // Resetting writes the empty default back.
+        let reset = service
+            .update_kv_settings(|kv| kv.container_name.clear())
+            .await
+            .expect("reset the KV container name");
+        assert!(reset.container_name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kv_write_rejects_a_malformed_section_without_overwriting_it() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["kv"] = serde_json::json!({ "container_name": 7 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_kv_settings(|kv| kv.container_name = "redis-x".into())
+            .await
+            .expect_err("a malformed KV section must abort the write");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection { section: "kv" }
+            ),
+            "unexpected KV write error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
     async fn join_token_write_rejects_malformed_multi_node_without_overwriting_settings() {
         let mut row = settings_row("preserved.example.test");
         row.data["multi_node"] = serde_json::json!(["invalid"]);
@@ -4132,6 +4584,128 @@ mod tests {
             .find(|s| s.starts_with("UPDATE "))
             .expect("settings update");
         assert!(update.contains(r#""allowed_node_ids":[0,3]"#), "{update}");
+    }
+
+    fn retention_row(data: serde_json::Value) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_policy_survives_an_unrelated_malformed_section() {
+        // `preview_domain: 42` makes the whole document undecodable, which
+        // `get_settings` turns into the defaults. The sweep must still see the
+        // 365-day events window and "keep addresses" that were saved.
+        let row = retention_row(serde_json::json!({
+            "preview_domain": 42,
+            "analytics_retention": {
+                "events_days": 365,
+                "unreferenced_ip_days": null,
+            },
+            "observability_retention": { "proxy_logs_days": 90 },
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let policy = service.get_retention_policy().await.expect("policy");
+
+        assert_eq!(policy.analytics.events_days, 365);
+        assert_eq!(policy.analytics.unreferenced_ip_days, None);
+        assert_eq!(policy.proxy_logs_days, 90);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_retention_section_is_an_error_not_a_default() {
+        let row = retention_row(serde_json::json!({
+            "analytics_retention": { "events_days": "forever" },
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = service
+            .get_retention_policy()
+            .await
+            .expect_err("the pass must be skipped");
+
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "analytics_retention"
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_policy_defaults_apply_only_when_nothing_was_saved() {
+        let empty = retention_row(serde_json::json!({}));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![empty], Vec::<settings::Model>::new()])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let sections_absent = service.get_retention_policy().await.expect("policy");
+        let no_row = service.get_retention_policy().await.expect("policy");
+
+        for policy in [sections_absent, no_row] {
+            assert_eq!(policy.analytics, AnalyticsRetentionSettings::default());
+            assert_eq!(
+                policy.proxy_logs_days,
+                ObservabilityRetentionSettings::default().proxy_logs_days
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ip_hold_is_derived_from_the_locked_proxy_log_window() {
+        // The caller's snapshot may be older than the row this save locks: the
+        // window it lowers is the one stored, not the one it last read.
+        let mut locked = settings_row("old.example.test");
+        locked.data["observability_retention"] = serde_json::json!({ "proxy_logs_days": 90 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([vec![locked.clone()], vec![locked.clone()], vec![locked]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+        let mut lowered = AppSettings {
+            preview_domain: "new.example.test".into(),
+            ..Default::default()
+        };
+        lowered.observability_retention.proxy_logs_days = 7;
+        // A client-supplied hold is replaced, never trusted.
+        lowered.analytics_retention.ip_hold_until = Some(Utc::now() + chrono::Duration::days(1));
+
+        service
+            .update_settings(lowered)
+            .await
+            .expect("settings save lowering the window");
+        let saved = service.get_settings().await.expect("saved settings");
+
+        let hold = saved
+            .analytics_retention
+            .ip_hold_until
+            .expect("lowering the window from 90 days holds addresses");
+        let held_for = hold - Utc::now();
+        assert!(
+            held_for > chrono::Duration::days(90)
+                && held_for <= chrono::Duration::days(91) + chrono::Duration::minutes(1),
+            "held for the locked 90-day window plus the lookup slack, got {held_for}"
+        );
     }
 
     #[tokio::test]
@@ -5393,5 +5967,357 @@ mod tests {
             updated.cloud.console_access_enabled,
             "the 4th positional argument must map to console_access_enabled"
         );
+    }
+
+    fn config_with_listeners(admin: Option<&str>, ingress: Option<&str>) -> ServerConfig {
+        let mut config = (*test_config()).clone();
+        config.console_address = "127.0.0.1:8000".to_string();
+        config.console_admin_address = admin.map(str::to_string);
+        config.console_ingress_address = ingress.map(str::to_string);
+        config
+    }
+
+    // ADR-051 D4: the public-only surface is a listener of its own in every
+    // topology.
+    #[test]
+    fn single_listener_binds_a_dedicated_public_only_listener() {
+        let config = config_with_listeners(None, Some("127.0.0.1:8002"));
+        assert_eq!(config.public_surface_address(), Some("127.0.0.1:8002"));
+    }
+
+    // In dual-listener mode `console_address` has no admin routes but does
+    // serve authenticated MCP. A request the admin gate denied must not land
+    // there, so it is never the public-only surface.
+    #[test]
+    fn dual_listener_never_reuses_the_console_listener_as_the_public_surface() {
+        let with_ingress = config_with_listeners(Some("127.0.0.1:8001"), Some("127.0.0.1:8002"));
+        assert_eq!(
+            with_ingress.public_surface_address(),
+            Some("127.0.0.1:8002")
+        );
+
+        let without_ingress = config_with_listeners(Some("127.0.0.1:8001"), None);
+        assert_eq!(
+            without_ingress.public_surface_address(),
+            None,
+            "without a dedicated listener there is no public-only surface, \
+             and the proxy keeps answering gate-denied requests itself"
+        );
+        assert_ne!(
+            with_ingress.public_surface_address(),
+            Some(with_ingress.console_address.as_str())
+        );
+    }
+
+    #[test]
+    fn no_public_only_listener_without_an_ingress_address() {
+        for ingress in [None, Some("")] {
+            let config = config_with_listeners(None, ingress);
+            assert_eq!(config.public_surface_address(), None);
+        }
+    }
+
+    #[test]
+    fn default_ingress_listener_is_loopback_and_filled_in_both_listener_modes() {
+        for admin in [None, Some("127.0.0.1:8001")] {
+            let config = config_with_listeners(admin, None).with_default_ingress_listener();
+            let address = config
+                .public_surface_address()
+                .expect("the single-binary server gets a public-only listener");
+            let socket: std::net::SocketAddr = address.parse().expect("a socket address");
+            assert!(socket.ip().is_loopback(), "{address} must be loopback");
+            assert_ne!(address, config.console_address);
+            assert_ne!(Some(address), config.console_admin_address.as_deref());
+        }
+
+        // An explicit address is kept; an empty one counts as unset.
+        let explicit =
+            config_with_listeners(None, Some("127.0.0.1:8002")).with_default_ingress_listener();
+        assert_eq!(explicit.public_surface_address(), Some("127.0.0.1:8002"));
+        let blank = config_with_listeners(None, Some("")).with_default_ingress_listener();
+        assert!(blank.public_surface_address().is_some());
+    }
+
+    /// Count occurrences of `needle` in every `.rs` file under `dir`, keyed by
+    /// path relative to `root`.
+    fn count_in_sources(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        needle: &str,
+        counts: &mut BTreeMap<String, usize>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count_in_sources(root, &path, needle, counts);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let count = std::fs::read_to_string(&path)
+                    .map(|source| source.matches(needle).count())
+                    .unwrap_or(0);
+                if count > 0 {
+                    let relative = path.strip_prefix(root).unwrap_or(&path);
+                    counts.insert(relative.to_string_lossy().replace('\\', "/"), count);
+                }
+            }
+        }
+    }
+
+    // ADR-051 D2: every URL Temps emits is classified by who will request it.
+    // A third party gets `get_public_ingress_url`; only links an operator's
+    // own browser follows may use the external (console) URL.
+    //
+    // This fails when a crate that serves third-party receivers gains a new
+    // `get_external_url*` call, so the author has to decide which it is: use
+    // `get_public_ingress_url`, or add the site below with the reason it is
+    // operator-facing. Getting it wrong is silent in production — the
+    // callback simply never arrives when the console is restricted.
+    #[test]
+    fn external_url_use_in_receiver_crates_is_classified() {
+        const RECEIVER_CRATES: &[&str] = &[
+            "temps-agents",
+            "temps-analytics-events",
+            "temps-analytics-performance",
+            "temps-analytics-session-replay",
+            "temps-email",
+            "temps-email-tracking",
+            "temps-error-tracking",
+            "temps-git",
+            "temps-otel",
+            "temps-projects",
+        ];
+        // (file, call sites, why the console URL is right there)
+        const OPERATOR_FACING: &[(&str, usize, &str)] = &[(
+            "temps-git/src/handlers/github.rs",
+            3,
+            "GitHub redirects the operator's own browser back to the console \
+             after creating, authorizing or installing the App",
+        )];
+
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("temps-config lives in crates/");
+        let mut found = BTreeMap::new();
+        for name in RECEIVER_CRATES {
+            count_in_sources(
+                crates_dir,
+                &crates_dir.join(name).join("src"),
+                "get_external_url",
+                &mut found,
+            );
+        }
+
+        let expected: BTreeMap<String, usize> = OPERATOR_FACING
+            .iter()
+            .map(|(file, count, _reason)| (file.to_string(), *count))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a crate that serves third-party receivers changed how often it reads the \
+             external (console) URL. A URL a third party will request must be built \
+             from ConfigService::get_public_ingress_url (ADR-051 D2); if the new use \
+             is a link an operator's browser follows, record it in OPERATOR_FACING \
+             with the reason."
+        );
+    }
+
+    fn settings_row_with_urls(external: Option<&str>, ingress: Option<&str>) -> settings::Model {
+        let s = AppSettings {
+            external_url: external.map(str::to_string),
+            public_ingress_url: ingress.map(str::to_string),
+            ..AppSettings::default()
+        };
+        settings::Model {
+            id: 1,
+            data: s.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // ADR-051 D1: one getter resolves the URL third parties are given.
+    #[tokio::test]
+    async fn public_ingress_url_prefers_the_explicit_setting() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row_with_urls(
+                Some("https://console.example.com"),
+                Some("https://hooks.example.com"),
+            )]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        assert_eq!(
+            svc.get_public_ingress_url().await.expect("ingress url"),
+            "https://hooks.example.com"
+        );
+        // Operator-facing links are untouched by the ingress setting.
+        assert_eq!(
+            svc.get_external_url_or_default().await.expect("external"),
+            "https://console.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_falls_back_to_the_external_url_then_the_default() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row_with_urls(
+                Some("https://console.example.com/"),
+                None,
+            )]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.get_public_ingress_url().await.expect("ingress url"),
+            "https://console.example.com"
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row_with_urls(None, None)]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.get_public_ingress_url().await.expect("ingress url"),
+            svc.get_external_url_or_default().await.expect("external"),
+            "an unconfigured install must keep emitting the URLs it always has"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_surfaces_a_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert!(matches!(
+            svc.get_public_ingress_url().await,
+            Err(ConfigServiceError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_reports_a_free_hostname() {
+        use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
+            .append_query_results(vec![Vec::<environment_domains::Model>::new()])
+            .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.hostname_claimed_by("hooks.example.com").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_names_the_record_that_routes_it() {
+        use temps_entities::{environment_domains, project_custom_domains};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_custom_domains::Model {
+                id: 7,
+                project_id: 3,
+                environment_id: 4,
+                domain: "hooks.example.com".into(),
+                redirect_to: None,
+                status_code: None,
+                branch: None,
+                status: "active".into(),
+                message: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                certificate_id: None,
+                service_name: None,
+            }]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.hostname_claimed_by(" Hooks.Example.com. ")
+                .await
+                .unwrap(),
+            Some("a project custom domain")
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
+            .append_query_results(vec![vec![environment_domains::Model {
+                id: 9,
+                environment_id: 4,
+                domain: "hooks.example.com".into(),
+                created_at: Utc::now(),
+            }]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.hostname_claimed_by("hooks.example.com").await.unwrap(),
+            Some("an environment domain")
+        );
+    }
+
+    // A wildcard record serves every name one label below it, so reserving
+    // such a name would take the application behind the wildcard offline.
+    #[tokio::test]
+    async fn hostname_claimed_by_looks_for_the_wildcard_that_covers_the_host() {
+        use temps_entities::project_custom_domains;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![project_custom_domains::Model {
+                    id: 7,
+                    project_id: 3,
+                    environment_id: 4,
+                    domain: "*.example.com".into(),
+                    redirect_to: None,
+                    status_code: None,
+                    branch: None,
+                    status: "active".into(),
+                    message: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    certificate_id: None,
+                    service_name: None,
+                }]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        assert_eq!(
+            svc.hostname_claimed_by("App.Example.com").await.unwrap(),
+            Some("a project custom domain")
+        );
+        // The query asked for the exact name and for the wildcard one label up.
+        drop(svc);
+        let db = Arc::into_inner(db).expect("the service was the only other owner");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("app.example.com"), "{log}");
+        assert!(log.contains("*.example.com"), "{log}");
+        assert!(
+            !log.contains("*.com"),
+            "a wildcard stands for exactly one label: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_ignores_an_empty_hostname_without_querying() {
+        // No query results are queued: touching the database would error.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(svc.hostname_claimed_by("  ").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_surfaces_a_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert!(matches!(
+            svc.hostname_claimed_by("hooks.example.com").await,
+            Err(ConfigServiceError::Database(_))
+        ));
     }
 }

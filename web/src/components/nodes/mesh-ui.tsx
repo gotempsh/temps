@@ -12,7 +12,7 @@ import { problemDetail } from '@/lib/api-problem'
 /** Badge colors for the `tone` the wireguard-mesh helpers return. */
 export const TONE_CLASSES = {
   ok: 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-  warn: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/20',
+  warn: 'bg-amber-500/15 text-amber-800 dark:text-amber-400 border-amber-500/20',
   error: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
   muted: 'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
 } as const

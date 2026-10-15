@@ -17,6 +17,7 @@ readme = "README.md"
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-ai = { path = "../temps-ai" }
+temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
@@ -44,7 +45,10 @@ axum-macros = { workspace = true }
 url = "2"
 urlencoding = "2"
 moka = { version = "0.12", features = ["future"] }
+tower-http = { workspace = true }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 testcontainers = { workspace = true }
+bollard = { workspace = true }

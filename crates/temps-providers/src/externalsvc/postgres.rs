@@ -85,6 +85,28 @@ pub enum PostgresUpgradeRejected {
     MajorVersionChange { from: u32, to: u32 },
 }
 
+/// What enabling WAL archiving did to the running service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalArchivingOutcome {
+    /// PostgreSQL was restarted in a recreated container (archive_mode was
+    /// off). The data was verified to be the same cluster before this was
+    /// reported.
+    pub restarted: bool,
+}
+
+/// Enabling WAL archiving would restart PostgreSQL, and the caller did not
+/// agree to a restart (a manual backup run without `confirm_restart`).
+/// Decided before anything is changed, or with the change undone.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Enabling WAL archiving for PostgreSQL service '{service_name}' needs a restart (archive_mode \
+     is off), and a restart was not confirmed. Nothing was restarted. Run the backup again and \
+     confirm the restart"
+)]
+pub struct PostgresRestartNotConfirmed {
+    pub service_name: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to verify WAL archiving for PostgreSQL service '{service_name}': {reason}. Check this service's logs and retry this operation")]
 struct PostgresArchiveVerificationError {
@@ -693,7 +715,15 @@ impl PostgresService {
                     *config = attempt_config;
                     return Ok(());
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                // A failed guarded recreate has already put the original
+                // container back under this name; removing "the failed
+                // attempt" here would remove the original.
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                            .is_none()
+                        && is_port_conflict_error(&e.to_string()) =>
+                {
                     warn!(
                         "Port {} for PostgreSQL container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
                         attempt_config.port, attempt, MAX_ATTEMPTS, e
@@ -727,27 +757,7 @@ impl PostgresService {
         resource_limits: &ServiceResourceLimits,
         enable_archiving: bool,
     ) -> Result<()> {
-        // Pull image first
-        info!("Pulling PostgreSQL image {}", config.docker_image);
-
-        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
         let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
-
-        // Create volume if it doesn't exist
-        match docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(volume_name.clone()),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(_) => info!("Created or reused volume {}", volume_name),
-            Err(e) => return Err(anyhow::anyhow!("Failed to create volume: {:?}", e)),
-        };
 
         // Check if container already exists
         let containers = docker
@@ -762,42 +772,124 @@ impl PostgresService {
             .await?;
 
         if !containers.is_empty() {
-            // Container exists - check if the image has changed
-            let existing_container = &containers[0];
-            let existing_image = existing_container.image.as_deref().unwrap_or("");
+            // Compare with the image reference the container was created
+            // from. The list API reports an image ID instead once the tag has
+            // been re-pulled to a newer digest, which used to look like an
+            // image change and replaced the container on every init.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| containers[0].image.clone())
+                .unwrap_or_default();
 
-            if existing_image != config.docker_image {
-                info!(
-                    "Container {} exists with different image ({}), removing to upgrade to {}",
-                    container_name, existing_image, config.docker_image
-                );
-
-                // Stop the container if running
-                let _ = docker
-                    .stop_container(&container_name, None::<StopContainerOptions>)
-                    .await;
-
-                // Remove the container (but keep the volume for data persistence)
-                docker
-                    .remove_container(
-                        &container_name,
-                        Some(bollard::query_parameters::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .context("Failed to remove old container for upgrade")?;
-
-                info!("Old container removed, proceeding with new image");
-            } else {
+            if existing_image == config.docker_image {
                 info!(
                     "Container {} already exists with same image",
                     container_name
                 );
                 return Ok(());
             }
+            info!(
+                "Container {} exists with different image ({}), recreating it with {}",
+                container_name, existing_image, config.docker_image
+            );
+            self.recreate_container_guarded(
+                docker,
+                config,
+                resource_limits,
+                enable_archiving,
+                "changing its image",
+            )
+            .await?;
+            return Ok(());
         }
+
+        info!("Pulling PostgreSQL image {}", config.docker_image);
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.create_fresh_container(docker, config, resource_limits, enable_archiving)
+            .await
+    }
+
+    /// The storage a container created from `config` mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(
+        &self,
+        config: &PostgresConfig,
+    ) -> Result<super::recreate_guard::ReplacementStorage> {
+        Ok(super::recreate_guard::ReplacementStorage {
+            data_dir: Self::get_pgdata_path(&config.docker_image)?,
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: postgres_volume_names(&self.name)[0].clone(),
+                target: "/var/lib/postgresql".to_string(),
+            }],
+        })
+    }
+
+    /// Replace this managed service's existing container with one built from
+    /// `config`, through the shared guard: refuse unless the new container
+    /// mounts the same data, keep the old one until the new one is verified
+    /// to hold the same cluster, and roll back otherwise. Returns whether a
+    /// container was actually replaced.
+    async fn recreate_container_guarded(
+        &self,
+        docker: &Docker,
+        config: &PostgresConfig,
+        resource_limits: &ServiceResourceLimits,
+        enable_archiving: bool,
+        operation: &str,
+    ) -> Result<super::recreate_guard::RecreateReport> {
+        if let Some(imported) = &config.container_name {
+            return Err(anyhow::anyhow!(
+                "Refusing to recreate imported PostgreSQL container '{}' of service '{}' ({}): \
+                 Temps does not manage its lifecycle or storage. Nothing was changed",
+                imported,
+                self.name,
+                operation
+            ));
+        }
+        let container_name = self.get_container_name();
+        let replacement = self.replacement_storage(config)?;
+        // Pull while the original still serves: a pull failure must not
+        // cost any downtime.
+        info!("Pulling PostgreSQL image {}", config.docker_image);
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let report = super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker,
+                engine: super::recreate_guard::ManagedEngine::Postgres,
+                service_name: &self.name,
+                container_name: &container_name,
+                replacement,
+                operation,
+            },
+            || self.create_fresh_container(docker, config, resource_limits, enable_archiving),
+        )
+        .await?;
+        Ok(report)
+    }
+
+    /// Pull, create, start and wait for a new container. The caller has made
+    /// sure no container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &PostgresConfig,
+        resource_limits: &ServiceResourceLimits,
+        enable_archiving: bool,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let volume_name = format!("{}_data", container_name);
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(volume_name.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create volume {}: {:?}", volume_name, e))?;
+        info!("Created or reused volume {}", volume_name);
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
@@ -1331,7 +1423,8 @@ impl PostgresService {
         container_name: &str,
         walg_env: &[String],
         postgres_config: &PostgresConfig,
-    ) -> Result<()> {
+        allow_restart: bool,
+    ) -> Result<WalArchivingOutcome> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         if postgres_config.container_name.is_some() {
@@ -1342,6 +1435,33 @@ impl PostgresService {
                     reason: "the imported database has archive_mode off. Enable archiving in its external startup configuration and restart it, or back up a new managed service; the imported container and data have not been changed".to_string(),
                 }
                 .into());
+            }
+        }
+
+        // A managed service with archive_mode off will need its container
+        // recreated (step 3). Refuse before writing anything if the new
+        // container would not mount the data the current one uses (#1415):
+        // a refusal must leave the service exactly as it was, and a stray
+        // walg.env would make every later start try the same recreate.
+        if postgres_config.container_name.is_none() {
+            let (mode, _) = self.archive_settings(postgres_config, None).await?;
+            if mode == "off" {
+                if !allow_restart {
+                    return Err(PostgresRestartNotConfirmed {
+                        service_name: self.name.clone(),
+                    }
+                    .into());
+                }
+                let replacement = self.replacement_storage(postgres_config)?;
+                super::recreate_guard::preflight(
+                    &self.docker,
+                    super::recreate_guard::ManagedEngine::Postgres,
+                    &self.name,
+                    &self.get_container_name(),
+                    &replacement,
+                    "enabling WAL archiving",
+                )
+                .await?;
             }
         }
 
@@ -1423,7 +1543,7 @@ impl PostgresService {
             .into());
         }
         if mode == "on" || mode == "always" {
-            return Ok(());
+            return Ok(WalArchivingOutcome { restarted: false });
         }
         // An operator can restart an imported workload while the settings
         // reload is in flight. Its physical container must never enter the
@@ -1440,49 +1560,49 @@ impl PostgresService {
             container_name
         );
 
-        // Step 3: recreate so archive_mode=on lands in CMD args. We go through
-        // `stop()` → `docker.remove_container` → `create_container_once(.., true)`
-        // → `docker.start_container` → `wait_for_container_health`. Same path
-        // `start()`'s reconcile branch uses.
-        self.stop().await?;
-        self.docker
-            .remove_container(
-                container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to remove container '{}' before re-creating with archive_mode=on: {}",
-                    container_name,
-                    e
-                )
-            })?;
+        // archive_mode can have been turned off since the check above (an
+        // in-place restore finishing meanwhile): the restart is decided here,
+        // so the caller's consent is enforced here too. Undo walg.env, or
+        // every later start would try the same recreate.
+        if !allow_restart {
+            self.remove_walg_env(container_name).await;
+            return Err(PostgresRestartNotConfirmed {
+                service_name: self.name.clone(),
+            }
+            .into());
+        }
 
+        // Step 3: recreate so archive_mode=on lands in CMD args. A
+        // command-line `-c archive_mode=off` outranks ALTER SYSTEM, so a
+        // restart alone cannot turn it on for a container created with it.
+        // The shared guard refuses unless the new container mounts the same
+        // data, keeps the old container until the new one is verified to
+        // hold the same cluster, and puts the old one back otherwise.
+        warn!(
+            service = %self.name,
+            container = container_name,
+            "Enabling WAL archiving restarts PostgreSQL: recreating its container with archive_mode=on"
+        );
         let limits = self.resource_limits.read().await.clone();
         // A backup's provider has no persistence path for a new published
         // port. Preserve this registered endpoint instead of silently choosing
         // a different port on a bind conflict; its data volume remains intact.
-        self.create_container_once(&self.docker, postgres_config, &limits, true)
-            .await?;
-        self.docker
-            .start_container(
-                container_name,
-                None::<bollard::query_parameters::StartContainerOptions>,
+        if let Err(e) = self
+            .recreate_container_guarded(
+                &self.docker,
+                postgres_config,
+                &limits,
+                true,
+                "enabling WAL archiving",
             )
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to start container '{}' after recreating with archive_mode=on: {}",
-                    container_name,
-                    e
-                )
-            })?;
-        self.wait_for_container_health(&self.docker, container_name)
-            .await?;
+        {
+            // The original container is back (or was never touched). Take
+            // walg.env away again, or every later start would see "archiving
+            // configured" and try the same recreate.
+            self.remove_walg_env(container_name).await;
+            return Err(e);
+        }
 
         let (mode, command) = self
             .active_archive_settings(postgres_config, &archive_command)
@@ -1500,7 +1620,31 @@ impl PostgresService {
             container_name
         );
 
-        Ok(())
+        Ok(WalArchivingOutcome { restarted: true })
+    }
+
+    /// Remove `walg.env` from the service's volume, best effort.
+    async fn remove_walg_env(&self, container_name: &str) {
+        if let Err(cleanup) = super::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec![
+                "rm".to_string(),
+                "-f".to_string(),
+                "/var/lib/postgresql/walg.env".to_string(),
+            ],
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            warn!(
+                service = %self.name,
+                container = container_name,
+                error = %cleanup,
+                "Could not remove walg.env after WAL archiving was not enabled"
+            );
+        }
     }
 
     /// Read settings from PostgreSQL itself, rather than inferring them
@@ -2405,6 +2549,24 @@ impl PostgresService {
             }
         }
 
+        // The restore ends by recreating a managed container from the
+        // service's specification. Refuse up front, before fetching or
+        // touching anything, when that container would not mount the storage
+        // the current one uses: the restored data would land where the new
+        // container never looks (#1415).
+        if postgres_config.container_name.is_none() {
+            let replacement = self.replacement_storage(&postgres_config)?;
+            super::recreate_guard::preflight(
+                &self.docker,
+                super::recreate_guard::ManagedEngine::Postgres,
+                &self.name,
+                &container_name,
+                &replacement,
+                "restoring a backup in place",
+            )
+            .await?;
+        }
+
         info!(
             "Restoring PostgreSQL from WAL-G backup (prefix: {}) in container '{}'",
             walg_s3_prefix, container_name
@@ -2993,8 +3155,15 @@ impl PostgresService {
             // Legacy callers need the same pre-backup policy and resource
             // verification as the v2 engine. Persist any refusal as a failed
             // child rather than completing an unrestorable base backup.
-            self.write_wal_archiving_config(service_config, s3_credentials, &walg_s3_prefix)
+            let archiving = self
+                .write_wal_archiving_config(service_config, s3_credentials, &walg_s3_prefix, true)
                 .await?;
+            if archiving.restarted {
+                info!(
+                    "PostgreSQL service '{}' was restarted to enable WAL archiving; its data was verified intact before the base backup",
+                    self.name
+                );
+            }
             self.run_walg_backup_push(
                 &container_name,
                 &walg_s3_prefix,
@@ -3701,6 +3870,24 @@ pub(crate) fn postgres_volume_names(name: &str) -> [String; 1] {
 
 #[async_trait]
 impl ExternalService for PostgresService {
+    fn recreate_plan(
+        &self,
+        service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        let config = self.get_postgres_config(service_config.clone()).ok()?;
+        // Imported containers are never replaced by Temps.
+        if config.container_name.is_some() {
+            return None;
+        }
+        Some((
+            super::recreate_guard::ManagedEngine::Postgres,
+            self.replacement_storage(&config).ok()?,
+        ))
+    }
+
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
             containers: vec![postgres_container_name(&self.name)],
@@ -3812,15 +3999,25 @@ impl ExternalService for PostgresService {
         *self.resource_limits.write().await = resource_limits.clone();
 
         if postgres_config.container_name.is_none() {
-            // Create Docker container. New services always start with archiving
-            // off — `enable_wal_archiving()` recreates with archiving on when
-            // WAL-G is later configured. `create_container` may retry on a
-            // different host port than requested (see its docs); it writes
-            // that back into `postgres_config`, so everything below —
-            // `self.config` and the DB-persisted parameters — reflects the
-            // port the container is actually bound to.
-            self.create_container(&self.docker, &mut postgres_config, &resource_limits, false)
-                .await?;
+            // Create Docker container. A new service starts with archiving
+            // off (its volume has no walg.env); `enable_wal_archiving()`
+            // recreates with archiving on when WAL-G is later configured. A
+            // re-initialised service keeps what its volume records, so a
+            // recreate (e.g. a /dev/shm change) does not drop archiving and
+            // then need a second restart to restore it. `create_container`
+            // may retry on a different host port than requested (see its
+            // docs); it writes that back into `postgres_config`, so
+            // everything below — `self.config` and the DB-persisted
+            // parameters — reflects the port the container is actually
+            // bound to.
+            let enable_archiving = self.compute_desired_enable_archiving().await;
+            self.create_container(
+                &self.docker,
+                &mut postgres_config,
+                &resource_limits,
+                enable_archiving,
+            )
+            .await?;
             *self.config.write().await = Some(postgres_config.clone());
         } else {
             info!(
@@ -4139,7 +4336,7 @@ impl ExternalService for PostgresService {
             }))
             .await?;
 
-        let mut need_create = containers.is_empty();
+        let need_create = containers.is_empty();
         if let Some(container) = containers.first() {
             // Inspect the existing CMD. If it disagrees with what we'd emit
             // now, force a recreate by stopping + removing the old container
@@ -4177,24 +4374,53 @@ impl ExternalService for PostgresService {
                      Recreating to apply correct config.",
                     container_name, archive_drift, preload_drift, desired_enable_archiving
                 );
-                let _ = self
-                    .docker
-                    .stop_container(
-                        &container_name,
-                        None::<bollard::query_parameters::StopContainerOptions>,
-                    )
-                    .await;
-                self.docker
-                    .remove_container(
-                        &container_name,
-                        Some(bollard::query_parameters::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .context("Failed to remove drifted container during reconcile")?;
-                need_create = true;
+                // Without a hydrated config there is nothing to rebuild the
+                // container from; leave the existing one alone.
+                let config = self.config.read().await.as_ref().cloned();
+                if let Some(config) = config {
+                    let limits = self.resource_limits.read().await.clone();
+                    match self
+                        .recreate_container_guarded(
+                            &self.docker,
+                            &config,
+                            &limits,
+                            desired_enable_archiving,
+                            "applying configuration drift on start",
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            self.wait_for_container_health(&self.docker, &container_name)
+                                .await?;
+                            return Ok(());
+                        }
+                        Err(e)
+                            if e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                                .is_some_and(|g| g.original_in_place()) =>
+                        {
+                            // Drift repair is optional; data is not. The
+                            // guard refused before touching anything, or a
+                            // verified rollback put the original back exactly
+                            // as it was: start it unchanged. Any other
+                            // failure (a rollback that did not complete) is
+                            // returned: the original may still be set aside
+                            // or a replacement that failed verification may
+                            // hold its name, and that needs an operator.
+                            warn!(
+                                service = %self.name,
+                                container = %container_name,
+                                error = %e,
+                                "Not applying configuration drift; starting the existing container unchanged"
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    warn!(
+                        "Container {} has CMD drift but no service configuration is loaded; starting it unchanged",
+                        container_name
+                    );
+                }
             }
         }
 
@@ -4281,8 +4507,9 @@ impl ExternalService for PostgresService {
         // Every backup reconciles the explicit, pinned write destination.
         // enable_wal_archiving verifies the actual command and recreates only
         // when PostgreSQL's archive_mode needs a postmaster restart.
-        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix, true)
             .await
+            .map(|_| ())
     }
 
     async fn stop(&self) -> Result<()> {
@@ -4521,6 +4748,9 @@ impl ExternalService for PostgresService {
 
     async fn upgrade(&self, old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
         let old_pg_config = self.get_postgres_config(old_config)?;
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let mut new_pg_config = self.get_postgres_config(new_config)?;
 
         // Extract version numbers from Docker images
@@ -4579,6 +4809,21 @@ impl ExternalService for PostgresService {
             .await?;
         info!("New Docker image verified and is available");
 
+        // The swap stops the container before recreating it. Refuse first,
+        // while it still runs, if the new container would not see its data.
+        if new_pg_config.container_name.is_none() {
+            let replacement = self.replacement_storage(&new_pg_config)?;
+            super::recreate_guard::preflight(
+                &self.docker,
+                super::recreate_guard::ManagedEngine::Postgres,
+                &self.name,
+                &self.get_container_name(),
+                &replacement,
+                "changing its image",
+            )
+            .await?;
+        }
+
         // Same major version — image swap only (e.g., postgres:18 -> gotempsh/postgres-walg:18).
         // No pg_upgrade needed. Just recreate the container with the new image;
         // data is preserved on the Docker volume.
@@ -4586,8 +4831,10 @@ impl ExternalService for PostgresService {
             "Same PostgreSQL major version ({}), swapping image without pg_upgrade",
             old_version
         );
-        self.stop().await?;
-        let limits = self.resource_limits.read().await.clone();
+        // No stop here: `create_container` replaces the running container
+        // through the recreate guard, which stops it only after checking the
+        // new one will see its data, and fingerprints it while it runs.
+        let limits = upgrade_limits;
         // Preserve archiving state across the image swap by reading
         // `walg.env` from the existing volume — same rule as `start()`.
         let enable_archiving = self.compute_desired_enable_archiving().await;
@@ -5084,8 +5331,67 @@ impl PostgresService {
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
     ) -> Result<()> {
-        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix, true)
             .await
+            .map(|_| ())
+    }
+
+    /// [`ExternalService::enable_continuous_archiving`], also reporting
+    /// whether PostgreSQL had to be restarted, so a backup can say so. With
+    /// `allow_restart` false it never restarts PostgreSQL: when turning
+    /// archiving on would need one it returns [`PostgresRestartNotConfirmed`]
+    /// and changes nothing.
+    pub async fn enable_continuous_archiving_reporting(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+        allow_restart: bool,
+    ) -> Result<WalArchivingOutcome> {
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix, allow_restart)
+            .await
+    }
+
+    /// Whether running a WAL-G backup now would restart PostgreSQL: true when
+    /// this managed service has archive_mode off, so enabling archiving has
+    /// to recreate its container. Bounded: one SQL round trip.
+    pub async fn backup_requires_restart(&self, service_config: ServiceConfig) -> Result<bool> {
+        let postgres_config = self.get_postgres_config(service_config)?;
+        if postgres_config.container_name.is_some() {
+            // Imported services are never recreated; enabling refuses instead.
+            return Ok(false);
+        }
+        let (mode, _) = self.archive_settings(&postgres_config, None).await?;
+        Ok(mode == "off")
+    }
+
+    /// When the restart [`Self::backup_requires_restart`] reports cannot be
+    /// done safely (the new container would not see this service's data),
+    /// the guard's refusal, so a client can say the backup will be refused
+    /// instead of promising a restart. Read-only.
+    pub async fn backup_restart_refusal(
+        &self,
+        service_config: ServiceConfig,
+    ) -> Result<Option<String>> {
+        let postgres_config = self.get_postgres_config(service_config)?;
+        if postgres_config.container_name.is_some() {
+            return Ok(None);
+        }
+        let replacement = self.replacement_storage(&postgres_config)?;
+        match super::recreate_guard::preflight(
+            &self.docker,
+            super::recreate_guard::ManagedEngine::Postgres,
+            &self.name,
+            &self.get_container_name(),
+            &replacement,
+            "enabling WAL archiving",
+        )
+        .await
+        {
+            Ok(_) => Ok(None),
+            Err(e) if e.is_refusal() => Ok(Some(e.to_string())),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn write_wal_archiving_config(
@@ -5093,7 +5399,8 @@ impl PostgresService {
         service_config: ServiceConfig,
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
-    ) -> Result<()> {
+        allow_restart: bool,
+    ) -> Result<WalArchivingOutcome> {
         // Backup engines construct a fresh provider. Hydrate its limits from
         // the registered service before an off-policy managed recreation so
         // enabling archiving cannot remove the workload's resource bounds.
@@ -5128,7 +5435,7 @@ impl PostgresService {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
-        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config, allow_restart)
             .await
     }
 }
@@ -5428,6 +5735,7 @@ mod tests {
                 fixture.off.container_name.as_deref().unwrap(),
                 &["WALG_S3_PREFIX=s3://test-bucket/unused".to_string()],
                 &fixture.off,
+                true,
             )
             .await
             .expect_err("an imported off-policy container must never be recreated");
@@ -8407,5 +8715,443 @@ mod tests {
         let (plain, custom) = outcome.expect("pg_dump restore round trip");
         assert_eq!(plain.trim(), "3", "plain-format restore");
         assert_eq!(custom.trim(), "5", "custom-format restore");
+    }
+
+    // ── #1415: replacing the container never loses the data ─────────────
+    //
+    // Each test builds a container named exactly like a managed service's
+    // (`postgres-<name>`) in a shape some release, import or operator could
+    // have produced, seeds it, and drives the real provider path. The
+    // outcome is either a refusal with the container and data untouched, or a
+    // recreate that keeps the same cluster.
+
+    mod recreate_guard_docker {
+        use super::super::super::recreate_guard::test_support::*;
+        use super::super::super::recreate_guard::{ManagedEngine, RecreateGuardError};
+        use super::*;
+
+        const WALG_18: &str = "gotempsh/postgres-walg:18-bookworm";
+        const WALG_17: &str = "gotempsh/postgres-walg:17-bookworm";
+        const PASSWORD: &str = "apppass123";
+
+        fn env(extra: &[&str]) -> Vec<String> {
+            let mut env = vec![
+                "POSTGRES_USER=app".to_string(),
+                format!("POSTGRES_PASSWORD={PASSWORD}"),
+                "POSTGRES_DB=app".to_string(),
+            ];
+            env.extend(extra.iter().map(|s| String::from(*s)));
+            env
+        }
+
+        fn config(port: u16, image: &str) -> PostgresConfig {
+            PostgresConfig {
+                host: "localhost".into(),
+                port: port.to_string(),
+                database: "app".into(),
+                username: "app".into(),
+                password: PASSWORD.into(),
+                max_connections: 50,
+                ssl_mode: Some("disable".into()),
+                docker_image: image.into(),
+                container_name: None,
+            }
+        }
+
+        fn walg_env() -> Vec<String> {
+            // Never reached: archiving is refused, or verified by settings
+            // only. A closed port keeps any wal-push from leaving the host.
+            vec![
+                "WALG_S3_PREFIX=s3://recreate-guard-test/walg".into(),
+                "AWS_ACCESS_KEY_ID=test".into(),
+                "AWS_SECRET_ACCESS_KEY=test".into(),
+                "AWS_REGION=us-east-1".into(),
+                "AWS_ENDPOINT=http://127.0.0.1:9".into(),
+            ]
+        }
+
+        async fn seed(docker: &Docker, container: &str) {
+            psql(
+                docker,
+                container,
+                "CREATE TABLE accounts(id int); \
+                 INSERT INTO accounts SELECT generate_series(1,7); \
+                 CREATE ROLE reporting LOGIN",
+            )
+            .await;
+        }
+
+        async fn assert_untouched(docker: &Docker, container: &str, id: &str) {
+            assert_eq!(
+                container_id(docker, container).await.as_deref(),
+                Some(id),
+                "same container"
+            );
+            assert!(is_running(docker, container).await, "still running");
+            assert_eq!(
+                psql(docker, container, "SELECT count(*) FROM accounts").await,
+                "7"
+            );
+            assert_eq!(psql(docker, container, "SHOW archive_mode").await, "off");
+            let walg = sh_eventually(
+                docker,
+                container,
+                "test -e /var/lib/postgresql/walg.env && echo present || echo absent",
+            )
+            .await;
+            assert_eq!(
+                walg.trim(),
+                "absent",
+                "a refusal must not leave walg.env behind"
+            );
+            assert!(set_aside_containers(docker, container).await.is_empty());
+        }
+
+        fn assert_refusal(err: &anyhow::Error) {
+            let guard = err
+                .downcast_ref::<RecreateGuardError>()
+                .unwrap_or_else(|| panic!("expected a recreate refusal, got: {err:#}"));
+            assert!(guard.is_refusal(), "{guard}");
+            assert!(guard.to_string().contains("Nothing was changed"), "{guard}");
+        }
+
+        /// One mismatched layout: run it, seed it, then "Run backup"'s
+        /// archiving step must refuse and leave everything as it was.
+        async fn refuses(
+            test: &str,
+            image: &str,
+            config_image: &str,
+            extra_env: &[&str],
+            mounts: impl FnOnce(&RunScope, &str) -> Vec<bollard::models::Mount>,
+        ) {
+            let Some(docker) = docker_or_skip(test).await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, test);
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            scope.track_volume(postgres_volume_names(&service)[0].clone());
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let mounts = mounts(&scope, &service);
+            let id = run_container(
+                &docker,
+                &container,
+                image,
+                &env(extra_env),
+                None,
+                mounts,
+                Some(("5432/tcp", port)),
+            )
+            .await;
+            seed(&docker, &container).await;
+
+            let provider = PostgresService::new(service.clone(), Arc::new(docker.clone()));
+            let err = provider
+                .enable_wal_archiving(&container, &walg_env(), &config(port, config_image), true)
+                .await
+                .expect_err("archiving must be refused for this layout");
+            assert_refusal(&err);
+            assert_untouched(&docker, &container, &id).await;
+            scope.cleanup().await;
+        }
+
+        /// The #1415 root cause: a container Temps did not create, named
+        /// `postgres-<service>`, keeping its cluster on the image's anonymous
+        /// volume. On the reported build "Run backup" removed it and started
+        /// an empty cluster on `postgres-<service>_data`.
+        #[tokio::test]
+        async fn issue_1415_container_on_an_anonymous_volume_is_never_recreated() {
+            refuses("anon", WALG_18, WALG_18, &[], |_, _| vec![]).await;
+        }
+
+        #[tokio::test]
+        async fn issue_1415_container_on_a_compose_volume_is_never_recreated() {
+            refuses("compose", WALG_18, WALG_18, &[], |scope, _| {
+                let v = scope.name("stack_pgdata");
+                scope.track_volume(&v);
+                vec![volume_mount(&v, "/var/lib/postgresql")]
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn container_on_a_bind_mount_is_never_recreated() {
+            refuses("bind", WALG_18, WALG_18, &[], |scope, _| {
+                vec![bind_mount(&scope.bind_dir("bind"), "/var/lib/postgresql")]
+            })
+            .await;
+        }
+
+        /// Releases before Nov 2025 mounted the volume at
+        /// `/var/lib/postgresql/data` and let the image pick PGDATA.
+        #[tokio::test]
+        async fn legacy_layout_is_never_recreated() {
+            refuses("legacy", WALG_17, WALG_17, &[], |_, service| {
+                vec![volume_mount(
+                    &postgres_volume_names(service)[0],
+                    "/var/lib/postgresql/data",
+                )]
+            })
+            .await;
+        }
+
+        /// The service's image says 18 while the container still runs 17.
+        #[tokio::test]
+        async fn changed_major_version_is_never_recreated() {
+            refuses(
+                "major",
+                WALG_17,
+                WALG_18,
+                &["PGDATA=/var/lib/postgresql/17/docker"],
+                |_, service| {
+                    vec![volume_mount(
+                        &postgres_volume_names(service)[0],
+                        "/var/lib/postgresql",
+                    )]
+                },
+            )
+            .await;
+        }
+
+        /// `start()`'s drift reconcile on a legacy container (no
+        /// shared_preload_libraries flag, so always "drifted"): it must start
+        /// the container unchanged instead of replacing it.
+        #[tokio::test]
+        async fn start_drift_on_a_legacy_container_starts_it_unchanged() {
+            let Some(docker) = docker_or_skip("start_drift_legacy").await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, "drift");
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            let volume = postgres_volume_names(&service)[0].clone();
+            scope.track_volume(&volume);
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let id = run_container(
+                &docker,
+                &container,
+                WALG_17,
+                &env(&[]),
+                None,
+                vec![volume_mount(&volume, "/var/lib/postgresql/data")],
+                Some(("5432/tcp", port)),
+            )
+            .await;
+            seed(&docker, &container).await;
+            docker
+                .stop_container(&container, None::<StopContainerOptions>)
+                .await
+                .expect("stop");
+
+            let provider = PostgresService::new(service.clone(), Arc::new(docker.clone()));
+            let params = serde_json::to_value(config(port, WALG_17)).unwrap();
+            provider
+                .force_recreate(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: params,
+                })
+                .await
+                .expect("start must fall back to the unchanged container");
+            assert_untouched(&docker, &container, &id).await;
+            scope.cleanup().await;
+        }
+
+        /// A normal start of a managed service whose volume says archiving is
+        /// configured (walg.env present, e.g. a first backup interrupted
+        /// before its recreate) but whose container still runs with
+        /// archive_mode=off. The manager starts it through `force_recreate`
+        /// with a provider it just built, so the drift is repaired, through
+        /// the guard, on the same cluster.
+        #[tokio::test]
+        async fn start_repairs_archive_drift_on_managed_storage() {
+            let Some(docker) = docker_or_skip("start_repairs_archive_drift").await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, "drift2");
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            scope.track_volume(postgres_volume_names(&service)[0].clone());
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let cfg = config(port, WALG_18);
+            let params = serde_json::to_value(&cfg).unwrap();
+            PostgresService::new(service.clone(), Arc::new(docker.clone()))
+                .init(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: params.clone(),
+                })
+                .await
+                .expect("init");
+            seed(&docker, &container).await;
+            let identity = system_id_of(&docker, &container).await;
+            sh_eventually(
+                &docker,
+                &container,
+                "echo 'WALG_S3_PREFIX=s3://recreate-guard-test/walg' > /var/lib/postgresql/walg.env",
+            )
+            .await;
+            assert_eq!(psql(&docker, &container, "SHOW archive_mode").await, "off");
+
+            // As start_service does it: a fresh provider, then force_recreate.
+            PostgresService::new(service.clone(), Arc::new(docker.clone()))
+                .force_recreate(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: params,
+                })
+                .await
+                .expect("start with drift repair");
+            assert_eq!(psql(&docker, &container, "SHOW archive_mode").await, "on");
+            assert_eq!(system_id_of(&docker, &container).await, identity);
+            assert_eq!(
+                psql(&docker, &container, "SELECT count(*) FROM accounts").await,
+                "7"
+            );
+            assert!(set_aside_containers(&docker, &container).await.is_empty());
+            scope.cleanup().await;
+        }
+
+        async fn system_id_of(docker: &Docker, container: &str) -> Option<String> {
+            super::super::super::recreate_guard::fingerprint(
+                docker,
+                ManagedEngine::Postgres,
+                container,
+                "/var/lib/postgresql/18/docker",
+                false,
+                false,
+            )
+            .await
+            .identity
+        }
+
+        /// A manual backup run without confirming a restart never restarts
+        /// PostgreSQL: with archive_mode off, enabling archiving is refused
+        /// at the point the restart would be decided, and nothing changes.
+        #[tokio::test]
+        async fn archiving_without_restart_consent_changes_nothing() {
+            let Some(docker) = docker_or_skip("archiving_without_restart_consent").await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, "noconsent");
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            scope.track_volume(postgres_volume_names(&service)[0].clone());
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let provider = PostgresService::new(service.clone(), Arc::new(docker.clone()));
+            let cfg = config(port, WALG_18);
+            provider
+                .init(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::to_value(&cfg).unwrap(),
+                })
+                .await
+                .expect("init");
+            seed(&docker, &container).await;
+            let id = container_id(&docker, &container).await.unwrap();
+
+            let err = provider
+                .enable_wal_archiving(&container, &walg_env(), &cfg, false)
+                .await
+                .expect_err("a restart without consent");
+            assert!(
+                err.downcast_ref::<PostgresRestartNotConfirmed>().is_some(),
+                "{err:#}"
+            );
+            assert_untouched(&docker, &container, &id).await;
+            scope.cleanup().await;
+        }
+
+        /// The exact #1415 flow on a service Temps created: archive_mode off,
+        /// then "Run backup"'s archiving step. It restarts PostgreSQL in a new
+        /// container, and the data, roles and cluster identity are the same.
+        #[tokio::test]
+        async fn issue_1415_managed_service_keeps_its_data_when_archiving_is_enabled() {
+            let Some(docker) = docker_or_skip("issue_1415_managed").await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, "managed");
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            scope.track_volume(postgres_volume_names(&service)[0].clone());
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let provider = PostgresService::new(service.clone(), Arc::new(docker.clone()));
+            let cfg = config(port, WALG_18);
+            provider
+                .init(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::to_value(&cfg).unwrap(),
+                })
+                .await
+                .expect("init");
+            seed(&docker, &container).await;
+            let before = super::super::super::recreate_guard::fingerprint(
+                &docker,
+                ManagedEngine::Postgres,
+                &container,
+                "/var/lib/postgresql/18/docker",
+                true,
+                false,
+            )
+            .await;
+            let old_id = container_id(&docker, &container).await.unwrap();
+
+            let outcome = provider
+                .enable_wal_archiving(&container, &walg_env(), &cfg, true)
+                .await
+                .expect("archiving on a managed service");
+            assert!(outcome.restarted);
+            assert_ne!(container_id(&docker, &container).await.unwrap(), old_id);
+            let after = super::super::super::recreate_guard::fingerprint(
+                &docker,
+                ManagedEngine::Postgres,
+                &container,
+                "/var/lib/postgresql/18/docker",
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(after.identity, before.identity, "same cluster");
+            assert_eq!(
+                psql(&docker, &container, "SELECT count(*) FROM accounts").await,
+                "7"
+            );
+            assert_eq!(
+                psql(
+                    &docker,
+                    &container,
+                    "SELECT count(*) FROM pg_roles WHERE rolname = 'reporting'"
+                )
+                .await,
+                "1"
+            );
+            assert_eq!(psql(&docker, &container, "SHOW archive_mode").await, "on");
+            assert!(set_aside_containers(&docker, &container).await.is_empty());
+
+            // A second backup must not restart it again.
+            let again = provider
+                .enable_wal_archiving(&container, &walg_env(), &cfg, true)
+                .await
+                .expect("already archiving");
+            assert!(!again.restarted);
+            scope.cleanup().await;
+        }
     }
 }

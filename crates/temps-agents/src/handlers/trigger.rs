@@ -70,14 +70,31 @@ impl AuditOperation for AgentRunTriggeredAudit {
 // lives in `handlers::workflows` — it owns its own routes, request type, and
 // audit struct.
 
+/// Request body ceiling for the agent webhook trigger. Matches what the route
+/// accepted before it declared a limit (axum's default).
+const WEBHOOK_TRIGGER_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The agent webhook trigger (ADR-051 D3).
+///
+/// Called by whatever system the operator wired the agent to, from the open
+/// internet and with no session, so it is mounted on the public router. The
+/// handler authenticates the request with the agent's `X-Webhook-Token`
+/// (constant-time compared) and never reads the session cookie.
+pub fn public_routes() -> Router<Arc<AppState>> {
+    Router::new().route(
+        "/agents/webhook/{webhook_id}",
+        post(webhook_trigger).layer(axum::extract::DefaultBodyLimit::max(
+            WEBHOOK_TRIGGER_BODY_LIMIT,
+        )),
+    )
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/projects/{project_id}/agents/{slug}/trigger",
             post(trigger_agent),
         )
-        // Public webhook endpoint — X-Webhook-Token header auth
-        .route("/agents/webhook/{webhook_id}", post(webhook_trigger))
         .route(
             "/projects/{project_id}/agents/cli-status",
             get(get_cli_status),
@@ -441,6 +458,10 @@ pub struct SandboxStatusResponse {
     /// Experimental microsandbox microVM backend (ADR-050). Always present:
     /// when not configured it carries the reason and where to set it up.
     pub microsandbox: crate::sandbox::microsandbox::MicrosandboxCapability,
+    /// Whether Firecracker sandboxes can open interactive terminals (the
+    /// guest terminal agent must be staged). Always present, with the reason
+    /// and fix when not, so clients never have to infer it from a 409.
+    pub firecracker_terminal: crate::sandbox::TerminalCapability,
 }
 
 #[utoipa::path(
@@ -494,6 +515,9 @@ pub async fn get_sandbox_status(
         microsandbox: crate::sandbox::microsandbox::microsandbox_capability(
             &crate::sandbox::microsandbox::host_data_dir(),
         ),
+        firecracker_terminal: crate::sandbox::firecracker::firecracker_terminal_capability(
+            &crate::sandbox::microsandbox::host_data_dir(),
+        ),
     }))
 }
 
@@ -539,6 +563,8 @@ pub async fn get_global_sandbox_status(
     let firecracker_available =
         crate::sandbox::firecracker::is_firecracker_available(&data_dir).await;
     let microsandbox = crate::sandbox::microsandbox::microsandbox_capability(&data_dir);
+    let firecracker_terminal =
+        crate::sandbox::firecracker::firecracker_terminal_capability(&data_dir);
 
     Ok(Json(SandboxStatusResponse {
         docker_available,
@@ -547,6 +573,7 @@ pub async fn get_global_sandbox_status(
         error,
         firecracker_available,
         microsandbox,
+        firecracker_terminal,
     }))
 }
 
@@ -775,8 +802,31 @@ pub async fn smoke_test_agent(
                         test_env.insert(auth_flavor.env_var.to_string(), plain);
                     }
                     CredentialFormat::OauthToken if target_provider_id == "claude_cli" => {
-                        // Legacy env var still recognized by the Claude CLI.
-                        test_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), plain);
+                        // Legacy env var still recognized by the Claude CLI. A
+                        // console sign-in is stored as a snapshot, so resolve
+                        // it to the bearer rather than exporting the JSON.
+                        match crate::ai_cli::credential_snapshot::resolve_claude_oauth(
+                            &plain,
+                            std::time::Duration::from_secs(300),
+                        )
+                        .await
+                        {
+                            Ok(resolved) => {
+                                test_env.insert(
+                                    "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                                    resolved.access_token,
+                                );
+                            }
+                            Err(error) => {
+                                // Leave the variable unset so the check reports
+                                // "not authenticated" instead of exporting JSON.
+                                tracing::warn!(
+                                    provider_id = %target_provider_id,
+                                    %error,
+                                    "saved Claude sign-in could not be resolved for the smoke test"
+                                );
+                            }
+                        }
                     }
                     _ => {
                         // ConfigFile flavors (opencode, codex subscription): the
@@ -806,6 +856,7 @@ pub async fn smoke_test_agent(
             memory_limit_mb: Some(512),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             // Use the default egress-filtered bridge network (same as production
             // sandboxes).  The old "host" override was a security hole: it gave
             // the smoke-test container unrestricted access to all host-network

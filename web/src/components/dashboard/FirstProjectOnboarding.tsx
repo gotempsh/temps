@@ -31,7 +31,7 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { HighlightedCode } from '@/components/ui/code-block'
 
-/** First-run project collection: choose a task before configuring its inputs. */
+/** First-run service collection: choose a task before configuring its inputs. */
 export function FirstProjectOnboarding() {
   const choosingSource = true
   const origin = typeof window === 'undefined' ? '' : window.location.origin
@@ -42,7 +42,7 @@ export function FirstProjectOnboarding() {
 
   return (
     <section
-      aria-label="Get started with projects"
+      aria-label="Get started with services"
       className="w-full min-w-0 space-y-6"
     >
       <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
@@ -55,6 +55,11 @@ export function FirstProjectOnboarding() {
           </Link>
         </Button>
       </div>
+      <p className="text-sm text-muted-foreground">
+        Each app you deploy becomes a service. Services that ship together, like
+        a frontend, an API and a worker, can later be grouped into a project
+        that shares their repository, variables and routes.
+      </p>
       {/* The do-this-first path: something live in one click, before any
           credentials. The same card lives on /get-started, which the Platform
           setup checklist links to once this empty state is gone. */}
@@ -88,6 +93,7 @@ export function FirstProjectOnboarding() {
               Moving from another platform?
             </h2>
             <div
+              role="group"
               className="mt-3 flex flex-wrap gap-2"
               aria-label="Migration platforms"
             >
@@ -140,7 +146,7 @@ export function FirstProjectOnboarding() {
                     <p className="text-sm font-medium">
                       {index === 0
                         ? '1. Connect to this instance'
-                        : '2. Deploy your project'}
+                        : '2. Deploy your service'}
                     </p>
                     <div className="flex min-w-0 items-center gap-2 rounded-md border bg-muted/50 p-2 pl-3">
                       <HighlightedCode
@@ -168,7 +174,7 @@ export function FirstProjectOnboarding() {
           {!import.meta.env.DEV && (
             <Button asChild variant="ghost" size="sm">
               <Link to="/projects/new?source=drop">
-                <UploadCloud className="mr-2 size-4" /> Upload project files
+                <UploadCloud className="mr-2 size-4" /> Upload files
               </Link>
             </Button>
           )}

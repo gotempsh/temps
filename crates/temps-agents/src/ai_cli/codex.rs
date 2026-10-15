@@ -5,9 +5,14 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 
+use super::host_cli::{self, HostIdentity, ProviderLocation};
+use super::login::{
+    validate_verification_url, LoginChallenge, LoginControl, LoginError, LoginHandle,
+    CHALLENGE_TIMEOUT, CODEX_LOGIN_HOSTS, MAX_SCANNED_OUTPUT_BYTES,
+};
 use super::{
-    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
-    AiRunConfig, AiRunResult, NativeToolEvent,
+    copy_environment_variable, AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult,
+    NativeToolEvent,
 };
 use crate::error::AgentError;
 
@@ -23,11 +28,14 @@ pub struct CodexModelInfo {
     pub default_reasoning_effort: Option<String>,
 }
 
+/// The `codex` command every host-side invocation starts from. Codex has
+/// always run as the server's own user, so sign-in, status and turns share
+/// that identity and, once an operator has signed in through Temps, the
+/// Temps-owned `CODEX_HOME` (see [`host_cli`]).
 fn codex_command() -> Command {
-    let mut command = Command::new("codex");
-    sanitize_command_environment(&mut command);
+    let location = host_cli::active_managed_location("codex_cli");
+    let mut command = host_cli::host_command("codex", &HostIdentity::current(), location.as_ref());
     copy_environment_variable(&mut command, "OPENAI_API_KEY");
-    command.kill_on_drop(true);
     command
 }
 
@@ -226,6 +234,513 @@ pub async fn discover_models() -> Vec<CodexModelInfo> {
         .unwrap_or_default()
 }
 
+/// Probe installation and sign-in state with commands built by `make_command`.
+/// `ambient_api_key` controls whether `OPENAI_API_KEY` in the server
+/// environment counts as being signed in: it must not when confirming that a
+/// subscription sign-in produced a credential.
+async fn probe_codex_status(
+    make_command: impl Fn() -> Command,
+    ambient_api_key: bool,
+) -> AiCliStatus {
+    let version_output = tokio::time::timeout(
+        STATUS_TIMEOUT,
+        make_command()
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await;
+
+    let (installed, version) = match version_output {
+        Ok(Ok(output)) if output.status.success() => {
+            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (true, if ver.is_empty() { None } else { Some(ver) })
+        }
+        _ => {
+            return AiCliStatus {
+                provider: "codex_cli".into(),
+                installed: false,
+                version: None,
+                authenticated: false,
+                auth_method: None,
+                email: None,
+                subscription_type: None,
+                setup_hint: Some("Install Codex CLI: npm install -g @openai/codex".into()),
+            };
+        }
+    };
+
+    // `codex login status` is the narrow, redacted readiness probe and
+    // normally returns immediately. Do not put `doctor --json` first:
+    // doctor also checks unrelated network/MCP state and can take longer
+    // than the provider catalog's entire timeout, making a healthy Codex
+    // login disappear intermittently. Only use the richer diagnostic as a
+    // compatibility fallback when login status cannot identify auth.
+    let has_env_key = ambient_api_key && std::env::var("OPENAI_API_KEY").is_ok();
+    let login_output = tokio::time::timeout(
+        STATUS_TIMEOUT,
+        make_command()
+            .args(["login", "status"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await;
+    let login_auth_method = login_output
+        .as_ref()
+        .ok()
+        .and_then(|result| result.as_ref().ok())
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            codex_auth_method(&combined)
+        });
+
+    let cli_auth_method = if login_auth_method.is_some() {
+        login_auth_method
+    } else {
+        let doctor_output = tokio::time::timeout(
+            STATUS_TIMEOUT,
+            make_command()
+                .args(["doctor", "--json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await;
+        doctor_output
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|output| codex_doctor_auth_method(&String::from_utf8_lossy(&output.stdout)))
+    };
+    let authenticated = has_env_key || cli_auth_method.is_some();
+    let auth_method = if has_env_key {
+        Some("api_key_env".to_string())
+    } else {
+        cli_auth_method
+    };
+
+    AiCliStatus {
+        provider: "codex_cli".into(),
+        installed,
+        version,
+        authenticated,
+        auth_method,
+        email: None,
+        subscription_type: None,
+        setup_hint: if authenticated {
+            None
+        } else {
+            Some(
+                "Run 'codex login' as the user running Temps, or provide OPENAI_API_KEY to the Temps process."
+                    .into(),
+            )
+        },
+    }
+}
+
+/// Ask the CLI that owns `location` to use (and therefore refresh) its own
+/// credential with one minimal request, so the access token can be
+/// re-snapshotted. Output is discarded.
+pub async fn refresh_managed_login(
+    location: &ProviderLocation,
+    timeout: std::time::Duration,
+) -> Result<(), LoginError> {
+    let mut command = host_cli::host_command("codex", &HostIdentity::current(), Some(location));
+    command
+        .args([
+            "exec",
+            "ok",
+            "--json",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+        ])
+        .current_dir(&location.home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|error| LoginError::Spawn {
+        provider_id: "codex_cli".to_string(),
+        reason: error.to_string(),
+    })?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(LoginError::CliRejected {
+            provider_id: "codex_cli".to_string(),
+            exit_code: status.code().unwrap_or(-1),
+        }),
+        Ok(Err(error)) => Err(LoginError::Io {
+            provider_id: "codex_cli".to_string(),
+            operation: "waiting for the credential refresh".to_string(),
+            reason: error.to_string(),
+        }),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(LoginError::Timeout {
+                provider_id: "codex_cli".to_string(),
+                timeout_secs: timeout.as_secs(),
+            })
+        }
+    }
+}
+
+/// How to launch the device-code sign-in; `program` is injectable for tests.
+pub struct CodexLoginOptions {
+    pub program: std::ffi::OsString,
+    pub identity: HostIdentity,
+    pub location: ProviderLocation,
+    pub challenge_timeout: std::time::Duration,
+}
+
+/// What one JSON-RPC line from `codex app-server` means for the sign-in.
+#[derive(Debug, PartialEq, Eq)]
+enum CodexLoginMessage {
+    /// Response to `account/login/start` carrying the device code.
+    Challenge {
+        login_id: Option<String>,
+        verification_url: String,
+        user_code: String,
+    },
+    /// The login request was refused with a JSON-RPC error code.
+    Refused {
+        code: i64,
+    },
+    /// `account/login/completed`.
+    Completed {
+        login_id: Option<String>,
+        success: bool,
+    },
+    Other,
+}
+
+const LOGIN_START_REQUEST_ID: i64 = 2;
+
+fn parse_codex_login_message(line: &str) -> CodexLoginMessage {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return CodexLoginMessage::Other;
+    };
+    if value.get("id").and_then(serde_json::Value::as_i64) == Some(LOGIN_START_REQUEST_ID) {
+        if let Some(error) = value.get("error") {
+            return CodexLoginMessage::Refused {
+                code: error
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            };
+        }
+        let result = value.get("result");
+        let text = |camel: &str, snake: &str| {
+            result
+                .and_then(|result| result.get(camel).or_else(|| result.get(snake)))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        if let (Some(verification_url), Some(user_code)) = (
+            text("verificationUrl", "verification_url"),
+            text("userCode", "user_code"),
+        ) {
+            return CodexLoginMessage::Challenge {
+                login_id: text("loginId", "login_id"),
+                verification_url,
+                user_code,
+            };
+        }
+        return CodexLoginMessage::Other;
+    }
+    if value.get("method").and_then(serde_json::Value::as_str) == Some("account/login/completed") {
+        let params = value.get("params");
+        return CodexLoginMessage::Completed {
+            login_id: params
+                .and_then(|params| params.get("loginId").or_else(|| params.get("login_id")))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            success: params
+                .and_then(|params| params.get("success"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        };
+    }
+    CodexLoginMessage::Other
+}
+
+/// A device code is a short run of letters, digits and dashes.
+fn valid_user_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+struct CodexLoginControl {
+    cancel: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl LoginControl for CodexLoginControl {
+    async fn submit_code(&self, _code: &str) -> Result<(), LoginError> {
+        Err(LoginError::NotWaitingForCode {
+            provider_id: "codex_cli".to_string(),
+            phase: "device-code sign-in needs no pasted code".to_string(),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancel.notify_one();
+    }
+}
+
+/// Kill the process group on drop unless the child was reaped.
+struct GroupKill(Option<i32>);
+
+impl GroupKill {
+    fn kill(&self) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: kill(2) with a negative pid signals a process group;
+            // ESRCH for an exited group is ignored.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Start `codex app-server`, request a ChatGPT device code and return once it
+/// has been issued. The returned completion resolves when the app-server
+/// reports `account/login/completed`. Nothing the server prints is logged.
+pub async fn begin_codex_login(options: CodexLoginOptions) -> Result<LoginHandle, LoginError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    const PROVIDER_ID: &str = "codex_cli";
+    let CodexLoginOptions {
+        program,
+        identity,
+        location,
+        challenge_timeout,
+    } = options;
+
+    host_cli::prepare_login_location(PROVIDER_ID, &identity, &location).await?;
+
+    let mut command = host_cli::host_command(&program, &identity, Some(&location));
+    command
+        .arg("app-server")
+        .current_dir(&location.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LoginError::NotInstalled {
+                provider_id: PROVIDER_ID.to_string(),
+            }
+        } else {
+            LoginError::Spawn {
+                provider_id: PROVIDER_ID.to_string(),
+                reason: error.to_string(),
+            }
+        }
+    })?;
+    let mut group = GroupKill(child.id().and_then(|pid| i32::try_from(pid).ok()));
+    let io_error = |operation: &str, reason: String| LoginError::Io {
+        provider_id: PROVIDER_ID.to_string(),
+        operation: operation.to_string(),
+        reason,
+    };
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io_error("opening the app-server input", "stdin was not piped".into()))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        io_error(
+            "opening the app-server output",
+            "stdout was not piped".into(),
+        )
+    })?;
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        });
+    }
+
+    let requests = format!(
+        "{}\n{}\n{}\n",
+        r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"temps","title":"Temps","version":"1"}}}"#,
+        r#"{"method":"initialized","params":{}}"#,
+        format_args!(
+            r#"{{"id":{LOGIN_START_REQUEST_ID},"method":"account/login/start","params":{{"type":"chatgptDeviceCode"}}}}"#
+        ),
+    );
+    stdin
+        .write_all(requests.as_bytes())
+        .await
+        .map_err(|error| io_error("requesting a device code", error.to_string()))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| io_error("requesting a device code", error.to_string()))?;
+
+    let mut lines = BufReader::new(stdout.take(MAX_SCANNED_OUTPUT_BYTES as u64)).lines();
+    let challenge_wait = async {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => match parse_codex_login_message(&line) {
+                    CodexLoginMessage::Challenge {
+                        login_id,
+                        verification_url,
+                        user_code,
+                    } => return Ok((login_id, verification_url, user_code)),
+                    CodexLoginMessage::Refused { code } => {
+                        return Err(LoginError::CliRejected {
+                            provider_id: PROVIDER_ID.to_string(),
+                            exit_code: i32::try_from(code).unwrap_or(-1),
+                        })
+                    }
+                    CodexLoginMessage::Completed { .. } | CodexLoginMessage::Other => {}
+                },
+                Ok(None) | Err(_) => {
+                    return Err(LoginError::NoChallenge {
+                        provider_id: PROVIDER_ID.to_string(),
+                        waited_secs: challenge_timeout.as_secs(),
+                    })
+                }
+            }
+        }
+    };
+    let issued = match tokio::time::timeout(challenge_timeout, challenge_wait).await {
+        Ok(Ok(issued)) => issued,
+        Ok(Err(error)) => {
+            group.kill();
+            let _ = child.wait().await;
+            group.disarm();
+            return Err(match (&error, child_exit_hint(&mut child)) {
+                (LoginError::NoChallenge { .. }, Some(126 | 127)) => LoginError::NotInstalled {
+                    provider_id: PROVIDER_ID.to_string(),
+                },
+                _ => error,
+            });
+        }
+        Err(_) => {
+            group.kill();
+            let _ = child.wait().await;
+            group.disarm();
+            return Err(LoginError::NoChallenge {
+                provider_id: PROVIDER_ID.to_string(),
+                waited_secs: challenge_timeout.as_secs(),
+            });
+        }
+    };
+    let (login_id, verification_url, user_code) = issued;
+
+    let verification_url =
+        match validate_verification_url(PROVIDER_ID, &verification_url, CODEX_LOGIN_HOSTS) {
+            Ok(url) => url,
+            Err(error) => {
+                group.kill();
+                let _ = child.wait().await;
+                group.disarm();
+                return Err(error);
+            }
+        };
+    if !valid_user_code(&user_code) {
+        group.kill();
+        let _ = child.wait().await;
+        group.disarm();
+        return Err(LoginError::InvalidUrl {
+            provider_id: PROVIDER_ID.to_string(),
+            reason: "the device code has an unexpected shape".to_string(),
+        });
+    }
+
+    let control = std::sync::Arc::new(CodexLoginControl {
+        cancel: tokio::sync::Notify::new(),
+    });
+    let waiter = control.clone();
+    let completion = Box::pin(async move {
+        // Keep stdin open for the life of the sign-in; closing it ends the
+        // app-server before the browser step finishes.
+        let _stdin = stdin;
+        let outcome = async {
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if let CodexLoginMessage::Completed {
+                            login_id: completed_id,
+                            success,
+                        } = parse_codex_login_message(&line)
+                        {
+                            let same_login = match (&login_id, &completed_id) {
+                                (Some(expected), Some(actual)) => expected == actual,
+                                _ => true,
+                            };
+                            if same_login {
+                                return if success {
+                                    Ok(())
+                                } else {
+                                    Err(LoginError::NotCompleted {
+                                        provider_id: PROVIDER_ID.to_string(),
+                                    })
+                                };
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        return Err(LoginError::NotCompleted {
+                            provider_id: PROVIDER_ID.to_string(),
+                        })
+                    }
+                }
+            }
+        };
+        let result = tokio::select! {
+            result = outcome => result,
+            _ = waiter.cancel.notified() => Err(LoginError::Cancelled {
+                provider_id: PROVIDER_ID.to_string(),
+            }),
+        };
+        // The app-server is only needed until the credential is written.
+        group.kill();
+        let _ = child.wait().await;
+        group.disarm();
+        result
+    });
+
+    Ok(LoginHandle {
+        challenge: LoginChallenge {
+            verification_url,
+            user_code: Some(user_code),
+            requires_code: false,
+        },
+        control,
+        completion,
+    })
+}
+
+fn child_exit_hint(child: &mut tokio::process::Child) -> Option<i32> {
+    child
+        .try_wait()
+        .ok()
+        .flatten()
+        .and_then(|status| status.code())
+}
+
 #[async_trait]
 impl AiCliProvider for CodexCliProvider {
     fn name(&self) -> &str {
@@ -249,109 +764,49 @@ impl AiCliProvider for CodexCliProvider {
     }
 
     async fn get_status(&self) -> AiCliStatus {
-        let version_output = tokio::time::timeout(
-            STATUS_TIMEOUT,
-            codex_command()
-                .arg("--version")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
+        probe_codex_status(codex_command, true).await
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    async fn begin_login(&self, config_dir: &std::path::Path) -> Result<LoginHandle, LoginError> {
+        let location =
+            ProviderLocation::from_config_dir("codex_cli", config_dir).ok_or_else(|| {
+                LoginError::Io {
+                    provider_id: "codex_cli".to_string(),
+                    operation: "resolving the sign-in directory".to_string(),
+                    reason: format!(
+                        "{} is not a Codex home directory (expected a directory named .codex)",
+                        config_dir.display()
+                    ),
+                }
+            })?;
+        begin_codex_login(CodexLoginOptions {
+            program: std::ffi::OsString::from("codex"),
+            identity: HostIdentity::current(),
+            location,
+            challenge_timeout: CHALLENGE_TIMEOUT,
+        })
+        .await
+    }
+
+    async fn verify_login(&self, config_dir: &std::path::Path) -> Result<AiCliStatus, LoginError> {
+        let location =
+            ProviderLocation::from_config_dir("codex_cli", config_dir).ok_or_else(|| {
+                LoginError::Io {
+                    provider_id: "codex_cli".to_string(),
+                    operation: "resolving the sign-in directory".to_string(),
+                    reason: format!("{} is not a Codex home directory", config_dir.display()),
+                }
+            })?;
+        let identity = HostIdentity::current();
+        Ok(probe_codex_status(
+            || host_cli::host_command("codex", &identity, Some(&location)),
+            false,
         )
-        .await;
-
-        let (installed, version) = match version_output {
-            Ok(Ok(output)) if output.status.success() => {
-                let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                (true, if ver.is_empty() { None } else { Some(ver) })
-            }
-            _ => {
-                return AiCliStatus {
-                    provider: "codex_cli".into(),
-                    installed: false,
-                    version: None,
-                    authenticated: false,
-                    auth_method: None,
-                    email: None,
-                    subscription_type: None,
-                    setup_hint: Some("Install Codex CLI: npm install -g @openai/codex".into()),
-                };
-            }
-        };
-
-        // `codex login status` is the narrow, redacted readiness probe and
-        // normally returns immediately. Do not put `doctor --json` first:
-        // doctor also checks unrelated network/MCP state and can take longer
-        // than the provider catalog's entire timeout, making a healthy Codex
-        // login disappear intermittently. Only use the richer diagnostic as a
-        // compatibility fallback when login status cannot identify auth.
-        let has_env_key = std::env::var("OPENAI_API_KEY").is_ok();
-        let login_output = tokio::time::timeout(
-            STATUS_TIMEOUT,
-            codex_command()
-                .args(["login", "status"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await;
-        let login_auth_method = login_output
-            .as_ref()
-            .ok()
-            .and_then(|result| result.as_ref().ok())
-            .filter(|output| output.status.success())
-            .and_then(|output| {
-                let combined = format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                codex_auth_method(&combined)
-            });
-
-        let cli_auth_method = if login_auth_method.is_some() {
-            login_auth_method
-        } else {
-            let doctor_output = tokio::time::timeout(
-                STATUS_TIMEOUT,
-                codex_command()
-                    .args(["doctor", "--json"])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output(),
-            )
-            .await;
-            doctor_output
-                .as_ref()
-                .ok()
-                .and_then(|result| result.as_ref().ok())
-                .and_then(|output| {
-                    codex_doctor_auth_method(&String::from_utf8_lossy(&output.stdout))
-                })
-        };
-        let authenticated = has_env_key || cli_auth_method.is_some();
-        let auth_method = if has_env_key {
-            Some("api_key_env".to_string())
-        } else {
-            cli_auth_method
-        };
-
-        AiCliStatus {
-            provider: "codex_cli".into(),
-            installed,
-            version,
-            authenticated,
-            auth_method,
-            email: None,
-            subscription_type: None,
-            setup_hint: if authenticated {
-                None
-            } else {
-                Some(
-                    "Run 'codex login' as the user running Temps, or provide OPENAI_API_KEY to the Temps process."
-                        .into(),
-                )
-            },
-        }
+        .await)
     }
 
     async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {

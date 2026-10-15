@@ -237,7 +237,7 @@ test('permission checklist requires explicit core approval and leaves optional a
     page.getByRole('checkbox', { name: 'Use AI', exact: true })
   ).toHaveCount(0)
   await expect(
-    page.getByRole('checkbox', { name: 'Read projects', exact: true })
+    page.getByRole('checkbox', { name: 'Read services', exact: true })
   ).not.toBeChecked()
   await expect(
     page.getByRole('checkbox', { name: 'Receive platform events', exact: true })
@@ -251,7 +251,7 @@ test('permission checklist requires explicit core approval and leaves optional a
   )
   expect(requests).toEqual([])
   await page
-    .getByRole('checkbox', { name: 'Read projects', exact: true })
+    .getByRole('checkbox', { name: 'Read services', exact: true })
     .check()
   await page
     .getByRole('button', { name: 'Build and install', exact: true })

@@ -18,6 +18,8 @@ const COMMAND_FEATURE_KEYS: Readonly<Record<string, string>> = {
   notifications: 'notifications-webhooks',
   webhooks: 'notifications-webhooks',
   teams: 'teams',
+  'project-groups': 'project-groups',
+  instantiations: 'project-groups',
   data: 'database-browser',
   imports: 'competitor-importers',
   'ip-access': 'ip-access-geo',
@@ -28,6 +30,15 @@ const COMMAND_FEATURE_KEYS: Readonly<Record<string, string>> = {
   'session-replay': 'session-replay',
   scans: 'vulnerability-scanning',
   ai: 'ai-chat',
+}
+
+/**
+ * Subcommands whose feature is less mature than the rest of their group,
+ * keyed by `<group> <subcommand>`. They take precedence over the group.
+ */
+const SUBCOMMAND_FEATURE_KEYS: Readonly<Record<string, string>> = {
+  'templates create': 'project-groups',
+  'projects hosting': 'project-groups',
 }
 
 const announcedGroups = new Set<string>()
@@ -43,11 +54,24 @@ export function topLevelCommandName(
   return command.name()
 }
 
+/**
+ * What the maturity notice is about: `templates create` for a subcommand with
+ * its own feature, else the top-level group (`analytics`).
+ */
+export function maturityCommandName(actionCommand: Command, rootCommand: Command): string {
+  const group = topLevelCommandName(actionCommand, rootCommand)
+  if (actionCommand.parent && actionCommand.parent !== rootCommand) {
+    const subcommand = `${group} ${actionCommand.name()}`
+    if (SUBCOMMAND_FEATURE_KEYS[subcommand]) return subcommand
+  }
+  return group
+}
+
 export function maturityNotice(
   commandGroup: string,
   registry: readonly FeatureMaturity[]
 ): string | undefined {
-  const featureKey = COMMAND_FEATURE_KEYS[commandGroup]
+  const featureKey = SUBCOMMAND_FEATURE_KEYS[commandGroup] ?? COMMAND_FEATURE_KEYS[commandGroup]
   if (!featureKey) return undefined
   const feature = registry.find((entry) => entry.key === featureKey)
   if (!feature || feature.maturity === 'stable') return undefined
@@ -83,7 +107,7 @@ export async function announceCommandMaturity(
   actionCommand: Command,
   rootCommand: Command
 ): Promise<void> {
-  const commandGroup = topLevelCommandName(actionCommand, rootCommand)
+  const commandGroup = maturityCommandName(actionCommand, rootCommand)
   // Bootstrap must not contact any previously selected server, including dry runs.
   if (commandGroup === 'setup') return
   if (announcedGroups.has(commandGroup)) return

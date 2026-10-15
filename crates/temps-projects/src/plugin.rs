@@ -129,6 +129,7 @@ impl TempsPlugin for ProjectsPlugin {
             telemetry,
             project_access_checker,
             sensitive_action_authorizer,
+            project_deletion_hook: context.get_service::<dyn temps_core::ProjectDeletionHook>(),
         });
         let routes = crate::handlers::configure_routes()
             .with_state(app_state)

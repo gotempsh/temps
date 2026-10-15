@@ -53,6 +53,10 @@ pub const DELTA_COUNTER_METRICS: &[&str] = &[
     "proxy.requests_other",
     "proxy.streaming_sessions",
     "proxy.rate_limited",
+    "proxy.ip_access_denied",
+    "proxy.log_write_retries",
+    "proxy.log_batches_dropped",
+    "proxy.log_entries_dropped",
 ];
 
 /// Returns `true` when `metric_name` is a per-interval delta counter that

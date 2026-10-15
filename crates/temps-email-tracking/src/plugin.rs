@@ -45,10 +45,11 @@ impl temps_core::plugin::TempsPlugin for EmailTrackingPlugin {
         Box::pin(async move {
             let db = context.require_service::<DatabaseConnection>();
 
-            // Use the platform's external URL for tracking endpoints
+            // Tracking endpoints are fetched by mail clients, so they use the
+            // public ingress URL (ADR-051), not the console's.
             let config_service = context.require_service::<temps_config::ConfigService>();
             let external_url = config_service
-                .get_external_url_or_default()
+                .get_public_ingress_url()
                 .await
                 .unwrap_or_else(|_| "http://localho.st".to_string());
 

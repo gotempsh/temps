@@ -16,6 +16,7 @@ temps-audit = { path = "../temps-audit" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-file-store = { path = "../temps-file-store" }

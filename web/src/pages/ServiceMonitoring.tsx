@@ -1015,7 +1015,7 @@ function DatabasesSection({
       {PG_PER_DATABASE_GROUPS.map((group) => (
         <div key={group.title}>
           <div className="mb-2">
-            <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground/70">
+            <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
               {group.title}
             </h3>
           </div>

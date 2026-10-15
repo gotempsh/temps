@@ -60,7 +60,7 @@ function SessionDiagnosticsDialog({ publicId }: { publicId: string }) {
         <DialogDescription>
           Inspect stored chat events and the native harness session when
           available. Credentials are redacted and export limits are reported in
-          the JSON. Messages and project details may still be private; review
+          the JSON. Messages and service details may still be private; review
           before sharing. This is a snapshot, not a live feed. Refresh to
           inspect pending tools.
         </DialogDescription>
@@ -93,6 +93,8 @@ function SessionDiagnosticsDialog({ publicId }: { publicId: string }) {
         )}
         {json && (
           <pre
+            role="region"
+            tabIndex={0}
             aria-label="Session JSON"
             className="min-h-0 overflow-auto rounded-md border p-3 text-xs"
           >

@@ -486,6 +486,36 @@ impl AuditOperation for AlarmSilencedAudit {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AlarmUnsilencedAudit {
+    context: AuditContext,
+    alarm_id: i32,
+    project_id: Option<i32>,
+}
+
+impl AuditOperation for AlarmUnsilencedAudit {
+    fn operation_type(&self) -> String {
+        "ALARM_UNSILENCED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize AlarmUnsilencedAudit: {}", e))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -757,6 +787,62 @@ pub async fn silence_alarm(
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!(
             "Failed to create audit log for alarm silence {}: {}",
+            alarm_id, e
+        );
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Lift an alarm's silence before it expires, so the next breach of the same
+/// alert notifies again.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_id}/alarms/{alarm_id}/silence",
+    tag = "Alarms",
+    operation_id = "unsilenceAlarm",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("alarm_id" = i32, Path, description = "Alarm ID"),
+    ),
+    responses(
+        (status = 200, description = "Alarm unsilenced (or it was not silenced)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alarm not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn unsilence_alarm(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path((project_id, alarm_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    state
+        .alarm_service
+        .unsilence_alarm(alarm_id, Some(project_id))
+        .await
+        .map_err(Problem::from)?;
+
+    // Audit log — failure is non-fatal
+    let audit = AlarmUnsilencedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        alarm_id,
+        project_id: Some(project_id),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for alarm unsilence {}: {}",
             alarm_id, e
         );
     }
@@ -1087,6 +1173,55 @@ pub async fn silence_system_alarm(
     Ok(StatusCode::OK)
 }
 
+/// Lift a system alarm's silence before it expires.
+#[utoipa::path(
+    delete,
+    path = "/system/alarms/{alarm_id}/silence",
+    tag = "Alarms",
+    operation_id = "unsilenceSystemAlarm",
+    params(("alarm_id" = i32, Path, description = "Alarm ID")),
+    responses(
+        (status = 200, description = "Alarm unsilenced (or it was not silenced)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alarm not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn unsilence_system_alarm(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path(alarm_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    state
+        .alarm_service
+        .unsilence_alarm(alarm_id, None)
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = AlarmUnsilencedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        alarm_id,
+        project_id: None,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for system alarm unsilence {}: {}",
+            alarm_id, e
+        );
+    }
+
+    Ok(StatusCode::OK)
+}
+
 /// Acknowledge or resolve many system alarms at once — either the explicit
 /// `alarm_ids` or every system alarm matching `filter`.
 #[utoipa::path(
@@ -1142,7 +1277,7 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         )
         .route(
             "/projects/{project_id}/alarms/{alarm_id}/silence",
-            post(silence_alarm),
+            post(silence_alarm).delete(unsilence_alarm),
         )
         .route("/system/alarms", get(list_system_alarms))
         .route("/system/alarms/summary", get(get_system_alarms_summary))
@@ -1157,7 +1292,7 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         )
         .route(
             "/system/alarms/{alarm_id}/silence",
-            post(silence_system_alarm),
+            post(silence_system_alarm).delete(unsilence_system_alarm),
         )
 }
 
@@ -1173,12 +1308,14 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         acknowledge_alarm,
         resolve_alarm,
         silence_alarm,
+        unsilence_alarm,
         bulk_update_project_alarms,
         list_system_alarms,
         get_system_alarms_summary,
         acknowledge_system_alarm,
         resolve_system_alarm,
         silence_system_alarm,
+        unsilence_system_alarm,
         bulk_update_system_alarms,
     ),
     components(schemas(

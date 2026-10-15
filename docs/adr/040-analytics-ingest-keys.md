@@ -403,6 +403,46 @@ Per-key `allowed_origins` cannot be enforced at the layer (it is per-request
 DB state), so it is enforced in the handler as a 403. This is exactly the
 shape Sentry ingest already uses (`allow_origin(Any)` + in-handler checks).
 
+#### Amendment: credentialed CORS for keyed browser requests (gotempsh/temps#1416)
+
+The `allow_origin(Any)`, never-credentialed layer above broke every
+page-unload event on cross-origin keyed ingest. `navigator.sendBeacon` always
+uses credentials mode `include`; the SDK beaconed `application/json`, which is
+preflighted, and browsers reject `*` on a credentialed response. So
+`page_leave`, late Web Vitals and the final replay batch never left the page.
+Three changes, all in `temps-analytics::ingest_keys`:
+
+- **`text/plain` bodies on the keyed path** (`body.rs`, `IngestJson`). They
+  are parsed as JSON with the same body limit and schema, so a keyed beacon can
+  be a CORS "simple" request and needs no preflight. Current SDKs send keyed
+  beacons this way. The unkeyed path still requires `application/json`: it
+  takes identity from Temps cookies, and accepting a simple request there would
+  let any page write into a visitor's session.
+- **Credentialed CORS, origin by origin** (`cors.rs`). This is for SDK versions
+  already deployed. A request that carries a key and an `Origin` gets that
+  origin echoed with `Access-Control-Allow-Credentials: true` and
+  `Vary: Origin` when the key resolves and its `allowed_origins` admits it. A
+  key with no allowlist mirrors any origin, which is the grant it already had.
+  A disallowed origin gets no ACAO, and its preflight is a `403` Problem. An
+  unknown key, `Origin: null`, and every unkeyed request keep the wildcard
+  policy above, unchanged. This supersedes "`allow_credentials` stays
+  `false`" for keyed requests only.
+- **Cookies are never identity on a keyed cross-origin request**
+  (`request.rs`, `IngestBranch`). This is what makes the credentialed grant
+  safe: the cookies a credentialed or simple cross-origin request carries are
+  ignored, and identity comes from the SDK's client-generated id. No public
+  ingest route reads a session, and the auth middleware is not applied to
+  public routes. So a reflected origin can neither act as the visitor nor read
+  anything a non-credentialed caller could not.
+
+The CORS layer resolves the key through the same cached service as the handler.
+The unresolved-key budget is charged per database *query* that does not
+resolve a key, misses and failures alike (`resolve_within_unresolved_budget`).
+A lookup made by the CORS layer for a request that never reaches its handler is
+still counted. A failing database, whose errors are never cached, is retried at
+most at the budget's rate rather than once per request. A request resolved
+twice costs one unit, and a cache hit is never charged or gated.
+
 #### Relationship to the visitor-id fallback
 
 `allow_credentials: false` means the browser will not send the

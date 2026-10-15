@@ -157,6 +157,7 @@ async fn build_sandbox_provider(
     use crate::sandbox::SandboxBackend;
 
     let data_dir = crate::sandbox::microsandbox::host_data_dir();
+    refresh_staged_pty_agents(&data_dir);
     let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
         std::collections::HashMap::new();
 
@@ -190,6 +191,93 @@ async fn build_sandbox_provider(
     Arc::new(RoutingSandboxProvider::new(backends, default))
 }
 
+/// Keep the guest agents each microVM backend injects in step with the ones
+/// shipped beside this executable (release archive, installer, `deploy.sh`
+/// and `temps upgrade` all place them there): `temps-pty-agent` for terminals
+/// and, for Firecracker, `temps-vm-agent` -- the only transport into a VM, so
+/// without it the backend is unavailable.
+///
+/// Only backends an operator has already set up are touched -- their state
+/// directory exists -- so a host that never opted into microVMs gets no new
+/// directories. Failures are logged and otherwise ignored: a stale agent
+/// degrades the backend (reported by the capability status) but must never
+/// stop the server from starting. Runs before the providers are probed, so a
+/// Firecracker host whose setup predated a release that ships the VM agent
+/// becomes available on the first start after upgrading.
+fn refresh_staged_pty_agents(data_dir: &std::path::Path) {
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    refresh_staged_guest_agents_from(data_dir, &exe_dir);
+}
+
+fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::path::Path) {
+    use crate::sandbox::firecracker::FirecrackerSandboxConfig;
+    use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
+    use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
+    const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
+
+    let microsandbox = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    let firecracker = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    // (backend, state dir that proves setup ran, shipped file name, staged path)
+    let targets = [
+        (
+            "microsandbox",
+            microsandbox.home(),
+            PTY_AGENT_BINARY_NAME,
+            microsandbox.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            PTY_AGENT_BINARY_NAME,
+            firecracker.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            VM_AGENT_BINARY_NAME,
+            firecracker.agent_bin(),
+        ),
+    ];
+    for (backend, state_dir, name, staged) in targets {
+        if !state_dir.is_dir() {
+            continue;
+        }
+        let source = exe_dir.join(name);
+        if !source.is_file() {
+            tracing::debug!(
+                backend,
+                "no {} beside the temps executable ({}); the staged copy is not refreshed",
+                name,
+                source.display()
+            );
+            continue;
+        }
+        match sync_pty_agent_binary(&source, &staged) {
+            Ok(PtyAgentSync::AlreadyCurrent) => tracing::debug!(
+                backend,
+                staged = %staged.display(),
+                "staged {} is current",
+                name
+            ),
+            Ok(PtyAgentSync::Staged) => tracing::info!(
+                backend,
+                staged = %staged.display(),
+                source = %source.display(),
+                "updated the staged {} to the one shipped with this temps",
+                name
+            ),
+            Err(error) => {
+                tracing::warn!(backend, "could not refresh the staged {}: {}", name, error)
+            }
+        }
+    }
+}
+
 /// The host-default backend from the platform setting. Docker unless the
 /// operator picked a microVM backend that is actually registered on this
 /// host. A configured-but-unavailable microsandbox default is logged with
@@ -220,7 +308,7 @@ fn default_sandbox_backend(
 }
 
 /// The microsandbox backend (ADR-050) if this host can run it right now.
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
     use crate::sandbox::microsandbox::{MicrosandboxSandboxConfig, MicrosandboxSandboxProvider};
 
@@ -245,8 +333,9 @@ fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxPr
     }
 }
 
-/// musl builds don't link the microsandbox SDK; the status API reports why.
-#[cfg(target_env = "musl")]
+/// musl and Intel macOS builds don't link the microsandbox SDK; the status
+/// API reports why.
+#[cfg(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64")))]
 fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
     let capability = crate::sandbox::microsandbox::microsandbox_capability(data_dir);
     tracing::debug!(
@@ -829,13 +918,33 @@ impl TempsPlugin for AgentsPlugin {
             // `register_services` — races against other plugins' registration
             // order and would see `None` whenever the checker plugin loads
             // after this one.
+            // Console sign-in for subscription CLIs. The CLI-owned credential
+            // directory lives below the Temps data directory, and the same
+            // root is registered with `host_cli` so status checks and turns
+            // read exactly what a sign-in produced.
+            let ai_cli_state_root = platform_config_service.get_data_subdir("ai-cli");
+            crate::ai_cli::host_cli::set_state_root(ai_cli_state_root.clone());
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            let login_sink = Arc::new(crate::handlers::ai_provider_login::SettingsLoginSink::new(
+                platform_config_service.clone(),
+                encryption_service.clone(),
+                audit_service.clone(),
+            ));
+            let provider_login = Arc::new(
+                crate::services::provider_login_service::ProviderLoginService::new(
+                    ai_cli_state_root,
+                    login_sink.clone(),
+                ),
+            );
+
             let app_state = Arc::new(AppState {
                 db: context.require_service::<sea_orm::DatabaseConnection>(),
-                encryption_service: context.require_service::<temps_core::EncryptionService>(),
+                encryption_service,
                 config_service,
                 run_service,
                 executor,
-                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                audit_service,
                 autofixer_service,
                 secret_service,
                 definition_service,
@@ -847,6 +956,8 @@ impl TempsPlugin for AgentsPlugin {
                     .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
                 project_access_checker: None,
                 ai_service: None,
+                provider_login,
+                login_sink,
             });
             context.register_plugin_state("agents", app_state);
 
@@ -898,33 +1009,16 @@ impl TempsPlugin for AgentsPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        // Resolve the ProjectAccessChecker here, not in register_services.
-        // configure_routes runs after ALL plugins have completed both
-        // register_services and initialize_plugin_services, so any checker
-        // registered by another plugin is guaranteed to be visible here
-        // regardless of plugin load order.
-        let old = context.get_plugin_state::<AppState>("agents")?;
-        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
-        let ai_service = context.get_service::<dyn temps_ai::AiService>();
-        let app_state = Arc::new(AppState {
-            db: old.db.clone(),
-            encryption_service: old.encryption_service.clone(),
-            config_service: old.config_service.clone(),
-            run_service: old.run_service.clone(),
-            executor: old.executor.clone(),
-            audit_service: old.audit_service.clone(),
-            autofixer_service: old.autofixer_service.clone(),
-            secret_service: old.secret_service.clone(),
-            definition_service: old.definition_service.clone(),
-            docker: old.docker.clone(),
-            platform_config_service: old.platform_config_service.clone(),
-            preview_gateway_name: old.preview_gateway_name.clone(),
-            telemetry: old.telemetry.clone(),
-            project_access_checker,
-            ai_service,
-        });
+        let router = crate::handlers::configure_routes().with_state(route_state(context)?);
 
-        let router = crate::handlers::configure_routes().with_state(app_state);
+        Some(PluginRoutes::new(router))
+    }
+
+    /// The agent webhook trigger (ADR-051 D3): called with an
+    /// `X-Webhook-Token` and no session, so it must be reachable when the
+    /// console itself is restricted.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = crate::handlers::configure_public_routes().with_state(route_state(context)?);
 
         Some(PluginRoutes::new(router))
     }
@@ -935,11 +1029,112 @@ impl TempsPlugin for AgentsPlugin {
     }
 }
 
+/// The handler state shared by the admin and public agent routers.
+fn route_state(context: &PluginContext) -> Option<Arc<AppState>> {
+    // Resolve the ProjectAccessChecker here, not in register_services.
+    // Route configuration runs after ALL plugins have completed both
+    // register_services and initialize_plugin_services, so any checker
+    // registered by another plugin is guaranteed to be visible here
+    // regardless of plugin load order.
+    let old = context.get_plugin_state::<AppState>("agents")?;
+    let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+    let ai_service = context.get_service::<dyn temps_ai::AiService>();
+    let app_state = Arc::new(AppState {
+        db: old.db.clone(),
+        encryption_service: old.encryption_service.clone(),
+        config_service: old.config_service.clone(),
+        run_service: old.run_service.clone(),
+        executor: old.executor.clone(),
+        audit_service: old.audit_service.clone(),
+        autofixer_service: old.autofixer_service.clone(),
+        secret_service: old.secret_service.clone(),
+        definition_service: old.definition_service.clone(),
+        docker: old.docker.clone(),
+        platform_config_service: old.platform_config_service.clone(),
+        preview_gateway_name: old.preview_gateway_name.clone(),
+        telemetry: old.telemetry.clone(),
+        project_access_checker,
+        ai_service,
+        provider_login: old.provider_login.clone(),
+        login_sink: old.login_sink.clone(),
+    });
+    // The AI registry is registered after this plugin, so it can only be
+    // bound once routes are configured. Binding is idempotent: both the admin
+    // and the public router build this state.
+    if let Some(ai_service) = app_state.ai_service.clone() {
+        app_state.login_sink.bind_ai_service(ai_service);
+    }
+    Some(app_state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn startup_refresh_updates_all_three_targets_and_leaves_unconfigured_backends_alone() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let pty = test_elf::static_for_host(b"new-pty");
+        let vm = test_elf::static_for_host(b"new-vm");
+        std::fs::write(exe.path().join("temps-pty-agent"), &pty).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), &vm).unwrap();
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(!ms.home().exists());
+        assert!(!fc.fc_root().exists());
+        std::fs::create_dir_all(ms.pty_agent_bin().parent().unwrap()).unwrap();
+        std::fs::write(ms.pty_agent_bin(), test_elf::static_for_host(b"old")).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert!(
+            !fc.fc_root().exists(),
+            "refresh must not configure another backend"
+        );
+        for dest in [ms.pty_agent_bin(), fc.pty_agent_bin(), fc.agent_bin()] {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, test_elf::static_for_host(b"stale")).unwrap();
+        }
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+        // Missing and rejected shipped sources preserve working copies.
+        std::fs::remove_file(exe.path().join("temps-pty-agent")).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), b"invalid").unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+    }
+
+    #[test]
+    fn startup_refresh_continues_after_a_target_fails() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let bytes = test_elf::static_for_host(b"current");
+        for name in ["temps-pty-agent", "temps-vm-agent"] {
+            std::fs::write(exe.path().join(name), &bytes).unwrap();
+        }
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        std::fs::create_dir_all(ms.pty_agent_bin()).unwrap(); // rename onto a directory must fail
+        std::fs::create_dir_all(fc.fc_root()).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(ms.pty_agent_bin().is_dir());
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), bytes);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), bytes);
+    }
 
     #[test]
     fn default_backend_honours_only_registered_microvm_backends() {

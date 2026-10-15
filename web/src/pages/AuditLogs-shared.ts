@@ -71,6 +71,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
   {
     label: 'MFA',
     operations: [
+      { value: 'MFA_SETUP_STARTED', label: 'MFA Setup Started' },
       { value: 'MFA_ENABLED', label: 'MFA Enabled' },
       { value: 'MFA_DISABLED', label: 'MFA Disabled' },
       { value: 'MFA_VERIFIED', label: 'MFA Verified' },
@@ -78,12 +79,73 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     ],
   },
   {
-    label: 'Projects & Environments',
+    // Project groups: several services that ship together ("Projects" in
+    // the console). A template run or import is logged when it starts and
+    // when it is retried; each change it makes is logged as the matching
+    // event below, tagged with the run, and its services as Service Created.
+    label: 'Projects',
     operations: [
-      { value: 'PROJECT_CREATED', label: 'Project Created' },
-      { value: 'PROJECT_UPDATED', label: 'Project Updated' },
-      { value: 'PROJECT_DELETED', label: 'Project Deleted' },
-      { value: 'PROJECT_SETTINGS_UPDATED', label: 'Project Settings Updated' },
+      {
+        value: 'TEMPLATE_INSTANTIATION_STARTED',
+        label: 'Template or Import Started',
+      },
+      {
+        value: 'TEMPLATE_INSTANTIATION_RETRIED',
+        label: 'Template or Import Retried',
+      },
+      { value: 'PROJECT_GROUP_CREATED', label: 'Project Created' },
+      { value: 'PROJECT_GROUP_UPDATED', label: 'Project Updated' },
+      { value: 'PROJECT_GROUP_DELETED', label: 'Project Deleted' },
+      {
+        value: 'PROJECT_GROUP_PROJECT_ADDED',
+        label: 'Service Added to Project',
+      },
+      {
+        value: 'PROJECT_GROUP_PROJECT_REMOVED',
+        label: 'Service Removed from Project',
+      },
+      {
+        value: 'PROJECT_GROUP_ENV_VAR_CREATED',
+        label: 'Shared Variable Created',
+      },
+      {
+        value: 'PROJECT_GROUP_ENV_VAR_UPDATED',
+        label: 'Shared Variable Updated',
+      },
+      {
+        value: 'PROJECT_GROUP_ENV_VAR_DELETED',
+        label: 'Shared Variable Deleted',
+      },
+      {
+        value: 'PROJECT_GROUP_REPOSITORY_SET',
+        label: 'Project Repository Set',
+      },
+      {
+        value: 'PROJECT_GROUP_REPOSITORY_CLEARED',
+        label: 'Project Repository Disconnected',
+      },
+      {
+        value: 'PROJECT_GROUP_PROJECT_FOLLOWS_REPOSITORY',
+        label: 'Service Follows Project Repository',
+      },
+      {
+        value: 'PROJECT_GROUP_PROJECT_UNFOLLOWS_REPOSITORY',
+        label: 'Service Stopped Following Project Repository',
+      },
+      { value: 'PROJECT_GROUP_ROUTE_ADDED', label: 'Project Route Added' },
+      { value: 'PROJECT_GROUP_ROUTE_REMOVED', label: 'Project Route Removed' },
+    ],
+  },
+  {
+    label: 'Services & Environments',
+    operations: [
+      { value: 'PROJECT_CREATED', label: 'Service Created' },
+      { value: 'PROJECT_UPDATED', label: 'Service Updated' },
+      { value: 'PROJECT_DELETED', label: 'Service Deleted' },
+      {
+        value: 'PROJECT_SETTINGS_UPDATED',
+        label: 'Service Settings Updated',
+      },
       {
         value: 'DEPLOYMENT_CONFIG_UPDATED',
         label: 'Deployment Config Updated',
@@ -198,11 +260,11 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       },
       {
         value: 'EXTERNAL_SERVICE_PROJECT_LINKED',
-        label: 'External Service Linked to Project',
+        label: 'External Service Linked to Service',
       },
       {
         value: 'EXTERNAL_SERVICE_PROJECT_UNLINKED',
-        label: 'External Service Unlinked from Project',
+        label: 'External Service Unlinked from Service',
       },
       {
         value: 'EXTERNAL_SERVICE_BACKUP_RUN',

@@ -6,6 +6,7 @@ import { listUsersOptions } from '@/api/client/@tanstack/react-query.gen'
 import { UsersManagement } from '@/components/users/UsersManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect, useState } from 'react'
 import { UserEditDialog } from '@/components/users/UserEditDialog'
@@ -19,6 +20,7 @@ export function Users() {
     email: string
   } | null>(null)
   const navigate = useNavigate()
+  const canAddUsers = useIsInstanceAdmin()
 
   const {
     data: users,
@@ -42,6 +44,7 @@ export function Users() {
   useKeyboardShortcut({
     key: 'n',
     callback: () => navigate('/settings/users/new'),
+    enabled: canAddUsers,
   })
 
   usePageTitle('Users')

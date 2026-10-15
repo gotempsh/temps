@@ -64,7 +64,7 @@ pub enum UrlValidationError {
 
 /// Appended to the errors a trusted private network can lift, so whoever hits
 /// one learns the block is an instance policy rather than a bug.
-const TRUSTED_NETWORKS_HINT: &str = " (an administrator can allow specific private networks \
+pub const TRUSTED_NETWORKS_HINT: &str = " (an administrator can allow specific private networks \
      under Settings > Security > Trusted private networks)";
 
 /// Address ranges an operator may mark as trusted outbound destinations.
@@ -91,7 +91,11 @@ const TRUSTABLE_RANGES: &[&str] = &[
 /// Self-hosted installs routinely need to reach services on their own LAN or
 /// overlay network: an internal webhook receiver, an Ollama box, a Gitea
 /// server, an uptime target. The default stays closed; an address inside one
-/// of these networks is accepted by every outbound validator in this module.
+/// of these networks is accepted by every outbound validator in this module --
+/// webhooks, notifications, Git, importers, monitors, the AI gateway and so on.
+/// That scope is why single-address entries (`/32`, `/128`) are recommended,
+/// and why features that only need one host (an AI provider key) can trust it
+/// on the resource instead, via [`validate_trustable_private_host`].
 /// Cloud metadata endpoints are rejected even when inside a trusted network.
 ///
 /// Loaded from the database at startup and re-published by the config
@@ -133,6 +137,31 @@ pub fn parse_trusted_private_network(entry: &str) -> Result<IpNet, UrlValidation
     }
 
     Ok(net)
+}
+
+/// Check that `ip` may be trusted as a **single** outbound destination by one
+/// resource (e.g. one AI provider key), independent of the instance-wide list.
+///
+/// The eligibility rules are the instance-wide ones: the address must lie in
+/// one of the private-by-allocation [`TRUSTABLE_RANGES`], and a cloud metadata
+/// endpoint is never eligible -- even where it sits inside such a range
+/// (Alibaba's `100.100.100.200` in `100.64.0.0/10`, AWS's `fd00:ec2::254` in
+/// `fc00::/7`). An IPv4-mapped IPv6 address is canonicalised to its IPv4 form,
+/// which is what the returned address is.
+pub fn validate_trustable_private_host(ip: IpAddr) -> Result<IpAddr, UrlValidationError> {
+    let canonical = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V4(_) => ip,
+    };
+    let is_metadata = match canonical {
+        IpAddr::V4(v4) => is_cloud_metadata_ipv4(&v4),
+        IpAddr::V6(v6) => is_cloud_metadata_ipv6(&v6),
+    };
+    if is_metadata {
+        return Err(UrlValidationError::CloudMetadata);
+    }
+    parse_trusted_private_network(&canonical.to_string())?;
+    Ok(canonical)
 }
 
 /// Parse a full list of trusted network entries, failing on the first invalid
@@ -1309,6 +1338,55 @@ mod trusted_private_network_tests {
                 "::1/128".parse::<IpNet>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn single_host_trust_accepts_private_addresses() {
+        for host in [
+            "10.1.2.3",
+            "192.168.1.20",
+            "127.0.0.1",
+            "100.70.1.2",
+            "fd12::5",
+            "::1",
+        ] {
+            let ip: IpAddr = host.parse().unwrap();
+            assert_eq!(validate_trustable_private_host(ip).unwrap(), ip, "{host}");
+        }
+        // IPv4-mapped IPv6 is canonicalised to the IPv4 address.
+        let mapped: IpAddr = "::ffff:10.0.0.5".parse().unwrap();
+        assert_eq!(
+            validate_trustable_private_host(mapped).unwrap(),
+            "10.0.0.5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn single_host_trust_never_accepts_metadata_link_local_or_public() {
+        for host in ["100.100.100.200", "fd00:ec2::254", "::ffff:169.254.169.254"] {
+            let ip: IpAddr = host.parse().unwrap();
+            assert!(
+                matches!(
+                    validate_trustable_private_host(ip),
+                    Err(UrlValidationError::CloudMetadata)
+                ),
+                "{host} must be rejected as cloud metadata"
+            );
+        }
+        for host in [
+            "169.254.169.254",
+            "169.254.10.1",
+            "fe80::1",
+            "8.8.8.8",
+            "0.0.0.0",
+            "2001:4860::8888",
+        ] {
+            let ip: IpAddr = host.parse().unwrap();
+            assert!(
+                validate_trustable_private_host(ip).is_err(),
+                "{host} must not be trustable"
+            );
+        }
     }
 
     #[test]

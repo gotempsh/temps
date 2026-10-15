@@ -12,7 +12,8 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    /// Provider identifier: "openai", "anthropic", "xai", "gemini", "openrouter", "custom"
+    /// Provider identifier: "openai", "anthropic", "xai", "gemini", "openrouter",
+    /// or "openai_compatible" for a self-hosted OpenAI-compatible server
     pub provider: String,
     /// Human-readable display name, e.g. "OpenAI Production"
     pub display_name: String,
@@ -26,6 +27,20 @@ pub struct Model {
     pub default_model: Option<String>,
     /// Whether this provider key is active and available for routing
     pub is_active: bool,
+    /// Exact private `ip:port` this key alone may reach, without the address
+    /// being in the instance-wide trusted private networks. NULL → no per-key
+    /// trust. Only ever set by an administrator, and only to the IP literal in
+    /// this key's own `base_url`; a base URL change clears it.
+    pub trusted_private_address: Option<String>,
+    /// User who last set `trusted_private_address`.
+    pub trusted_private_address_set_by: Option<i32>,
+    /// When `trusted_private_address` was last set.
+    pub trusted_private_address_set_at: Option<DBDateTime>,
+    /// Capabilities an administrator declared for a self-hosted
+    /// (`openai_compatible`) key, e.g. `{"streaming":true,"tools":true,
+    /// "embeddings":false,"responses_api":false}`. NULL for vendor keys,
+    /// whose capabilities are defined by their adapter.
+    pub capabilities: Option<Json>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

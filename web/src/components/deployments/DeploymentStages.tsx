@@ -113,14 +113,14 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
   const getLevelIconColor = (level: string) => {
     switch (level.toLowerCase()) {
       case 'error':
-        return 'text-red-500'
+        return 'text-red-700 dark:text-red-500'
       case 'warning':
       case 'warn':
-        return 'text-yellow-500'
+        return 'text-yellow-700 dark:text-yellow-500'
       case 'success':
-        return 'text-green-500'
+        return 'text-green-700 dark:text-green-500'
       case 'info':
-        return 'text-blue-500'
+        return 'text-blue-600 dark:text-blue-500'
       default:
         return 'text-muted-foreground'
     }
@@ -303,6 +303,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             clipped with no way to reach them. A plain overflow-auto div gives
             reliable two-axis touch scrolling. */}
         <div
+          tabIndex={0}
           ref={scrollAreaRef}
           className="h-96 overflow-auto border rounded-md bg-background overscroll-contain"
         >
@@ -326,7 +327,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
                   key={log.line}
                   className="flex gap-2 items-start hover:bg-muted/50 leading-relaxed"
                 >
-                  <span className="text-muted-foreground/50 select-none min-w-[3ch] text-right shrink-0">
+                  <span className="text-muted-foreground select-none min-w-[3ch] text-right shrink-0">
                     {log.line}
                   </span>
                   <span
@@ -340,7 +341,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
                       __html: ansiConverter.toHtml(log.message),
                     }}
                   />
-                  <span className="text-muted-foreground/40 text-[10px] whitespace-nowrap shrink-0">
+                  <span className="text-muted-foreground text-[10px] whitespace-nowrap shrink-0">
                     {formatTimestamp(log.timestamp)}
                   </span>
                 </div>
@@ -551,7 +552,7 @@ export function DeploymentStages({
         return (
           <Badge
             variant="secondary"
-            className="capitalize bg-orange-500/10 text-orange-600 border-orange-500/20"
+            className="capitalize bg-orange-500/10 text-orange-700 dark:text-orange-600 border-orange-500/20"
           >
             In Progress
           </Badge>
@@ -614,7 +615,7 @@ export function DeploymentStages({
                     title="Debug this failure with AI"
                   >
                     <Sparkles className="h-4 w-4" />
-                    <span className="hidden sm:inline">Debug with AI</span>
+                    <span className="max-sm:sr-only">Debug with AI</span>
                   </Button>
                 )}
                 <ElapsedTime
@@ -634,13 +635,22 @@ export function DeploymentStages({
                   <Settings className="h-4 w-4" />
                 </Button>
                 <button
+                  type="button"
                   onClick={() => toggleStage(stage.id)}
-                  className="cursor-pointer"
+                  aria-expanded={expandedStageIds.has(stage.id)}
+                  aria-label={`${expandedStageIds.has(stage.id) ? 'Hide' : 'Show'} logs for ${stage.name}`}
+                  className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 >
                   {expandedStageIds.has(stage.id) ? (
-                    <ChevronUpIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronUpIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <ChevronDownIcon className="h-4 w-4 text-muted-foreground" />
+                    <ChevronDownIcon
+                      className="h-4 w-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                   )}
                 </button>
               </div>

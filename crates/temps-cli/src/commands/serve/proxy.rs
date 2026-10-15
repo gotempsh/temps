@@ -9,7 +9,6 @@ use temps_core::CookieCrypto;
 use temps_database::DbConnection;
 use temps_deployer::ContainerDeployer;
 use temps_proxy::on_demand::{ContainerLifecycle, OnDemandError, OnDemandManager};
-use temps_proxy::on_demand_cert::EnqueueOutcome;
 use temps_proxy::ProxyShutdownSignal;
 use tracing::{info, warn};
 
@@ -278,6 +277,7 @@ pub fn start_proxy_server(
     console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
+    let console_ingress_address = config.public_surface_address().map(str::to_string);
     // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
     // enabled, the long-lived home of `OnDemandCertManager`'s issuance consumer
     // (`OnDemandCertManager::new` calls `tokio::spawn` on whatever runtime is
@@ -389,49 +389,26 @@ pub fn start_proxy_server(
             move |hostnames: Vec<String>| {
                 let cert_manager = cert_manager_for_callback.clone();
                 Box::pin(async move {
-                    let mut enqueued = 0u32;
-                    for hostname in &hostnames {
-                        if let EnqueueOutcome::Enqueued = cert_manager.try_enqueue(hostname, None)
-                        {
-                            enqueued += 1;
-                        }
-                    }
-                    if enqueued > 0 {
-                        tracing::info!(
-                            enqueued,
-                            total = hostnames.len(),
-                            "on-demand TLS: eagerly pre-provisioning {} cert(s) for new/updated routes",
-                            enqueued
-                        );
-                    }
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                    log_pre_provision(
+                        &cert_manager.pre_provision(&hostnames).await,
+                        "for new/updated routes",
+                    );
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             },
         ));
 
         // One-time immediate pass for cert-eligible routes already in the table
         // (populated by the initial load that runs before this code executes).
         let initial_hosts = route_table.cert_eligible_hosts();
-        if !initial_hosts.is_empty() {
-            let mut enqueued = 0u32;
-            for hostname in &initial_hosts {
-                if let EnqueueOutcome::Enqueued = cert_manager.try_enqueue(hostname, None) {
-                    enqueued += 1;
-                }
-            }
-            if enqueued > 0 {
-                tracing::info!(
-                    enqueued,
-                    total = initial_hosts.len(),
-                    "on-demand TLS: eagerly pre-provisioning {} cert(s) for existing routes at startup",
-                    enqueued
-                );
-            }
-        }
+        let summary = rt.block_on(cert_manager.pre_provision(&initial_hosts));
+        log_pre_provision(&summary, "for existing routes at startup");
     }
 
     let proxy_config = temps_proxy::ProxyConfig {
         address,
         console_address,
+        console_ingress_address,
         internal_dns_sync_address,
         tls_address,
         preview_domain,
@@ -483,6 +460,29 @@ pub fn start_proxy_server(
             tracing::error!("Failed to start proxy server: {}", e);
             Err(anyhow::anyhow!("Failed to start proxy server: {}", e))
         }
+    }
+}
+
+/// Log the outcome of an eager on-demand pre-provisioning pass. Quiet when
+/// nothing was enqueued; covered hosts are reported at debug so a wildcard
+/// install does not log on every reload.
+fn log_pre_provision(summary: &temps_proxy::on_demand_cert::PreProvisionSummary, context: &str) {
+    if summary.covered > 0 {
+        tracing::debug!(
+            covered = summary.covered,
+            total = summary.total,
+            "on-demand TLS: {} hostname(s) already covered by a certificate, no order needed",
+            summary.covered
+        );
+    }
+    if summary.enqueued > 0 {
+        tracing::info!(
+            enqueued = summary.enqueued,
+            total = summary.total,
+            "on-demand TLS: eagerly pre-provisioning {} cert(s) {}",
+            summary.enqueued,
+            context
+        );
     }
 }
 

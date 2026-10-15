@@ -42,9 +42,12 @@ pub enum WorkflowError {
     #[error("Other error: {0}")]
     Other(String),
 
-    /// Fix #17/#18: invalid archive entry path (path traversal, absolute path, etc.).
-    /// Maps to HTTP 400.
-    #[error("Invalid archive entry '{path}': {reason}")]
+    /// Fix #17/#18: an archive entry the platform refuses to extract (path
+    /// traversal, absolute path, symbolic link, etc.). `path` is the entry as
+    /// it is named in the archive and `reason` says why it was refused and
+    /// what to change; the message must stay self-sufficient because it is
+    /// the only thing the user sees. Maps to HTTP 400.
+    #[error("Rejected archive entry '{path}': {reason}")]
     InvalidArchiveEntry { path: String, reason: String },
 
     /// Fix #27: archive decompressed size exceeds the allowed limit.

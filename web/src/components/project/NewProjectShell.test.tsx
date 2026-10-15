@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import {
+  getFeatureMaturityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -70,3 +71,29 @@ for (const cached of [false, true]) {
     client.clear()
   })
 }
+
+test('the Beta badge sits beside the Services tab, not inside it', () => {
+  const client = createClient()
+  client.setQueryData(connectionsKey, emptyConnections)
+  client.setQueryData(getFeatureMaturityOptions().queryKey, [
+    {
+      key: 'service-template-catalog',
+      maturity: 'beta',
+      reason: 'Templates may change.',
+      docs_path: '/docs/maturity#beta',
+    },
+  ])
+  const html = render(client)
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  const tabs = Array.from(doc.querySelectorAll('[role="tab"]'))
+  const services = tabs.find((tab) => tab.textContent?.includes('Services'))
+  expect(services).toBeDefined()
+  // axe `nested-interactive`: a tab has no focusable descendants.
+  expect(
+    services!.querySelector('[tabindex], button, a, [role="button"]')
+  ).toBe(null)
+  const badge = doc.querySelector('[aria-label="Beta feature. Show details"]')
+  expect(badge).not.toBeNull()
+  expect(services!.contains(badge)).toBe(false)
+  client.clear()
+})

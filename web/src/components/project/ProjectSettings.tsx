@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { ProjectResponse } from '@/api/client'
-import { Navigate, Route, Routes } from 'react-router'
+import { Route, Routes } from 'react-router'
 import { CronJobDetail } from './settings/CronJobDetail'
 import { LegacyProjectRouteRedirect } from './LegacyProjectRouteRedirect'
 import { CombinedProjectSettings } from './settings/CombinedProjectSettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
+import { ProjectIpAccessCard } from './settings/ProjectIpAccessCard'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { SecretPage } from './settings/SecretPage'
 import { TelemetrySettings } from './settings/TelemetrySettings'
@@ -38,7 +40,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             />
           )
         )}
-        <Route index element={<Navigate to="general" replace />} />
+        <Route index element={<RedirectWithQuery to="general" />} />
         <Route
           path="general"
           element={
@@ -105,7 +107,13 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         <Route
           path="security"
           element={
-            <ProjectSecuritySettings project={project} refetch={refetch} />
+            <div className="space-y-6">
+              <ProjectSecuritySettings project={project} refetch={refetch} />
+              <ProjectIpAccessCard
+                projectId={project.id}
+                scopeName={project.name}
+              />
+            </div>
           }
         />
         <Route
@@ -178,7 +186,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           path="telemetry"
           element={<TelemetrySettings project={project} />}
         />
-        <Route path="*" element={<Navigate to="." replace />} />
+        <Route path="*" element={<RedirectWithQuery to="." />} />
       </Routes>
     </div>
   )

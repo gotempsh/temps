@@ -49,13 +49,13 @@ const STARTER_PROMPTS = [
     icon: Bot,
     title: 'Verify access',
     prompt:
-      'Use the Temps skill to verify my connection and list the projects on this instance. Do not make any changes.',
+      'Use the Temps skill to verify my connection and list the services (Temps projects) on this instance. Do not make any changes.',
   },
   {
     icon: FolderPlus,
-    title: 'Create a project',
+    title: 'Create a service',
     prompt:
-      'Use the Temps skill to create a manual project named api-playground. Explain the target and ask for confirmation before creating it, then verify it appears in the project list.',
+      'Use the Temps skill to create a manual project (a single deployable service) named api-playground. Explain the target and ask for confirmation before creating it, then verify it appears in the project list.',
   },
   {
     icon: Database,
@@ -173,7 +173,7 @@ export function AiOnboarding() {
                   One connection, every platform workflow
                 </h2>
                 <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-                  Your harness can inspect projects, create services, deploy
+                  Your harness can inspect services, create databases, deploy
                   applications, and verify the result using the same pinned
                   Temps CLI workflow.
                 </p>
@@ -182,7 +182,7 @@ export function AiOnboarding() {
             {apiKeysLoading ? (
               <Skeleton className="h-10 w-44" />
             ) : effectiveHarnessStatus === 'connected' ? (
-              <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
+              <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
                 <Check className="size-4" />
                 Harness connected
               </div>
@@ -229,7 +229,7 @@ export function AiOnboarding() {
           number="01"
           icon={KeyRound}
           title="Create a dedicated admin key"
-          description="The harness needs platform access to create and verify projects, databases, deployments, domains, and other resources."
+          description="The harness needs platform access to create and verify services, databases, deployments, domains, and other resources."
           ready={!!harnessKey || !!createdKeySecret}
           loading={apiKeysLoading}
           status={harnessKey || createdKeySecret ? 'Key ready' : 'Required'}
@@ -305,7 +305,7 @@ export function AiOnboarding() {
           number="03"
           icon={Terminal}
           title="Verify before changing anything"
-          description="Confirm the harness is targeting this instance and can read its projects. Neither verification command changes platform state."
+          description="Confirm the harness is targeting this instance and can read its services. Neither verification command changes platform state."
           ready={effectiveHarnessStatus === 'connected'}
           status={
             effectiveHarnessStatus === 'connected' ? 'Verified' : 'Read-only'
@@ -317,7 +317,7 @@ export function AiOnboarding() {
               value={commands.verifyIdentity}
             />
             <Command
-              label="Verify project access"
+              label="Verify service access"
               value={commands.verifyProjects}
             />
           </div>
@@ -455,7 +455,7 @@ function OnboardingStep({
                 className={cn(
                   'flex size-9 items-center justify-center rounded-lg border',
                   ready
-                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500'
                     : 'bg-muted text-muted-foreground'
                 )}
               >
@@ -476,7 +476,7 @@ function OnboardingStep({
                 className={cn(
                   'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-wide',
                   ready
-                    ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400'
+                    ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400'
                     : 'text-muted-foreground'
                 )}
               >
@@ -516,6 +516,7 @@ function Command({
       <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
       <div className="flex min-w-0 items-start gap-2 rounded-lg border bg-background px-3 py-2.5">
         <pre
+          tabIndex={0}
           className={cn(
             'm-0 min-w-0 flex-1 overflow-x-auto font-mono text-xs',
             multiline ? 'whitespace-pre leading-relaxed' : 'whitespace-nowrap'

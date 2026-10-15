@@ -21,9 +21,9 @@ import type { TeamRole } from '@/api/client/types.gen'
  */
 export const ROLE_DESCRIPTIONS: Record<TeamRole, string> = {
   owner:
-    'Deploy, manage env vars, settings and domains, and delete the project',
+    'Deploy, manage env vars, settings and domains, and delete the service',
   admin:
-    'Deploy, manage env vars, settings and domains. Cannot delete the project',
+    'Deploy, manage env vars, settings and domains. Cannot delete the service',
   deployer: 'Deploy and manage env vars. Cannot change settings or domains',
   viewer: 'Cannot deploy, or change env vars, settings or domains',
 }
@@ -33,8 +33,8 @@ export const ROLE_DESCRIPTIONS: Record<TeamRole, string> = {
  * so nobody grants `viewer` expecting a read-only contractor account.
  */
 export const ROLE_ENFORCEMENT_NOTE =
-  'Roles currently restrict deployments, environment variables, project ' +
-  'settings, domains and project deletion. Other actions still follow the ' +
+  'Roles currently restrict deployments, environment variables, service ' +
+  'settings, domains and service deletion. Other actions still follow the ' +
   "member's instance-wide role."
 
 export interface AddMemberDialogProps {

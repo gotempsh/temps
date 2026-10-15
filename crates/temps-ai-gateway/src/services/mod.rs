@@ -12,10 +12,14 @@ pub mod structured_output;
 pub mod usage_service;
 
 pub use ai_service::GatewayAiService;
-pub use gateway_service::{ByokOverride, CredentialType, GatewayService, ResolvedCredentials};
+pub use gateway_service::{
+    ByokOverride, CredentialType, GatewayService, ResolvedCredentials, SelfHostedListing, ServedBy,
+};
 pub use native_api_service::{NativeApiService, Owner};
 pub use provider_capabilities::gateway_provider_capabilities;
-pub use provider_key_service::ProviderKeyService;
+pub use provider_key_service::{
+    NewProviderKey, ProviderKeyService, ProviderKeyUpdate, TrustChange, TrustRequest,
+};
 pub use provider_model_service::ProviderModelService;
 pub use provider_preference_service::{ProviderPreferenceError, ProviderPreferenceService};
 pub use structured_output::{

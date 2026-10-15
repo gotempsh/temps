@@ -477,6 +477,72 @@ impl AuditOperation for EmailSentAudit {
     }
 }
 
+/// Durable intent record written before a captured email is delivered again.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailResendRequestedAudit {
+    pub user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub correlation_id: uuid::Uuid,
+    pub email_id: uuid::Uuid,
+}
+
+impl AuditOperation for EmailResendRequestedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_RESEND_REQUESTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+/// Outcome of a resend: the status the email ended in (`sent`, `captured`
+/// again, or `delivery_unknown`).
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailResendCompletedAudit {
+    pub user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub correlation_id: uuid::Uuid,
+    pub email_id: uuid::Uuid,
+    pub status: String,
+}
+
+impl AuditOperation for EmailResendCompletedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_RESEND_COMPLETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

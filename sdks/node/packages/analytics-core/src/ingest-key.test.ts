@@ -14,6 +14,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * 2. With no `ingestKey` configured, requests go out byte-identically to before
  *    the feature existed — no header, no query param — so Temps-hosted apps
  *    keep resolving by `Host`.
+ * 3. A keyed beacon's Blob is `text/plain`, so the browser sends it without a
+ *    CORS preflight (gotempsh/temps#1416). Unkeyed beacons stay
+ *    `application/json`, and `fetch` is unchanged either way.
  */
 
 const recordCalls: Array<{ emit: (event: unknown) => void; stop: ReturnType<typeof vi.fn> }> = [];
@@ -33,6 +36,7 @@ vi.mock("@rrweb/packer", () => ({
 import { INGEST_KEY_HEADER } from "./constants";
 import { SessionRecorder } from "./SessionRecorder";
 import {
+  beaconBlob,
   ingestKeyHeaders,
   sendAnalytics,
   sendAnalyticsReliable,
@@ -148,7 +152,62 @@ describe("sendAnalytics (fetch transport)", () => {
   });
 });
 
+/** jsdom's Blob has no `.text()`; read it the way a browser-era test would. */
+function readBlob(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blob);
+  });
+}
+
+/** The Blob handed to the nth sendBeacon call. */
+function beaconBody(index = 0): Blob {
+  return beaconMock.mock.calls[index]?.[1] as Blob;
+}
+
+describe("beaconBlob", () => {
+  it("is text/plain for a keyed beacon, so no CORS preflight is needed", async () => {
+    const blob = beaconBlob('{"a":1}', "pa_abc");
+
+    expect(blob.type).toBe("text/plain");
+    expect(await readBlob(blob)).toBe('{"a":1}');
+  });
+
+  it("stays application/json without a key", () => {
+    expect(beaconBlob("{}").type).toBe("application/json");
+    expect(beaconBlob("{}", "").type).toBe("application/json");
+  });
+});
+
 describe("sendAnalyticsReliable (sendBeacon transport)", () => {
+  it("beacons a keyed payload as text/plain carrying the same JSON", async () => {
+    stubBeacon();
+
+    sendAnalyticsReliable("event", { event_name: "page_leave" }, "/api/_temps", KEY);
+
+    const blob = beaconBody();
+    expect(blob.type).toBe("text/plain");
+    expect(JSON.parse(await readBlob(blob))).toMatchObject({ event_name: "page_leave" });
+  });
+
+  it("beacons an unkeyed payload as application/json, exactly as before", () => {
+    stubBeacon();
+
+    sendAnalyticsReliable("event", { event_name: "page_leave" }, "/api/_temps");
+
+    expect(beaconBody().type).toBe("application/json");
+  });
+
+  it("leaves the keepalive fetch fallback as application/json", () => {
+    vi.stubGlobal("navigator", { userAgent: "test", language: "en", sendBeacon: undefined });
+
+    sendAnalyticsReliable("event", { event_name: "page_leave" }, "/api/_temps", KEY);
+
+    expect(fetchHeaders()["Content-Type"]).toBe("application/json");
+  });
+
   it("appends the url-encoded key as ?temps_key= — sendBeacon cannot set headers", () => {
     stubBeacon();
 
@@ -283,6 +342,8 @@ describe("SessionRecorder ingest key", () => {
       expect(String(beacons[0][0])).toBe(
         `/api/_temps/session-replay/events?temps_key=${ENCODED_KEY}`,
       );
+      // No preflight on the keyed unload flush either.
+      expect((beacons[0][1] as Blob).type).toBe("text/plain");
     });
   });
 
@@ -299,6 +360,7 @@ describe("SessionRecorder ingest key", () => {
         String(url).endsWith("/session-replay/events"),
       );
       expect(beacons).toHaveLength(1);
+      expect((beacons[0][1] as Blob).type).toBe("application/json");
     });
   });
 });

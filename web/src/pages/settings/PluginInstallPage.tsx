@@ -270,7 +270,7 @@ export function PluginInstallPage() {
                   onSensitiveError={handleSensitiveActionError}
                   onPendingChange={setPending}
                   onClearSelection={() => navigate('/settings/plugins')}
-                  onInstalled={() => navigate('/settings/plugins')}
+                  onInstalled={() => navigate('/settings/plugins?tab=running')}
                 />
               </section>
             ) : (

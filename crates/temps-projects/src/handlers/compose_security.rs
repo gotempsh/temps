@@ -141,9 +141,7 @@ impl AuditOperation for ComposeSecurityAudit {
 }
 
 /// Retire legacy grants so imports and generic project updates cannot bypass acknowledgment.
-pub(crate) fn reject_legacy_sandbox_grants(
-    config: Option<&serde_json::Value>,
-) -> Result<(), Problem> {
+pub fn reject_legacy_sandbox_grants(config: Option<&serde_json::Value>) -> Result<(), Problem> {
     let grants = config
         .and_then(|value| value.get("unsandboxedServices"))
         .and_then(serde_json::Value::as_array);

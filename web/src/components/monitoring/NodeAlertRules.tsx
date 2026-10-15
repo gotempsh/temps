@@ -42,6 +42,8 @@ import {
 } from '@/components/ui/table'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { toast } from 'sonner'
 
 /** The control-plane is always node 0 — mirrors `CONTROL_PLANE_NODE_ID`. */
@@ -260,16 +262,15 @@ export function NodeAlertRules() {
             <Skeleton className="h-10 w-full" />
           </div>
         ) : rulesQuery.isError ? (
-          <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-            Failed to load the platform alert rules.{' '}
-            <button
-              type="button"
-              className="underline underline-offset-2"
-              onClick={() => rulesQuery.refetch()}
-            >
-              Retry
-            </button>
-          </p>
+          <ReadFailure
+            resource="Platform alert rules"
+            error={rulesQuery.error}
+            onRetry={
+              isForbiddenRead(rulesQuery.error)
+                ? undefined
+                : () => void rulesQuery.refetch()
+            }
+          />
         ) : rules.length === 0 ? (
           <p className="px-2 py-6 text-center text-sm text-muted-foreground">
             No alert rules on the control-plane node yet. Defaults are seeded

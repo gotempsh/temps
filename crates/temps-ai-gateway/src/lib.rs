@@ -5,7 +5,9 @@ pub mod error;
 pub mod handlers;
 pub mod native_types;
 pub mod plugin;
+pub mod provider_url;
 pub mod providers;
+pub mod self_hosted;
 pub mod services;
 pub mod types;
 

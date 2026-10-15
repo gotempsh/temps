@@ -37,6 +37,9 @@ interface ProjectSelectProps {
   placeholder?: string
   disabled?: boolean
   className?: string
+  /** Controls the dropdown, e.g. to open it from a call-to-action elsewhere. */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
 /**
@@ -52,12 +55,23 @@ export function ProjectSelect({
   onValueChange,
   allowAll = true,
   excludeIds,
-  placeholder = 'Select project…',
+  placeholder = 'Select service…',
   disabled,
   className,
+  open: openProp,
+  onOpenChange,
 }: ProjectSelectProps) {
-  const [open, setOpen] = React.useState(false)
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(false)
+  const open = openProp ?? uncontrolledOpen
+  const setOpen = (next: boolean) => {
+    if (openProp === undefined) setUncontrolledOpen(next)
+    onOpenChange?.(next)
+  }
   const queryClient = useQueryClient()
+  // A button with role="combobox" takes no name from its content, so without
+  // `ariaLabel` the picker would be an unnamed control. Fall back to the
+  // visible value (e.g. "All projects") by reference.
+  const valueId = React.useId()
 
   const projectsQuery = useQuery({
     queryKey: ['project-selector-catalog'],
@@ -120,7 +134,7 @@ export function ProjectSelect({
   const triggerLabel =
     value == null
       ? allowAll
-        ? 'All projects'
+        ? 'All services'
         : placeholder
       : (selected?.name ?? placeholder)
 
@@ -132,6 +146,7 @@ export function ProjectSelect({
           variant="outline"
           role="combobox"
           aria-label={ariaLabel}
+          aria-labelledby={ariaLabel ? undefined : valueId}
           aria-expanded={open}
           disabled={disabled}
           className={cn(
@@ -142,7 +157,9 @@ export function ProjectSelect({
         >
           <span className="flex min-w-0 items-center">
             {selected && projectImage(selected)}
-            <span className="truncate">{triggerLabel}</span>
+            <span id={valueId} className="truncate">
+              {triggerLabel}
+            </span>
           </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
@@ -166,7 +183,7 @@ export function ProjectSelect({
               className="mr-1 h-7 w-7 shrink-0"
               onClick={handleRefresh}
               disabled={projectsQuery.isFetching}
-              title="Refresh projects"
+              title="Refresh services"
             >
               <RefreshCw
                 className={cn(
@@ -185,7 +202,7 @@ export function ProjectSelect({
               </div>
             ) : projectsQuery.isError ? (
               <div className="flex flex-col items-center gap-2 p-4 text-center text-sm text-muted-foreground">
-                Failed to load projects
+                Failed to load services
                 <Button
                   type="button"
                   variant="outline"
@@ -197,7 +214,7 @@ export function ProjectSelect({
               </div>
             ) : (
               <>
-                <CommandEmpty>No projects found.</CommandEmpty>
+                <CommandEmpty>No services found.</CommandEmpty>
                 {allowAll && (
                   <CommandGroup>
                     <CommandItem
@@ -213,7 +230,7 @@ export function ProjectSelect({
                           value == null ? 'opacity-100' : 'opacity-0'
                         )}
                       />
-                      <span className="truncate">All projects</span>
+                      <span className="truncate">All services</span>
                     </CommandItem>
                   </CommandGroup>
                 )}

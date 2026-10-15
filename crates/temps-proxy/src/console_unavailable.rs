@@ -133,6 +133,10 @@ pub struct ConsoleUnavailableResponder {
     /// `console_address` resolved the same way `HttpPeer::new` resolves it,
     /// so a hostname-form address (`localhost:8081`) still matches the peer.
     console_socket: Option<SocketAddr>,
+    /// The same console process's public-only listener (ADR-051), when it has
+    /// one. It fails to start, and comes up, together with `console_address`.
+    ingress_address: Option<String>,
+    ingress_socket: Option<SocketAddr>,
     failure_pages: OnceLock<FailurePages>,
 }
 
@@ -146,8 +150,22 @@ impl ConsoleUnavailableResponder {
             state,
             console_address: console_address.to_string(),
             console_socket,
+            ingress_address: None,
+            ingress_socket: None,
             failure_pages: OnceLock::new(),
         }
+    }
+
+    /// Also treat the console's public-only listener as the console, so a
+    /// request bound for it gets the same status page while the console is
+    /// starting or has failed to start.
+    pub fn with_ingress_address(mut self, ingress_address: Option<&str>) -> Self {
+        let ingress_address = ingress_address.filter(|address| !address.is_empty());
+        self.ingress_socket = ingress_address
+            .and_then(|address| address.to_socket_addrs().ok())
+            .and_then(|mut addrs| addrs.next());
+        self.ingress_address = ingress_address.map(str::to_string);
+        self
     }
 
     /// Current console phase. One atomic load.
@@ -165,8 +183,13 @@ impl ConsoleUnavailableResponder {
 
     /// Whether `peer` is this process's console listener.
     pub fn is_console_peer(&self, peer: &HttpPeer) -> bool {
-        match (peer.address().as_inet(), self.console_socket) {
-            (Some(peer_addr), Some(console)) if *peer_addr == console => true,
+        match peer.address().as_inet() {
+            Some(peer_addr)
+                if self.console_socket == Some(*peer_addr)
+                    || self.ingress_socket == Some(*peer_addr) =>
+            {
+                true
+            }
             _ => self.is_console_address(&peer.address().to_string()),
         }
     }
@@ -176,12 +199,12 @@ impl ConsoleUnavailableResponder {
         if address.is_empty() {
             return false;
         }
-        if address == self.console_address {
+        if address == self.console_address || self.ingress_address.as_deref() == Some(address) {
             return true;
         }
-        match (address.parse::<SocketAddr>(), self.console_socket) {
-            (Ok(addr), Some(console)) => addr == console,
-            _ => false,
+        match address.parse::<SocketAddr>() {
+            Ok(addr) => self.console_socket == Some(addr) || self.ingress_socket == Some(addr),
+            Err(_) => false,
         }
     }
 
@@ -527,6 +550,20 @@ mod tests {
             "temps.example.test",
             Some(&gate)
         ));
+    }
+
+    #[test]
+    fn the_public_only_listener_counts_as_the_console() {
+        let responder = failed_responder().with_ingress_address(Some("127.0.0.1:8082"));
+        assert!(responder.is_console_peer(&HttpPeer::new("127.0.0.1:8082", false, String::new())));
+        assert!(responder.is_console_address("127.0.0.1:8082"));
+        assert!(responder.is_console_address("127.0.0.1:8081"));
+        assert!(!responder.is_console_address("127.0.0.1:9000"));
+
+        // An empty address is "no such listener", never a wildcard match.
+        let responder = failed_responder().with_ingress_address(Some(""));
+        assert!(!responder.is_console_address(""));
+        assert!(!responder.is_console_peer(&HttpPeer::new("127.0.0.1:8082", false, String::new())));
     }
 
     #[test]

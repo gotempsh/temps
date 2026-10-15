@@ -6,6 +6,7 @@ import {
   buildBucketedQuery,
   extractIncidentsList,
   incidentStatusBadge,
+  resolveVisibility,
   isValidIncidentStatus,
   isValidSeverity,
   severityColor,
@@ -74,6 +75,11 @@ describe('extractIncidentsList', () => {
     expect(result[0]!.id).toBe(2)
   })
 
+  test('unwraps the server\'s { incidents, total } response', () => {
+    const data = { incidents: [{ id: 7 }], total: 1 } as unknown as Parameters<typeof extractIncidentsList>[0]
+    expect(extractIncidentsList(data).map((i) => i.id)).toEqual([7])
+  })
+
   test('falls back to an empty list rather than throwing on an unexpected shape', () => {
     expect(extractIncidentsList(undefined)).toEqual([])
     expect(extractIncidentsList({} as unknown as Parameters<typeof extractIncidentsList>[0])).toEqual([])
@@ -103,5 +109,17 @@ describe('buildBucketedQuery', () => {
 
   test('drops a malformed environment id instead of sending NaN to the API', () => {
     expect(buildBucketedQuery({ environmentId: 'not-a-number' })).toEqual({})
+  })
+})
+
+describe('resolveVisibility', () => {
+  test('maps --public and --private', () => {
+    expect(resolveVisibility({ public: true })).toBe(true)
+    expect(resolveVisibility({ private: true })).toBe(false)
+  })
+
+  test('requires exactly one flag', () => {
+    expect(typeof resolveVisibility({})).toBe('string')
+    expect(typeof resolveVisibility({ public: true, private: true })).toBe('string')
   })
 })

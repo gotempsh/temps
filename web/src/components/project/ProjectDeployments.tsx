@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { EnvironmentResponse, ProjectResponse } from '@/api/client'
+import {
+  DeploymentResponse,
+  EnvironmentResponse,
+  ProjectResponse,
+} from '@/api/client'
 import {
   cancelDeploymentMutation,
   deployFromImageMutation,
@@ -63,8 +67,10 @@ import {
   RefreshCw,
   Upload,
   UploadCloud,
+  Globe,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import { projectDeploymentsRefetchInterval } from '@/lib/recent-deployments'
 import {
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
@@ -84,6 +90,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     null
   )
   const [promoteTargetEnv, setPromoteTargetEnv] = useState<string>('')
+  // Snapshot of the row the redeploy/promote dialog was opened from. The list
+  // live-polls and pages, so the row can drop off the current page while the
+  // dialog is open; the dialog must keep using the deployment the user chose.
+  const [pinnedDeployment, setPinnedDeployment] =
+    useState<DeploymentResponse | null>(null)
   // Static-files deploy: upload a bundle, then deploy it to an environment.
   const [staticDialogOpen, setStaticDialogOpen] = useState(false)
   const [staticEnv, setStaticEnv] = useState<string>('')
@@ -104,6 +115,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     setSelectedDeployment(null)
     setIsRedeployModalOpen(true)
   }, [])
+  const anyDialogOpen =
+    isRedeployModalOpen ||
+    promoteDeploymentId !== null ||
+    staticDialogOpen ||
+    imageDialogOpen
   const {
     data: deploymentsData,
     isLoading,
@@ -119,7 +135,18 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       },
     }),
     retry: false,
-    refetchOnWindowFocus: true,
+    // Same dialog guard as the interval below: a focus refetch while a dialog
+    // is open would shift the selected row off the page just the same.
+    refetchOnWindowFocus: () => !anyDialogOpen,
+    // A deployment started in the background (webhook, CLI, another tab)
+    // must show up without a reload, and a running one must progress.
+    // Paused while a dialog is open: the dialogs resolve their target row from
+    // this page, and a newer deployment would shift it off the page and strip
+    // the dialog of its commit and environment.
+    refetchInterval: (query) =>
+      anyDialogOpen
+        ? false
+        : projectDeploymentsRefetchInterval(query.state.data?.deployments),
   })
 
   const totalPages = deploymentsData
@@ -298,10 +325,19 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   // A historical redeploy preserves that deployment's image. A new deployment
   // uses the project's saved service-template image before falling back to the
   // latest deployment (for projects created before runtime persistence).
+  const findDeployment = useCallback(
+    (id: number | null): DeploymentResponse | undefined => {
+      if (id == null) return undefined
+      if (pinnedDeployment?.id === id) return pinnedDeployment
+      return deploymentsData?.deployments.find((d) => d.id === id)
+    },
+    [deploymentsData?.deployments, pinnedDeployment]
+  )
+
   const resolveImageRef = useCallback((): string | undefined => {
     const deployments = deploymentsData?.deployments ?? []
     if (selectedDeployment != null) {
-      const sel = deployments.find((d) => d.id === selectedDeployment)
+      const sel = findDeployment(selectedDeployment)
       if (sel?.metadata?.externalImageRef) return sel.metadata.externalImageRef
     }
     const savedImage = serviceTemplateDeployOverrides(project).image_ref
@@ -310,13 +346,16 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       deployments.find((d) => d.metadata?.externalImageRef)?.metadata
         ?.externalImageRef ?? undefined
     )
-  }, [deploymentsData?.deployments, project, selectedDeployment])
+  }, [
+    deploymentsData?.deployments,
+    findDeployment,
+    project,
+    selectedDeployment,
+  ])
 
   const imageRef = resolveImageRef()
 
-  const selectedDeploymentRecord = deploymentsData?.deployments.find(
-    (deployment) => deployment.id === selectedDeployment
-  )
+  const selectedDeploymentRecord = findDeployment(selectedDeployment)
   const selectedDeploymentSourceType = selectedDeploymentRecord
     ? resolveDeploymentSourceType(selectedDeploymentRecord, project.source_type)
     : undefined
@@ -399,7 +438,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           : serviceTemplateDeployOverrides(project)
         const ref = editedImageRef?.trim() || resolveImageRef()
         if (!ref) {
-          toast.error('No image reference found for this project')
+          toast.error('No image reference found for this service')
           return
         }
         await redeployImage.mutateAsync({
@@ -611,9 +650,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   // Get environments that are different from the deployment's environment
   const getPromoteTargetEnvironments = (deploymentId: number) => {
-    const deployment = deploymentsData?.deployments.find(
-      (d) => d.id === deploymentId
-    )
+    const deployment = findDeployment(deploymentId)
     if (!deployment || !environmentsQuery.data) return []
     return (environmentsQuery.data as EnvironmentResponse[]).filter(
       (env) => env.id !== deployment.environment_id
@@ -826,6 +863,31 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     )
   }
 
+  if (!deploymentsData?.deployments.length && project.hosting === 'external') {
+    return (
+      <EmptyPlaceholder
+        className="border-2 border-dashed"
+        icon={Globe}
+        title="Runs outside Temps"
+        description="This app is hosted elsewhere, so Temps does not deploy it. Its analytics, errors and traces arrive through an ingest key."
+        action={
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button asChild>
+              <Link to={`/projects/${project.slug}/analytics`}>
+                Set up analytics
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to={`/projects/${project.slug}/settings/delivery`}>
+                Let Temps host it
+              </Link>
+            </Button>
+          </div>
+        }
+      />
+    )
+  }
+
   if (!deploymentsData?.deployments.length) {
     return (
       <>
@@ -881,33 +943,19 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           onConfirm={handleRedeploy}
           mode={selectedDeployment ? 'redeploy' : 'new'}
           defaultBranch={
-            deploymentsData?.deployments.find(
-              (d) => d.id === selectedDeployment
-            )?.branch ?? project.main_branch
+            findDeployment(selectedDeployment)?.branch ?? project.main_branch
           }
-          defaultCommit={
-            deploymentsData?.deployments.find(
-              (d) => d.id === selectedDeployment
-            )?.commit_hash ?? ''
-          }
-          defaultTag={
-            deploymentsData?.deployments.find(
-              (d) => d.id === selectedDeployment
-            )?.tag ?? ''
-          }
+          defaultCommit={findDeployment(selectedDeployment)?.commit_hash ?? ''}
+          defaultTag={findDeployment(selectedDeployment)?.tag ?? ''}
           defaultType={(() => {
-            const deployment = deploymentsData?.deployments.find(
-              (d) => d.id === selectedDeployment
-            )
+            const deployment = findDeployment(selectedDeployment)
             if (!deployment) return 'branch' // Default to branch for new deployments
             if (deployment?.tag) return 'tag'
             if (deployment?.branch) return 'branch'
             return 'commit'
           })()}
           defaultEnvironment={
-            deploymentsData?.deployments.find(
-              (d) => d.id === selectedDeployment
-            )?.environment_id ?? undefined
+            findDeployment(selectedDeployment)?.environment_id ?? undefined
           }
           isLoading={
             createDeployment.isPending ||
@@ -962,12 +1010,14 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                 deployment={deployment}
                 projectSourceType={project.source_type}
                 onRedeploy={() => {
+                  setPinnedDeployment(deployment)
                   setSelectedDeployment(deployment.id)
                   setIsRedeployModalOpen(true)
                 }}
                 onCancel={() => handleCancelDeployment(deployment.id)}
                 onRollback={() => handleRollbackDeployment(deployment.id)}
                 onPromote={() => {
+                  setPinnedDeployment(deployment)
                   setPromoteDeploymentId(deployment.id)
                   setPromoteTargetEnv('')
                 }}
@@ -999,7 +1049,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               disabled={currentPage <= 1 || isFetching}
             >
               <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline ml-1">Previous</span>
+              <span className="max-sm:sr-only ml-1">Previous</span>
             </Button>
             <Button
               variant="outline"
@@ -1008,7 +1058,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >
-              <span className="hidden sm:inline mr-1">Next</span>
+              <span className="max-sm:sr-only mr-1">Next</span>
               <ChevronRight className="h-4 w-4" />
             </Button>
           </div>
@@ -1025,29 +1075,19 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         onConfirm={handleRedeploy}
         mode={selectedDeployment ? 'redeploy' : 'new'}
         defaultBranch={
-          deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
-            ?.branch ?? project.main_branch
+          findDeployment(selectedDeployment)?.branch ?? project.main_branch
         }
-        defaultCommit={
-          deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
-            ?.commit_hash ?? ''
-        }
-        defaultTag={
-          deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
-            ?.tag ?? ''
-        }
+        defaultCommit={findDeployment(selectedDeployment)?.commit_hash ?? ''}
+        defaultTag={findDeployment(selectedDeployment)?.tag ?? ''}
         defaultType={(() => {
-          const deployment = deploymentsData?.deployments.find(
-            (d) => d.id === selectedDeployment
-          )
+          const deployment = findDeployment(selectedDeployment)
           if (!deployment) return 'branch' // Default to branch for new deployments
           if (deployment?.tag) return 'tag'
           if (deployment?.branch) return 'branch'
           return 'commit'
         })()}
         defaultEnvironment={
-          deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
-            ?.environment_id ?? undefined
+          findDeployment(selectedDeployment)?.environment_id ?? undefined
         }
         isLoading={
           createDeployment.isPending ||

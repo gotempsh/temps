@@ -162,7 +162,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 id: "subscription",
                 label: "Claude subscription",
                 description:
-                    "Run `claude setup-token` on any machine signed in to Claude Pro or Max, then paste the token.",
+                    "Sign in with your Claude Pro or Max account, or paste a token from `claude setup-token`.",
                 format: CredentialFormat::OauthToken,
                 env_var: "",
                 seed_path_rel: ".claude/.credentials.json",

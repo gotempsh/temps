@@ -118,7 +118,16 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
         icon: Sparkles,
         featureKey: 'ai-chat',
       },
-      { title: 'Projects', url: '/projects', icon: Folder },
+      {
+        title: 'Projects',
+        url: '/projects',
+        icon: Folder,
+        // A project (group) overview lives at /p/:slug.
+        activeWhen: (path: string) =>
+          path === '/projects' ||
+          path.startsWith('/projects/') ||
+          path.startsWith('/p/'),
+      },
       { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       // Lives under the /settings/nodes URL for historical reasons, but it is
@@ -575,7 +584,10 @@ function GettingStartedNavItem() {
               tooltip={`Platform setup — ${completedCount}/${totalCount}`}
               className="justify-center"
             >
-              <Link to="/setup">
+              <Link
+                to="/setup"
+                aria-label={`Platform setup, ${completedCount} of ${totalCount} steps complete`}
+              >
                 <BadgeCheck />
               </Link>
             </SidebarMenuButton>
@@ -1076,7 +1088,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         backLabel="Back to menu"
       />
       <SidebarGroup className="py-2">
-        <SidebarMenu aria-label="Project navigation">
+        <SidebarMenu aria-label="Service navigation">
           {items.map((item) => (
             <SidebarMenuItem key={item.section} data-tour={item.section}>
               <SidebarMenuButton

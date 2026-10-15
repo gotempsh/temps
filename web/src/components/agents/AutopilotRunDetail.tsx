@@ -641,13 +641,13 @@ function ConversationViewer({
       case 'system':
         return 'bg-muted text-muted-foreground border-border'
       case 'user':
-        return 'bg-pink-500/10 text-pink-600 dark:text-pink-300 border-pink-500/20'
+        return 'bg-pink-500/10 text-pink-700 dark:text-pink-300 border-pink-500/20'
       case 'assistant':
         return 'bg-purple-500/10 text-purple-600 dark:text-purple-300 border-purple-500/20'
       case 'tool':
         return 'bg-blue-500/10 text-blue-600 dark:text-blue-300 border-blue-500/20'
       case 'result':
-        return 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 border-emerald-500/20'
+        return 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/20'
     }
   }
 
@@ -689,6 +689,7 @@ function ConversationViewer({
         </button>
         <span className="text-border">·</span>
         <select
+          aria-label="Filter run events"
           value={filter}
           onChange={(e) => setFilter(e.target.value as typeof filter)}
           className="bg-transparent text-muted-foreground hover:text-foreground cursor-pointer px-1 py-0.5"
@@ -713,7 +714,7 @@ function ConversationViewer({
         </select>
         <div className="flex-1" />
         {live && (
-          <span className="text-[10px] font-medium text-emerald-500 animate-pulse tracking-wide">
+          <span className="text-[10px] font-medium text-emerald-700 dark:text-emerald-500 animate-pulse tracking-wide">
             ● LIVE
           </span>
         )}
@@ -781,7 +782,9 @@ function ConversationViewer({
                         <span
                           className={cn(
                             'text-xs font-mono font-medium',
-                            isFailed ? 'text-red-500' : 'text-blue-500'
+                            isFailed
+                              ? 'text-red-700 dark:text-red-500'
+                              : 'text-blue-600 dark:text-blue-500'
                           )}
                         >
                           {e.tool}
@@ -793,7 +796,7 @@ function ConversationViewer({
                           <Loader2 className="h-3 w-3 animate-spin text-blue-500" />
                         )}
                         {isFailed && (
-                          <span className="text-[10px] font-medium text-red-500">
+                          <span className="text-[10px] font-medium text-red-700 dark:text-red-500">
                             FAILED
                           </span>
                         )}
@@ -807,7 +810,10 @@ function ConversationViewer({
                               : resultText.length}{' '}
                             chars)
                           </summary>
-                          <pre className="text-xs font-mono bg-muted/30 px-3 py-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
+                          <pre
+                            tabIndex={0}
+                            className="text-xs font-mono bg-muted/30 px-3 py-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-muted-foreground"
+                          >
                             {resultText.slice(0, 2000)}
                             {resultText.length > 2000 ? '\n…' : ''}
                           </pre>
@@ -916,7 +922,10 @@ function ConversationViewer({
                   <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wide">
                     prompt
                   </p>
-                  <div className="text-sm text-muted-foreground bg-background border border-border rounded p-3 max-h-96 overflow-auto">
+                  <div
+                    tabIndex={0}
+                    className="text-sm text-muted-foreground bg-background border border-border rounded p-3 max-h-96 overflow-auto"
+                  >
                     <Markdown>{selected.raw}</Markdown>
                   </div>
                 </>
@@ -926,7 +935,10 @@ function ConversationViewer({
                   <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wide">
                     message
                   </p>
-                  <div className="text-sm text-muted-foreground bg-background border border-border rounded p-3 max-h-96 overflow-auto">
+                  <div
+                    tabIndex={0}
+                    className="text-sm text-muted-foreground bg-background border border-border rounded p-3 max-h-96 overflow-auto"
+                  >
                     <Markdown>
                       {(selected.raw as ConversationEvent).content || ''}
                     </Markdown>
@@ -937,7 +949,10 @@ function ConversationViewer({
                   <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wide">
                     raw
                   </p>
-                  <pre className="text-[11px] font-mono bg-background border border-border rounded p-3 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
+                  <pre
+                    tabIndex={0}
+                    className="text-[11px] font-mono bg-background border border-border rounded p-3 overflow-auto whitespace-pre-wrap break-words text-muted-foreground"
+                  >
                     <HighlightedCode
                       code={
                         typeof selected.raw === 'string'
@@ -1312,7 +1327,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                       href={run.pr_url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-green-400 hover:underline font-medium inline-flex items-center gap-1"
+                      className="text-green-700 dark:text-green-400 hover:underline font-medium inline-flex items-center gap-1"
                     >
                       View PR #{run.pr_number}{' '}
                       <ExternalLink className="h-3 w-3" />
@@ -1325,7 +1340,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                 </span>
               )}
               {(run.status === 'failed' || run.status === 'cancelled') && (
-                <span className="text-red-400">
+                <span className="text-red-700 dark:text-red-400">
                   {run.status === 'failed' ? 'Run failed' : 'Run cancelled'}
                 </span>
               )}
@@ -1406,6 +1421,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           />
           <Button
             size="sm"
+            aria-label="Send context"
             onClick={onSendContext}
             disabled={!contextInput.trim() || isSendingContext}
           >
@@ -1515,19 +1531,19 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
               {errorGroup.error_type && (
                 <span>
-                  <span className="text-muted-foreground/70">Type:</span>{' '}
+                  <span className="text-muted-foreground">Type:</span>{' '}
                   <code className="text-xs">{errorGroup.error_type}</code>
                 </span>
               )}
               {errorGroup.total_count != null && (
                 <span>
-                  <span className="text-muted-foreground/70">Occurrences:</span>{' '}
+                  <span className="text-muted-foreground">Occurrences:</span>{' '}
                   {errorGroup.total_count}
                 </span>
               )}
               {errorGroup.first_seen && (
                 <span>
-                  <span className="text-muted-foreground/70">First seen:</span>{' '}
+                  <span className="text-muted-foreground">First seen:</span>{' '}
                   {new Date(errorGroup.first_seen).toLocaleString()}
                 </span>
               )}
@@ -1551,7 +1567,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                   <DialogHeader>
                     <DialogTitle>Full error message</DialogTitle>
                   </DialogHeader>
-                  <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words">
+                  <pre
+                    tabIndex={0}
+                    className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words"
+                  >
                     {run.error_message}
                   </pre>
                 </DialogContent>
@@ -1570,7 +1589,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           <FileCode className="h-4 w-4" />
           <AlertTitle className="flex items-center gap-2">
             Ephemeral CLI run
-            <span className="text-[10px] uppercase tracking-wide bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-medium">
+            <span className="text-[10px] uppercase tracking-wide bg-blue-500/10 text-blue-600 dark:text-blue-400 px-1.5 py-0.5 rounded font-medium">
               dry-run
             </span>
           </AlertTitle>
@@ -1597,7 +1616,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                       The exact config the executor ran.
                     </DialogDescription>
                   </DialogHeader>
-                  <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[60vh] whitespace-pre-wrap break-all">
+                  <pre
+                    tabIndex={0}
+                    className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[60vh] whitespace-pre-wrap break-all"
+                  >
                     <HighlightedCode
                       code={run.ephemeral_yaml}
                       language={'yaml'}
@@ -1625,7 +1647,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           </CardHeader>
           {run.user_context && (
             <CardContent className="pt-0">
-              <pre className="whitespace-pre-wrap text-xs font-mono bg-muted p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto">
+              <pre
+                tabIndex={0}
+                className="whitespace-pre-wrap text-xs font-mono bg-muted p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto"
+              >
                 <HighlightedCode
                   code={(() => {
                     try {
@@ -1668,7 +1693,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                       context merged.
                     </DialogDescription>
                   </DialogHeader>
-                  <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words">
+                  <pre
+                    tabIndex={0}
+                    className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words"
+                  >
                     <HighlightedCode
                       code={run.prompt_text}
                       language={'markdown'}
@@ -1679,7 +1707,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             </div>
           </CardHeader>
           <CardContent className="pt-0">
-            <pre className="whitespace-pre-wrap text-xs font-mono bg-muted p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto">
+            <pre
+              tabIndex={0}
+              className="whitespace-pre-wrap text-xs font-mono bg-muted p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto"
+            >
               <HighlightedCode
                 code={
                   run.prompt_text.length > 1200
@@ -1749,6 +1780,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           >
             <Link
               to={settingsSectionHref(project.slug, 'automation', 'agents')}
+              aria-label="Back to agents"
             >
               <ArrowLeft className="h-4 w-4" />
             </Link>
@@ -1763,7 +1795,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             </h1>
           )}
           {isStreaming && (
-            <span className="text-[10px] font-medium text-emerald-500 animate-pulse tracking-wide">
+            <span className="text-[10px] font-medium text-emerald-700 dark:text-emerald-500 animate-pulse tracking-wide">
               ● LIVE
             </span>
           )}

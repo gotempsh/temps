@@ -239,6 +239,66 @@ use super::deployment_token_service::DeploymentTokenService;
 
 const BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
 
+/// Plaintext job-config field listing the build arguments whose values may
+/// be sent to a worker build. Names only, like `build_args_keys`.
+pub(crate) const WORKER_BUILD_ARG_KEYS_FIELD: &str = "worker_build_arg_keys";
+
+/// Values the planner knows to be public: the project's variables that are
+/// not marked secret, and the platform's own non-secret values (the bind
+/// address, the browser Sentry DSN and tunnel, the API and OTLP endpoints,
+/// asset prefixes). A build argument may be sent to a worker build only when
+/// its final value is the one recorded here, so a secret source that sets the
+/// same name later -- a secrets-manager binding, a linked service, a platform
+/// token -- keeps it on the control plane.
+///
+/// Deliberately not `Debug`: it holds values.
+#[derive(Default)]
+pub(crate) struct PublicBuildValues(std::collections::HashMap<String, String>);
+
+impl PublicBuildValues {
+    pub(crate) fn record(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.0.insert(name.into(), value.into());
+    }
+
+    /// Record each of `names` with its current value in `env`. Only for
+    /// names the platform itself just set unconditionally: a name it merely
+    /// defaults (`or_insert`) may hold a project's secret value instead.
+    fn record_present(&mut self, env: &std::collections::HashMap<String, String>, names: &[&str]) {
+        for name in names {
+            if let Some(value) = env.get(*name) {
+                self.record(*name, value.clone());
+            }
+        }
+    }
+
+    /// The names in `build_args` whose values may be sent to a worker build,
+    /// sorted. Never a `BUILDKIT_*` argument (the cache namespace travels on
+    /// its own) or the `.npmrc` credentials.
+    pub(crate) fn worker_build_arg_keys(
+        &self,
+        build_args: &std::collections::HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut keys: Vec<String> = build_args
+            .iter()
+            .filter(|(name, value)| self.0.get(name.as_str()) == Some(*value))
+            .map(|(name, _)| name.clone())
+            .filter(|name| {
+                temps_deployer::build_protocol::is_worker_build_arg_name(name)
+                    && !matches!(name.as_str(), "NPM_TOKEN" | "NPM_RC")
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+}
+
+/// A deployment's resolved variables, with the record of which of their
+/// values are public.
+struct DeploymentVariables {
+    values: std::collections::HashMap<String, String>,
+    public: PublicBuildValues,
+}
+
 /// Derive an opaque, stable namespace for BuildKit cache mounts.
 ///
 /// Cache mounts are writable and live on a shared builder. A public namespace
@@ -411,18 +471,20 @@ impl WorkflowPlanner {
         project: &projects::Model,
         environment: &environments::Model,
         deployment: &deployments::Model,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    ) -> anyhow::Result<(std::collections::HashMap<String, String>, PublicBuildValues)> {
         use std::collections::{BTreeMap, HashMap};
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
         let mut explicit_project_vars = HashMap::new();
+        let mut public_values = PublicBuildValues::default();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
         // which is required for external access via port mapping
         // Can be overridden by user-defined environment variables
         env_vars_map.insert("HOST".to_string(), "0.0.0.0".to_string());
+        public_values.record("HOST", "0.0.0.0");
 
         // 1. Get environment variables for this project and environment
         // Query through the env_var_environments junction table to get all env vars
@@ -457,6 +519,9 @@ impl WorkflowPlanner {
                 } else {
                     env_var.value
                 };
+                if !env_var.is_secret {
+                    public_values.record(env_var.key.clone(), value.clone());
+                }
                 explicit_project_vars.insert(env_var.key, value);
             }
         }
@@ -465,6 +530,29 @@ impl WorkflowPlanner {
             "📦 Loaded {} environment variables from env_vars table via env_var_environments",
             explicit_project_vars.len()
         );
+
+        // 1b. Variables inherited from the project's group sit beneath the
+        // project's own values (which win) and above linked-service defaults.
+        // A failure is a `GroupEnvError`, which names the project,
+        // environment, group and variable key.
+        let inherited = crate::services::group_env::inherited_group_env_vars(
+            self.db.as_ref(),
+            self.encryption_service.as_ref(),
+            project.id,
+            environment,
+        )
+        .await?;
+        // The winning non-secret inherited values are public build values,
+        // exactly as the project's own non-secret variables are above: a
+        // remote builder may receive them. A value the project overrode, a
+        // secret, and a variable scoped to another environment (never
+        // selected) are not recorded.
+        for (key, value) in crate::services::group_env::merge_inherited_beneath(
+            &mut explicit_project_vars,
+            inherited,
+        ) {
+            public_values.record(key, value);
+        }
 
         // 2. Get runtime environment variables from external services
         // First, get all services linked to this project
@@ -642,8 +730,10 @@ impl WorkflowPlanner {
             project.id, environment.id
         );
 
-        // Get base URL from config service for DSN generation
-        match self.config_service.get_external_url_or_default().await {
+        // The DSN is reported to by the application and by browser SDKs it
+        // ships, so it is built from the public ingress URL (ADR-051), which
+        // defaults to the external URL.
+        match self.config_service.get_public_ingress_url().await {
             Ok(base_url) => {
                 match self
                     .dsn_service
@@ -683,6 +773,14 @@ impl WorkflowPlanner {
                         if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
                             env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
+
+                        // A DSN carries only a public key -- browser bundles
+                        // embed it -- and the tunnel is a path, so a worker
+                        // build may receive all four.
+                        let mut sentry_vars = vec!["SENTRY_DSN", "SENTRY_TUNNEL"];
+                        sentry_vars.extend(public_sentry_dsn_var(project.preset));
+                        sentry_vars.extend(public_sentry_tunnel_var(project.preset));
+                        public_values.record_present(&env_vars_map, &sentry_vars);
                     }
                     Err(e) => {
                         // Warn about Sentry DSN failure but don't fail the deployment
@@ -723,6 +821,7 @@ impl WorkflowPlanner {
             Ok(base_url) => {
                 // Set the API URL - this is always available
                 env_vars_map.insert("TEMPS_API_URL".to_string(), format!("{}/api", base_url));
+                public_values.record_present(&env_vars_map, &["TEMPS_API_URL"]);
 
                 // Get or create the deployment token
                 match self
@@ -798,12 +897,25 @@ impl WorkflowPlanner {
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 
-            // Use commit SHA as service version when available
+            // Use commit SHA as service version when available. A value the
+            // project set wins, and keeps whatever classification it had.
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map
-                    .entry("OTEL_SERVICE_VERSION".to_string())
-                    .or_insert_with(|| commit_sha.clone());
+                if !env_vars_map.contains_key("OTEL_SERVICE_VERSION") {
+                    env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                    public_values.record("OTEL_SERVICE_VERSION", commit_sha.clone());
+                }
             }
+
+            // Only the three the platform set unconditionally above. The
+            // headers carry the deployment token and stay unrecorded.
+            public_values.record_present(
+                &env_vars_map,
+                &[
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL",
+                    "OTEL_SERVICE_NAME",
+                ],
+            );
 
             debug!(
                 "Set OTEL_EXPORTER_OTLP_ENDPOINT for project {} environment {}",
@@ -816,7 +928,7 @@ impl WorkflowPlanner {
             env_vars_map.len(),
             env_vars_map.keys().cloned().collect::<Vec<_>>().join(", ")
         );
-        Ok(env_vars_map)
+        Ok((env_vars_map, public_values))
     }
 
     /// Gathers secrets visible to this deployment, decrypted and keyed by name.
@@ -1191,6 +1303,18 @@ impl WorkflowPlanner {
         }
         let docker_socket_authorized = caller.may_deploy_granted_project();
 
+        // Every deploy path (API, push webhook, rollback, redeploy) is
+        // planned here, so this is where a project whose app runs elsewhere
+        // is refused.
+        if let Some(reason) = project.hosting.deploy_refusal(&project.name) {
+            warn!(
+                deployment_id,
+                project_id = project.id,
+                "Refused to plan a deployment for a project hosted outside Temps"
+            );
+            return Err(anyhow::anyhow!("{reason}"));
+        }
+
         info!(
             "Planning workflow for deployment {} (project: {}, env: {})",
             deployment_id, project.name, environment.name
@@ -1408,7 +1532,7 @@ impl WorkflowPlanner {
         );
 
         // Gather environment variables for the deployment
-        let mut env_vars = self
+        let (mut env_vars, mut public_values) = self
             .gather_environment_variables(project, environment, deployment)
             .await?;
 
@@ -1448,6 +1572,16 @@ impl WorkflowPlanner {
             &deployment.slug,
             default_port,
         );
+        // Record exactly what `apply_deployment_owned_variables` just set: a
+        // name it left alone may still hold a project's secret value.
+        let mut deployment_owned = vec!["TEMPS_ASSET_PREFIX"];
+        if default_port.is_some() {
+            deployment_owned.push("PORT");
+        }
+        if project.preset == temps_entities::preset::Preset::NextJs {
+            deployment_owned.push("NEXT_PUBLIC_TEMPS_ASSET_PREFIX");
+        }
+        public_values.record_present(&env_vars, &deployment_owned);
 
         debug!(
             "📦 Gathered {} environment variables for deployment",
@@ -1518,23 +1652,15 @@ impl WorkflowPlanner {
                 self.plan_static_bundle_deployment(project, environment, deployment, env_vars)
                     .await
             }
-            SourceType::Git => {
+            SourceType::Git | SourceType::UploadedSource => {
                 self.plan_git_deployment(
                     project,
                     environment,
                     deployment,
-                    env_vars,
-                    remote_env_plan,
-                    secrets,
-                )
-                .await
-            }
-            SourceType::UploadedSource => {
-                self.plan_git_deployment(
-                    project,
-                    environment,
-                    deployment,
-                    env_vars,
+                    DeploymentVariables {
+                        values: env_vars,
+                        public: public_values,
+                    },
                     remote_env_plan,
                     secrets,
                 )
@@ -1567,10 +1693,14 @@ impl WorkflowPlanner {
         project: &projects::Model,
         environment: &environments::Model,
         deployment: &deployments::Model,
-        mut env_vars: std::collections::HashMap<String, String>,
+        variables: DeploymentVariables,
         remote_env_plan: RemoteEnvironmentPlan,
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
+        let DeploymentVariables {
+            values: mut env_vars,
+            public: mut public_values,
+        } = variables;
         let mut jobs = Vec::new();
 
         let source_bundle_path = deployment
@@ -1593,9 +1723,10 @@ impl WorkflowPlanner {
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
         if let Some(ref commit_sha) = deployment.commit_sha {
-            env_vars
-                .entry("SENTRY_RELEASE".to_string())
-                .or_insert_with(|| commit_sha.clone());
+            if !env_vars.contains_key("SENTRY_RELEASE") {
+                env_vars.insert("SENTRY_RELEASE".to_string(), commit_sha.clone());
+                public_values.record("SENTRY_RELEASE", commit_sha.clone());
+            }
         }
 
         // Inject Sentry source map upload env vars so `@sentry/nextjs` (and other Sentry
@@ -1604,26 +1735,35 @@ impl WorkflowPlanner {
         //
         // Docker builds use networkmode "host" (BuildKit) so the container can reach the
         // Temps server. Auth uses deployment tokens (dt_*) validated via the Sentry-compat API.
+        //
+        // The URL, organization and project are public; a value a project
+        // variable already set keeps whatever classification it had.
+        // SENTRY_AUTH_TOKEN is the deployment token and stays unrecorded.
         if let Some(api_url) = env_vars.get("TEMPS_API_URL").cloned() {
             let sentry_url = api_url.trim_end_matches("/api").to_string();
-            env_vars
-                .entry("SENTRY_URL".to_string())
-                .or_insert(sentry_url);
+            if !env_vars.contains_key("SENTRY_URL") {
+                public_values.record("SENTRY_URL", sentry_url.clone());
+                env_vars.insert("SENTRY_URL".to_string(), sentry_url);
+            }
         }
         if let Some(api_token) = env_vars.get("TEMPS_API_TOKEN").cloned() {
             env_vars
                 .entry("SENTRY_AUTH_TOKEN".to_string())
                 .or_insert(api_token);
         }
-        env_vars
-            .entry("SENTRY_ORG".to_string())
-            .or_insert_with(|| "default".to_string());
-        env_vars
-            .entry("SENTRY_PROJECT".to_string())
-            .or_insert_with(|| project.slug.clone());
+        for (name, value) in [
+            ("SENTRY_ORG", "default".to_string()),
+            ("SENTRY_PROJECT", project.slug.clone()),
+        ] {
+            if !env_vars.contains_key(name) {
+                public_values.record(name, value.clone());
+                env_vars.insert(name.to_string(), value);
+            }
+        }
 
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
+        let is_uploaded_source = source_job_id == "prepare_source_bundle";
 
         // Job 1: Download repository (only if git info is available)
         if let Some(archive_path) = source_bundle_path {
@@ -1772,6 +1912,10 @@ impl WorkflowPlanner {
             });
             if let Some(obj) = build_job_config.as_object_mut() {
                 self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+                obj.insert(
+                    WORKER_BUILD_ARG_KEYS_FIELD.to_string(),
+                    serde_json::json!(public_values.worker_build_arg_keys(&build_args_map)),
+                );
             }
 
             // Job 2: Build image (for static deployments, this builds the static files inside container)
@@ -1879,6 +2023,10 @@ impl WorkflowPlanner {
             });
             if let Some(obj) = build_job_config.as_object_mut() {
                 self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+                obj.insert(
+                    WORKER_BUILD_ARG_KEYS_FIELD.to_string(),
+                    serde_json::json!(public_values.worker_build_arg_keys(&build_args_map)),
+                );
             }
 
             jobs.push(JobDefinition {
@@ -2056,11 +2204,13 @@ impl WorkflowPlanner {
         });
         debug!("Added mark_deployment_complete job as barrier between core and optional jobs");
 
-        // Job 5: Configure cron jobs (only if git info is available)
-        // This job reads .temps.yaml from the repository and configures cron jobs
-        // It runs AFTER deployment is marked complete (via mark_deployment_complete job)
-        // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info {
+        // Job 5: Configure cron jobs and metric alert rules from .temps.yaml.
+        // Both read the file from the source tree the source job produced
+        // (a git checkout, or the extracted upload for a Drop deployment), so
+        // they are planned whenever there is a source tree to read.
+        // They run AFTER deployment is marked complete (via mark_deployment_complete job)
+        // NOT required for deployment completion - if they fail, deployment still succeeds
+        if has_git_info || is_uploaded_source {
             jobs.push(JobDefinition {
                 job_id: "configure_crons".to_string(),
                 job_type: "ConfigureCronsJob".to_string(),
@@ -2100,7 +2250,13 @@ impl WorkflowPlanner {
             debug!(
                 "Added configure_metric_alerts job to workflow (runs after deployment is marked complete)"
             );
+        } else {
+            debug!("Skipping configure_crons job - no source tree to read .temps.yaml from");
+        }
 
+        // Agent definitions come from `.temps/agents/*.yaml` of a git
+        // repository; uploaded sources do not sync them.
+        if has_git_info {
             // Job: Sync agent definitions from .temps/agents/*.yaml
             // Runs in parallel with configure_crons, after deployment is complete
             jobs.push(JobDefinition {
@@ -2118,8 +2274,6 @@ impl WorkflowPlanner {
             debug!(
                 "Added configure_agents job to workflow (runs after deployment is marked complete)"
             );
-        } else {
-            debug!("Skipping configure_crons job - no git info available");
         }
 
         // Job 6: Take screenshot (only if screenshots are enabled in config)
@@ -3672,6 +3826,150 @@ mod tests {
         Ok(())
     }
 
+    /// Plan the jobs of an uploaded-source (Drop) deployment of `preset`.
+    /// `None` when the test database (Docker) is unavailable.
+    async fn plan_uploaded_source_jobs(
+        preset: Preset,
+    ) -> Result<Option<Vec<deployment_jobs::Model>>, Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping uploaded-source planner test: {error}");
+                return Ok(None);
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _environment, deployment) = create_test_project(db.as_ref(), preset).await?;
+
+        let mut project_update: projects::ActiveModel = project.into();
+        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        project_update.repo_owner = Set(String::new());
+        project_update.repo_name = Set(String::new());
+        project_update.git_provider_connection_id = Set(None);
+        project_update.directory = Set(".".to_string());
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.into();
+        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        let deployment = deployment_update.update(db.as_ref()).await?;
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+        Ok(Some(jobs))
+    }
+
+    fn planned_job<'a>(
+        jobs: &'a [deployment_jobs::Model],
+        id: &str,
+    ) -> Option<&'a deployment_jobs::Model> {
+        jobs.iter().find(|job| job.job_id == id)
+    }
+
+    fn assert_reads_temps_yaml_from(job: &deployment_jobs::Model, source_job: &str) {
+        assert_eq!(
+            job.dependencies,
+            Some(serde_json::json!(["mark_deployment_complete"])),
+            "{} must wait until the deployment is live",
+            job.job_id
+        );
+        assert_eq!(
+            job.job_config
+                .as_ref()
+                .and_then(|config| config.get("download_job_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(source_job),
+            "{} must read the tree {source_job} produced",
+            job.job_id
+        );
+    }
+
+    /// A Drop deployment has no git info, but its extracted bundle can carry a
+    /// `.temps.yaml`; the cron and metric-alert jobs read it from there.
+    #[tokio::test]
+    async fn uploaded_source_deployment_plans_temps_yaml_jobs_from_the_bundle(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A static site (no build) and a container app take different deploy
+        // paths; both must reconcile `.temps.yaml`.
+        for preset in [Preset::Static, Preset::NextJs] {
+            let Some(jobs) = plan_uploaded_source_jobs(preset).await? else {
+                return Ok(());
+            };
+            assert!(
+                planned_job(&jobs, "prepare_source_bundle").is_some(),
+                "{preset:?}: the upload must be extracted"
+            );
+            assert!(planned_job(&jobs, "download_repo").is_none());
+
+            let crons = planned_job(&jobs, "configure_crons")
+                .unwrap_or_else(|| panic!("{preset:?}: configure_crons must be planned"));
+            assert_eq!(crons.job_type, "ConfigureCronsJob");
+            assert_reads_temps_yaml_from(crons, "prepare_source_bundle");
+
+            let alerts = planned_job(&jobs, "configure_metric_alerts")
+                .unwrap_or_else(|| panic!("{preset:?}: configure_metric_alerts must be planned"));
+            assert_eq!(alerts.job_type, "ConfigureMetricAlertsJob");
+            assert_reads_temps_yaml_from(alerts, "prepare_source_bundle");
+
+            // Agent definitions are synced from a git repository only.
+            assert!(planned_job(&jobs, "configure_agents").is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn git_deployment_still_plans_crons_alerts_and_agents_from_download_repo(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping git planner test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+
+        assert!(planned_job(&jobs, "prepare_source_bundle").is_none());
+        for id in ["configure_crons", "configure_metric_alerts"] {
+            let job = planned_job(&jobs, id).unwrap_or_else(|| panic!("{id} must be planned"));
+            assert_reads_temps_yaml_from(job, "download_repo");
+        }
+        assert!(planned_job(&jobs, "configure_agents").is_some());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn compose_cache_namespace_is_sealed_build_only_and_tenant_proof(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4399,6 +4697,27 @@ mod tests {
         Ok(())
     }
 
+    /// The `deploy_refusal` guard in `plan_deployment_workflow` fires before
+    /// any DB queries. Verify the `Hosting` type's contract: Hosted always
+    /// returns None (allow), External returns Some with the project name.
+    /// The full workflow path is tested through the handler layer; this unit
+    /// test pins the guard's shape so a refactor cannot silence it.
+    #[test]
+    fn external_hosting_produces_a_deploy_refusal() {
+        use temps_entities::types::Hosting;
+        assert!(
+            Hosting::Hosted.deploy_refusal("my-app").is_none(),
+            "Hosted projects must have no refusal"
+        );
+        let reason = Hosting::External
+            .deploy_refusal("my-app")
+            .expect("External projects must have a refusal reason");
+        assert!(
+            reason.contains("my-app"),
+            "refusal reason must name the project; got: {reason}"
+        );
+    }
+
     /// ADR 045: the executor recovers the deploy authority from the job row
     /// the planner wrote, because there is no request left to re-derive it
     /// from. Everything that is not an explicit `true` must come back as an
@@ -4428,5 +4747,524 @@ mod tests {
                 "must fail closed for {config}"
             );
         }
+    }
+
+    /// A name is sent to a worker build only while its final value is the
+    /// one recorded as public: a secret source that later sets the same name
+    /// keeps it on the control plane.
+    #[test]
+    fn public_build_values_follow_the_final_value() {
+        let mut public = PublicBuildValues::default();
+        public.record("HOST", "0.0.0.0");
+        public.record("VITE_API_URL", "https://api.example.test");
+        public.record("SENTRY_RELEASE", "abc123");
+        public.record("NPM_TOKEN", "recorded-but-never-sent");
+        public.record("BUILDKIT_SYNTAX", "recorded-but-never-sent");
+        let build_args: std::collections::HashMap<String, String> = [
+            ("HOST", "0.0.0.0"),
+            ("VITE_API_URL", "https://api.example.test"),
+            // Overridden later by a secret source.
+            ("SENTRY_RELEASE", "secret-override"),
+            ("TEMPS_API_TOKEN", "never-recorded"),
+            ("NPM_TOKEN", "recorded-but-never-sent"),
+            ("BUILDKIT_SYNTAX", "recorded-but-never-sent"),
+            (BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG, "ns"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(
+            public.worker_build_arg_keys(&build_args),
+            vec!["HOST".to_string(), "VITE_API_URL".to_string()]
+        );
+    }
+
+    /// A non-secret variable inherited from the project's group is a public
+    /// build value, exactly as the same variable set on the project is, so a
+    /// remote builder receives it. A group secret, a group value the project
+    /// overrode, and a group variable scoped to another environment never
+    /// leave the control plane as the group's value.
+    #[tokio::test]
+    async fn inherited_group_variables_reach_worker_builds_only_when_public(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{
+            env_var_environments, env_vars, project_group_env_vars, project_group_members,
+            project_groups,
+        };
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping group worker variables test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let catalog_preset = temps_presets::all_presets()
+            .into_iter()
+            .find(|preset| preset.slug() == "vite")
+            .ok_or("the vite preset is in the catalog")?;
+        let stored = catalog_preset.resolve_storage(None)?;
+        let project = projects::ActiveModel {
+            name: Set("Group worker vars".to_string()),
+            slug: Set("group-worker-vars".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            main_branch: Set("main".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(stored.preset),
+            preset_config: Set(stored.config.clone()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("group-worker-vars.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("group-worker-vars.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("group-worker-vars-deployment".to_string()),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // The project's own variables: one public value that overrides the
+        // group's, and one secret under a name the group sets publicly.
+        for (key, value, is_secret) in [
+            ("VITE_OVERRIDDEN", "project-public", false),
+            ("VITE_SECRET_OVERRIDE", "project-secret", true),
+        ] {
+            let variable = env_vars::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                key: Set(key.to_string()),
+                value: Set(value.to_string()),
+                is_secret: Set(is_secret),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            env_var_environments::ActiveModel {
+                env_var_id: Set(variable.id),
+                environment_id: Set(environment.id),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let group = project_groups::ActiveModel {
+            name: Set("Worker vars group".to_string()),
+            slug: Set("worker-vars-group".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        project_group_members::ActiveModel {
+            project_id: Set(project.id),
+            group_id: Set(group.id),
+            position: Set(0),
+            inherits_repository: Set(false),
+            added_at: Set(Utc::now()),
+        }
+        .insert(db.as_ref())
+        .await?;
+        for (key, value, is_secret, environment_slug) in [
+            ("VITE_API_URL", "https://api.example.test", false, None),
+            ("VITE_GROUP_TOKEN", "group-secret-value", true, None),
+            ("VITE_OVERRIDDEN", "group-public", false, None),
+            ("VITE_SECRET_OVERRIDE", "group-public", false, None),
+            (
+                "VITE_STAGING_ONLY",
+                "staging-value",
+                false,
+                Some("staging".to_string()),
+            ),
+        ] {
+            project_group_env_vars::ActiveModel {
+                group_id: Set(group.id),
+                key: Set(key.to_string()),
+                value: Set(encryption_service.encrypt_string(value)?),
+                is_secret: Set(is_secret),
+                environment_slug: Set(environment_slug),
+                include_in_preview: Set(true),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+        let build_job = jobs
+            .iter()
+            .find(|job| job.job_id == "build_image")
+            .ok_or("a vite project has a build job")?;
+        let config = build_job
+            .job_config
+            .as_ref()
+            .ok_or("a build job has configuration")?;
+        let build_args = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        let keys: std::collections::BTreeSet<String> = config
+            .get(WORKER_BUILD_ARG_KEYS_FIELD)
+            .and_then(|value| value.as_array())
+            .ok_or("the build job lists its worker build arguments")?
+            .iter()
+            .filter_map(|key| key.as_str().map(str::to_owned))
+            .collect();
+
+        // The public group value is built in and may go to a worker.
+        assert_eq!(
+            build_args.get("VITE_API_URL").map(String::as_str),
+            Some("https://api.example.test")
+        );
+        assert!(keys.contains("VITE_API_URL"), "keys: {keys:?}");
+
+        // The project's own public value wins and is the one a worker gets.
+        assert_eq!(
+            build_args.get("VITE_OVERRIDDEN").map(String::as_str),
+            Some("project-public")
+        );
+        assert!(keys.contains("VITE_OVERRIDDEN"), "keys: {keys:?}");
+
+        // A group secret is built in but stays on the control plane.
+        assert_eq!(
+            build_args.get("VITE_GROUP_TOKEN").map(String::as_str),
+            Some("group-secret-value")
+        );
+        assert!(!keys.contains("VITE_GROUP_TOKEN"), "keys: {keys:?}");
+
+        // The project's secret wins, and the group's public value under the
+        // same name is not recorded, so the name is withheld.
+        assert_eq!(
+            build_args.get("VITE_SECRET_OVERRIDE").map(String::as_str),
+            Some("project-secret")
+        );
+        assert!(!keys.contains("VITE_SECRET_OVERRIDE"), "keys: {keys:?}");
+
+        // Another environment's variable is not inherited at all.
+        assert!(!build_args.contains_key("VITE_STAGING_ONLY"));
+        assert!(!keys.contains("VITE_STAGING_ONLY"), "keys: {keys:?}");
+        Ok(())
+    }
+
+    /// Inherited group variables go through the same record as the project's:
+    /// the winning non-secret value is sendable, a secret or an overridden
+    /// value is not.
+    #[test]
+    fn inherited_non_secret_values_are_recorded_as_public() {
+        use crate::services::group_env::{merge_inherited_beneath, InheritedGroupVariable};
+
+        let inherited = |value: &str, is_secret: bool| InheritedGroupVariable {
+            value: value.to_string(),
+            is_secret,
+        };
+        let mut explicit: std::collections::HashMap<String, String> = [
+            ("VITE_OVERRIDDEN", "project-public"),
+            ("VITE_SECRET_OVERRIDE", "project-secret"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let mut public = PublicBuildValues::default();
+        public.record("VITE_OVERRIDDEN", "project-public");
+        for (name, value) in merge_inherited_beneath(
+            &mut explicit,
+            [
+                ("VITE_API_URL", inherited("https://api.example.test", false)),
+                ("VITE_GROUP_TOKEN", inherited("group-secret", true)),
+                ("VITE_OVERRIDDEN", inherited("group-public", false)),
+                ("VITE_SECRET_OVERRIDE", inherited("group-public", false)),
+            ]
+            .into_iter()
+            .map(|(name, variable)| (name.to_string(), variable))
+            .collect(),
+        ) {
+            public.record(name, value);
+        }
+
+        assert_eq!(
+            public.worker_build_arg_keys(&explicit),
+            vec!["VITE_API_URL".to_string(), "VITE_OVERRIDDEN".to_string()]
+        );
+        assert_eq!(
+            explicit.get("VITE_OVERRIDDEN").map(String::as_str),
+            Some("project-public")
+        );
+    }
+
+    /// Issue #1344, at the planner, for every preset in the catalog
+    /// (`temps_presets::all_presets`): the build job records which of the
+    /// variables it carries a worker may receive. That always includes the
+    /// platform's public Sentry DSN and tunnel for the framework and the
+    /// project's non-secret variables, never a secret or a platform
+    /// credential -- so the platform's own variables can neither block nor
+    /// downgrade a worker build.
+    #[tokio::test]
+    async fn every_preset_plan_lets_worker_builds_receive_public_variables(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars};
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping every-preset worker variables test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+        const PUBLIC_USER_VARS: [&str; 4] = [
+            "VITE_API_URL",
+            "NEXT_PUBLIC_SITE_NAME",
+            "PUBLIC_SITE_TITLE",
+            "REACT_APP_FEATURE",
+        ];
+        // The last two reuse names the platform only sets conditionally (a
+        // default, and a Next.js-only value): a project's secret under such
+        // a name must stay a secret.
+        const SECRET_USER_VARS: [&str; 4] = [
+            "VITE_PRIVATE_TOKEN",
+            "DATABASE_URL",
+            "OTEL_SERVICE_VERSION",
+            "NEXT_PUBLIC_TEMPS_ASSET_PREFIX",
+        ];
+
+        let mut planned = Vec::new();
+        for (index, catalog_preset) in temps_presets::all_presets().into_iter().enumerate() {
+            let slug = catalog_preset.slug();
+            let stored = catalog_preset.resolve_storage(None)?;
+            if stored.preset == Preset::DockerCompose {
+                continue;
+            }
+            let project = projects::ActiveModel {
+                name: Set(format!("Worker vars {slug}")),
+                slug: Set(format!("worker-vars-{index}")),
+                repo_owner: Set("test-owner".to_string()),
+                repo_name: Set("test-repo".to_string()),
+                main_branch: Set("main".to_string()),
+                git_provider_connection_id: Set(Some(1)),
+                preset: Set(stored.preset),
+                preset_config: Set(stored.config.clone()),
+                directory: Set("/".to_string()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            let environment = environments::ActiveModel {
+                project_id: Set(project.id),
+                name: Set("Production".to_string()),
+                slug: Set("production".to_string()),
+                host: Set(format!("worker-vars-{index}.example.com")),
+                upstreams: Set(UpstreamList::default()),
+                subdomain: Set(format!("worker-vars-{index}.example.com")),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            let deployment = deployments::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                slug: Set(format!("worker-vars-{index}-deployment")),
+                state: Set("pending".to_string()),
+                metadata: Set(Some(
+                    temps_entities::deployments::DeploymentMetadata::default(),
+                )),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            for (key, is_secret) in PUBLIC_USER_VARS
+                .iter()
+                .map(|key| (*key, false))
+                .chain(SECRET_USER_VARS.iter().map(|key| (*key, true)))
+            {
+                let variable = env_vars::ActiveModel {
+                    project_id: Set(project.id),
+                    environment_id: Set(Some(environment.id)),
+                    key: Set(key.to_string()),
+                    value: Set(format!("synthetic-{}", key.to_ascii_lowercase())),
+                    is_secret: Set(is_secret),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await?;
+                env_var_environments::ActiveModel {
+                    env_var_id: Set(variable.id),
+                    environment_id: Set(environment.id),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await?;
+            }
+
+            let jobs = planner
+                .create_deployment_jobs(
+                    deployment.id,
+                    temps_core::docker_socket_grant::DeployCaller::Platform,
+                )
+                .await?;
+            let Some(build_job) = jobs.iter().find(|job| job.job_id == "build_image") else {
+                // Nothing to build (e.g. a plain static site).
+                continue;
+            };
+            let config = build_job
+                .job_config
+                .as_ref()
+                .expect("a build job has configuration");
+            let build_args = crate::services::sensitive_envelope::read_sealed(
+                config,
+                Some(&encryption_service),
+                "build_args",
+            )?;
+            let keys: std::collections::BTreeSet<String> = config
+                .get(WORKER_BUILD_ARG_KEYS_FIELD)
+                .and_then(|value| value.as_array())
+                .unwrap_or_else(|| panic!("{slug}: no {WORKER_BUILD_ARG_KEYS_FIELD}"))
+                .iter()
+                .filter_map(|key| key.as_str().map(str::to_owned))
+                .collect();
+
+            let mut must_send: Vec<&str> = PUBLIC_USER_VARS.to_vec();
+            must_send.extend(["HOST", "SENTRY_DSN", "SENTRY_TUNNEL", "TEMPS_API_URL"]);
+            must_send.extend(public_sentry_dsn_var(stored.preset));
+            must_send.extend(public_sentry_tunnel_var(stored.preset));
+            for name in must_send {
+                assert!(build_args.contains_key(name), "{slug}: {name} not planned");
+                assert!(
+                    keys.contains(name),
+                    "{slug}: {name} is withheld from workers"
+                );
+            }
+            // Next.js is the one preset whose asset prefix the platform sets,
+            // replacing the project's value; everywhere else the project's
+            // secret under that name is what the build carries.
+            let platform_asset_prefix = stored.preset == Preset::NextJs;
+            for name in SECRET_USER_VARS.iter().copied().chain([
+                "TEMPS_API_TOKEN",
+                "CRON_SECRET",
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "SENTRY_AUTH_TOKEN",
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG,
+            ]) {
+                if name == "NEXT_PUBLIC_TEMPS_ASSET_PREFIX" && platform_asset_prefix {
+                    assert!(keys.contains(name), "{slug}: {name} is withheld");
+                    assert_ne!(
+                        build_args.get(name).map(String::as_str),
+                        Some("synthetic-next_public_temps_asset_prefix"),
+                        "{slug}: the platform's asset prefix did not replace the project's"
+                    );
+                    continue;
+                }
+                assert!(
+                    !keys.contains(name),
+                    "{slug}: {name} would leave the control plane"
+                );
+            }
+            for key in &keys {
+                assert!(
+                    build_args.contains_key(key),
+                    "{slug}: {key} is not a build arg"
+                );
+            }
+            // Only the project's own secret inlined variables could keep this
+            // build off a worker; the platform's variables never do.
+            let mut withheld_inlined = crate::jobs::build_image::build_inlined_variables(
+                build_args
+                    .keys()
+                    .filter(|name| !keys.contains(*name))
+                    .map(String::as_str),
+            );
+            withheld_inlined.sort();
+            let mut expected = vec!["VITE_PRIVATE_TOKEN".to_string()];
+            if !platform_asset_prefix {
+                expected.insert(0, "NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string());
+            }
+            assert_eq!(withheld_inlined, expected, "{slug}");
+            planned.push(slug);
+        }
+        for slug in [
+            "nextjs",
+            "vite",
+            "rsbuild",
+            "docusaurus",
+            "autopack",
+            "dockerfile",
+        ] {
+            assert!(
+                planned.iter().any(|planned| planned == slug),
+                "{slug} not planned"
+            );
+        }
+        Ok(())
     }
 }

@@ -79,7 +79,9 @@ export function resolveExplicitProjectEnvironment(
     namedSlug ??
     uniquePartialSlug ??
     (normalized.includes('this project') ||
-    normalized.includes('current project')
+    normalized.includes('current project') ||
+    normalized.includes('this service') ||
+    normalized.includes('current service')
       ? currentProjectSlug
       : undefined)
   if (!slug) return undefined

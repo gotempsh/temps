@@ -123,6 +123,29 @@ pub trait UpstreamResolver: Send + Sync {
     fn console_address(&self) -> &str {
         ""
     }
+
+    /// Address of the listener that serves only the console's public routes
+    /// (ADR-051), when one exists. `None` keeps the earlier behaviour: a
+    /// gate-denied request is answered with a 404 by the proxy itself.
+    fn console_ingress_address(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether `host` is the dedicated public ingress hostname. Such a
+    /// request may only ever reach the public-only listener. Must not block
+    /// or allocate: it runs for every request that falls through to the
+    /// console.
+    fn is_public_ingress_host(&self, _host: &str) -> bool {
+        false
+    }
+
+    /// The status-page binding for `host` when it is a status page's custom
+    /// hostname (#1412). Such a host may only ever reach the two status-page
+    /// routes on the public-only listener. Must not block: it runs for every
+    /// request.
+    fn status_page_host(&self, _host: &str) -> Option<temps_routes::StatusPageHostRoute> {
+        None
+    }
 }
 
 /// Trait for resolving project context from request information
@@ -139,6 +162,12 @@ pub trait ProjectContextResolver: Send + Sync {
 
     /// Get static file path for a host (if it serves static files)
     async fn get_static_path(&self, host: &str) -> Option<String>;
+
+    /// The path route (ADR 050) that hands `path` on `host` to another
+    /// service, if any. Must be an in-memory lookup: it runs per request.
+    fn match_path_route(&self, _host: &str, _path: &str) -> Option<temps_routes::PathRoute> {
+        None
+    }
 }
 
 /// First-visit attribution data for a new visitor

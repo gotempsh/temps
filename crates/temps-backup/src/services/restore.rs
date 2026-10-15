@@ -8,7 +8,7 @@
 //! (`restore_from_s3`, `restore_to_new_service`, `restore_pitr`) to
 //! completion in a spawned task. Handlers poll `restore_runs` for progress.
 
-use aws_sdk_s3::{Client as S3Client, Config as S3Config};
+use aws_sdk_s3::Client as S3Client;
 use chrono::Utc;
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::{
@@ -3190,22 +3190,12 @@ fn build_s3_client(creds: &S3Credentials) -> S3Client {
         None,
         "restore-service",
     );
-    let mut builder = S3Config::builder()
-        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new(creds.region.clone()))
-        .force_path_style(creds.force_path_style)
-        .credentials_provider(aws_creds)
-        .http_client(crate::engines::v2_common::bundled_roots_http_client());
-
-    if let Some(endpoint) = &creds.endpoint {
-        let url = if endpoint.starts_with("http") {
-            endpoint.clone()
-        } else {
-            format!("http://{}", endpoint)
-        };
-        builder = builder.endpoint_url(url);
-    }
-
+    let builder = crate::engines::v2_common::s3_config_builder(
+        &creds.region,
+        creds.force_path_style,
+        aws_creds,
+        creds.endpoint.as_deref(),
+    );
     S3Client::from_conf(builder.build())
 }
 

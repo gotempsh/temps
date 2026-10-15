@@ -188,7 +188,10 @@ function ErrorDetails({ error, message }: { error: unknown; message: string }) {
             )}
           </Button>
         </div>
-        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-background p-3 font-mono text-xs">
+        <pre
+          tabIndex={0}
+          className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-background p-3 font-mono text-xs"
+        >
           {payload}
         </pre>
       </div>

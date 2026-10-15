@@ -107,6 +107,21 @@ class BuildInputsTests(unittest.TestCase):
         self.assertIn("RUN cargo build --locked --release", dockerfile)
         self.assertIn("COPY Cargo.toml Cargo.lock", dockerfile)
 
+    def test_ai_clis_install_into_a_sandbox_owned_prefix(self):
+        dockerfile = (PACKAGE / "Dockerfile").read_text()
+        # Self-update needs a prefix the sandbox user owns, outside the home
+        # volume that masks image contents.
+        self.assertIn("prefix=/opt/temps-cli", dockerfile)
+        self.assertIn("chown -R temps:temps /opt/temps-cli", dockerfile)
+        self.assertNotIn("/home/temps/.npm", dockerfile)
+        # The host root-execs the daemon from /usr/local/bin, so that
+        # directory must never be handed to the sandbox user.
+        for line in dockerfile.splitlines():
+            if "chown" in line and "/usr/local" in line:
+                self.fail(f"sandbox user must not own /usr/local: {line.strip()}")
+        for cli in ("claude", "codex", "opencode"):
+            self.assertIn(cli, re.search(r"for cli in ([^;]+);", dockerfile).group(1).split())
+
     def invoke_builder(self, arguments):
         with tempfile.TemporaryDirectory(prefix="temps-build-inputs-") as directory:
             temporary = Path(directory)

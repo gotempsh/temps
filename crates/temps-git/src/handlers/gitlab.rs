@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, StatusCode},
     response::Redirect,
     routing::post,
@@ -28,7 +28,16 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/webhook/git/gitlab/auth",
             axum::routing::get(gitlab_oauth_callback),
         )
-        .route("/webhook/git/gitlab/events", post(gitlab_webhook_events))
+}
+
+/// The server-to-server event receiver GitLab delivers webhooks to.
+/// Authenticated by the project's signing token before any event is
+/// processed, so it needs no session and is mounted on the public router.
+pub fn configure_public_routes() -> Router<Arc<AppState>> {
+    Router::new().route(
+        "/webhook/git/gitlab/events",
+        post(gitlab_webhook_events).layer(DefaultBodyLimit::max(super::PROVIDER_EVENT_BODY_LIMIT)),
+    )
 }
 
 // ── Token verification helpers ─────────────────────────────────────────────

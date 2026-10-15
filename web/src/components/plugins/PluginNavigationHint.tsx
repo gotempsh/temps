@@ -7,7 +7,7 @@ export function PluginNavigationHint({ nav }: { nav: NavEntry[] }) {
   const message = nav.some((entry) => entry.section === 'settings')
     ? 'Open this plugin from the Settings sidebar.'
     : nav.some((entry) => entry.section === 'project')
-      ? 'Open a project to find this plugin in its sidebar.'
+      ? 'Open a service to find this plugin in its sidebar.'
       : 'This plugin declares no sidebar page. It can run in the background; its author must add a navigation entry to expose a page.'
   return <p className="mt-1 text-sm text-muted-foreground">{message}</p>
 }

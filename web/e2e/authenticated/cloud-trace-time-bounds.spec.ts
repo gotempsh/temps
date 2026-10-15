@@ -431,7 +431,7 @@ test('global trace list links preserve bounds for project and cross-project deta
   await page.goto('/traces')
   const projectLink = page.getByRole('link', { name: trace.root_span_name })
   const crossProjectLink = page.getByRole('link', {
-    name: 'Cross-project waterfall',
+    name: 'Cross-service waterfall',
   })
   await expect(projectLink).toBeVisible()
   expectBounds(

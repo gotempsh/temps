@@ -22,19 +22,18 @@ use axum::Extension;
 use axum::{
     extract::{Path, Query, RawQuery, State},
     http::{
-        header::{self, HeaderMap, HeaderName},
-        Method, StatusCode,
+        header::{self, HeaderMap},
+        StatusCode,
     },
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use std::sync::Arc;
-use std::time::Duration;
 use temps_analytics::ingest_keys::{
-    extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
-    stamp_retry_after_on_rate_limited, AnalyticsIngestKeyService, AnalyticsIngestRateLimiter,
-    ANALYTICS_INGEST_KEY_HEADER,
+    extract_analytics_key, keyed_ingest_cors, resolve_client_identity, resolve_keyed_ingest_scope,
+    stamp_retry_after_on_rate_limited, wildcard_ingest_cors, AnalyticsIngestKeyService,
+    AnalyticsIngestRateLimiter, IngestBranch, IngestJson, KeyedIngestCors,
 };
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
@@ -42,7 +41,6 @@ use temps_auth::{
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_proxy::CachedPeerTable;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::error;
 
 pub struct AppState {
@@ -737,7 +735,7 @@ pub async fn record_event_metrics(
     Extension(metadata): Extension<temps_core::RequestMetadata>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-    Json(payload): Json<EventMetricsPayload>,
+    IngestJson(payload): IngestJson<EventMetricsPayload>,
 ) -> impl IntoResponse {
     use tracing::{error, info};
 
@@ -765,7 +763,7 @@ pub async fn record_event_metrics(
     // keyed event look like it happened on the analytics backend, and
     // `get_channel` would classify the customer's real internal navigation as
     // "Referral" instead of a self-referral.
-    let (project_id, environment_id, deployment_id, site_hostname, is_keyed) = if let Some(key) =
+    let (project_id, environment_id, deployment_id, site_hostname, branch) = if let Some(key) =
         extract_analytics_key(&headers, raw_query.as_deref())
     {
         let origin = headers
@@ -791,7 +789,7 @@ pub async fn record_event_metrics(
                     scope.environment_id,
                     scope.deployment_id,
                     None,
-                    true,
+                    IngestBranch::keyed(&headers),
                 )
             }
             Err(problem) => return problem.into_response(),
@@ -832,7 +830,7 @@ pub async fn record_event_metrics(
                     environment_id,
                     deployment_id,
                     (!host.is_empty()).then(|| host.clone()),
-                    false,
+                    IngestBranch::HostResolved,
                 )
             }
             None => {
@@ -929,12 +927,12 @@ pub async fn record_event_metrics(
     let session_id = resolve_client_identity(
         metadata.session_id_cookie,
         payload.session_id.clone(),
-        is_keyed,
+        branch,
     );
     let visitor_id = resolve_client_identity(
         metadata.visitor_id_cookie,
         payload.visitor_id.clone(),
-        is_keyed,
+        branch,
     );
 
     // The SDK sends `domain` as a sibling of `event_data`, not nested inside
@@ -1336,41 +1334,22 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 /// These are called by browser SDKs on customer sites and must be reachable
 /// without authentication — the project is resolved from the Host header, or
 /// from an `X-Temps-Analytics-Key` / `?temps_key=` ingest key (ADR-040).
-pub fn configure_public_routes() -> Router<Arc<AppState>> {
+///
+/// CORS is two layers: the wildcard policy every request has always had, and,
+/// outside it, the keyed policy that grants credentialed CORS to the origins an
+/// ingest key admits (gotempsh/temps#1416). See
+/// [`temps_analytics::ingest_keys::cors`].
+pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/event", post(record_event_metrics))
         .layer(axum::middleware::map_response(
             stamp_retry_after_on_rate_limited,
         ))
-        .layer(public_ingest_cors())
-}
-
-/// CORS for the public analytics ingest routes.
-///
-/// Required by ADR-040: with a key, the request is cross-origin by definition,
-/// and without this layer the browser blocks it before it ever leaves the page.
-///
-/// `allow_credentials` stays at its default `false`, and must never be set
-/// true. The entire point of key-based ingest is that it needs no cookies;
-/// credentialed CORS on a wildcard origin would be a real vulnerability, and
-/// the browser rejects the combination outright.
-pub(crate) fn public_ingest_cors() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
-        ])
-        // `Retry-After` is not one of the seven CORS-safelisted response
-        // headers, so without this a cross-origin browser SDK — the stated
-        // consumer of keyed ingest — gets the 429 but cannot read the header
-        // that tells it when to come back, and falls back to guessing or
-        // hammering. Exposed explicitly rather than via `Any` because
-        // `Access-Control-Expose-Headers: *` is ignored by browsers for
-        // credentialed requests and is a wider grant than is needed.
-        .expose_headers([header::RETRY_AFTER])
-        .max_age(Duration::from_secs(600))
+        .layer(wildcard_ingest_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            cors,
+            keyed_ingest_cors,
+        ))
 }
 
 #[derive(utoipa::OpenApi)]
@@ -2226,6 +2205,10 @@ mod tests {
     // Breaking a Temps-deployed app's analytics would be worse than not
     // shipping keyed ingest at all.
 
+    /// Test-only request header carrying the plaintext a `_temps_sid` cookie
+    /// would decrypt to; see `test_request_metadata`.
+    const TEST_SESSION_COOKIE_HEADER: &str = "x-test-session-cookie";
+
     /// A syntactically valid key that is guaranteed not to exist.
     const UNKNOWN_KEY: &str = "pa_0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -2235,12 +2218,18 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
+        // Stands in for the decrypted `_temps_sid` cookie the real middleware
+        // would extract, so tests can prove when a cookie is (not) honoured.
+        let session_id_cookie = headers
+            .get(TEST_SESSION_COOKIE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         temps_core::RequestMetadata {
             ip_address: String::new(),
             user_agent: String::new(),
             headers: headers.clone(),
             visitor_id_cookie: None,
-            session_id_cookie: None,
+            session_id_cookie,
             base_url: format!("http://{host}"),
             scheme: "http".to_string(),
             host,
@@ -2260,7 +2249,11 @@ mod tests {
             },
         );
 
-        configure_public_routes()
+        let cors = KeyedIngestCors::new(
+            state.ingest_key_service.clone(),
+            state.ingest_rate_limiter.clone(),
+        );
+        configure_public_routes(cors)
             .layer(metadata_middleware)
             .with_state(state)
     }
@@ -2866,7 +2859,7 @@ mod tests {
                 "/_temps/event",
                 axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
             )
-            .layer(public_ingest_cors());
+            .layer(wildcard_ingest_cors());
 
         let response = tower::ServiceExt::oneshot(
             app,
@@ -2894,5 +2887,475 @@ mod tests {
                 .any(|name| name == "retry-after"),
             "Retry-After must be in access-control-expose-headers, got {exposed:?}"
         );
+    }
+
+    // ── gotempsh/temps#1416: unload beacons on keyed cross-origin ingest ──
+    //
+    // `navigator.sendBeacon` is always credentialed. The SDK now beacons
+    // `text/plain` (no preflight); SDKs already in the field beacon
+    // `application/json`, which needs a credentialed CORS grant. Both must
+    // work, and neither may change the unkeyed path.
+
+    const SITE_ORIGIN: &str = "https://shop.example.com";
+    const TEMPS_HOST: &str = "analytics.temps.test";
+
+    async fn mint_key(state: &AppState, project_id: i32, origins: Option<Vec<&str>>) -> String {
+        state
+            .ingest_key_service
+            .create(
+                project_id,
+                None,
+                None,
+                origins.map(|list| list.into_iter().map(str::to_string).collect()),
+                None,
+                None,
+            )
+            .await
+            .expect("minting an ingest key must succeed")
+            .public_key
+    }
+
+    /// A beacon as a browser sends it: key in the query string, credentialed,
+    /// from the customer's site to the Temps host.
+    fn beacon(key: &str, content_type: &str, origin: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/_temps/event?temps_key={key}"))
+            .header("host", TEMPS_HOST)
+            .header("origin", origin)
+            .header("sec-fetch-site", "cross-site")
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn keyed_preflight(key: &str, origin: &str) -> Request<Body> {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(format!("/_temps/event?temps_key={key}"))
+            .header("host", TEMPS_HOST)
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn header_value(response: &axum::response::Response, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    fn assert_credentialed_grant(response: &axum::response::Response, origin: &str) {
+        assert_eq!(
+            header_value(response, "access-control-allow-origin").as_deref(),
+            Some(origin),
+            "a credentialed request needs its own origin echoed, never `*`"
+        );
+        assert_eq!(
+            header_value(response, "access-control-allow-credentials").as_deref(),
+            Some("true")
+        );
+        let vary = header_value(response, "vary").unwrap_or_default();
+        assert!(
+            vary.contains("origin"),
+            "Vary must include Origin: {vary:?}"
+        );
+    }
+
+    fn assert_no_cors_grant(response: &axum::response::Response) {
+        assert_eq!(
+            header_value(response, "access-control-allow-origin"),
+            None,
+            "an origin the key rejects must get no ACAO at all"
+        );
+        assert_eq!(
+            header_value(response, "access-control-allow-credentials"),
+            None
+        );
+    }
+
+    macro_rules! test_db_or_skip {
+        () => {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => db,
+                Err(e) => {
+                    println!("Database not available, skipping test: {}", e);
+                    return;
+                }
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn keyed_text_plain_beacon_is_stored_and_needs_no_preflight() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, Some(vec![SITE_ORIGIN])).await;
+
+        let mut payload = event_payload();
+        payload["event_name"] = serde_json::json!("page_leave");
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon(
+                &key,
+                "text/plain;charset=UTF-8",
+                SITE_ORIGIN,
+                payload.to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // Not needed by a no-cors beacon, but harmless and consistent.
+        assert_credentialed_grant(&response, SITE_ORIGIN);
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name.as_deref(), Some("page_leave"));
+        assert_eq!(events[0].project_id, project.id);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_application_json_beacon_from_an_old_sdk_is_credentialed() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, Some(vec![SITE_ORIGIN])).await;
+
+        // The preflight the browser sends first for an `application/json`
+        // beacon. This is the request that used to fail with `*`.
+        let preflight = setup_public_app(state.clone())
+            .oneshot(keyed_preflight(&key, SITE_ORIGIN))
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success(), "{}", preflight.status());
+        assert_credentialed_grant(&preflight, SITE_ORIGIN);
+        let methods = header_value(&preflight, "access-control-allow-methods").unwrap_or_default();
+        assert!(methods.contains("POST"), "{methods:?}");
+        assert!(
+            stored_events(db.as_ref()).await.is_empty(),
+            "a preflight must never reach the handler"
+        );
+
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon(
+                &key,
+                "application/json",
+                SITE_ORIGIN,
+                event_payload().to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_credentialed_grant(&response, SITE_ORIGIN);
+        assert_eq!(stored_events(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_preflight_and_beacon_from_a_disallowed_origin_get_no_grant() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, Some(vec![SITE_ORIGIN])).await;
+        let stranger = "https://copied-the-key.example.net";
+
+        let preflight = setup_public_app(state.clone())
+            .oneshot(keyed_preflight(&key, stranger))
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::FORBIDDEN);
+        assert_no_cors_grant(&preflight);
+
+        // A `text/plain` beacon skips the preflight, so the handler's own
+        // allowlist check is what stops it.
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon(
+                &key,
+                "text/plain",
+                stranger,
+                event_payload().to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_no_cors_grant(&response);
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_preflight_for_a_key_without_an_allowlist_mirrors_the_origin() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        for origin in [SITE_ORIGIN, "http://localhost:5173"] {
+            let preflight = setup_public_app(state.clone())
+                .oneshot(keyed_preflight(&key, origin))
+                .await
+                .unwrap();
+            assert!(preflight.status().is_success(), "{}", preflight.status());
+            assert_credentialed_grant(&preflight, origin);
+        }
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_preflight_with_an_unknown_key_keeps_the_wildcard() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let preflight = setup_public_app(state)
+            .oneshot(keyed_preflight(UNKNOWN_KEY, SITE_ORIGIN))
+            .await
+            .unwrap();
+        assert_eq!(
+            header_value(&preflight, "access-control-allow-origin").as_deref(),
+            Some("*")
+        );
+        assert_eq!(
+            header_value(&preflight, "access-control-allow-credentials"),
+            None,
+            "an unknown key must never earn a credentialed grant"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_text_plain_with_invalid_json_is_a_400_and_stores_nothing() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        for (body, expected) in [
+            ("{not json".to_string(), StatusCode::BAD_REQUEST),
+            // Valid JSON, wrong shape: the same schema validation as JSON.
+            (
+                r#"{"event_name":"x"}"#.to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let response = setup_public_app(state.clone())
+                .oneshot(beacon(&key, "text/plain", SITE_ORIGIN, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_text_plain_over_the_body_limit_is_a_413() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        // axum's default body limit (2 MiB) applies to this route, exactly as
+        // it does to an `application/json` body.
+        let mut payload = event_payload();
+        payload["page_title"] = serde_json::json!("a".repeat(3 * 1024 * 1024));
+        for content_type in ["text/plain", "application/json"] {
+            let response = setup_public_app(state.clone())
+                .oneshot(beacon(&key, content_type, SITE_ORIGIN, payload.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{content_type}"
+            );
+        }
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_text_plain_with_a_bad_key_is_still_a_401() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let response = setup_public_app(state)
+            .oneshot(beacon(
+                UNKNOWN_KEY,
+                "text/plain",
+                SITE_ORIGIN,
+                event_payload().to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    /// The unkeyed path takes identity from Temps' cookies, so it must keep
+    /// refusing `text/plain` — a simple request any third-party page could
+    /// fire with the visitor's cookies attached — and keep its wildcard CORS.
+    #[tokio::test]
+    async fn unkeyed_ingest_is_unchanged() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(&state.route_table, "app.example.com", Some(project));
+
+        let unkeyed = |content_type: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/_temps/event")
+                .header("host", "app.example.com")
+                .header("origin", "https://app.example.com")
+                .header("content-type", content_type)
+                .body(Body::from(event_payload().to_string()))
+                .unwrap()
+        };
+
+        let rejected = setup_public_app(state.clone())
+            .oneshot(unkeyed("text/plain"))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        let accepted = setup_public_app(state.clone())
+            .oneshot(unkeyed("application/json"))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            header_value(&accepted, "access-control-allow-origin").as_deref(),
+            Some("*")
+        );
+        assert_eq!(
+            header_value(&accepted, "access-control-allow-credentials"),
+            None,
+            "the unkeyed path must never become credentialed"
+        );
+        assert_eq!(stored_events(db.as_ref()).await.len(), 1);
+
+        let preflight = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.com")
+                    .header("origin", "https://elsewhere.example.net")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            header_value(&preflight, "access-control-allow-origin").as_deref(),
+            Some("*")
+        );
+        assert_eq!(
+            header_value(&preflight, "access-control-allow-credentials"),
+            None
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// A credentialed cross-origin beacon arrives with whatever cookies the
+    /// browser holds for the Temps host. They must not decide identity: any
+    /// page holding the public key could otherwise write into the visitor's
+    /// real session, and the SDK's never-credentialed `fetch` events would
+    /// land on a different session than its unload beacons.
+    #[tokio::test]
+    async fn cross_origin_keyed_ingest_ignores_temps_cookies() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        let mut payload = event_payload();
+        payload["sessionId"] = serde_json::json!("sdk-session-0001");
+        let mut request = beacon(&key, "text/plain", SITE_ORIGIN, payload.to_string());
+        request.headers_mut().insert(
+            TEST_SESSION_COOKIE_HEADER,
+            axum::http::HeaderValue::from_static("cookie-session-0001"),
+        );
+
+        let response = setup_public_app(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].session_id.as_deref(),
+            Some("sdk-session-0001"),
+            "a cross-origin keyed request must take identity from the payload, never the cookie"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// The same request from the Temps host's own origin keeps preferring the
+    /// cookie, as keyed same-origin ingest always has.
+    #[tokio::test]
+    async fn same_origin_keyed_ingest_still_prefers_temps_cookies() {
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        let mut payload = event_payload();
+        payload["sessionId"] = serde_json::json!("sdk-session-0002");
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", TEMPS_HOST)
+                    .header("origin", format!("https://{TEMPS_HOST}"))
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key)
+                    .header(TEST_SESSION_COOKIE_HEADER, "cookie-session-0002")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("cookie-session-0002"));
+
+        test_db.cleanup().await;
     }
 }

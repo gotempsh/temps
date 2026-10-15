@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Select,
   SelectContent,
@@ -77,7 +78,14 @@ export function VersionPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { data: settings } = useSettings()
   const updateSettings = useUpdateSettings()
-  const { data: capability, isPending } = useSelfUpdateCapability()
+  const {
+    data: capability,
+    isPending,
+    isError: capabilityFailed,
+    error: capabilityError,
+    refetch: refetchCapability,
+    isFetching: capabilityFetching,
+  } = useSelfUpdateCapability()
   const { data: status } = useUpdateStatus()
   const checkForUpdate = useCheckForUpdate()
   const [updateOpen, setUpdateOpen] = useState(false)
@@ -119,6 +127,32 @@ export function VersionPage() {
 
   const latest = checkForUpdate.data
   const canApply = Boolean(capability?.can_apply && capability?.allowed)
+
+  // Without the capability the page knows neither the installed version, the
+  // supervisor nor the restart mode. Say that, rather than printing
+  // "unknown" and a restart sentence nothing supports.
+  if (capabilityFailed && capability === undefined) {
+    return (
+      <div className="space-y-6">
+        <Card>
+          <CardHeader>
+            <CardTitle>Version</CardTitle>
+            <CardDescription>
+              What this server is running, and what is available on its channel.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ReadFailure
+              resource="Version and update status"
+              error={capabilityError}
+              onRetry={() => void refetchCapability()}
+              retrying={capabilityFetching}
+            />
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">
@@ -288,9 +322,10 @@ export function VersionPage() {
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
                 This server was started with{' '}
-                <span className="font-mono">--disable-self-update</span>, which
-                overrides this setting. Remove the flag and restart temps to
-                allow console updates.
+                <span className="font-mono">--disable-self-update</span> (or{' '}
+                <span className="font-mono">TEMPS_DISABLE_SELF_UPDATE</span>),
+                which overrides this setting. Remove the flag or variable and
+                restart temps to allow console updates.
               </span>
             </p>
           )}

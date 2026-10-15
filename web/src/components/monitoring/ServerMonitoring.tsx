@@ -40,7 +40,10 @@ import {
 } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { useSettings } from '@/hooks/useSettings'
+import { NodeMetricsAccessDenied } from '@/components/monitoring/NodeMetricsAccessDenied'
+import { refetchUnlessRefused } from '@/lib/query-retry'
 import {
   CONTROL_PLANE_NODE_ID,
   CPU_THRESHOLDS,
@@ -88,10 +91,19 @@ const isRangePreset = (v: string | null): v is ProxyRangePreset =>
 // Data
 // ---------------------------------------------------------------------------
 
+/**
+ * Poll `interval` ms, unless paused (`false`) or the server has refused the
+ * read: a role without settings:read gets the same 403 every time.
+ */
+function pollInterval(interval: number | false) {
+  return interval === false ? false : refetchUnlessRefused(interval)
+}
+
 function useNodeSeries(
   metric: string,
   range: ProxyRangePreset,
-  refetchInterval: number | false
+  refetchInterval: number | false,
+  enabled: boolean
 ) {
   return useQuery({
     ...nodeMetricsGetRangeOptions({
@@ -99,8 +111,9 @@ function useNodeSeries(
       query: { metric, range },
     }),
     staleTime: 15_000,
-    refetchInterval,
+    refetchInterval: pollInterval(refetchInterval),
     retry: false,
+    enabled,
   })
 }
 
@@ -112,9 +125,9 @@ const lastValue = (points: MetricDataPoint[] | undefined) =>
 // ---------------------------------------------------------------------------
 
 const TONE_TEXT: Record<UsageTone, string> = {
-  good: 'text-emerald-600 dark:text-emerald-400',
+  good: 'text-emerald-700 dark:text-emerald-400',
   warn: 'text-amber-700 dark:text-amber-400',
-  poor: 'text-rose-600 dark:text-rose-400',
+  poor: 'text-rose-700 dark:text-rose-400',
 }
 const TONE_BAR: Record<UsageTone, string> = {
   good: '[&>div]:bg-primary',
@@ -338,7 +351,9 @@ function DockerDiskUsageCard() {
           </div>
         ) : q.isError || !usage ? (
           <div className="space-y-2 text-sm">
-            <p className="text-rose-500">docker system df did not answer.</p>
+            <p className="text-rose-700 dark:text-rose-500">
+              docker system df did not answer.
+            </p>
             <p className="text-xs text-muted-foreground">
               {(q.error as { detail?: string } | null)?.detail ??
                 'Docker walks every image layer and volume for this figure; it can take up to a minute on a busy host.'}
@@ -465,41 +480,66 @@ export function ServerMonitoring() {
   const scrapeInterval = settings.data?.monitoring?.scrape_interval_secs ?? 30
   const retentionDays = settings.data?.monitoring?.retention_raw_days ?? 7
 
+  // Node metrics need settings:read, which only instance administrators
+  // hold. Other roles get one explanation below and send no metric requests.
+  const canReadNodeMetrics = useIsInstanceAdmin()
+
   const latest = useQuery({
     ...nodeMetricsGetLatestOptions({ path: { id: CONTROL_PLANE_NODE_ID } }),
     staleTime: 15_000,
-    refetchInterval,
+    refetchInterval: pollInterval(refetchInterval),
     retry: false,
+    enabled: canReadNodeMetrics,
   })
-  const cpu = useNodeSeries('node.cpu_percent', range, refetchInterval)
-  const memory = useNodeSeries('node.memory_percent', range, refetchInterval)
-  const disk = useNodeSeries('node.disk_used_bytes', range, refetchInterval)
+  const cpu = useNodeSeries(
+    'node.cpu_percent',
+    range,
+    refetchInterval,
+    canReadNodeMetrics
+  )
+  const memory = useNodeSeries(
+    'node.memory_percent',
+    range,
+    refetchInterval,
+    canReadNodeMetrics
+  )
+  const disk = useNodeSeries(
+    'node.disk_used_bytes',
+    range,
+    refetchInterval,
+    canReadNodeMetrics
+  )
   // The projection always reads the longest window: extrapolating a fill
   // date from the last hour turns one image pull into "full in 3 days".
   const diskHistory = useNodeSeries(
     'node.disk_used_bytes',
     '7d',
-    refetchInterval
+    refetchInterval,
+    canReadNodeMetrics
   )
   const rx = useNodeSeries(
     'node.network_rx_bytes_total',
     range,
-    refetchInterval
+    refetchInterval,
+    canReadNodeMetrics
   )
   const tx = useNodeSeries(
     'node.network_tx_bytes_total',
     range,
-    refetchInterval
+    refetchInterval,
+    canReadNodeMetrics
   )
   const read = useNodeSeries(
     'node.disk_read_bytes_total',
     range,
-    refetchInterval
+    refetchInterval,
+    canReadNodeMetrics
   )
   const write = useNodeSeries(
     'node.disk_write_bytes_total',
     range,
-    refetchInterval
+    refetchInterval,
+    canReadNodeMetrics
   )
 
   const snapshot = (latest.data ?? {}) as Record<string, number>
@@ -575,6 +615,15 @@ export function ServerMonitoring() {
   const bucketCaption = `${step >= 3600 ? `${step / 3600} h` : `${step / 60} min`} buckets · last ${range} · kept ${retentionDays} days`
   const seriesError = (q: { isError: boolean }) =>
     q.isError ? 'Failed to load node metrics' : null
+
+  if (!canReadNodeMetrics) {
+    return (
+      <div className="space-y-6">
+        <PageHeader title="Server" />
+        <NodeMetricsAccessDenied />
+      </div>
+    )
+  }
 
   if (firstError && isMetricsUnavailable(firstError)) {
     return (
@@ -804,7 +853,7 @@ function SectionIntro({
     <PageHeader
       title="Server"
       actions={
-        <div className="flex shrink-0 flex-wrap items-center gap-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
           <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
             {paused
               ? 'Updates paused'
