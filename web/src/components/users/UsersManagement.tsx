@@ -483,67 +483,70 @@ export function UsersManagement({
                   </div>
                 </div>
                 <div className="relative z-10 ml-4">
-                  {canManageUsers && (
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon">
-                          <MoreHorizontal className="h-4 w-4" />
-                          <span className="sr-only">Open menu</span>
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onClick={() =>
-                            onEditUser({
-                              id: user.user.id,
-                              name: user.user.username || user.user.name || '',
-                              email: user.user.email || '',
-                            })
-                          }
-                        >
-                          <Edit2 className="mr-2 h-4 w-4" />
-                          Edit
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => setUserToManageRoles(user)}
-                        >
-                          <Shield className="mr-2 h-4 w-4" />
-                          Manage Roles
-                        </DropdownMenuItem>
-                        {currentUser?.id === user.user.id ? (
+                  <DropdownMenu>
+                    {canManageUsers && (
+                      <>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="icon">
+                            <MoreHorizontal className="h-4 w-4" />
+                            <span className="sr-only">Open menu</span>
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
                           <DropdownMenuItem
-                            onClick={() => navigate('/account')}
-                          >
-                            <KeyRound className="mr-2 h-4 w-4" />
-                            Change your password
-                          </DropdownMenuItem>
-                        ) : (
-                          <DropdownMenuItem
-                            disabled={!!user.user.deleted_at}
                             onClick={() =>
-                              setUserToResetPassword({
+                              onEditUser({
                                 id: user.user.id,
                                 name:
-                                  user.user.name || user.user.username || '',
+                                  user.user.username || user.user.name || '',
                                 email: user.user.email || '',
                               })
                             }
                           >
-                            <KeyRound className="mr-2 h-4 w-4" />
-                            Reset password
+                            <Edit2 className="mr-2 h-4 w-4" />
+                            Edit
                           </DropdownMenuItem>
-                        )}
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          onClick={() => setUserToDelete(user)}
-                          className="text-destructive"
-                        >
-                          <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  )}
+                          <DropdownMenuItem
+                            onClick={() => setUserToManageRoles(user)}
+                          >
+                            <Shield className="mr-2 h-4 w-4" />
+                            Manage Roles
+                          </DropdownMenuItem>
+                          {currentUser?.id === user.user.id ? (
+                            <DropdownMenuItem
+                              onClick={() => navigate('/account')}
+                            >
+                              <KeyRound className="mr-2 h-4 w-4" />
+                              Change your password
+                            </DropdownMenuItem>
+                          ) : (
+                            <DropdownMenuItem
+                              disabled={!!user.user.deleted_at}
+                              onClick={() =>
+                                setUserToResetPassword({
+                                  id: user.user.id,
+                                  name:
+                                    user.user.name || user.user.username || '',
+                                  email: user.user.email || '',
+                                })
+                              }
+                            >
+                              <KeyRound className="mr-2 h-4 w-4" />
+                              Reset password
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onClick={() => setUserToDelete(user)}
+                            className="text-destructive"
+                          >
+                            <Trash2 className="mr-2 h-4 w-4" />
+                            Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </>
+                    )}
+                  </DropdownMenu>
                 </div>
               </div>
             ))}
