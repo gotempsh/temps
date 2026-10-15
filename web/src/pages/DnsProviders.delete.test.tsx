@@ -179,7 +179,7 @@ test('a delete the server accepts closes the confirmation and refreshes the list
   api.restore()
 })
 
-test('losing write access while the confirmation is open closes it', async () => {
+test('losing write access while the confirmation is open closes it for good', async () => {
   const api = mockApi({
     'GET /dns-providers': () => jsonResponse([PROVIDER]),
   })
@@ -218,5 +218,11 @@ test('losing write access while the confirmation is open closes it', async () =>
     expect(view.queryByText('Delete DNS provider Example DNS?')).toBeNull()
   )
   expect(api.called('DELETE', '/dns-providers/4')).toBe(false)
+
+  // Restoring the role must not bring the old confirmation back.
+  view.rerender(page('admin'))
+  await act(async () => {})
+  expect(view.queryByText('Delete DNS provider Example DNS?')).toBeNull()
+  expect(view.getByText('Example DNS')).toBeTruthy()
   api.restore()
 })

@@ -87,6 +87,15 @@ export function DnsProviders() {
   const currentRole = useCurrentUserRole()
   const [providerToDelete, setProviderToDelete] =
     useState<DnsProviderResponse | null>(null)
+  // A confirmation armed under a role that has since lost write access must
+  // not come back when the role is restored, so the pending target is dropped
+  // in the same render that sees the loss (not in an effect, which would paint
+  // the stale dialog first).
+  const [couldManage, setCouldManage] = useState(canManageProviders)
+  if (couldManage !== canManageProviders) {
+    setCouldManage(canManageProviders)
+    if (!canManageProviders) setProviderToDelete(null)
+  }
 
   const {
     data: dnsProviders,
@@ -377,8 +386,9 @@ export function DnsProviders() {
 
       {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog
-        // Closed as soon as the role loses write access: a still-open
-        // confirmation whose button silently does nothing is worse than none.
+        // Closed as soon as the role loses write access (and the pending
+        // target is cleared above): a still-open confirmation whose button
+        // silently does nothing is worse than none.
         open={canManageProviders && providerToDelete !== null}
         onOpenChange={(open) => {
           if (!open) setProviderToDelete(null)
