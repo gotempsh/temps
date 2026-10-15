@@ -179,7 +179,7 @@ test('group lifecycle through the console', async ({ page }) => {
     await page.goto(`/p/${g1.slug}?tab=settings&section=services`)
     await expect(page.getByText(`Services (1)`)).toBeVisible()
     await page.getByRole('button', { name: 'Remove' }).click()
-    await expect(page.getByRole('alertdialog')).toContainText(`Remove ${SVC_WEB} from ${G1}?`)
+    await expect(page.getByRole('alertdialog')).toContainText(`Remove service ${SVC_WEB}?`)
     await shot(page, '09-remove-confirm')
     await page.getByRole('button', { name: 'Remove from project' }).click()
     await expect(page.getByText(`${SVC_WEB} is now a standalone service`)).toBeVisible()
