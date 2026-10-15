@@ -50,6 +50,7 @@ import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
+import { AcmeContactEmailBanner } from './components/alerts/AcmeContactEmailBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import SandboxPreviewAccess from './pages/SandboxPreviewAccess'
 import { SettingsLayout } from './components/settings/SettingsLayout'
@@ -590,6 +591,9 @@ const FullAppRoutes = () => {
               version dismissible, links the upgrade docs. */}
               <UpdateAvailableBanner />
               <AiHarnessPendingBanner />
+              {/* HTTPS for environment URLs needs a Let's Encrypt contact; asks
+              for it inline while on-demand TLS is on and nothing else blocks. */}
+              <AcmeContactEmailBanner />
               {/* Wrap header with independent error boundary */}
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (
