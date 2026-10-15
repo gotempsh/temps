@@ -9,6 +9,7 @@ import {
   RouteResponse,
   updateRoute,
 } from '@/api/client'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -54,6 +55,8 @@ import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 
 interface RoutesManagementProps {
   routes?: ListRoutesResponse
@@ -86,6 +89,10 @@ export function RoutesManagement({
   // Checked before the empty branch: a refused or failed read must not claim
   // no routes are configured and invite the operator to add one.
   const readFailed = error != null
+  // Adding a route needs the load balancer write permission; offering it to a
+  // role that cannot use it just leads to a refusal.
+  const canManageRoutes = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
   const [routeToDelete, setRouteToDelete] = useState<string | null>(null)
   const [editRoute, setEditRoute] = useState<RouteResponse | null>(null)
 
@@ -178,11 +185,17 @@ export function RoutesManagement({
             Configure custom domain routing and load balancing
           </p>
         </div>
-        <CreateActionButton
-          to="/settings/load-balancer/add"
-          label="Add Route"
-        />
+        {canManageRoutes && (
+          <CreateActionButton
+            to="/settings/load-balancer/add"
+            label="Add Route"
+          />
+        )}
       </div>
+
+      {!canManageRoutes && (
+        <AdminOnlyNote action="add, edit or remove routes" role={currentRole} />
+      )}
 
       {readFailed && !!routes?.length && (
         <ReadFailure
@@ -220,16 +233,19 @@ export function RoutesManagement({
         />
       ) : !routes?.length ? (
         <EmptyState
+          size="compact"
           icon={Router}
           title="No routes configured"
           description="Get started by adding a new route to direct traffic to your backend services"
           action={
-            <Button asChild>
-              <Link to="/settings/load-balancer/add">
-                <Plus className="mr-2 h-4 w-4" />
-                Add Route
-              </Link>
-            </Button>
+            canManageRoutes ? (
+              <Button asChild>
+                <Link to="/settings/load-balancer/add">
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add Route
+                </Link>
+              </Button>
+            ) : undefined
           }
         />
       ) : (
