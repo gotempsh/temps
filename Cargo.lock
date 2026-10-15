@@ -15203,6 +15203,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",

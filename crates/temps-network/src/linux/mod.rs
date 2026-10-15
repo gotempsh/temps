@@ -219,40 +219,32 @@ pub async fn detect_underlay_mtu(device: &str) -> crate::Result<u32> {
         })
 }
 
-/// Resolve the Linux interface that owns `address`. `ip -o addr` is used
-/// deliberately: it handles VLAN, bond and WireGuard interfaces uniformly,
-/// while default-route discovery selects the public NIC on many hosts.
+/// Resolve the Linux interface that owns `address`. The kernel's own address
+/// table (`getifaddrs`) is used deliberately: it handles VLAN, bond and
+/// WireGuard interfaces uniformly, while default-route discovery selects the
+/// public NIC on many hosts. Read in-process, so it needs no `ip` binary and
+/// no capability.
 pub async fn detect_device_for_address(address: IpAddr) -> crate::Result<String> {
-    let output = tokio::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .output()
-        .await
-        .map_err(|error| NetworkError::Io {
-            op: "ip -o addr show",
-            path: "ip".into(),
-            reason: error.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(NetworkError::UnderlayDetection {
-            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
-    let needle = address.to_string();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 4 {
+    use nix::sys::socket::SockaddrLike;
+
+    let entries = nix::ifaddrs::getifaddrs().map_err(|error| NetworkError::UnderlayDetection {
+        reason: format!("listing interface addresses: {error}"),
+    })?;
+    for entry in entries {
+        let Some(owned) = entry.address.as_ref() else {
             continue;
-        }
-        let owns_address = fields
-            .iter()
-            .any(|field| field.split('/').next() == Some(needle.as_str()));
-        if owns_address {
-            return Ok(fields[1]
-                .trim_end_matches(':')
-                .split('@')
-                .next()
-                .unwrap_or(fields[1])
-                .to_owned());
+        };
+        let owned: Option<IpAddr> = match owned.family() {
+            Some(nix::sys::socket::AddressFamily::Inet) => {
+                owned.as_sockaddr_in().map(|a| IpAddr::V4(a.ip()))
+            }
+            Some(nix::sys::socket::AddressFamily::Inet6) => {
+                owned.as_sockaddr_in6().map(|a| IpAddr::V6(a.ip()))
+            }
+            _ => None,
+        };
+        if owned == Some(address) {
+            return Ok(entry.interface_name);
         }
     }
     Err(NetworkError::UnderlayDetection {
@@ -297,37 +289,85 @@ async fn route_overlapping(
     pool: ipnet::Ipv4Net,
     owned_devices: &[&str],
 ) -> crate::Result<Option<(ipnet::Ipv4Net, String)>> {
-    use std::str::FromStr;
+    use futures::TryStreamExt;
+    use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteType};
+    use rtnetlink::RouteMessageBuilder;
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
 
-    let output = tokio::process::Command::new("ip")
-        .args(["-4", "route", "show", "table", "all"])
-        .output()
-        .await
-        .map_err(|error| NetworkError::Io {
-            op: "ip -4 route show table all",
-            path: "ip".into(),
-            reason: error.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(NetworkError::UnderlayDetection {
-            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    let (handle, _conn) = open_handle().await?;
+    let listing_error = |error: rtnetlink::Error| NetworkError::UnderlayDetection {
+        reason: format!("listing ipv4 routes: {error}"),
+    };
+
+    // Table 0 (unspecified) asks for every table, as `ip route show table all`
+    // does; the builder's default is the main table alone.
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().table_id(0).build())
+        .execute();
+
+    let mut names: HashMap<u32, String> = HashMap::new();
+    let mut seen = Vec::new();
+    while let Some(message) = routes.try_next().await.map_err(listing_error)? {
+        // Only connected/static unicast routes can shadow the pool. `local`,
+        // `broadcast`, `multicast`, `unreachable` and friends are not routes
+        // a packet to the pool would take.
+        if message.header.kind != RouteType::Unicast {
+            continue;
+        }
+        let prefix_len = message.header.destination_prefix_length;
+        let destination = message.attributes.iter().find_map(|attr| match attr {
+            RouteAttribute::Destination(RouteAddress::Inet(address)) => Some(*address),
+            _ => None,
         });
+        let oif = message.attributes.iter().find_map(|attr| match attr {
+            RouteAttribute::Oif(index) => Some(*index),
+            _ => None,
+        });
+        let device = match oif {
+            Some(index) => {
+                if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(index) {
+                    if let Some(name) = bridge::link_name_by_index(&handle, index)
+                        .await
+                        .unwrap_or(None)
+                    {
+                        slot.insert(name);
+                    }
+                }
+                names.get(&index).cloned()
+            }
+            None => None,
+        };
+        seen.push((destination, prefix_len, device));
     }
 
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let Some(destination) = fields.first() else {
+    Ok(first_overlapping_route(pool, owned_devices, &seen))
+}
+
+/// Pure half of [`route_overlapping`]: `routes` are `(destination, prefix
+/// length, device)` for the host's unicast IPv4 routes.
+///
+/// Default routes and host (/32) routes are not reported. That is what the
+/// `ip route show` text this replaced did in effect (`default` is not a CIDR,
+/// and a /32 is printed as a bare address), and a restart of an existing node
+/// must keep passing exactly the checks it passed before.
+fn first_overlapping_route(
+    pool: ipnet::Ipv4Net,
+    owned_devices: &[&str],
+    routes: &[(Option<std::net::Ipv4Addr>, u8, Option<String>)],
+) -> Option<(ipnet::Ipv4Net, String)> {
+    for (destination, prefix_len, device) in routes {
+        let Some(destination) = destination else {
             continue;
         };
-        let Ok(existing) = ipnet::Ipv4Net::from_str(destination) else {
-            // `default`, `local`, `broadcast`, and `unreachable` entries do
-            // not put a CIDR in the first field and are not connected routes.
+        if *prefix_len == 0 || *prefix_len >= 32 {
+            continue;
+        }
+        let Ok(existing) = ipnet::Ipv4Net::new(*destination, *prefix_len) else {
             continue;
         };
-        let device = fields
-            .windows(2)
-            .find_map(|pair| (pair[0] == "dev").then_some(pair[1]))
-            .unwrap_or("unknown");
+        let device = device.as_deref().unwrap_or("unknown");
         if owned_devices.contains(&device) {
             continue;
         }
@@ -336,10 +376,10 @@ async fn route_overlapping(
             || existing.contains(&pool.network())
             || existing.contains(&pool.broadcast())
         {
-            return Ok(Some((existing, device.to_owned())));
+            return Some((existing, device.to_owned()));
         }
     }
-    Ok(None)
+    None
 }
 
 /// Helper that opens an rtnetlink connection and spawns its background task
@@ -354,4 +394,103 @@ async fn open_handle() -> crate::Result<(rtnetlink::Handle, tokio::task::JoinHan
         conn.await;
     });
     Ok((handle, task))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn route(cidr: &str, device: &str) -> (Option<Ipv4Addr>, u8, Option<String>) {
+        let net: ipnet::Ipv4Net = cidr.parse().unwrap();
+        (
+            Some(net.network()),
+            net.prefix_len(),
+            Some(device.to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_route_inside_the_pool_is_reported_with_its_device() {
+        let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let routes = [
+            route("192.168.1.0/24", "eth0"),
+            route("10.201.4.0/24", "tun0"),
+        ];
+        assert_eq!(
+            first_overlapping_route(pool, &[], &routes),
+            Some(("10.201.4.0/24".parse().unwrap(), "tun0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_route_that_contains_the_pool_is_reported() {
+        let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let routes = [route("10.0.0.0/8", "wg-corp")];
+        assert_eq!(
+            first_overlapping_route(pool, &[], &routes),
+            Some(("10.0.0.0/8".parse().unwrap(), "wg-corp".to_owned()))
+        );
+    }
+
+    #[test]
+    fn routes_on_owned_devices_are_accepted_so_a_restart_passes() {
+        let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let routes = [route("10.201.0.0/16", "temps-wg0")];
+        assert_eq!(first_overlapping_route(pool, &["temps-wg0"], &routes), None);
+    }
+
+    #[test]
+    fn default_and_host_routes_do_not_count() {
+        let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let routes = [
+            (None, 0, Some("eth0".to_owned())),
+            (Some(Ipv4Addr::UNSPECIFIED), 0, Some("eth0".to_owned())),
+            (
+                Some(Ipv4Addr::new(10, 201, 0, 7)),
+                32,
+                Some("tun0".to_owned()),
+            ),
+        ];
+        assert_eq!(first_overlapping_route(pool, &[], &routes), None);
+    }
+
+    #[test]
+    fn a_route_without_a_resolvable_device_is_still_a_collision() {
+        let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let routes = [(Some(Ipv4Addr::new(10, 201, 0, 0)), 24, None)];
+        assert_eq!(
+            first_overlapping_route(pool, &["temps-wg0"], &routes),
+            Some(("10.201.0.0/24".parse().unwrap(), "unknown".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_owns_its_address() {
+        assert_eq!(
+            detect_device_for_address("127.0.0.1".parse().unwrap())
+                .await
+                .unwrap(),
+            "lo"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unowned_address_is_reported_as_such() {
+        let error = detect_device_for_address("203.0.113.77".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("203.0.113.77"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_routes_needs_no_ip_binary() {
+        // A pool no sane host routes: the dump must succeed and find nothing
+        // overlapping, which also exercises the rtnetlink path end to end.
+        let pool: ipnet::Ipv4Net = "240.77.0.0/24".parse().unwrap();
+        assert_eq!(route_overlapping(pool, &[]).await.unwrap(), None);
+    }
 }

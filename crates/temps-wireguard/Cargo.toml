@@ -25,3 +25,12 @@ temps-core = { path = "../temps-core" }
 # Embedded WireGuard (no external wireguard-tools dependency)
 defguard_wireguard_rs = "0.12"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
+
+# In-process link up/MTU and address reads for the mesh interface, so the mesh
+# path needs CAP_NET_ADMIN and nothing else (no `ip` binary, no euid 0).
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["net"] }
+
+[features]
+# Real-kernel tests (tests/it_mesh_kernel.rs); never part of a plain `cargo test`.
+integration_kernel = []
