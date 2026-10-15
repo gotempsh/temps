@@ -179,7 +179,11 @@ fn external_url_is_loopback(external_url: &str) -> bool {
 /// subdomains against). Resolution order (ADR §2 / §6):
 ///   1. explicit `settings.on_demand_tls.zone` (operator opt-in for custom
 ///      domains, or a precomputed sslip.io zone written by `temps setup`);
-///   2. auto-derived `<ip>.sslip.io` suffix from a `*.sslip.io` `external_url`.
+///   2. auto-derived `<ip>.sslip.io` suffix from a `*.sslip.io` `external_url`;
+///   3. the `preview_domain`, when it is a public name. Environment URLs are
+///      direct subdomains of it, so a custom base domain works without a
+///      separate zone setting. Loopback names (`localho.st`, `localhost`,
+///      `127.0.0.1…`) never qualify: Let's Encrypt cannot reach them.
 ///
 /// Returns `None` when no zone can be derived — the caller then disables the
 /// feature (an empty zone makes the gate reject all SNI anyway).
@@ -194,7 +198,18 @@ fn derive_zone(settings: &OnDemandZoneInputs) -> Option<String> {
     }
 
     // Auto-derive from external_url when it is a sslip.io URL.
-    let external = settings.external_url.as_ref()?.trim();
+    if let Some(zone) = sslip_zone_from_external_url(settings.external_url.as_deref()) {
+        return Some(zone);
+    }
+
+    public_preview_domain(settings.preview_domain.as_deref())
+}
+
+/// The console/base host on a sslip.io install IS the zone itself
+/// (`<ip>.sslip.io`), e.g. external_url `https://1.2.3.4.sslip.io` → zone
+/// `1.2.3.4.sslip.io`. App hostnames are `<app>.1.2.3.4.sslip.io`.
+fn sslip_zone_from_external_url(external_url: Option<&str>) -> Option<String> {
+    let external = external_url?.trim();
     if external.is_empty() {
         return None;
     }
@@ -203,13 +218,28 @@ fn derive_zone(settings: &OnDemandZoneInputs) -> Option<String> {
         Err(_) => Some(external.to_string()),
     }?;
     let host_lc = host.trim_end_matches('.').to_ascii_lowercase();
-    if !host_lc.ends_with("sslip.io") {
-        return None;
-    }
-    // The console/base host on a sslip.io install IS the zone itself
-    // (`<ip>.sslip.io`), e.g. external_url `https://1.2.3.4.sslip.io` →
-    // zone `1.2.3.4.sslip.io`. App hostnames are `<app>.1.2.3.4.sslip.io`.
-    Some(host_lc)
+    host_lc.ends_with("sslip.io").then_some(host_lc)
+}
+
+/// The preview domain as a zone, or `None` when it cannot be a public one.
+fn public_preview_domain(preview_domain: Option<&str>) -> Option<String> {
+    let domain = preview_domain?
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let is_loopback = domain == "localhost"
+        || domain.ends_with(".localhost")
+        || domain == "localho.st"
+        || domain.ends_with(".localho.st")
+        || domain.starts_with("127.")
+        || domain.contains("127-0-0-1");
+    let is_bare_dns_name = domain.contains('.')
+        && !domain.is_empty()
+        && domain.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    (is_bare_dns_name && !is_loopback).then_some(domain)
 }
 
 /// Inputs to [`derive_zone`], extracted so zone derivation is unit-testable
@@ -217,6 +247,7 @@ fn derive_zone(settings: &OnDemandZoneInputs) -> Option<String> {
 struct OnDemandZoneInputs {
     configured_zone: Option<String>,
     external_url: Option<String>,
+    preview_domain: Option<String>,
 }
 
 /// Derive the conventional console host (`console.<zone>`) for the gate's
@@ -277,12 +308,14 @@ pub async fn build_on_demand_cert_manager(
     let zone = match derive_zone(&OnDemandZoneInputs {
         configured_zone: cfg.zone.clone(),
         external_url: settings.external_url.clone(),
+        preview_domain: Some(settings.preview_domain.clone()),
     }) {
         Some(zone) => zone,
         None => {
             warn!(
                 "on-demand TLS is enabled but no zone could be derived \
-                 (set on_demand_tls.zone, or use a *.sslip.io external_url). \
+                 (set on_demand_tls.zone, use a *.sslip.io external_url, or set a public \
+                 preview domain). \
                  Disabling on-demand TLS for this process."
             );
             return None;
@@ -448,6 +481,7 @@ mod tests {
         let zone = derive_zone(&OnDemandZoneInputs {
             configured_zone: Some("  Apps.Example.COM. ".to_string()),
             external_url: Some("https://1.2.3.4.sslip.io".to_string()),
+            preview_domain: None,
         });
         // Trimmed, trailing-dot-stripped, lowercased.
         assert_eq!(zone.as_deref(), Some("apps.example.com"));
@@ -458,6 +492,7 @@ mod tests {
         let zone = derive_zone(&OnDemandZoneInputs {
             configured_zone: None,
             external_url: Some("https://1.2.3.4.sslip.io".to_string()),
+            preview_domain: None,
         });
         assert_eq!(zone.as_deref(), Some("1.2.3.4.sslip.io"));
     }
@@ -467,6 +502,7 @@ mod tests {
         let zone = derive_zone(&OnDemandZoneInputs {
             configured_zone: None,
             external_url: Some("http://1.2.3.4.SSLIP.IO:8080".to_string()),
+            preview_domain: None,
         });
         assert_eq!(zone.as_deref(), Some("1.2.3.4.sslip.io"));
     }
@@ -478,8 +514,62 @@ mod tests {
         let zone = derive_zone(&OnDemandZoneInputs {
             configured_zone: None,
             external_url: Some("https://paas.example.com".to_string()),
+            preview_domain: None,
         });
         assert_eq!(zone, None);
+    }
+
+    #[test]
+    fn zone_falls_back_to_a_public_preview_domain() {
+        let zone = derive_zone(&OnDemandZoneInputs {
+            configured_zone: None,
+            external_url: Some("https://paas.example.com".to_string()),
+            preview_domain: Some(" Apps.Example.com ".to_string()),
+        });
+        assert_eq!(zone.as_deref(), Some("apps.example.com"));
+    }
+
+    #[test]
+    fn zone_prefers_sslip_external_url_over_preview_domain() {
+        let zone = derive_zone(&OnDemandZoneInputs {
+            configured_zone: None,
+            external_url: Some("https://1.2.3.4.sslip.io".to_string()),
+            preview_domain: Some("apps.example.com".to_string()),
+        });
+        assert_eq!(zone.as_deref(), Some("1.2.3.4.sslip.io"));
+    }
+
+    #[test]
+    fn zone_never_derived_from_a_loopback_preview_domain() {
+        for preview in [
+            "localho.st",
+            "apps.localho.st",
+            "localhost",
+            "app.localhost",
+            "127.0.0.1.sslip.io",
+            "127-0-0-1.sslip.io",
+            "",
+            "no-dot",
+            "bad host.example.com",
+            "https://apps.example.com",
+        ] {
+            let zone = derive_zone(&OnDemandZoneInputs {
+                configured_zone: None,
+                external_url: None,
+                preview_domain: Some(preview.to_string()),
+            });
+            assert_eq!(zone, None, "preview domain {preview:?} must not be a zone");
+        }
+    }
+
+    #[test]
+    fn zone_strips_wildcard_prefix_from_preview_domain() {
+        let zone = derive_zone(&OnDemandZoneInputs {
+            configured_zone: None,
+            external_url: None,
+            preview_domain: Some("*.apps.example.com".to_string()),
+        });
+        assert_eq!(zone.as_deref(), Some("apps.example.com"));
     }
 
     #[test]
@@ -509,6 +599,7 @@ mod tests {
         let zone = derive_zone(&OnDemandZoneInputs {
             configured_zone: None,
             external_url: None,
+            preview_domain: None,
         });
         assert_eq!(zone, None);
     }
@@ -520,6 +611,7 @@ mod tests {
         let zone = derive_zone(&OnDemandZoneInputs {
             configured_zone: Some("   ".to_string()),
             external_url: Some("https://5.6.7.8.sslip.io".to_string()),
+            preview_domain: None,
         });
         assert_eq!(zone.as_deref(), Some("5.6.7.8.sslip.io"));
     }
