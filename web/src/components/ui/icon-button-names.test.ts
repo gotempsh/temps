@@ -30,7 +30,8 @@ function onlyIconsInExpression(inner: string): RegExpExecArray | null {
   if (!first) return null
   const rest = inner
     .replace(new RegExp(ICON, 'gs'), '')
-    .replace(/[\w.!&| ]+\?/g, '')
+    // Condition heads of any shape (`a ?`, `n > 0 ?`, `s === 'x' ?`, `f(a) ?`).
+    .replace(/[^?:{}]*\?/g, '')
     .replace(/&&|[{}():\s]/g, '')
   return rest === '' ? first : null
 }
@@ -123,6 +124,28 @@ test('the scan recognises an unnamed icon-only button', () => {
       '<Button onClick={copy}>\n  {copied ? (\n    <Check className="h-4 w-4" />\n  ) : (\n    <Copy className="h-4 w-4" />\n  )}\n</Button>'
     )
   ).toHaveLength(1)
+  // Comparison and call conditions are still just a condition.
+  expect(
+    unnamedIconButtons(
+      "<Button onClick={go}>{status === 'open' ? <ChevronUp /> : <ChevronDown />}</Button>"
+    )
+  ).toHaveLength(1)
+  expect(
+    unnamedIconButtons(
+      '<Button onClick={go}>{rows.length > 0 ? (<Trash />) : (<Plus />)}</Button>'
+    )
+  ).toHaveLength(1)
+  expect(
+    unnamedIconButtons(
+      '<Button onClick={go}>{isOn(id) ? (<Eye />) : n >= 2 ? (<EyeOff />) : (<Lock />)}</Button>'
+    )
+  ).toHaveLength(1)
+  // A text branch names the button.
+  expect(
+    unnamedIconButtons(
+      "<Button onClick={go}>{count > 0 ? <Check /> : 'Close'}</Button>"
+    )
+  ).toHaveLength(0)
   // Text next to the swap names the button.
   expect(
     unnamedIconButtons(
