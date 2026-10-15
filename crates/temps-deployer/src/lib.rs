@@ -27,6 +27,7 @@ pub type ImageImportStream =
 
 pub mod build_protocol;
 pub mod build_timings;
+pub mod build_verification;
 pub mod compose;
 mod compose_remote;
 
