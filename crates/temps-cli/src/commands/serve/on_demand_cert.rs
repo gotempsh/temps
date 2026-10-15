@@ -32,7 +32,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_core::{AppSettings, EncryptionService};
 use temps_database::DbConnection;
 use temps_domains::{DefaultCertificateRepository, DomainService, LetsEncryptProvider};
-use temps_entities::domains;
+use temps_entities::{domains, settings};
 use temps_proxy::on_demand_cert::{
     CertProvisionFailure, OnDemandCertConfig, OnDemandCertManager, OnDemandCertProvisioner,
     OnDemandCertState,
@@ -50,36 +50,61 @@ const STATE_SEED_LOOKBACK_HOURS: i64 = 24;
 /// `ContainerLifecycleAdapter` pattern for scale-to-zero).
 struct DomainServiceProvisioner {
     domain_service: Arc<DomainService>,
-    /// ACME contact email resolved at startup from `letsencrypt.email` settings
-    /// (the manager re-passes it per call; resolving once at boot avoids a
-    /// settings round-trip on every issuance). There is no fallback: if
-    /// `letsencrypt.email` is unset, [`Self::resolve_email`] returns empty and
-    /// issuance fails cleanly with "no ACME contact email configured" rather
-    /// than substituting a system/placeholder address.
+    db: Arc<DbConnection>,
+    /// ACME contact email as it was when the proxy started. Only a fallback:
+    /// the stored `letsencrypt.email` is read again on every issuance (see
+    /// [`Self::resolve_email`]), so an email set after boot -- from the
+    /// console banner or the settings page -- takes effect without a restart.
     configured_email: Option<String>,
 }
 
 impl DomainServiceProvisioner {
-    /// Resolve the ACME account email. The configured `letsencrypt.email` is the
-    /// single source of truth — there is NO fallback to the first user's email
-    /// or a placeholder, because those produced invalid contacts (e.g. the
-    /// `system@localhost` system user). Returns empty when unset; the caller
+    /// Resolve the ACME account email for this attempt. The stored
+    /// `letsencrypt.email` is the single source of truth -- there is NO
+    /// fallback to the first user's email or a placeholder, because those
+    /// produced invalid contacts (e.g. the `system@localhost` system user).
+    ///
+    /// The settings row is read on every call: issuance is bounded by the
+    /// hourly cap and per-host backoff, so one primary-key lookup per attempt
+    /// is negligible next to the ACME order it precedes. If the read itself
+    /// fails the boot-time value is used, so a database blip does not turn a
+    /// configured install into "no email". Returns empty when unset; the caller
     /// (`provision_on_demand`) treats empty as a clean, logged failure.
     async fn resolve_email(&self) -> String {
-        self.configured_email
-            .as_ref()
-            .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty())
-            .unwrap_or_default()
+        match settings::Entity::find_by_id(1).one(self.db.as_ref()).await {
+            Ok(row) => row
+                .and_then(|r| acme_email_from_settings_json(r.data))
+                .unwrap_or_default(),
+            Err(e) => {
+                warn!(
+                    "on-demand TLS: could not re-read the ACME contact email from settings: {};                      using the value from startup",
+                    e
+                );
+                self.configured_email
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .unwrap_or_default()
+            }
+        }
     }
+}
+
+/// The trimmed, non-empty `letsencrypt.email` of a stored settings document.
+fn acme_email_from_settings_json(data: serde_json::Value) -> Option<String> {
+    AppSettings::from_json(data)
+        .letsencrypt
+        .email
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
 }
 
 #[async_trait]
 impl OnDemandCertProvisioner for DomainServiceProvisioner {
     async fn provision(&self, hostname: &str, _email: &str) -> Result<(), CertProvisionFailure> {
-        // The manager hands us the boot-time email it was configured with, but we
-        // re-resolve here so a settings change (or a user added after boot) is
-        // honored without a proxy restart for the email specifically.
+        // The manager hands us the boot-time email it was configured with, but
+        // the stored setting is re-read here so an email set after boot is
+        // honored without a proxy restart.
         let email = self.resolve_email().await;
         self.domain_service
             .provision_on_demand(hostname, &email)
@@ -329,15 +354,17 @@ pub async fn build_on_demand_cert_manager(
         .map(|e| e.trim().to_string())
         .filter(|e| !e.is_empty());
 
-    // Warn loudly at boot if on-demand TLS is enabled but has no ACME contact:
-    // every issuance will fail cleanly ("no ACME contact email configured"), so
-    // the console/app HTTPS will never come up. There is no fallback by design.
+    // Warn at boot if on-demand TLS is enabled but has no ACME contact yet:
+    // issuance fails cleanly ("no ACME contact email configured") and backs off
+    // until one is saved, which is picked up on the next attempt with no
+    // restart. There is no fallback by design.
     if email.is_none() {
         warn!(
             "on-demand TLS is enabled but no Let's Encrypt contact email is set \
              (settings.letsencrypt.email is empty). Certificate issuance cannot \
-             proceed — set a contact email (e.g. re-run `temps setup \
-             --letsencrypt-email you@example.com`) to enable HTTPS."
+             proceed until one is set in the console (Settings → Certificates) \
+             or with `temps setup --letsencrypt-email you@example.com`; no \
+             restart is needed."
         );
     }
 
@@ -361,6 +388,7 @@ pub async fn build_on_demand_cert_manager(
 
     let provisioner: Arc<dyn OnDemandCertProvisioner> = Arc::new(DomainServiceProvisioner {
         domain_service,
+        db: db.clone(),
         configured_email: email.clone(),
     });
 
@@ -460,6 +488,103 @@ async fn seed_state_from_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acme_email_is_read_trimmed_from_stored_settings() {
+        let data = serde_json::json!({ "letsencrypt": { "email": "  ops@example.com " } });
+        assert_eq!(
+            acme_email_from_settings_json(data).as_deref(),
+            Some("ops@example.com")
+        );
+    }
+
+    #[test]
+    fn acme_email_absent_blank_or_missing_section_is_none() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({ "letsencrypt": {} }),
+            serde_json::json!({ "letsencrypt": { "email": null } }),
+            serde_json::json!({ "letsencrypt": { "email": "   " } }),
+        ] {
+            assert_eq!(acme_email_from_settings_json(data), None);
+        }
+    }
+
+    async fn provisioner_with(
+        stored: Result<Vec<settings::Model>, sea_orm::DbErr>,
+        configured_email: Option<&str>,
+    ) -> DomainServiceProvisioner {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres);
+        mock = match stored {
+            Ok(rows) => mock.append_query_results(vec![rows]),
+            Err(e) => mock.append_query_errors(vec![e]),
+        };
+        let db = Arc::new(mock.into_connection());
+        let encryption = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("test encryption key"),
+        );
+        let repository = Arc::new(DefaultCertificateRepository::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let provider = Arc::new(LetsEncryptProvider::new(repository.clone()));
+        DomainServiceProvisioner {
+            domain_service: Arc::new(DomainService::new(
+                db.clone(),
+                provider,
+                repository,
+                encryption,
+            )),
+            db,
+            configured_email: configured_email.map(str::to_string),
+        }
+    }
+
+    fn settings_row(data: serde_json::Value) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_email_prefers_the_stored_value_over_the_boot_value() {
+        // Started without an email, saved one afterwards: the stored value wins.
+        let p = provisioner_with(
+            Ok(vec![settings_row(
+                serde_json::json!({ "letsencrypt": { "email": "ops@example.com" } }),
+            )]),
+            None,
+        )
+        .await;
+        assert_eq!(p.resolve_email().await, "ops@example.com");
+    }
+
+    #[tokio::test]
+    async fn resolve_email_follows_a_removed_email_rather_than_the_boot_value() {
+        let p = provisioner_with(
+            Ok(vec![settings_row(serde_json::json!({}))]),
+            Some("old@example.com"),
+        )
+        .await;
+        assert_eq!(p.resolve_email().await, "");
+    }
+
+    #[tokio::test]
+    async fn resolve_email_falls_back_to_the_boot_value_when_the_read_fails() {
+        let p = provisioner_with(
+            Err(sea_orm::DbErr::Custom("connection reset".to_string())),
+            Some(" boot@example.com "),
+        )
+        .await;
+        assert_eq!(p.resolve_email().await, "boot@example.com");
+    }
 
     #[test]
     fn loopback_detection() {

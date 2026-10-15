@@ -11,6 +11,8 @@
  * instead of showing a switch that is on but does nothing.
  */
 
+import { z } from 'zod'
+
 export const ON_DEMAND_TLS_SETTINGS_PATH = '/settings/on-demand-tls'
 
 /** Where the Let's Encrypt contact email is edited. */
@@ -224,9 +226,25 @@ export function needsAcmeContactEmail(
 }
 
 /** Same rule the settings form applies to the contact email. */
-export function isValidContactEmail(email: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-}
+export const CONTACT_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+/**
+ * Zod schema for the contact email field. Trims before validating so the saved
+ * value never carries stray whitespace; both the banner and any future inline
+ * prompt share it so they accept exactly what the settings form accepts.
+ */
+export const contactEmailSchema = z.object({
+  email: z
+    .string()
+    .trim()
+    .min(1, 'Enter an email address')
+    .regex(
+      CONTACT_EMAIL_PATTERN,
+      'Enter a valid email address, such as ops@your-domain.com'
+    ),
+})
+
+export type ContactEmailFormData = z.infer<typeof contactEmailSchema>
 
 /** Empty or whitespace becomes `null` ("derive from the external URL"). */
 export function normalizeZoneInput(

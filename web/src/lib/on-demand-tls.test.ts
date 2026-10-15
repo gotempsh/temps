@@ -7,7 +7,7 @@ import {
   certificatesEmptyStateCopy,
   effectiveZone,
   isLoopbackHost,
-  isValidContactEmail,
+  contactEmailSchema,
   needsAcmeContactEmail,
   isValidZoneInput,
   normalizeZoneInput,
@@ -232,11 +232,20 @@ describe('needsAcmeContactEmail', () => {
   })
 })
 
-describe('isValidContactEmail', () => {
-  test('matches the settings form rule', () => {
-    expect(isValidContactEmail(' ops@example.com ')).toBe(true)
-    expect(isValidContactEmail('ops@example')).toBe(false)
-    expect(isValidContactEmail('')).toBe(false)
-    expect(isValidContactEmail('a b@example.com')).toBe(false)
+describe('contactEmailSchema', () => {
+  test('accepts what the settings form accepts and trims it', () => {
+    const parsed = contactEmailSchema.safeParse({ email: ' ops@example.com ' })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data.email).toBe('ops@example.com')
+  })
+
+  test('rejects blank and malformed addresses with a message', () => {
+    for (const email of ['', '   ', 'ops@example', 'a b@example.com', 'nope']) {
+      const parsed = contactEmailSchema.safeParse({ email })
+      expect(parsed.success).toBe(false)
+      if (!parsed.success) {
+        expect(parsed.error.issues[0].message.length).toBeGreaterThan(0)
+      }
+    }
   })
 })
