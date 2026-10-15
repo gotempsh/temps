@@ -126,6 +126,9 @@ impl TempsPlugin for AnalyticsPlugin {
             rate_limiter: context.require_service::<AnalyticsIngestRateLimiter>(),
             audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
             project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+            // Optional: a binary without the settings service still serves the
+            // key CRUD; the ingest-endpoint route then reports no external URL.
+            config_service: context.get_service::<temps_config::ConfigService>(),
         });
 
         // Configure routes with the state
