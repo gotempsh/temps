@@ -103,26 +103,16 @@ fn health_check_path_for_public_route(
 /// Variables are substituted before detection, so a healthcheck such as
 /// `curl localhost/ready/${TOKEN}` would otherwise persist the secret.
 /// Only a path the public route could use is kept (no query, fragment,
-/// userinfo or scheme). A path written literally in the Compose `sources`
-/// was not substituted and is kept as is; any other path is dropped when it
-/// contains the value of a project variable. The route then falls back to
-/// `/`, as it does for any unsafe path.
-fn snapshot_health_check_path(
-    path: Option<String>,
-    environment: &HashMap<String, String>,
-    sources: &[&str],
-) -> Option<String> {
+/// userinfo or scheme), and only when it is written literally in the Compose
+/// `sources`: any other path was produced by substitution, and its values may
+/// come from the project, the repository `.env` or an include's env files, so
+/// none can be ruled out. The route then falls back to `/`, as it does for
+/// any unsafe path.
+fn snapshot_health_check_path(path: Option<String>, sources: &[&str]) -> Option<String> {
     let path = path?;
-    if !is_safe_health_check_path(&path) {
-        return None;
-    }
-    if sources.iter().any(|source| source.contains(path.as_str())) {
-        return Some(path);
-    }
-    let embeds_variable = environment
-        .values()
-        .any(|value| value.len() >= 3 && path.contains(value.as_str()));
-    (!embeds_variable).then_some(path)
+    (is_safe_health_check_path(&path)
+        && sources.iter().any(|source| source.contains(path.as_str())))
+    .then_some(path)
 }
 
 fn is_safe_health_check_path(path: &str) -> bool {
@@ -1069,7 +1059,6 @@ impl DeployComposeJob {
                         ports: s.ports,
                         health_check_path: snapshot_health_check_path(
                             s.health_check_path,
-                            &self.environment_vars,
                             &health_path_sources,
                         ),
                     })
@@ -2481,73 +2470,51 @@ mod tests {
 
     #[test]
     fn snapshot_health_paths_never_carry_substituted_secrets() {
-        let environment = HashMap::from([
-            ("HEALTH_TOKEN".to_string(), "s3cr3t-token".to_string()),
-            ("PORT".to_string(), "80".to_string()),
-        ]);
-        let source = "healthcheck: {test: [CMD, curl, 'http://localhost/ready/${HEALTH_TOKEN}']}";
-        // A query is never persisted, whatever it contains.
+        // TOKEN may come from the repository .env or an include's env file,
+        // which the project's variables never see; the path is dropped
+        // because it is not written in any source.
+        let source = "healthcheck: {test: [CMD, curl, 'http://localhost/ready/${TOKEN}']}";
+        assert_eq!(
+            snapshot_health_check_path(Some("/ready/private-token".to_string()), &[source]),
+            None
+        );
+        // A query is never persisted, whatever it contains or wherever it
+        // is written.
         assert_eq!(
             snapshot_health_check_path(
-                Some("/ready?token=s3cr3t-token".to_string()),
-                &environment,
-                &[source]
+                Some("/ready?token=x".to_string()),
+                &["test: curl localhost/ready?token=x"]
             ),
             None
         );
-        // Nor is a substituted path that embeds a project variable's value.
+        // A path partly built from a variable is not in the sources either.
         assert_eq!(
             snapshot_health_check_path(
-                Some("/ready/s3cr3t-token".to_string()),
-                &environment,
-                &[source]
+                Some("/v2/health".to_string()),
+                &["test: curl localhost/${API_VERSION}/health"]
             ),
             None
         );
-        // Ordinary paths are kept; values shorter than three bytes are ignored.
-        assert_eq!(
-            snapshot_health_check_path(Some("/healthz80".to_string()), &environment, &[source]),
-            Some("/healthz80".to_string())
-        );
-        assert_eq!(
-            snapshot_health_check_path(None, &environment, &[source]),
-            None
-        );
+        assert_eq!(snapshot_health_check_path(None, &[source]), None);
     }
 
     #[test]
-    fn literal_health_paths_survive_matching_ordinary_variables() {
-        // APP_NAME=api and HEALTH_PATH=/health are ordinary settings; the
-        // healthcheck never referenced them, so its path is kept.
-        let environment = HashMap::from([
-            ("APP_NAME".to_string(), "api".to_string()),
-            ("HEALTH_PATH".to_string(), "/health".to_string()),
-        ]);
+    fn literal_health_paths_are_kept_from_any_source() {
         let source = "services:\n  web:\n    healthcheck:\n      test: [CMD, curl, -f, 'http://localhost:8080/api/health']\n";
         assert_eq!(
-            snapshot_health_check_path(Some("/api/health".to_string()), &environment, &[source]),
+            snapshot_health_check_path(Some("/api/health".to_string()), &[source]),
             Some("/api/health".to_string())
         );
-        // The override is a source too.
+        // The override and referenced files are sources too.
         assert_eq!(
             snapshot_health_check_path(
                 Some("/health".to_string()),
-                &environment,
                 &[
                     "services: {}",
                     "services: {web: {healthcheck: {test: 'curl localhost/health'}}}"
                 ]
             ),
             Some("/health".to_string())
-        );
-        // Without a literal occurrence the value check still applies.
-        assert_eq!(
-            snapshot_health_check_path(
-                Some("/api/health".to_string()),
-                &environment,
-                &["services: {}"]
-            ),
-            None
         );
     }
 

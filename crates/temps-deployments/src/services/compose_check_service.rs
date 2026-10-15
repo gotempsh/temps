@@ -29,6 +29,7 @@ use temps_entities::{
     compose_security_policies, compose_validation_reports, deployment_jobs, deployments,
     env_var_environments, env_vars, environments, projects,
 };
+use temps_git::services::git_provider_manager::GitProviderManagerError;
 use temps_git::GitProviderManager;
 use temps_presets::compose_check::{
     compose_local_references, ComposeCheckErrorClass, ComposeCheckReport, ComposeCheckRequest,
@@ -36,7 +37,7 @@ use temps_presets::compose_check::{
     ComposeRepositorySource, COMPOSE_VALIDATION_REVISION,
 };
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use utoipa::ToSchema;
 
 /// File names tried, in order, when a project has no configured Compose path
@@ -399,13 +400,16 @@ impl ComposeCheckService {
     }
 
     /// Read the Compose file (trying the standard names when no path is
-    /// configured) and, best-effort, the repository `.env` beside it.
+    /// configured) and the repository `.env` beside it. A `.env` the provider
+    /// could not answer for is recorded in `inconclusive`: its values may
+    /// change the result, so the check cannot be treated as conclusive.
     async fn read_source(
         &self,
         project_id: i32,
         source: &ComposeSource,
         context: &ComposeProjectContext,
         notes: &mut Vec<String>,
+        inconclusive: &mut Vec<String>,
     ) -> Result<(String, String, Option<String>), ComposeCheckServiceError> {
         let (connection_id, owner, name, git_ref) = match source {
             ComposeSource::Inline(content) => {
@@ -455,23 +459,19 @@ impl ComposeCheckService {
             });
         };
         let env_path = repository_path(&context.directory, ".env");
-        let repository_env = match self
+        let read = self
             .git_provider_manager
             .read_repository_text_file(connection_id, owner, name, &env_path, git_ref)
-            .await
-        {
-            Ok(content) => Some(content),
-            Err(error) => {
-                debug!(
+            .await;
+        if let Err(error) = &read {
+            if !error.is_file_not_found() {
+                warn!(
                     project_id,
-                    "Repository .env not read for the Compose check: {error}"
+                    "Repository .env could not be read for the Compose check: {error}"
                 );
-                notes.push(
-                    "No repository .env was read at this revision; variables are resolved from the environment's variables and defaults only.".to_string(),
-                );
-                None
             }
-        };
+        }
+        let repository_env = repository_env_outcome(read, &env_path, notes, inconclusive);
         Ok((compose_file, content, repository_env))
     }
 
@@ -485,8 +485,9 @@ impl ComposeCheckService {
         context: ComposeProjectContext,
     ) -> Result<(ComposeCheckReport, bool), ComposeCheckServiceError> {
         let mut notes = Vec::new();
+        let mut unread = Vec::new();
         let (compose_file, content, repository_env) = self
-            .read_source(project_id, &source, &context, &mut notes)
+            .read_source(project_id, &source, &context, &mut notes, &mut unread)
             .await?;
         let repository = match source {
             ComposeSource::Repository {
@@ -518,6 +519,8 @@ impl ComposeCheckService {
             })
             .await;
         report.notes.extend(notes);
+        let complete = complete && unread.is_empty();
+        report.notes.extend(unread);
         Ok((report, complete))
     }
 
@@ -753,15 +756,18 @@ impl ComposeCheckService {
     /// Returns whether the project was flagged as failing.
     async fn revalidate_project(&self, project_id: i32) -> bool {
         let report = match self.check_project(project_id).await {
-            Ok((report, complete)) if report.passed || complete => report,
-            Ok((report, _)) => {
-                warn!(
-                    project_id,
-                    "Compose revalidation was inconclusive because referenced files could not be read; it will be retried at the next startup: {}",
-                    report.error.as_deref().unwrap_or("no detail")
-                );
-                return false;
-            }
+            Ok(checked) => match Revalidation::of(checked) {
+                Revalidation::Store(report) => report,
+                Revalidation::Inconclusive(report) => {
+                    warn!(
+                        project_id,
+                        passed = report.passed,
+                        "Compose revalidation was inconclusive because referenced files could not be read; it will be retried at the next startup: {}",
+                        report.error.as_deref().unwrap_or("no detail")
+                    );
+                    return false;
+                }
+            },
             Err(error) => {
                 warn!(
                     project_id,
@@ -837,7 +843,53 @@ fn normalize_directory(directory: &str) -> String {
     }
 }
 
-/// A repository-relative path for `file` inside the project directory.
+/// The repository `.env` for a check. A confirmed absence is conclusive (the
+/// deployment would not see one either); any other failure leaves the check
+/// inconclusive, since the file's values may change the result.
+fn repository_env_outcome(
+    read: Result<String, GitProviderManagerError>,
+    env_path: &str,
+    notes: &mut Vec<String>,
+    inconclusive: &mut Vec<String>,
+) -> Option<String> {
+    match read {
+        Ok(content) => Some(content),
+        Err(error) if error.is_file_not_found() => {
+            notes.push(
+                "The repository has no .env at this revision; variables are resolved from the environment's variables and defaults only.".to_string(),
+            );
+            None
+        }
+        Err(error) => {
+            inconclusive.push(format!(
+                "The repository .env at '{env_path}' could not be read ({error}); the result may change once it can be."
+            ));
+            None
+        }
+    }
+}
+
+/// What revalidation does with a check.
+#[derive(Debug)]
+enum Revalidation {
+    /// Every input was read: the result is stored.
+    Store(ComposeCheckReport),
+    /// Some input could not be read. Unread inputs can change the outcome
+    /// either way (an unread env file may enable what the defaults leave
+    /// off), so a pass is no more conclusive than a failure.
+    Inconclusive(ComposeCheckReport),
+}
+
+impl Revalidation {
+    fn of((report, complete): (ComposeCheckReport, bool)) -> Self {
+        if complete {
+            Self::Store(report)
+        } else {
+            Self::Inconclusive(report)
+        }
+    }
+}
+
 /// Why a referenced repository file was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReferenceReadError {
@@ -866,7 +918,12 @@ type ReferenceScope = (Arc<HashMap<String, String>>, u64);
 
 /// A Compose document whose references are still to be examined.
 struct PendingDocument {
+    /// Repository path relative to the project directory; for an inline
+    /// document, only a label that keeps it apart from the others.
     path: String,
+    /// Content of a document that is not read from the repository: the
+    /// Compose file itself and the project override.
+    inline: Option<String>,
     /// Directory its references resolve against.
     base: String,
     variables: Arc<HashMap<String, String>>,
@@ -913,22 +970,38 @@ where
     // Values that may appear in a referenced path once it is interpolated;
     // every note is redacted for them before it reaches the report.
     let mut sensitive: HashSet<String> = root_variables.values().cloned().collect();
+    let root_variables = Arc::new(root_variables);
     let mut traversal = Traversal::default();
     traversal.enqueue(PendingDocument {
         path: String::new(),
-        base,
-        variables: Arc::new(root_variables),
+        inline: Some(request.content.clone()),
+        base: base.clone(),
+        variables: root_variables.clone(),
         scope: 0,
     });
+    // The override is another `-f` file: Compose resolves its paths against
+    // the Compose file's directory, with the same variables.
+    if let Some(override_content) = request
+        .compose_override
+        .as_ref()
+        .filter(|content| !content.trim().is_empty())
+    {
+        traversal.enqueue(PendingDocument {
+            path: "\0project override".to_string(),
+            inline: Some(override_content.clone()),
+            base,
+            variables: root_variables,
+            scope: 0,
+        });
+    }
     // Include environments by including scope and env files, so a repeated
     // include reuses one map instead of parsing and holding another.
     let mut scopes: HashMap<(u64, Vec<String>), ReferenceScope> = HashMap::new();
     let mut scope_bytes = 0_usize;
     'documents: while let Some(document) = traversal.queue.pop_front() {
-        let content = if document.path.is_empty() {
-            Some(request.content.clone())
-        } else {
-            reader.read(document.path.clone(), false).await
+        let content = match document.inline {
+            Some(content) => Some(content),
+            None => reader.read(document.path.clone(), false).await,
         };
         let Some(content) = content else {
             continue;
@@ -948,6 +1021,7 @@ where
             traversal.enqueue(PendingDocument {
                 base: parent_path(&file),
                 path: file,
+                inline: None,
                 variables: document.variables.clone(),
                 scope: document.scope,
             });
@@ -1018,6 +1092,7 @@ where
                         .clone()
                         .unwrap_or_else(|| parent_path(&path)),
                     path,
+                    inline: None,
                     variables: variables.clone(),
                     scope,
                 });
@@ -1458,6 +1533,103 @@ mod tests {
         assert!(!notes.contains("s3cr3t-token"), "{notes}");
         assert!(!notes.contains("include-env-value"), "{notes}");
         assert!(notes.contains("<redacted>/child.yaml"), "{notes}");
+    }
+
+    #[tokio::test]
+    async fn references_in_the_project_override_are_read_too() {
+        // The override is another `-f` file, resolved against the Compose
+        // file's directory with the same variables.
+        let mut request = reference_request("services: {}\n", &[("TEAM", "teams")]);
+        request.compose_file = "deploy/compose.yaml".to_string();
+        request.compose_override = Some("include:\n  - ${TEAM}/extra.yaml\n".to_string());
+        let (files, requested) = collect(
+            &request,
+            &[("deploy/teams/extra.yaml", Ok("services: {}\n"))],
+        )
+        .await;
+        // The include's own optional `.env` is looked up too, as for any
+        // include; its absence is not a finding.
+        assert_eq!(
+            requested,
+            vec![
+                "deploy/teams/.env".to_string(),
+                "deploy/teams/extra.yaml".to_string()
+            ]
+        );
+        assert!(files.files.contains_key("deploy/teams/extra.yaml"));
+        assert!(files.missing.is_empty(), "{:?}", files.missing);
+        assert!(files.inconclusive.is_empty(), "{:?}", files.inconclusive);
+
+        // A blank override adds nothing.
+        request.compose_override = Some("  \n".to_string());
+        let (_, requested) = collect(&request, &[]).await;
+        assert!(requested.is_empty(), "{requested:?}");
+    }
+
+    #[test]
+    fn an_unread_repository_env_is_inconclusive_and_a_missing_one_is_not() {
+        let mut notes = Vec::new();
+        let mut inconclusive = Vec::new();
+        let missing = GitProviderManagerError::ProviderError(
+            temps_git::services::git_provider::GitProviderError::FileNotFound {
+                repository: "owner/repo".to_string(),
+                path: "app/.env".to_string(),
+                git_ref: "main".to_string(),
+            },
+        );
+        assert_eq!(
+            repository_env_outcome(Err(missing), "app/.env", &mut notes, &mut inconclusive),
+            None
+        );
+        assert!(inconclusive.is_empty(), "{inconclusive:?}");
+        assert_eq!(notes.len(), 1);
+
+        let outage = GitProviderManagerError::ConnectionNotFound("connection 7".to_string());
+        assert_eq!(
+            repository_env_outcome(Err(outage), "app/.env", &mut notes, &mut inconclusive),
+            None
+        );
+        assert_eq!(inconclusive.len(), 1);
+        assert!(inconclusive[0].contains("app/.env"), "{inconclusive:?}");
+
+        assert_eq!(
+            repository_env_outcome(
+                Ok("A=1".to_string()),
+                "app/.env",
+                &mut notes,
+                &mut inconclusive
+            ),
+            Some("A=1".to_string())
+        );
+    }
+
+    #[test]
+    fn revalidation_stores_only_checks_that_saw_every_input() {
+        let passed = ComposeCheckReport {
+            passed: true,
+            error_class: None,
+            error: None,
+            ..ComposeCheckReport::failure(ComposeCheckErrorClass::Interpolation, "")
+        };
+        let failed = ComposeCheckReport::failure(ComposeCheckErrorClass::PolicyViolation, "no");
+        assert!(matches!(
+            Revalidation::of((passed.clone(), true)),
+            Revalidation::Store(_)
+        ));
+        assert!(matches!(
+            Revalidation::of((failed.clone(), true)),
+            Revalidation::Store(_)
+        ));
+        // An unread env file may enable what the defaults leave off, so an
+        // incomplete pass is no more conclusive than an incomplete failure.
+        assert!(matches!(
+            Revalidation::of((passed, false)),
+            Revalidation::Inconclusive(_)
+        ));
+        assert!(matches!(
+            Revalidation::of((failed, false)),
+            Revalidation::Inconclusive(_)
+        ));
     }
 
     /// An env file whose values double on every line: ~2 MiB once parsed.
