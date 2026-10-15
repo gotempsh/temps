@@ -27,6 +27,53 @@ pub fn is_monotonic_counter(metric_name: &str) -> bool {
         || metric_name.ends_with(".count")
 }
 
+/// Metrics that are stored as per-interval **deltas** (one non-negative count
+/// per sampler cycle), as opposed to point-in-time gauges.
+///
+/// These must be `SUM`med per bucket at read time. `AVG` would report the mean
+/// count per sampling cycle, which neither grows with the bucket width nor adds
+/// up to a window total: a 5-minute bucket over 60s samples would show ~1/5 of
+/// the real traffic, and summing the buckets for a "total requests" card would
+/// undercount by `bucket / sample_interval`.
+///
+/// They are not caught by [`is_monotonic_counter`] on purpose — that flag means
+/// "raw cumulative value, LAG-difference me" and these are already deltas.
+/// The store does not persist [`MetricKind`], so the read path identifies them
+/// by name. The proxy sampler's `is_counter` samples are checked against this
+/// list by a test in `temps-proxy` so the two cannot drift apart.
+pub const DELTA_COUNTER_METRICS: &[&str] = &[
+    "proxy.requests",
+    "proxy.requests_1xx",
+    "proxy.requests_2xx",
+    "proxy.requests_3xx",
+    "proxy.requests_4xx",
+    "proxy.requests_5xx",
+    "proxy.requests_project",
+    "proxy.requests_console",
+    "proxy.requests_other",
+    "proxy.streaming_sessions",
+    "proxy.rate_limited",
+];
+
+/// Returns `true` when `metric_name` is a per-interval delta counter that
+/// range queries must `SUM` per bucket. See [`DELTA_COUNTER_METRICS`].
+pub fn is_delta_counter(metric_name: &str) -> bool {
+    DELTA_COUNTER_METRICS.contains(&metric_name)
+}
+
+/// SQL aggregate used to collapse the raw samples of one bucket for a
+/// non-cumulative metric: `SUM` for delta counters, `AVG` for gauges.
+///
+/// Returns a `&'static str` chosen from a closed set, so it is safe to
+/// interpolate into SQL.
+pub(crate) fn bucket_aggregate(metric_name: &str) -> &'static str {
+    if is_delta_counter(metric_name) {
+        "SUM"
+    } else {
+        "AVG"
+    }
+}
+
 /// Widen `requested` so `window / step` stays ≤ [`temps_core::time_window::MAX_SERIES_POINTS`].
 ///
 /// A 7-day window at 1 minute is 10_080 points. Preset steps from
@@ -206,7 +253,11 @@ pub trait MetricsStore: Send + Sync {
     /// Persist a batch of metric points. Uses bulk insert for efficiency.
     async fn write_batch(&self, points: Vec<MetricPoint>) -> Result<(), MetricsError>;
 
-    /// Return bucketed `(timestamp, avg_value)` pairs for the requested range.
+    /// Return bucketed `(timestamp, value)` pairs for the requested range.
+    ///
+    /// The per-bucket value is `AVG` for gauges, `SUM` for per-interval delta
+    /// counters ([`is_delta_counter`]), and the LAG-differenced increase for
+    /// cumulative counters (`RangeQuery::monotonic`).
     ///
     /// Table selection (TimescaleDB implementation; ClickHouse may differ):
     /// - range ≤ 7 days  → raw `service_metrics` (full resolution, avoids the
@@ -330,5 +381,39 @@ mod tests {
         assert!(!is_monotonic_counter("container.cpu_percent"));
         assert!(!is_monotonic_counter("container.memory_used_bytes"));
         assert!(!is_monotonic_counter("container.network_rx_bytes_delta"));
+    }
+
+    #[test]
+    fn test_is_delta_counter_matches_proxy_request_counters_only() {
+        assert!(is_delta_counter("proxy.requests"));
+        assert!(is_delta_counter("proxy.requests_5xx"));
+        assert!(is_delta_counter("proxy.requests_console"));
+        assert!(is_delta_counter("proxy.streaming_sessions"));
+        // Gauges derived from the same interval must keep averaging.
+        assert!(!is_delta_counter("proxy.error_rate_percent"));
+        assert!(!is_delta_counter("proxy.request_duration_p95_ms"));
+        assert!(!is_delta_counter("proxy.streaming_duration_avg_ms"));
+        assert!(!is_delta_counter("node.cpu_percent"));
+        // Prefix matches are not enough: names are matched exactly.
+        assert!(!is_delta_counter("proxy.requests_other_thing"));
+    }
+
+    #[test]
+    fn test_delta_counters_are_not_treated_as_monotonic() {
+        // Delta counters are pre-differenced; LAG-differencing them again would
+        // corrupt the series.
+        for name in DELTA_COUNTER_METRICS {
+            assert!(
+                !is_monotonic_counter(name),
+                "{name} is a delta counter and must not be LAG-differenced"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_aggregate_selection() {
+        assert_eq!(bucket_aggregate("proxy.requests"), "SUM");
+        assert_eq!(bucket_aggregate("proxy.request_duration_p95_ms"), "AVG");
+        assert_eq!(bucket_aggregate("pg.connections_active"), "AVG");
     }
 }

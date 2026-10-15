@@ -126,7 +126,8 @@ type NodePanelDef = {
 const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by status class',
-    description: 'Per-interval request count, split by response status class',
+    description:
+      'Requests per time bucket, split by response status class. Bucket width grows with the selected range, so a longer range shows larger counts',
     series: [
       {
         metric: 'proxy.requests',
@@ -158,7 +159,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by destination',
     description:
-      'Per-interval request count, split by destination: project routes, console fallback, or handled by the proxy itself',
+      'Requests per time bucket, split by destination: project routes, console fallback, or handled by the proxy itself',
     series: [
       {
         metric: 'proxy.requests_project',
@@ -300,7 +301,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Streaming sessions',
     description:
-      'WebSocket tunnels and SSE streams that closed, averaged per collection interval (not a total for the bucket). These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
+      'WebSocket tunnels and SSE streams that closed in each time bucket. These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
     series: [
       {
         metric: 'proxy.streaming_sessions',

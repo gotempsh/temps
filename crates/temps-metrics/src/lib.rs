@@ -21,6 +21,7 @@ pub use store::clickhouse::{ChMetricRow, ClickHouseMetricsConfig, ClickhouseMetr
 pub use store::clickhouse_migrations;
 pub use store::timescale::{validate_metric_name, TimescaleMetricsStore};
 pub use store::{
-    clamp_step, duration_to_step, is_monotonic_counter, range_to_step, LabelledMetric,
-    LatestByLabelQuery, LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind,
+    clamp_step, duration_to_step, is_delta_counter, is_monotonic_counter, range_to_step,
+    LabelledMetric, LatestByLabelQuery, LatestQuery, MetricKind, MetricPoint, MetricsStore,
+    RangeQuery, SourceKind, DELTA_COUNTER_METRICS,
 };

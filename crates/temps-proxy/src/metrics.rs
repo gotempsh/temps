@@ -643,6 +643,51 @@ fn percentile_from(buckets: &[u64; NUM_BUCKETS], q: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// The metrics store sums `is_counter` samples per bucket and averages the
+    /// rest, deciding by name (it does not persist `MetricKind`). Every sample
+    /// this module emits must therefore be classified consistently, or a new
+    /// counter silently charts as a per-sample mean again.
+    #[test]
+    fn test_counter_samples_match_store_delta_counter_list() {
+        let m = ProxyMetrics::default();
+        // Exercise every conditional sample (latency, upstream, self, streaming).
+        m.record(200, 5, Some(3), RequestDestination::Project, false);
+        m.record(101, 1_000, Some(2), RequestDestination::Project, true);
+        m.record(502, 7, None, RequestDestination::Other, false);
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+
+        let counters: Vec<&str> = samples
+            .iter()
+            .filter(|s| s.is_counter)
+            .map(|s| s.name)
+            .collect();
+        assert!(!counters.is_empty());
+
+        for s in &samples {
+            assert_eq!(
+                temps_metrics::is_delta_counter(s.name),
+                s.is_counter,
+                "{} is_counter={} but the metrics store would aggregate it as {}",
+                s.name,
+                s.is_counter,
+                if temps_metrics::is_delta_counter(s.name) {
+                    "SUM"
+                } else {
+                    "AVG"
+                },
+            );
+        }
+        for name in temps_metrics::DELTA_COUNTER_METRICS {
+            assert!(
+                counters.contains(name),
+                "{name} is listed as a delta counter in temps-metrics but the proxy no longer emits it as one"
+            );
+        }
+    }
+
     #[test]
     fn test_record_classifies_status_codes() {
         let m = ProxyMetrics::default();
