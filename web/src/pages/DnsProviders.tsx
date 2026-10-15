@@ -377,7 +377,9 @@ export function DnsProviders() {
 
       {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog
-        open={providerToDelete !== null}
+        // Closed as soon as the role loses write access: a still-open
+        // confirmation whose button silently does nothing is worse than none.
+        open={canManageProviders && providerToDelete !== null}
         onOpenChange={(open) => {
           if (!open) setProviderToDelete(null)
         }}

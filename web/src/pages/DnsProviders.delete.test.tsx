@@ -162,3 +162,44 @@ test('a delete the server accepts closes the confirmation and refreshes the list
   )
   api.restore()
 })
+
+test('losing write access while the confirmation is open closes it', async () => {
+  const api = mockApi({
+    'GET /dns-providers': () => jsonResponse([PROVIDER]),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  const page = (role: string) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <AuthContext.Provider
+          value={{
+            user: signedInAs(role),
+            isLoading: false,
+            error: null,
+            logout: async () => {},
+            refetch: () => {},
+          }}
+        >
+          <BreadcrumbProvider>
+            <DnsProviders />
+          </BreadcrumbProvider>
+        </AuthContext.Provider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const view = render(page('admin'))
+  await openRowMenu(view)
+  await act(async () => {
+    fireEvent.click(await view.findByText('Delete Provider'))
+  })
+  expect(await view.findByText('Delete DNS provider Example DNS?')).toBeTruthy()
+
+  view.rerender(page('user'))
+  await waitFor(() =>
+    expect(view.queryByText('Delete DNS provider Example DNS?')).toBeNull()
+  )
+  expect(api.called('DELETE', '/dns-providers/4')).toBe(false)
+  api.restore()
+})
