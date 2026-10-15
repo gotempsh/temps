@@ -280,7 +280,13 @@ fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::p
                 name
             ),
             Err(error) => {
-                tracing::warn!(backend, "could not refresh the staged {}: {}", name, error)
+                tracing::warn!(backend, "could not refresh the staged {}: {}", name, error);
+                // The sync left the previous staged copy in place, and that is
+                // the one guests get; the shipped file matching this build
+                // says nothing about it, so check it on its own.
+                if staged.is_file() && checked.insert(staged.clone()) {
+                    warn_if_agent_outdated(backend, name, &staged);
+                }
             }
         }
         if checked.insert(source.clone()) {

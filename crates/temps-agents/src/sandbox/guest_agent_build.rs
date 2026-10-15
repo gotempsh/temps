@@ -56,17 +56,24 @@ pub fn classify(agent: Option<&str>, host: &str) -> AgentBuildStatus {
 /// The build recorded in the agent binary at `path`, or `None` when it has no
 /// marker (an agent from before this was recorded, or not an agent at all).
 pub fn read_agent_build(path: &Path) -> std::io::Result<Option<String>> {
-    let len = std::fs::metadata(path)?.len();
-    if len > MAX_AGENT_BYTES {
+    use std::io::Read;
+
+    // One open, and a read capped one byte past the limit, so a file that is
+    // replaced or grows between a size check and the read cannot be slurped
+    // whole.
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut file, MAX_AGENT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_AGENT_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "{} is {len} bytes, more than the {MAX_AGENT_BYTES} an agent binary can be",
+                "{} is larger than the {MAX_AGENT_BYTES} bytes an agent binary can be",
                 path.display()
             ),
         ));
     }
-    Ok(find_build(&std::fs::read(path)?))
+    Ok(find_build(&bytes))
 }
 
 /// First well-formed marker in `bytes`. The prefix can also occur as a plain
@@ -176,6 +183,20 @@ mod tests {
             AgentBuildStatus::Unknown
         );
         assert_eq!(classify(None, "unknown"), AgentBuildStatus::Unknown);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_rejected_after_a_bounded_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("huge");
+        let handle = std::fs::File::create(&file).unwrap();
+        // Sparse: no real disk is used for the extra byte past the limit.
+        handle.set_len(MAX_AGENT_BYTES + 1).unwrap();
+        let error = read_agent_build(&file).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        handle.set_len(MAX_AGENT_BYTES).unwrap();
+        assert_eq!(read_agent_build(&file).unwrap(), None);
     }
 
     #[test]
