@@ -94,3 +94,25 @@ test('editing a field withdraws only its own message', async () => {
   expect(view.getByText('Select at least one provider')).toBeTruthy()
   api.restore()
 })
+
+test('a failed provider read is explained and focus still lands on a field', async () => {
+  const api = mockApi({
+    'GET /notification-providers': () =>
+      jsonResponse({ title: 'Internal Server Error', detail: 'boom' }, 500),
+  })
+  const view = renderPage()
+  await view.findByText('Notification providers unavailable')
+
+  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+
+  expect(view.getByText('Select at least one provider')).toBeTruthy()
+  expect(document.activeElement?.id).toBe('route-providers-failure')
+
+  fireEvent.change(
+    view.container.querySelector<HTMLInputElement>('#route-name')!,
+    { target: { value: 'Critical' } }
+  )
+  fireEvent.click(view.getByRole('button', { name: 'Create Route' }))
+  expect(document.activeElement?.id).toBe('route-providers-failure')
+  api.restore()
+})

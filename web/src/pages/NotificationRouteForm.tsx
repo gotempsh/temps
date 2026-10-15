@@ -77,6 +77,7 @@ const ROUTE_NAME_ERROR_ID = 'route-name-error'
 const ROUTE_PROVIDERS_ERROR_ID = 'route-providers-error'
 const ROUTE_FIRST_PROVIDER_ID = 'route-provider-first'
 const ROUTE_ADD_PROVIDER_ID = 'route-add-provider'
+const ROUTE_PROVIDERS_FAILURE_ID = 'route-providers-failure'
 
 const emptyDraft = (): RouteDraft => ({
   name: '',
@@ -102,7 +103,14 @@ export function NotificationRouteForm() {
     isEditing ? 'Edit Notification Route' : 'Create Notification Route'
   )
 
-  const { data: providers, isLoading: providersLoading } = useQuery({
+  const {
+    data: providers,
+    isLoading: providersLoading,
+    isError: providersError,
+    error: providersReadError,
+    refetch: refetchProviders,
+    isFetching: providersFetching,
+  } = useQuery({
     ...listNotificationProvidersOptions({ query: { page_size: 100 } }),
   })
   const {
@@ -208,12 +216,20 @@ export function NotificationRouteForm() {
     if (errors.name || errors.providers) {
       // Destinations render above the name (`order-first`), so the first
       // invalid field on screen is the destinations list.
-      const firstInvalidId = errors.providers
-        ? providers && providers.length > 0
-          ? ROUTE_FIRST_PROVIDER_ID
-          : ROUTE_ADD_PROVIDER_ID
-        : ROUTE_NAME_ID
-      document.getElementById(firstInvalidId)?.focus()
+      // Which control stands for the destinations depends on whether the
+      // providers loaded, so take the first one that is actually on the page.
+      const candidates = errors.providers
+        ? [
+            ROUTE_FIRST_PROVIDER_ID,
+            ROUTE_ADD_PROVIDER_ID,
+            ROUTE_PROVIDERS_FAILURE_ID,
+            ROUTE_NAME_ID,
+          ]
+        : [ROUTE_NAME_ID]
+      candidates
+        .map((id) => document.getElementById(id))
+        .find((element) => element !== null)
+        ?.focus()
       return
     }
 
@@ -417,7 +433,16 @@ export function NotificationRouteForm() {
                       select the channel destinations for this route.
                     </p>
                   </div>
-                  {!providersLoading && providers?.length === 0 ? (
+                  {providersError && !providers ? (
+                    <div id={ROUTE_PROVIDERS_FAILURE_ID} tabIndex={-1}>
+                      <ReadFailure
+                        resource="Notification providers"
+                        error={providersReadError}
+                        onRetry={() => refetchProviders()}
+                        retrying={providersFetching}
+                      />
+                    </div>
+                  ) : !providersLoading && providers?.length === 0 ? (
                     <div className="rounded-lg border border-dashed p-6 text-center">
                       <BellRing className="mx-auto mb-3 h-6 w-6 text-muted-foreground" />
                       <p className="font-medium">No providers available</p>
