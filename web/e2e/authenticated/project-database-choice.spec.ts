@@ -119,7 +119,14 @@ test('empty databases offer all supported types and load errors do not look empt
     path: '/tmp/temps-databases-empty-cards.png',
     fullPage: true,
   })
-  await cards.getByRole('link', { name: 'Create mongodb', exact: true }).click()
+  // Each card is one link whose name is the type's heading, description and
+  // "Create database" label; pick it by its heading.
+  await cards
+    .getByRole('link')
+    .filter({
+      has: page.getByRole('heading', { name: 'mongodb', exact: true }),
+    })
+    .click()
   await expect(page).toHaveURL(new RegExp(`project_id=${project.id}`))
 })
 

@@ -105,6 +105,20 @@ const routeCloudLifecycle = async (page: Page, rejected = false) => {
   return { enrollmentCodes, featureUpdates, operations }
 }
 
+/**
+ * Disconnecting asks first: the page's Disconnect button only opens a
+ * confirmation that names the account, and the destructive action is the
+ * matching button inside that alert dialog.
+ */
+async function disconnectAndConfirm(page: Page) {
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+  const confirmation = page.getByRole('alertdialog')
+  await expect(confirmation).toContainText('Disconnect Temps Cloud account')
+  await confirmation
+    .getByRole('button', { name: 'Disconnect', exact: true })
+    .click()
+}
+
 test.describe('Temps Cloud activation onboarding', () => {
   test('connects and disconnects an instance from the two-step setup', async ({
     page,
@@ -157,7 +171,7 @@ test.describe('Temps Cloud activation onboarding', () => {
       { notifications_enabled: true },
     ])
 
-    await page.getByRole('button', { name: 'Disconnect' }).click()
+    await disconnectAndConfirm(page)
     await expect(
       page.getByRole('heading', { name: 'Connect this instance' })
     ).toBeVisible()
@@ -216,7 +230,7 @@ test.describe('Temps Cloud activation onboarding', () => {
       contentType: 'image/png',
     })
 
-    await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+    await disconnectAndConfirm(page)
     await expect(
       page
         .getByRole('alert')
@@ -229,7 +243,7 @@ test.describe('Temps Cloud activation onboarding', () => {
     expect(cloud.enrollmentCodes).toEqual([])
 
     failDisconnect = false
-    await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
+    await disconnectAndConfirm(page)
     await expect(
       page.getByRole('heading', { name: 'Connect this instance' })
     ).toBeVisible()
@@ -292,9 +306,7 @@ test.describe('Temps Cloud activation onboarding', () => {
       ).toBeVisible()
       await expect(page.getByLabel('1. Paste enrollment code')).toHaveCount(0)
 
-      await page
-        .getByRole('button', { name: 'Disconnect', exact: true })
-        .click()
+      await disconnectAndConfirm(page)
       await expect(
         page.getByRole('heading', { name: 'Connect this instance' })
       ).toBeVisible()
@@ -364,8 +376,10 @@ test.describe('Temps Cloud activation onboarding', () => {
       page.getByText('Temps Cloud capability unavailable')
     ).toBeVisible()
     await expect(
+      // The same refusal is also quoted as "Server response: ...".
       page.getByText(
-        'Cloud capability checks timed out. Check connectivity and retry.'
+        'Cloud capability checks timed out. Check connectivity and retry.',
+        { exact: true }
       )
     ).toBeVisible()
 
