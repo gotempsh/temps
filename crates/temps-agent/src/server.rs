@@ -269,6 +269,10 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
             post(sandbox_handlers::recover_sandbox),
         )
         .route(
+            "/agent/sandboxes/release-orphaned",
+            post(sandbox_handlers::release_orphaned_sandbox_resources),
+        )
+        .route(
             "/agent/sandboxes/status",
             post(sandbox_handlers::sandbox_status),
         )
@@ -1126,7 +1130,7 @@ mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 13] = [
+    const SANDBOX_ROUTES: [&str; 14] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1139,6 +1143,7 @@ mod tests {
         "/agent/sandboxes/stop",
         "/agent/sandboxes/start",
         "/agent/sandboxes/recover",
+        "/agent/sandboxes/release-orphaned",
         "/agent/sandboxes/status",
     ];
     const UPLOAD_ROUTES: [&str; 2] = [

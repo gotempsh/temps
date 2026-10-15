@@ -1531,6 +1531,47 @@ pub struct DockerSandboxProvider {
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
     network_lock: tokio::sync::Mutex<()>,
+    /// Sandboxes whose `create` is running, with a count per name. Their
+    /// isolated network may be reused from an earlier incarnation and so be
+    /// arbitrarily old, yet their container does not exist until the very
+    /// end of `create`; the orphan reaper must not mistake that gap for an
+    /// abandoned network.
+    creates_in_flight: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+/// Marks a sandbox as being created for as long as it lives. See
+/// [`DockerSandboxProvider::creates_in_flight`].
+struct CreateInFlight<'a> {
+    registry: &'a std::sync::Mutex<HashMap<String, usize>>,
+    name: String,
+}
+
+impl<'a> CreateInFlight<'a> {
+    fn new(registry: &'a std::sync::Mutex<HashMap<String, usize>>, name: &str) -> Self {
+        let mut names = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *names.entry(name.to_string()).or_insert(0) += 1;
+        Self {
+            registry,
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for CreateInFlight<'_> {
+    fn drop(&mut self) {
+        let mut names = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = names.get_mut(&self.name) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                names.remove(&self.name);
+            }
+        }
+    }
 }
 
 /// PATH used for every command Temps runs as root inside a sandbox.
@@ -1667,7 +1708,16 @@ impl DockerSandboxProvider {
             docker,
             config,
             network_lock: tokio::sync::Mutex::new(()),
+            creates_in_flight: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether a `create` for this sandbox is running right now.
+    fn create_in_flight(&self, container_name: &str) -> bool {
+        self.creates_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(container_name)
     }
 
     /// Run a command as root inside a freshly-started sandbox container,
@@ -2675,6 +2725,9 @@ impl DockerSandboxProvider {
             let Some(owner) = orphan_candidate_owner(network, now_unix, min_age) else {
                 continue;
             };
+            if self.create_in_flight(owner) {
+                continue;
+            }
             match self
                 .docker
                 .inspect_container(
@@ -2692,6 +2745,11 @@ impl DockerSandboxProvider {
                     );
                     continue;
                 }
+            }
+            // A create may have started (and reused this old network) while
+            // the owner was being inspected.
+            if self.create_in_flight(owner) {
+                continue;
             }
             if self.remove_isolated_sandbox_network(owner).await.is_empty() {
                 tracing::info!(
@@ -3813,6 +3871,9 @@ impl SandboxProvider for DockerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        // Held until the container exists: from here on this sandbox's
+        // network may be in use although no container carries its name.
+        let _create_in_flight = CreateInFlight::new(&self.creates_in_flight, &container_name);
         // Resolve the request override exactly once. Provisioning, proxy
         // environment, and HostConfig must all use this same effective value;
         // otherwise `none -> full` references a bridge that was never created
@@ -10225,6 +10286,27 @@ function response() {{
             orphan_candidate_owner(&labelled_network(&name, Some(""), old), now, min_age),
             None
         );
+    }
+
+    #[test]
+    fn a_create_stays_in_flight_until_the_last_guard_for_its_name_drops() {
+        let registry = std::sync::Mutex::new(HashMap::new());
+        let in_flight = |name: &str| registry.lock().unwrap().contains_key(name);
+
+        let first = CreateInFlight::new(&registry, "temps-sandbox-a");
+        let second = CreateInFlight::new(&registry, "temps-sandbox-a");
+        let other = CreateInFlight::new(&registry, "temps-sandbox-b");
+        assert!(in_flight("temps-sandbox-a") && in_flight("temps-sandbox-b"));
+
+        // Two overlapping creates of one sandbox: the first to finish must
+        // not unprotect the network the second is still about to attach.
+        drop(first);
+        assert!(in_flight("temps-sandbox-a"));
+        drop(second);
+        assert!(!in_flight("temps-sandbox-a"));
+        assert!(in_flight("temps-sandbox-b"));
+        drop(other);
+        assert!(registry.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
