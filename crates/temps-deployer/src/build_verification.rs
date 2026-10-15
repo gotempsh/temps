@@ -46,6 +46,13 @@ const SHA256_HEX_LEN: usize = 64;
 /// Longest repository (registry host, port and path) accepted for a dispatch.
 const MAX_REPOSITORY_LEN: usize = 255;
 
+/// Most platforms a runner may list in one report. A multi-architecture build
+/// targets a handful; anything near this limit is not a build.
+const MAX_REPORTED_PLATFORMS: usize = 16;
+
+/// Longest platform string a runner may report (`linux/arm/v7` is 12).
+const MAX_REPORTED_PLATFORM_LEN: usize = 64;
+
 /// A content digest in the one spelling the control plane accepts.
 ///
 /// Only `sha256` with lowercase hex is accepted. Registries and the OCI image
@@ -179,6 +186,20 @@ pub enum BuildVerificationError {
     },
 
     #[error(
+        "Runner reported {count} platform(s) for build '{build_id}' of deployment \
+         {deployment_id} (longest {longest} bytes); at most {max_count} platforms of \
+         {max_len} bytes are accepted"
+    )]
+    PlatformReportTooLarge {
+        deployment_id: i32,
+        build_id: String,
+        count: usize,
+        longest: usize,
+        max_count: usize,
+        max_len: usize,
+    },
+
+    #[error(
         "Runner reported platforms [{reported}] for build '{build_id}' of deployment \
          {deployment_id}, but [{expected}] were requested"
     )]
@@ -239,6 +260,20 @@ pub fn verify_runner_report(
             build_id: dispatched.build_id.clone(),
             reported: reported_digest,
             observed: observed.clone(),
+        });
+    }
+
+    // Bound the runner-controlled list before doing any work proportional to
+    // it, and so that the mismatch diagnostic below is bounded too.
+    let longest = report.platforms.iter().map(String::len).max().unwrap_or(0);
+    if report.platforms.len() > MAX_REPORTED_PLATFORMS || longest > MAX_REPORTED_PLATFORM_LEN {
+        return Err(BuildVerificationError::PlatformReportTooLarge {
+            deployment_id,
+            build_id: dispatched.build_id.clone(),
+            count: report.platforms.len(),
+            longest,
+            max_count: MAX_REPORTED_PLATFORMS,
+            max_len: MAX_REPORTED_PLATFORM_LEN,
         });
     }
 
@@ -379,12 +414,11 @@ fn validate_repository(deployment_id: i32, repository: &str) -> Result<(), Build
     if last_segment.contains(':') {
         return Err(invalid("already carries a tag"));
     }
-    let allowed = |byte: u8| {
+    if !repository.bytes().all(|byte| {
         byte.is_ascii_lowercase()
             || byte.is_ascii_digit()
             || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':')
-    };
-    if !repository.bytes().all(allowed) {
+    }) {
         return Err(invalid(
             "only lowercase letters, digits and . - _ / : are allowed",
         ));
@@ -392,7 +426,79 @@ fn validate_repository(deployment_id: i32, repository: &str) -> Result<(), Build
     if repository.starts_with('/') || repository.ends_with('/') || repository.contains("//") {
         return Err(invalid("has an empty path component"));
     }
+
+    // Docker's rule: the first component is a registry host when it has a
+    // `.` or a `:` or is `localhost`; otherwise it is a namespace.
+    let mut components = repository.split('/');
+    let first = components.next().unwrap_or_default();
+    let is_host = first.contains('.') || first.contains(':') || first == "localhost";
+    if is_host {
+        if !is_registry_host(first) {
+            return Err(invalid(
+                "registry host is not a host name with an optional numeric port",
+            ));
+        }
+        // `registry.example.test` on its own names a registry, not an image.
+        if !repository.contains('/') {
+            return Err(invalid("names a registry host but no repository"));
+        }
+    } else if !is_path_component(first) {
+        return Err(invalid("is not a valid repository path component"));
+    }
+    if components.any(|component| !is_path_component(component)) {
+        return Err(invalid("is not a valid repository path component"));
+    }
     Ok(())
+}
+
+/// `host` or `host:port`, with DNS-label host names.
+fn is_registry_host(host: &str) -> bool {
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    let port_ok = port.is_none_or(|port| {
+        !port.is_empty() && port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    port_ok && name.split('.').all(label_ok)
+}
+
+/// One path component of a repository, per the distribution grammar:
+/// lowercase alphanumeric runs joined by a single `.`, a single `_`, `__`, or
+/// one or more `-`.
+fn is_path_component(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if bytes.is_empty() || !alnum(bytes[0]) || !alnum(bytes[bytes.len() - 1]) {
+        return false;
+    }
+    let mut separator_start = None;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match (alnum(byte), separator_start) {
+            (true, None) => {}
+            (true, Some(start)) => {
+                let valid = match &bytes[start..index] {
+                    b"." | b"_" | b"__" => true,
+                    run => run.iter().all(|&byte| byte == b'-'),
+                };
+                if !valid {
+                    return false;
+                }
+                separator_start = None;
+            }
+            (false, None) => separator_start = Some(index),
+            (false, Some(_)) => {}
+        }
+    }
+    true
 }
 
 /// A runner-supplied value, bounded and with control characters escaped, so
@@ -653,6 +759,45 @@ mod tests {
             ("/app", "empty path component"),
             ("registry.example.test//app", "empty path component"),
             ("registry.example.test/app/", "empty path component"),
+            (
+                "registry.example.test/team:tag/app",
+                "not a valid repository path component",
+            ),
+            ("team:tag/app", "registry host is not"),
+            (
+                "registry.example.test/../app",
+                "not a valid repository path component",
+            ),
+            (
+                "registry.example.test/-app",
+                "not a valid repository path component",
+            ),
+            (
+                "registry.example.test/app-",
+                "not a valid repository path component",
+            ),
+            (
+                "registry.example.test/a..b",
+                "not a valid repository path component",
+            ),
+            (
+                "registry.example.test/a___b",
+                "not a valid repository path component",
+            ),
+            (
+                "registry.example.test/a._b",
+                "not a valid repository path component",
+            ),
+            (
+                "registry.example.test/a_",
+                "not a valid repository path component",
+            ),
+            ("team/.app", "not a valid repository path component"),
+            ("registry.example.test:port/app", "registry host is not"),
+            ("registry.example.test:123456/app", "registry host is not"),
+            ("-bad.example.test/app", "registry host is not"),
+            ("a..b.example.test/app", "registry host is not"),
+            ("registry.example.test", "no repository"),
         ];
 
         for (repository, reason) in cases {
@@ -679,6 +824,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn accepts_repository_paths_the_distribution_grammar_allows() {
+        let cases = [
+            "app",
+            "team/app",
+            "localhost/app",
+            "ghcr.io/org/app.name_v2",
+            "registry.example.test/team/a__b/c---d",
+            "registry.example.test:5000/a.b/c-d",
+            "10.0.0.5:5000/app",
+        ];
+
+        for repository in cases {
+            let mut dispatch = dispatched();
+            dispatch.image_repository = repository.into();
+
+            assert!(
+                verify_runner_report(&dispatch, &report(), &observed()).is_ok(),
+                "repository {repository:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_oversized_platform_report_without_echoing_it() {
+        let mut reported = report();
+        reported.platforms = vec!["linux/arm64".to_string(); 10_000];
+
+        let error = verify_runner_report(&dispatched(), &reported, &observed())
+            .expect_err("an oversized platform list is refused");
+
+        assert!(matches!(
+            error,
+            BuildVerificationError::PlatformReportTooLarge { count: 10_000, .. }
+        ));
+        assert!(error.to_string().len() < 300, "{error}");
+    }
+
+    #[test]
+    fn rejects_an_overlong_platform_string_without_echoing_it() {
+        let mut reported = report();
+        reported.platforms = vec!["x".repeat(1_000_000)];
+
+        let error = verify_runner_report(&dispatched(), &reported, &observed())
+            .expect_err("an overlong platform is refused");
+
+        assert!(matches!(
+            error,
+            BuildVerificationError::PlatformReportTooLarge {
+                longest: 1_000_000,
+                ..
+            }
+        ));
+        assert!(error.to_string().len() < 300, "{error}");
+    }
+
+    #[test]
+    fn a_platform_mismatch_diagnostic_is_bounded_at_the_report_limits() {
+        let mut reported = report();
+        reported.platforms = (0..MAX_REPORTED_PLATFORMS)
+            .map(|index| format!("linux/{}{index}", "a".repeat(MAX_REPORTED_PLATFORM_LEN - 8)))
+            .collect();
+
+        let error = verify_runner_report(&dispatched(), &reported, &observed())
+            .expect_err("unrequested platforms are refused");
+
+        assert!(matches!(
+            error,
+            BuildVerificationError::PlatformMismatch { .. }
+        ));
+        assert!(
+            error.to_string().len() < 2_000,
+            "{}",
+            error.to_string().len()
+        );
     }
 
     #[test]

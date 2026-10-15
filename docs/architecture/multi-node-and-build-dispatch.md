@@ -192,9 +192,12 @@ deployment and build:
   run the control plane never recorded, or a recorded run the report omits);
 - a digest that is not `sha256:` plus 64 lowercase hex;
 - a reported digest that is not the digest the control plane observed;
-- a platform set that is not exactly the requested set, in either direction;
-- a dispatch record whose repository already carries a tag or digest or is not a bare
-  repository name.
+- a platform set that is not exactly the requested set, in either direction, and a
+  platform list longer than 16 entries or with an entry over 64 bytes (rejected before
+  any work proportional to it, so the diagnostic is bounded too);
+- a dispatch record whose repository carries a tag or digest, or whose registry host or
+  any path component does not follow the distribution grammar (so `team:tag/app`, `..`
+  and `-app` are refused rather than yielding an undeployable reference).
 
 Runner-supplied strings are bounded and escaped before they reach an error, because those
 errors end up in build logs.
