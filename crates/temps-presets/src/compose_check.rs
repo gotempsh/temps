@@ -465,18 +465,34 @@ fn is_yaml_subset(small: &yaml_serde::Value, large: &yaml_serde::Value) -> bool 
 }
 
 /// Service list fields whose items Compose appends when files are merged.
-/// Identical items are merged once instead of repeated.
+/// Repeated items are merged once where that cannot change the result.
 pub const DEDUPLICATED_SERVICE_LISTS: &[&str] = &["env_file", "volumes", "environment", "ports"];
 
-/// Remove from `overlay` every list item its base service already has, for
-/// the fields in [`DEDUPLICATED_SERVICE_LISTS`], so merging the two appends
-/// only what is new. Duplicates inside the overlay's own list are dropped
-/// too. An overlay list that becomes empty is removed, which leaves the base
-/// list untouched.
+/// Longest list [`deduplicate_override_lists`] compares; a longer one is
+/// left as written, which Compose merges as it always would.
+const MAX_DEDUPLICATED_ITEMS: usize = 1024;
+
+/// Remove the list items in `overlay` that only repeat what is already in
+/// effect, for the fields in [`DEDUPLICATED_SERVICE_LISTS`], so a pasted copy
+/// of the repository file does not append everything a second time. An
+/// overlay list that becomes empty is removed, which leaves the base list
+/// untouched.
 ///
-/// `ports` is only de-duplicated within the overlay: Temps replaces a
-/// service's ports with the override's list rather than appending, so
-/// removing an item there would drop a port instead of a duplicate.
+/// Order decides which entry wins: a later env file overrides an earlier
+/// one, and a later volume or variable for the same target or key replaces
+/// it. Compose versions also differ in how they merge these lists (plain
+/// append, or one entry per key). So an item is only dropped when it repeats
+/// the entries directly before it, in order: the overlay starting with the
+/// end of the base list, or an item repeating the one before it. Applying
+/// the same run twice in a row leaves what applying it once does, under
+/// every merge. Any other repeat moves an entry after ones it would
+/// otherwise precede, so it stays: base `[common.env, production.env]` with
+/// an overlay `[common.env]` keeps the overlay's `common.env` last.
+///
+/// `ports` is only de-duplicated within the overlay, where identical
+/// mappings carry no order: Temps replaces a service's ports with the
+/// override's list rather than appending, so removing an item there would
+/// drop a port instead of a duplicate.
 pub fn deduplicate_override_lists(base: &yaml_serde::Value, overlay: &mut yaml_serde::Value) {
     use yaml_serde::Value;
     let Some(overlay_services) = overlay
@@ -501,30 +517,50 @@ pub fn deduplicate_override_lists(base: &yaml_serde::Value, overlay: &mut yaml_s
             let Some(Value::Sequence(items)) = overlay_service.get_mut(&key) else {
                 continue;
             };
-            let existing: Vec<Value> = if *field == "ports" {
-                Vec::new()
-            } else {
-                match base_service.and_then(|service| service.get(*field)) {
-                    Some(Value::Sequence(items)) => items.iter().map(list_identity).collect(),
-                    Some(single @ Value::String(_)) => vec![list_identity(single)],
-                    _ => Vec::new(),
-                }
+            if *field == "ports" {
+                let mut seen = Vec::new();
+                items.retain(|item| {
+                    let identity = list_identity(item);
+                    let new = !seen.contains(&identity);
+                    if new {
+                        seen.push(identity);
+                    }
+                    new
+                });
+                continue;
+            }
+            let existing: Vec<Value> = match base_service.and_then(|service| service.get(*field)) {
+                Some(Value::Sequence(items)) => items.iter().map(list_identity).collect(),
+                Some(single @ Value::String(_)) => vec![list_identity(single)],
+                _ => Vec::new(),
             };
-            let mut seen = existing;
-            items.retain(|item| {
-                let identity = list_identity(item);
-                if seen.contains(&identity) {
-                    false
-                } else {
-                    seen.push(identity);
-                    true
-                }
-            });
-            if items.is_empty() && *field != "ports" {
+            if items.len() > MAX_DEDUPLICATED_ITEMS || existing.len() > MAX_DEDUPLICATED_ITEMS {
+                continue;
+            }
+            drop_repeated_runs(&existing, items);
+            if items.is_empty() {
                 overlay_service.remove(&key);
             }
         }
     }
+}
+
+/// Drop the leading overlay items that repeat the end of `base` in order,
+/// until none do, then items that repeat the item directly before them.
+/// See [`deduplicate_override_lists`] for why only these are safe.
+fn drop_repeated_runs(base: &[yaml_serde::Value], items: &mut Vec<yaml_serde::Value>) {
+    loop {
+        let identities: Vec<yaml_serde::Value> = items.iter().map(list_identity).collect();
+        let repeated = (1..=base.len().min(identities.len()))
+            .rev()
+            .find(|&run| identities[..run] == base[base.len() - run..])
+            .unwrap_or(0);
+        if repeated == 0 {
+            break;
+        }
+        items.drain(..repeated);
+    }
+    items.dedup_by(|later, earlier| list_identity(later) == list_identity(earlier));
 }
 
 /// Comparison key for a list item: `env_file: .env` and
@@ -586,6 +622,64 @@ mod tests {
         assert_eq!(app["environment"], yaml_serde::from_str::<yaml_serde::Value>("[A=1]").unwrap());
         // Ports keep replacement semantics: only internal duplicates go.
         assert_eq!(app["ports"], yaml_serde::from_str::<yaml_serde::Value>("[\"8080:80\"]").unwrap());
+    }
+
+    fn overlay_list(base: &str, overlay: &str, field: &str) -> Option<yaml_serde::Value> {
+        let base: yaml_serde::Value =
+            yaml_serde::from_str(&format!("services:\n  app:\n    {field}: {base}\n")).unwrap();
+        let mut overlay: yaml_serde::Value =
+            yaml_serde::from_str(&format!("services:\n  app:\n    {field}: {overlay}\n"))
+                .unwrap();
+        deduplicate_override_lists(&base, &mut overlay);
+        overlay["services"]["app"].get(field).cloned()
+    }
+
+    fn list(text: &str) -> Option<yaml_serde::Value> {
+        Some(yaml_serde::from_str(text).unwrap())
+    }
+
+    #[test]
+    fn repeats_that_would_change_which_entry_wins_are_kept() {
+        // The overlay's common.env loads after production.env.
+        assert_eq!(
+            overlay_list("[common.env, production.env]", "[common.env]", "env_file"),
+            list("[common.env]")
+        );
+        assert_eq!(
+            overlay_list("[a.env, b.env]", "[b.env, a.env]", "env_file"),
+            list("[a.env]")
+        );
+        // The overlay's ./conf mount replaces ./other for the same target.
+        assert_eq!(
+            overlay_list("[./conf:/data]", "[./other:/data, ./conf:/data]", "volumes"),
+            list("[./other:/data, ./conf:/data]")
+        );
+        assert_eq!(
+            overlay_list("[A=1]", "[A=2, A=1]", "environment"),
+            list("[A=2, A=1]")
+        );
+        // A repeat that is not adjacent stays inside the overlay too.
+        assert_eq!(
+            overlay_list("[]", "[x.env, y.env, x.env]", "env_file"),
+            list("[x.env, y.env, x.env]")
+        );
+    }
+
+    #[test]
+    fn repeats_of_the_entries_just_before_are_dropped() {
+        // The overlay continues the base list after repeating its end.
+        assert_eq!(
+            overlay_list("[a.env, b.env, c.env]", "[b.env, c.env, d.env]", "env_file"),
+            list("[d.env]")
+        );
+        assert_eq!(
+            overlay_list("[common.env, production.env]", "[common.env, production.env]", "env_file"),
+            None
+        );
+        assert_eq!(
+            overlay_list("[a.env]", "[a.env, a.env, b.env, b.env]", "env_file"),
+            list("[b.env]")
+        );
     }
 
     #[test]
