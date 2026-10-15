@@ -483,7 +483,10 @@ export function UsersManagement({
                   </div>
                 </div>
                 <div className="relative z-10 ml-4">
-                  <DropdownMenu>
+                  {/* Always mounted; keyed on the permission so a menu left
+                      open when access is revoked does not spring back open
+                      when it is granted again. */}
+                  <DropdownMenu key={canManageUsers ? 'manage' : 'view'}>
                     {canManageUsers && (
                       <>
                         <DropdownMenuTrigger asChild>
