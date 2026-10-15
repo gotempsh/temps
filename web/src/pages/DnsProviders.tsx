@@ -6,11 +6,12 @@ import {
   testProviderConnection,
   type DnsProviderResponse,
 } from '@/api/client'
-import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Badge } from '@/components/ui/badge'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
-import { isForbiddenRead } from '@/lib/read-failure'
+import { errorWithStatus } from '@/lib/http-error-status'
+import { isForbiddenRead, readFailureServerDetail } from '@/lib/read-failure'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -96,7 +97,19 @@ export function DnsProviders() {
   } = useQuery(dnsProvidersQueryOptions())
 
   const deleteProviderMut = useMutation({
-    mutationFn: (id: number) => deleteProvider({ path: { id } }),
+    mutationFn: async (id: number) => {
+      const response = await deleteProvider({ path: { id } })
+      // The generated client resolves a refused request with `error` set
+      // rather than throwing; without this a 403 is reported as a deletion.
+      if (response.error) {
+        throw errorWithStatus(
+          readFailureServerDetail(response.error) ??
+            `The server refused to delete DNS provider ${id}`,
+          response.error
+        )
+      }
+      return response.data
+    },
     onSuccess: () => {
       toast.success('DNS provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: DNS_PROVIDERS_QUERY_KEY })
@@ -139,7 +152,8 @@ export function DnsProviders() {
   usePageTitle('DNS Providers')
 
   const handleDeleteProvider = () => {
-    if (!providerToDelete) return
+    // The role can change under a cached list; never fire a refused write.
+    if (!providerToDelete || !canManageProviders) return
     deleteProviderMut.mutate(providerToDelete.id)
   }
 
@@ -215,18 +229,20 @@ export function DnsProviders() {
             ))}
           </div>
         ) : !dnsProviders?.length ? (
-          <EmptyPlaceholder
+          <EmptyState
+            size="compact"
             icon={Globe}
             title="No DNS providers found"
             description="Get started by adding a DNS provider like Cloudflare or Namecheap to enable automatic DNS record management"
-          >
-            {canManageProviders && (
-              <Button onClick={() => navigate('/dns-providers/add')}>
-                <Plus className="mr-2 h-4 w-4" />
-                Add DNS Provider
-              </Button>
-            )}
-          </EmptyPlaceholder>
+            action={
+              canManageProviders ? (
+                <Button onClick={() => navigate('/dns-providers/add')}>
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add DNS Provider
+                </Button>
+              ) : undefined
+            }
+          />
         ) : (
           <div className="overflow-hidden rounded-lg border">
             <ul role="list" className="divide-y">
@@ -292,20 +308,22 @@ export function DnsProviders() {
                     onClick={(e) => e.stopPropagation()}
                     onPointerDown={(e) => e.stopPropagation()}
                   >
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleTestConnection(provider)}
-                      disabled={testConnectionMut.isPending}
-                      className="hidden gap-2 sm:inline-flex"
-                    >
-                      {testConnectionMut.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <TestTube2 className="h-4 w-4" />
-                      )}
-                      Test
-                    </Button>
+                    {canManageProviders && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleTestConnection(provider)}
+                        disabled={testConnectionMut.isPending}
+                        className="hidden gap-2 sm:inline-flex"
+                      >
+                        {testConnectionMut.isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <TestTube2 className="h-4 w-4" />
+                        )}
+                        Test
+                      </Button>
+                    )}
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <Button
@@ -325,23 +343,27 @@ export function DnsProviders() {
                         >
                           View Details
                         </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => handleTestConnection(provider)}
-                        >
-                          <TestTube2 className="h-4 w-4 mr-2" />
-                          Test Connection
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          className="text-destructive cursor-pointer"
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            setProviderToDelete(provider)
-                          }}
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          Delete Provider
-                        </DropdownMenuItem>
+                        {canManageProviders && (
+                          <>
+                            <DropdownMenuItem
+                              onClick={() => handleTestConnection(provider)}
+                            >
+                              <TestTube2 className="h-4 w-4 mr-2" />
+                              Test Connection
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-destructive cursor-pointer"
+                              onSelect={(e) => {
+                                e.preventDefault()
+                                setProviderToDelete(provider)
+                              }}
+                            >
+                              <Trash2 className="h-4 w-4 mr-2" />
+                              Delete Provider
+                            </DropdownMenuItem>
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>

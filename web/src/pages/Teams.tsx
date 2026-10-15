@@ -318,6 +318,7 @@ export function Teams() {
             />
           ) : teams.length === 0 ? (
             <EmptyState
+              size="compact"
               icon={Users}
               title="No teams yet"
               description="Create a team, add members, then grant it access to a service from that service's Access tab."
@@ -364,19 +365,21 @@ export function Teams() {
                         <MemberCount teamId={team.id} />
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          aria-label={`Delete team ${team.name}`}
-                          onClick={(e) => {
-                            // Don't trigger the row's navigate.
-                            e.stopPropagation()
-                            setTeamToDelete(team)
-                          }}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4 text-destructive" />
-                          Delete
-                        </Button>
+                        {canManageTeams && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`Delete team ${team.name}`}
+                            onClick={(e) => {
+                              // Don't trigger the row's navigate.
+                              e.stopPropagation()
+                              setTeamToDelete(team)
+                            }}
+                          >
+                            <Trash2 className="mr-2 h-4 w-4 text-destructive" />
+                            Delete
+                          </Button>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))}
