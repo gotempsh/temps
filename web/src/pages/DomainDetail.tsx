@@ -373,8 +373,12 @@ export function DomainDetail() {
   // A failed mutation usually leaves the backend in a new state (a failed
   // validation sets `failed` and `last_error`), so re-read instead of keeping
   // the status the page was showing before the attempt.
-  const refreshAfterFailure = async () => {
-    await refreshAll()
+  //
+  // Registered through `onSettled`, never `onError`: a mutation's own `onError`
+  // replaces the app-wide error toast, and a refusal the server did not store
+  // on the domain (a limit, an operation already running) would go unannounced.
+  const refreshWhenFailed = async (_data: unknown, error: unknown) => {
+    if (error) await refreshAll()
   }
 
   const createOrder = useMutation({
@@ -384,7 +388,7 @@ export function DomainDetail() {
       toast.success('ACME order created successfully')
       await refreshAll()
     },
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
   })
 
   const finalizeOrder = useMutation({
@@ -394,7 +398,7 @@ export function DomainDetail() {
     // with the error, and the CA may invalidate the order). Refetch right away
     // so the page does not keep showing `challenge_requested` until a reload.
     // A failed validation is returned as an error, so `onSuccess` never runs.
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
     onSuccess: async () => {
       toast.success(
         'DNS challenge verified! TLS certificate provisioning in progress.'
@@ -431,7 +435,7 @@ export function DomainDetail() {
       }
       await refreshAll()
     },
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
   })
 
   const setupDns = useMutation({
@@ -450,7 +454,7 @@ export function DomainDetail() {
       })
       await refreshAll()
     },
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
   })
 
   const handleCreateOrder = () => {
