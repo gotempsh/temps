@@ -32,21 +32,16 @@ export function EnvironmentVariableRevealValue({
   /** Changes whenever the stored value changes, so stale plaintext is dropped. */
   version: string
 }) {
-  if (isSecret) {
-    return (
-      <>
-        <dd className="mt-1 font-mono">{MASK}</dd>
-        <dd className="text-xs text-muted-foreground">Secret · write-only</dd>
-      </>
-    )
-  }
-  // Keyed so a new project, variable or version starts hidden with no value.
+  // Always mounted; `isSecret` only changes what it renders and whether a
+  // fetch is possible. Keyed so a new project, variable, version or secret
+  // classification starts hidden with no value.
   return (
     <RevealableValue
-      key={`${projectId}:${variableId}:${version}`}
+      key={`${projectId}:${variableId}:${version}:${isSecret}`}
       projectId={projectId}
       variableId={variableId}
       name={name}
+      isSecret={isSecret}
     />
   )
 }
@@ -55,15 +50,21 @@ function RevealableValue({
   projectId,
   variableId,
   name,
+  isSecret,
 }: {
   projectId: number
   variableId: number
   name: string
+  isSecret: boolean
 }) {
   // The app's default mutation error handler reports a failed reveal (using
   // `errorTitle`), so the controller only resets state and never toasts.
   const reveal = useMutation({
-    mutationFn: () => getEnvVarValue(projectId, name, variableId),
+    mutationFn: () => {
+      // Marked secrets are write-only: never request their value.
+      if (isSecret) return Promise.reject(new Error(`${name} is a secret`))
+      return getEnvVarValue(projectId, name, variableId)
+    },
     meta: { errorTitle: `Failed to reveal ${name}` },
   })
   const [controller] = useState(() =>
@@ -75,6 +76,14 @@ function RevealableValue({
     controller.getState,
     controller.getState
   )
+  if (isSecret) {
+    return (
+      <>
+        <dd className="mt-1 font-mono">{MASK}</dd>
+        <dd className="text-xs text-muted-foreground">Secret · write-only</dd>
+      </>
+    )
+  }
   return (
     <EnvironmentVariableRevealView
       name={name}
