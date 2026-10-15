@@ -6,13 +6,15 @@ import { Command } from 'commander'
 import { getCurrentUser, getProjects } from '../api/sdk.gen.js'
 import {
   ApiResponseError,
+  assertTempsApiResponse,
   client,
+  describeApiFailure,
   getErrorMessage,
+  isUserObject,
   requireApiShape,
   setupClient,
 } from './api-client.js'
 import { announceCommandMaturity, __resetMaturityNotices } from './feature-maturity.js'
-import { isUserObject } from '../commands/auth/login.js'
 import { promptConfirm } from '../ui/prompts.js'
 
 /**
@@ -75,7 +77,7 @@ describe('a 2xx that is not the Temps API', () => {
     reply = { status: 200, body: JSON.stringify({ projects: [] }), contentType: 'application/json' }
     const { data, error } = await callProjects()
     expect(error).toBeUndefined()
-    expect(data).toEqual({ projects: [] })
+    expect(data as unknown).toEqual({ projects: [] })
   })
 
   test('a problem+json success-class reply is still JSON', async () => {
@@ -92,7 +94,7 @@ describe('a 2xx that is not the Temps API', () => {
     reply = { status: 200, body: 'line one\nline two', contentType: 'text/plain' }
     const { data, error } = await callProjects()
     expect(error).toBeUndefined()
-    expect(data).toBe('line one\nline two')
+    expect(data as unknown).toBe("line one\nline two")
   })
 })
 
@@ -211,16 +213,75 @@ describe('feature maturity lookup', () => {
 })
 
 describe('confirmation prompt without a terminal', () => {
-  test('fails with a message that says to pass --yes', async () => {
+  test('fails with a message that names the missing terminal', async () => {
     const stdinTty = process.stdin.isTTY
-    const stdoutTty = process.stdout.isTTY
     process.stdin.isTTY = false
-    process.stdout.isTTY = false
     try {
-      await expect(promptConfirm({ message: 'Delete project foo?' })).rejects.toThrow(/--yes/)
+      await expect(promptConfirm({ message: 'Delete project foo?' })).rejects.toThrow(
+        /stdin is not an interactive terminal/
+      )
     } finally {
       process.stdin.isTTY = stdinTty
-      process.stdout.isTTY = stdoutTty
     }
+  })
+})
+
+describe('assertTempsApiResponse edge cases', () => {
+  const get = (url = 'http://api.example.test/api/projects') =>
+    new Request(url, { method: 'GET' })
+
+  test('an explicit parseAs of text, blob or stream is never judged', async () => {
+    const html = () =>
+      new Response('<html></html>', { status: 200, headers: { 'content-type': 'text/html' } })
+    for (const parseAs of ['text', 'blob', 'stream', 'arrayBuffer']) {
+      const res = await assertTempsApiResponse(html(), get(), { parseAs })
+      expect(res.status).toBe(200)
+    }
+  })
+
+  test('an untyped GET with a body is not rejected and its body is still readable', async () => {
+    const res = await assertTempsApiResponse(new Response('ok-body', { status: 200 }), get())
+    expect(await res.text()).toBe('ok-body')
+  })
+
+  test('an untyped empty POST is allowed', async () => {
+    const res = await assertTempsApiResponse(
+      new Response(null, { status: 200 }),
+      new Request('http://api.example.test/api/x', { method: 'POST' })
+    )
+    expect(res.status).toBe(200)
+  })
+
+  test('an untyped empty GET is rejected without reading a stream to its end', async () => {
+    await expect(
+      assertTempsApiResponse(new Response(null, { status: 200 }), get())
+    ).rejects.toBeInstanceOf(ApiResponseError)
+  })
+})
+
+describe('describeApiFailure edge cases', () => {
+  const request = new Request('http://api.example.test/api/projects')
+
+  test('a timeout is reported as a timeout, not as an unreachable host', () => {
+    const timeout = Object.assign(new Error('The operation timed out'), { name: 'TimeoutError' })
+    const described = describeApiFailure(timeout, undefined, request)
+    expect(described).toBeInstanceOf(ApiResponseError)
+    expect((described as Error).message).toContain('timed out')
+    expect((described as Error).message).not.toContain('Unable to reach')
+  })
+
+  test('a user abort passes through untouched', () => {
+    const abort = Object.assign(new Error('aborted'), { name: 'AbortError' })
+    expect(describeApiFailure(abort, undefined, request)).toBe(abort)
+  })
+
+  test('a 401 with no body keeps its status for callers to recognise', () => {
+    const described = describeApiFailure(
+      '',
+      new Response('', { status: 401, statusText: 'Unauthorized' }),
+      request
+    ) as ApiResponseError
+    expect(described).toBeInstanceOf(ApiResponseError)
+    expect(described.status).toBe(401)
   })
 })

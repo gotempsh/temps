@@ -3,6 +3,7 @@
 
 import { client } from '../api/client.gen.js'
 import { config, credentials } from '../config/store.js'
+import type { UserResponse } from '../api/types.gen.js'
 
 /**
  * Setup the API client with the correct base URL and auth headers
@@ -55,6 +56,16 @@ export class ApiResponseError extends Error {
 
 const BODY_EXCERPT_CHARS = 200
 
+/** A decoded `GET /user/me` reply: an object that carries the user's id. */
+export function isUserObject(value: unknown): value is UserResponse {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'id' in value &&
+    typeof value.id === 'number'
+  )
+}
+
 /**
  * Narrow a decoded reply to the shape the endpoint is documented to return.
  *
@@ -100,8 +111,15 @@ function isHtmlContentType(contentType: string): boolean {
 export async function assertTempsApiResponse(
   response: Response,
   request: Request,
+  options?: { parseAs?: string },
 ): Promise<Response> {
   if (!response.ok || response.status === 204 || response.status === 205) {
+    return response
+  }
+
+  // A caller that explicitly asked for text, a blob or a stream knows the
+  // reply is not JSON; only the default ('auto') is judged.
+  if (options?.parseAs && options.parseAs !== 'auto' && options.parseAs !== 'json') {
     return response
   }
 
@@ -123,9 +141,9 @@ export async function assertTempsApiResponse(
   }
 
   if (!contentType && request.method === 'GET') {
-    // Only an untyped reply is read: a typed one may be a long-lived stream.
-    const body = await response.clone().text()
-    if (body.length === 0) {
+    // Only an untyped reply is looked at, and only until its first chunk: the
+    // body may be large or long-lived, so it is never read to the end.
+    if (await hasEmptyBody(response)) {
       throw new ApiResponseError(
         `${where} returned an empty body (${status}) where a Temps API response was expected. ${hint}`,
         response.status,
@@ -135,6 +153,25 @@ export async function assertTempsApiResponse(
   }
 
   return response
+}
+
+/** True when the reply carries no bytes. Reads at most one chunk of a clone. */
+async function hasEmptyBody(response: Response): Promise<boolean> {
+  if (response.headers.get('content-length') === '0') return true
+  const body = response.clone().body
+  if (!body) return true
+  const reader = body.getReader()
+  try {
+    // An empty body closes without yielding a chunk. Only chunk-less bodies
+    // are empty; a zero-length chunk is skipped until real data or the end.
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.done) return true
+      if (chunk.value && chunk.value.byteLength > 0) return false
+    }
+  } finally {
+    void reader.cancel().catch(() => undefined)
+  }
 }
 
 function errorCauseText(error: Error): string {
@@ -175,6 +212,16 @@ export function describeApiFailure(
   const url = request?.url ?? response?.url ?? 'the server'
 
   if (!response) {
+    // An aborted or timed-out request says nothing about whether the host is
+    // reachable; report it as what it is instead of "unable to reach".
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      return new ApiResponseError(`Request to ${url} timed out`, undefined, url, {
+        cause: error,
+      })
+    }
+    if (error instanceof Error && error.name === 'AbortError') {
+      return error
+    }
     if (error instanceof Error) {
       return new ApiResponseError(
         `Unable to reach ${url}: ${errorCauseText(error)}`,

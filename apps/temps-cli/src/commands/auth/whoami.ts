@@ -5,9 +5,14 @@ import { credentials, config } from '../../config/store.js'
 import { getActiveContext } from '../../config/contexts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { info, newline, keyValue, header, icons, json, colors } from '../../ui/output.js'
-import { setupClient, client, getErrorMessage, requireApiShape } from '../../lib/api-client.js'
+import {
+  setupClient,
+  client,
+  getErrorMessage,
+  requireApiShape,
+  isUserObject,
+} from '../../lib/api-client.js'
 import { getCurrentUser } from '../../api/sdk.gen.js'
-import { isUserObject } from './login.js'
 
 interface WhoamiOptions {
   json?: boolean

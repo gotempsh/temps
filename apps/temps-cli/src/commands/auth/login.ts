@@ -6,9 +6,13 @@ import { upsertContext, defaultContextName } from '../../config/contexts.js'
 import { promptPassword } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { info, icons, colors, newline, box } from '../../ui/output.js'
-import { setupClient, client, ApiResponseError } from '../../lib/api-client.js'
+import {
+  setupClient,
+  client,
+  ApiResponseError,
+  isUserObject,
+} from '../../lib/api-client.js'
 import { getCurrentUser } from '../../api/sdk.gen.js'
-import type { UserResponse } from '../../api/types.gen.js'
 import { AuthenticationError } from '../../utils/errors.js'
 import { hostname, platform } from 'node:os'
 import { spawn } from 'node:child_process'
@@ -106,16 +110,6 @@ async function debugFetch(
  *
  * Returns the `/api`-suffixed base, with no trailing slash.
  */
-/** A decoded `GET /user/me` reply: an object that carries the user's id. */
-export function isUserObject(value: unknown): value is UserResponse {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'id' in value &&
-    typeof value.id === 'number'
-  )
-}
-
 export function serverBaseUrl(rawApiUrl: string): string {
   const trimmed = rawApiUrl.replace(/\/+$/, '')
   return /\/api$/.test(trimmed) ? trimmed : `${trimmed}/api`
@@ -522,9 +516,9 @@ export async function loginWithApiKey(
   const baseUrl = opts.url
     ? serverBaseUrl(opts.url)
     : serverBaseUrl(config.get('apiUrl'))
-  if (opts.url) {
-    config.set('apiUrl', baseUrl)
-  }
+  // The URL is persisted only after the key has been validated against it
+  // (below): saving it first would leave a URL that is not a Temps server as
+  // the target of every later command when validation fails.
   if (debug) {
     debugLog(`api-key login resolved apiUrl: ${baseUrl}`)
     debugLog(`raw url arg: ${opts.url ?? '(none, using config apiUrl)'}`)
@@ -547,8 +541,14 @@ export async function loginWithApiKey(
         if (error) {
           // A reply that is not a Temps API answer (wrong URL, unreachable
           // host) is not an invalid key; say what actually went wrong.
+          // A 401/403 is still the server rejecting the key, even when the
+          // proxy in front of it sent no body.
+          const rejectedKey =
+            !(error instanceof ApiResponseError) ||
+            error.status === 401 ||
+            error.status === 403
           throw new AuthenticationError(
-            error instanceof ApiResponseError ? error.message : 'Invalid API key'
+            rejectedKey ? 'Invalid API key' : (error as ApiResponseError).message
           )
         }
         // A 2xx without a user object is not a Temps server vouching for the
