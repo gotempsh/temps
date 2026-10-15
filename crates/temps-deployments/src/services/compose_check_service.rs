@@ -1062,17 +1062,9 @@ where
                         let mut hasher = std::collections::hash_map::DefaultHasher::new();
                         std::hash::Hash::hash(&(document.scope, &entries), &mut hasher);
                         let scope = std::hash::Hasher::finish(&hasher);
-                        let mut variables = HashMap::clone(&document.variables);
-                        for (key, value) in loaded {
-                            sensitive.insert(value.clone());
-                            variables.entry(key).or_insert(value);
-                        }
-                        scope_bytes = scope_bytes.saturating_add(
-                            variables
-                                .iter()
-                                .map(|(key, value)| key.len() + value.len())
-                                .sum::<usize>(),
-                        );
+                        let (variables, charged) =
+                            merge_include_scope(&document.variables, loaded, &mut sensitive);
+                        scope_bytes = scope_bytes.saturating_add(charged);
                         if scope_bytes > MAX_REFERENCE_SCOPE_BYTES {
                             reader.result.inconclusive.push(format!(
                                 "Stopped looking for referenced Compose files: include environments exceed {MAX_REFERENCE_SCOPE_BYTES} bytes."
@@ -1115,6 +1107,33 @@ where
         *note = redact_variable_text(note, &sensitive);
     }
     result
+}
+
+/// The variables an include's documents see: the including scope's, with
+/// the include's env files underneath (the including scope wins). Only the
+/// loaded values that take effect are added to `sensitive`, since an
+/// overridden one never reaches a document. Returns the scope and the bytes
+/// it holds, counting the redaction copies it added as well.
+fn merge_include_scope(
+    parent: &HashMap<String, String>,
+    loaded: HashMap<String, String>,
+    sensitive: &mut HashSet<String>,
+) -> (HashMap<String, String>, usize) {
+    let mut variables = parent.clone();
+    let mut redaction_bytes = 0_usize;
+    for (key, value) in loaded {
+        if let std::collections::hash_map::Entry::Vacant(entry) = variables.entry(key) {
+            if sensitive.insert(value.clone()) {
+                redaction_bytes = redaction_bytes.saturating_add(value.len());
+            }
+            entry.insert(value);
+        }
+    }
+    let scope_bytes = variables
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum::<usize>();
+    (variables, scope_bytes.saturating_add(redaction_bytes))
 }
 
 /// Documents waiting to be examined. Each (path, base, scope) is queued at
@@ -1525,6 +1544,38 @@ mod tests {
             "{:?}",
             files.inconclusive
         );
+    }
+
+    #[test]
+    fn include_scopes_keep_and_charge_only_values_that_take_effect() {
+        let parent = HashMap::from([
+            ("PAD".to_string(), "p".repeat(64)),
+            ("IGNORED".to_string(), "safe".to_string()),
+        ]);
+        let overridden = "x".repeat(4096);
+        let loaded = HashMap::from([
+            ("IGNORED".to_string(), overridden.clone()),
+            ("FRESH".to_string(), "include-value".to_string()),
+        ]);
+        let mut sensitive = HashSet::new();
+        let (variables, charged) = merge_include_scope(&parent, loaded, &mut sensitive);
+
+        // The including scope wins, so the overridden value is neither in
+        // the scope nor retained for redaction.
+        assert_eq!(variables["IGNORED"], "safe");
+        assert!(!sensitive.contains(&overridden));
+        assert_eq!(sensitive, HashSet::from(["include-value".to_string()]));
+        // The scope is charged for its map and for the redaction copy.
+        let map_bytes: usize = variables.iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert_eq!(charged, map_bytes + "include-value".len());
+
+        // A value already retained is not charged twice.
+        let (_, again) = merge_include_scope(
+            &parent,
+            HashMap::from([("FRESH".to_string(), "include-value".to_string())]),
+            &mut sensitive,
+        );
+        assert_eq!(again, map_bytes);
     }
 
     #[tokio::test]
