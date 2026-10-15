@@ -668,10 +668,10 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// The sandbox a network belongs to, when the network is a candidate for
 /// being reaped as orphaned: it carries the ownership label, its name is the
 /// one this provider derives for that owner (so a user's own network that
-/// happens to copy the label is left alone), it is not labelled for another
-/// preview gateway (another Temps instance sharing this Docker daemon may be
-/// recreating that sandbox, which this instance's bookkeeping cannot see),
-/// and it is at least `min_age` old. Whether the owner's container still
+/// happens to copy the label is left alone), it is labelled for this
+/// instance's preview gateway (another Temps instance sharing this Docker
+/// daemon may be recreating that sandbox, which this instance's bookkeeping
+/// cannot see), and it is at least `min_age` old. Whether the owner's container still
 /// exists is checked by the caller.
 fn orphan_candidate_owner<'a>(
     network: &'a bollard::models::Network,
@@ -680,9 +680,13 @@ fn orphan_candidate_owner<'a>(
     min_age: std::time::Duration,
 ) -> Option<&'a str> {
     let labels = network.labels.as_ref()?;
+    // Positive ownership only: a network that predates the gateway label
+    // cannot be attributed to this instance (another one on the same daemon
+    // may have reused it as a legacy network), so it is left alone.
     if labels
         .get(SANDBOX_PREVIEW_GATEWAY_LABEL)
-        .is_some_and(|labelled| labelled != gateway)
+        .map(String::as_str)
+        != Some(gateway)
     {
         return None;
     }
@@ -2748,8 +2752,8 @@ impl DockerSandboxProvider {
     /// carrying this provider's ownership label whose name matches the owner
     /// are candidates, and a network younger than `min_age` is skipped
     /// because its container may not have been created yet. Networks
-    /// labelled for a preview gateway other than `gateway` belong to another
-    /// Temps instance on this daemon and are left alone. Best effort:
+    /// not labelled for `gateway` (another Temps instance on this daemon, or
+    /// a legacy network with no gateway label) are left alone. Best effort:
     /// failures are logged and never block the caller.
     async fn reap_orphaned_sandbox_networks(
         &self,
@@ -10393,6 +10397,16 @@ function response() {{
                 min_age
             ),
             Some(owner)
+        );
+        // A legacy network with no gateway label cannot be attributed to
+        // this instance, so it is never reaped.
+        let mut unlabelled = labelled_network(&name, Some(owner), old);
+        if let Some(labels) = unlabelled.labels.as_mut() {
+            labels.remove(SANDBOX_PREVIEW_GATEWAY_LABEL);
+        }
+        assert_eq!(
+            orphan_candidate_owner(&unlabelled, TEST_GATEWAY, now, min_age),
+            None
         );
         // Labelled for another Temps instance's preview gateway: that
         // instance may be recreating the sandbox, and this one cannot see it.
