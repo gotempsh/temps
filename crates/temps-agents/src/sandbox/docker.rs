@@ -681,8 +681,9 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// bookkeeping and must not both run automatic reaping against one daemon.
 /// The reaper additionally never removes a network that has any workload
 /// attached (`network_has_foreign_endpoints`), so even then a running sandbox
-/// is not disconnected; at worst a create in its first seconds fails and is
-/// retried.
+/// is not disconnected (its removal never force-detaches an endpoint, so
+/// Docker refuses to remove a network a workload has attached); at worst a
+/// create in its first seconds fails and is retried.
 ///
 /// Whether the owner's container still exists is checked by the caller.
 fn orphan_candidate_owner<'a>(
@@ -2874,7 +2875,11 @@ impl DockerSandboxProvider {
                     continue;
                 }
             }
-            if self.remove_isolated_sandbox_network(owner).await.is_empty() {
+            if self
+                .remove_isolated_sandbox_network_with(owner, false)
+                .await
+                .is_empty()
+            {
                 tracing::info!(
                     network = ?network.name,
                     sandbox = %owner,
@@ -2887,6 +2892,23 @@ impl DockerSandboxProvider {
     }
 
     async fn remove_isolated_sandbox_network(&self, container_name: &str) -> Vec<String> {
+        self.remove_isolated_sandbox_network_with(container_name, true)
+            .await
+    }
+
+    /// Remove a sandbox's egress proxy and isolated network.
+    ///
+    /// `force_disconnect` detaches whatever is still attached before the
+    /// network is removed, which is right when the caller knows the sandbox
+    /// is gone. The orphan reaper passes `false`: it can only infer that,
+    /// and another Temps process may have started the sandbox meanwhile, so
+    /// it lets Docker refuse to remove a network that has a workload
+    /// attached instead of cutting that workload off.
+    async fn remove_isolated_sandbox_network_with(
+        &self,
+        container_name: &str,
+        force_disconnect: bool,
+    ) -> Vec<String> {
         let mut cleanup_errors = Vec::new();
         let proxy_name = sandbox_egress_proxy_name(container_name);
         if let Err(error) = self
@@ -2953,7 +2975,12 @@ impl DockerSandboxProvider {
             );
             return cleanup_errors;
         }
-        for container_id in network.containers.unwrap_or_default().into_keys() {
+        let attached = if force_disconnect {
+            network.containers.unwrap_or_default().into_keys().collect()
+        } else {
+            Vec::new()
+        };
+        for container_id in attached {
             if let Err(error) = self
                 .docker
                 .disconnect_network(
