@@ -51,7 +51,7 @@ import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { AnalyticsOnboardingGate } from '@/components/analytics/AnalyticsOnboardingGate'
-import { requestLogsRedirectPath } from '@/components/analytics/analytics-legacy-routes'
+import { RequestLogsRedirect } from '@/components/analytics/RequestLogsRedirect'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Button } from '@/components/ui/button'
 import {
@@ -148,7 +148,6 @@ import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import {
   Link,
-  Navigate,
   Route,
   Routes,
   useLocation,
@@ -1172,18 +1171,6 @@ function JourneyTab({ project }: JourneyTabProps) {
 
 interface ProjectAnalyticsProps {
   project: ProjectResponse
-}
-
-/**
- * Request logs used to be mounted a second time under analytics; keep old
- * links working by sending them to the canonical Request logs page.
- */
-function RequestLogsRedirect({ projectSlug }: { projectSlug: string }) {
-  const { '*': rest = '' } = useParams()
-  const { search } = useLocation()
-  return (
-    <Navigate to={requestLogsRedirectPath(projectSlug, rest, search)} replace />
-  )
 }
 
 export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {

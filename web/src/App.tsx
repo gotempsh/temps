@@ -50,6 +50,7 @@ import {
   installUnhandledRejectionReporter,
   markErrorReported,
 } from './lib/unhandled-rejections'
+import { announceMutationFailure } from './lib/mutation-error-toast'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
@@ -1159,24 +1160,6 @@ const AppContent = () => {
   )
 }
 
-// Helper to generate friendly error titles from mutation operations
-const getErrorTitle = (
-  context: any,
-  defaultTitle?: string
-): string | undefined => {
-  // Check for custom error title in mutation meta
-  if (context?.meta?.errorTitle) {
-    return context.meta.errorTitle
-  }
-  const mutationKey = context?.mutationKey?.[0]
-  if (mutationKey) {
-    // e.g., "createProject" -> "Failed to create project"
-    return `Failed to ${mutationKey.replace(/([A-Z])/g, ' $1').toLowerCase()}`
-  }
-
-  return defaultTitle
-}
-
 const queryClient = new QueryClient({
   // Runs for every failed mutation, including those that define their own
   // `onError` (which replaces the default one below). Whoever announces the
@@ -1244,7 +1227,9 @@ const queryClient = new QueryClient({
       retry: shouldRetryQuery,
     },
     mutations: {
-      onError: (error: unknown, _variables, context) => {
+      // `meta` and `mutationKey` arrive in the fourth argument; the third is
+      // the `onMutate` result, which is `undefined` for these mutations.
+      onError: (error: unknown, _variables, _onMutateResult, context) => {
         const problemDetails = error as ProblemDetails
 
         // Sensitive mutations own this response: they open a step-up dialog
@@ -1303,16 +1288,8 @@ const queryClient = new QueryClient({
           return
         }
 
-        // Get custom error title
-        const customTitle = getErrorTitle(context, problemDetails.title)
-
-        if (problemDetails.title) {
-          toast.error(customTitle || problemDetails.title, {
-            description: problemDetails.detail,
-          })
-        } else {
-          toast.error(customTitle || 'An error occurred')
-        }
+        // Authored title (`meta.errorTitle`) plus the server's reason.
+        announceMutationFailure(problemDetails, context)
       },
     },
   },

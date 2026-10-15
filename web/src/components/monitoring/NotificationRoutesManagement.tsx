@@ -13,7 +13,13 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { BellRing, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -38,13 +44,25 @@ export function NotificationRoutesManagement({
   const {
     data: routePage,
     isLoading: routesLoading,
+    error: routesError,
+    isFetching: routesFetching,
     refetch: refetchRoutes,
   } = useQuery({
     ...listNotificationRoutesOptions({ query: { page_size: 100 } }),
   })
-  const { data: providers, isLoading: providersLoading } = useQuery({
+  const {
+    data: providers,
+    isLoading: providersLoading,
+    error: providersError,
+    isFetching: providersFetching,
+    refetch: refetchProviders,
+  } = useQuery({
     ...listNotificationProvidersOptions({ query: { page_size: 100 } }),
   })
+  // Creating a route or provider is offered to administrators only; for
+  // anyone else it would just lead to a refusal.
+  const canManage = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
 
   const providerById = useMemo(
     () =>
@@ -78,6 +96,14 @@ export function NotificationRoutesManagement({
 
   const routes = routePage?.items || []
   const isLoading = routesLoading || providersLoading
+  // A failed or refused read is never an empty list.
+  const readError =
+    (routesError && routes.length === 0 ? routesError : null) ??
+    (providersError && !providers?.length ? providersError : null)
+  const retryReads = () => {
+    if (routesError) void refetchRoutes()
+    if (providersError) void refetchProviders()
+  }
   const startCreate = () =>
     navigate(withReturnTo('/settings/notifications/routes/new', returnTo))
   const startEdit = (routeId: number) =>
@@ -95,35 +121,69 @@ export function NotificationRoutesManagement({
             route&apos;s range goes to that route&apos;s providers.
           </p>
         </div>
-        {providers && providers.length > 0 && routes.length > 0 && (
-          <Button onClick={startCreate}>
-            <Plus className="mr-2 h-4 w-4" />
-            Add Route
-          </Button>
-        )}
+        {canManage &&
+          providers &&
+          providers.length > 0 &&
+          routes.length > 0 && (
+            <Button onClick={startCreate}>
+              <Plus className="mr-2 h-4 w-4" />
+              Add Route
+            </Button>
+          )}
       </div>
 
-      {!isLoading && providers?.length === 0 ? (
+      {!canManage && (
+        <AdminOnlyNote action="add or change routes" role={currentRole} />
+      )}
+
+      {readError ? (
+        <ReadFailure
+          resource="Notification routes"
+          error={readError}
+          onRetry={isForbiddenRead(readError) ? undefined : retryReads}
+          retrying={routesFetching || providersFetching}
+        />
+      ) : isLoading ? (
+        <div
+          role="status"
+          aria-label="Loading notification routes"
+          className="space-y-3 rounded-lg border p-4"
+        >
+          {Array.from({ length: 3 }, (_, index) => (
+            <Skeleton key={index} className="h-12 w-full" />
+          ))}
+        </div>
+      ) : providers?.length === 0 ? (
         <EmptyState
+          size="compact"
           icon={BellRing}
           title="Add a destination first"
           description="Routes send alerts to providers. Add an email, Slack, webhook, or Cloudflare destination before creating a route."
           action={
-            <Button
-              onClick={() =>
-                navigate(withReturnTo('/settings/notifications/new', returnTo))
-              }
-            >
-              Add Provider
-            </Button>
+            canManage ? (
+              <Button
+                onClick={() =>
+                  navigate(
+                    withReturnTo('/settings/notifications/new', returnTo)
+                  )
+                }
+              >
+                Add Provider
+              </Button>
+            ) : undefined
           }
         />
-      ) : !isLoading && routes.length === 0 ? (
+      ) : routes.length === 0 ? (
         <EmptyState
+          size="compact"
           icon={BellRing}
           title="No notification routes configured"
           description="Providers do not receive alert notifications until an enabled route assigns them."
-          action={<Button onClick={startCreate}>Create Route</Button>}
+          action={
+            canManage ? (
+              <Button onClick={startCreate}>Create Route</Button>
+            ) : undefined
+          }
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2">

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Routes, Route, Link, Navigate, useLocation } from 'react-router'
+import { Routes, Route, Link, useLocation } from 'react-router'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { ProjectResponse } from '@/api/client'
 import { Bell, ChevronRight, LayoutDashboard, LineChart } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
@@ -66,7 +67,7 @@ function MetricsIndexRedirect({ project }: { project: ProjectResponse }) {
     enabled: !!project.id && !wantsExplore,
   })
 
-  if (wantsExplore) return <Navigate to={`explore${search}`} replace />
+  if (wantsExplore) return <RedirectWithQuery to="explore" />
 
   if (query.isPending) {
     return (
@@ -80,9 +81,9 @@ function MetricsIndexRedirect({ project }: { project: ProjectResponse }) {
 
   const dashboards = query.data?.data ?? []
   if (!query.isError && dashboards.length > 0) {
-    return <Navigate to={`dashboards/${dashboards[0].id}`} replace />
+    return <RedirectWithQuery to={`dashboards/${dashboards[0].id}`} />
   }
-  return <Navigate to={`explore${search}`} replace />
+  return <RedirectWithQuery to="explore" />
 }
 
 interface TabDef {
