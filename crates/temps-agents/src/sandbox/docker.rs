@@ -679,6 +679,10 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// two instances on one daemon are expected to use different names. Two
 /// instances configured with the *same* name are not separable by this
 /// bookkeeping and must not both run automatic reaping against one daemon.
+/// The reaper additionally never removes a network that has any workload
+/// attached (`network_has_foreign_endpoints`), so even then a running sandbox
+/// is not disconnected; at worst a create in its first seconds fails and is
+/// retried.
 ///
 /// Whether the owner's container still exists is checked by the caller.
 fn orphan_candidate_owner<'a>(
@@ -704,6 +708,25 @@ fn orphan_candidate_owner<'a>(
     }
     let age_secs = now_unix.checked_sub(network.created?.unix_timestamp())?;
     (u64::try_from(age_secs).ok()? >= min_age.as_secs()).then_some(owner)
+}
+
+/// Containers attached to `network` other than the sandbox's own egress proxy
+/// and the preview gateway: anything else is a workload, so the network is in
+/// use and must not be torn down by the reaper, which would disconnect it.
+fn network_has_foreign_endpoints(
+    network: &bollard::models::NetworkInspect,
+    owner: &str,
+    gateway: &str,
+) -> bool {
+    let proxy = sandbox_egress_proxy_name(owner);
+    network.containers.as_ref().is_some_and(|containers| {
+        containers.values().any(|endpoint| {
+            endpoint
+                .name
+                .as_deref()
+                .is_none_or(|name| name != proxy && name != gateway)
+        })
+    })
 }
 
 fn isolated_sandbox_network_request(
@@ -2816,6 +2839,37 @@ impl DockerSandboxProvider {
                     tracing::warn!(
                         network = ?network.name,
                         "Could not inspect owner '{owner}' of sandbox network: {error}"
+                    );
+                    continue;
+                }
+            }
+            // The owner's container is absent, but a sandbox another Temps
+            // process is creating right now would be attached by the time
+            // this looks again. Never force-disconnect a workload: a network
+            // with any endpoint besides its own proxy and the gateway is in
+            // use, so leave it for a later pass.
+            match self
+                .docker
+                .inspect_network(
+                    &sandbox_network_name(owner),
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+            {
+                Ok(inspected) if network_has_foreign_endpoints(&inspected, owner, gateway) => {
+                    tracing::debug!(
+                        network = ?network.name,
+                        sandbox = %owner,
+                        "Not reaping a sandbox network that still has attached workloads"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) if docker_error_is_not_found(&error) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        network = ?network.name,
+                        "Could not inspect sandbox network '{owner}' before reaping it: {error}"
                     );
                     continue;
                 }
@@ -10477,6 +10531,51 @@ function response() {{
             ),
             None
         );
+    }
+
+    #[test]
+    fn networks_with_attached_workloads_are_not_reapable() {
+        let owner = "temps-sandbox-abc123";
+        let gateway = "temps-preview-gateway";
+        let endpoint = |name: &str| bollard::models::EndpointResource {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let network = |members: &[&str]| bollard::models::NetworkInspect {
+            containers: Some(
+                members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (format!("id{index}"), endpoint(name)))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let proxy = sandbox_egress_proxy_name(owner);
+
+        // Only its own proxy and the gateway: a leftover.
+        assert!(!network_has_foreign_endpoints(
+            &network(&[]),
+            owner,
+            gateway
+        ));
+        assert!(!network_has_foreign_endpoints(
+            &network(&[proxy.as_str(), gateway]),
+            owner,
+            gateway
+        ));
+        // The sandbox's own container (a create that finished meanwhile) or
+        // anything else attached means the network is in use.
+        assert!(network_has_foreign_endpoints(
+            &network(&[proxy.as_str(), owner]),
+            owner,
+            gateway
+        ));
+        assert!(network_has_foreign_endpoints(
+            &network(&["some-other-container"]),
+            owner,
+            gateway
+        ));
     }
 
     #[test]
