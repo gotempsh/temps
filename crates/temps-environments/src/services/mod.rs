@@ -9,6 +9,6 @@ pub use environment_service::*;
 pub use secret_service::*;
 mod types;
 pub use types::{
-    EnvVarEnvironment, EnvVarWithEnvironments, SecretEnvironmentRef, SecretWithEnvironments,
-    UpdateEnvVarOutcome,
+    DeletedEnvVar, EnvVarEnvironment, EnvVarWithEnvironments, SecretEnvironmentRef,
+    SecretWithEnvironments, UpdateEnvVarOutcome,
 };
