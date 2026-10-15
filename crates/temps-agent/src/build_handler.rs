@@ -687,16 +687,23 @@ pub async fn scan_image(
     let scanner = temps_vulnerability_scanner::TrivyScanner::new(Arc::new(
         temps_core::DockerHandle::available(Arc::new(docker)),
     ));
-    let scanned = tokio::time::timeout_at(
-        deadline,
-        temps_vulnerability_scanner::VulnerabilityScanner::scan_image(&scanner, &image),
-    )
-    .await
-    .map_err(|_| AgentImageError::Deadline(format!("Scan of '{image}' exceeded 30 minutes")))?;
-    let result = scanned.map_err(|error| {
-        tracing::error!(image = %image, "Image scan failed: {error}");
-        AgentImageError::Storage(format!("Cannot scan '{image}': {error}"))
-    })?;
+    // The scanner enforces the deadline itself and removes its container
+    // before returning, so the slot held by `_permit` is only released once
+    // nothing is left running on this node on the scan's behalf.
+    let result =
+        scanner
+            .scan_image_before(&image, deadline)
+            .await
+            .map_err(|error| match error {
+                temps_vulnerability_scanner::ScannerError::DeadlineExceeded { .. } => {
+                    tracing::error!(image = %image, "Image scan timed out: {error}");
+                    AgentImageError::Deadline(format!("Scan of '{image}' exceeded 30 minutes"))
+                }
+                error => {
+                    tracing::error!(image = %image, "Image scan failed: {error}");
+                    AgentImageError::Storage(format!("Cannot scan '{image}': {error}"))
+                }
+            })?;
     if result.total_count > MAX_SCAN_FINDINGS {
         return Err(AgentImageError::TooLarge(format!(
             "Scan of '{image}' found {} vulnerabilities, more than the {MAX_SCAN_FINDINGS} a report may carry",
