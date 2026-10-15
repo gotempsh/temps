@@ -540,6 +540,8 @@ pub struct ResolvedComposeConfiguration {
     /// from substituted values. At most [`MAX_RESOLVED_COMPOSE_CONFIG_BYTES`]
     /// in total; files past that are left out.
     pub referenced_sources: Vec<String>,
+    /// Values substituted into `content`, for redacting text derived from it.
+    pub substituted_values: SubstitutedValues,
     /// Caveats, e.g. resolution skipped because no Compose CLI is present.
     pub notes: Vec<String>,
 }
@@ -1023,6 +1025,32 @@ pub fn redact_variable_text(text: &str, values: &[String]) -> String {
         .cloned()
         .collect();
     redact_compose_text(text, &values)
+}
+
+/// Every variable value substituted into a resolved Compose model: the
+/// project environment, the repository `.env` and include env files. Text
+/// derived from the model (paths, log lines) may embed any of them. `Debug`
+/// prints only the count, so the values never reach a log through it.
+#[derive(Clone, Default)]
+pub struct SubstitutedValues(Vec<String>);
+
+impl SubstitutedValues {
+    fn extend<'a>(&mut self, values: impl IntoIterator<Item = &'a String>) {
+        self.0
+            .extend(values.into_iter().filter(|value| value.len() >= 3).cloned());
+    }
+
+    /// `text` with every substituted value and credential-shaped token
+    /// masked.
+    pub fn redact(&self, text: &str) -> String {
+        redact_compose_text(text, &self.0)
+    }
+}
+
+impl std::fmt::Debug for SubstitutedValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SubstitutedValues({} values)", self.0.len())
+    }
 }
 
 /// Mask every known sensitive value and credential-shaped token in `text`,
@@ -3689,6 +3717,8 @@ impl ComposeExecutor {
             _ => None,
         };
         let resolution_reasons = Self::resolution_reasons(&content, override_content.as_deref());
+        let mut substituted_values = SubstitutedValues::default();
+        substituted_values.extend(variables.values());
         let mut resolved = ResolvedComposeConfiguration {
             content,
             override_content,
@@ -3698,6 +3728,7 @@ impl ComposeExecutor {
             referenced_variables,
             deferred_required_variables,
             referenced_sources: Vec::new(),
+            substituted_values,
             notes: Vec::new(),
         };
         if resolved.resolution_reasons.is_empty() {
@@ -3730,6 +3761,9 @@ impl ComposeExecutor {
             .referenced_variables
             .extend(snapshots_variables.referenced);
         resolved.referenced_sources = snapshots_variables.sources;
+        resolved
+            .substituted_values
+            .extend(&snapshots_variables.loaded_values);
         resolved.content = merged;
         resolved.override_content = None;
         resolved.command = Some(command);
@@ -18128,6 +18162,38 @@ services:
             .await
             .unwrap_err();
         assert_eq!(error.class(), ComposeCheckErrorClass::Interpolation);
+    }
+
+    #[tokio::test]
+    async fn resolution_carries_every_substituted_value_for_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let environment =
+            HashMap::from([("PROJECT_TOKEN".to_string(), "project-secret".to_string())]);
+        let content = "services:\n  app:\n    image: registry.example.com/${REPO_TOKEN}/app:1\n    env_file: ${PROJECT_TOKEN}.env\n";
+        let resolved = executor_with_checks_disabled(&[])
+            .resolve_configuration(&ComposeCheckInput {
+                content,
+                allow_cli: false,
+                filesystem_checks: false,
+                repository_env: Some("REPO_TOKEN=repository-secret\n"),
+                ..idiomatic_input(root.path(), &environment, None)
+            })
+            .await
+            .unwrap();
+        // Both sources were substituted into the model...
+        assert!(resolved.content.contains("project-secret.env"));
+        assert!(resolved.content.contains("repository-secret/app"));
+        // ...and text derived from it can be masked for either.
+        let line = format!(
+            "env file '{}' for image {}",
+            "project-secret.env", "registry.example.com/repository-secret/app:1"
+        );
+        let redacted = resolved.substituted_values.redact(&line);
+        assert!(!redacted.contains("project-secret"), "{redacted}");
+        assert!(!redacted.contains("repository-secret"), "{redacted}");
+        // Debug output never carries them.
+        let debug = format!("{:?}", resolved.substituted_values);
+        assert!(!debug.contains("secret"), "{debug}");
     }
 
     #[tokio::test]

@@ -14,9 +14,9 @@
 //! that are deployed — the guarantee does not depend on this module matching
 //! Compose's interpolation byte for byte.
 
-use yaml_serde::Value;
 use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
+use yaml_serde::Value;
 
 /// Longest location path copied into an error. Locations are built from
 /// repository keys, never values, but a pathological key could be large.

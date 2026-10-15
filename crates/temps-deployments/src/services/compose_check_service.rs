@@ -962,7 +962,7 @@ where
         .unwrap_or_default();
     let mut reader = ReferenceReader {
         read,
-        cache: HashMap::new(),
+        requested: HashSet::new(),
         bytes: 0,
         stopped: false,
         result: ReferenceFiles::default(),
@@ -1147,8 +1147,9 @@ impl Traversal {
 /// and classifies what could not be read.
 struct ReferenceReader<F> {
     read: F,
-    /// Every path requested so far and its content; `None` when unread.
-    cache: HashMap<String, Option<String>>,
+    /// Every path requested so far. Content that was read is kept once, in
+    /// `result.files`.
+    requested: HashSet<String>,
     bytes: usize,
     stopped: bool,
     result: ReferenceFiles,
@@ -1160,26 +1161,38 @@ where
     Fut: std::future::Future<Output = Result<String, ReferenceReadError>>,
 {
     async fn read(&mut self, path: String, optional: bool) -> Option<String> {
-        if let Some(cached) = self.cache.get(&path) {
-            return cached.clone();
+        if self.requested.contains(&path) {
+            return self.result.files.get(&path).cloned();
         }
         if self.stopped {
             return None;
         }
-        if self.cache.len() >= MAX_REFERENCE_FILES || self.bytes > MAX_REFERENCE_BYTES {
+        if self.requested.len() >= MAX_REFERENCE_FILES || self.bytes >= MAX_REFERENCE_BYTES {
             self.stopped = true;
             self.result.inconclusive.push(format!(
                 "Stopped reading referenced Compose files after {} requests ({} bytes); '{}' and any later references were not read.",
-                self.cache.len(),
+                self.requested.len(),
                 self.bytes,
                 path
             ));
             return None;
         }
-        let outcome = match (self.read)(path.clone()).await {
+        self.requested.insert(path.clone());
+        match (self.read)(path.clone()).await {
             Ok(content) => {
-                self.bytes = self.bytes.saturating_add(content.len());
-                self.result.files.insert(path.clone(), content.clone());
+                // Checked before the file is kept, so no single file can
+                // carry the total past the limit.
+                let remaining = MAX_REFERENCE_BYTES - self.bytes;
+                if content.len() > remaining {
+                    self.stopped = true;
+                    self.result.inconclusive.push(format!(
+                        "Referenced file '{path}' is {} bytes, more than the {remaining} bytes left of the {MAX_REFERENCE_BYTES}-byte limit for referenced files; it and any later references were not read.",
+                        content.len()
+                    ));
+                    return None;
+                }
+                self.bytes += content.len();
+                self.result.files.insert(path, content.clone());
                 Some(content)
             }
             Err(ReferenceReadError::NotFound) => {
@@ -1196,9 +1209,7 @@ where
                     .push(format!("Referenced file {reason}"));
                 None
             }
-        };
-        self.cache.insert(path, outcome.clone());
-        outcome
+        }
     }
 }
 
@@ -1478,6 +1489,42 @@ mod tests {
         assert_eq!(requested.len(), MAX_REFERENCE_FILES);
         assert!(!files.inconclusive.is_empty());
         assert!(files.inconclusive[0].starts_with("Stopped reading"));
+    }
+
+    #[tokio::test]
+    async fn a_file_larger_than_the_remaining_budget_is_never_kept() {
+        let request = reference_request(
+            "include:\n  - first.yaml\n  - second.yaml\n  - third.yaml\n",
+            &[],
+        );
+        let first = format!("# {}\nservices: {{}}\n", "a".repeat(3 * 1024 * 1024));
+        let second = format!("# {}\nservices: {{}}\n", "b".repeat(2 * 1024 * 1024));
+        let (files, requested) = collect(
+            &request,
+            &[
+                ("first.yaml", Ok(first.as_str())),
+                ("second.yaml", Ok(second.as_str())),
+                ("third.yaml", Ok("services: {}\n")),
+            ],
+        )
+        .await;
+        assert!(files.files.contains_key("first.yaml"));
+        assert!(!files.files.contains_key("second.yaml"));
+        let kept: usize = files.files.values().map(String::len).sum();
+        assert!(kept <= MAX_REFERENCE_BYTES, "{kept} bytes kept");
+        // Nothing is requested once a file overran the limit.
+        assert!(
+            !requested.contains(&"third.yaml".to_string()),
+            "{requested:?}"
+        );
+        assert!(
+            files
+                .inconclusive
+                .iter()
+                .any(|note| note.contains("second.yaml") && note.contains("bytes left")),
+            "{:?}",
+            files.inconclusive
+        );
     }
 
     #[tokio::test]

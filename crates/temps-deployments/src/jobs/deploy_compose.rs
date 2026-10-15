@@ -1097,7 +1097,9 @@ impl DeployComposeJob {
                 let image_suffix = service
                     .image
                     .as_deref()
-                    .map(|image| format!(" ({image})"))
+                    .map(|image| {
+                        format!(" ({})", checked.resolution.substituted_values.redact(image))
+                    })
                     .unwrap_or_default();
                 let message = format!(
                     "Service '{}'{} looks like a {} container running unmanaged in this \
@@ -1120,6 +1122,10 @@ impl DeployComposeJob {
         // planning and the actual `docker compose up` see the model.
         let compose_content = checked.content;
         let compose_override = checked.override_content;
+        // Paths in the resolved model may embed substituted values
+        // (`env_file: ${TOKEN}.env`); the job log is readable without
+        // permission to see them.
+        let substituted_values = checked.resolution.substituted_values;
 
         // Read .env from repo if it exists
         let env_content = if let Some(selected_repo_dir) = repo_path.as_deref() {
@@ -1154,17 +1160,17 @@ impl DeployComposeJob {
             let message = match plan.source {
                 EnvFileSource::Repository(_) => format!(
                     "Compose references env file '{}' — copied from the repository",
-                    plan.path
+                    substituted_values.redact(&plan.path)
                 ),
                 EnvFileSource::ProjectEnvironment if self.environment_vars.is_empty() => format!(
                     "Compose references env file '{}', which is not in the repository — created it empty. \
                      If the stack needs values, set them in the environment's variables and redeploy.",
-                    plan.path
+                    substituted_values.redact(&plan.path)
                 ),
                 EnvFileSource::ProjectEnvironment => format!(
                     "Compose references env file '{}', which is not in the repository — created it from \
                      this environment's {} variable(s)",
-                    plan.path,
+                    substituted_values.redact(&plan.path),
                     self.environment_vars.len()
                 ),
             };
