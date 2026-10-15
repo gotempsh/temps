@@ -42,7 +42,13 @@ export function sortTableRows<Row>(
             })
           : Number(aValue) - Number(bValue)
       const directed = direction === 'asc' ? comparison : -comparison
-      return directed || a.index - b.index
+      if (directed !== 0) return directed
+      // Rows that tie keep their incoming order when descending (the default
+      // a column starts in) and the exact reverse when ascending. When every
+      // value in a column is equal (all-zero bounce rates, one view each),
+      // flipping the direction then still visibly reverses the list instead
+      // of looking like the click did nothing.
+      return direction === 'desc' ? a.index - b.index : b.index - a.index
     })
     .map(({ row }) => row)
 }
