@@ -1731,7 +1731,21 @@ async fn run_project_teardown(
     project: crate::services::types::Project,
     audit_context: AuditContext,
 ) -> Result<(), Problem> {
-    state.project_service.begin_project_deletion(id).await?;
+    // Failures are logged here, inside the task: after a client disconnect
+    // nobody awaits this result, so an unlogged error would leave the project
+    // fenced with no trace of why the cleanup stopped.
+    state
+        .project_service
+        .begin_project_deletion(id)
+        .await
+        .map_err(|error| {
+            warn!(
+                project_id = id,
+                %error,
+                "Project deletion did not start; project was not fenced"
+            );
+            Problem::from(error)
+        })?;
 
     // Stop serving anything public for this project now: if cleanup below
     // fails, the project stays fenced but `ProjectDeleted` is never emitted.
@@ -1779,7 +1793,18 @@ async fn run_project_teardown(
     state
         .project_service
         .delete_project(id, &project.name)
-        .await?;
+        .await
+        .map_err(|error| {
+            error!(
+                project_id = id,
+                project_name = %project.name,
+                %error,
+                "Failed to delete project rows; project stays fenced, retry the delete to finish it"
+            );
+            Problem::from(error)
+        })?;
+
+    info!(project_id = id, project_name = %project.name, "Project deleted");
 
     let audit_event = ProjectDeletedAudit {
         context: audit_context,
