@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
 import axe from 'axe-core'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactElement } from 'react'
@@ -108,12 +108,111 @@ const TRACE = {
   })),
 }
 
+const PREFERENCES = {
+  backup_failures_enabled: true,
+  backup_successes_enabled: false,
+  batch_similar_notifications: false,
+  build_errors_enabled: true,
+  deployment_failures_enabled: true,
+  digest_sections: {
+    deployments: true,
+    errors: true,
+    funnels: true,
+    performance: true,
+    projects: true,
+  },
+  digest_send_day: 'monday',
+  digest_send_time: '09:00',
+  dns_changes_enabled: true,
+  domain_expiration_enabled: true,
+  email_enabled: true,
+  error_threshold: 10,
+  error_time_window: 60,
+  load_balancer_issues_enabled: true,
+  minimum_severity: 'warning',
+  retention_policy_violations_enabled: true,
+  route_downtime_enabled: true,
+  runtime_errors_enabled: true,
+  s3_connection_issues_enabled: true,
+  slack_enabled: false,
+  ssl_days_before_expiration: 30,
+  ssl_expiration_enabled: true,
+  weekly_digest_enabled: false,
+}
+
+const APPLICATION = {
+  created_at: '2026-10-12T10:00:00Z',
+  description: null,
+  name: 'Example workspace',
+  projects: [],
+  public_id: 'ws-1',
+  status: 'active',
+  updated_at: '2026-10-12T10:00:00Z',
+}
+
+const NO_PROJECTS = {
+  projects: [],
+  total: 0,
+  page: 1,
+  per_page: 20,
+  total_pages: 0,
+}
+
+const WORKSPACE = {
+  cpu_limit: 2,
+  data_network_service_count: 0,
+  desired_state: 'running',
+  disk_limit_enforced: true,
+  disk_limit_mb: 10240,
+  idle_timeout_secs: 900,
+  memory_limit_mb: 4096,
+  open_preview_ports: [],
+  persistent_volume_healthy: true,
+  pids_limit: 512,
+  runtime: 'default',
+  runtime_update_available: false,
+  state: 'running',
+}
+
+const FEATURES = {
+  backups_local: true,
+  backups_remote: false,
+  deployments_local: true,
+  docker: true,
+  image_builds_local: true,
+  imports: true,
+  kv: true,
+  log_aggregation: true,
+  managed_services: true,
+  persistent_workspaces: true,
+  profile: 'full',
+  sandboxes: true,
+  vulnerability_scanning: false,
+}
+
+/**
+ * Copy of the error states these pages fall back to. A page sitting on one of
+ * these would pass axe while hiding the controls the test exists to check, so
+ * a case must mock the replies that carry it past them -- or say, with
+ * `errorState`, that the error state itself is what is under test.
+ */
+const FAILURE_COPY = [
+  'Failed to load',
+  'Could not load',
+  'could not be loaded',
+  'unavailable',
+]
+
 interface RouteCase {
   name: string
   path: string
   pattern: string
   element: ReactElement
   routes?: Parameters<typeof mockApi>[0]
+  /** Text that must be on screen before axe runs, so the real controls are checked. */
+  ready?: string
+  /** The case renders an error state on purpose. */
+  errorState?: boolean
 }
 
 const CASES: RouteCase[] = [
@@ -128,12 +227,27 @@ const CASES: RouteCase[] = [
     path: '/proxy',
     pattern: '/proxy',
     element: <ProxyMetrics />,
+    routes: {
+      'GET /projects': () => jsonResponse(NO_PROJECTS),
+      'GET /nodes/0/metrics': () => jsonResponse([]),
+    },
+    ready: 'No proxy metrics yet',
   },
   {
     name: '/proxy-logs',
     path: '/proxy-logs',
     pattern: '/proxy-logs',
     element: <ProxyLogs />,
+    routes: {
+      'GET /proxy-logs': () =>
+        jsonResponse({
+          logs: [],
+          page: 1,
+          page_size: 20,
+          total: 0,
+          total_pages: 0,
+        }),
+    },
   },
   {
     name: '/proxy-logs (with rows)',
@@ -211,18 +325,36 @@ const CASES: RouteCase[] = [
     path: '/workspaces',
     pattern: '/workspaces',
     element: <Sandboxes key="workspaces" workspacesOnly />,
+    routes: {
+      'GET /platform/features': () => jsonResponse(FEATURES),
+      'GET /ai/applications': () => jsonResponse([APPLICATION]),
+      'GET /ai/workspace': () => jsonResponse(WORKSPACE),
+      'GET /ai/workspace-activity': () => jsonResponse({ workspaces: [] }),
+      'GET /ai/applications/ws-1/workspace': () => jsonResponse(WORKSPACE),
+    },
+    ready: 'Example workspace',
   },
   {
     name: '/sandboxes',
     path: '/sandboxes',
     pattern: '/sandboxes',
     element: <Sandboxes />,
+    routes: {
+      'GET /platform/features': () => jsonResponse(FEATURES),
+      'GET /v1/sandboxes': () =>
+        jsonResponse({ pagination: { count: 0 }, sandboxes: [] }),
+    },
   },
   {
     name: '/workspaces/:workspaceId',
     path: '/workspaces/ws-1',
     pattern: '/workspaces/:workspaceId',
     element: <WorkspaceDetail />,
+    routes: {
+      'GET /ai/applications/ws-1': () => jsonResponse(APPLICATION),
+      'GET /ai/applications/ws-1/workspace': () => jsonResponse(WORKSPACE),
+    },
+    ready: 'No linked services.',
   },
   {
     name: '/setup/ai',
@@ -231,17 +363,19 @@ const CASES: RouteCase[] = [
     element: <AiOnboarding />,
   },
   {
-    name: '/traces/global/:traceId',
+    name: '/traces/global/:traceId (trace not found)',
     path: '/traces/global/trace-1',
     pattern: '/traces/global/:traceId',
     element: <CrossProjectTraceDetail />,
+    errorState: true,
   },
 ]
 
 async function violationsFor(
   initialPath: string,
   routes: ReactElement,
-  api: Parameters<typeof mockApi>[0] = {}
+  api: Parameters<typeof mockApi>[0] = {},
+  options: { ready?: string; errorState?: boolean } = {}
 ): Promise<string[]> {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, retryOnMount: false } },
@@ -274,12 +408,24 @@ async function violationsFor(
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 60))
   })
+  if (options.ready) {
+    const { ready } = options
+    await waitFor(() => expect(view.container.textContent).toContain(ready))
+  }
+  // A page sitting on its error state would pass axe while hiding the controls.
+  const text = view.container.textContent ?? ''
+  const failed = options.errorState
+    ? []
+    : FAILURE_COPY.filter((copy) => text.includes(copy))
   const result = await axe.run(view.container, AXE_OPTIONS)
   mock.restore()
   client.clear()
-  return result.violations.map(
-    (v) => `${v.id}: ${v.nodes.map((n) => n.html.slice(0, 160)).join(' | ')}`
-  )
+  return [
+    ...failed.map((copy) => `page rendered its error state: "${copy}"`),
+    ...result.violations.map(
+      (v) => `${v.id}: ${v.nodes.map((n) => n.html.slice(0, 160)).join(' | ')}`
+    ),
+  ]
 }
 
 for (const entry of CASES) {
@@ -290,10 +436,22 @@ for (const entry of CASES) {
         <Routes>
           <Route path={entry.pattern} element={entry.element} />
         </Routes>,
-        entry.routes
+        entry.routes,
+        { ready: entry.ready, errorState: entry.errorState }
       )
     ).toEqual([])
   })
+}
+
+/** A control or heading each section only renders after preferences load. */
+const SECTION_READY: Record<
+  (typeof MONITORING_SECTIONS)[number]['id'],
+  string
+> = {
+  alerts: 'Route Monitoring',
+  rules: 'Monitoring & Alerts',
+  alarms: 'Monitoring & Alerts',
+  notifications: 'Weekly Digest',
 }
 
 for (const section of MONITORING_SECTIONS) {
@@ -305,7 +463,13 @@ for (const section of MONITORING_SECTIONS) {
           <Route path="/monitoring" element={<Monitoring />}>
             <Route path=":section" element={<MonitoringSettings />} />
           </Route>
-        </Routes>
+        </Routes>,
+        {
+          'GET /notification-preferences': () => jsonResponse(PREFERENCES),
+          'GET /projects': () => jsonResponse(NO_PROJECTS),
+          'GET /nodes/0/metrics/alert-rules': () => jsonResponse([]),
+        },
+        { ready: SECTION_READY[section.id] }
       )
     ).toEqual([])
   })
