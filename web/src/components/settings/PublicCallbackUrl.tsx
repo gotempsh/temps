@@ -4,6 +4,7 @@
 import { RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePublicIngress } from '@/hooks/usePublicIngress'
 import { cn } from '@/lib/utils'
@@ -76,15 +77,17 @@ export function PublicCallbackUrl({
 
   return (
     <div className={cn('flex min-w-0 items-center gap-2', className)}>
-      <code
-        className={cn(
-          'min-w-0 flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-xs',
-          codeClassName
-        )}
+      <ScrollRegion
+        className="min-w-0 flex-1 rounded bg-muted px-2 py-1"
+        regionLabel={`${prefix ? `${prefix} ` : ''}callback URL, scrollable`}
       >
-        {prefix ? `${prefix} ` : ''}
-        {url}
-      </code>
+        <code
+          className={cn('block w-max whitespace-nowrap text-xs', codeClassName)}
+        >
+          {prefix ? `${prefix} ` : ''}
+          {url}
+        </code>
+      </ScrollRegion>
       <CopyButton value={url} label={label} />
     </div>
   )

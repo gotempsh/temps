@@ -199,6 +199,83 @@ describe('scrollable-region-focusable', () => {
   test('every scrolling <pre> is keyboard focusable', () => {
     expect(scan((_file, src) => scrollingPre(src))).toEqual([])
   })
+
+  // Text-only elements that scroll hold nothing focusable either, so they
+  // need the same treatment as a <pre>. `<code overflow-x-auto>` and
+  // `<HighlightedCode className="overflow-x-auto">` are the shapes that
+  // slipped through; `ScrollRegion` is the fix (it is a tab stop only while
+  // it actually overflows).
+  function scrollingText(src: string): string[] {
+    const found: string[] = []
+    for (const tag of tags(src, 'code|samp|kbd|HighlightedCode|p|span')) {
+      if (!/overflow-(x-|y-)?(auto|scroll)/.test(tag.text)) continue
+      if (/\btabIndex=/.test(tag.text)) continue
+      found.push(
+        `${lineOf(src, tag.index)}: scrolling <${tag.name}> without tabIndex; wrap it in <ScrollRegion>`
+      )
+    }
+    return found
+  }
+
+  test('the scan recognises scrolling inline code without tabIndex', () => {
+    expect(
+      scrollingText('<code className="block overflow-x-auto">ls</code>')
+    ).toHaveLength(1)
+    expect(
+      scrollingText(
+        '<HighlightedCode className="overflow-x-auto" code={c} language="bash" />'
+      )
+    ).toHaveLength(1)
+    expect(
+      scrollingText(
+        '<ScrollRegion><code className="block">ls</code></ScrollRegion>'
+      )
+    ).toHaveLength(0)
+    expect(
+      scrollingText('<code tabIndex={0} className="overflow-x-auto">ls</code>')
+    ).toHaveLength(0)
+  })
+
+  test('no scrolling code, kbd, p or span is left unreachable by keyboard', () => {
+    expect(scan((_file, src) => scrollingText(src))).toEqual([])
+  })
+})
+
+describe('label-title-only', () => {
+  // `title` is not an accessible name for a text field: axe reports
+  // `label-title-only` (serious) because it is only exposed as a tooltip.
+  // A placeholder is not enough either, so a bare Input needs aria-label,
+  // aria-labelledby or a <Label htmlFor>.
+  function titleOnly(src: string): string[] {
+    const found: string[] = []
+    for (const tag of tags(src, 'Input|input|Textarea|textarea')) {
+      if (!/\btitle=/.test(tag.text)) continue
+      if (/\baria-label=|\baria-labelledby=|\{\.\.\./.test(tag.text)) continue
+      if (/\bid=/.test(tag.text)) continue
+      if (/\btype="(hidden|checkbox|radio|submit|button)"/.test(tag.text)) {
+        continue
+      }
+      found.push(
+        `${lineOf(src, tag.index)}: <${tag.name}> is named only by title`
+      )
+    }
+    return found
+  }
+
+  test('the scan recognises a title-only input', () => {
+    expect(
+      titleOnly('<Input value={v} title="Working directory" />')
+    ).toHaveLength(1)
+    expect(
+      titleOnly(
+        '<Input value={v} aria-label="Working directory" title="Working directory" />'
+      )
+    ).toHaveLength(0)
+  })
+
+  test('no text field relies on title alone for its name', () => {
+    expect(scan((_file, src) => titleOnly(src))).toEqual([])
+  })
 })
 
 describe('color-contrast', () => {

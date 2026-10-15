@@ -15,6 +15,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   Table,
   TableBody,
@@ -118,9 +119,14 @@ function TlsStatusCell({
           HTTPS will fail — no cert authorized
         </span>
         <span className="flex items-start justify-between gap-1 rounded-md bg-muted px-1.5 py-1">
-          <code className="overflow-x-auto whitespace-nowrap font-mono text-[11px] leading-relaxed">
-            {requestCommand}
-          </code>
+          <ScrollRegion
+            className="min-w-0"
+            regionLabel="Request-certificate command, scrollable"
+          >
+            <code className="block w-max whitespace-nowrap font-mono text-[11px] leading-relaxed">
+              {requestCommand}
+            </code>
+          </ScrollRegion>
           <CopyButton
             value={requestCommand}
             minimal

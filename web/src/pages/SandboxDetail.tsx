@@ -930,6 +930,7 @@ export default function SandboxDetail() {
                       ref={cmdInputRef}
                       value={cmdInput}
                       placeholder='ls -la  (use "quotes" to group)'
+                      aria-label="Command to run in the sandbox"
                       onChange={(e) => setCmdInput(e.target.value)}
                       onKeyDown={(e) => {
                         if (
@@ -950,6 +951,7 @@ export default function SandboxDetail() {
                       placeholder={sandbox.work_dir}
                       onChange={(e) => setCwdInput(e.target.value)}
                       className="font-mono h-9 w-full sm:w-56 text-base sm:text-xs"
+                      aria-label="Working directory (optional)"
                       title="Working directory (optional)"
                     />
                     <Button
