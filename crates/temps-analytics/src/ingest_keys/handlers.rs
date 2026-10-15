@@ -178,11 +178,15 @@ impl From<AnalyticsIngestKeyError> for Problem {
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
             }
-            AnalyticsIngestKeyError::ExternalUrlUnavailable { .. } => {
+            // The reason is a settings-store error; it stays in the server log
+            // because this route answers roles that cannot read settings.
+            AnalyticsIngestKeyError::ExternalUrlUnavailable { project_id, .. } => {
                 error!("{error}");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("External URL Unavailable")
-                    .with_detail(error.to_string())
+                    .with_detail(format!(
+                        "The external URL for analytics ingest in project {project_id} could not be read"
+                    ))
             }
             AnalyticsIngestKeyError::Database(ref e) => {
                 error!("Analytics ingest key database error: {e}");
@@ -884,6 +888,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_answers_500_without_leaking_the_settings_error_when_the_read_fails() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "settings store unreachable at 10.0.0.9".to_string(),
+                )])
+                .into_connection(),
+        );
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("test ServerConfig should build"),
+        );
+        let state = Arc::new(AnalyticsIngestKeysAppState {
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            project_access_checker: None,
+            config_service: Some(Arc::new(temps_config::ConfigService::new(
+                server_config,
+                db,
+            ))),
+        });
+
+        let err = get_analytics_ingest_key_endpoint(user_auth(Role::User), State(state), Path(7))
+            .await
+            .err()
+            .expect("a failed settings read must not be reported as 'no external URL'");
+
+        assert_eq!(err.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let rendered = serde_json::to_string(&err.body).expect("problem body should serialize");
+        assert!(
+            rendered.contains("project 7"),
+            "the detail should name the project: {rendered}"
+        );
+        assert!(
+            !rendered.contains("10.0.0.9") && !rendered.contains("unreachable"),
+            "the settings error must stay in the server log: {rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn endpoint_rejects_a_role_without_analytics_read() {
         assert!(!Role::MetricsIngest.has_permission(&Permission::AnalyticsRead));
 
@@ -1304,6 +1354,13 @@ mod tests {
                 AnalyticsIngestKeyError::MalformedAllowedOrigins {
                     key_id: 4,
                     reason: "not an array".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                AnalyticsIngestKeyError::ExternalUrlUnavailable {
+                    project_id: 2,
+                    reason: "settings store unreachable".into(),
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
