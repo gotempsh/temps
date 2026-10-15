@@ -6,18 +6,30 @@
 //! Scans the deployed application for security vulnerabilities using Trivy.
 //! This job runs after deployment is complete to identify any known vulnerabilities
 //! in the application dependencies and container images.
+//!
+//! An image built on a worker node is scanned on that node, through the agent
+//! that already holds it: the control plane neither copies the image nor runs
+//! the scanner. A node that cannot scan (an agent that predates the endpoint)
+//! falls back to copying the image and scanning it here, as before. A scan
+//! that cannot run at all fails its own scan record and never the deployment.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployer::ImageBuilder;
 use temps_logs::{LogLevel, LogService};
 use temps_vulnerability_scanner::{
-    scanner::VulnerabilityScanner, service::VulnerabilityScanService, trivy::TrivyScanner,
+    node_report::result_from_report,
+    scanner::{ScanResult, ScannerError, VulnerabilityScanner},
+    service::VulnerabilityScanService,
+    trivy::TrivyScanner,
 };
 use tracing::{debug, error, info, warn};
 
+use crate::jobs::builder_node::{image_builder_for_build, BuilderNodeResolver};
 use crate::jobs::ImageOutput;
 
 /// Output from ScanVulnerabilitiesJob
@@ -49,6 +61,12 @@ pub struct ScanVulnerabilitiesJob {
     /// `ScannerError::DockerUnavailable` at scan time if this process was
     /// started with `--profile control-plane` (no local daemon).
     docker_handle: Arc<DockerHandle>,
+    /// This process's own image store, used to copy a node-built image over
+    /// when its node cannot scan it.
+    image_builder: Option<Arc<dyn ImageBuilder>>,
+    /// Reaches the node that built an image. Without it a node-built image
+    /// can only be scanned from a copy in the local image store.
+    builder_node_resolver: Option<Arc<dyn BuilderNodeResolver>>,
 }
 
 impl std::fmt::Debug for ScanVulnerabilitiesJob {
@@ -92,7 +110,50 @@ impl ScanVulnerabilitiesJob {
             log_id: None,
             log_service: None,
             docker_handle,
+            image_builder: None,
+            builder_node_resolver: None,
         }
+    }
+
+    pub fn with_image_builder(mut self, image_builder: Arc<dyn ImageBuilder>) -> Self {
+        self.image_builder = Some(image_builder);
+        self
+    }
+
+    pub fn with_builder_node_resolver(mut self, resolver: Arc<dyn BuilderNodeResolver>) -> Self {
+        self.builder_node_resolver = Some(resolver);
+        self
+    }
+
+    /// The scanner for `image_output`: the build node's, when a node built
+    /// the image and this job can reach it; this process's own otherwise.
+    async fn scanner_for(
+        &self,
+        context: &WorkflowContext,
+        image_output: &ImageOutput,
+    ) -> Result<(Arc<dyn VulnerabilityScanner>, Option<i32>), WorkflowError> {
+        let local: Arc<dyn VulnerabilityScanner> =
+            Arc::new(TrivyScanner::new(self.docker_handle.clone()));
+        let (Some(image_builder), Some(resolver)) = (
+            self.image_builder.as_ref(),
+            self.builder_node_resolver.as_ref(),
+        ) else {
+            return Ok((local, None));
+        };
+        let (builder, node_id) =
+            image_builder_for_build(context, &self.build_job_id, image_builder, Some(resolver))
+                .await?;
+        let Some(node_id) = node_id else {
+            return Ok((local, None));
+        };
+        let scanner = NodeImageScanner {
+            node: builder,
+            node_id,
+            expected_image_id: image_output.expected_image_id().map(str::to_string),
+            local,
+            local_builder: image_builder.clone(),
+        };
+        Ok((Arc::new(scanner), Some(node_id)))
     }
 
     pub fn with_log_id(mut self, log_id: String) -> Self {
@@ -139,6 +200,89 @@ impl ScanVulnerabilitiesJob {
     }
 }
 
+/// Scans an image through the node that built it.
+///
+/// `scan_image` asks the node's agent, which runs the scanner against the
+/// image it holds and returns the findings. Only when the agent cannot scan
+/// does the image come to this process (once, identity-checked) to be scanned
+/// by `local`.
+struct NodeImageScanner {
+    node: Arc<dyn ImageBuilder>,
+    node_id: i32,
+    /// The id recorded when the image was built; the node refuses a tag that
+    /// now names something else.
+    expected_image_id: Option<String>,
+    local: Arc<dyn VulnerabilityScanner>,
+    local_builder: Arc<dyn ImageBuilder>,
+}
+
+#[async_trait]
+impl VulnerabilityScanner for NodeImageScanner {
+    fn name(&self) -> &str {
+        "trivy"
+    }
+
+    /// The node reports its scanner's version with the findings; asking for
+    /// it here would start a scanner container on the control plane.
+    async fn version(&self) -> Result<Option<String>, ScannerError> {
+        Ok(None)
+    }
+
+    async fn scan_path(&self, path: &Path) -> Result<ScanResult, ScannerError> {
+        self.local.scan_path(path).await
+    }
+
+    async fn scan_image(&self, image_name: &str) -> Result<ScanResult, ScannerError> {
+        match self
+            .node
+            .scan_image_vulnerabilities(image_name, self.expected_image_id.as_deref())
+            .await
+        {
+            Ok(Some(report)) => Ok(result_from_report(report)),
+            Ok(None) => self.scan_copy_locally(image_name).await,
+            Err(error) => Err(ScannerError::Execution(format!(
+                "Scan of '{image_name}' on build node {} failed: {error}",
+                self.node_id
+            ))),
+        }
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+impl NodeImageScanner {
+    /// The node's agent cannot scan: bring the image here and scan it.
+    async fn scan_copy_locally(&self, image_name: &str) -> Result<ScanResult, ScannerError> {
+        let node_name = format!("node {}", self.node_id);
+        match super::node_image::copy_node_built_image(
+            self.node.as_ref(),
+            &node_name,
+            self.local_builder.as_ref(),
+            image_name,
+            self.expected_image_id.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                let reason = match &error {
+                    WorkflowError::JobExecutionFailed(message) => message.clone(),
+                    other => other.to_string(),
+                };
+                return Err(ScannerError::Execution(format!(
+                    "Build node {} cannot scan '{image_name}' itself (its agent predates \
+                     image scans) and the image could not be copied to this control plane \
+                     to scan it here: {reason}",
+                    self.node_id
+                )));
+            }
+        }
+        self.local.scan_image(image_name).await
+    }
+}
+
 #[async_trait]
 impl WorkflowTask for ScanVulnerabilitiesJob {
     fn job_id(&self) -> &str {
@@ -169,25 +313,33 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
         self.log(format!("Scanning Docker image: {}", image_tag))
             .await?;
 
-        // Construct the Trivy scanner. This never fails at construction time
-        // -- it holds the process-wide `DockerHandle` and resolves it lazily,
-        // so a control-plane process (no local Docker daemon) surfaces a
-        // typed `ScannerError::DockerUnavailable` from the scan calls below
-        // instead of failing here with a generic message.
-        let scanner = Arc::new(TrivyScanner::new(self.docker_handle.clone()));
+        // Pick the scanner. For an image built on a worker node this is the
+        // node's own: nothing is copied and no scanner runs on the control
+        // plane. Otherwise a `TrivyScanner` is built from the process-wide
+        // `DockerHandle`, which never fails at construction -- a
+        // control-plane process (no local Docker daemon) surfaces a typed
+        // `ScannerError::DockerUnavailable` from the scan call instead.
+        let (scanner, scanned_on_node) = self.scanner_for(&context, &image_output).await?;
 
-        // Check scanner version
-        match scanner.version().await {
-            Ok(Some(version)) => {
-                self.log(format!("Using Trivy version: {}", version))
-                    .await?;
-                debug!("Trivy version: {}", version);
-            }
-            Ok(None) => {
-                warn!("Could not determine Trivy version");
-            }
-            Err(e) => {
-                warn!("Failed to get Trivy version: {}", e);
+        if let Some(node_id) = scanned_on_node {
+            self.log(format!(
+                "Scanning on build node {node_id}; the image is not copied to the control plane"
+            ))
+            .await?;
+        } else {
+            // Check scanner version
+            match scanner.version().await {
+                Ok(Some(version)) => {
+                    self.log(format!("Using Trivy version: {}", version))
+                        .await?;
+                    debug!("Trivy version: {}", version);
+                }
+                Ok(None) => {
+                    warn!("Could not determine Trivy version");
+                }
+                Err(e) => {
+                    warn!("Failed to get Trivy version: {}", e);
+                }
             }
         }
 
@@ -291,5 +443,283 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
         updated_context.set_output(&self.job_id, "high_count", scan_result.high_count)?;
 
         Ok(JobResult::success(updated_context))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::node_image::fake::FakeImageStore;
+    use std::sync::Mutex;
+    use temps_deployer::image_scan::{ImageScanFinding, ImageScanReport};
+    use temps_deployer::{
+        BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ImageImportStream,
+        ImageInfo,
+    };
+
+    /// A build node: an image store plus a scripted answer to a scan request.
+    struct ScanningNode {
+        store: FakeImageStore,
+        answer: Mutex<Option<Result<Option<ImageScanReport>, String>>>,
+        requests: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl ScanningNode {
+        fn new(
+            store: FakeImageStore,
+            answer: Result<Option<ImageScanReport>, String>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                store,
+                answer: Mutex::new(Some(answer)),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ImageBuilder for ScanningNode {
+        async fn build_image(&self, _: BuildRequest) -> Result<BuildResult, BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn build_image_with_callback(
+            &self,
+            _: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn import_image(
+            &self,
+            _: std::path::PathBuf,
+            _: &str,
+        ) -> Result<String, BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn import_image_stream(
+            &self,
+            stream: ImageImportStream,
+            tag: &str,
+        ) -> Result<String, BuilderError> {
+            self.store.import_image_stream(stream, tag).await
+        }
+        async fn export_image_stream(
+            &self,
+            image_name: &str,
+        ) -> Result<ImageImportStream, BuilderError> {
+            self.store.export_image_stream(image_name).await
+        }
+        async fn save_image(&self, _: &str, _: &Path) -> Result<(), BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn extract_from_image(&self, _: &str, _: &str, _: &Path) -> Result<(), BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn remove_image(&self, _: &str) -> Result<(), BuilderError> {
+            unimplemented!("not used")
+        }
+        async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError> {
+            self.store.inspect_image(image_name).await
+        }
+        async fn scan_image_vulnerabilities(
+            &self,
+            image_name: &str,
+            expected_image_id: Option<&str>,
+        ) -> Result<Option<ImageScanReport>, BuilderError> {
+            self.requests.lock().unwrap().push((
+                image_name.to_string(),
+                expected_image_id.map(str::to_string),
+            ));
+            match self.answer.lock().unwrap().take() {
+                Some(Ok(report)) => Ok(report),
+                Some(Err(message)) => Err(BuilderError::Other(message)),
+                None => panic!("scan requested twice"),
+            }
+        }
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".to_string()
+        }
+    }
+
+    /// The control plane's own scanner; records what it is asked to scan.
+    #[derive(Default)]
+    struct RecordingScanner {
+        scanned: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl VulnerabilityScanner for RecordingScanner {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn version(&self) -> Result<Option<String>, ScannerError> {
+            panic!("a node scan must not start a scanner on the control plane")
+        }
+        async fn scan_path(&self, _: &Path) -> Result<ScanResult, ScannerError> {
+            unimplemented!("not used")
+        }
+        async fn scan_image(&self, image_name: &str) -> Result<ScanResult, ScannerError> {
+            self.scanned.lock().unwrap().push(image_name.to_string());
+            Ok(ScanResult::new("trivy".to_string(), None))
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn report(findings: usize) -> ImageScanReport {
+        ImageScanReport {
+            image_id: "sha256:built".to_string(),
+            scanner: "trivy".to_string(),
+            scanner_version: Some("0.58.1".to_string()),
+            findings: (0..findings)
+                .map(|index| ImageScanFinding {
+                    vulnerability_id: format!("CVE-2000-{index:04}"),
+                    package_name: "libexample".to_string(),
+                    installed_version: "1.0.0".to_string(),
+                    fixed_version: None,
+                    severity: if index == 0 { "CRITICAL" } else { "LOW" }.to_string(),
+                    title: "synthetic finding".to_string(),
+                    description: None,
+                    references: Vec::new(),
+                    cvss_score: None,
+                    primary_url: None,
+                    published_date: None,
+                    last_modified_date: None,
+                    class: None,
+                    vuln_type: None,
+                    target: None,
+                })
+                .collect(),
+        }
+    }
+
+    struct Fixture {
+        scanner: NodeImageScanner,
+        node: Arc<ScanningNode>,
+        local_store: Arc<FakeImageStore>,
+        local_scanner: Arc<RecordingScanner>,
+    }
+
+    fn fixture(node: Arc<ScanningNode>) -> Fixture {
+        let local_store = Arc::new(FakeImageStore::default());
+        let local_scanner = Arc::new(RecordingScanner::default());
+        Fixture {
+            scanner: NodeImageScanner {
+                node: node.clone(),
+                node_id: 7,
+                expected_image_id: Some("sha256:built".to_string()),
+                local: local_scanner.clone(),
+                local_builder: local_store.clone(),
+            },
+            node,
+            local_store,
+            local_scanner,
+        }
+    }
+
+    /// The scan runs on the node: its findings come back, the image never
+    /// reaches this process, and no scanner starts here.
+    #[tokio::test]
+    async fn node_findings_are_used_without_copying_or_scanning_locally() {
+        let node = ScanningNode::new(
+            FakeImageStore::holding("app:1", "sha256:built"),
+            Ok(Some(report(3))),
+        );
+        let fixture = fixture(node);
+
+        let result = fixture.scanner.scan_image("app:1").await.unwrap();
+
+        assert_eq!(result.total_count, 3);
+        assert_eq!(result.critical_count, 1);
+        assert_eq!(result.low_count, 2);
+        assert_eq!(result.scanner_version.as_deref(), Some("0.58.1"));
+        assert_eq!(
+            *fixture.node.requests.lock().unwrap(),
+            vec![("app:1".to_string(), Some("sha256:built".to_string()))],
+            "the node must be told which image id the findings must describe"
+        );
+        assert!(fixture.local_store.images.lock().unwrap().is_empty());
+        assert!(fixture.local_scanner.scanned.lock().unwrap().is_empty());
+    }
+
+    /// A clean image is a successful scan with no findings.
+    #[tokio::test]
+    async fn node_report_without_findings_is_a_completed_scan() {
+        let node = ScanningNode::new(FakeImageStore::default(), Ok(Some(report(0))));
+        let result = fixture(node).scanner.scan_image("app:1").await.unwrap();
+        assert_eq!(result.total_count, 0);
+    }
+
+    /// An agent that predates the endpoint: the image is copied once,
+    /// identity-checked, and scanned by this process's scanner.
+    #[tokio::test]
+    async fn node_that_cannot_scan_falls_back_to_a_verified_local_copy() {
+        let node = ScanningNode::new(FakeImageStore::holding("app:1", "sha256:built"), Ok(None));
+        let fixture = fixture(node);
+
+        fixture.scanner.scan_image("app:1").await.unwrap();
+
+        assert_eq!(
+            fixture.local_store.images.lock().unwrap().get("app:1"),
+            Some(&"sha256:built".to_string())
+        );
+        assert_eq!(
+            *fixture.local_scanner.scanned.lock().unwrap(),
+            vec!["app:1".to_string()]
+        );
+    }
+
+    /// The fallback cannot run (no copy to scan): the scan fails with a
+    /// message that names the node and the reason -- never a silent pass.
+    #[tokio::test]
+    async fn fallback_that_cannot_copy_the_image_fails_the_scan_with_the_reason() {
+        let node = ScanningNode::new(FakeImageStore::default(), Ok(None));
+        let fixture = fixture(node);
+
+        let error = fixture
+            .scanner
+            .scan_image("app:1")
+            .await
+            .expect_err("nothing to scan");
+        let message = error.to_string();
+
+        assert!(message.contains("Build node 7"), "{message}");
+        assert!(message.contains("predates image scans"), "{message}");
+        assert!(fixture.local_scanner.scanned.lock().unwrap().is_empty());
+    }
+
+    /// A scan that was attempted and failed is reported as failed. Copying
+    /// the image over and scanning again would double the work and hide why.
+    #[tokio::test]
+    async fn failed_node_scan_is_reported_not_retried_locally() {
+        let node = ScanningNode::new(
+            FakeImageStore::holding("app:1", "sha256:built"),
+            Err("trivy image pull failed".to_string()),
+        );
+        let fixture = fixture(node);
+
+        let error = fixture
+            .scanner
+            .scan_image("app:1")
+            .await
+            .expect_err("node scan failed");
+        let message = error.to_string();
+
+        assert!(message.contains("build node 7"), "{message}");
+        assert!(message.contains("trivy image pull failed"), "{message}");
+        assert!(fixture.local_store.images.lock().unwrap().is_empty());
+        assert!(fixture.local_scanner.scanned.lock().unwrap().is_empty());
+    }
+
+    /// The version comes with the node's findings; asking for it would start
+    /// a scanner container on the control plane.
+    #[tokio::test]
+    async fn node_scanner_does_not_query_a_local_version() {
+        let node = ScanningNode::new(FakeImageStore::default(), Ok(None));
+        let fixture = fixture(node);
+        assert_eq!(fixture.scanner.version().await.unwrap(), None);
     }
 }

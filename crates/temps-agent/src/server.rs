@@ -154,6 +154,7 @@ pub fn build_router(
             "/agent/images/extract",
             get(crate::build_handler::extract_image_path),
         )
+        .route("/agent/images/scan", post(crate::build_handler::scan_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))
         // Service management routes

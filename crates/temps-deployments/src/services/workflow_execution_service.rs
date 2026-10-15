@@ -2138,7 +2138,12 @@ impl WorkflowExecutionService {
                     self.docker_handle.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
+                .with_log_service(self.log_service.clone())
+                .with_image_builder(self.image_builder.clone());
+                let job = match self.builder_node_resolver() {
+                    Some(resolver) => job.with_builder_node_resolver(resolver),
+                    None => job,
+                };
 
                 Ok(Arc::new(job))
             }
@@ -5107,6 +5112,7 @@ mod tests {
                 tags: vec!["mock-image:latest".to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 

@@ -6599,6 +6599,7 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 

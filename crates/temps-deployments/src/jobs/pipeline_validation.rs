@@ -77,6 +77,7 @@ impl ImageBuilder for MockImageBuilder {
             tags: vec![image_name.to_string()],
             created: Some("2025-01-01T00:00:00Z".to_string()),
             working_dir: Some("/app".to_string()),
+            config: None,
         })
     }
 
