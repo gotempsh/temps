@@ -4,6 +4,7 @@
 pub mod docker;
 pub mod firecracker;
 pub mod git_credential_bundle;
+pub mod guest_agent_build;
 pub mod local;
 pub mod managed;
 pub mod microsandbox;

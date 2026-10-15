@@ -243,6 +243,11 @@ fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::p
             firecracker.agent_bin(),
         ),
     ];
+    // The copy that is checked for being outdated is the one beside the
+    // executable when there is one (the sync above made the staged copy
+    // identical to it, and it is the one `temps upgrade` replaces), else the
+    // staged copy itself. Each file is reported once.
+    let mut checked = std::collections::HashSet::new();
     for (backend, state_dir, name, staged) in targets {
         if !state_dir.is_dir() {
             continue;
@@ -255,6 +260,9 @@ fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::p
                 name,
                 source.display()
             );
+            if staged.is_file() && checked.insert(staged.clone()) {
+                warn_if_agent_outdated(backend, name, &staged);
+            }
             continue;
         }
         match sync_pty_agent_binary(&source, &staged) {
@@ -275,6 +283,63 @@ fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::p
                 tracing::warn!(backend, "could not refresh the staged {}: {}", name, error)
             }
         }
+        if checked.insert(source.clone()) {
+            warn_if_agent_outdated(backend, name, &source);
+        }
+    }
+}
+
+/// Warn when the guest agent at `path` was built from a different commit than
+/// this `temps`, which is how a host ends up pairing a new server with an
+/// agent that was never replaced (a manual install, a console update that does
+/// not carry the agent, an installer from before agents were shipped).
+fn warn_if_agent_outdated(backend: &str, name: &str, path: &std::path::Path) {
+    use crate::sandbox::guest_agent_build::{
+        classify, host_build, read_agent_build, AgentBuildStatus,
+    };
+
+    let host = host_build();
+    let recorded = match read_agent_build(path) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(
+                backend,
+                agent = name,
+                path = %path.display(),
+                "could not read the build of {}: {}",
+                name,
+                error
+            );
+            return;
+        }
+    };
+    match classify(recorded.as_deref(), host) {
+        AgentBuildStatus::Current => tracing::debug!(
+            backend,
+            agent = name,
+            build = host,
+            "{} matches this temps build",
+            name
+        ),
+        AgentBuildStatus::Unknown => tracing::debug!(
+            backend,
+            agent = name,
+            path = %path.display(),
+            "cannot compare the build of {} with this temps (no commit information)",
+            name
+        ),
+        AgentBuildStatus::Outdated { agent, host } => tracing::warn!(
+            backend,
+            agent = name,
+            path = %path.display(),
+            agent_build = agent.as_deref().unwrap_or("predates build ids"),
+            host_build = %host,
+            "{} was built from a different commit than this temps; sandboxes may misbehave \
+             until it is replaced. Install the {} that ships with this release \
+             (`temps upgrade`, or the release archive), then restart temps",
+            name,
+            name
+        ),
     }
 }
 
