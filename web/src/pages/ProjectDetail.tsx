@@ -98,7 +98,6 @@ import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import {
-  Navigate,
   Route,
   Routes,
   useNavigate,
@@ -777,9 +776,8 @@ export function ProjectDetail() {
               <Route
                 path="git/change-repository"
                 element={
-                  <Navigate
+                  <RedirectWithQuery
                     to={`/projects/${project.slug}/connect-repository`}
-                    replace
                   />
                 }
               />
@@ -812,9 +810,8 @@ export function ProjectDetail() {
               <Route
                 path="databases"
                 element={
-                  <Navigate
+                  <RedirectWithQuery
                     to={legacyDatabasesRedirectPath(project.slug)}
-                    replace
                   />
                 }
               />
