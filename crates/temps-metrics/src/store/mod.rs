@@ -38,9 +38,11 @@ pub fn is_monotonic_counter(metric_name: &str) -> bool {
 ///
 /// They are not caught by [`is_monotonic_counter`] on purpose — that flag means
 /// "raw cumulative value, LAG-difference me" and these are already deltas.
-/// The store does not persist [`MetricKind`], so the read path identifies them
-/// by name. The proxy sampler's `is_counter` samples are checked against this
-/// list by a test in `temps-proxy` so the two cannot drift apart.
+/// TimescaleDB does not persist [`MetricKind`]. ClickHouse does, but
+/// [`MetricKind::Counter`] alone cannot distinguish cumulative counters from
+/// interval deltas, so both read paths identify these metrics by name.
+/// The proxy sampler's `is_counter` samples are checked against this list by
+/// a test in `temps-proxy` so the two cannot drift apart.
 pub const DELTA_COUNTER_METRICS: &[&str] = &[
     "proxy.requests",
     "proxy.requests_1xx",
