@@ -2276,10 +2276,11 @@ impl SandboxService {
                     self.remove_work_dir(&public_id_value).await;
                 }
                 self.mark_destroyed(row.id).await.ok();
-                if e.image_pull_failure().is_some() {
-                    // The image could not be pulled: report which image and
-                    // why, so the caller can tell a missing tag from a
-                    // sandbox runtime fault.
+                if e.image_pull_failure().is_some() || e.network_pool_exhaustion().is_some() {
+                    // The image could not be pulled, or the host has no
+                    // address space left for the sandbox's network: report
+                    // which, so the caller can tell a missing tag or a full
+                    // host from a sandbox runtime fault.
                     return Err(from_agent_error(&public_id_value, e));
                 }
                 return Err(SandboxError::CreateFailed {

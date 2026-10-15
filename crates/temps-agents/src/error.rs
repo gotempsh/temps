@@ -240,7 +240,57 @@ pub fn image_pull_failure_reason(image: &str, cause: &str) -> String {
     format!("{IMAGE_PULL_REASON_PREFIX}{image}: {cause}")
 }
 
+/// Substrings (lower case) that identify Docker having no subnet left to hand
+/// to a new network. The first is the daemon's message when every
+/// `default-address-pools` range is carved up; the second is the same
+/// condition on older engines; the third is our own reworded message.
+const NETWORK_POOL_EXHAUSTED_MARKERS: [&str; 3] = [
+    "all predefined address pools have been fully subnetted",
+    "could not find an available, non-overlapping ipv4 address pool",
+    // What `network_pool_exhausted_reason` itself says, so the reworded
+    // message is still recognised once the daemon's text is not in it.
+    "docker has no free address pool left",
+];
+
+/// Whether `message` is the Docker daemon refusing to create a network
+/// because its address pools are exhausted.
+///
+/// The error also crosses the worker-node HTTP boundary as a string, so it
+/// is recognised by its text in one place, like the image pull failure.
+pub fn is_network_pool_exhausted(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    NETWORK_POOL_EXHAUSTED_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Build the reason for a sandbox whose isolated network could not be created
+/// because Docker has no free address pool left. `cause` is the daemon's own
+/// message. States what to do about it: the operator can widen the pools or
+/// remove sandboxes they no longer use.
+pub fn network_pool_exhausted_reason(sandbox: &str, cause: &str) -> String {
+    format!(
+        "Docker has no free address pool left for the isolated network of sandbox '{sandbox}' \
+         ({cause}). Delete sandboxes that are no longer needed to release their networks, or \
+         raise `default-address-pools` in the Docker daemon configuration (daemon.json, for \
+         example a larger `base` range with a `size` of 24) and restart Docker."
+    )
+}
+
 impl AgentError {
+    /// The reason, when this error is the Docker daemon running out of
+    /// address pools for the per-sandbox network. Callers answer it with a
+    /// capacity error instead of a server fault.
+    pub fn network_pool_exhaustion(&self) -> Option<&str> {
+        match self {
+            AgentError::SandboxProviderUnavailable { reason, .. }
+            | AgentError::SandboxCreationFailed { reason, .. } => {
+                is_network_pool_exhausted(reason).then_some(reason.as_str())
+            }
+            _ => None,
+        }
+    }
+
     /// A terminal request to the guest of `sandbox_id` that did not finish
     /// within `timeout`; `operation` says which step ("agent handshake on
     /// vsock port 5000", "agent bootstrap", …).
@@ -347,5 +397,47 @@ mod image_pull_tests {
             reason: "Failed to pull image a:1: boom".into(),
         };
         assert_eq!(error.image_pull_failure(), None);
+    }
+
+    #[test]
+    fn docker_address_pool_exhaustion_is_recognised() {
+        assert!(is_network_pool_exhausted(
+            "Docker responded with status code 400: all predefined address pools have been fully subnetted"
+        ));
+        assert!(is_network_pool_exhausted(
+            "Could not find an available, non-overlapping IPv4 address pool among the defaults to assign to the network"
+        ));
+        assert!(!is_network_pool_exhausted(
+            "network temps-sandbox-x already exists"
+        ));
+    }
+
+    #[test]
+    fn pool_exhaustion_reason_names_sandbox_cause_and_remedy() {
+        let reason = network_pool_exhausted_reason("temps-sandbox-abc", "pools fully subnetted");
+        assert!(reason.contains("temps-sandbox-abc"), "{reason}");
+        assert!(reason.contains("pools fully subnetted"), "{reason}");
+        assert!(reason.contains("default-address-pools"), "{reason}");
+        assert!(reason.contains("Delete sandboxes"), "{reason}");
+        let error = AgentError::SandboxProviderUnavailable {
+            provider: "docker".into(),
+            reason,
+        };
+        assert_eq!(
+            error
+                .network_pool_exhaustion()
+                .map(|r| r.contains("temps-sandbox-abc")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unrelated_errors_are_not_pool_exhaustion() {
+        let error = creation_failed("create container: no such image".into());
+        assert_eq!(error.network_pool_exhaustion(), None);
+        assert_eq!(
+            AgentError::RunNotFound { run_id: 1 }.network_pool_exhaustion(),
+            None
+        );
     }
 }

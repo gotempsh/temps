@@ -45,9 +45,10 @@ use temps_agents::sandbox::remote::{
     is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteCreateRequest,
     RemoteDestroyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest, RemoteExecResponse,
     RemoteFileContents, RemoteHandleRequest, RemoteKillRequest, RemoteOkResponse,
-    RemoteReadFileRequest, RemoteRecoverRequest, RemoteStatusResponse, RemoteWriteDirectoryRequest,
-    RemoteWriteFileRequest, EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX,
-    WORKER_EXEC_OUTPUT_LIMIT, WORKER_READ_FILE_MAX_BYTES,
+    RemoteReadFileRequest, RemoteRecoverRequest, RemoteReleaseOrphanedRequest,
+    RemoteStatusResponse, RemoteWriteDirectoryRequest, RemoteWriteFileRequest,
+    EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX, WORKER_EXEC_OUTPUT_LIMIT,
+    WORKER_READ_FILE_MAX_BYTES,
 };
 use temps_agents::sandbox::{
     ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxHandle, SandboxProvider,
@@ -1365,6 +1366,7 @@ pub async fn kill_sandbox_processes(
         (status = 200, description = "Destroyed (or already gone)", body = RemoteOkResponse),
         (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "The sandbox is being created or released right now, or its container reappeared; retry", body = RemoteErrorBody),
         (status = 500, description = "Destroy failed", body = RemoteErrorBody),
         (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
     ),
@@ -1377,12 +1379,25 @@ pub async fn destroy_sandbox(
     let host = host(&state)?;
     let label = label_of(&req.handle).map(str::to_string);
     // Already gone is fine: destroy is idempotent, and the work dir below is
-    // still cleaned up.
-    if let Some(handle) = resolve_handle(host, req.handle).await? {
-        host.provider
-            .destroy(&handle, req.purge_volumes)
-            .await
-            .map_err(provider_err)?;
+    // still cleaned up. With no container there is nothing for the provider's
+    // destroy to act on, but the sandbox's network and egress proxy may have
+    // outlived it (a crashed create, a reaper that removed only the
+    // container), so those are released here instead of leaking.
+    match resolve_handle(host, req.handle).await? {
+        Some(handle) => {
+            host.provider
+                .destroy(&handle, req.purge_volumes)
+                .await
+                .map_err(provider_err)?;
+        }
+        None => {
+            if let Some(label) = label.as_deref().filter(|l| is_valid_sandbox_label(l)) {
+                host.provider
+                    .release_orphaned_resources(label)
+                    .await
+                    .map_err(provider_err)?;
+            }
+        }
     }
     if let Some(label) = label.as_deref() {
         remove_work_dir(&work_dir_for(&state, label)).await;
@@ -1501,6 +1516,76 @@ pub async fn recover_sandbox(
         .await
         .map_err(provider_err)?;
     Ok(Json(handle))
+}
+
+/// `POST /agent/sandboxes/release-orphaned` — release the isolated network and
+/// egress proxy a sandbox left behind after its container was removed.
+///
+/// The control plane calls this when it destroys a sandbox whose container no
+/// longer exists, so the regular destroy never ran. Refuses a sandbox whose
+/// container is still there: tearing its network down would cut it off.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/release-orphaned",
+    request_body = RemoteReleaseOrphanedRequest,
+    responses(
+        (status = 200, description = "Nothing is left behind for this sandbox", body = RemoteOkResponse),
+        (status = 400, description = "Invalid sandbox label, or not a sandbox", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 409, description = "The sandbox's container still exists", body = RemoteErrorBody),
+        (status = 500, description = "Release failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn release_orphaned_sandbox_resources(
+    State(state): HostState,
+    Json(req): Json<RemoteReleaseOrphanedRequest>,
+) -> ApiResult<RemoteOkResponse> {
+    let host = host(&state)?;
+    if !is_valid_sandbox_label(&req.container_name) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid sandbox name '{}'", req.container_name),
+        ));
+    }
+    let container_name = format!("{}{}", SANDBOX_CONTAINER_PREFIX, req.container_name);
+    match host.containers.find(&container_name).await {
+        Ok(NamedContainer::Missing) => {}
+        Ok(NamedContainer::Sandbox { .. }) => {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "sandbox '{}' still has a container on this node; destroy it instead of releasing its leftovers",
+                    req.container_name
+                ),
+            ));
+        }
+        Ok(NamedContainer::Other) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "container '{}' on this node is not a sandbox (no {} label)",
+                    container_name, SANDBOX_CONTAINER_LABEL
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the Docker daemon on this node failed while releasing leftovers of sandbox '{}': {}",
+                    req.container_name, e
+                ),
+            ));
+        }
+    }
+    host.provider
+        .release_orphaned_resources(&req.container_name)
+        .await
+        .map_err(provider_err)?;
+    Ok(ok())
 }
 
 /// `POST /agent/sandboxes/status` — whether this node can run sandboxes.
@@ -1646,6 +1731,8 @@ mod tests {
     struct FakeProvider {
         seen_ids: Mutex<Vec<String>>,
         destroyed: Mutex<Vec<(String, bool)>>,
+        /// Labels `release_orphaned_resources` was asked to release.
+        released: Mutex<Vec<String>>,
         /// Files `write_directory` found in the staging dir, by relative path.
         uploaded: Mutex<Vec<(String, Vec<u8>)>>,
         read_limits: Mutex<Vec<u64>>,
@@ -1808,6 +1895,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((handle.sandbox_name.clone(), purge));
+            Ok(())
+        }
+        async fn release_orphaned_resources(&self, label: &str) -> Result<(), AgentError> {
+            self.released.lock().unwrap().push(label.to_string());
             Ok(())
         }
         async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
@@ -2060,6 +2151,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn releasing_leftovers_only_touches_sandboxes_without_a_container() {
+        let n = node_with(
+            FakeProvider::default(),
+            vec![("temps-sandbox-foreign", NamedContainer::Other)],
+        );
+        let request = |label: &str| {
+            Json(RemoteReleaseOrphanedRequest {
+                container_name: label.into(),
+            })
+        };
+
+        // No container: the network and proxy are released, by bare label.
+        let Json(released) =
+            release_orphaned_sandbox_resources(State(n.state.clone()), request("gone"))
+                .await
+                .unwrap();
+        assert!(released.ok);
+        assert_eq!(*n.provider.released.lock().unwrap(), vec!["gone"]);
+
+        // A live sandbox must not lose its network, a foreign container is
+        // not ours to touch, and an unsafe label never reaches Docker.
+        for (label, expected) in [
+            ("abc", StatusCode::CONFLICT),
+            ("foreign", StatusCode::BAD_REQUEST),
+            ("../etc", StatusCode::BAD_REQUEST),
+            ("egress-proxy-v2-x", StatusCode::BAD_REQUEST),
+        ] {
+            let (status, _) =
+                release_orphaned_sandbox_resources(State(n.state.clone()), request(label))
+                    .await
+                    .unwrap_err();
+            assert_eq!(status, expected, "{label}");
+        }
+        assert_eq!(*n.provider.released.lock().unwrap(), vec!["gone"]);
+    }
+
+    #[tokio::test]
     async fn destroy_is_idempotent_and_removes_the_work_dir() {
         let n = node();
         let dir = n.state.work_root.join("gone");
@@ -2074,8 +2202,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!dir.exists());
-        // The container was already gone, so the provider was never asked.
+        // The container was already gone, so the provider was never asked to
+        // destroy it, but its network and proxy leftovers were released.
         assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+        assert!(n.provider.destroyed.lock().unwrap().is_empty());
+        assert_eq!(*n.provider.released.lock().unwrap(), vec!["gone"]);
     }
 
     #[tokio::test]

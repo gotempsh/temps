@@ -412,9 +412,36 @@ impl StandaloneSandboxRegistry {
         let handle = match self.get_or_recover(id, public_id).await {
             Ok(h) => h,
             Err(AgentError::SandboxNotFound { .. }) => {
-                // Nothing to remove — treat as already destroyed. The
+                // No container to remove — treat as already destroyed. The
                 // caller will still transition the DB row to "destroyed".
+                //
+                // The container being gone does not mean everything is: a
+                // failed create or a manual `docker rm` leaves the isolated
+                // network (and the subnet it pins) behind, and `provider
+                // .destroy` is never reached without a handle. Release those
+                // here so deleting the sandbox always frees its network.
                 self.handles.write().await.remove(&id);
+                self.recovered_in_this_generation.write().await.remove(&id);
+                match self.node_of(id).await {
+                    Ok(node_id) => {
+                        if let Err(error) = self
+                            .provider
+                            .release_orphaned_resources_on(node_id, Self::label_for(public_id))
+                            .await
+                        {
+                            tracing::warn!(
+                                sandbox_id = %public_id,
+                                internal_id = id,
+                                "Failed to release leftover resources of removed sandbox: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        sandbox_id = %public_id,
+                        internal_id = id,
+                        "Could not resolve the node of removed sandbox to release its leftover resources: {error}"
+                    ),
+                }
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -637,6 +664,10 @@ mod tests {
         liveness: Liveness,
         /// Node each `recover_by_name_on` call was routed to.
         recovered_on: std::sync::Mutex<Vec<Option<i32>>>,
+        /// `(node, container name)` of every `release_orphaned_resources_on`.
+        released: std::sync::Mutex<Vec<(Option<i32>, String)>>,
+        /// Whether releasing leftovers fails, like a daemon that is down.
+        release_fails: bool,
     }
 
     impl FakeProvider {
@@ -655,6 +686,8 @@ mod tests {
                 recovery_delay: Duration::ZERO,
                 liveness: Liveness::Running,
                 recovered_on: std::sync::Mutex::new(Vec::new()),
+                released: std::sync::Mutex::new(Vec::new()),
+                release_fails: false,
             }
         }
 
@@ -871,6 +904,24 @@ mod tests {
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
             }))
+        }
+
+        async fn release_orphaned_resources_on(
+            &self,
+            node_id: Option<i32>,
+            container_name: &str,
+        ) -> Result<(), AgentError> {
+            self.released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((node_id, container_name.to_string()));
+            if self.release_fails {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: "daemon unreachable".into(),
+                });
+            }
+            Ok(())
         }
 
         async fn recover_by_name_on(
@@ -1148,6 +1199,84 @@ mod tests {
             0,
             "nothing to destroy at the provider layer"
         );
+    }
+
+    /// A sandbox whose container is already gone can still own an isolated
+    /// network, which pins a subnet from the daemon's address pool. Deleting
+    /// it must release that on the node the row names, using the container
+    /// label, even though `provider.destroy` has no handle to run with.
+    #[tokio::test]
+    async fn destroy_of_a_missing_container_releases_its_leftover_network() {
+        let provider = Arc::new(FakeProvider::new());
+        let reg =
+            StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Ok(Some(7)))));
+
+        reg.destroy(42, "sbx_abc123")
+            .await
+            .expect("destroy is idempotent");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *provider.released.lock().expect("released"),
+            vec![(Some(7), "abc123".to_string())]
+        );
+    }
+
+    /// Failing to release leftovers must not turn an already-gone sandbox
+    /// into a failed delete: the caller still has to mark the row destroyed.
+    #[tokio::test]
+    async fn destroy_of_a_missing_container_survives_a_failed_release() {
+        let mut fake = FakeProvider::new();
+        fake.release_fails = true;
+        let provider = Arc::new(fake);
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+
+        reg.destroy(42, "sbx_abc123")
+            .await
+            .expect("a failed release does not fail the destroy");
+
+        assert_eq!(provider.released.lock().expect("released").len(), 1);
+    }
+
+    /// A live container is torn down through `provider.destroy`, which owns
+    /// removing its network; the orphan path must not run as well.
+    #[tokio::test]
+    async fn destroy_of_a_live_container_does_not_use_the_orphan_path() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+
+        reg.destroy(42, "sbx_abc123").await.expect("destroy");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 1);
+        assert!(provider.released.lock().expect("released").is_empty());
+    }
+
+    /// A cached handle whose container was removed behind the registry's
+    /// back still goes through `provider.destroy`, which owns removing the
+    /// sandbox's network and proxy (the worker does so even when the
+    /// container is already absent). The registry must drop its entry and
+    /// not double-release through the orphan path.
+    #[tokio::test]
+    async fn destroy_with_a_stale_cached_handle_goes_through_the_provider() {
+        let provider = Arc::new(FakeProvider::new()); // The container is not known.
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+        reg.handles.write().await.insert(
+            42,
+            SandboxHandle {
+                node_id: None,
+                sandbox_id: "stale-docker-id".to_string(),
+                sandbox_name: "temps-sandbox-abc123".to_string(),
+                work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
+            },
+        );
+
+        reg.destroy(42, "sbx_abc123").await.expect("destroy");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 1);
+        assert!(provider.released.lock().expect("released").is_empty());
+        assert!(!reg.handles.read().await.contains_key(&42));
     }
 
     /// Warm-path check: when the handle IS in the map, lifecycle ops use

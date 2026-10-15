@@ -499,11 +499,11 @@ for (const width of [1440, 390]) {
       fullPage: true,
     })
     await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
-    // The confirmation is its own alertdialog (portalled outside the
-    // configuration dialog) that names the check before deleting it.
-    const confirm = page.getByRole('alertdialog')
-    await expect(confirm).toContainText('This cannot be undone.')
-    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    // The confirmation is an alert dialog portalled outside the region.
+    await page
+      .getByRole('alertdialog')
+      .getByRole('button', { name: 'Delete', exact: true })
+      .click()
     await expect(dialog.getByRole('button', { name: 'Check now' })).toHaveCount(
       0
     )

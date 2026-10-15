@@ -429,6 +429,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::stop_sandbox,
         crate::sandbox_handlers::start_sandbox,
         crate::sandbox_handlers::recover_sandbox,
+        crate::sandbox_handlers::release_orphaned_sandbox_resources,
         crate::sandbox_handlers::sandbox_status,
     ),
     components(schemas(
@@ -490,6 +491,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_agents::sandbox::remote::RemoteWriteDirectoryRequest,
         temps_agents::sandbox::remote::RemoteKillRequest,
         temps_agents::sandbox::remote::RemoteRecoverRequest,
+        temps_agents::sandbox::remote::RemoteReleaseOrphanedRequest,
         temps_agents::sandbox::remote::RemoteStatusRequest,
         temps_agents::sandbox::remote::RemoteAliveResponse,
         temps_agents::sandbox::remote::RemoteStatusResponse,

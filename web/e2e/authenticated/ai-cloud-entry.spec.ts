@@ -242,8 +242,8 @@ test.describe('AI entry and Cloud onboarding', () => {
       .getByRole('button', { name: 'AI assistant', exact: true })
       .click()
     await expect(page.getByText('AI availability is unknown')).toBeVisible()
-    // Other surfaces on the page quote the same refusal as "Server response:
-    // ...", so match the assistant's own sentence exactly.
+    // The read-failure alert repeats the server detail under "Server response:",
+    // so match the explanation paragraph exactly.
     await expect(
       page.getByText('The managed capability check timed out.', { exact: true })
     ).toBeVisible()
