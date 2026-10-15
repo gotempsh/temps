@@ -59,7 +59,7 @@
     },
     "packages/analytics-browser": {
       "name": "@temps-sdk/analytics-browser",
-      "version": "0.0.7",
+      "version": "0.0.8",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },
@@ -136,7 +136,7 @@
     },
     "packages/react-analytics": {
       "name": "@temps-sdk/react-analytics",
-      "version": "0.0.8",
+      "version": "0.0.9",
       "dependencies": {
         "@rrweb/packer": "^2.0.0-alpha.17",
         "@temps-sdk/analytics-core": "workspace:*",
@@ -181,7 +181,7 @@
     },
     "packages/svelte-analytics": {
       "name": "@temps-sdk/svelte-analytics",
-      "version": "0.0.5",
+      "version": "0.0.6",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },
@@ -195,7 +195,7 @@
     },
     "packages/vue-analytics": {
       "name": "@temps-sdk/vue-analytics",
-      "version": "0.0.5",
+      "version": "0.0.6",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },
