@@ -31,7 +31,7 @@ import {
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
 import { Button } from '@/components/ui/button'
 import { EnvironmentVariableValue } from './EnvironmentVariableValue'
-import { RecordLink, useUrlState } from '@temps-sdk/ds'
+import { RecordLink, useUrlSearchText, useUrlState } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -1299,8 +1299,13 @@ export function EnvironmentVariablesSettings({
     new Set()
   )
   const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
-  const { get, patch } = useUrlState<'environment' | 'q'>()
-  const search = get('q') ?? ''
+  const urlState = useUrlState<'environment' | 'q'>()
+  const { get, patch } = urlState
+  // The box keeps what was typed locally; `search` is the committed URL value
+  // the list is filtered by.
+  const [searchText, setSearchText, search] = useUrlSearchText('q', {
+    urlState,
+  })
   const environmentFilter = get('environment')
   const [revealAllScope, setRevealAllScope] = useState<string | null>(null)
   const [showComparison, setShowComparison] = useState(false)
@@ -1903,8 +1908,8 @@ export function EnvironmentVariablesSettings({
                 <Input
                   aria-label="Filter environment variables by name"
                   placeholder="Filter by variable name…"
-                  value={search}
-                  onChange={(event) => patch({ q: event.target.value })}
+                  value={searchText}
+                  onChange={(event) => setSearchText(event.target.value)}
                   className="w-full sm:w-72"
                 />
               </div>

@@ -293,6 +293,28 @@ test('useUrlSearchText keeps fast typing, writes the key and resets page', async
   view.unmount()
 })
 
+test('useUrlSearchText keeps spaces and special characters exactly as typed', async () => {
+  const typed = ' my var: a&b=c %20 #x+y/z ü '
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  typeFast(input, typed)
+  // Leading/trailing whitespace is not trimmed while typing.
+  expect(input.value).toBe(typed)
+  await waitFor(() => {
+    expect(view.getByTestId('committed').textContent).toBe(typed)
+  })
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe(typed)
+  expect(input.value).toBe(typed)
+  view.unmount()
+})
+
 test('useUrlSearchText restores the text from the URL on a fresh mount', () => {
   const view = render(
     <MemoryRouter initialEntries={['/list?find=pages']}>
