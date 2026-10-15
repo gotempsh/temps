@@ -343,7 +343,10 @@ export function DockBody({
     setMobileRailOpen(false)
   }
   useEffect(() => {
-    if (!isMobile) return
+    if (!isMobile) {
+      restoreToggleFocusRef.current = false
+      return
+    }
     if (mobileRailOpen) {
       railCloseRef.current?.focus()
     } else if (restoreToggleFocusRef.current) {
@@ -406,6 +409,9 @@ export function DockBody({
     // conversation for an unsaved draft.
     setActivePublicId(c.public_id)
     setPicking(false)
+    // Picking a chat (including the one already open) removes the focused
+    // list button, so hand focus to the toggle like the close button does.
+    restoreToggleFocusRef.current = true
     setMobileRailOpen(false)
     setActive({
       projectId: c.project_id,
