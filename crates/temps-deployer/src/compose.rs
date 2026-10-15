@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::value::{Tag, TaggedValue};
 use serde_yaml::Value as YamlValue;
 use serde_yaml::{Mapping, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Weak};
@@ -23,8 +23,13 @@ use temps_core::{DockerHandle, DockerUnavailable};
 use temps_entities::compose_security::{
     ComposeSecurityCheck as PolicyCheck, ComposeSecurityPolicy,
 };
+use temps_presets::compose_check::{
+    ComposeCheckCommand, ComposeCheckErrorClass, ComposeCheckReport, ComposeCheckRequest,
+};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
+
+use crate::compose_interpolation::{self, InterpolationError};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
@@ -32,8 +37,13 @@ use tracing::{debug, info, warn};
 /// Owns the inspected local inputs until `compose config` finishes. Remote
 /// archives are retained only after validation, because effective runtime paths
 /// can refer to their assets throughout the deployment.
+/// Variables for interpolating referenced files, plus the unset and
+/// referenced variable names collected while doing so.
+type SnapshotInterpolation = (HashMap<String, String>, BTreeSet<String>, BTreeSet<String>);
+
 struct ComposeReferenceSnapshots {
     cache: tempfile::TempDir,
+    interpolation: SnapshotInterpolation,
     files: Vec<tempfile::NamedTempFile>,
     remote: HashMap<String, (PathBuf, PathBuf)>,
     resolved: HashMap<(PathBuf, PathBuf), PathBuf>,
@@ -52,6 +62,7 @@ impl ComposeReferenceSnapshots {
             resolved: HashMap::new(),
             active: HashSet::new(),
             bytes: 0,
+            interpolation: Default::default(),
         })
     }
 }
@@ -278,6 +289,24 @@ pub enum ComposeError {
         reason: String,
     },
 
+    /// `docker compose config` rejected the model. `cause` is safe to show
+    /// to anyone who can read the deployment; `diagnostics` carries the exact
+    /// command, exit code and a sanitized stderr for the deployment log.
+    #[error(
+        "Compose configuration resolution failed for project '{project}' (exit status {exit_status}, {class}): {cause}"
+    )]
+    ConfigResolutionFailed {
+        project: String,
+        class: ComposeConfigFailureClass,
+        exit_status: String,
+        cause: String,
+        diagnostics: Box<ComposeCommandDiagnostics>,
+    },
+
+    /// A `${VAR}` expression could not be resolved before validation.
+    #[error("{0}")]
+    Interpolation(#[from] InterpolationError),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -289,6 +318,181 @@ pub enum ComposeError {
     /// failure part-way through a deploy.
     #[error(transparent)]
     DockerUnavailable(#[from] DockerUnavailable),
+}
+
+impl ComposeError {
+    /// The coarse class shared by deploy, preview and "Run compose check".
+    pub fn class(&self) -> ComposeCheckErrorClass {
+        match self {
+            Self::SecurityPolicyViolation { .. } => ComposeCheckErrorClass::PolicyViolation,
+            Self::InvalidComposePath { .. } => ComposeCheckErrorClass::InvalidPath,
+            Self::InvalidComposeYaml { .. } => ComposeCheckErrorClass::InvalidYaml,
+            Self::InvalidOverride { .. } => ComposeCheckErrorClass::InvalidOverride,
+            Self::Interpolation(_) | Self::InvalidEnvironmentVariable { .. } => {
+                ComposeCheckErrorClass::Interpolation
+            }
+            Self::ConfigResolutionFailed { class, .. } => match class {
+                ComposeConfigFailureClass::UnsupportedComposeVersion => {
+                    ComposeCheckErrorClass::UnsupportedComposeVersion
+                }
+                ComposeConfigFailureClass::RequiredVariable
+                | ComposeConfigFailureClass::ExtendsTarget
+                | ComposeConfigFailureClass::UndefinedDependency
+                | ComposeConfigFailureClass::MissingEnvFile
+                | ComposeConfigFailureClass::MissingFile
+                | ComposeConfigFailureClass::InvalidModel
+                | ComposeConfigFailureClass::InvalidYaml
+                | ComposeConfigFailureClass::Unclassified => {
+                    ComposeCheckErrorClass::ConfigResolution
+                }
+            },
+            Self::CommandFailed { .. } => ComposeCheckErrorClass::ConfigResolution,
+            Self::ComposeUnavailable { .. } | Self::DockerUnavailable(_) => {
+                ComposeCheckErrorClass::ComposeUnavailable
+            }
+            Self::FileWriteFailed { .. }
+            | Self::DiscoveryFailed { .. }
+            | Self::Docker(_)
+            | Self::ServicesNotReady { .. }
+            | Self::Io(_) => ComposeCheckErrorClass::Internal,
+        }
+    }
+}
+
+/// Why `docker compose config` failed, classified from its stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposeConfigFailureClass {
+    /// The Compose CLI does not know an option Temps passes.
+    UnsupportedComposeVersion,
+    RequiredVariable,
+    ExtendsTarget,
+    UndefinedDependency,
+    MissingEnvFile,
+    MissingFile,
+    InvalidModel,
+    InvalidYaml,
+    /// Anything Temps does not recognise; the sanitized stderr is the
+    /// diagnostic.
+    Unclassified,
+}
+
+impl std::fmt::Display for ComposeConfigFailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedComposeVersion => "unsupported Compose version",
+            Self::RequiredVariable => "required variable",
+            Self::ExtendsTarget => "extends target",
+            Self::UndefinedDependency => "undefined dependency",
+            Self::MissingEnvFile => "missing env file",
+            Self::MissingFile => "missing file",
+            Self::InvalidModel => "invalid model",
+            Self::InvalidYaml => "invalid YAML",
+            Self::Unclassified => "unclassified",
+        })
+    }
+}
+
+/// One `docker compose` invocation, sanitized for the deployment log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeCommandDiagnostics {
+    /// Program and arguments. Variable values are never passed on the command
+    /// line (they travel in a temporary env file), and known values are
+    /// redacted regardless.
+    pub argv: Vec<String>,
+    pub exit_code: Option<i32>,
+    /// Sanitized stderr tail: see [`sanitize_config_stderr`].
+    pub stderr: String,
+}
+
+impl ComposeCommandDiagnostics {
+    pub fn into_report(self) -> ComposeCheckCommand {
+        ComposeCheckCommand {
+            argv: self.argv,
+            exit_code: self.exit_code,
+            stderr: (!self.stderr.is_empty()).then_some(self.stderr),
+        }
+    }
+}
+
+/// The oldest Docker Compose release that accepts every option Temps passes
+/// to `docker compose config` (`--no-env-resolution` arrived in v2.35.0).
+pub const MIN_COMPOSE_VERSION: &str = "2.35.0";
+
+/// Options Temps passes to `docker compose config` during resolution.
+pub const COMPOSE_CONFIG_FLAGS: &[&str] = &[
+    "--no-normalize",
+    "--no-path-resolution",
+    "--no-env-resolution",
+    "--no-interpolate",
+];
+
+/// What the host's Docker Compose CLI supports, probed once at startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeSupport {
+    /// Whether `docker compose version` ran successfully.
+    pub available: bool,
+    /// Version reported by `docker compose version --short`.
+    pub version: Option<String>,
+    /// `docker compose config` options Temps needs that this CLI lacks.
+    pub missing_flags: Vec<String>,
+    /// Operator-facing explanation when something is missing.
+    pub problem: Option<String>,
+}
+
+impl ComposeSupport {
+    pub fn supported(&self) -> bool {
+        self.available && self.missing_flags.is_empty()
+    }
+}
+
+/// A Compose model after interpolation and, when needed, `docker compose
+/// config` resolution.
+#[derive(Debug, Clone)]
+pub struct ResolvedComposeConfiguration {
+    pub content: String,
+    pub override_content: Option<String>,
+    /// Why resolution was needed; empty when the file was used directly.
+    pub resolution_reasons: Vec<&'static str>,
+    /// The `docker compose config` command that ran, when one did.
+    pub command: Option<ComposeCommandDiagnostics>,
+    pub unset_variables: BTreeSet<String>,
+    pub referenced_variables: BTreeSet<String>,
+    /// Caveats, e.g. resolution skipped because no Compose CLI is present.
+    pub notes: Vec<String>,
+}
+
+/// Output of [`ComposeExecutor::check_configuration`]: everything the deploy
+/// job needs after the deploy-time checks passed.
+#[derive(Debug, Clone)]
+pub struct CheckedComposeConfiguration {
+    /// Resolved model before excluded services are removed (the settings
+    /// page lists every service so excluded ones can be re-enabled).
+    pub resolved_content: String,
+    /// Resolved model with excluded services removed — what deploys.
+    pub content: String,
+    pub override_content: Option<String>,
+    pub resolution: ResolvedComposeConfiguration,
+}
+
+/// Inputs for one deploy-time configuration check.
+#[derive(Debug, Clone, Copy)]
+pub struct ComposeCheckInput<'a> {
+    pub project_name: &'a str,
+    /// Repository checkout; `None` for inline projects and previews.
+    pub project_dir: Option<&'a Path>,
+    pub compose_file: &'a str,
+    pub content: &'a str,
+    pub override_content: Option<&'a str>,
+    pub excluded_services: &'a [String],
+    pub environment: &'a HashMap<String, String>,
+    /// Repository `.env` text when there is no checkout to read it from.
+    pub repository_env: Option<&'a str>,
+    /// Whether filesystem confinement is checked against `project_dir`.
+    pub filesystem_checks: bool,
+    /// Whether `docker compose config` may run. When false and resolution
+    /// would be needed, the files are validated separately and a note says so.
+    pub allow_cli: bool,
 }
 
 /// A failed Compose startup together with every container Docker managed to
@@ -808,30 +1012,83 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// Compose can echo values from repository and included env files in stderr.
 /// Classify its diagnostic instead of copying untrusted text into a deployment
 /// error, where readers may not have permission to view those values.
+#[cfg(test)]
 fn safe_compose_config_failure(stderr: &[u8]) -> String {
+    classify_compose_config_failure(stderr).1
+}
+
+static UNKNOWN_FLAG_PATTERN: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bunknown (?:shorthand )?flag:? '?(--?[a-z0-9][a-z0-9-]{0,63})").ok()
+});
+
+/// Classify a `docker compose config` failure and describe it without
+/// copying values out of stderr.
+fn classify_compose_config_failure(stderr: &[u8]) -> (ComposeConfigFailureClass, String) {
     let diagnostic = String::from_utf8_lossy(stderr);
     let lower = diagnostic.to_ascii_lowercase();
-    let cause = if lower.contains("required variable") && lower.contains("missing a value") {
+    let (class, cause) = if lower.contains("unknown flag")
+        || lower.contains("unknown shorthand flag")
+    {
+        // Flag names come from Temps' own command line, never from the
+        // repository, so the matched name is safe to repeat.
+        let flag = UNKNOWN_FLAG_PATTERN
+            .as_ref()
+            .and_then(|pattern| pattern.captures(&diagnostic))
+            .and_then(|captures| captures.get(1).map(|flag| flag.as_str().to_string()))
+            .filter(|flag| COMPOSE_CONFIG_FLAGS.contains(&flag.as_str()) || flag.starts_with("--"));
+        (
+            ComposeConfigFailureClass::UnsupportedComposeVersion,
+            format!(
+                "The Docker Compose CLI on this host does not support {} that Temps passes to `docker compose config`. Upgrade the Docker Compose plugin to v{MIN_COMPOSE_VERSION} or newer (check with `docker compose version`), then redeploy.",
+                flag.map(|flag| format!("the {flag} option"))
+                    .unwrap_or_else(|| "an option".to_string())
+            ),
+        )
+    } else if lower.contains("is not a docker command") {
+        (
+            ComposeConfigFailureClass::UnsupportedComposeVersion,
+            format!(
+                "The Docker Compose v2 CLI plugin is not installed on this host. Install Docker Compose v{MIN_COMPOSE_VERSION} or newer and verify it with `docker compose version`."
+            ),
+        )
+    } else if lower.contains("additional propert") && lower.contains("'required'") {
+        (
+            ComposeConfigFailureClass::UnsupportedComposeVersion,
+            format!(
+                "The Docker Compose CLI on this host does not understand env_file 'required'. Upgrade the Docker Compose plugin to v{MIN_COMPOSE_VERSION} or newer."
+            ),
+        )
+    } else if lower.contains("required variable") && lower.contains("missing a value") {
         let variable =
             Regex::new(r"(?i)\brequired variable ([a-z_][a-z0-9_]{0,63}) is missing a value")
                 .ok()
                 .and_then(|pattern| pattern.captures(&diagnostic))
                 .and_then(|captures| captures.get(1).map(|name| name.as_str().to_string()));
-        match variable {
-            Some(variable) => format!("Required Compose variable {variable} has no value. Set it in the project environment or .env file."),
-            None => "A required Compose variable has no value. Set it in the project environment or .env file.".to_string(),
-        }
+        (
+            ComposeConfigFailureClass::RequiredVariable,
+            match variable {
+                Some(variable) => format!("Required Compose variable {variable} has no value. Set it in the project environment or .env file."),
+                None => "A required Compose variable has no value. Set it in the project environment or .env file.".to_string(),
+            },
+        )
     } else if lower.contains("cannot extend service") && lower.contains("not found") {
-        "An extends reference names a service missing from its referenced Compose file. Check the extends.file and extends.service settings.".to_string()
+        (ComposeConfigFailureClass::ExtendsTarget, "An extends reference names a service missing from its referenced Compose file. Check the extends.file and extends.service settings.".to_string())
     } else if lower.contains("depends on undefined service") {
-        "A service depends on another service that is not defined in the combined Compose project. Check inherited depends_on entries and excluded services.".to_string()
+        (ComposeConfigFailureClass::UndefinedDependency, "A service depends on another service that is not defined in the combined Compose project. Check inherited depends_on entries and excluded services.".to_string())
     } else if (lower.contains("env_file") || lower.contains("env file"))
         && (lower.contains("not found") || lower.contains("no such file"))
     {
-        "A required env_file is missing. Check its path relative to the Compose project directory."
-            .to_string()
+        (
+            ComposeConfigFailureClass::MissingEnvFile,
+            "A required env_file is missing. Check its path relative to the Compose project directory, or mark it `required: false`."
+                .to_string(),
+        )
     } else if lower.contains("no such file") || lower.contains("file not found") {
-        "A referenced file is missing. Check Compose file, include, and extends paths.".to_string()
+        (
+            ComposeConfigFailureClass::MissingFile,
+            "A referenced file is missing. Check Compose file, include, and extends paths."
+                .to_string(),
+        )
     } else if lower.contains("validating ")
         || lower.contains("additional properties are not allowed")
         || lower.contains("must be a ")
@@ -846,14 +1103,24 @@ fn safe_compose_config_failure(stderr: &[u8]) -> String {
                 matches!(field, "ports" | "environment" | "env_file" | "volumes" | "networks" | "depends_on" | "healthcheck" | "build" | "image" | "secrets" | "configs" | "labels" | "command" | "entrypoint")
                     .then(|| format!("services.{service}.{field} expects a value of type {expected}."))
             });
-        field.unwrap_or_else(|| "The Compose model has an invalid field or value type. Check the source file and project override.".to_string())
+        (
+            ComposeConfigFailureClass::InvalidModel,
+            field.unwrap_or_else(|| "The Compose model has an invalid field or value type. Check the source file and project override.".to_string()),
+        )
     } else if lower.contains("yaml:")
         || lower.contains("did not find expected key")
         || lower.contains("mapping values are not allowed")
     {
-        "A Compose file contains invalid YAML. Check its syntax and indentation.".to_string()
+        (
+            ComposeConfigFailureClass::InvalidYaml,
+            "A Compose file contains invalid YAML. Check its syntax and indentation.".to_string(),
+        )
     } else {
-        "Compose rejected the source files or project override.".to_string()
+        (
+            ComposeConfigFailureClass::Unclassified,
+            "Docker Compose rejected the configuration with an error Temps does not recognise. The exact command, its exit code and the sanitized Compose output are in the deployment log; \"Run compose check\" on the deployment page repeats this step and shows the same output."
+                .to_string(),
+        )
     };
 
     // Only numeric locations are copied from stderr. File names, field values,
@@ -862,10 +1129,114 @@ fn safe_compose_config_failure(stderr: &[u8]) -> String {
         .ok()
         .and_then(|pattern| pattern.captures(&diagnostic))
         .and_then(|captures| captures.get(1).map(|line| line.as_str().to_string()));
-    match line {
+    let cause = match line {
         Some(line) => format!("{cause} Compose reported line {line}."),
-        None => cause.to_string(),
+        None => cause,
+    };
+    (class, cause)
+}
+
+/// Exit statuses Docker Compose uses for its own failure classes
+/// (`cmd/compose`): 14 compose file not found, 15 parse failure, 16
+/// command-line syntax failure (an unknown option).
+const COMPOSE_EXIT_FILE_NOT_FOUND: i32 = 14;
+const COMPOSE_EXIT_PARSE_FAILURE: i32 = 15;
+const COMPOSE_EXIT_COMMAND_SYNTAX: i32 = 16;
+
+/// [`classify_compose_config_failure`], falling back to Compose's exit status
+/// when stderr does not identify the failure. Status 16 is what an older
+/// Compose returns for an option it does not know.
+fn classify_compose_config_failure_with_status(
+    stderr: &[u8],
+    exit_code: Option<i32>,
+) -> (ComposeConfigFailureClass, String) {
+    let (class, cause) = classify_compose_config_failure(stderr);
+    if class != ComposeConfigFailureClass::Unclassified {
+        return (class, cause);
     }
+    match exit_code {
+        Some(COMPOSE_EXIT_COMMAND_SYNTAX) => (
+            ComposeConfigFailureClass::UnsupportedComposeVersion,
+            format!(
+                "Docker Compose rejected the `docker compose config` command line (exit status 16, command syntax failure). This happens when the Compose CLI is older than v{MIN_COMPOSE_VERSION} and does not know an option Temps passes ({}). Upgrade the Docker Compose plugin and check with `docker compose version`.",
+                COMPOSE_CONFIG_FLAGS.join(", ")
+            ),
+        ),
+        Some(COMPOSE_EXIT_PARSE_FAILURE) => (
+            ComposeConfigFailureClass::InvalidModel,
+            "Docker Compose could not parse the combined Compose model (exit status 15). Check the source file, included and extended files, and the project override.".to_string(),
+        ),
+        Some(COMPOSE_EXIT_FILE_NOT_FOUND) => (
+            ComposeConfigFailureClass::MissingFile,
+            "Docker Compose could not find a referenced Compose file (exit status 14). Check Compose file, include, and extends paths.".to_string(),
+        ),
+        _ => (class, cause),
+    }
+}
+
+/// Most stderr lines and bytes copied into the deployment log.
+const MAX_SANITIZED_STDERR_LINES: usize = 40;
+const MAX_SANITIZED_STDERR_LINE_BYTES: usize = 300;
+
+/// Patterns that can carry a value in Compose's error text, replaced before
+/// stderr reaches a log. What remains is Compose's wording, field paths,
+/// option names, error classes and line/column numbers.
+static STDERR_VALUE_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    [
+        (r#""(?:[^"\\]|\\.)*""#, "\"<value>\""),
+        (r"'[^'\n]*'", "'<value>'"),
+        (r"`[^`\n]*`", "`<value>`"),
+        (r"\$\{[^}\n]*\}?", "<template>"),
+        (r"(?i)\b[a-z][a-z0-9+.-]*://\S+", "<url>"),
+        (r"\b([A-Za-z_][A-Za-z0-9_]*)=\S+", "${1}=<value>"),
+        (r"(^|[\s(\[:=,])/[^\s:,;)\]]+", "${1}<path>"),
+    ]
+    .into_iter()
+    .filter_map(|(pattern, replacement)| Regex::new(pattern).ok().map(|regex| (regex, replacement)))
+    .collect()
+});
+
+/// Reduce `docker compose` stderr to something safe for any reader of the
+/// deployment log: known values redacted, then quoted text, templates,
+/// assignments, URLs and absolute paths replaced. Numeric locations and the
+/// error's wording survive, so the class of failure stays visible.
+fn sanitize_config_stderr(stderr: &[u8], redact_values: &[String]) -> String {
+    let text = redact_compose_text(&String::from_utf8_lossy(stderr), redact_values);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let skip = lines.len().saturating_sub(MAX_SANITIZED_STDERR_LINES);
+    let mut sanitized = Vec::new();
+    if skip > 0 {
+        sanitized.push(format!("… {skip} earlier line(s) omitted"));
+    }
+    for line in &lines[skip..] {
+        let mut line = (*line).to_string();
+        for (pattern, replacement) in STDERR_VALUE_PATTERNS.iter() {
+            line = pattern.replace_all(&line, *replacement).into_owned();
+        }
+        if line.len() > MAX_SANITIZED_STDERR_LINE_BYTES {
+            let mut boundary = MAX_SANITIZED_STDERR_LINE_BYTES;
+            while !line.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            line.truncate(boundary);
+            line.push_str(" …");
+        }
+        sanitized.push(line);
+    }
+    sanitized.join("\n")
+}
+
+/// The argv of `command`, with known values redacted.
+fn command_argv(command: &tokio::process::Command, redact_values: &[String]) -> Vec<String> {
+    let command = command.as_std();
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|arg| redact_compose_text(&arg.to_string_lossy(), redact_values))
+        .collect()
 }
 
 /// Request to deploy a Docker Compose stack.
@@ -1128,6 +1499,90 @@ impl ComposeExecutor {
     /// failure part-way through.
     fn require_docker(&self) -> Result<Arc<Docker>, ComposeError> {
         self.docker.require().map_err(ComposeError::from)
+    }
+
+    /// Probe the host's Compose CLI once (at startup): its version and
+    /// whether `docker compose config` knows every option Temps passes.
+    /// Never fails; problems are reported in the returned value.
+    pub async fn probe_compose_support() -> ComposeSupport {
+        let mut version = isolated_docker_command();
+        version.args(["compose", "version", "--short"]);
+        let version = Self::bounded_command_output(
+            version,
+            COMPOSE_VERSION_TIMEOUT,
+            "compose-support-probe",
+            "probe Docker Compose version",
+        )
+        .await;
+        let version = match version {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            Ok(output) => {
+                return ComposeSupport {
+                    available: false,
+                    version: None,
+                    missing_flags: Vec::new(),
+                    problem: Some(format!(
+                        "`docker compose version` failed ({}): {}. Install the Docker Compose v2 plugin, v{MIN_COMPOSE_VERSION} or newer.",
+                        output.status,
+                        sanitize_config_stderr(&output.stderr, &[])
+                    )),
+                }
+            }
+            Err(error) => {
+                return ComposeSupport {
+                    available: false,
+                    version: None,
+                    missing_flags: Vec::new(),
+                    problem: Some(format!(
+                        "Could not run `docker compose version`: {error}. Install the Docker Compose v2 plugin, v{MIN_COMPOSE_VERSION} or newer."
+                    )),
+                }
+            }
+        };
+        let mut help = isolated_docker_command();
+        help.args(["compose", "config", "--help"]);
+        let help = Self::bounded_command_output(
+            help,
+            COMPOSE_VERSION_TIMEOUT,
+            "compose-support-probe",
+            "probe Docker Compose config options",
+        )
+        .await
+        .map(|output| {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            text
+        })
+        .unwrap_or_default();
+        Self::compose_support_from(Some(version), &help)
+    }
+
+    /// Interpret probe output; separate from the probe so it can be tested.
+    fn compose_support_from(version: Option<String>, config_help: &str) -> ComposeSupport {
+        let missing_flags: Vec<String> = COMPOSE_CONFIG_FLAGS
+            .iter()
+            .filter(|flag| {
+                !config_help
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .any(|word| word == **flag)
+            })
+            .map(|flag| flag.to_string())
+            .collect();
+        let problem = (!missing_flags.is_empty()).then(|| {
+            format!(
+                "Docker Compose {} on this host does not support {} for `docker compose config`. Compose deployments that use a project override, include, extends or merge tags will fail until the Docker Compose plugin is upgraded to v{MIN_COMPOSE_VERSION} or newer.",
+                version.as_deref().map(|v| format!("v{}", v.trim_start_matches('v'))).unwrap_or_else(|| "(unknown version)".to_string()),
+                missing_flags.join(", ")
+            )
+        });
+        ComposeSupport {
+            available: true,
+            version,
+            missing_flags,
+            problem,
+        }
     }
 
     async fn require_compose_v2(&self) -> Result<(), ComposeError> {
@@ -1828,33 +2283,32 @@ impl ComposeExecutor {
         // command before writing files, building images, or allowing the
         // workflow to stop the currently-serving stack.
         self.require_compose_v2().await?;
-        let resolved_request;
-        let request = if self.needs_resolution(
-            &request.compose_content,
-            request.compose_override.as_deref(),
-        ) {
-            let (content, overrides) = self
-                .resolve_security_configuration(
-                    &request.project_name,
-                    request.repo_dir.as_deref(),
-                    request
-                        .compose_path
-                        .as_deref()
-                        .unwrap_or("docker-compose.yml"),
-                    &request.compose_content,
-                    request.compose_override.as_deref(),
-                    &request.environment_vars,
-                )
-                .await?;
-            resolved_request = ComposeDeployRequest {
-                compose_content: content,
-                compose_override: overrides,
-                ..request.clone()
-            };
-            &resolved_request
-        } else {
-            request
+        // Idempotent: a request the deploy job already resolved has its
+        // values substituted and its merge features flattened, so this only
+        // re-checks it. A request from anywhere else gets the same pipeline.
+        let resolved = self
+            .resolve_configuration(&ComposeCheckInput {
+                project_name: &request.project_name,
+                project_dir: request.repo_dir.as_deref(),
+                compose_file: request
+                    .compose_path
+                    .as_deref()
+                    .unwrap_or("docker-compose.yml"),
+                content: &request.compose_content,
+                override_content: request.compose_override.as_deref(),
+                excluded_services: &[],
+                environment: &request.environment_vars,
+                repository_env: None,
+                filesystem_checks: request.repo_dir.is_some(),
+                allow_cli: true,
+            })
+            .await?;
+        let resolved_request = ComposeDeployRequest {
+            compose_content: resolved.content,
+            compose_override: resolved.override_content,
+            ..request.clone()
         };
+        let request = &resolved_request;
         Self::validate_service_dir_name(generation)?;
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
@@ -2996,33 +3450,414 @@ impl ComposeExecutor {
         })
     }
 
-    fn needs_resolution(&self, content: &str, override_content: Option<&str>) -> bool {
-        if override_content.is_some() {
-            return true;
-        }
-        if !self.enforced(PolicyCheck::Interpolation) && Self::contains_interpolation(content) {
-            return true;
+    /// Why this model needs `docker compose config` before validation. Only
+    /// file features count: an override to merge, `include`, `extends`,
+    /// Compose merge tags (`!reset`/`!override`), or YAML merge keys that do
+    /// not expand. Policy settings never add a resolution step, so turning a
+    /// check off can never introduce a failure.
+    fn resolution_reasons(content: &str, override_content: Option<&str>) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if override_content.is_some_and(|content| !content.trim().is_empty()) {
+            reasons.push("project override");
         }
         let Ok(mut root) = serde_yaml::from_str::<Value>(content) else {
-            return false;
+            // Invalid YAML is reported by validation with its own message.
+            return reasons;
         };
         if root.apply_merge().is_err() {
-            return true;
+            reasons.push("YAML merge keys");
+            return reasons;
         }
-        Self::contains_compose_tag(&root)
-            || root.get("include").is_some()
-            || root
-                .get("services")
-                .and_then(Value::as_mapping)
-                .is_some_and(|services| {
-                    services
-                        .values()
-                        .any(|service| service.get("extends").is_some())
-                })
+        if root.get("include").is_some() {
+            reasons.push("include");
+        }
+        if root
+            .get("services")
+            .and_then(Value::as_mapping)
+            .is_some_and(|services| {
+                services
+                    .values()
+                    .any(|service| service.get("extends").is_some())
+            })
+        {
+            reasons.push("extends");
+        }
+        if Self::contains_compose_tag(&root) {
+            reasons.push("Compose merge tags");
+        }
+        reasons
     }
 
-    /// Resolve the user-owned model before discovery, exclusions, or generated overrides.
-    /// The Docker CLI supplies Compose's merge/path semantics; no build/pull/up runs here.
+    /// Variables Compose would interpolate with: the repository `.env`,
+    /// overridden by the project environment (the same precedence as the
+    /// `--env-file .env --env-file .env.temps` pair used at deploy time).
+    fn interpolation_variables(
+        input: &ComposeCheckInput<'_>,
+    ) -> Result<HashMap<String, String>, ComposeError> {
+        let repository_env = match (input.repository_env, input.project_dir) {
+            (Some(content), _) => Some(content.to_string()),
+            (None, Some(dir)) => Self::read_repository_dotenv(dir)?,
+            (None, None) => None,
+        };
+        let mut variables = repository_env
+            .as_deref()
+            .map(compose_interpolation::parse_dotenv)
+            .unwrap_or_default();
+        variables.extend(
+            input
+                .environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Ok(variables)
+    }
+
+    /// The checkout's root `.env`, confined to the checkout and size-limited.
+    /// A missing file is not an error: Compose treats it as empty.
+    fn read_repository_dotenv(dir: &Path) -> Result<Option<String>, ComposeError> {
+        let path = dir.join(".env");
+        if path.symlink_metadata().is_err() {
+            return Ok(None);
+        }
+        let root = std::fs::canonicalize(dir)?;
+        let path = Self::confined_reference(&root, &root, ".env")?;
+        let metadata = std::fs::metadata(&path)?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        if metadata.len() > compose_interpolation::MAX_DOTENV_BYTES as u64 {
+            return Err(ComposeError::InvalidComposePath {
+                field: ".env".to_string(),
+                path: ".env".to_string(),
+                reason: format!(
+                    "the repository .env file is {} bytes; at most {} bytes are read for Compose interpolation",
+                    metadata.len(),
+                    compose_interpolation::MAX_DOTENV_BYTES
+                ),
+            });
+        }
+        Ok(Some(std::fs::read_to_string(&path)?))
+    }
+
+    /// Resolve the user-owned model before discovery, exclusions, or generated
+    /// overrides, so validation sees the values that will actually deploy.
+    ///
+    /// 1. `${VAR}` / `${VAR:-default}` / `${VAR:?}` are substituted in-process
+    ///    from the repository `.env` and project environment, and every
+    ///    remaining `$` is escaped, so Compose performs no later substitution.
+    /// 2. Override list fields are de-duplicated against the repository file.
+    /// 3. Only when the files use override/include/extends/merge tags does
+    ///    `docker compose config` merge them (with `--no-interpolate`; values
+    ///    are already final). No build/pull/up runs here.
+    ///
+    /// Policy errors raised on substituted values never echo variable values.
+    pub async fn resolve_configuration(
+        &self,
+        input: &ComposeCheckInput<'_>,
+    ) -> Result<ResolvedComposeConfiguration, ComposeError> {
+        let variables = Self::interpolation_variables(input)?;
+        let result = self.resolve_configuration_inner(input, &variables).await;
+        result.map_err(|error| Self::redact_variable_values(error, &variables))
+    }
+
+    async fn resolve_configuration_inner(
+        &self,
+        input: &ComposeCheckInput<'_>,
+        variables: &HashMap<String, String>,
+    ) -> Result<ResolvedComposeConfiguration, ComposeError> {
+        let content =
+            compose_interpolation::interpolate_document("compose file", input.content, variables)?;
+        let mut unset_variables = content.unset_variables;
+        let mut referenced_variables = content.referenced_variables;
+        let content = content.content;
+        let override_content = match input.override_content {
+            Some(override_content) if !override_content.trim().is_empty() => {
+                let interpolated = compose_interpolation::interpolate_document(
+                    "compose override",
+                    override_content,
+                    variables,
+                )?;
+                unset_variables.extend(interpolated.unset_variables);
+                referenced_variables.extend(interpolated.referenced_variables);
+                Some(Self::deduplicate_override(
+                    input.project_name,
+                    &content,
+                    &interpolated.content,
+                )?)
+            }
+            _ => None,
+        };
+        let resolution_reasons = Self::resolution_reasons(&content, override_content.as_deref());
+        let mut resolved = ResolvedComposeConfiguration {
+            content,
+            override_content,
+            resolution_reasons,
+            command: None,
+            unset_variables,
+            referenced_variables,
+            notes: Vec::new(),
+        };
+        if resolved.resolution_reasons.is_empty() {
+            return Ok(resolved);
+        }
+        if !input.allow_cli {
+            resolved.notes.push(format!(
+                "Docker Compose is not available here, so the {} step was not run; the files were validated separately. Deployment merges them with `docker compose config` on the deploying host.",
+                resolved.resolution_reasons.join(", ")
+            ));
+            return Ok(resolved);
+        }
+        let mut snapshots_variables = (variables.clone(), BTreeSet::new(), BTreeSet::new());
+        let (merged, command) = self
+            .run_compose_config(
+                input,
+                &resolved.content,
+                resolved.override_content.as_deref(),
+                &mut snapshots_variables,
+            )
+            .await?;
+        resolved.unset_variables.extend(snapshots_variables.1);
+        resolved.referenced_variables.extend(snapshots_variables.2);
+        resolved.content = merged;
+        resolved.override_content = None;
+        resolved.command = Some(command);
+        Ok(resolved)
+    }
+
+    /// Remove override list items (env_file, volumes, environment, ports)
+    /// that repeat the repository file, so a pasted copy of the repo file
+    /// does not duplicate mounts or env files when Compose appends lists.
+    fn deduplicate_override(
+        project_name: &str,
+        content: &str,
+        override_content: &str,
+    ) -> Result<String, ComposeError> {
+        let (Ok(mut base), Ok(mut overlay)) = (
+            serde_yaml::from_str::<Value>(content),
+            serde_yaml::from_str::<Value>(override_content),
+        ) else {
+            // Malformed YAML is reported by validation with its own message.
+            return Ok(override_content.to_string());
+        };
+        if base.apply_merge().is_err() {
+            return Ok(override_content.to_string());
+        }
+        let before = overlay.clone();
+        temps_presets::compose_check::deduplicate_override_lists(&base, &mut overlay);
+        if overlay == before {
+            return Ok(override_content.to_string());
+        }
+        serde_yaml::to_string(&overlay).map_err(|error| ComposeError::InvalidOverride {
+            project: project_name.to_string(),
+            reason: format!(
+                "failed to re-serialize the override after removing duplicate list items: {error}"
+            ),
+        })
+    }
+
+    /// Policy errors raised on substituted values must not reveal the value of
+    /// a project variable to readers of the deployment. Values shorter than
+    /// three bytes are left alone: they cannot hide a secret and redacting
+    /// them would mangle the message.
+    fn redact_variable_values(
+        error: ComposeError,
+        variables: &HashMap<String, String>,
+    ) -> ComposeError {
+        let values: Vec<String> = variables
+            .values()
+            .filter(|value| value.len() >= 3)
+            .cloned()
+            .collect();
+        if values.is_empty() {
+            return error;
+        }
+        let redact = |text: String| redact_compose_text(&text, &values);
+        match error {
+            ComposeError::SecurityPolicyViolation {
+                service,
+                field,
+                reason,
+            } => ComposeError::SecurityPolicyViolation {
+                service,
+                field,
+                reason: redact(reason),
+            },
+            ComposeError::InvalidComposePath {
+                field,
+                path,
+                reason,
+            } => ComposeError::InvalidComposePath {
+                field,
+                path: redact(path),
+                reason: redact(reason),
+            },
+            ComposeError::InvalidOverride { project, reason } => ComposeError::InvalidOverride {
+                project,
+                reason: redact(reason),
+            },
+            ComposeError::InvalidComposeYaml {
+                compose_source,
+                reason,
+            } => ComposeError::InvalidComposeYaml {
+                compose_source,
+                reason: redact(reason),
+            },
+            other => other,
+        }
+    }
+
+    /// Every deploy-time configuration check, in deploy order and without
+    /// touching Docker state: resolution (see [`Self::resolve_configuration`]),
+    /// removal of excluded services, the security policy, and — for a
+    /// checkout — filesystem confinement. The deploy job, the "Run compose
+    /// check" action and the settings preview all call this, so they accept
+    /// and reject the same files with the same error class.
+    pub async fn check_configuration(
+        &self,
+        input: &ComposeCheckInput<'_>,
+    ) -> Result<CheckedComposeConfiguration, ComposeError> {
+        let variables = Self::interpolation_variables(input)?;
+        let result = async {
+            let resolution = self.resolve_configuration_inner(input, &variables).await?;
+            let content =
+                self.strip_excluded_services(&resolution.content, input.excluded_services)?;
+            let override_content = resolution.override_content.clone();
+            self.preflight_validate(&content, override_content.as_deref())?;
+            if input.filesystem_checks {
+                if let Some(project_dir) = input.project_dir {
+                    self.preflight_validate_filesystem(
+                        project_dir,
+                        input.compose_file,
+                        &content,
+                        override_content.as_deref(),
+                    )?;
+                }
+            }
+            Ok(CheckedComposeConfiguration {
+                resolved_content: resolution.content.clone(),
+                content,
+                override_content,
+                resolution,
+            })
+        }
+        .await;
+        result.map_err(|error| Self::redact_variable_values(error, &variables))
+    }
+
+    /// [`Self::check_configuration`] on in-memory files, as a typed report.
+    /// Runs in a throwaway directory with no checkout, so filesystem
+    /// confinement is not checked; `docker compose config` runs only when the
+    /// local Compose CLI is usable, otherwise the report notes the skip.
+    pub async fn check_report(&self, request: ComposeCheckRequest) -> ComposeCheckReport {
+        let workspace = match tempfile::Builder::new()
+            .prefix(".temps-compose-check-")
+            .tempdir()
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return ComposeCheckReport::failure(
+                    ComposeCheckErrorClass::Internal,
+                    format!(
+                        "Failed to create a temporary directory for the Compose check of project '{}': {error}",
+                        request.project_name
+                    ),
+                )
+            }
+        };
+        // `docker compose config` reads files only; it needs the CLI, not a daemon.
+        let allow_cli = self.require_compose_v2().await.is_ok();
+        let compose_file = if request.compose_file.trim().is_empty() {
+            "docker-compose.yml".to_string()
+        } else {
+            request.compose_file.clone()
+        };
+        let input = ComposeCheckInput {
+            project_name: &request.project_name,
+            project_dir: Some(workspace.path()),
+            compose_file: &compose_file,
+            content: &request.content,
+            override_content: request.compose_override.as_deref(),
+            excluded_services: &request.excluded_services,
+            environment: &request.environment,
+            repository_env: Some(request.repository_env.as_deref().unwrap_or_default()),
+            filesystem_checks: false,
+            allow_cli,
+        };
+        // The scratch directory only gives the config step somewhere to
+        // write its temporary inputs; nothing in it is a checkout.
+        let parent_ok = Self::validate_relative_path(&compose_file, "compose_path").is_ok()
+            && Path::new(&compose_file).parent().is_none_or(|parent| {
+                std::fs::create_dir_all(workspace.path().join(parent)).is_ok()
+            });
+        let executor = ComposeExecutor {
+            policy: request.policy.clone(),
+            policy_authoritative: true,
+            ..self.clone_for_check()
+        };
+        let result = if parent_ok {
+            executor.check_configuration(&input).await
+        } else {
+            Err(ComposeError::InvalidComposePath {
+                field: "compose_path".to_string(),
+                path: compose_file.clone(),
+                reason: "the Compose file path must be a relative path inside the repository"
+                    .to_string(),
+            })
+        };
+        match result {
+            Ok(checked) => {
+                let resolution = checked.resolution;
+                ComposeCheckReport {
+                    passed: true,
+                    error_class: None,
+                    error: None,
+                    resolution_reasons: resolution
+                        .resolution_reasons
+                        .iter()
+                        .map(|reason| reason.to_string())
+                        .collect(),
+                    resolution_ran: resolution.command.is_some(),
+                    command: resolution
+                        .command
+                        .map(ComposeCommandDiagnostics::into_report),
+                    unset_variables: resolution.unset_variables.into_iter().collect(),
+                    referenced_variables: resolution.referenced_variables.into_iter().collect(),
+                    notes: resolution.notes,
+                }
+            }
+            Err(error) => {
+                let command = match &error {
+                    ComposeError::ConfigResolutionFailed { diagnostics, .. } => {
+                        Some((**diagnostics).clone().into_report())
+                    }
+                    _ => None,
+                };
+                let resolution_reasons =
+                    Self::resolution_reasons(&request.content, request.compose_override.as_deref())
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                ComposeCheckReport {
+                    resolution_ran: command.is_some(),
+                    command,
+                    resolution_reasons,
+                    ..ComposeCheckReport::failure(error.class(), error.to_string())
+                }
+            }
+        }
+    }
+
+    /// An executor sharing this one's Docker handle and data directory.
+    fn clone_for_check(&self) -> Self {
+        Self {
+            docker: self.docker.clone(),
+            data_dir: self.data_dir.clone(),
+            policy: self.policy.clone(),
+            policy_authoritative: self.policy_authoritative,
+        }
+    }
+
+    /// [`Self::check_configuration`] returning only the resolved files.
     pub async fn resolve_security_configuration(
         &self,
         project_name: &str,
@@ -3032,9 +3867,36 @@ impl ComposeExecutor {
         override_content: Option<&str>,
         environment: &HashMap<String, String>,
     ) -> Result<(String, Option<String>), ComposeError> {
-        if !self.needs_resolution(content, override_content) {
-            return Ok((content.to_string(), override_content.map(str::to_string)));
-        }
+        let checked = self
+            .check_configuration(&ComposeCheckInput {
+                project_name,
+                project_dir,
+                compose_file,
+                content,
+                override_content,
+                excluded_services: &[],
+                environment,
+                repository_env: None,
+                filesystem_checks: project_dir.is_some(),
+                allow_cli: true,
+            })
+            .await?;
+        Ok((checked.content, checked.override_content))
+    }
+
+    /// Merge the (already interpolated) files with `docker compose config`
+    /// and validate the merged model. Referenced files are snapshotted and
+    /// interpolated with the same variables first.
+    async fn run_compose_config(
+        &self,
+        input: &ComposeCheckInput<'_>,
+        content: &str,
+        override_content: Option<&str>,
+        interpolation: &mut SnapshotInterpolation,
+    ) -> Result<(String, ComposeCommandDiagnostics), ComposeError> {
+        let project_name = input.project_name;
+        let project_dir = input.project_dir;
+        let compose_file = input.compose_file;
         let inline_root;
         let root = match project_dir {
             Some(root) => root,
@@ -3058,46 +3920,54 @@ impl ComposeExecutor {
             .to_path_buf();
         // File preparation still uses the non-bypassable confined-write guard.
         Self::confined_write_path(&canonical_root, Path::new(compose_file), "compose_path")?;
+        std::fs::create_dir_all(&base)?;
         let base = std::fs::canonicalize(&base)?;
         let mut snapshots = ComposeReferenceSnapshots::new(&canonical_root)?;
+        std::mem::swap(&mut snapshots.interpolation, interpolation);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-        let input = tokio::time::timeout_at(
-            deadline,
-            self.snapshot_compose_document(&canonical_root, &base, content, &mut snapshots),
-        )
-        .await
-        .map_err(|_| ComposeError::CommandFailed {
-            project: project_name.to_string(),
-            reason: "Compose reference resolution exceeded 120 seconds".to_string(),
-        })??;
-        let inline = if let Some(override_content) = override_content {
-            Self::validate_compose_override_with_policy(
-                project_name,
-                content,
-                override_content,
-                &self.policy,
-            )?;
-            let override_content =
-                Self::without_duplicate_extends(project_name, content, override_content)?;
-            Some(
-                tokio::time::timeout_at(
-                    deadline,
-                    self.snapshot_compose_document(
-                        &canonical_root,
-                        &base,
-                        &override_content,
-                        &mut snapshots,
-                    ),
-                )
-                .await
-                .map_err(|_| ComposeError::CommandFailed {
-                    project: project_name.to_string(),
-                    reason: "Compose reference resolution exceeded 120 seconds".to_string(),
-                })??,
+        let snapshot_result = async {
+            let input = tokio::time::timeout_at(
+                deadline,
+                self.snapshot_compose_document(&canonical_root, &base, content, &mut snapshots),
             )
-        } else {
-            None
-        };
+            .await
+            .map_err(|_| ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: "Compose reference resolution exceeded 120 seconds".to_string(),
+            })??;
+            let inline = if let Some(override_content) = override_content {
+                Self::validate_compose_override_with_policy(
+                    project_name,
+                    content,
+                    override_content,
+                    &self.policy,
+                )?;
+                let override_content =
+                    Self::without_duplicate_extends(project_name, content, override_content)?;
+                Some(
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.snapshot_compose_document(
+                            &canonical_root,
+                            &base,
+                            &override_content,
+                            &mut snapshots,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| ComposeError::CommandFailed {
+                        project: project_name.to_string(),
+                        reason: "Compose reference resolution exceeded 120 seconds".to_string(),
+                    })??,
+                )
+            } else {
+                None
+            };
+            Ok::<_, ComposeError>((input, inline))
+        }
+        .await;
+        std::mem::swap(&mut snapshots.interpolation, interpolation);
+        let (input_file, inline) = snapshot_result?;
         // Inline port changes replace the repository and inherited ports.
         // Compose normally appends port lists, and after this resolution the
         // inline file is flattened away, so the later write-time strip cannot
@@ -3120,12 +3990,12 @@ impl ComposeExecutor {
         let variables = tempfile::Builder::new()
             .prefix(".temps-compose-env-")
             .tempfile_in(&base)?;
-        std::fs::write(variables.path(), render_env_file(environment)?)?;
+        std::fs::write(variables.path(), render_env_file(input.environment)?)?;
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name, "--project-directory"])
             .arg(&base)
             .arg("-f")
-            .arg(&input);
+            .arg(&input_file);
         if let Some(reset) = &port_reset {
             cmd.arg("-f").arg(reset.path());
         }
@@ -3139,13 +4009,18 @@ impl ComposeExecutor {
         }
         // Platform environment values override repository defaults, matching deployment.
         cmd.arg("--env-file").arg(variables.path());
-        cmd.args([
-            "config",
-            "--no-normalize",
-            "--no-path-resolution",
-            "--no-env-resolution",
-        ])
-        .current_dir(&base);
+        // Values were substituted (and `$` escaped) before this step;
+        // `--no-interpolate` keeps Compose from substituting a second time.
+        cmd.arg("config")
+            .args(COMPOSE_CONFIG_FLAGS)
+            .current_dir(&base);
+        let redact_values: Vec<String> = input
+            .environment
+            .values()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        let argv = command_argv(&cmd, &redact_values);
         let output = Self::bounded_command_output(
             cmd,
             COMPOSE_CONFIG_TIMEOUT,
@@ -3153,14 +4028,24 @@ impl ComposeExecutor {
             "resolve Compose security configuration",
         )
         .await?;
+        let diagnostics = ComposeCommandDiagnostics {
+            argv,
+            exit_code: output.status.code(),
+            stderr: sanitize_config_stderr(&output.stderr, &redact_values),
+        };
         if !output.status.success() {
-            let cause = safe_compose_config_failure(&output.stderr);
-            return Err(ComposeError::CommandFailed {
+            let (class, cause) =
+                classify_compose_config_failure_with_status(&output.stderr, output.status.code());
+            return Err(ComposeError::ConfigResolutionFailed {
                 project: project_name.to_string(),
-                reason: format!(
-                    "Compose configuration resolution failed ({}). {cause} Run docker compose config against the same source files, override, and environment for the full diagnostic.",
-                    output.status
-                ),
+                class,
+                exit_status: output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string()),
+                cause,
+                diagnostics: Box::new(diagnostics),
             });
         }
         let resolved =
@@ -3168,14 +4053,26 @@ impl ComposeExecutor {
                 compose_source: project_name.to_string(),
                 reason: format!("resolved configuration is not UTF-8: {error}"),
             })?;
-        self.validate_compose_security_policy("resolved Compose configuration", &resolved)?;
-        Self::validate_compose_filesystem_confinement_with_policy(
-            &canonical_root,
-            compose_file,
+        // Idempotent for the substituted files; resolves anything Compose
+        // pulled in that was not snapshotted (none today, defensively).
+        let reinterpolated = compose_interpolation::interpolate_document(
             "resolved Compose configuration",
             &resolved,
-            &self.policy,
+            &interpolation.0,
         )?;
+        interpolation.1.extend(reinterpolated.unset_variables);
+        interpolation.2.extend(reinterpolated.referenced_variables);
+        let resolved = reinterpolated.content;
+        self.validate_compose_security_policy("resolved Compose configuration", &resolved)?;
+        if input.filesystem_checks || project_dir.is_none() {
+            Self::validate_compose_filesystem_confinement_with_policy(
+                &canonical_root,
+                compose_file,
+                "resolved Compose configuration",
+                &resolved,
+                &self.policy,
+            )?;
+        }
         // Effective file/build paths may point into these archives. Keep them with
         // the deployment checkout; its lifecycle owns their cleanup.
         if let Some(cache_name) = snapshots
@@ -3195,7 +4092,7 @@ impl ComposeExecutor {
                 let _ = snapshots.cache.keep();
             }
         }
-        Ok((resolved, None))
+        Ok((resolved, diagnostics))
     }
 
     /// The workflow removes its checkout after deployment. Image builds and env
@@ -3318,6 +4215,7 @@ impl ComposeExecutor {
                         }
                     }
                 }
+                Self::tolerate_missing_env_files(base, definition);
                 if let Some(file) = definition
                     .get_mut("extends")
                     .and_then(|v| v.get_mut("file"))
@@ -3483,6 +4381,22 @@ impl ComposeExecutor {
                 });
             }
             let content = std::fs::read_to_string(&path)?;
+            // Referenced files are interpolated with the same variables as
+            // the root file, so their values are validated as deployed.
+            let interpolated = compose_interpolation::interpolate_document(
+                "Compose reference",
+                &content,
+                &snapshots.interpolation.0,
+            )?;
+            snapshots
+                .interpolation
+                .1
+                .extend(interpolated.unset_variables);
+            snapshots
+                .interpolation
+                .2
+                .extend(interpolated.referenced_variables);
+            let content = interpolated.content;
             let snapshot =
                 Box::pin(self.snapshot_compose_document(&scope, &directory, &content, snapshots))
                     .await?;
@@ -3517,6 +4431,51 @@ impl ComposeExecutor {
             });
         }
         Ok(path)
+    }
+
+    /// Rewrite each `env_file` entry naming a file absent from `base` to
+    /// `{path, required: false}` for the config step. Deployment writes the
+    /// file (synthesized from the project environment when the repository
+    /// lacks it), so a `.env` that is only created at deploy time must not
+    /// fail resolution. Existing files keep their entries unchanged.
+    fn tolerate_missing_env_files(base: &Path, definition: &mut Value) {
+        let Some(env_file) = definition.get_mut("env_file") else {
+            return;
+        };
+        let missing = |path: &str| {
+            !path.is_empty()
+                && !Self::contains_interpolation(path)
+                && base.join(path).symlink_metadata().is_err()
+        };
+        let optional = |path: &str| {
+            let mut entry = Mapping::new();
+            entry.insert(Value::from("path"), Value::from(path));
+            entry.insert(Value::from("required"), Value::Bool(false));
+            Value::Mapping(entry)
+        };
+        match env_file {
+            Value::String(path) if missing(path) => {
+                *env_file = Value::Sequence(vec![optional(path)]);
+            }
+            Value::Sequence(entries) => {
+                for entry in entries.iter_mut() {
+                    match entry {
+                        Value::String(path) if missing(path) => *entry = optional(path),
+                        Value::Mapping(mapping) => {
+                            let absent = mapping
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .is_some_and(missing);
+                            if absent {
+                                mapping.insert(Value::from("required"), Value::Bool(false));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn validate_source_security(&self, content: &str) -> Result<(), ComposeError> {
@@ -4562,12 +5521,11 @@ impl ComposeExecutor {
                     )
                 } else {
                     format!(
-                        "image '{image}' uses a variable, which is checked before variables are \
-                         resolved because it could otherwise select another deployment's local \
-                         image. Write the literal registry reference (for example \
-                         ghcr.io/org/app:1.2.3), or have an instance administrator disable \
-                         'Block variables in guarded fields' so Temps resolves variables first \
-                         and checks the result"
+                        "image '{image}' still contains a variable after Temps resolved the \
+                         project environment and the repository .env, so the image it selects \
+                         cannot be checked. Define the variable in the environment's variables \
+                         or the repository .env, give it a default (${{VAR:-ghcr.io/org/app:1}}), \
+                         or write the literal registry reference (for example ghcr.io/org/app:1.2.3)"
                     )
                 })
             } else if self.enforced(PolicyCheck::ImageReferences) && is_temps_internal {
@@ -12422,7 +13380,7 @@ volumes:
                 "services:\n  app:\n    image: ghcr.io/org/app:${TAG:-latest}\n",
                 [
                     "'ghcr.io/org/app:${TAG:-latest}'",
-                    "Block variables in guarded fields",
+                    "still contains a variable",
                 ],
                 None,
             ),
@@ -14253,7 +15211,15 @@ services:
             ),
             (
                 "unexpected Compose error: repo-only-secret",
-                "Compose rejected the source files",
+                "error Temps does not recognise",
+            ),
+            (
+                "unknown flag: --no-env-resolution",
+                "does not support the --no-env-resolution option",
+            ),
+            (
+                "unknown flag: --no-env-resolution\nSee 'docker compose config --help'.",
+                "v2.35.0 or newer",
             ),
         ];
         for (diagnostic, expected) in cases {
@@ -14287,13 +15253,26 @@ services:
                 &HashMap::new(),
             )
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        let ComposeError::ConfigResolutionFailed {
+            class, diagnostics, ..
+        } = &error
+        else {
+            panic!("expected a config resolution failure, got {error}");
+        };
+        assert_eq!(*class, ComposeConfigFailureClass::InvalidModel);
+        assert_eq!(error.class(), ComposeCheckErrorClass::ConfigResolution);
+        // The exact command is reported, so the step can be reproduced.
+        assert!(diagnostics.argv.iter().any(|arg| arg == "config"));
+        assert!(diagnostics.argv.iter().any(|arg| arg == "--no-interpolate"));
+        assert!(diagnostics.exit_code.is_some_and(|code| code != 0));
+        assert!(!diagnostics.stderr.is_empty());
+        assert!(!diagnostics.stderr.contains("repo-only-secret"));
+        let error = error.to_string();
         assert!(
             error.contains("services.web.ports expects a value of type array"),
             "{error}"
         );
-        assert!(error.contains("docker compose config"), "{error}");
         assert!(!error.contains("repo-only-secret"), "{error}");
     }
 
@@ -14849,13 +15828,33 @@ services:
 
     #[test]
     fn reset_tags_require_resolution_without_policy_exceptions() {
-        let executor = executor_with_checks_disabled(&[]);
-        assert!(executor.needs_resolution(
-            "services: {app: {image: alpine, shm_size: !reset null}}",
+        assert_eq!(
+            ComposeExecutor::resolution_reasons(
+                "services: {app: {image: alpine, shm_size: !reset null}}",
+                None
+            ),
+            vec!["Compose merge tags"]
+        );
+        assert!(ComposeExecutor::resolution_reasons(
+            "services: {app: {image: alpine, shm_size: 128m}}",
             None
-        ));
-        assert!(
-            !executor.needs_resolution("services: {app: {image: alpine, shm_size: 128m}}", None)
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn resolution_depends_on_file_features_not_policy() {
+        // Interpolation used to force `docker compose config` when its check
+        // was disabled, so disabling a check could add a failing step.
+        let interpolated = "services: {app: {image: '${IMG:-ghcr.io/example/app:1}'}}";
+        assert!(ComposeExecutor::resolution_reasons(interpolated, None).is_empty());
+        assert!(ComposeExecutor::resolution_reasons(interpolated, Some("  \n")).is_empty());
+        assert_eq!(
+            ComposeExecutor::resolution_reasons(
+                "include: [other.yml]\nservices: {app: {extends: {file: base.yml, service: app}}}",
+                Some("services: {app: {ports: ['8080:80']}}")
+            ),
+            vec!["project override", "include", "extends"]
         );
     }
 
@@ -16028,5 +17027,345 @@ services:
         let web_env = &model["services"]["web"]["environment"];
         assert_eq!(web_env["GREETING"], "from-temps", "{web_env}");
         assert_eq!(web_env["APP_NAME"], "sample-compose-app", "{web_env}");
+    }
+
+    // ---- Standard Compose idioms, resolution and diagnostics ----
+
+    /// The idioms an ordinary Compose file uses: an image with a default, an
+    /// optional-in-practice `.env` that is not committed, and defaults in
+    /// environment and ports.
+    const IDIOMATIC_COMPOSE: &str = "services:\n  app:\n    image: ${IMG:-ghcr.io/example/app:1}\n    env_file: .env\n    environment:\n      GREETING: ${GREETING:-x}\n    ports:\n      - \"127.0.0.1:${APP_PORT:-8080}:80\"\n";
+
+    fn idiomatic_input<'a>(
+        root: &'a Path,
+        environment: &'a HashMap<String, String>,
+        override_content: Option<&'a str>,
+    ) -> ComposeCheckInput<'a> {
+        ComposeCheckInput {
+            project_name: "temps-idiom-test",
+            project_dir: Some(root),
+            compose_file: "docker-compose.yml",
+            content: IDIOMATIC_COMPOSE,
+            override_content,
+            excluded_services: &[],
+            environment,
+            repository_env: None,
+            filesystem_checks: true,
+            allow_cli: true,
+        }
+    }
+
+    fn resolved_service(content: &str) -> Value {
+        let model: Value = serde_yaml::from_str(content).unwrap();
+        model["services"]["app"].clone()
+    }
+
+    #[tokio::test]
+    async fn standard_idioms_pass_with_the_default_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = HashMap::new();
+        let executor =
+            disabled_executor(root.path().join("data")).with_security_policy(Default::default());
+        let checked = executor
+            .check_configuration(&idiomatic_input(root.path(), &environment, None))
+            .await
+            .unwrap();
+        // No merge feature is used, so no `docker compose config` step runs.
+        assert!(checked.resolution.resolution_reasons.is_empty());
+        assert!(checked.resolution.command.is_none());
+        let app = resolved_service(&checked.content);
+        assert_eq!(app["image"], "ghcr.io/example/app:1");
+        assert_eq!(app["environment"]["GREETING"], "x");
+        assert_eq!(app["ports"][0], "127.0.0.1:8080:80");
+        assert_eq!(app["env_file"], ".env");
+        // Every reference has a default, so nothing is reported as unset.
+        assert!(checked.resolution.unset_variables.is_empty());
+        assert_eq!(
+            checked.resolution.referenced_variables,
+            BTreeSet::from(["APP_PORT", "GREETING", "IMG"].map(str::to_string))
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_idioms_behave_the_same_with_the_interpolation_check_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = HashMap::new();
+        let enforced = disabled_executor(root.path().join("data"))
+            .with_security_policy(Default::default())
+            .check_configuration(&idiomatic_input(root.path(), &environment, None))
+            .await
+            .unwrap();
+        let relaxed = executor_with_checks_disabled(&[PolicyCheck::Interpolation])
+            .check_configuration(&idiomatic_input(root.path(), &environment, None))
+            .await
+            .unwrap();
+        assert_eq!(enforced.content, relaxed.content);
+        assert_eq!(
+            enforced.resolution.resolution_reasons,
+            relaxed.resolution.resolution_reasons
+        );
+        assert!(relaxed.resolution.command.is_none());
+    }
+
+    #[tokio::test]
+    async fn standard_idioms_resolve_through_compose_config_with_an_override() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            println!("Docker Compose not available, skipping");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let environment = HashMap::from([("IMG".to_string(), "ghcr.io/example/app:2".to_string())]);
+        // Missing `.env` and a project variable overriding the image default.
+        let override_content =
+            "services:\n  app:\n    environment:\n      EXTRA: '${GREETING:-y}'\n";
+        for checks in [&[][..], &[PolicyCheck::Interpolation][..]] {
+            let checked = executor_with_checks_disabled(checks)
+                .check_configuration(&idiomatic_input(
+                    root.path(),
+                    &environment,
+                    Some(override_content),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("checks disabled {checks:?}: {error}"));
+            assert_eq!(
+                checked.resolution.resolution_reasons,
+                vec!["project override"]
+            );
+            let command = checked.resolution.command.as_ref().unwrap();
+            assert_eq!(command.exit_code, Some(0));
+            let app = resolved_service(&checked.content);
+            assert_eq!(app["image"], "ghcr.io/example/app:2", "{}", checked.content);
+            // GREETING is unset, so the override's own default applies.
+            assert!(
+                app["environment"]
+                    .as_sequence()
+                    .is_some_and(|env| env.contains(&Value::from("EXTRA=y"))
+                        && env.contains(&Value::from("GREETING=x"))),
+                "{}",
+                checked.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn substituted_values_are_still_held_to_the_policy_without_echoing_them() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = HashMap::from([
+            ("HOST_DIR".to_string(), "/srv/private-host-dir".to_string()),
+            ("PRIV".to_string(), "yes".to_string()),
+        ]);
+        let executor =
+            disabled_executor(root.path().join("data")).with_security_policy(Default::default());
+        for (content, field) in [
+            (
+                "services: {app: {image: 'ghcr.io/example/app:1', volumes: ['${HOST_DIR}:/data']}}",
+                "volumes",
+            ),
+            (
+                "services: {app: {image: 'ghcr.io/example/app:1', privileged: '${PRIV:-false}'}}",
+                "privileged",
+            ),
+            (
+                "services: {app: {image: '${IMG:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}'}}",
+                "image",
+            ),
+            (
+                "services: {app: {image: '${IMG:-temps.internal/other-project:latest}'}}",
+                "image",
+            ),
+        ] {
+            let error = executor
+                .check_configuration(&ComposeCheckInput {
+                    content,
+                    ..idiomatic_input(root.path(), &environment, None)
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.class(), ComposeCheckErrorClass::PolicyViolation, "{error}");
+            assert!(
+                matches!(&error, ComposeError::SecurityPolicyViolation { field: f, .. } if f == field),
+                "{content}: {error}"
+            );
+            assert!(!error.to_string().contains("private-host-dir"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn required_variables_fail_with_their_name_only() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = HashMap::new();
+        let error = executor_with_checks_disabled(&[])
+            .check_configuration(&ComposeCheckInput {
+                content: "services: {app: {image: '${IMG:?set the image}'}}",
+                ..idiomatic_input(root.path(), &environment, None)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.class(), ComposeCheckErrorClass::Interpolation);
+        assert!(error.to_string().contains("IMG"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_compose_flags_map_to_a_specific_error() {
+        for (stderr, status) in [
+            (&b"unknown flag: --no-env-resolution\n"[..], Some(1)),
+            (&b"unknown flag: --no-env-resolution\n"[..], Some(16)),
+            (&b""[..], Some(COMPOSE_EXIT_COMMAND_SYNTAX)),
+        ] {
+            let (class, cause) = classify_compose_config_failure_with_status(stderr, status);
+            assert_eq!(class, ComposeConfigFailureClass::UnsupportedComposeVersion);
+            assert!(cause.contains(MIN_COMPOSE_VERSION), "{cause}");
+            assert!(cause.contains("docker compose version"), "{cause}");
+            assert!(!cause.contains("does not recognise"), "{cause}");
+            let error = ComposeError::ConfigResolutionFailed {
+                project: "temps-1-1".to_string(),
+                class,
+                exit_status: "16".to_string(),
+                cause,
+                diagnostics: Box::new(ComposeCommandDiagnostics {
+                    argv: vec![],
+                    exit_code: status,
+                    stderr: String::new(),
+                }),
+            };
+            assert_eq!(
+                error.class(),
+                ComposeCheckErrorClass::UnsupportedComposeVersion
+            );
+        }
+        let (class, _) = classify_compose_config_failure_with_status(
+            b"compose: is not a docker command",
+            Some(1),
+        );
+        assert_eq!(class, ComposeConfigFailureClass::UnsupportedComposeVersion);
+    }
+
+    #[test]
+    fn config_stderr_is_sanitized_but_keeps_the_error_shape() {
+        let stderr = b"validating /checkout/app/compose.yml: services.app.environment.TOKEN must be a string\nline 7: value \"hunter2-secret\" from TOKEN=hunter2-secret at https://user:pw@example.invalid/x\n${SECRET_VAR:-fallback}";
+        let sanitized = sanitize_config_stderr(stderr, &["project-variable-value".to_string()]);
+        assert!(
+            sanitized.contains("services.app.environment.TOKEN must be a string"),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains("line 7"), "{sanitized}");
+        for secret in ["hunter2-secret", "/checkout", "user:pw", "fallback"] {
+            assert!(!sanitized.contains(secret), "{secret} leaked: {sanitized}");
+        }
+        let long: Vec<u8> = (0..100)
+            .flat_map(|line| format!("line {line}\n").into_bytes())
+            .collect();
+        let sanitized = sanitize_config_stderr(&long, &[]);
+        assert_eq!(sanitized.lines().count(), MAX_SANITIZED_STDERR_LINES + 1);
+        assert!(sanitized.ends_with("line 99"));
+    }
+
+    #[test]
+    fn compose_support_reports_missing_config_flags() {
+        let old_help = "Usage: docker compose config [OPTIONS]\n      --no-normalize   Don't normalize\n      --no-path-resolution  Don't resolve\n      --no-interpolate  Don't interpolate\n";
+        let support = ComposeExecutor::compose_support_from(Some("2.29.7".to_string()), old_help);
+        assert!(support.available);
+        assert!(!support.supported());
+        assert_eq!(
+            support.missing_flags,
+            vec!["--no-env-resolution".to_string()]
+        );
+        let problem = support.problem.unwrap();
+        assert!(
+            problem.contains("v2.29.7") && problem.contains(MIN_COMPOSE_VERSION),
+            "{problem}"
+        );
+
+        let new_help =
+            format!("{old_help}      --no-env-resolution  Don't resolve service env files\n");
+        let support = ComposeExecutor::compose_support_from(Some("2.35.1".to_string()), &new_help);
+        assert!(support.supported());
+        assert!(support.problem.is_none());
+    }
+
+    #[test]
+    fn missing_env_files_become_optional_for_the_config_step() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("present.env"), "A=1\n").unwrap();
+        let mut definition: Value = serde_yaml::from_str(
+            "env_file: [.env, present.env, {path: other.env}, {path: present.env, required: true}]",
+        )
+        .unwrap();
+        ComposeExecutor::tolerate_missing_env_files(root.path(), &mut definition);
+        let expected: Value = serde_yaml::from_str(
+            "env_file: [{path: .env, required: false}, present.env, {path: other.env, required: false}, {path: present.env, required: true}]",
+        )
+        .unwrap();
+        assert_eq!(definition, expected);
+
+        let mut single: Value = serde_yaml::from_str("env_file: .env").unwrap();
+        ComposeExecutor::tolerate_missing_env_files(root.path(), &mut single);
+        assert_eq!(single["env_file"][0]["required"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn preview_and_deploy_report_the_same_policy_error() {
+        let root = tempfile::tempdir().unwrap();
+        let content = "services: {app: {image: 'ghcr.io/example/app:1', privileged: true}}";
+        let environment = HashMap::new();
+        let executor =
+            disabled_executor(root.path().join("data")).with_security_policy(Default::default());
+        let deploy_error = executor
+            .check_configuration(&ComposeCheckInput {
+                content,
+                ..idiomatic_input(root.path(), &environment, None)
+            })
+            .await
+            .unwrap_err();
+        let report = executor
+            .check_report(ComposeCheckRequest {
+                project_name: "temps-idiom-test".to_string(),
+                compose_file: "docker-compose.yml".to_string(),
+                content: content.to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(!report.passed);
+        assert_eq!(report.error_class, Some(deploy_error.class()));
+        assert_eq!(
+            report.error_class,
+            Some(ComposeCheckErrorClass::PolicyViolation)
+        );
+        assert_eq!(
+            report.error.as_deref(),
+            Some(deploy_error.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn override_lists_repeating_the_repository_file_are_not_duplicated() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".env"), "A=1\n").unwrap();
+        let environment = HashMap::new();
+        let content = "services:\n  app:\n    image: ghcr.io/example/app:1\n    env_file: .env\n    volumes: [data:/data]\nvolumes: {data: {}}\n";
+        let override_content = "services:\n  app:\n    env_file: [.env]\n    volumes: [data:/data, cache:/cache]\nvolumes: {cache: {}}\n";
+        let resolved = executor_with_checks_disabled(&[])
+            .resolve_configuration(&ComposeCheckInput {
+                content,
+                allow_cli: false,
+                ..idiomatic_input(root.path(), &environment, Some(override_content))
+            })
+            .await
+            .unwrap();
+        let overlay: Value =
+            serde_yaml::from_str(resolved.override_content.as_deref().unwrap()).unwrap();
+        assert!(
+            overlay["services"]["app"].get("env_file").is_none(),
+            "{overlay:?}"
+        );
+        assert_eq!(
+            overlay["services"]["app"]["volumes"],
+            serde_yaml::from_str::<Value>("[cache:/cache]").unwrap()
+        );
+        assert_eq!(resolved.notes.len(), 1);
     }
 }

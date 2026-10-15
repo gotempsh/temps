@@ -368,6 +368,7 @@ pub fn render_effective_compose_preview_with_policy(
         validate_preview_composition(&override_document, policy)?;
         validate_preview_override(&base, &override_document, policy)?;
         normalize_sensitive_maps(&mut override_document);
+        super::compose_check::deduplicate_override_lists(&base, &mut override_document);
         merge_compose_value(&mut base, override_document, &[]);
     }
     validate_preview_build_images(&base, policy)?;
@@ -731,7 +732,13 @@ fn merge_compose_value(
             if compose_sequence_replaces(path) {
                 *base = serde_yaml::Value::Sequence(override_items);
             } else if let serde_yaml::Value::Sequence(base_items) = base {
-                base_items.append(&mut override_items);
+                // Compose appends these lists; identical items are merged
+                // once, matching the deploy-time de-duplication.
+                for item in override_items.drain(..) {
+                    if !base_items.contains(&item) {
+                        base_items.push(item);
+                    }
+                }
             }
         }
         (base, override_value) => *base = override_value,

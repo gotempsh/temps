@@ -92,6 +92,20 @@ pub struct RepositoryComposeServicesDomain {
     pub services: Vec<ComposeServicePreviewDomain>,
 }
 
+/// A Compose file read from a connected repository, with what is needed to
+/// read its neighbours (the repository `.env`) at the same revision.
+#[derive(Debug, Clone)]
+pub struct RepositoryComposeSourceDomain {
+    pub repository_id: i32,
+    pub connection_id: i32,
+    pub owner: String,
+    pub name: String,
+    /// Branch name or commit SHA the file was read at.
+    pub git_ref: String,
+    pub path: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RepositoryComposePreviewDomain {
     pub repository_id: i32,
@@ -3692,9 +3706,95 @@ impl GitProviderManager {
         })
     }
 
+    /// Read one text file from a connected repository through the provider
+    /// API, at a branch name or commit SHA. No checkout is made.
+    pub async fn read_repository_text_file(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        name: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<String, GitProviderManagerError> {
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
+        };
+        let file = self
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = owner.to_string();
+                let name = name.to_string();
+                let path = path.to_string();
+                let git_ref = git_ref.to_string();
+                async move {
+                    provider_service
+                        .get_file_content(&access_token, &owner, &name, &path, Some(&git_ref))
+                        .await
+                }
+            })
+            .await?;
+        Ok(decode_file_content(&file.content, &file.encoding))
+    }
+
+    /// Fetch a Compose file from a connected repository at `branch` (the
+    /// repository's default branch when `None`).
+    pub async fn fetch_repository_compose_source(
+        &self,
+        repository_id: i32,
+        branch: Option<String>,
+        path: String,
+    ) -> Result<RepositoryComposeSourceDomain, GitProviderManagerError> {
+        let repository = self.get_repository_for_user(repository_id).await?;
+        let git_ref = branch.unwrap_or_else(|| repository.default_branch.clone());
+        let content = self
+            .read_repository_text_file(
+                repository.git_provider_connection_id,
+                &repository.owner,
+                &repository.name,
+                &path,
+                &git_ref,
+            )
+            .await?;
+        Ok(RepositoryComposeSourceDomain {
+            repository_id,
+            connection_id: repository.git_provider_connection_id,
+            owner: repository.owner,
+            name: repository.name,
+            git_ref,
+            path,
+            content,
+        })
+    }
+
+    /// Render the effective Compose document for the settings mini editor.
+    /// The presets layer removes disabled services, applies the inline
+    /// override, and redacts sensitive values before this returns.
+    pub fn render_repository_compose_preview(
+        source: &RepositoryComposeSourceDomain,
+        compose_override: Option<&str>,
+        excluded_services: &[String],
+        preview_policy: &temps_entities::compose_security::ComposeSecurityPolicy,
+    ) -> Result<RepositoryComposePreviewDomain, GitProviderManagerError> {
+        let preview = temps_presets::render_effective_compose_preview_with_policy(
+            &source.content,
+            compose_override,
+            excluded_services,
+            preview_policy,
+        )
+        .map_err(|error| GitProviderManagerError::ComposePreview {
+            path: source.path.clone(),
+            source: error,
+        })?;
+        Ok(RepositoryComposePreviewDomain {
+            repository_id: source.repository_id,
+            path: source.path.clone(),
+            preview,
+        })
+    }
+
     /// Fetch and render the effective Compose document for the settings mini
-    /// editor. The presets layer removes disabled services, applies the inline
-    /// override, and redacts sensitive values before this method returns.
+    /// editor. See [`Self::render_repository_compose_preview`].
     pub async fn calculate_repository_compose_preview_live(
         &self,
         repository_id: i32,
@@ -3704,46 +3804,15 @@ impl GitProviderManager {
         excluded_services: Vec<String>,
         preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
     ) -> Result<RepositoryComposePreviewDomain, GitProviderManagerError> {
-        let repository = self.get_repository_for_user(repository_id).await?;
-
-        let connection_id = repository.git_provider_connection_id;
-        let provider_service = {
-            let connection = self.get_connection(connection_id).await?;
-            self.get_provider_service(connection.provider_id).await?
-        };
-        let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
-        let file = self
-            .execute_with_refresh(connection_id, |access_token| {
-                let provider_service = provider_service.clone();
-                let owner = repository.owner.clone();
-                let name = repository.name.clone();
-                let target_branch = target_branch.clone();
-                let path = path.clone();
-                async move {
-                    provider_service
-                        .get_file_content(&access_token, &owner, &name, &path, Some(&target_branch))
-                        .await
-                }
-            })
+        let source = self
+            .fetch_repository_compose_source(repository_id, branch, path)
             .await?;
-
-        let content = decode_file_content(&file.content, &file.encoding);
-        let preview = temps_presets::render_effective_compose_preview_with_policy(
-            &content,
+        Self::render_repository_compose_preview(
+            &source,
             compose_override.as_deref(),
             &excluded_services,
             &preview_policy,
         )
-        .map_err(|source| GitProviderManagerError::ComposePreview {
-            path: path.clone(),
-            source,
-        })?;
-
-        Ok(RepositoryComposePreviewDomain {
-            repository_id,
-            path,
-            preview,
-        })
     }
 
     /// Detect presets in directories with proper grouping and filtering

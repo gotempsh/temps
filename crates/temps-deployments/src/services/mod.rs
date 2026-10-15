@@ -5,6 +5,7 @@
 pub mod services;
 pub use services::*;
 
+pub mod compose_check_service;
 pub mod container_operations;
 pub use container_operations::*;
 

@@ -21,7 +21,8 @@ use temps_core::{
 };
 use temps_database::DbConnection;
 use temps_deployer::compose::{
-    ComposeDeployRequest, ComposeExecutor, ComposeOutputSink, EnvFileSource,
+    ComposeCheckInput, ComposeDeployRequest, ComposeError, ComposeExecutor, ComposeOutputSink,
+    EnvFileSource, ResolvedComposeConfiguration,
 };
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
 use temps_logs::{LogLevel, LogService};
@@ -683,6 +684,121 @@ impl DeployComposeJob {
         Err(WorkflowError::WorkflowCancelled)
     }
 
+    /// Keep the project's stored Compose check current, so the settings page
+    /// stops (or starts) flagging it. Best-effort: the deployment outcome
+    /// never depends on this write.
+    async fn record_compose_check(
+        &self,
+        passed: bool,
+        error_class: Option<temps_presets::compose_check::ComposeCheckErrorClass>,
+        error: Option<String>,
+    ) {
+        if let Err(error) = crate::services::compose_check_service::store_validation_report(
+            self.db.as_ref(),
+            self.project_id,
+            passed,
+            error_class,
+            error,
+        )
+        .await
+        {
+            tracing::warn!(
+                project_id = self.project_id,
+                deployment_id = self.deployment_id,
+                "Failed to record the Compose configuration check: {error}"
+            );
+        }
+    }
+
+    /// Write a configuration-check failure to the deployment log: the error
+    /// class, and for a `docker compose config` failure the exact command,
+    /// its exit code and the sanitized Compose output.
+    async fn log_compose_check_failure(&self, error: &ComposeError) {
+        tracing::error!(
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            deployment_id = self.deployment_id,
+            error_class = %error.class(),
+            error = %error,
+            "Compose configuration check failed"
+        );
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        let _ = self
+            .log_service
+            .log_error(
+                log_id,
+                &format!(
+                    "Compose configuration check failed ({}): {error}",
+                    error.class()
+                ),
+            )
+            .await;
+        if let ComposeError::ConfigResolutionFailed { diagnostics, .. } = error {
+            let _ = self
+                .log_service
+                .log_error(
+                    log_id,
+                    &format!(
+                        "Command: {}\nExit code: {}\nCompose output (sanitized):\n{}",
+                        diagnostics.argv.join(" "),
+                        diagnostics
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "none (terminated by signal)".to_string()),
+                        if diagnostics.stderr.is_empty() {
+                            "<empty>"
+                        } else {
+                            diagnostics.stderr.as_str()
+                        }
+                    ),
+                )
+                .await;
+        }
+    }
+
+    /// Say what the configuration check did, so a stack that boots with an
+    /// unexpected value can be traced back to a variable that was not set.
+    async fn log_compose_resolution(&self, resolution: &ResolvedComposeConfiguration) {
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        if let Some(command) = &resolution.command {
+            let _ = self
+                .log_service
+                .log_info(
+                    log_id,
+                    &format!(
+                        "Resolved Compose configuration ({}) with: {}",
+                        resolution.resolution_reasons.join(", "),
+                        command.argv.join(" ")
+                    ),
+                )
+                .await;
+        }
+        if !resolution.unset_variables.is_empty() {
+            let names: Vec<&str> = resolution
+                .unset_variables
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let _ = self
+                .log_service
+                .log_warning(
+                    log_id,
+                    &format!(
+                        "Compose variable(s) {} are not set in this environment or the repository .env and have no default; they were replaced with empty strings, as Docker Compose does.",
+                        names.join(", ")
+                    ),
+                )
+                .await;
+        }
+        for note in &resolution.notes {
+            let _ = self.log_service.log_info(log_id, note).await;
+        }
+    }
+
     async fn execute_locked(
         &self,
         mut context: WorkflowContext,
@@ -836,23 +952,59 @@ impl DeployComposeJob {
             }
         };
 
-        let (compose_content, compose_override) = self
+        if !self.excluded_services.is_empty() {
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "Excluding service(s) from deployment: {}",
+                            self.excluded_services.join(", ")
+                        ),
+                    )
+                    .await;
+            }
+        }
+
+        // Every configuration check, before Docker or database mutations and
+        // before the running stack is touched: variables are resolved first,
+        // then the security policy judges the values that will deploy.
+        // Rejecting after teardown would cause downtime on the running
+        // deployment for what is purely a configuration problem. "Run compose
+        // check" and the settings preview run this same function.
+        let checked = match self
             .compose_executor
-            .resolve_security_configuration(
-                &project_name,
-                repo_path.as_deref(),
-                compose_file_name,
-                &compose_content,
-                self.compose_override.as_deref(),
-                &self.environment_vars,
-            )
+            .check_configuration(&ComposeCheckInput {
+                project_name: &project_name,
+                project_dir: repo_path.as_deref(),
+                compose_file: compose_file_name,
+                content: &compose_content,
+                override_content: self.compose_override.as_deref(),
+                excluded_services: &self.excluded_services,
+                environment: &self.environment_vars,
+                repository_env: None,
+                filesystem_checks: repo_path.is_some(),
+                allow_cli: true,
+            })
             .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to resolve Compose policy for project {}: {error}",
-                    self.project_id
-                ))
-            })?;
+        {
+            Ok(checked) => {
+                self.record_compose_check(true, None, None).await;
+                checked
+            }
+            Err(error) => {
+                self.log_compose_check_failure(&error).await;
+                self.record_compose_check(false, Some(error.class()), Some(error.to_string()))
+                    .await;
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Compose configuration check failed for project {} ({}): {error}",
+                    self.project_id,
+                    error.class()
+                )));
+            }
+        };
+        self.log_compose_resolution(&checked.resolution).await;
 
         // Full service list from the raw compose file, *before* exclusion
         // stripping — so excluded services still show up as re-includable
@@ -862,8 +1014,8 @@ impl DeployComposeJob {
         // itself.
         let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
             temps_presets::list_compose_services_with_override(
-                &compose_content,
-                compose_override.as_deref(),
+                &checked.resolved_content,
+                checked.override_content.as_deref(),
             )
             .map(|services| {
                 services
@@ -929,41 +1081,11 @@ impl DeployComposeJob {
             }
         }
 
-        // Strip any user-excluded services (and references to them in other
-        // services' `depends_on`) before anything downstream — env-file
-        // planning, security preflight, and the actual `docker compose up` —
-        // ever sees them. Compose's own `-f` override merging can only
-        // add/replace fields on a service, never unset one, so this has to
-        // rewrite the base document rather than layer another override file.
-        let compose_content = if self.excluded_services.is_empty() {
-            compose_content
-        } else {
-            if let Some(ref log_id) = self.log_id {
-                let _ = self
-                    .log_service
-                    .log_info(
-                        log_id,
-                        &format!(
-                            "Excluding service(s) from deployment: {}",
-                            self.excluded_services.join(", ")
-                        ),
-                    )
-                    .await;
-            }
-            match self
-                .compose_executor
-                .strip_excluded_services(&compose_content, &self.excluded_services)
-            {
-                Ok(stripped) => stripped,
-                Err(e) => {
-                    let error_msg = format!("Failed to apply excluded services: {}", e);
-                    if let Some(ref log_id) = self.log_id {
-                        let _ = self.log_service.log_error(log_id, &error_msg).await;
-                    }
-                    return Err(WorkflowError::JobExecutionFailed(error_msg));
-                }
-            }
-        };
+        // Excluded services (and references to them in other services'
+        // `depends_on`) were removed by the check above, before env-file
+        // planning and the actual `docker compose up` see the model.
+        let compose_content = checked.content;
+        let compose_override = checked.override_content;
 
         // Read .env from repo if it exists
         let env_content = if let Some(selected_repo_dir) = repo_path.as_deref() {
@@ -1094,37 +1216,6 @@ impl DeployComposeJob {
                         )
                         .await;
                 }
-            }
-        }
-
-        // Validate the compose security policy BEFORE tearing down the existing
-        // stack. Rejecting after teardown would cause downtime on the running
-        // deployment for what is purely a configuration problem.
-        if let Err(error) = self
-            .compose_executor
-            .preflight_validate(&compose_content, compose_override.as_deref())
-        {
-            let error_msg = format!("Compose security policy rejected deployment: {error}");
-            tracing::error!(error = %error_msg, "Docker Compose preflight validation failed");
-            if let Some(ref log_id) = self.log_id {
-                let _ = self.log_service.log_error(log_id, &error_msg).await;
-            }
-            return Err(WorkflowError::JobExecutionFailed(error_msg));
-        }
-        if let Some(selected_repo_dir) = repo_path.as_deref() {
-            if let Err(e) = self.compose_executor.preflight_validate_filesystem(
-                selected_repo_dir,
-                compose_file_name,
-                &compose_content,
-                compose_override.as_deref(),
-            ) {
-                let error_msg =
-                    format!("Compose filesystem security policy rejected deployment: {e}");
-                tracing::error!(error = %error_msg, "Docker Compose filesystem preflight failed");
-                if let Some(ref log_id) = self.log_id {
-                    let _ = self.log_service.log_error(log_id, &error_msg).await;
-                }
-                return Err(WorkflowError::JobExecutionFailed(error_msg));
             }
         }
 

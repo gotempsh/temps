@@ -31,7 +31,7 @@ temps-logs = { path = "../temps-logs" }
 temps-metrics = { path = "../temps-metrics" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
-temps-presets = { path = "../temps-presets" }
+temps-presets = { path = "../temps-presets", features = ["openapi"] }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network", features = ["control_plane"] }

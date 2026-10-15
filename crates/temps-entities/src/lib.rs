@@ -228,6 +228,7 @@ pub mod prelude;
 pub mod compose_security;
 pub mod compose_security_policies;
 pub mod compose_security_policy_changes;
+pub mod compose_validation_reports;
 
 pub mod compose_security_legacy_migrations;
 

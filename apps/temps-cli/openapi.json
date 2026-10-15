@@ -8809,6 +8809,191 @@
         ],
         "type": "string"
       },
+      "ComposeCheckCommand": {
+        "description": "The `docker compose` invocation a check ran, sanitized for display.",
+        "properties": {
+          "argv": {
+            "description": "Program and arguments. Contains paths and option names only; no\nvariable values are passed on the command line.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "exit_code": {
+            "description": "Process exit code; `None` when it was killed or did not start.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stderr": {
+            "description": "The tail of stderr with variable values, quoted text, assignments,\nURLs and absolute paths removed. Line numbers and error wording are\nkept.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "argv"
+        ],
+        "type": "object"
+      },
+      "ComposeCheckErrorClass": {
+        "description": "Stable, user-facing class of a Compose check failure. The deploy job, the\npreview and the check action all report the same class for the same input.",
+        "enum": [
+          "interpolation",
+          "policy_violation",
+          "invalid_path",
+          "invalid_yaml",
+          "invalid_override",
+          "unsupported_compose_version",
+          "config_resolution",
+          "compose_unavailable",
+          "internal"
+        ],
+        "type": "string"
+      },
+      "ComposeCheckReport": {
+        "description": "Result of running the deploy-time resolution and policy validation.",
+        "properties": {
+          "command": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckCommand"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "description": "The same message the deployment would fail with. Variable values are\nredacted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_class": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckErrorClass"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "notes": {
+            "description": "Caveats about what this check could not cover.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "passed": {
+            "description": "Whether the configuration would pass the deploy-time checks.",
+            "type": "boolean"
+          },
+          "referenced_variables": {
+            "description": "Variables the file references, in sorted order. Names only.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "resolution_ran": {
+            "description": "Whether `docker compose config` actually ran for this check.",
+            "type": "boolean"
+          },
+          "resolution_reasons": {
+            "description": "Why `docker compose config` had to run (project override, include,\nextends, YAML tags). Empty when the file was validated directly.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unset_variables": {
+            "description": "Variables referenced without a default that are not set; Compose\nsubstitutes an empty string for each.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "passed",
+          "resolution_reasons",
+          "resolution_ran",
+          "unset_variables",
+          "referenced_variables",
+          "notes"
+        ],
+        "type": "object"
+      },
+      "ComposeHostStatusResponse": {
+        "description": "The host's Docker Compose CLI as probed at startup.",
+        "properties": {
+          "available": {
+            "description": "Whether the Compose CLI ran.",
+            "type": "boolean"
+          },
+          "checked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "minimum_version": {
+            "type": "string"
+          },
+          "missing_flags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "probed": {
+            "description": "False until the startup probe finishes.",
+            "type": "boolean"
+          },
+          "problem": {
+            "description": "Operator-facing explanation when not supported.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "description": "Whether every `docker compose config` option Temps needs is present.",
+            "type": "boolean"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "probed",
+          "available",
+          "supported",
+          "minimum_version",
+          "missing_flags"
+        ],
+        "type": "object"
+      },
+      "ComposeOverrideRedundancy": {
+        "description": "How a saved project override relates to the repository Compose file.",
+        "enum": [
+          "identical",
+          "superset"
+        ],
+        "type": "string"
+      },
       "ComposePortMapping": {
         "description": "A Docker Compose service port mapping, reduced to the information the UI\nneeds to build a public route without confusing host and container ports.",
         "properties": {
@@ -8844,6 +9029,28 @@
           },
           {
             "properties": {
+              "compose_check": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComposeCheckReport",
+                    "description": "The deploy-time Compose check that rejected the configuration, when\nit ran: the `docker compose config` command, its sanitized output and\nthe referenced variable names. Variable values are never included."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "error_class": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComposeCheckErrorClass",
+                    "description": "The class a deployment of the same configuration would fail with."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "policy_check": {
                 "oneOf": [
                   {
@@ -8875,6 +9082,14 @@
               "null"
             ]
           },
+          "environmentId": {
+            "description": "Environment whose variables resolve `${VAR}`; defaults to the\nproject's production environment. Requires `project_id`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "excludedServices": {
             "items": {
               "type": "string"
@@ -8886,7 +9101,15 @@
           },
           "previewPolicy": {
             "$ref": "#/components/schemas/ComposeSecurityPolicy",
-            "description": "Advisory preview only. Deployment reloads the saved project policy."
+            "description": "Advisory preview only. Deployment reloads the saved project policy.\nIgnored when `project_id` is set: the saved policy is used instead."
+          },
+          "projectId": {
+            "description": "The project this Compose file deploys. When set, the preview runs the\ndeploy job's check with that project's saved security policy and the\nenvironment's variables (values are never returned), so it fails with\nthe same error class a deployment would.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -8896,6 +9119,17 @@
       },
       "ComposePreviewResponse": {
         "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckReport",
+                "description": "The deploy-time Compose check this preview ran (resolution, policy,\nreferenced variable names). `None` when the check is unavailable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "disabledServices": {
             "items": {
               "type": "string"
@@ -8911,6 +9145,24 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "overrideRedundancy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeOverrideRedundancy",
+                "description": "Set when the override repeats the whole repository file."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "overrideWarning": {
+            "description": "What to do about `override_redundancy`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "path": {
             "type": "string"
@@ -9181,6 +9433,49 @@
           "environmentVariables",
           "looksLikeDatabase",
           "ports"
+        ],
+        "type": "object"
+      },
+      "ComposeValidationReportResponse": {
+        "description": "The last stored Compose check for a project.",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_class": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckErrorClass"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outdated": {
+            "description": "True when the check ran under an older validation revision than this\nserver's and has not been repeated yet.",
+            "type": "boolean"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "passed",
+          "outdated",
+          "checked_at"
         ],
         "type": "object"
       },
@@ -100071,6 +100366,52 @@
         ]
       }
     },
+    "/platform/compose-status": {
+      "get": {
+        "operationId": "get_compose_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeHostStatusResponse"
+                }
+              }
+            },
+            "description": "Docker Compose CLI status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The host's Docker Compose CLI, as probed at startup. Compose deployments\nthat need `docker compose config` fail on an unsupported CLI; the console\nshows a platform warning from this.",
+        "tags": [
+          "Compose"
+        ]
+      }
+    },
     "/platform/features": {
       "get": {
         "description": "Always present, in every profile — a client must be able to tell\n\"unavailable here, and here is why\" from \"endpoint does not exist\".",
@@ -105501,6 +105842,81 @@
         ]
       }
     },
+    "/projects/{project_id}/compose-validation": {
+      "get": {
+        "operationId": "get_project_compose_validation",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ComposeValidationReportResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Last stored check, or null"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The project's most recent stored Compose check (from its last deployment\nor the revalidation after an upgrade); `null` when it was never checked.",
+        "tags": [
+          "Compose"
+        ]
+      }
+    },
     "/projects/{project_id}/custom-domains": {
       "get": {
         "operationId": "list_custom_domains_for_project",
@@ -106552,6 +106968,114 @@
         "summary": "Cancel a deployment",
         "tags": [
           "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/deployments/{deployment_id}/compose-check": {
+      "post": {
+        "operationId": "run_deployment_compose_check",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Deployment ID",
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeCheckReport"
+                }
+              }
+            },
+            "description": "Check result (passed or the failure)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not a Docker Compose project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, deployment or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Compose file could not be read from the Git provider"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Run the deploy job's Compose configuration check for a deployment, without\ndeploying: the deployment's commit, the project's current override,\nexclusions and security policy, and the environment's variables. Returns\nthe error the deployment would fail with, its class, and the exact\n`docker compose config` command with sanitized output. Read-only.",
+        "tags": [
+          "Compose"
         ]
       }
     },
@@ -130515,6 +131039,10 @@
     {
       "description": "Cron jobs management API",
       "name": "Crons"
+    },
+    {
+      "description": "Docker Compose configuration diagnostics",
+      "name": "Compose"
     },
     {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",

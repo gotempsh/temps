@@ -571,6 +571,55 @@ impl TempsPlugin for DeploymentsPlugin {
                 unreachable!("register_services runs exactly once per plugin instance");
             }
 
+            // Compose configuration checks outside a deployment: the
+            // "Run compose check" action, the settings preview (via the
+            // `ComposeConfigurationChecker` trait, so temps-git runs the
+            // deploy job's own validation without depending on this crate),
+            // the host Compose CLI status and post-upgrade revalidation.
+            let compose_check_service = Arc::new(
+                crate::services::compose_check_service::ComposeCheckService::new(
+                    context.require_service::<sea_orm::DatabaseConnection>(),
+                    context.require_service::<temps_core::EncryptionService>(),
+                    context.require_service::<temps_git::GitProviderManager>(),
+                    Arc::new(temps_deployer::compose::ComposeExecutor::new_with_handle(
+                        context.require_service::<temps_core::DockerHandle>(),
+                        config_service.data_dir(),
+                    )),
+                ),
+            );
+            context.register_service(compose_check_service.clone());
+            let compose_checker: Arc<
+                dyn temps_presets::compose_check::ComposeConfigurationChecker,
+            > = compose_check_service.clone();
+            context.register_service(compose_checker);
+            // Probe once at startup: an outdated Compose CLI is reported as a
+            // platform warning before the first deployment hits it.
+            tokio::spawn({
+                let service = compose_check_service.clone();
+                async move {
+                    service.probe_host().await;
+                }
+            });
+            // Re-check Compose projects whose stored check predates this
+            // binary's validation rules, after boot has settled. Sequential
+            // and one-shot; see `revalidate_outdated_projects`.
+            tokio::spawn({
+                let service = compose_check_service;
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    match service.revalidate_outdated_projects().await {
+                        Ok(0) => tracing::debug!("Compose revalidation found no failing projects"),
+                        Ok(flagged) => tracing::warn!(
+                            flagged,
+                            "Compose revalidation flagged project(s) that would fail their next deployment; see each project's Git settings"
+                        ),
+                        Err(error) => {
+                            tracing::error!("Compose revalidation after upgrade failed: {error}")
+                        }
+                    }
+                }
+            });
+
             // Get the db connection for RemoteDeploymentService
             let db_for_remote = context.require_service::<sea_orm::DatabaseConnection>();
 
@@ -980,6 +1029,16 @@ impl TempsPlugin for DeploymentsPlugin {
         let traefik_discovery_routes =
             handlers::traefik_discovery::configure_routes().with_state(traefik_discovery_state);
 
+        let compose_check_routes =
+            handlers::compose_check::configure_routes()
+                .with_state(Arc::new(handlers::compose_check::ComposeCheckAppState {
+                compose_check_service: context
+                    .require_service::<crate::services::compose_check_service::ComposeCheckService>(
+                ),
+                project_access_checker: context
+                    .get_service::<dyn temps_core::ProjectAccessChecker>(),
+            }));
+
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
@@ -987,7 +1046,8 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(admin_node_routes)
             .with_state(app_state)
             .merge(deployment_token_routes)
-            .merge(traefik_discovery_routes);
+            .merge(traefik_discovery_routes)
+            .merge(compose_check_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -1005,6 +1065,8 @@ impl TempsPlugin for DeploymentsPlugin {
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
         let traefik_discovery_schema =
             <handlers::traefik_discovery::TraefikDiscoveryApiDoc as UtoimaOpenApi>::openapi();
+        let compose_check_schema =
+            <handlers::compose_check::ComposeCheckApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -1015,6 +1077,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 nodes_schema,
                 deployment_tokens_schema,
                 traefik_discovery_schema,
+                compose_check_schema,
             ],
         ))
     }

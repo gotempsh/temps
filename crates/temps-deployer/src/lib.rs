@@ -28,6 +28,7 @@ pub type ImageImportStream =
 pub mod build_protocol;
 pub mod build_timings;
 pub mod compose;
+pub mod compose_interpolation;
 mod compose_remote;
 
 /// Callback function type for processing build logs in real-time
