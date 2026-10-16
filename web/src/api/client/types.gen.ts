@@ -14912,6 +14912,16 @@ export type MicrosandboxCapability = {
 };
 
 /**
+ * Copy every bucket of another managed S3 service into this one.
+ */
+export type MigrateS3ServiceRequest = {
+    /**
+     * Managed S3 service to copy from (RustFS or Garage). It is only read.
+     */
+    source_service_id: number;
+};
+
+/**
  * A single step in the migration execution plan.
  *
  * Steps are presented to the user before execution so they know exactly
@@ -21595,6 +21605,20 @@ export type S3CredentialsResponse = {
     force_path_style: boolean;
     region: string;
     secret_key: string;
+};
+
+/**
+ * Outcome of copying one managed S3 service's buckets into another.
+ */
+export type S3MigrationReport = {
+    /**
+     * Buckets that were copied, by their name on the source.
+     */
+    buckets: Array<string>;
+    source_backend: string;
+    source_service_id: number;
+    target_backend: string;
+    target_service_id: number;
 };
 
 /**
@@ -40291,7 +40315,13 @@ export type GetServiceTypeParametersData = {
          */
         service_type: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Managed S3 storage engine to describe (`rustfs` or `garage`). Defaults
+         * to `rustfs`; ignored for service types without backends.
+         */
+        backend?: string | null;
+    };
     url: '/external-services/types/{service_type}/parameters';
 };
 
@@ -41387,6 +41417,50 @@ export type ExternalServiceMetricsStatusResponses = {
 };
 
 export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
+
+export type MigrateS3ServiceData = {
+    body: MigrateS3ServiceRequest;
+    path: {
+        /**
+         * Target external service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/migrate-s3';
+};
+
+export type MigrateS3ServiceErrors = {
+    /**
+     * Either service is not a migratable managed S3 service
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MigrateS3ServiceResponses = {
+    /**
+     * Buckets copied
+     */
+    200: S3MigrationReport;
+};
+
+export type MigrateS3ServiceResponse = MigrateS3ServiceResponses[keyof MigrateS3ServiceResponses];
 
 export type RevealServiceParameterData = {
     body?: never;

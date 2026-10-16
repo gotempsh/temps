@@ -32350,6 +32350,21 @@
         ],
         "type": "object"
       },
+      "MigrateS3ServiceRequest": {
+        "description": "Copy every bucket of another managed S3 service into this one.",
+        "properties": {
+          "source_service_id": {
+            "description": "Managed S3 service to copy from (RustFS or Garage). It is only read.",
+            "example": 12,
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_service_id"
+        ],
+        "type": "object"
+      },
       "MigrationStep": {
         "description": "A single step in the migration execution plan.\n\nSteps are presented to the user before execution so they know exactly\nwhat will happen. During execution, each step runs in order and reports\nits outcome before proceeding to the next.",
         "properties": {
@@ -45671,6 +45686,40 @@
           "region",
           "bucket_name",
           "force_path_style"
+        ],
+        "type": "object"
+      },
+      "S3MigrationReport": {
+        "description": "Outcome of copying one managed S3 service's buckets into another.",
+        "properties": {
+          "buckets": {
+            "description": "Buckets that were copied, by their name on the source.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_backend": {
+            "type": "string"
+          },
+          "source_service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_backend": {
+            "type": "string"
+          },
+          "target_service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_service_id",
+          "target_service_id",
+          "source_backend",
+          "target_backend",
+          "buckets"
         ],
         "type": "object"
       },
@@ -80934,6 +80983,19 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Managed S3 storage engine to describe (`rustfs` or `garage`). Defaults\nto `rustfs`; ignored for service types without backends.",
+            "example": "garage",
+            "in": "query",
+            "name": "backend",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -82586,6 +82648,70 @@
         "summary": "Return the freshness status (last-received timestamp) for a service.",
         "tags": [
           "Metrics"
+        ]
+      }
+    },
+    "/external-services/{id}/migrate-s3": {
+      "post": {
+        "description": "Plain S3 semantics, so data moves between any two backends (RustFS to\nGarage and back). The source is only read and existing target objects are\nkept. Re-run it after switching writers to pick up late writes.",
+        "operationId": "migrate_s3_service",
+        "parameters": [
+          {
+            "description": "Target external service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateS3ServiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3MigrationReport"
+                }
+              }
+            },
+            "description": "Buckets copied"
+          },
+          "400": {
+            "description": "Either service is not a migratable managed S3 service"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Copy every bucket of another managed S3 service into this one",
+        "tags": [
+          "External Services"
         ]
       }
     },
