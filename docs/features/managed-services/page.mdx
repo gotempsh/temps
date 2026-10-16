@@ -407,7 +407,16 @@ environment gets the single bucket `<project>-<environment>`.
 | `AWS_REGION` | Region reported by the service |
 
 Unlinking a project revokes its environments' keys. Buckets and their objects
-are kept; deleting data is always a separate action.
+are kept; deleting data is always a separate action. If a key cannot be revoked
+(for example the storage container is down, or a worker node is offline), the
+unlink fails and the link is kept, so a credential is never left active behind
+a link you believed was removed. Revoking keys on a worker node needs a worker
+agent that is up to date. A key is left in place while another project still
+links the same bucket scope.
+
+Two projects cannot link one service with the same project and environment
+scope, or with scopes that resolve to the same physical bucket name; the second
+link is refused with a message naming the project that holds the scope.
 
 ### Migrate between backends {{ anchor: true, id: 'migrate-between-backends' }}
 
@@ -425,6 +434,8 @@ curl -X POST "$TEMPS_URL/api/external-services/$TARGET_ID/migrate-s3" \
 Both services must run on the control-plane host, and Garage services cannot
 be created on a worker node yet. Zero-byte objects are copied with direct
 requests, because the bulk-copy client uploads them in a way Garage rejects.
+
+Garage is available for S3 storage only; Blob services cannot use it.
 
 Backups of a managed S3 service are plain object copies. Restoring one into a
 new service creates a service on the same engine as the source.

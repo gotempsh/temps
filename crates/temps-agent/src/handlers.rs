@@ -414,6 +414,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::service_handlers::service_status,
         crate::service_handlers::service_exec,
         crate::service_handlers::runtime_env,
+        crate::service_handlers::revoke_s3_access,
         crate::service_handlers::health_probe,
         crate::service_handlers::list_services,
         crate::service_handlers::backup_service,

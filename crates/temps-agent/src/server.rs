@@ -182,6 +182,10 @@ pub fn build_router(
             post(service_handlers::runtime_env),
         )
         .route(
+            "/agent/services/revoke-s3-access",
+            post(service_handlers::revoke_s3_access),
+        )
+        .route(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
         )

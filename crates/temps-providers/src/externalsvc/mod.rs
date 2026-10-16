@@ -631,6 +631,73 @@ pub async fn provision_runtime_environment(
         .map_err(RuntimeProvisioningError::Provider)
 }
 
+/// Revoke the credentials [`provision_runtime_environment`] minted for one
+/// project environment, on the Docker daemon supplied by the caller.
+///
+/// The control plane cannot reach a worker's storage engine directly, so a
+/// remote service's unlink asks the owning agent to run this. Only managed
+/// S3 engines (RustFS, Garage) have per-environment credentials; any other
+/// service type is rejected rather than silently reported as revoked.
+#[allow(deprecated)]
+pub async fn revoke_runtime_environment(
+    name: String,
+    service_type: ServiceType,
+    config: ServiceConfig,
+    project_slug: &str,
+    environment_slug: &str,
+    docker: Arc<bollard::Docker>,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    validate_runtime_target(&config)?;
+    let unsupported = |reason: &str| {
+        RuntimeProvisioningError::Provider(anyhow::anyhow!(
+            "service '{}' ({}) has no revocable managed S3 credentials: {}",
+            name,
+            service_type,
+            reason
+        ))
+    };
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(
+            &temps_core::EncryptionService::generate_raw_key()
+                .map_err(RuntimeProvisioningError::Provider)?,
+        )
+        .map_err(RuntimeProvisioningError::Provider)?,
+    );
+    let backend: Box<dyn ManagedS3Backend> = match service_type {
+        ServiceType::S3 | ServiceType::Blob => {
+            let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)
+                .map_err(|e| RuntimeProvisioningError::Provider(e.into()))?;
+            match selection.backend {
+                ManagedS3BackendKind::Rustfs => {
+                    Box::new(RustfsService::new(name.clone(), docker, encryption))
+                }
+                ManagedS3BackendKind::Garage => Box::new(GarageService::new(
+                    name.clone(),
+                    docker,
+                    encryption,
+                    service_type,
+                )),
+                ManagedS3BackendKind::Minio => {
+                    return Err(unsupported("legacy MinIO services use one shared key"));
+                }
+            }
+        }
+        ServiceType::Rustfs => Box::new(RustfsService::new(name.clone(), docker, encryption)),
+        ServiceType::Mariadb
+        | ServiceType::Mongodb
+        | ServiceType::Postgres
+        | ServiceType::Redis
+        | ServiceType::Kv
+        | ServiceType::Minio => {
+            return Err(unsupported("the service is not managed S3 storage"));
+        }
+    };
+    backend
+        .revoke_access_key(&config, project_slug, environment_slug)
+        .await
+        .map_err(|e| RuntimeProvisioningError::Provider(e.into()))
+}
+
 fn set_runtime_container_name(
     config: &mut ServiceConfig,
     container_name: &str,
@@ -2615,5 +2682,89 @@ mod temporary_credential_tests {
         assert!(!rendered.contains("operator-secret"));
         assert!(!rendered.contains("sts-session-token"));
         assert!(rendered.contains("AKIAOPERATOR"));
+    }
+}
+
+#[cfg(test)]
+mod revoke_runtime_environment_tests {
+    use super::*;
+
+    /// A client that is never asked to talk to a daemon: every case below
+    /// fails before the first Docker call.
+    fn unused_docker() -> Arc<bollard::Docker> {
+        Arc::new(
+            bollard::Docker::connect_with_http(
+                "http://127.0.0.1:1",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .expect("a lazily connecting client"),
+        )
+    }
+
+    fn config(service_type: ServiceType, parameters: serde_json::Value) -> ServiceConfig {
+        ServiceConfig {
+            name: "media".to_string(),
+            service_type,
+            version: None,
+            parameters,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_managed_s3_services_have_credentials_to_revoke() {
+        let error = revoke_runtime_environment(
+            "media".to_string(),
+            ServiceType::Postgres,
+            config(ServiceType::Postgres, serde_json::json!({})),
+            "shop",
+            "prod",
+            unused_docker(),
+        )
+        .await
+        .expect_err("a database has no managed S3 credentials");
+
+        assert!(
+            error.to_string().contains("not managed S3 storage"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_minio_shares_one_key_and_cannot_be_revoked_per_environment() {
+        let error = revoke_runtime_environment(
+            "media".to_string(),
+            ServiceType::S3,
+            config(ServiceType::S3, serde_json::json!({ "backend": "minio" })),
+            "shop",
+            "prod",
+            unused_docker(),
+        )
+        .await
+        .expect_err("legacy MinIO has no per-environment keys");
+
+        assert!(error.to_string().contains("legacy MinIO"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn revocation_refuses_a_target_that_is_not_the_node_loopback() {
+        let error = revoke_runtime_environment(
+            "media".to_string(),
+            ServiceType::S3,
+            config(
+                ServiceType::S3,
+                serde_json::json!({ "backend": "garage", "host": "10.0.0.5" }),
+            ),
+            "shop",
+            "prod",
+            unused_docker(),
+        )
+        .await
+        .expect_err("only the owning node's loopback is a valid target");
+
+        assert!(matches!(
+            error,
+            RuntimeProvisioningError::UnsafeTarget { .. }
+        ));
     }
 }

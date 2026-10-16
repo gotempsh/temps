@@ -299,6 +299,24 @@ impl RemoteServiceClient {
             .await
     }
 
+    /// Revoke the per-environment storage credentials a project link
+    /// provisioned on the worker that owns the service. Unlinking must not
+    /// leave working keys behind, and the control plane has no route to the
+    /// worker's storage engine, so the agent performs the revocation.
+    pub async fn revoke_s3_access(
+        &self,
+        request: RemoteRuntimeEnvRequest,
+    ) -> Result<(), ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            "Revoking managed S3 credentials on remote node"
+        );
+        self.agent_post::<_, String>("/agent/services/revoke-s3-access", &request)
+            .await
+            .map(|_| ())
+    }
+
     /// Run the provider's authenticated health probe inside the worker that
     /// owns the service. Secrets are carried only in the TLS-protected JSON
     /// request body and are never included in URL or tracing fields.

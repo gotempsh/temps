@@ -1315,6 +1315,10 @@ impl ManagedS3Backend for GarageService {
         self.name.clone()
     }
 
+    fn container_name(&self) -> String {
+        self.get_container_name()
+    }
+
     fn docker(&self) -> Arc<Docker> {
         self.docker.clone()
     }

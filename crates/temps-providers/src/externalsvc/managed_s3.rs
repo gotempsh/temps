@@ -661,6 +661,10 @@ pub trait ManagedS3Backend: Send + Sync {
     /// Name of the managed service (used in errors and helper containers).
     fn service_name(&self) -> String;
 
+    /// Docker container the service runs in. Restore helpers are labelled
+    /// with it so the restore fence and crash recovery can find them.
+    fn container_name(&self) -> String;
+
     fn docker(&self) -> Arc<Docker>;
 
     /// Where the service listens, from its stored configuration.

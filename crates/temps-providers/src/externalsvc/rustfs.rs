@@ -1182,6 +1182,10 @@ impl ManagedS3Backend for RustfsService {
         self.instance_name()
     }
 
+    fn container_name(&self) -> String {
+        self.get_container_name()
+    }
+
     fn docker(&self) -> Arc<Docker> {
         self.docker.clone()
     }

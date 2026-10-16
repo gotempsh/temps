@@ -104,6 +104,18 @@ impl RcSession {
         service: &str,
         env: Vec<String>,
     ) -> Result<Self, ManagedS3Error> {
+        Self::start_with_labels(docker, service, env, std::collections::HashMap::new()).await
+    }
+
+    /// Like [`Self::start`], with `extra_labels` added to the helper. A
+    /// restore helper carries the restore labels of the container it writes
+    /// into, so the restore fence finds one that outlived a crash.
+    pub(crate) async fn start_with_labels(
+        docker: Arc<Docker>,
+        service: &str,
+        env: Vec<String>,
+        extra_labels: std::collections::HashMap<String, String>,
+    ) -> Result<Self, ManagedS3Error> {
         let mirror_error = |operation: &str, reason: String| ManagedS3Error::Mirror {
             service: service.to_string(),
             operation: operation.to_string(),
@@ -124,6 +136,8 @@ impl RcSession {
 
         let name = format!("rc-s3-{}", uuid::Uuid::new_v4());
         let label_key = format!("{}managed_s3_helper", temps_core::DOCKER_LABEL_PREFIX);
+        let mut labels = extra_labels;
+        labels.insert(label_key, service.to_string());
         let config = bollard::models::ContainerCreateBody {
             image: Some(rc_client::RC_IMAGE.to_string()),
             env: Some(env),
@@ -134,12 +148,13 @@ impl RcSession {
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            labels: Some(std::collections::HashMap::from([(
-                label_key,
-                service.to_string(),
-            )])),
+            labels: Some(labels),
             host_config: Some(bollard::models::HostConfig {
                 network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+                // Linux Docker has no `host.docker.internal` unless asked:
+                // a backup location on the host's loopback is reached
+                // through it (see `host_gateway_endpoint`).
+                extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -442,7 +457,13 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
             source.session_token.as_deref(),
         );
 
-    let session = RcSession::start(backend.docker(), &service, env).await?;
+    let session = RcSession::start_with_labels(
+        backend.docker(),
+        &service,
+        env,
+        crate::externalsvc::restore_helper::restore_helper_labels(&backend.container_name()),
+    )
+    .await?;
     let result = async {
         // The trailing slash lists the folder's contents rather than every key
         // sharing the prefix.
@@ -465,28 +486,24 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
                 exact,
                 TokenSide::when(has_token, TokenSide::Source),
             );
-            // The staged (token) form and the "exact" form do not end with
-            // plain source/target arguments, so only the common restore gets
-            // the zero-byte fallback.
-            let fallback = match (has_token || exact, location_sdk_client(source)) {
-                (false, Some(from)) => Some(EmptyObjectCopy {
-                    source_label: format!("backup location '{}'", location_path("", source)),
-                    from,
-                    from_bucket: source.bucket.clone(),
-                    from_prefix: format!(
-                        "{}/",
-                        [source.prefix.trim_matches('/'), bucket.as_str()]
-                            .iter()
-                            .filter(|part| !part.is_empty())
-                            .copied()
-                            .collect::<Vec<_>>()
-                            .join("/")
-                    ),
-                    to: sdk_client(&endpoint, &admin_access_key, &admin_secret_key),
-                    to_bucket: bucket.clone(),
-                }),
-                _ => None,
-            };
+            // Every restore form (token-staged, exact, plain) can hit the
+            // target's refusal of zero-byte uploads, so all get the fallback.
+            let fallback = Some(EmptyObjectCopy {
+                source_label: format!("backup location '{}'", location_path("", source)),
+                from: location_sdk_client(source).await,
+                from_bucket: source.bucket.clone(),
+                from_prefix: format!(
+                    "{}/",
+                    [source.prefix.trim_matches('/'), bucket.as_str()]
+                        .iter()
+                        .filter(|part| !part.is_empty())
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                ),
+                to: sdk_client(&endpoint, &admin_access_key, &admin_secret_key),
+                to_bucket: bucket.clone(),
+            });
             run_mirror_with_empty_object_fallback(
                 &session,
                 &service,
@@ -544,17 +561,38 @@ fn exact_glob(key: &str) -> String {
     glob
 }
 
-/// `command` (an `rc mirror ... <source> <target>` invocation) with each of
-/// `keys` excluded from the transfer.
+/// `command` (an `rc mirror` invocation) with each of `keys` excluded from
+/// the transfer. The direct form ends with source and target, so the flags go
+/// in front of them; the staged form (`sh -c <script> sh <src> <dst> <mode>
+/// <side>`) takes the flags as trailing arguments, which the script passes to
+/// the upload step.
 fn with_excluded_keys(command: &[String], keys: &[String]) -> Vec<String> {
+    let exclusions: Vec<String> = keys
+        .iter()
+        .flat_map(|key| ["--exclude".to_string(), exact_glob(key)])
+        .collect();
+    if command.first().map(String::as_str) == Some("sh") {
+        let mut result = command.to_vec();
+        result.extend(exclusions);
+        return result;
+    }
     let split = command.len().saturating_sub(2);
     let mut result: Vec<String> = command[..split].to_vec();
-    for key in keys {
-        result.push("--exclude".to_string());
-        result.push(exact_glob(key));
-    }
+    result.extend(exclusions);
     result.extend_from_slice(&command[split..]);
     result
+}
+
+/// The object key relative to the mirrored tree, exactly as stored: only the
+/// listing prefix is removed, so a key that itself starts with `/` keeps it.
+/// `None` for the prefix's own placeholder and for directory markers.
+fn key_below_prefix<'a>(full_key: &'a str, prefix: &str) -> Option<&'a str> {
+    let key = full_key.strip_prefix(prefix)?;
+    if key.is_empty() || key.ends_with('/') {
+        None
+    } else {
+        Some(key)
+    }
 }
 
 /// Where zero-byte objects of one bucket are read from and written to when
@@ -606,13 +644,9 @@ async fn copy_empty_objects(
             let (Some(full_key), Some(0)) = (object.key(), object.size()) else {
                 continue;
             };
-            let key = full_key
-                .strip_prefix(copy.from_prefix.as_str())
-                .unwrap_or(full_key)
-                .trim_start_matches('/');
-            if key.is_empty() || key.ends_with('/') {
+            let Some(key) = key_below_prefix(full_key, &copy.from_prefix) else {
                 continue;
-            }
+            };
             if copied.len() >= MAX_EMPTY_OBJECTS {
                 return Err(fail(
                     &format!("copying empty objects of bucket '{bucket}'"),
@@ -622,11 +656,42 @@ async fn copy_empty_objects(
                     ),
                 ));
             }
+            // The mirror would have carried the object's headers and user
+            // metadata, so the direct copy reads them from the source too.
+            let head = copy
+                .from
+                .head_object()
+                .bucket(&copy.from_bucket)
+                .key(full_key)
+                .send()
+                .await
+                .map_err(|e| {
+                    fail(
+                        &format!(
+                            "reading metadata of empty object '{full_key}' in bucket '{}' of {}",
+                            copy.from_bucket, copy.source_label
+                        ),
+                        e.to_string(),
+                    )
+                })?;
             copy.to
                 .put_object()
                 .bucket(bucket)
                 .key(key)
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b""))
+                .set_content_type(head.content_type().map(str::to_string))
+                .set_cache_control(head.cache_control().map(str::to_string))
+                .set_content_disposition(head.content_disposition().map(str::to_string))
+                .set_content_encoding(head.content_encoding().map(str::to_string))
+                .set_content_language(head.content_language().map(str::to_string))
+                // The SDK deprecates the parsed value in favour of the raw
+                // header string, but `put_object` only accepts a parsed date.
+                .set_expires({
+                    #[allow(deprecated)]
+                    let expires = head.expires().cloned();
+                    expires
+                })
+                .set_metadata(head.metadata().cloned())
                 .send()
                 .await
                 .map_err(|e| {
@@ -641,15 +706,11 @@ async fn copy_empty_objects(
     Ok(copied)
 }
 
-/// SDK client for a backup location, for the control plane. `None` for AWS S3
-/// proper, where `rc` has no zero-byte problem worth working around.
-fn location_sdk_client(location: &S3Location) -> Option<aws_sdk_s3::Client> {
-    let endpoint = location.endpoint.as_deref()?;
-    let url = if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
+/// SDK client for a backup location, for the control plane. A location with
+/// no endpoint is AWS S3 proper: the bucket's region is looked up first (the
+/// global endpoint answers `GetBucketLocation` for any region), falling back
+/// to `us-east-1`.
+async fn location_sdk_client(location: &S3Location) -> aws_sdk_s3::Client {
     let credentials = aws_sdk_s3::config::Credentials::new(
         &location.access_key,
         &location.secret_key,
@@ -657,15 +718,51 @@ fn location_sdk_client(location: &S3Location) -> Option<aws_sdk_s3::Client> {
         None,
         "temps-restore",
     );
-    Some(aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::Config::builder()
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .endpoint_url(url)
-            .credentials_provider(credentials)
-            .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .build(),
-    ))
+    let build = |region: String, endpoint: Option<String>, path_style: bool| {
+        let mut config = aws_sdk_s3::Config::builder()
+            .region(aws_sdk_s3::config::Region::new(region))
+            .credentials_provider(credentials.clone())
+            .force_path_style(path_style)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+        if let Some(endpoint) = endpoint {
+            config = config.endpoint_url(endpoint);
+        }
+        aws_sdk_s3::Client::from_conf(config.build())
+    };
+    match location.endpoint.as_deref() {
+        Some(endpoint) => {
+            let url = if endpoint.starts_with("http") {
+                endpoint.to_string()
+            } else {
+                format!("http://{endpoint}")
+            };
+            build("us-east-1".to_string(), Some(url), true)
+        }
+        None => {
+            let global = build("us-east-1".to_string(), None, false);
+            let region = match global
+                .get_bucket_location()
+                .bucket(&location.bucket)
+                .send()
+                .await
+            {
+                Ok(output) => match output.location_constraint().map(|c| c.as_str()) {
+                    None | Some("") => "us-east-1".to_string(),
+                    Some("EU") => "eu-west-1".to_string(),
+                    Some(region) => region.to_string(),
+                },
+                Err(e) => {
+                    warn!(
+                        bucket = %location.bucket,
+                        "Could not look up the region of the backup bucket, assuming us-east-1: {}",
+                        e
+                    );
+                    "us-east-1".to_string()
+                }
+            };
+            build(region, None, false)
+        }
+    }
 }
 
 /// Run a plain `rc mirror` (`command` ends with source and target). When it
@@ -854,6 +951,44 @@ mod tests {
     fn exact_glob_escapes_metacharacters_only() {
         assert_eq!(exact_glob("dir/empty"), "dir/empty");
         assert_eq!(exact_glob("a*b?[c]{d}"), "a[*]b[?][[]c[]][{]d[}]");
+    }
+
+    #[test]
+    fn exclusions_are_appended_to_a_staged_mirror() {
+        let command = rc_client::mirror_command("src/b/", "dst/b/", true, TokenSide::Source);
+        let retried = with_excluded_keys(&command, &["dir/empty".to_string()]);
+        assert_eq!(retried[..command.len()], command[..]);
+        assert_eq!(retried[command.len()..], ["--exclude", "dir/empty"]);
+    }
+
+    #[test]
+    fn exclusions_apply_to_an_exact_direct_mirror() {
+        let command = rc_client::mirror_command("src/b/", "dst/b/", true, TokenSide::Neither);
+        let retried = with_excluded_keys(&command, &["e".to_string()]);
+        assert_eq!(
+            retried,
+            vec![
+                "rc",
+                "mirror",
+                "--overwrite",
+                "--remove",
+                "--exclude",
+                "e",
+                "src/b/",
+                "dst/b/"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_keeps_everything_after_the_listing_prefix() {
+        assert_eq!(key_below_prefix("p/b/empty", "p/b/"), Some("empty"));
+        // A stored key that starts with a slash is not the key without it.
+        assert_eq!(key_below_prefix("p/b//empty", "p/b/"), Some("/empty"));
+        assert_eq!(key_below_prefix("empty", ""), Some("empty"));
+        assert_eq!(key_below_prefix("p/b/", "p/b/"), None);
+        assert_eq!(key_below_prefix("p/b/dir/", "p/b/"), None);
+        assert_eq!(key_below_prefix("other/empty", "p/b/"), None);
     }
 
     #[test]
