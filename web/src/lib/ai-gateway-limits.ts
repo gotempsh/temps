@@ -222,3 +222,11 @@ export function monthStartIso(now: Date): string {
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
   ).toISOString()
 }
+
+/**
+ * The override page to show after one row is removed. Removing the only row on
+ * a later page would leave it empty, so step back to the previous page.
+ */
+export function pageAfterRemoval(page: number, rowsOnPage: number): number {
+  return rowsOnPage <= 1 ? Math.max(1, page - 1) : page
+}

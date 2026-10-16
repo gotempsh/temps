@@ -5,7 +5,7 @@ import { expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
-import { monthStartIso, usdToMicrocents } from '@/lib/ai-gateway-limits'
+import { usdToMicrocents } from '@/lib/ai-gateway-limits'
 import { AiGatewayLimitsPage } from './AiGatewayLimitsPage'
 
 function render(seed: (client: QueryClient) => void) {
@@ -44,7 +44,7 @@ function seedOverview(client: QueryClient, overrides: unknown[]) {
 test('shows the built-in default and an onboarding empty state with no overrides', () => {
   const markup = render((client) => {
     seedOverview(client, [])
-    client.setQueryData(['aiLimits', 'spend', monthStartIso(new Date())], [])
+    client.setQueryData(['aiLimits', 'spend'], [])
   })
   expect(markup).toContain('300 / min')
   expect(markup).toContain('Built-in default')
@@ -73,7 +73,7 @@ test('lists overrides with inherit, unlimited and capped values distinct', () =>
       },
     ])
     client.setQueryData(
-      ['aiLimits', 'spend', monthStartIso(new Date())],
+      ['aiLimits', 'spend'],
       [
         {
           project_id: 7,

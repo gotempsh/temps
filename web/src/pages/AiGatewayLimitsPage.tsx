@@ -62,6 +62,7 @@ import {
   formatRequestLimit,
   limitsToFormValues,
   monthStartIso,
+  pageAfterRemoval,
 } from '@/lib/ai-gateway-limits'
 import { extractProblemDetails } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -171,14 +172,16 @@ export function AiGatewayLimitsPage() {
     },
   })
 
-  const monthStart = useMemo(() => monthStartIso(new Date()), [])
   const spend = useQuery({
-    queryKey: ['aiLimits', 'spend', monthStart],
+    queryKey: ['aiLimits', 'spend'],
     queryFn: async () => {
+      // Read the clock per fetch, so a page left open across a UTC month
+      // boundary starts counting the new month instead of the old one.
+      const now = new Date()
       const { data } = await getUsageByProject({
         query: {
-          from: monthStart,
-          to: new Date().toISOString(),
+          from: monthStartIso(now),
+          to: now.toISOString(),
           limit: SPEND_ROWS,
         },
         throwOnError: true,
@@ -249,6 +252,8 @@ export function AiGatewayLimitsPage() {
         `${projectLabel(projectId)} now inherits the instance defaults`
       )
       setResetting(null)
+      const rowsOnPage = overview.data?.project_overrides.length ?? 0
+      setPage((current) => pageAfterRemoval(current, rowsOnPage))
       void invalidate()
     },
     onError: (error) =>

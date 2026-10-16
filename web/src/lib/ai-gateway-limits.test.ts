@@ -16,6 +16,7 @@ import {
   limitsToFormValues,
   MAX_REQUESTS_PER_MINUTE,
   monthStartIso,
+  pageAfterRemoval,
   parseLimitForm,
   usdToMicrocents,
 } from './ai-gateway-limits'
@@ -212,5 +213,18 @@ describe('monthStartIso', () => {
     expect(monthStartIso(new Date('2026-01-01T00:00:00Z'))).toBe(
       '2026-01-01T00:00:00.000Z'
     )
+  })
+})
+
+describe('pageAfterRemoval', () => {
+  test('steps back when the last row of a later page is removed', () => {
+    expect(pageAfterRemoval(2, 1)).toBe(1)
+    expect(pageAfterRemoval(3, 1)).toBe(2)
+  })
+
+  test('stays put while the page still has rows, or on the first page', () => {
+    expect(pageAfterRemoval(2, 20)).toBe(2)
+    expect(pageAfterRemoval(1, 1)).toBe(1)
+    expect(pageAfterRemoval(1, 0)).toBe(1)
   })
 })

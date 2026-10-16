@@ -1610,9 +1610,7 @@ export function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
-                    <TableHead className="hidden lg:table-cell">
-                      Caller
-                    </TableHead>
+                    <TableHead>Caller</TableHead>
                     <TableHead className="hidden md:table-cell">
                       Tokens
                     </TableHead>
@@ -1640,7 +1638,7 @@ export function UsageAnalytics() {
                       <TableCell className="font-mono text-xs">
                         {log.model}
                       </TableCell>
-                      <TableCell className="hidden lg:table-cell text-muted-foreground text-xs whitespace-nowrap">
+                      <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
                         {log.project_id === undefined
                           ? '—'
                           : `Project #${log.project_id}${log.token_id === undefined ? '' : ` · token #${log.token_id}`}`}
