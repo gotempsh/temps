@@ -1164,6 +1164,12 @@ pub enum BuildCapacity {
 /// Poll `probe` (the node's free build slots, `None` when unknown) every
 /// `interval` until a slot is free or `max_wait` has passed. Returns the
 /// outcome and how long it waited.
+///
+/// `max_wait` bounds the whole call, probes included: once a probe has seen
+/// the node busy, a later probe still in flight when the window runs out is
+/// dropped and the node is reported busy. The first probe is always allowed
+/// to answer (it is what tells busy from unknown, so a zero window still
+/// checks once), bounded only by the probe's own timeout.
 pub async fn wait_for_free_build_slot<F, Fut>(
     mut probe: F,
     max_wait: Duration,
@@ -1174,11 +1180,21 @@ where
     Fut: std::future::Future<Output = Option<u32>>,
 {
     let started = tokio::time::Instant::now();
+    let mut seen_busy = false;
     loop {
-        match probe().await {
+        let answer = if seen_busy {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, probe()).await {
+                Ok(answer) => answer,
+                Err(_) => return (BuildCapacity::Busy, started.elapsed()),
+            }
+        } else {
+            probe().await
+        };
+        match answer {
             None => return (BuildCapacity::Unknown, started.elapsed()),
             Some(free) if free > 0 => return (BuildCapacity::Free, started.elapsed()),
-            Some(_) => {}
+            Some(_) => seen_busy = true,
         }
         let waited = started.elapsed();
         if waited >= max_wait {
@@ -2438,6 +2454,30 @@ mod tests {
         assert_eq!(capacity, BuildCapacity::Busy);
         assert_eq!(waited, Duration::from_secs(12));
         assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_final_probe_cannot_stretch_the_wait_past_its_window() {
+        // First probe answers busy at once; the second starts at 5s and
+        // would only answer at 14s, past the 12s window.
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let n = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n > 0 {
+                        tokio::time::sleep(Duration::from_secs(9)).await;
+                    }
+                    Some(0)
+                }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
     }
 
     #[tokio::test(start_paused = true)]
