@@ -80,7 +80,9 @@ test('lists overrides with inherit, unlimited and capped values distinct', () =>
           request_count: 1200,
           input_tokens: 1000,
           output_tokens: 500,
-          estimated_cost_microcents: usdToMicrocents(3.5),
+          estimated_cost_microcents: usdToMicrocents(5),
+          operator_cost_microcents: usdToMicrocents(3.5),
+          monthly_budget_microcents: usdToMicrocents(25),
           byok_request_count: 0,
           error_count: 2,
         },
@@ -94,6 +96,7 @@ test('lists overrides with inherit, unlimited and capped values distinct', () =>
   expect(markup).toContain('60 / min')
   expect(markup).toContain('Inherited')
   expect(markup).toContain('$3.50')
+  expect(markup).toContain('14% of $25.00')
   expect(markup).toContain('Edit limits for Storefront')
   expect(markup).toContain('Reset limits for Project #9')
 })

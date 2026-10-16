@@ -20058,6 +20058,18 @@ export type ProjectUsage = {
      */
     estimated_cost_microcents: number;
     input_tokens: number;
+    /**
+     * The project's effective monthly budget after inheritance, in microcents;
+     * `null` when it has no cap. Left `None` by the usage service and filled in
+     * by the handler, which owns the link to the limits service.
+     */
+    monthly_budget_microcents?: number | null;
+    /**
+     * The part of `estimated_cost_microcents` the operator pays for: requests
+     * made with a caller-supplied provider key are excluded. This is the
+     * figure a project's monthly budget is measured against.
+     */
+    operator_cost_microcents: number;
     output_tokens: number;
     project_id: number;
     request_count: number;
@@ -32350,9 +32362,9 @@ export type UpdateProjectLimitsError = UpdateProjectLimitsErrors[keyof UpdatePro
 
 export type UpdateProjectLimitsResponses = {
     /**
-     * Project limits replaced
+     * Project limits replaced, as stored
      */
-    200: ProjectLimitsResponse;
+    200: LimitSettingsBody;
 };
 
 export type UpdateProjectLimitsResponse = UpdateProjectLimitsResponses[keyof UpdateProjectLimitsResponses];

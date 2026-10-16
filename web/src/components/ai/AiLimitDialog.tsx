@@ -45,6 +45,8 @@ interface AiLimitDialogProps {
   /** Extra controls rendered above the limit fields (e.g. a project picker). */
   children?: ReactNode
   submitDisabled?: boolean
+  /** Lock the limit fields, e.g. while the values to edit are still loading. */
+  fieldsDisabled?: boolean
   onSubmit: (payload: LimitPayload) => void
 }
 
@@ -64,6 +66,7 @@ export function AiLimitDialog({
   pending,
   children,
   submitDisabled = false,
+  fieldsDisabled = false,
   onSubmit,
 }: AiLimitDialogProps) {
   const form = useForm<LimitFormValues>({
@@ -102,6 +105,7 @@ export function AiLimitDialog({
                   <FormControl>
                     <Input
                       {...field}
+                      disabled={fieldsDisabled}
                       inputMode="numeric"
                       placeholder={`Inherit from ${inheritsFrom}`}
                     />
@@ -123,6 +127,7 @@ export function AiLimitDialog({
                   <FormControl>
                     <Input
                       {...field}
+                      disabled={fieldsDisabled}
                       inputMode="decimal"
                       placeholder={`Inherit from ${inheritsFrom}`}
                     />

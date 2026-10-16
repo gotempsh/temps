@@ -3,6 +3,7 @@
 
 import {
   getLimitsOverview,
+  getProjectLimits,
   getProjects,
   getUsageByProject,
   resetProjectLimits,
@@ -34,7 +35,9 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Label } from '@/components/ui/label'
+import { Progress } from '@/components/ui/progress'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { SearchableSelect } from '@/components/ui/searchable-select'
@@ -53,6 +56,7 @@ import {
   type LimitPayload,
   describeInstanceBudget,
   describeInstanceRequestLimit,
+  budgetUsedPercent,
   formatBudgetLimit,
   formatMicrocents,
   formatRequestLimit,
@@ -72,6 +76,39 @@ const SPEND_ROWS = 50
 const EMPTY_LIMITS: LimitFormValues = {
   requestsPerMinute: '',
   monthlyBudgetUsd: '',
+}
+
+function hasStoredLimits(limits: LimitSettingsBody): boolean {
+  return (
+    limits.max_requests_per_minute != null ||
+    limits.max_cost_per_month_microcents != null
+  )
+}
+
+/** Spend against a project's monthly budget, or a note when nothing caps it. */
+function BudgetUsage({
+  spend,
+  budget,
+}: {
+  spend: number
+  budget: number | null
+}) {
+  const percent = budgetUsedPercent(spend, budget)
+  if (percent === null || budget === null) {
+    return <span className="text-muted-foreground">No cap</span>
+  }
+  return (
+    <div className="min-w-[8rem] space-y-1">
+      <Progress
+        value={percent}
+        aria-label={`${Math.round(percent)}% of the monthly budget used`}
+        className="h-2"
+      />
+      <p className="text-xs text-muted-foreground">
+        {Math.round(percent)}% of {formatMicrocents(budget)}
+      </p>
+    </div>
+  )
 }
 
 function mutationMessage(error: unknown, fallback: string): string {
@@ -104,6 +141,23 @@ export function AiGatewayLimitsPage() {
       return data
     },
     placeholderData: (previous) => previous,
+  })
+
+  // The picker only knows the overrides on the current page, so the chosen
+  // project's stored limits are fetched on their own. The add form starts from
+  // them: saving replaces both limits, and a blank form would silently clear
+  // a project that already has an override on another page.
+  const pickedId = pickedProject === '' ? null : Number(pickedProject)
+  const pickedLimits = useQuery({
+    queryKey: ['aiLimits', 'project', pickedId],
+    enabled: dialog.kind === 'add' && pickedId !== null,
+    queryFn: async () => {
+      const { data } = await getProjectLimits({
+        path: { project_id: Number(pickedProject) },
+        throwOnError: true,
+      })
+      return data
+    },
   })
 
   const projects = useQuery({
@@ -237,15 +291,11 @@ export function AiGatewayLimitsPage() {
     saveProject.mutate({ projectId, body: payload })
 
   return (
-    <div className="w-full space-y-4 px-4 py-4 sm:space-y-6 sm:px-6 sm:py-6 lg:px-8">
-      <div>
-        <h1 className="text-2xl sm:text-3xl font-bold">AI Limits</h1>
-        <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
-          Cap how fast and how much each project can spend through the AI
-          gateway. Callers that exceed a cap get a 429 with a Retry-After
-          header.
-        </p>
-      </div>
+    <PageContainer>
+      <PageHeader
+        title="AI Limits"
+        description="Cap how fast and how much each project can spend through the AI gateway. Callers that exceed a cap get a 429 with a Retry-After header."
+      />
 
       {overview.isError && !data ? (
         <ReadFailure
@@ -416,9 +466,10 @@ export function AiGatewayLimitsPage() {
             <CardHeader>
               <CardTitle>Spend this month</CardTitle>
               <CardDescription>
-                Estimated cost per project since the start of the month (UTC),
-                from the model price list. Requests that used a caller-supplied
-                provider key are listed but do not count against the budget.
+                Operator-funded spend per project since the start of the month
+                (UTC), estimated from the model price list, against its monthly
+                budget. Requests that used a caller-supplied provider key are
+                listed but do not count against the budget.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -446,7 +497,10 @@ export function AiGatewayLimitsPage() {
                       <TableHead>Project</TableHead>
                       <TableHead className="text-right">Requests</TableHead>
                       <TableHead className="text-right">Tokens</TableHead>
-                      <TableHead className="text-right">Est. cost</TableHead>
+                      <TableHead className="text-right">
+                        Operator spend
+                      </TableHead>
+                      <TableHead>Monthly budget</TableHead>
                       <TableHead className="text-right">Errors</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -471,7 +525,13 @@ export function AiGatewayLimitsPage() {
                           ).toLocaleString('en-US')}
                         </TableCell>
                         <TableCell className="text-right">
-                          {formatMicrocents(row.estimated_cost_microcents)}
+                          {formatMicrocents(row.operator_cost_microcents)}
+                        </TableCell>
+                        <TableCell>
+                          <BudgetUsage
+                            spend={row.operator_cost_microcents}
+                            budget={row.monthly_budget_microcents ?? null}
+                          />
                         </TableCell>
                         <TableCell className="text-right">
                           {row.error_count.toLocaleString('en-US')}
@@ -503,11 +563,18 @@ export function AiGatewayLimitsPage() {
         onOpenChange={closeDialog}
         title="Add project override"
         description="Give one project its own limits."
-        initialValues={EMPTY_LIMITS}
+        initialValues={
+          pickedLimits.data
+            ? limitsToFormValues(pickedLimits.data.stored)
+            : EMPTY_LIMITS
+        }
         inheritsFrom="the instance default"
         submitLabel="Save override"
         pending={saveProject.isPending}
-        submitDisabled={pickedProject === ''}
+        fieldsDisabled={pickedId !== null && pickedLimits.isPending}
+        submitDisabled={
+          pickedId === null || pickedLimits.isPending || pickedLimits.isError
+        }
         onSubmit={(payload) => submitProject(Number(pickedProject), payload)}
       >
         <div className="space-y-2">
@@ -533,6 +600,18 @@ export function AiGatewayLimitsPage() {
           {projects.isError && (
             <p className="text-xs text-destructive">
               Could not load projects. Close this dialog and try again.
+            </p>
+          )}
+          {pickedLimits.isError && (
+            <p className="text-xs text-destructive">
+              Could not load this project&apos;s current limits, so it cannot be
+              saved safely. Pick it again to retry.
+            </p>
+          )}
+          {pickedLimits.data && hasStoredLimits(pickedLimits.data.stored) && (
+            <p className="text-xs text-muted-foreground">
+              This project already has an override. Its current values are
+              shown; saving replaces them.
             </p>
           )}
         </div>
@@ -593,6 +672,6 @@ export function AiGatewayLimitsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </PageContainer>
   )
 }
