@@ -414,12 +414,22 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
 
 /// Refuse a deployment-token request that is over its project's rate limit or
 /// monthly budget. Human callers (sessions, API keys) are not limited here.
+///
+/// `caller_funded` marks a request made with the caller's own provider key:
+/// it still counts toward the rate limit, but it spends none of the operator's
+/// money, so the monthly budget does not apply to it.
 pub(crate) async fn enforce_project_limits(
     app_state: &AiGatewayAppState,
     auth: &temps_auth::AuthContext,
+    caller_funded: bool,
 ) -> Result<(), AiGatewayError> {
     match auth.deployment_token_info() {
-        Some(token) => app_state.limits_service.enforce(token.project_id).await,
+        Some(token) => {
+            app_state
+                .limits_service
+                .enforce(token.project_id, caller_funded)
+                .await
+        }
         None => Ok(()),
     }
 }
@@ -493,7 +503,9 @@ async fn chat_completions(
     if let Some(error) = reject_deployment_token_base_url(&auth, &byok) {
         return Ok(error_to_response(error).into_response());
     }
-    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
         return Ok(error_to_response(limit_error).into_response());
     }
     let ai_context = extract_ai_context(&headers).attributed_to(&auth);
@@ -766,7 +778,9 @@ async fn embeddings(
     if let Some(error) = reject_deployment_token_base_url(&auth, &byok) {
         return Ok(error_to_response(error).into_response());
     }
-    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
         return Ok(error_to_response(limit_error).into_response());
     }
     let ai_context = extract_ai_context(&headers).attributed_to(&auth);

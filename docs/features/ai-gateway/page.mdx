@@ -590,7 +590,7 @@ Calls made with a project's deployment token are limited **per project**, so one
     A sliding-window cap on gateway requests. Defaults to **300 per minute per project** when nothing is configured.
   </Property>
   <Property name="Monthly budget">
-    A cap on operator-funded spend per calendar month (UTC), estimated from the model price list. Off by default. Requests that use a caller-supplied provider key are not counted.
+    A cap on operator-funded spend per calendar month (UTC), estimated from the model price list. Off by default. Requests that use a caller-supplied provider key are not counted, and are not refused when the budget is spent; they still count toward the request rate.
   </Property>
 </Properties>
 
@@ -614,13 +614,13 @@ curl -X DELETE https://your-temps-instance.com/ai/limits/projects/42 \
   -H "Authorization: Bearer your-admin-api-key"
 ```
 
-Reading and changing limits requires an instance administrator, because limits and spend span every project. A caller over either limit gets `429 Too Many Requests` with a `Retry-After` header (seconds). A rate-limit refusal returns `rate_limit_error` / `rate_limit_exceeded`; an exhausted budget returns `insufficient_quota` / `budget_exceeded`, with `Retry-After` set to the time until the month resets.
+Reading limits and spend requires an instance administrator, because they span every project; changing them requires the AI gateway write permission. A caller over either limit gets `429 Too Many Requests` with a `Retry-After` header (seconds). A rate-limit refusal returns `rate_limit_error` / `rate_limit_exceeded`; an exhausted budget returns `insufficient_quota` / `budget_exceeded`, with `Retry-After` set to the time until the month resets.
 
 <Note>
   The budget is a soft cap: spend is read from the usage log through a short cache, so a burst can overshoot it slightly. If the usage log cannot be read, requests are allowed rather than blocked.
 </Note>
 
-Every usage log entry made with a deployment token records its `project_id` and `token_id`, taken from the authenticated token and never from request headers. Filter the log with `?project_id=`, or get per-project totals from `GET /ai/usage/by-project` (administrators only).
+Project-scoped structured output (`/projects/{project_id}/ai/structured-output/stream`) shares the same rate limit and budget. The provider stream carries no token counts, so its usage is estimated from the request and response sizes and priced from the model list. Every usage log entry made with a deployment token records its `project_id` and `token_id`, taken from the authenticated token and never from request headers. Filter the log with `?project_id=`, or get per-project totals from `GET /ai/usage/by-project` (administrators only).
 
 ---
 

@@ -432,7 +432,9 @@ async fn create_response(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
-    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
         return Ok(error_to_response(limit_error).into_response());
     }
     let ai_context = extract_ai_context(&headers).attributed_to(&auth);
@@ -582,7 +584,9 @@ async fn upload_file(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
-    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
         return Ok(error_to_response(limit_error).into_response());
     }
 
@@ -866,7 +870,9 @@ async fn create_batch(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
-    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
         return Ok(error_to_response(limit_error).into_response());
     }
     let credential_type = credential_kind(&headers);

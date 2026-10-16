@@ -516,10 +516,20 @@ async fn get_usage_by_project(
     }
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let limit = params.limit.unwrap_or(50).clamp(1, 100);
-    let projects = app_state
+    let mut projects = app_state
         .usage_service
         .get_by_project(from, to, limit)
         .await?;
+    let project_ids: Vec<i32> = projects.iter().map(|usage| usage.project_id).collect();
+    let limits = app_state
+        .limits_service
+        .effective_limits_many(&project_ids)
+        .await?;
+    for usage in &mut projects {
+        usage.monthly_budget_microcents = limits
+            .get(&usage.project_id)
+            .and_then(|limits| limits.max_cost_per_month_microcents);
+    }
 
     Ok(Json(projects))
 }

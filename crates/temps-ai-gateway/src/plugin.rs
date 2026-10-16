@@ -661,13 +661,14 @@ impl TempsPlugin for AiGatewayPlugin {
             // Browser-supplied generic prompts are intentionally restricted to
             // tool-less gateway APIs. Host subscription CLIs can inspect the
             // host and are reserved for server-authored, purpose-specific jobs.
-            let structured_output_service = Arc::new(StructuredOutputService::new(
-                gateway_ai_service as Arc<dyn temps_ai::AiService>,
-            ));
-            context.register_service(structured_output_service.clone());
-
             let usage_service = Arc::new(UsageService::new(db.clone()));
             context.register_service(usage_service.clone());
+
+            let structured_output_service = Arc::new(StructuredOutputService::new(
+                gateway_ai_service as Arc<dyn temps_ai::AiService>,
+                usage_service.clone(),
+            ));
+            context.register_service(structured_output_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
             let project_access_checker =

@@ -317,10 +317,18 @@ impl AiLimitsService {
     /// Admit or refuse one gateway request from `project_id`'s deployment
     /// token. Refusals carry the seconds the caller should wait.
     ///
+    /// `caller_funded` requests (made with the caller's own provider key) cost
+    /// the operator nothing, so they skip the monthly budget but still count
+    /// toward the rate limit.
+    ///
     /// A failure to read the configured limits or the spend total never takes
     /// the gateway down: it is logged and the rate limit (which needs no I/O)
     /// still applies with the built-in default.
-    pub async fn enforce(&self, project_id: i32) -> Result<(), AiGatewayError> {
+    pub async fn enforce(
+        &self,
+        project_id: i32,
+        caller_funded: bool,
+    ) -> Result<(), AiGatewayError> {
         let limits = match self.effective_limits(project_id).await {
             Ok(limits) => limits,
             Err(limits_error) => {
@@ -333,7 +341,10 @@ impl AiLimitsService {
             }
         };
 
-        if let Some(budget) = limits.max_cost_per_month_microcents {
+        if let Some(budget) = limits
+            .max_cost_per_month_microcents
+            .filter(|_| !caller_funded)
+        {
             match self.month_spend(project_id).await {
                 Ok(used) if used >= budget => {
                     return Err(AiGatewayError::BudgetExceeded {
@@ -400,6 +411,34 @@ impl AiLimitsService {
                     "Failed to load AI gateway limits for project {project_id}: {error}"
                 ),
             })
+    }
+
+    /// Limits that apply to each of `project_ids` after inheritance, from one
+    /// query. Uncached: it serves the admin report, not the request path.
+    pub async fn effective_limits_many(
+        &self,
+        project_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, EffectiveLimits>, AiGatewayError> {
+        if project_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let scopes: Vec<String> = std::iter::once(INSTANCE_SCOPE.to_string())
+            .chain(project_ids.iter().map(|id| project_scope(*id)))
+            .collect();
+        let rows = ai_gateway_config::Entity::find()
+            .filter(Column::Scope.is_in(scopes))
+            .all(self.db.as_ref())
+            .await?;
+        let settings_of = |scope: &str| {
+            rows.iter()
+                .find(|row| row.scope == scope)
+                .map(LimitSettings::from)
+        };
+        let instance = settings_of(INSTANCE_SCOPE);
+        Ok(project_ids
+            .iter()
+            .map(|id| (*id, resolve(settings_of(&project_scope(*id)), instance)))
+            .collect())
     }
 
     /// Operator-funded spend of `project_id` this UTC month, in microcents.
@@ -777,9 +816,9 @@ mod tests {
                 .append_query_results([vec![config_row("project:7", Some(2), None)]])
                 .into_connection(),
         );
-        service.enforce(7).await.unwrap();
-        service.enforce(7).await.unwrap();
-        match service.enforce(7).await.unwrap_err() {
+        service.enforce(7, false).await.unwrap();
+        service.enforce(7, false).await.unwrap();
+        match service.enforce(7, false).await.unwrap_err() {
             AiGatewayError::RateLimited {
                 project_id,
                 limit,
@@ -793,7 +832,7 @@ mod tests {
         }
         // Another project is untouched by project 7's exhaustion.
         // (Its limits are not mocked, so it falls back to the built-in default.)
-        service.enforce(8).await.unwrap();
+        service.enforce(8, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -801,10 +840,10 @@ mod tests {
         // An empty mock fails the config query; the limiter must still run.
         let service = service_with(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         for _ in 0..DEFAULT_MAX_REQUESTS_PER_MINUTE {
-            service.enforce(3).await.unwrap();
+            service.enforce(3, false).await.unwrap();
         }
         assert!(matches!(
-            service.enforce(3).await.unwrap_err(),
+            service.enforce(3, false).await.unwrap_err(),
             AiGatewayError::RateLimited { project_id: 3, .. }
         ));
     }
@@ -819,7 +858,7 @@ mod tests {
             )])]])
             .into_connection();
         let service = service_with(db);
-        match service.enforce(4).await.unwrap_err() {
+        match service.enforce(4, false).await.unwrap_err() {
             AiGatewayError::BudgetExceeded {
                 project_id,
                 limit_microcents,
@@ -836,6 +875,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_limits_many_resolves_each_project_from_one_query() {
+        let service = service_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![
+                    config_row("instance", None, Some(5_000)),
+                    config_row("project:2", None, Some(9_000)),
+                ]])
+                .into_connection(),
+        );
+        let limits = service.effective_limits_many(&[1, 2]).await.unwrap();
+        assert_eq!(limits[&1].max_cost_per_month_microcents, Some(5_000));
+        assert_eq!(limits[&1].max_cost_per_month_source, LimitSource::Instance);
+        assert_eq!(limits[&2].max_cost_per_month_microcents, Some(9_000));
+        assert_eq!(limits[&2].max_cost_per_month_source, LimitSource::Project);
+    }
+
+    #[tokio::test]
+    async fn effective_limits_many_without_projects_skips_the_query() {
+        let service = service_with(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        assert!(service.effective_limits_many(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn caller_funded_requests_skip_the_budget_but_not_the_rate_limit() {
+        // The budget is spent, yet a request on the caller's own provider key
+        // costs the operator nothing, so it passes; the rate limit still binds.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![config_row("project:4", Some(1), Some(1_000))]])
+            .append_query_results([vec![std::collections::BTreeMap::from([(
+                "spend".to_string(),
+                sea_orm::Value::BigInt(Some(1_000)),
+            )])]])
+            .into_connection();
+        let service = service_with(db);
+        service.enforce(4, true).await.unwrap();
+        assert!(matches!(
+            service.enforce(4, true).await.unwrap_err(),
+            AiGatewayError::RateLimited { project_id: 4, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn enforce_allows_spend_below_the_budget() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![config_row("project:4", Some(0), Some(1_000))]])
@@ -845,7 +926,7 @@ mod tests {
             )])]])
             .into_connection();
         let service = service_with(db);
-        service.enforce(4).await.unwrap();
+        service.enforce(4, false).await.unwrap();
     }
 
     #[tokio::test]

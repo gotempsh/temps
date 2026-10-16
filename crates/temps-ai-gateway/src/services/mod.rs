@@ -5,6 +5,7 @@ pub mod ai_service;
 pub mod gateway_service;
 pub mod limits_service;
 pub mod native_api_service;
+pub mod pricing;
 pub mod provider_capabilities;
 pub mod provider_key_service;
 pub mod provider_model_service;

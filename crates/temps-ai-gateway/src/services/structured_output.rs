@@ -21,6 +21,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use temps_ai::{AiRequest, AiService};
 
+use crate::services::{AiRequestContext, UsageService};
+
 const CACHE_CAPACITY: u64 = 512;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 60;
 const MAX_CACHE_TTL_SECONDS: u64 = 300;
@@ -32,6 +34,10 @@ const MAX_REQUESTS_PER_WINDOW: usize = 12;
 const MAX_CONCURRENT_PER_CALLER: usize = 2;
 const MAX_REQUESTS_PER_PROJECT_WINDOW: usize = 30;
 const MAX_CONCURRENT_PER_PROJECT: usize = 4;
+/// The fixed instruction `stream` sends with every request, counted as input.
+const SYSTEM_PROMPT: &str = "Return only one JSON object matching the supplied schema. Put concise fields before longer arrays so the interface can render useful content immediately. Never wrap the object in Markdown.";
+/// Status recorded for a stream the client abandoned before it finished.
+const STATUS_CLIENT_CLOSED: i16 = 499;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StructuredOutputError {
@@ -57,6 +63,8 @@ pub struct StructuredOutputRequest {
     pub model: Option<String>,
     pub thinking_level: Option<String>,
     pub requester_id: Option<i32>,
+    /// Deployment token making the call, recorded on its usage row.
+    pub token_id: Option<i32>,
     pub cache_key: Option<String>,
     pub cache_ttl_seconds: Option<u64>,
     pub refresh: bool,
@@ -135,8 +143,76 @@ struct CachedOutput {
     thinking_level: Option<String>,
 }
 
+/// Rough token count for a text of `bytes` bytes (about four bytes a token).
+/// The provider stream carries text only, so this is an estimate; it is priced
+/// from the model catalog like every other request logged without a cost.
+fn estimate_tokens(bytes: usize) -> i64 {
+    i64::try_from(bytes.div_ceil(4)).unwrap_or(i64::MAX)
+}
+
+/// Writes one `ai_usage_logs` row for a provider-backed structured stream when
+/// it is dropped: on completion, on a provider failure, and when the client
+/// disconnects early (the provider still bills what it generated). Without
+/// it these calls would spend the operator's money but never reach a
+/// project's monthly budget.
+struct UsageRecorder {
+    usage: Arc<UsageService>,
+    user_id: Option<i32>,
+    context: AiRequestContext,
+    provider: String,
+    model: String,
+    input_tokens: i64,
+    output_bytes: usize,
+    started: Instant,
+    status: i16,
+}
+
+impl Drop for UsageRecorder {
+    fn drop(&mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let usage = self.usage.clone();
+        let user_id = self.user_id;
+        let context = self.context.clone();
+        let provider = std::mem::take(&mut self.provider);
+        let model = std::mem::take(&mut self.model);
+        let (input_tokens, output_tokens) = (self.input_tokens, estimate_tokens(self.output_bytes));
+        let latency_ms = i32::try_from(self.started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        let status = self.status;
+        runtime.spawn(async move {
+            // Cost 0 asks the usage service to price it from the catalog.
+            if let Err(error) = usage
+                .log_usage_with_context(
+                    user_id,
+                    &provider,
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    latency_ms,
+                    0,
+                    status,
+                    true,
+                    false,
+                    &context,
+                )
+                .await
+            {
+                tracing::warn!(
+                    project_id = ?context.project_id,
+                    provider,
+                    model,
+                    %error,
+                    "Failed to record structured AI usage"
+                );
+            }
+        });
+    }
+}
+
 pub struct StructuredOutputService {
     ai: Arc<dyn AiService>,
+    usage: Arc<UsageService>,
     cache: Cache<StructuredCacheKey, CachedOutput>,
     singleflight: Cache<StructuredCacheKey, Arc<tokio::sync::Mutex<()>>>,
     caller_limits: Cache<CallerLimitKey, Arc<StdMutex<CallerLimitState>>>,
@@ -144,9 +220,10 @@ pub struct StructuredOutputService {
 }
 
 impl StructuredOutputService {
-    pub fn new(ai: Arc<dyn AiService>) -> Self {
+    pub fn new(ai: Arc<dyn AiService>, usage: Arc<UsageService>) -> Self {
         Self {
             ai,
+            usage,
             cache: Cache::builder()
                 .max_capacity(CACHE_CAPACITY)
                 .time_to_live(Duration::from_secs(MAX_CACHE_TTL_SECONDS))
@@ -257,6 +334,26 @@ impl StructuredOutputService {
 
         let caller_permit = self.acquire_caller_permit(&request).await?;
 
+        // From here the provider is billed for this request, however the
+        // stream ends, so its usage is recorded when the recorder drops.
+        let recorder = UsageRecorder {
+            usage: self.usage.clone(),
+            user_id: request.requester_id,
+            context: AiRequestContext {
+                project_id: Some(request.project_id),
+                token_id: request.token_id,
+                ..AiRequestContext::default()
+            },
+            provider: provider.clone(),
+            model: model.clone(),
+            input_tokens: estimate_tokens(
+                SYSTEM_PROMPT.len() + request.prompt.len() + request.schema.to_string().len(),
+            ),
+            output_bytes: 0,
+            started: Instant::now(),
+            status: STATUS_CLIENT_CLOSED,
+        };
+
         let deadline = tokio::time::Instant::now() + STREAM_TIMEOUT;
         let token_stream = tokio::time::timeout_at(
             deadline,
@@ -264,10 +361,7 @@ impl StructuredOutputService {
                 purpose: request.purpose.clone(),
                 project_id: Some(request.project_id),
                 provider: Some(provider.clone()),
-                system: Some(
-                    "Return only one JSON object matching the supplied schema. Put concise fields before longer arrays so the interface can render useful content immediately. Never wrap the object in Markdown."
-                        .to_string(),
-                ),
+                system: Some(SYSTEM_PROMPT.to_string()),
                 prompt: request.prompt,
                 model: Some(model.clone()),
                 thinking_level: request.thinking_level.clone(),
@@ -304,12 +398,14 @@ impl StructuredOutputService {
                 thinking_level: thinking_level.clone(),
             };
             let mut tokens = token_stream;
+            let mut recorder = recorder;
             let mut raw = String::new();
             let mut last_partial = Value::Object(Map::new());
             loop {
                 let next = match tokio::time::timeout_at(deadline, tokens.next()).await {
                     Ok(next) => next,
                     Err(_) => {
+                        recorder.status = 504;
                         yield StructuredOutputEvent::Error {
                             code: "timeout",
                             message: format!(
@@ -324,7 +420,9 @@ impl StructuredOutputService {
                 match item {
                     Ok(delta) => {
                         raw.push_str(&delta);
+                        recorder.output_bytes = raw.len();
                         if raw.len() > MAX_STREAM_BYTES {
+                            recorder.status = 200;
                             yield StructuredOutputEvent::Error {
                                 code: "response_too_large",
                                 message: format!(
@@ -347,6 +445,7 @@ impl StructuredOutputService {
                             %error,
                             "Structured AI provider stream failed"
                         );
+                        recorder.status = 502;
                         yield StructuredOutputEvent::Error {
                             code: "provider_error",
                             message: "The AI provider stream ended unexpectedly".to_string(),
@@ -356,6 +455,7 @@ impl StructuredOutputService {
                 }
             }
 
+            recorder.status = 200;
             let Some(value) = temps_ai::extract_json_block(&raw) else {
                 yield StructuredOutputEvent::Error {
                     code: "invalid_json",
@@ -835,6 +935,35 @@ mod tests {
         }
     }
 
+    fn test_usage() -> Arc<UsageService> {
+        Arc::new(UsageService::new(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        )))
+    }
+
+    fn usage_row() -> temps_entities::ai_usage_logs::Model {
+        temps_entities::ai_usage_logs::Model {
+            id: 1,
+            timestamp: chrono::Utc::now(),
+            user_id: Some(11),
+            provider: "gateway_key:1".to_string(),
+            model: "model-a".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: 0,
+            estimated_cost_microcents: 0,
+            status: 200,
+            is_streaming: true,
+            is_byok: false,
+            conversation_id: None,
+            tags: vec![],
+            request_id: None,
+            trace_id: None,
+            project_id: Some(7),
+            token_id: Some(5),
+        }
+    }
+
     fn request(refresh: bool) -> StructuredOutputRequest {
         StructuredOutputRequest {
             project_id: 7,
@@ -853,6 +982,7 @@ mod tests {
             model: None,
             thinking_level: None,
             requester_id: Some(11),
+            token_id: None,
             cache_key: Some("window:1".to_string()),
             cache_ttl_seconds: Some(60),
             refresh,
@@ -899,12 +1029,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_estimate_rounds_up_to_whole_tokens() {
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1), 1);
+        assert_eq!(estimate_tokens(4), 1);
+        assert_eq!(estimate_tokens(5), 2);
+    }
+
+    #[tokio::test]
+    async fn an_uncached_stream_records_usage_for_its_project_and_token() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![usage_row()]])
+                .into_connection(),
+        );
+        let service = StructuredOutputService::new(
+            Arc::new(StreamingAi {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(UsageService::new(db.clone())),
+        );
+        let mut first = request(false);
+        first.token_id = Some(5);
+
+        // The second call is served from the cache, which spends nothing.
+        for call in [first.clone(), first] {
+            let events: Vec<_> = service
+                .stream(call)
+                .await
+                .expect("stream should start")
+                .collect()
+                .await;
+            assert!(matches!(
+                events.last(),
+                Some(StructuredOutputEvent::Complete { .. })
+            ));
+        }
+        drop(service);
+        for _ in 0..100 {
+            if Arc::strong_count(&db) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("the logging task released the connection")
+                .into_transaction_log()
+        );
+        assert_eq!(log.matches("INSERT INTO").count(), 1, "{log}");
+        assert!(log.contains("Int(Some(7))"), "project id missing: {log}");
+        assert!(log.contains("Int(Some(5))"), "token id missing: {log}");
+        assert!(log.contains("SmallInt(Some(200))"), "status missing: {log}");
+        assert!(log.contains("ai_usage_logs"), "wrong table: {log}");
+    }
+
     #[tokio::test]
     async fn cache_hit_skips_provider_and_refresh_bypasses_cache() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = StructuredOutputService::new(Arc::new(StreamingAi {
-            calls: calls.clone(),
-        }));
+        let service = StructuredOutputService::new(
+            Arc::new(StreamingAi {
+                calls: calls.clone(),
+            }),
+            test_usage(),
+        );
 
         for refresh in [false, false, true] {
             let events: Vec<_> = service
@@ -924,9 +1114,12 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_force_refresh_is_rate_limited() {
-        let service = StructuredOutputService::new(Arc::new(StreamingAi {
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        let service = StructuredOutputService::new(
+            Arc::new(StreamingAi {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            test_usage(),
+        );
         let _first_stream = service
             .stream(request(true))
             .await
@@ -939,9 +1132,12 @@ mod tests {
 
     #[tokio::test]
     async fn project_concurrency_limit_applies_across_distinct_callers() {
-        let service = StructuredOutputService::new(Arc::new(StreamingAi {
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        let service = StructuredOutputService::new(
+            Arc::new(StreamingAi {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            test_usage(),
+        );
         let mut permits = Vec::new();
         for requester_id in 1..=MAX_CONCURRENT_PER_PROJECT {
             let mut candidate = request(false);
@@ -965,9 +1161,12 @@ mod tests {
     #[tokio::test]
     async fn identical_cache_misses_are_singleflight() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = Arc::new(StructuredOutputService::new(Arc::new(StreamingAi {
-            calls: calls.clone(),
-        })));
+        let service = Arc::new(StructuredOutputService::new(
+            Arc::new(StreamingAi {
+                calls: calls.clone(),
+            }),
+            test_usage(),
+        ));
 
         let first = service
             .stream(request(false))
@@ -1000,9 +1199,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_models_and_thinking_modes_outside_capabilities() {
-        let service = StructuredOutputService::new(Arc::new(StreamingAi {
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        let service = StructuredOutputService::new(
+            Arc::new(StreamingAi {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            test_usage(),
+        );
         let mut bad_model = request(false);
         bad_model.model = Some("unknown".to_string());
         assert!(matches!(

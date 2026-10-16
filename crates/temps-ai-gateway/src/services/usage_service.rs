@@ -97,6 +97,14 @@ pub struct ProjectUsage {
     pub output_tokens: i64,
     /// Estimated cost in microcents (1/10000 of a cent), from the model price list
     pub estimated_cost_microcents: i64,
+    /// The part of `estimated_cost_microcents` the operator pays for: requests
+    /// made with a caller-supplied provider key are excluded. This is the
+    /// figure a project's monthly budget is measured against.
+    pub operator_cost_microcents: i64,
+    /// The project's effective monthly budget after inheritance, in microcents;
+    /// `null` when it has no cap. Left `None` by the usage service and filled in
+    /// by the handler, which owns the link to the limits service.
+    pub monthly_budget_microcents: Option<i64>,
     /// Requests served with a caller-supplied provider key (not operator spend)
     pub byok_request_count: i64,
     pub error_count: i64,
@@ -263,6 +271,7 @@ struct ProjectUsageRow {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     estimated_cost_microcents: Option<i64>,
+    operator_cost_microcents: Option<i64>,
     byok_request_count: Option<i64>,
     error_count: Option<i64>,
 }
@@ -388,7 +397,7 @@ impl UsageService {
         // else is priced from the model list so spend caps and per-project
         // reports have a cost to work with.
         let estimated_cost_microcents = if estimated_cost_microcents == 0 {
-            crate::handlers::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
+            crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
         } else {
             estimated_cost_microcents
         };
@@ -559,6 +568,7 @@ impl UsageService {
                 COALESCE(SUM(input_tokens), 0)::INT8 as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::INT8 as output_tokens,
                 COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as estimated_cost_microcents,
+                COALESCE(SUM(estimated_cost_microcents) FILTER (WHERE is_byok = false), 0)::INT8 as operator_cost_microcents,
                 COUNT(*) FILTER (WHERE is_byok = true) as byok_request_count,
                 COUNT(*) FILTER (WHERE status >= 400) as error_count
             FROM ai_usage_logs
@@ -580,6 +590,8 @@ impl UsageService {
                     input_tokens: r.input_tokens.unwrap_or(0),
                     output_tokens: r.output_tokens.unwrap_or(0),
                     estimated_cost_microcents: r.estimated_cost_microcents.unwrap_or(0),
+                    operator_cost_microcents: r.operator_cost_microcents.unwrap_or(0),
+                    monthly_budget_microcents: None,
                     byok_request_count: r.byok_request_count.unwrap_or(0),
                     error_count: r.error_count.unwrap_or(0),
                 })
@@ -1114,6 +1126,38 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn by_project_reports_operator_cost_apart_from_total_cost() {
+        use sea_orm::{MockDatabase, Value};
+        let row = std::collections::BTreeMap::from([
+            ("project_id".to_string(), Value::Int(Some(7))),
+            ("request_count".to_string(), Value::BigInt(Some(4))),
+            ("input_tokens".to_string(), Value::BigInt(Some(100))),
+            ("output_tokens".to_string(), Value::BigInt(Some(50))),
+            (
+                "estimated_cost_microcents".to_string(),
+                Value::BigInt(Some(900)),
+            ),
+            (
+                "operator_cost_microcents".to_string(),
+                Value::BigInt(Some(600)),
+            ),
+            ("byok_request_count".to_string(), Value::BigInt(Some(1))),
+            ("error_count".to_string(), Value::BigInt(Some(0))),
+        ]);
+        let service = UsageService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .into_connection(),
+        ));
+        let now = chrono::Utc::now();
+        let projects = service.get_by_project(now, now, 10).await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, 7);
+        assert_eq!(projects[0].estimated_cost_microcents, 900);
+        assert_eq!(projects[0].operator_cost_microcents, 600);
+    }
 
     #[test]
     fn test_shift_params_basic() {

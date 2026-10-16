@@ -348,7 +348,7 @@ async fn get_project_limits(
     params(("project_id" = i32, Path, description = "Project ID")),
     request_body = LimitSettingsBody,
     responses(
-        (status = 200, description = "Project limits replaced", body = ProjectLimitsResponse),
+        (status = 200, description = "Project limits replaced, as stored", body = LimitSettingsBody),
         (status = 400, description = "Invalid limit", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
@@ -377,7 +377,9 @@ async fn update_project_limits(
         saved,
     )
     .await;
-    Ok(Json(project_limits_response(&app_state, project_id).await?))
+    // Only the saved settings: this endpoint needs `AiGatewayWrite`, while the
+    // month-to-date spend in `ProjectLimitsResponse` is admin-only.
+    Ok(Json(LimitSettingsBody::from(saved)))
 }
 
 #[utoipa::path(

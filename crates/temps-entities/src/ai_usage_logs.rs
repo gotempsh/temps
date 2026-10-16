@@ -34,7 +34,8 @@ pub struct Model {
     /// Links to OTel trace_id for waterfall views
     pub trace_id: Option<String>,
     /// Project that made the call. Set for deployment-token callers, whose
-    /// `user_id` is NULL; NULL for human callers and rows older than the column.
+    /// `user_id` is NULL, and for project-scoped structured output; NULL for
+    /// other human callers and rows older than the column.
     pub project_id: Option<i32>,
     /// Deployment token that made the call. NULL for non-deployment callers.
     pub token_id: Option<i32>,
