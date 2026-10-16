@@ -450,6 +450,9 @@ const VM_RECONCILE_CONCURRENCY: usize = 8;
 /// hung start.
 const VM_RECONCILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many ids the startup reconciliation names in its summary.
+const VM_RECONCILE_REPORTED_IDS: usize = 50;
+
 /// What the startup reconciliation found, for the one summary log line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VmReconcileReport {
@@ -458,8 +461,13 @@ pub struct VmReconcileReport {
     /// Rows whose VM answered: left alone.
     pub alive: usize,
     /// Public ids of rows moved from `running` to `stopped` because their VM
-    /// is not running.
+    /// is not running, capped at [`VM_RECONCILE_REPORTED_IDS`] so the report
+    /// stays small however many VMs a restart took down. Each move also has
+    /// its own `vm_lost` event and log line.
     pub marked_stopped: Vec<String>,
+    /// How many rows were moved to `stopped` (the full count behind
+    /// `marked_stopped`).
+    pub marked_stopped_total: usize,
     /// Rows whose VM is down but whose row was left as it was: a managed
     /// application workspace (which reports a lost runtime as `recovering`),
     /// a row that changed since it was read, or a failed database write.
@@ -4903,7 +4911,9 @@ TEMPS_ASKPASS_EOF\n\
         use futures::StreamExt;
 
         let total = rows.len();
-        let outcomes: Vec<(sandboxes::Model, VmCheck)> = futures::stream::iter(rows)
+        // Verdicts are consumed as they arrive: only the bounded number of
+        // in-flight checks is ever held, not one result per row.
+        let mut verdicts = futures::stream::iter(rows)
             .map(|row| async move {
                 let check = match tokio::time::timeout(
                     VM_RECONCILE_DEADLINE,
@@ -4921,20 +4931,21 @@ TEMPS_ASKPASS_EOF\n\
                 };
                 (row, check)
             })
-            .buffer_unordered(VM_RECONCILE_CONCURRENCY)
-            .collect()
-            .await;
+            .buffer_unordered(VM_RECONCILE_CONCURRENCY);
 
         let mut report = VmReconcileReport {
             checked: total,
             ..Default::default()
         };
-        for (row, check) in outcomes {
+        while let Some((row, check)) = verdicts.next().await {
             match check {
                 VmCheck::Alive => report.alive += 1,
                 VmCheck::Down(cause) => {
                     if self.mark_vm_lost(&row, &cause, "startup").await {
-                        report.marked_stopped.push(row.public_id.clone());
+                        report.marked_stopped_total += 1;
+                        if report.marked_stopped.len() < VM_RECONCILE_REPORTED_IDS {
+                            report.marked_stopped.push(row.public_id.clone());
+                        }
                     } else {
                         report.not_marked += 1;
                     }
@@ -7809,6 +7820,7 @@ mod storage_cleanup_tests {
                 checked: 1,
                 alive: 0,
                 marked_stopped: vec![PUBLIC_ID.to_string()],
+                marked_stopped_total: 1,
                 not_marked: 0,
                 unverified: 0,
             }
@@ -7868,6 +7880,43 @@ mod storage_cleanup_tests {
         assert!(report.marked_stopped.is_empty());
         assert!(!report.all_alive());
         assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// A restart that took down many VMs still yields a small report: every
+    /// row is moved and counted, but only a bounded sample of ids is kept.
+    #[tokio::test]
+    async fn the_startup_report_names_a_bounded_sample_of_ids() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let total = VM_RECONCILE_REPORTED_IDS + 10;
+        let rows: Vec<sandboxes::Model> = (0..total)
+            .map(|index| {
+                let mut row = row_with(PUBLIC_ID, "ephemeral", "running");
+                row.id = i32::try_from(index).unwrap_or(i32::MAX) + 1;
+                row
+            })
+            .collect();
+        // Each move is an UPDATE then a `vm_lost` event insert, so the mock's
+        // results alternate row, event.
+        let data_root = unique_data_root("reconcile-many");
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres);
+        for _ in 0..total {
+            mock = mock
+                .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+                .append_query_results([vec![destroyed_event()]]);
+        }
+        let (service, _registry) = build_service_shared(
+            Arc::new(mock.into_connection()),
+            provider,
+            data_root.clone(),
+        );
+        let report = service.reconcile_running_vms(rows).await;
+        let _ = std::fs::remove_dir_all(&data_root);
+
+        assert_eq!(report.checked, total);
+        assert_eq!(report.marked_stopped_total, total);
+        assert_eq!(report.marked_stopped.len(), VM_RECONCILE_REPORTED_IDS);
+        assert_eq!(report.not_marked, 0);
     }
 
     #[tokio::test]

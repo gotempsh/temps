@@ -274,7 +274,8 @@ impl TempsPlugin for SandboxPlugin {
                                             alive = report.alive,
                                             unverified = report.unverified,
                                             not_marked = report.not_marked,
-                                            marked_stopped = ?report.marked_stopped,
+                                            marked_stopped = report.marked_stopped_total,
+                                            marked_stopped_ids = ?report.marked_stopped,
                                             "Sandbox plugin: not every running VM sandbox has a confirmed live VM; \
                                              rows whose VM is down were marked stopped (resume them with \
                                              `temps sandbox resume <id>`)"
