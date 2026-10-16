@@ -220,6 +220,12 @@ const aiNavItems: PlatformNavItem[] = [
     featureKey: 'ai-gateway',
   },
   {
+    title: 'Limits',
+    url: '/ai-gateway/limits',
+    icon: Gauge,
+    featureKey: 'ai-gateway',
+  },
+  {
     title: 'Activity',
     url: '/ai-gateway/activity',
     icon: Activity,

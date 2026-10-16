@@ -265,6 +265,9 @@ interface UsageLogEntry {
   status: number
   is_streaming: boolean
   is_byok: boolean
+  /** Set when the call came from a deployment token; absent otherwise. */
+  project_id?: number
+  token_id?: number
 }
 
 interface UsageLogPage {
@@ -1607,6 +1610,9 @@ export function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Caller
+                    </TableHead>
                     <TableHead className="hidden md:table-cell">
                       Tokens
                     </TableHead>
@@ -1633,6 +1639,11 @@ export function UsageAnalytics() {
                       </TableCell>
                       <TableCell className="font-mono text-xs">
                         {log.model}
+                      </TableCell>
+                      <TableCell className="hidden lg:table-cell text-muted-foreground text-xs whitespace-nowrap">
+                        {log.project_id === undefined
+                          ? '—'
+                          : `Project #${log.project_id}${log.token_id === undefined ? '' : ` · token #${log.token_id}`}`}
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
                         {formatTokenCount(log.input_tokens + log.output_tokens)}

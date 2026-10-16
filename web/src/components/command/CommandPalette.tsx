@@ -520,6 +520,21 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['ai', 'usage', 'credits', 'cost', 'tokens', 'spend', 'billing'],
   },
   {
+    title: 'AI Limits',
+    url: '/ai-gateway/limits',
+    icon: Gauge,
+    keywords: [
+      'ai',
+      'limits',
+      'rate limit',
+      'budget',
+      'quota',
+      'cap',
+      'spend',
+      '429',
+    ],
+  },
+  {
     title: 'AI Activity',
     url: '/ai-gateway/activity',
     icon: Activity,
