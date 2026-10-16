@@ -34,7 +34,7 @@ use crate::utils::ensure_network_exists;
 use super::managed_s3::{
     derive_grant, scope_slug, CredentialFormat, ManagedS3AccessKeyRequest, ManagedS3Backend,
     ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Endpoint, ManagedS3Error,
-    ManagedS3Grant, S3BucketPlan,
+    ManagedS3Grant, ManagedS3MirrorReport, MigrationSource, S3BucketPlan, S3Location,
 };
 use super::s3_mirror::RcSession;
 use super::{
@@ -1186,8 +1186,38 @@ impl ManagedS3Backend for RustfsService {
         self.get_container_name()
     }
 
-    fn docker(&self) -> Arc<Docker> {
-        self.docker.clone()
+    async fn backup(
+        &self,
+        config: &ServiceConfig,
+        destination: &S3Location,
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
+        let (access_key, secret_key) = self.admin_credentials(config)?;
+        super::s3_mirror::backup_buckets(
+            self.docker.clone(),
+            &self.service_name(),
+            &self.endpoint(config)?,
+            &access_key,
+            &secret_key,
+            destination,
+        )
+        .await
+    }
+
+    async fn restore(
+        &self,
+        config: &ServiceConfig,
+        source: &S3Location,
+        exact: bool,
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
+        super::s3_mirror::restore_buckets(self.docker.clone(), self, config, source, exact).await
+    }
+
+    async fn migrate_from(
+        &self,
+        config: &ServiceConfig,
+        source: &MigrationSource,
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
+        super::s3_mirror::migrate_buckets(self.docker.clone(), self, config, source).await
     }
 
     fn endpoint(&self, config: &ServiceConfig) -> Result<ManagedS3Endpoint, ManagedS3Error> {

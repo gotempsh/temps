@@ -425,6 +425,7 @@ pub(crate) async fn backup_buckets(
 /// Mirror the buckets stored under `source` into `backend`, creating each
 /// bucket first. See [`ManagedS3Backend::restore`] for `exact`.
 pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
+    docker: Arc<Docker>,
     backend: &B,
     config: &ServiceConfig,
     source: &S3Location,
@@ -441,7 +442,7 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
         service_alias("svc", &endpoint, &admin_access_key, &admin_secret_key),
         rc_client::rc_host_env(
             "src",
-            &helper_reachable_endpoint(&backend.docker(), source).await,
+            &helper_reachable_endpoint(&docker, source).await,
             &source.access_key,
             &source.secret_key,
         ),
@@ -458,7 +459,7 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
         );
 
     let session = RcSession::start_with_labels(
-        backend.docker(),
+        docker,
         &service,
         env,
         crate::externalsvc::restore_helper::restore_helper_labels(&backend.container_name()),
@@ -752,12 +753,28 @@ async fn location_sdk_client(location: &S3Location) -> aws_sdk_s3::Client {
                     Some(region) => region.to_string(),
                 },
                 Err(e) => {
-                    warn!(
-                        bucket = %location.bucket,
-                        "Could not look up the region of the backup bucket, assuming us-east-1: {}",
-                        e
-                    );
-                    "us-east-1".to_string()
+                    // A key without `s3:GetBucketLocation` is common; the
+                    // global endpoint still names the bucket's region in the
+                    // `x-amz-bucket-region` header of any answer about it.
+                    let header_region =
+                        match global.head_bucket().bucket(&location.bucket).send().await {
+                            Ok(_) => None,
+                            Err(head_error) => head_error
+                                .raw_response()
+                                .and_then(|response| response.headers().get("x-amz-bucket-region"))
+                                .map(str::to_string),
+                        };
+                    match header_region {
+                        Some(region) if !region.is_empty() => region,
+                        _ => {
+                            warn!(
+                                bucket = %location.bucket,
+                                "Could not look up the region of the backup bucket, assuming us-east-1: {}",
+                                e
+                            );
+                            "us-east-1".to_string()
+                        }
+                    }
                 }
             };
             build(region, None, false)
@@ -817,6 +834,7 @@ async fn run_mirror_with_empty_object_fallback(
 /// writes, so the move works between any two backends. Existing objects with
 /// the same key are overwritten; objects only present in the target are kept.
 pub(crate) async fn migrate_buckets<B: ManagedS3Backend + ?Sized>(
+    docker: Arc<Docker>,
     backend: &B,
     config: &ServiceConfig,
     source: &MigrationSource,
@@ -837,7 +855,7 @@ pub(crate) async fn migrate_buckets<B: ManagedS3Backend + ?Sized>(
         .credential(&admin_access_key, &admin_secret_key, None)
         .credential(&source.admin_access_key, &source.admin_secret_key, None);
 
-    let session = RcSession::start(backend.docker(), &service, env).await?;
+    let session = RcSession::start(docker, &service, env).await?;
     let result = async {
         let buckets = rc_client::list_dir_names(
             session.docker(),

@@ -30,12 +30,10 @@
 //! is involved.
 
 use async_trait::async_trait;
-use bollard::Docker;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::Arc;
 use utoipa::ToSchema;
 
 use super::{HealthProbeResult, ServiceConfig};
@@ -665,8 +663,6 @@ pub trait ManagedS3Backend: Send + Sync {
     /// with it so the restore fence and crash recovery can find them.
     fn container_name(&self) -> String;
 
-    fn docker(&self) -> Arc<Docker>;
-
     /// Where the service listens, from its stored configuration.
     fn endpoint(&self, config: &ServiceConfig) -> Result<ManagedS3Endpoint, ManagedS3Error>;
 
@@ -725,22 +721,15 @@ pub trait ManagedS3Backend: Send + Sync {
     }
 
     /// Mirror every bucket of this service to `destination`.
+    ///
+    /// Required rather than defaulted: the mirror runs helper containers on
+    /// the backend's own Docker daemon, and the daemon handle stays private to
+    /// each backend instead of being exposed through this trait.
     async fn backup(
         &self,
         config: &ServiceConfig,
         destination: &S3Location,
-    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
-        let (access_key, secret_key) = self.admin_credentials(config)?;
-        super::s3_mirror::backup_buckets(
-            self.docker(),
-            &self.service_name(),
-            &self.endpoint(config)?,
-            &access_key,
-            &secret_key,
-            destination,
-        )
-        .await
-    }
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error>;
 
     /// Mirror the buckets stored under `source` into this service. With
     /// `exact`, objects that are not in the backup are removed from the
@@ -751,9 +740,7 @@ pub trait ManagedS3Backend: Send + Sync {
         config: &ServiceConfig,
         source: &S3Location,
         exact: bool,
-    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
-        super::s3_mirror::restore_buckets(self, config, source, exact).await
-    }
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error>;
 
     /// Copy every bucket of `source` into this service with plain S3
     /// semantics, so the data can move between any two backends.
@@ -761,9 +748,7 @@ pub trait ManagedS3Backend: Send + Sync {
         &self,
         config: &ServiceConfig,
         source: &MigrationSource,
-    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
-        super::s3_mirror::migrate_buckets(self, config, source).await
-    }
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error>;
 }
 
 #[cfg(test)]
