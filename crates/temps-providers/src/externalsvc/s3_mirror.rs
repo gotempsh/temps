@@ -396,15 +396,50 @@ fn sdk_client(
     )
 }
 
+/// Most zero-byte objects copied one by one per bucket when a mirror refuses
+/// them (their keys are passed to the retry as `--exclude` arguments).
+const MAX_EMPTY_OBJECTS: usize = 1000;
+
+/// Glob that matches exactly `key`: every glob metacharacter becomes a
+/// one-character class.
+fn exact_glob(key: &str) -> String {
+    let mut glob = String::with_capacity(key.len());
+    for c in key.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\' | '!') {
+            glob.push('[');
+            glob.push(c);
+            glob.push(']');
+        } else {
+            glob.push(c);
+        }
+    }
+    glob
+}
+
+/// `command` (an `rc mirror ... <source> <target>` invocation) with each of
+/// `keys` excluded from the transfer.
+fn with_excluded_keys(command: &[String], keys: &[String]) -> Vec<String> {
+    let split = command.len().saturating_sub(2);
+    let mut result: Vec<String> = command[..split].to_vec();
+    for key in keys {
+        result.push("--exclude".to_string());
+        result.push(exact_glob(key));
+    }
+    result.extend_from_slice(&command[split..]);
+    result
+}
+
 /// Copy every zero-byte object of `bucket` from `source` to `target` with
 /// plain `PutObject` calls (control plane, loopback endpoints). Streams the
-/// listing page by page, so memory stays constant. Returns how many were put.
+/// listing page by page. Returns the keys that were put, so the caller can
+/// keep the mirror from trying them again; the list is capped at
+/// [`MAX_EMPTY_OBJECTS`] because it ends up on a command line.
 async fn copy_empty_objects(
     service: &str,
     source: &MigrationSource,
     target: (&ManagedS3Endpoint, &str, &str),
     bucket: &str,
-) -> Result<usize, ManagedS3Error> {
+) -> Result<Vec<String>, ManagedS3Error> {
     let fail = |operation: &str, reason: String| ManagedS3Error::Mirror {
         service: service.to_string(),
         operation: operation.to_string(),
@@ -417,7 +452,7 @@ async fn copy_empty_objects(
     );
     let to = sdk_client(target.0, target.1, target.2);
 
-    let mut copied = 0usize;
+    let mut copied: Vec<String> = Vec::new();
     let mut pages = from
         .list_objects_v2()
         .bucket(bucket)
@@ -437,6 +472,15 @@ async fn copy_empty_objects(
             let (Some(key), Some(0)) = (object.key(), object.size()) else {
                 continue;
             };
+            if copied.len() >= MAX_EMPTY_OBJECTS {
+                return Err(fail(
+                    &format!("copying empty objects of bucket '{bucket}'"),
+                    format!(
+                        "more than {MAX_EMPTY_OBJECTS} zero-byte objects; the target backend \
+                         cannot take them through a mirror and copying them one by one is capped"
+                    ),
+                ));
+            }
             to.put_object()
                 .bucket(bucket)
                 .key(key)
@@ -449,7 +493,7 @@ async fn copy_empty_objects(
                         e.to_string(),
                     )
                 })?;
-            copied += 1;
+            copied.push(key.to_string());
         }
     }
     Ok(copied)
@@ -525,15 +569,27 @@ pub(crate) async fn migrate_buckets<B: ManagedS3Backend + ?Sized>(
                 )
                 .await;
                 match copied {
-                    Ok(0) => return Err(first_error),
-                    Ok(count) => {
+                    Ok(keys) if keys.is_empty() => return Err(first_error),
+                    Ok(keys) => {
                         info!(
                             service = %service,
                             bucket = %bucket,
-                            count,
+                            count = keys.len(),
                             "Copied zero-byte objects directly after the mirror refused them"
                         );
-                        session.run(&operation, &command, &sensitive).await?;
+                        // `rc` would try the empty objects again (and fail
+                        // again), so the second pass leaves them out.
+                        let retry = with_excluded_keys(
+                            &rc_client::mirror_command(
+                                &format!("src/{bucket}/"),
+                                &format!("svc/{bucket}/"),
+                                false,
+                                TokenSide::Neither,
+                            ),
+                            &keys,
+                        );
+                        let retry: Vec<&str> = retry.iter().map(String::as_str).collect();
+                        session.run(&operation, &retry, &sensitive).await?;
                     }
                     Err(reconcile_error) => {
                         warn!(
@@ -575,6 +631,32 @@ mod tests {
             bucket: "backups".to_string(),
             prefix: prefix.to_string(),
         }
+    }
+
+    #[test]
+    fn exact_glob_escapes_metacharacters_only() {
+        assert_eq!(exact_glob("dir/empty"), "dir/empty");
+        assert_eq!(exact_glob("a*b?[c]{d}"), "a[*]b[?][[]c[]][{]d[}]");
+    }
+
+    #[test]
+    fn excluded_keys_go_before_the_source_and_target() {
+        let command = rc_client::mirror_command("src/b/", "svc/b/", false, TokenSide::Neither);
+        let retried = with_excluded_keys(&command, &["x/empty".to_string(), "e".to_string()]);
+        assert_eq!(
+            retried,
+            vec![
+                "rc",
+                "mirror",
+                "--overwrite",
+                "--exclude",
+                "x/empty",
+                "--exclude",
+                "e",
+                "src/b/",
+                "svc/b/"
+            ]
+        );
     }
 
     #[test]

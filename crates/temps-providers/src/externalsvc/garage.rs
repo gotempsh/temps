@@ -2821,6 +2821,7 @@ mod docker_tests {
                 ("a.txt", "alpha"),
                 ("nested/b.bin", "bravo-bravo"),
                 ("c.txt", ""),
+                ("nested/deeper/empty", ""),
             ] {
                 assert!(
                     put(&rustfs_admin, "photos", key, body.as_bytes()).await,
@@ -2840,7 +2841,7 @@ mod docker_tests {
                 .expect("rustfs -> garage");
             assert!(report.buckets.contains(&"photos".to_string()), "{report:?}");
             let before = checksums(&rustfs_admin, "photos").await;
-            assert_eq!(before.len(), 3);
+            assert_eq!(before.len(), 4);
             assert_eq!(checksums(&garage_admin, "photos").await, before);
 
             // Garage -> RustFS (carries a new object back, keeps the old)
@@ -2857,7 +2858,7 @@ mod docker_tests {
                 .await
                 .expect("garage -> rustfs");
             let after = checksums(&garage_admin, "photos").await;
-            assert_eq!(after.len(), 4);
+            assert_eq!(after.len(), 5);
             assert_eq!(checksums(&rustfs_admin, "photos").await, after);
         })
         .await;
