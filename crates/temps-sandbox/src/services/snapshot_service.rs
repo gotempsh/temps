@@ -408,6 +408,19 @@ impl SnapshotService {
             }
         }
 
+        // The sandbox is down on purpose from here until it is started again;
+        // a request that finds the VM down in between must not conclude it was
+        // lost and mark the row stopped.
+        let planned_downtime = if was_running {
+            Some(
+                self.registry
+                    .begin_planned_downtime(sandbox_internal_id)
+                    .await,
+            )
+        } else {
+            None
+        };
+
         if was_running {
             if let Err(error) = self.provider.stop(&handle).await {
                 let reason = format!("stop sandbox before snapshot: {}", error);
@@ -432,6 +445,8 @@ impl SnapshotService {
                 );
             }
         }
+
+        drop(planned_downtime);
 
         match artifact_result {
             Err(AgentError::SnapshotSizeLimitExceeded { .. }) => {

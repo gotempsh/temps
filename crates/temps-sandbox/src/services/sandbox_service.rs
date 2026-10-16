@@ -453,6 +453,11 @@ const VM_RECONCILE_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// How many ids the startup reconciliation names in its summary.
 const VM_RECONCILE_REPORTED_IDS: usize = 50;
 
+/// Rows loaded per page by [`SandboxService::reconcile_all_running_vms`]:
+/// the most rows the reconciliation holds at once, however many sandboxes the
+/// instance has.
+const VM_RECONCILE_PAGE_SIZE: u64 = 100;
+
 /// What the startup reconciliation found, for the one summary log line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VmReconcileReport {
@@ -478,6 +483,18 @@ pub struct VmReconcileReport {
 }
 
 impl VmReconcileReport {
+    /// Fold the report of another page into this one.
+    fn absorb(&mut self, page: VmReconcileReport) {
+        self.checked += page.checked;
+        self.alive += page.alive;
+        self.marked_stopped_total += page.marked_stopped_total;
+        self.not_marked += page.not_marked;
+        self.unverified += page.unverified;
+        let room = VM_RECONCILE_REPORTED_IDS.saturating_sub(self.marked_stopped.len());
+        self.marked_stopped
+            .extend(page.marked_stopped.into_iter().take(room));
+    }
+
     /// Whether every row examined has a confirmed live VM.
     pub fn all_alive(&self) -> bool {
         self.alive == self.checked
@@ -4850,6 +4867,29 @@ TEMPS_ASKPASS_EOF\n\
         if row.status != "running" || managed_application_id_from_name(&row.name).is_some() {
             return false;
         }
+        // The verdict was reached from a probe that may have run while the
+        // control plane itself had the VM down (snapshot capture, restart,
+        // disk resize); those start it again and leave the row `running`.
+        // Take the claim that excludes them, then ask again: the first answer
+        // may describe a stop that has since finished.
+        let Some(_unplanned) = self.registry.observe_unplanned(row.id) else {
+            tracing::debug!(
+                sandbox_id = %row.public_id,
+                internal_id = row.id,
+                source,
+                "VM is down for a planned stop; not marking the sandbox lost"
+            );
+            return false;
+        };
+        match tokio::time::timeout(
+            VM_RECONCILE_DEADLINE,
+            self.registry.probe(row.id, &row.public_id),
+        )
+        .await
+        {
+            Ok(VmProbe::Down(_)) => {}
+            Ok(VmProbe::Alive(_)) | Ok(VmProbe::Unknown(_)) | Err(_) => return false,
+        }
         let changes = sandboxes::ActiveModel {
             id: Set(row.id),
             status: Set("stopped".to_string()),
@@ -4900,13 +4940,61 @@ TEMPS_ASKPASS_EOF\n\
         }
     }
 
-    /// Startup reconciliation: for every control-plane sandbox row that says
-    /// `running`, ask the provider whether its VM really is, and move the ones
-    /// that are not to `stopped`. Runs once, over `running` rows only (never
-    /// the whole table), with bounded concurrency and a per-sandbox deadline
-    /// so a wedged VM cannot stall startup. A liveness check that fails
-    /// without proving the VM is down (error, timeout) leaves the row alone:
-    /// the lazy check on first access decides later.
+    /// Startup reconciliation: for every control-plane VM sandbox row that
+    /// says `running`, ask the provider whether its VM really is, and move the
+    /// ones that are not to `stopped`. Rows are read in id-ordered pages of
+    /// [`VM_RECONCILE_PAGE_SIZE`], each page checked before the next is read,
+    /// so memory stays constant however many sandboxes exist and slow checks
+    /// cannot pile rows up. A page that cannot be read ends the run early
+    /// (logged); the lazy check on first access covers whatever was not seen.
+    pub async fn reconcile_all_running_vms(&self) -> VmReconcileReport {
+        self.reconcile_running_vms_paged(VM_RECONCILE_PAGE_SIZE)
+            .await
+    }
+
+    async fn reconcile_running_vms_paged(&self, page_size: u64) -> VmReconcileReport {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+
+        let mut report = VmReconcileReport::default();
+        let mut after_id = 0;
+        loop {
+            let page = sandboxes::Entity::find()
+                .filter(sandboxes::Column::Status.eq("running"))
+                .filter(sandboxes::Column::NodeId.is_null())
+                .filter(sandboxes::Column::AgentRunId.is_null())
+                .filter(sandboxes::Column::Backend.is_in(["firecracker", "microsandbox"]))
+                .filter(sandboxes::Column::Id.gt(after_id))
+                .order_by_asc(sandboxes::Column::Id)
+                .limit(page_size)
+                .all(self.db.as_ref())
+                .await;
+            let rows = match page {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        after_id,
+                        error = %error,
+                        "Could not read the next page of running sandboxes for VM reconciliation; stopping early"
+                    );
+                    break;
+                }
+            };
+            let Some(last) = rows.last() else { break };
+            after_id = last.id;
+            let full_page = u64::try_from(rows.len()).is_ok_and(|n| n >= page_size);
+            report.absorb(self.reconcile_running_vms(rows).await);
+            if !full_page {
+                break;
+            }
+        }
+        report
+    }
+
+    /// Check one bounded page of rows (see [`Self::reconcile_all_running_vms`]),
+    /// with bounded concurrency and a per-sandbox deadline so a wedged VM
+    /// cannot stall startup. A liveness check that fails without proving the
+    /// VM is down (error, timeout) leaves the row alone: the lazy check on
+    /// first access decides later.
     pub async fn reconcile_running_vms(&self, rows: Vec<sandboxes::Model>) -> VmReconcileReport {
         use futures::StreamExt;
 
@@ -7674,11 +7762,13 @@ mod storage_cleanup_tests {
             backend: "firecracker".into(),
             reason: "its firecracker process exited".into(),
         };
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
         let (changed, sql) = with_statement_log(
             "mark-race",
             [Vec::<sandboxes::Model>::new()],
             0,
-            FakeProvider::new(),
+            provider,
             |service| async move { service.mark_vm_lost(&row, &cause, "access").await },
         )
         .await;
@@ -7686,6 +7776,115 @@ mod storage_cleanup_tests {
         assert!(!changed);
         assert!(sql.contains("UPDATE"), "{sql}");
         assert!(!sql.contains("vm_lost"), "no event without a change: {sql}");
+    }
+
+    /// Snapshot capture, restart and disk resize take the VM down on purpose
+    /// and start it again. A request that sees it down meanwhile must not
+    /// rewrite the row to `stopped`, or the sandbox would come back to life
+    /// unreachable.
+    #[tokio::test]
+    async fn a_planned_stop_is_not_a_lost_vm() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: row.id,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let data_root = unique_data_root("planned-stop");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+                .append_query_results([vec![destroyed_event()]])
+                .into_connection(),
+        );
+        let (service, registry) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let planned = registry.begin_planned_downtime(row.id).await;
+        assert!(
+            !service.mark_vm_lost(&row, &cause, "access").await,
+            "a VM that is down for a planned stop must not be marked lost"
+        );
+        drop(planned);
+        assert!(
+            service.mark_vm_lost(&row, &cause, "access").await,
+            "once the planned stop is over a down VM is lost again"
+        );
+
+        drop(service);
+        drop(registry);
+        let log = Arc::try_unwrap(db)
+            .expect("nothing holds the database after the service is dropped")
+            .into_transaction_log();
+        let _ = std::fs::remove_dir_all(&data_root);
+        let sql = format!("{log:?}");
+        assert_eq!(sql.matches("UPDATE").count(), 1, "{sql}");
+    }
+
+    /// A verdict reached while the control plane had the VM down is stale by
+    /// the time it is acted on if the planned stop has finished and the VM is
+    /// back: the claim is only worth something with a fresh look.
+    #[tokio::test]
+    async fn a_stale_down_verdict_is_not_acted_on_when_the_vm_is_back() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: row.id,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let (changed, sql) = with_statement_log(
+            "stale-verdict",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            FakeProvider::new(),
+            |service| async move { service.mark_vm_lost(&row, &cause, "access").await },
+        )
+        .await;
+
+        assert!(!changed);
+        assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// The reconciliation reads running VM rows page by page and covers every
+    /// one of them, however small the page.
+    #[tokio::test]
+    async fn startup_reconciliation_walks_every_page() {
+        let mut first = row_with(PUBLIC_ID, "ephemeral", "running");
+        first.id = 1;
+        let mut second = row_with(PUBLIC_ID, "ephemeral", "running");
+        second.id = 2;
+        let mut third = row_with(PUBLIC_ID, "ephemeral", "running");
+        third.id = 3;
+        let data_root = unique_data_root("reconcile-pages");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![first, second], vec![third]])
+                .into_connection(),
+        );
+        let (service, _registry) =
+            build_service_shared(db.clone(), FakeProvider::new(), data_root.clone());
+
+        let report = service.reconcile_running_vms_paged(2).await;
+        drop(service);
+        drop(_registry);
+        let log = Arc::try_unwrap(db)
+            .expect("nothing holds the database after the service is dropped")
+            .into_transaction_log();
+        let _ = std::fs::remove_dir_all(&data_root);
+
+        assert_eq!(report.checked, 3);
+        assert_eq!(report.alive, 3);
+        let sql = format!("{log:?}");
+        assert_eq!(sql.matches("LIMIT").count(), 2, "one query per page: {sql}");
+        assert!(
+            sql.contains("Int(Some(2))"),
+            "second page starts after the last id of the first: {sql}"
+        );
     }
 
     #[tokio::test]
@@ -7840,11 +8039,13 @@ mod storage_cleanup_tests {
             backend: "firecracker".into(),
             reason: "its firecracker process exited".into(),
         };
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
         let (_, sql) = with_statement_log(
             "mark-pinned",
             [Vec::<sandboxes::Model>::new()],
             0,
-            FakeProvider::new(),
+            provider,
             |service| async move { service.mark_vm_lost(&row, &cause, "startup").await },
         )
         .await;

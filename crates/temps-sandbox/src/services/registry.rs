@@ -63,6 +63,64 @@ fn not_running_reason(backend: temps_agents::sandbox::SandboxBackend) -> String 
     }
 }
 
+/// Which sandboxes the control plane is deliberately taking down right now
+/// (snapshot capture, restart, disk resize).
+///
+/// A planned stop makes the VM look exactly like a lost one to a concurrent
+/// request, and the row still says `running` while it lasts. Whoever wants to
+/// conclude "the VM is lost" must hold a shared claim, which cannot be taken
+/// while a planned stop is in flight and keeps one from starting until the
+/// conclusion is written. Entries exist only while somebody holds or awaits a
+/// claim, so the map is bounded by the operations in flight.
+#[derive(Default)]
+struct PlannedDowntime {
+    locks: std::sync::Mutex<HashMap<i32, Arc<RwLock<()>>>>,
+}
+
+impl PlannedDowntime {
+    fn lock_for(&self, id: i32) -> Arc<RwLock<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(id).or_default().clone()
+    }
+
+    /// Drop the entry once nobody else references it. Called after the
+    /// caller's own guard (and so its `Arc` clone) is gone.
+    fn release(&self, id: i32) {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.get(&id).is_some_and(|l| Arc::strong_count(l) == 1) {
+            locks.remove(&id);
+        }
+    }
+}
+
+/// The lock guards are held only for their `Drop`.
+#[allow(dead_code)]
+enum Claim {
+    Planned(tokio::sync::OwnedRwLockWriteGuard<()>),
+    Observing(tokio::sync::OwnedRwLockReadGuard<()>),
+}
+
+/// Held for the whole of a planned stop-and-start of one sandbox. Dropping it
+/// ends the planned downtime.
+#[must_use = "the planned downtime ends when this guard is dropped"]
+pub struct PlannedDowntimeGuard {
+    claim: Option<Claim>,
+    owner: Arc<PlannedDowntime>,
+    id: i32,
+}
+
+/// Proof that no planned stop of the sandbox is running, and none can start
+/// while it is held. See [`StandaloneSandboxRegistry::observe_unplanned`].
+#[must_use = "the claim is released when this guard is dropped"]
+pub struct UnplannedDowntimeClaim(#[allow(dead_code)] PlannedDowntimeGuard);
+
+impl Drop for PlannedDowntimeGuard {
+    fn drop(&mut self) {
+        self.claim.take();
+        self.owner.release(self.id);
+    }
+}
+
 pub struct StandaloneSandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     handles: RwLock<HashMap<i32, SandboxHandle>>,
@@ -76,6 +134,9 @@ pub struct StandaloneSandboxRegistry {
     /// generation marker remains set while the future is in flight, making
     /// cancellation fail closed; concurrent callers wait here and re-check it.
     recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
+    /// Stop-then-start operations the control plane itself performs. See
+    /// [`PlannedDowntime`].
+    planned_downtime: Arc<PlannedDowntime>,
     /// Finds the node hosting a sandbox (ADR-048) when its handle has to be
     /// recovered by name. Required: without it a worker sandbox would be
     /// looked for on the control plane and silently reported missing.
@@ -126,6 +187,7 @@ impl StandaloneSandboxRegistry {
             runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
+            planned_downtime: Arc::new(PlannedDowntime::default()),
             nodes,
         }
     }
@@ -556,8 +618,43 @@ impl StandaloneSandboxRegistry {
     /// Restart a container (stop + start) preserving its filesystem.
     /// Same post-restart recovery as `start`/`stop`.
     pub async fn restart(&self, id: i32, public_id: &str) -> Result<(), AgentError> {
+        let _planned = self.begin_planned_downtime(id).await;
         let handle = self.get_or_recover(id, public_id).await?;
         self.provider.restart(&handle).await
+    }
+
+    /// Mark the sandbox as being taken down on purpose until the returned
+    /// guard is dropped. Waits for any other planned stop or pending
+    /// conclusion about the sandbox. Callers that stop and start a VM without
+    /// going through [`Self::restart`] / [`Self::resize_disk`] (snapshot
+    /// capture) hold this around the whole stop-to-start window.
+    pub async fn begin_planned_downtime(&self, id: i32) -> PlannedDowntimeGuard {
+        let claim = self.planned_downtime.lock_for(id).write_owned().await;
+        PlannedDowntimeGuard {
+            claim: Some(Claim::Planned(claim)),
+            owner: self.planned_downtime.clone(),
+            id,
+        }
+    }
+
+    /// Claim the right to conclude that a sandbox's VM was lost. `None` while
+    /// a planned stop of that sandbox is in flight: its VM being down says
+    /// nothing, and the operation will start it again. While the claim is
+    /// held no planned stop can begin, so a liveness check made after taking
+    /// it describes a VM nobody is about to stop.
+    pub fn observe_unplanned(&self, id: i32) -> Option<UnplannedDowntimeClaim> {
+        let claim = self.planned_downtime.lock_for(id).try_read_owned();
+        match claim {
+            Ok(claim) => Some(UnplannedDowntimeClaim(PlannedDowntimeGuard {
+                claim: Some(Claim::Observing(claim)),
+                owner: self.planned_downtime.clone(),
+                id,
+            })),
+            Err(_) => {
+                self.planned_downtime.release(id);
+                None
+            }
+        }
     }
 
     /// Grow the sandbox's root disk (Firecracker only). Same recovery.
@@ -567,6 +664,7 @@ impl StandaloneSandboxRegistry {
         public_id: &str,
         new_size_mb: u64,
     ) -> Result<(), AgentError> {
+        let _planned = self.begin_planned_downtime(id).await;
         let handle = self.get_or_recover(id, public_id).await?;
         self.provider.resize_disk(&handle, new_size_mb).await
     }
@@ -1215,6 +1313,39 @@ mod tests {
             ),
             "a worker's not-found is not proof"
         );
+    }
+
+    #[tokio::test]
+    async fn a_conclusion_about_a_lost_vm_waits_out_a_planned_stop() {
+        let reg = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+
+        let planned = reg.begin_planned_downtime(7).await;
+        assert!(reg.observe_unplanned(7).is_none());
+        // Other sandboxes are unaffected.
+        assert!(reg.observe_unplanned(8).is_some());
+        drop(planned);
+
+        let claim = reg.observe_unplanned(7).expect("planned stop is over");
+        // While the claim is held a planned stop waits for it.
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(50), reg.begin_planned_downtime(7));
+        assert!(waiting.await.is_err(), "the planned stop must wait");
+        drop(claim);
+        let _ = reg.begin_planned_downtime(7).await;
+    }
+
+    #[tokio::test]
+    async fn planned_downtime_entries_do_not_accumulate() {
+        let reg = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+        for id in 0..50 {
+            drop(reg.begin_planned_downtime(id).await);
+            drop(reg.observe_unplanned(id));
+        }
+        let held = reg.begin_planned_downtime(99).await;
+        assert!(reg.observe_unplanned(99).is_none());
+        drop(held);
+        let locks = reg.planned_downtime.locks.lock().expect("lock map");
+        assert!(locks.is_empty(), "{} stale entries", locks.len());
     }
 
     #[tokio::test]

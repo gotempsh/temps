@@ -264,39 +264,37 @@ impl TempsPlugin for SandboxPlugin {
                     // `stopped` now so listings are true and `resume` works.
                     match &sandbox_service {
                         Some(service) => {
-                            let vm_rows: Vec<sandboxes::Model> = local_rows
-                                .into_iter()
-                                .filter(crate::services::sandbox_service::reconcilable_at_startup)
-                                .collect();
-                            if !vm_rows.is_empty() {
-                                // In the background: a wedged VM costs up to the
-                                // per-check deadline, and startup must not wait
-                                // for it. The same check runs lazily on first
-                                // access, so nothing depends on this finishing.
-                                let service = service.clone();
-                                tokio::spawn(async move {
-                                    let report = service.reconcile_running_vms(vm_rows).await;
-                                    if report.all_alive() {
-                                        info!(
-                                            checked = report.checked,
-                                            alive = report.alive,
-                                            "Sandbox plugin: every running VM sandbox row has a live VM"
-                                        );
-                                    } else {
-                                        warn!(
-                                            checked = report.checked,
-                                            alive = report.alive,
-                                            unverified = report.unverified,
-                                            not_marked = report.not_marked,
-                                            marked_stopped = report.marked_stopped_total,
-                                            marked_stopped_ids = ?report.marked_stopped,
-                                            "Sandbox plugin: not every running VM sandbox has a confirmed live VM; \
-                                             rows whose VM is down were marked stopped (resume them with \
-                                             `temps sandbox resume <id>`)"
-                                        );
-                                    }
-                                });
-                            }
+                            // In the background: a wedged VM costs up to the
+                            // per-check deadline, and startup must not wait
+                            // for it. The same check runs lazily on first
+                            // access, so nothing depends on this finishing.
+                            // Rows are read in bounded pages inside the task.
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                let report = service.reconcile_all_running_vms().await;
+                                if report.checked == 0 {
+                                    return;
+                                }
+                                if report.all_alive() {
+                                    info!(
+                                        checked = report.checked,
+                                        alive = report.alive,
+                                        "Sandbox plugin: every running VM sandbox row has a live VM"
+                                    );
+                                } else {
+                                    warn!(
+                                        checked = report.checked,
+                                        alive = report.alive,
+                                        unverified = report.unverified,
+                                        not_marked = report.not_marked,
+                                        marked_stopped = report.marked_stopped_total,
+                                        marked_stopped_ids = ?report.marked_stopped,
+                                        "Sandbox plugin: not every running VM sandbox has a confirmed live VM; \
+                                         rows whose VM is down were marked stopped (resume them with \
+                                         `temps sandbox resume <id>`)"
+                                    );
+                                }
+                            });
                         }
                         None => warn!(
                             "Sandbox plugin: sandbox service absent — skipping VM state reconciliation"

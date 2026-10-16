@@ -3620,7 +3620,16 @@ impl DockerSandboxProvider {
                     image: String::new(),
                 }))
             }
-            Err(_) => Ok(None),
+            Err(error) if docker_error_is_not_found(&error) => Ok(None),
+            // Anything but "no such container" (socket down, daemon
+            // restarting, timeout) says nothing about whether the container
+            // exists. `Ok(None)` is read as "gone" by callers that then
+            // rewrite the sandbox row, so it must stay an error.
+            Err(error) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_name.to_string(),
+                reason: format!("Failed to inspect container {container_name}: {error}"),
+            }),
         }
     }
 
