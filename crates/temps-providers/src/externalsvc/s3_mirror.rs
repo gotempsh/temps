@@ -242,6 +242,71 @@ fn location_endpoint(location: &S3Location) -> String {
         .unwrap_or_else(|| "https://s3.amazonaws.com".to_string())
 }
 
+/// Port of a loopback endpoint (`localhost` / `127.0.0.1`), which names the
+/// Temps host. Inside the `rc` helper container the same URL would point at
+/// the helper itself, so it has to be translated first.
+fn loopback_endpoint_port(endpoint: &str) -> Option<u16> {
+    let rest = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let (host, tail) = rest.split_once(':')?;
+    if host != "localhost" && host != "127.0.0.1" {
+        return None;
+    }
+    tail.split('/').next()?.parse().ok()
+}
+
+/// `endpoint` with its loopback host replaced by the host gateway name
+/// Docker resolves for containers.
+fn host_gateway_endpoint(endpoint: &str) -> String {
+    endpoint
+        .replace("://localhost", "://host.docker.internal")
+        .replace("://127.0.0.1", "://host.docker.internal")
+}
+
+/// The location's endpoint as the helper container can reach it. A loopback
+/// endpoint that is really another container's published port (a RustFS or
+/// Garage service used as a backup destination) becomes that container's
+/// Docker-network address; any other loopback endpoint goes through the host
+/// gateway; everything else is used unchanged.
+async fn helper_reachable_endpoint(docker: &Docker, location: &S3Location) -> String {
+    let endpoint = location_endpoint(location);
+    let Some(port) = loopback_endpoint_port(&endpoint) else {
+        return endpoint;
+    };
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: false,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_or_default();
+    for container in &containers {
+        let on_temps_network = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .is_some_and(|networks| networks.contains_key(temps_core::NETWORK_NAME.as_str()));
+        let internal_port = container
+            .ports
+            .as_ref()
+            .and_then(|ports| ports.iter().find(|p| p.public_port == Some(port)))
+            .map(|p| p.private_port);
+        let name = container
+            .names
+            .as_ref()
+            .and_then(|names| names.iter().find(|n| n.matches('/').count() == 1))
+            .map(|n| n.trim_start_matches('/'));
+        if let (true, Some(internal_port), Some(name)) = (on_temps_network, internal_port, name) {
+            let scheme = if endpoint.starts_with("https") {
+                "https"
+            } else {
+                "http"
+            };
+            return format!("{scheme}://{name}:{internal_port}");
+        }
+    }
+    host_gateway_endpoint(&endpoint)
+}
+
 fn location_path(alias: &str, location: &S3Location) -> String {
     let prefix = location.prefix.trim_matches('/');
     if prefix.is_empty() {
@@ -269,7 +334,7 @@ pub(crate) async fn backup_buckets(
         service_alias("svc", endpoint, admin_access_key, admin_secret_key),
         rc_client::rc_host_env(
             "dst",
-            &location_endpoint(destination),
+            &helper_reachable_endpoint(&docker, destination).await,
             &destination.access_key,
             &destination.secret_key,
         ),
@@ -321,7 +386,7 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
         service_alias("svc", &endpoint, &admin_access_key, &admin_secret_key),
         rc_client::rc_host_env(
             "src",
-            &location_endpoint(source),
+            &helper_reachable_endpoint(&backend.docker(), source).await,
             &source.access_key,
             &source.secret_key,
         ),
@@ -354,20 +419,43 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
 
         for bucket in &buckets {
             backend.create_bucket(config, bucket).await?;
-            let command = rc_client::mirror_command(
+            let mirror = rc_client::mirror_command(
                 &format!("{root}{bucket}/"),
                 &format!("svc/{bucket}/"),
                 exact,
                 TokenSide::when(has_token, TokenSide::Source),
             );
-            let command: Vec<&str> = command.iter().map(String::as_str).collect();
-            session
-                .run(
-                    &format!("restoring bucket '{bucket}'"),
-                    &command,
-                    &sensitive,
-                )
-                .await?;
+            // The staged (token) form and the "exact" form do not end with
+            // plain source/target arguments, so only the common restore gets
+            // the zero-byte fallback.
+            let fallback = match (has_token || exact, location_sdk_client(source)) {
+                (false, Some(from)) => Some(EmptyObjectCopy {
+                    source_label: format!("backup location '{}'", location_path("", source)),
+                    from,
+                    from_bucket: source.bucket.clone(),
+                    from_prefix: format!(
+                        "{}/",
+                        [source.prefix.trim_matches('/'), bucket.as_str()]
+                            .iter()
+                            .filter(|part| !part.is_empty())
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    ),
+                    to: sdk_client(&endpoint, &admin_access_key, &admin_secret_key),
+                    to_bucket: bucket.clone(),
+                }),
+                _ => None,
+            };
+            run_mirror_with_empty_object_fallback(
+                &session,
+                &service,
+                &format!("restoring bucket '{bucket}'"),
+                &sensitive,
+                &mirror,
+                fallback,
+            )
+            .await?;
         }
         Ok::<_, ManagedS3Error>(buckets)
     }
@@ -429,49 +517,62 @@ fn with_excluded_keys(command: &[String], keys: &[String]) -> Vec<String> {
     result
 }
 
-/// Copy every zero-byte object of `bucket` from `source` to `target` with
-/// plain `PutObject` calls (control plane, loopback endpoints). Streams the
-/// listing page by page. Returns the keys that were put, so the caller can
-/// keep the mirror from trying them again; the list is capped at
+/// Where zero-byte objects of one bucket are read from and written to when
+/// `rc` refuses them: a prefix of a source bucket, and the target bucket.
+struct EmptyObjectCopy {
+    /// Names the source in errors, e.g. `rustfs service 'media'`.
+    source_label: String,
+    from: aws_sdk_s3::Client,
+    from_bucket: String,
+    /// Key prefix of the mirrored tree inside `from_bucket` (empty for none).
+    from_prefix: String,
+    to: aws_sdk_s3::Client,
+    to_bucket: String,
+}
+
+/// Copy every zero-byte object under the source prefix with plain `PutObject`
+/// calls (control plane, loopback endpoints). Streams the listing page by
+/// page. Returns the keys, relative to the prefix, that were put, so the
+/// caller can keep the mirror from trying them again; the list is capped at
 /// [`MAX_EMPTY_OBJECTS`] because it ends up on a command line.
 async fn copy_empty_objects(
     service: &str,
-    source: &MigrationSource,
-    target: (&ManagedS3Endpoint, &str, &str),
-    bucket: &str,
+    copy: &EmptyObjectCopy,
 ) -> Result<Vec<String>, ManagedS3Error> {
     let fail = |operation: &str, reason: String| ManagedS3Error::Mirror {
         service: service.to_string(),
         operation: operation.to_string(),
         reason,
     };
-    let from = sdk_client(
-        &source.endpoint,
-        &source.admin_access_key,
-        &source.admin_secret_key,
-    );
-    let to = sdk_client(target.0, target.1, target.2);
+    let bucket = &copy.to_bucket;
 
     let mut copied: Vec<String> = Vec::new();
-    let mut pages = from
-        .list_objects_v2()
-        .bucket(bucket)
-        .into_paginator()
-        .send();
+    let mut listing = copy.from.list_objects_v2().bucket(&copy.from_bucket);
+    if !copy.from_prefix.is_empty() {
+        listing = listing.prefix(&copy.from_prefix);
+    }
+    let mut pages = listing.into_paginator().send();
     while let Some(page) = pages.next().await {
         let page = page.map_err(|e| {
             fail(
                 &format!(
-                    "listing bucket '{bucket}' of {} service '{}'",
-                    source.backend, source.service
+                    "listing bucket '{}' of {}",
+                    copy.from_bucket, copy.source_label
                 ),
                 e.to_string(),
             )
         })?;
         for object in page.contents() {
-            let (Some(key), Some(0)) = (object.key(), object.size()) else {
+            let (Some(full_key), Some(0)) = (object.key(), object.size()) else {
                 continue;
             };
+            let key = full_key
+                .strip_prefix(copy.from_prefix.as_str())
+                .unwrap_or(full_key)
+                .trim_start_matches('/');
+            if key.is_empty() || key.ends_with('/') {
+                continue;
+            }
             if copied.len() >= MAX_EMPTY_OBJECTS {
                 return Err(fail(
                     &format!("copying empty objects of bucket '{bucket}'"),
@@ -481,7 +582,8 @@ async fn copy_empty_objects(
                     ),
                 ));
             }
-            to.put_object()
+            copy.to
+                .put_object()
                 .bucket(bucket)
                 .key(key)
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b""))
@@ -497,6 +599,81 @@ async fn copy_empty_objects(
         }
     }
     Ok(copied)
+}
+
+/// SDK client for a backup location, for the control plane. `None` for AWS S3
+/// proper, where `rc` has no zero-byte problem worth working around.
+fn location_sdk_client(location: &S3Location) -> Option<aws_sdk_s3::Client> {
+    let endpoint = location.endpoint.as_deref()?;
+    let url = if endpoint.starts_with("http") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let credentials = aws_sdk_s3::config::Credentials::new(
+        &location.access_key,
+        &location.secret_key,
+        location.session_token.clone(),
+        None,
+        "temps-restore",
+    );
+    Some(aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(url)
+            .credentials_provider(credentials)
+            .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build(),
+    ))
+}
+
+/// Run a plain `rc mirror` (`command` ends with source and target). When it
+/// fails and `fallback` is given, copy the zero-byte objects directly (`rc`
+/// uploads them as a multipart upload with no parts, which Garage refuses)
+/// and mirror again without them. Any other failure is returned untouched.
+async fn run_mirror_with_empty_object_fallback(
+    session: &RcSession,
+    service: &str,
+    operation: &str,
+    sensitive: &SensitiveValues<'_>,
+    command: &[String],
+    fallback: Option<EmptyObjectCopy>,
+) -> Result<(), ManagedS3Error> {
+    let first: Vec<&str> = command.iter().map(String::as_str).collect();
+    let first_error = match session.run(operation, &first, sensitive).await {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    let Some(copy) = fallback else {
+        return Err(first_error);
+    };
+    match copy_empty_objects(service, &copy).await {
+        Ok(keys) if keys.is_empty() => Err(first_error),
+        Ok(keys) => {
+            info!(
+                service = %service,
+                bucket = %copy.to_bucket,
+                count = keys.len(),
+                "Copied zero-byte objects directly after the mirror refused them"
+            );
+            // `rc` would try the empty objects again (and fail again), so the
+            // second pass leaves them out.
+            let retry = with_excluded_keys(command, &keys);
+            let retry: Vec<&str> = retry.iter().map(String::as_str).collect();
+            session.run(operation, &retry, sensitive).await?;
+            Ok(())
+        }
+        Err(reconcile_error) => {
+            warn!(
+                service = %service,
+                bucket = %copy.to_bucket,
+                "Could not copy zero-byte objects after a failed mirror: {}",
+                reconcile_error
+            );
+            Err(first_error)
+        }
+    }
 }
 
 /// Copy every bucket of `source` into `backend` using plain S3 reads and
@@ -546,62 +723,37 @@ pub(crate) async fn migrate_buckets<B: ManagedS3Backend + ?Sized>(
 
         for bucket in &buckets {
             backend.create_bucket(config, bucket).await?;
-            let command = rc_client::mirror_command(
+            let mirror = rc_client::mirror_command(
                 &format!("src/{bucket}/"),
                 &format!("svc/{bucket}/"),
                 false,
                 TokenSide::Neither,
             );
-            let command: Vec<&str> = command.iter().map(String::as_str).collect();
             let operation = format!(
                 "migrating bucket '{bucket}' from {} service '{}'",
                 source.backend, source.service
             );
-            if let Err(first_error) = session.run(&operation, &command, &sensitive).await {
-                // `rc` uploads a zero-byte object as a multipart upload with no
-                // parts, which Garage refuses. Copy those with plain PUTs and
-                // mirror again; any other failure is returned untouched.
-                let copied = copy_empty_objects(
-                    &service,
-                    source,
-                    (&endpoint, &admin_access_key, &admin_secret_key),
-                    bucket,
-                )
-                .await;
-                match copied {
-                    Ok(keys) if keys.is_empty() => return Err(first_error),
-                    Ok(keys) => {
-                        info!(
-                            service = %service,
-                            bucket = %bucket,
-                            count = keys.len(),
-                            "Copied zero-byte objects directly after the mirror refused them"
-                        );
-                        // `rc` would try the empty objects again (and fail
-                        // again), so the second pass leaves them out.
-                        let retry = with_excluded_keys(
-                            &rc_client::mirror_command(
-                                &format!("src/{bucket}/"),
-                                &format!("svc/{bucket}/"),
-                                false,
-                                TokenSide::Neither,
-                            ),
-                            &keys,
-                        );
-                        let retry: Vec<&str> = retry.iter().map(String::as_str).collect();
-                        session.run(&operation, &retry, &sensitive).await?;
-                    }
-                    Err(reconcile_error) => {
-                        warn!(
-                            service = %service,
-                            bucket = %bucket,
-                            "Could not copy zero-byte objects after a failed mirror: {}",
-                            reconcile_error
-                        );
-                        return Err(first_error);
-                    }
-                }
-            }
+            let fallback = EmptyObjectCopy {
+                source_label: format!("{} service '{}'", source.backend, source.service),
+                from: sdk_client(
+                    &source.endpoint,
+                    &source.admin_access_key,
+                    &source.admin_secret_key,
+                ),
+                from_bucket: bucket.clone(),
+                from_prefix: String::new(),
+                to: sdk_client(&endpoint, &admin_access_key, &admin_secret_key),
+                to_bucket: bucket.clone(),
+            };
+            run_mirror_with_empty_object_fallback(
+                &session,
+                &service,
+                &operation,
+                &sensitive,
+                &mirror,
+                Some(fallback),
+            )
+            .await?;
         }
         Ok::<_, ManagedS3Error>(buckets)
     }
@@ -631,6 +783,31 @@ mod tests {
             bucket: "backups".to_string(),
             prefix: prefix.to_string(),
         }
+    }
+
+    #[test]
+    fn loopback_endpoints_are_recognised_by_host_and_port() {
+        assert_eq!(loopback_endpoint_port("http://127.0.0.1:9002"), Some(9002));
+        assert_eq!(loopback_endpoint_port("localhost:9000/"), Some(9000));
+        assert_eq!(
+            loopback_endpoint_port("http://localhost:3900/x"),
+            Some(3900)
+        );
+        assert_eq!(loopback_endpoint_port("http://minio.internal:9000"), None);
+        assert_eq!(loopback_endpoint_port("https://s3.amazonaws.com"), None);
+        assert_eq!(loopback_endpoint_port("http://127.0.0.1"), None);
+    }
+
+    #[test]
+    fn host_gateway_endpoint_replaces_only_loopback_hosts() {
+        assert_eq!(
+            host_gateway_endpoint("http://127.0.0.1:9002"),
+            "http://host.docker.internal:9002"
+        );
+        assert_eq!(
+            host_gateway_endpoint("http://store.internal:9002"),
+            "http://store.internal:9002"
+        );
     }
 
     #[test]

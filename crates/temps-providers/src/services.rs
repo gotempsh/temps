@@ -2641,6 +2641,81 @@ impl ExternalServiceManager {
         self.create_service_instance(name, service_type)
     }
 
+    /// Engine instance for the service registered under `name`.
+    ///
+    /// [`Self::get_service_instance`] only knows the service type, so for an
+    /// S3 or Blob service it always answers with the default engine. Anything
+    /// that acts on a registered service (backup, restore, import) needs the
+    /// engine that service actually runs, which is recorded in its
+    /// parameters. A name that is not registered gets the default engine.
+    pub async fn resolve_service_instance(
+        &self,
+        name: &str,
+        service_type: ServiceType,
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
+            return self.create_service_instance(name.to_string(), service_type);
+        }
+        let registered = external_services::Entity::find()
+            .filter(external_services::Column::Name.eq(name))
+            .one(self.db.as_ref())
+            .await?;
+        match registered {
+            Some(row) => {
+                let parameters = self.get_service_parameters(row.id).await?;
+                self.create_service_instance_for_parameters(
+                    name.to_string(),
+                    service_type,
+                    &parameters,
+                )
+            }
+            None => self.create_service_instance(name.to_string(), service_type),
+        }
+    }
+
+    /// Every engine that could own a service called `name` of `service_type`.
+    ///
+    /// A service that is not registered yet has no recorded engine, and the
+    /// callers that ask (name-collision checks, cleanup after a cancelled
+    /// restore) must cover whichever engine the restore picked.
+    fn candidate_instances(
+        &self,
+        name: &str,
+        service_type: ServiceType,
+    ) -> Result<Vec<Box<dyn ExternalService>>, ExternalServiceError> {
+        let mut candidates = vec![self.create_service_instance(name.to_string(), service_type)?];
+        if matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
+            let docker = self.require_docker()?;
+            candidates.push(Box::new(GarageService::new(
+                name.to_string(),
+                docker,
+                self.encryption_service.clone(),
+                service_type,
+            )));
+        }
+        Ok(candidates)
+    }
+
+    /// Remove the Docker objects of a service that was provisioned but never
+    /// registered (a cancelled or failed restore into a new service). Covers
+    /// every engine that could have created it; objects that do not exist are
+    /// skipped by the engines.
+    pub async fn remove_unregistered_service(
+        &self,
+        name: &str,
+        service_type: ServiceType,
+    ) -> Result<(), ExternalServiceError> {
+        for instance in self.candidate_instances(name, service_type)? {
+            instance
+                .remove()
+                .await
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!("removing unregistered service '{}' failed: {}", name, e),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Containers and volumes that already exist under the names a service
     /// called `service_name` would own (see
     /// [`ExternalService::docker_resource_names`]).
@@ -2656,19 +2731,24 @@ impl ExternalServiceManager {
         service_name: &str,
         service_type: ServiceType,
     ) -> Result<Vec<String>, ExternalServiceError> {
-        let instance = self.get_service_instance(service_name.to_string(), service_type)?;
-        let names = instance.docker_resource_names().ok_or_else(|| {
-            ExternalServiceError::InternalError {
-                reason: format!(
-                    "service type '{}' does not report the Docker resources it owns, so \
-                     existing containers or volumes for '{}' cannot be checked",
-                    service_type, service_name
-                ),
-            }
-        })?;
         let docker = self.require_docker()?;
         let mut existing = Vec::new();
-        for container in &names.containers {
+        let mut containers: Vec<String> = Vec::new();
+        let mut volumes: Vec<String> = Vec::new();
+        for instance in self.candidate_instances(service_name, service_type)? {
+            let names = instance.docker_resource_names().ok_or_else(|| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "service type '{}' does not report the Docker resources it owns, so \
+                         existing containers or volumes for '{}' cannot be checked",
+                        service_type, service_name
+                    ),
+                }
+            })?;
+            containers.extend(names.containers);
+            volumes.extend(names.volumes);
+        }
+        for container in &containers {
             match docker
                 .inspect_container(
                     container,
@@ -2690,7 +2770,7 @@ impl ExternalServiceManager {
                 }
             }
         }
-        for volume in &names.volumes {
+        for volume in &volumes {
             match docker.inspect_volume(volume).await {
                 Ok(_) => existing.push(format!("volume {}", volume)),
                 Err(bollard::errors::Error::DockerResponseServerError {
@@ -16659,6 +16739,79 @@ mod tests {
                 assert_eq!(params.image, expected_image);
             }
         }
+    }
+
+    fn s3_row(name: &str, parameters: serde_json::Value) -> external_services::Model {
+        let mut row = encrypted_service_model(41, parameters);
+        row.name = name.to_string();
+        row.service_type = "s3".to_string();
+        row
+    }
+
+    async fn resolved_container(
+        manager: &ExternalServiceManager,
+        name: &str,
+    ) -> Result<String, ExternalServiceError> {
+        let instance = manager
+            .resolve_service_instance(name, ServiceType::S3)
+            .await?;
+        Ok(instance
+            .docker_resource_names()
+            .and_then(|names| names.containers.into_iter().next())
+            .unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn a_registered_garage_service_resolves_to_the_garage_engine() {
+        let row = s3_row("media", serde_json::json!({ "backend": "garage" }));
+        let manager = mock_service_manager(vec![vec![row.clone()], vec![row]]);
+
+        let container = resolved_container(&manager, "media")
+            .await
+            .expect("resolve");
+
+        assert!(container.starts_with("garage-"), "{container}");
+    }
+
+    #[tokio::test]
+    async fn a_registered_s3_service_without_a_backend_resolves_to_rustfs() {
+        let row = s3_row("legacy-media", serde_json::json!({}));
+        let manager = mock_service_manager(vec![vec![row.clone()], vec![row]]);
+
+        let container = resolved_container(&manager, "legacy-media")
+            .await
+            .expect("resolve");
+
+        assert!(container.starts_with("rustfs-"), "{container}");
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_s3_name_resolves_to_the_default_engine() {
+        let manager = mock_service_manager(vec![Vec::<external_services::Model>::new()]);
+
+        let container = resolved_container(&manager, "fresh")
+            .await
+            .expect("resolve");
+
+        assert!(container.starts_with("rustfs-"), "{container}");
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_s3_name_is_checked_against_every_engine() {
+        let manager = mock_service_manager(vec![]);
+
+        let candidates = manager
+            .candidate_instances("restored", ServiceType::S3)
+            .expect("candidates");
+        let containers: Vec<String> = candidates
+            .iter()
+            .filter_map(|instance| instance.docker_resource_names())
+            .flat_map(|names| names.containers)
+            .collect();
+
+        assert_eq!(containers.len(), 2, "{containers:?}");
+        assert!(containers.iter().any(|c| c.starts_with("rustfs-")));
+        assert!(containers.iter().any(|c| c.starts_with("garage-")));
     }
 
     #[tokio::test]

@@ -1057,7 +1057,8 @@ impl RestoreService {
             })?;
         let instance = self
             .external_service_manager
-            .get_service_instance(service.name.clone(), service_type)
+            .resolve_service_instance(&service.name, service_type)
+            .await
             .map_err(|e| RestoreError::ExternalService {
                 reason: format!("get service instance: {}", e),
             })?;
@@ -2182,7 +2183,8 @@ async fn run_restore_inner(
     }
 
     let instance = mgr
-        .get_service_instance(target_service.name.clone(), service_type)
+        .resolve_service_instance(&target_service.name, service_type)
+        .await
         .map_err(|e| RestoreError::ExternalService {
             reason: format!("get service instance: {}", e),
         })?;

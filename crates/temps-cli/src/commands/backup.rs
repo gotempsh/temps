@@ -1813,7 +1813,8 @@ impl BackupCommand {
         // container-backed engine needs a Docker daemon that may be absent), so
         // the restore stops here rather than later with a less specific error.
         let service = manager
-            .get_service_instance(ext_backup.metadata.service_name.clone(), svc_type)
+            .resolve_service_instance(&ext_backup.metadata.service_name, svc_type)
+            .await
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Could not resolve the restore engine for service '{}' (type {}): {}",

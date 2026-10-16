@@ -2903,7 +2903,9 @@ mod docker_tests {
                 .await
                 .expect("backup bucket");
             let destination = S3Location {
-                endpoint: Some(store_endpoint.internal_url()),
+                // The host-loopback URL an operator registers for a backup
+                // destination; the helper containers must still reach it.
+                endpoint: Some(store_endpoint.host_url()),
                 access_key: sk,
                 secret_key: ss,
                 session_token: None,
@@ -2924,6 +2926,7 @@ mod docker_tests {
                 .expect("bucket");
             assert!(put(&source_admin, "docs", "one.txt", b"first").await);
             assert!(put(&source_admin, "docs", "dir/two.txt", b"second").await);
+            assert!(put(&source_admin, "docs", "dir/empty", b"").await);
 
             let backed_up = source_handle
                 .backup(&source_config, &destination)

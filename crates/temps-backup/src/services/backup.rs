@@ -9188,7 +9188,8 @@ ORDER BY a.opened_at DESC
         // used directly — the backup cannot proceed without the engine.
         let service_instance = self
             .external_service_manager
-            .get_service_instance(service.name.clone(), service_type)
+            .resolve_service_instance(&service.name, service_type)
+            .await
             .map_err(|e| {
                 error!(
                     "Could not resolve the backup engine for service '{}' (type={}, id={}): {}",
