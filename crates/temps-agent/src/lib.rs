@@ -89,6 +89,12 @@ pub struct NodeHealthReport {
     /// heartbeated), so it can validate an image before transferring it.
     #[serde(default)]
     pub platform: String,
+    /// Image-operation slots free right now. A build, export, import or scan
+    /// holds one for its whole run, so `0` means a new build would queue. The
+    /// control plane reads it to prefer a builder that is not busy; absent
+    /// from an agent that predates it, which is read as "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_slots_available: Option<u32>,
 }
 
 /// How this node verifies the control plane's TLS certificate.

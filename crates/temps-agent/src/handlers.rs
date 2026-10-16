@@ -112,6 +112,11 @@ impl AgentResourceLimits {
         }
     }
 
+    /// Image-operation slots that are free right now.
+    pub(crate) fn image_slots_available(&self) -> u32 {
+        u32::try_from(self.image_import_slots.available_permits()).unwrap_or(u32::MAX)
+    }
+
     #[cfg(test)]
     fn with_capacities(operations: usize, captures: usize, imports: usize) -> Self {
         Self {
@@ -2232,13 +2237,19 @@ pub async fn pull_image(
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn health_check(State(state): State<Arc<AgentState>>) -> impl IntoResponse {
-    let report = collect_system_metrics(&state).await;
+pub async fn health_check(
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+) -> impl IntoResponse {
+    let report = collect_system_metrics(&state, &limits).await;
     AgentResponse::ok(report)
 }
 
 /// Collect real system metrics using sysinfo.
-async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
+async fn collect_system_metrics(
+    state: &AgentState,
+    limits: &AgentResourceLimits,
+) -> NodeHealthReport {
     use sysinfo::{Disks, System};
 
     let mut sys = System::new();
@@ -2274,6 +2285,7 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         // Empty means "not discovered yet" — the control plane treats a blank
         // platform as unknown rather than as a claim about this node.
         platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
+        build_slots_available: Some(limits.image_slots_available()),
     }
 }
 

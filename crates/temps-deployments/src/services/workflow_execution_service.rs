@@ -147,7 +147,18 @@ struct SelectedNodeBuilder {
     node_name: String,
     platform: String,
     remote: Arc<dyn ImageBuilder>,
+    /// The same connection as `remote`, for the node-specific calls an
+    /// `ImageBuilder` has no place for (build capacity).
+    agent: Arc<temps_deployer::remote::RemoteNodeDeployer>,
 }
+
+/// How long a build offloaded from a control plane that could build it
+/// itself waits for a busy build node before building on the control plane.
+///
+/// Builds on a node are meant to keep CPU off the control plane, so this is
+/// patient (a typical build is a few minutes), but bounded: a preview must not
+/// sit behind another build for as long as the node's own queue would hold it.
+const OFFLOAD_BUILD_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How many images a worker build of a non-static deployment produces.
 #[derive(Debug, PartialEq, Eq)]
@@ -284,6 +295,34 @@ impl BuilderNodeResolver for NodeBuilderResolver {
             .await
             .map_err(WorkflowError::JobExecutionFailed)?;
         Ok(Arc::new(remote.with_platform(platform)))
+    }
+}
+
+/// What a build node's free-slot report means for an offloaded build: `Ok`
+/// with a build-log line when the build waited long enough to notice, or
+/// `Err` with the reason the build runs on the control plane instead.
+fn offload_capacity_verdict(
+    capacity: temps_deployer::remote::BuildCapacity,
+    waited: std::time::Duration,
+    node_name: &str,
+    node_id: i32,
+    queue_wait: std::time::Duration,
+) -> Result<Option<String>, String> {
+    use temps_deployer::remote::BuildCapacity;
+    match capacity {
+        BuildCapacity::Free if waited >= std::time::Duration::from_secs(1) => Ok(Some(format!(
+            "Build node '{node_name}' (id={node_id}) was busy; this build waited {}s for a free \
+             build slot",
+            waited.as_secs()
+        ))),
+        BuildCapacity::Free | BuildCapacity::Unknown => Ok(None),
+        BuildCapacity::Busy => Err(format!(
+            "build node '{node_name}' (id={node_id}) was busy: no build slot became free within \
+             {}s. Add a builder node (label it `{}={}`) so previews do not queue",
+            queue_wait.as_secs(),
+            crate::services::node_scheduler::NODE_ROLE_LABEL,
+            crate::services::node_scheduler::BUILDER_NODE_ROLE,
+        )),
     }
 }
 
@@ -1417,7 +1456,10 @@ impl WorkflowExecutionService {
                         )
                         .await
                     {
-                        Ok(selected) => {
+                        Ok((selected, queue_notice)) => {
+                            if let Some(notice) = queue_notice {
+                                builder = builder.build_location_notice(notice);
+                            }
                             // The control plane's own post-build jobs read
                             // the image from its daemon, so the finished
                             // image is streamed back once the build is done.
@@ -2894,7 +2936,7 @@ impl WorkflowExecutionService {
         cross_build_platforms: &[String],
         needs_npm_credentials: bool,
         inlined_build_variables: &[String],
-    ) -> Result<SelectedNodeBuilder, String> {
+    ) -> Result<(SelectedNodeBuilder, Option<String>), String> {
         // The reason becomes the build-log line explaining why the build
         // stays on the control plane.
         inlined_variables_allow_offload(inlined_build_variables)
@@ -2945,10 +2987,11 @@ impl WorkflowExecutionService {
         }
         .map_err(|error| format!("could not list build nodes: {error}"))?;
         if let Some((node, platform)) = dedicated {
-            return self
+            let selected = self
                 .connect_build_node(deployment_id, node, platform)
                 .await
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())?;
+            return Self::wait_for_offload_capacity(selected).await;
         }
 
         let required_platforms: Vec<String> = candidate.platform.iter().cloned().collect();
@@ -3019,9 +3062,33 @@ impl WorkflowExecutionService {
             .map_err(|error| {
                 format!("could not load worker '{target_name}' (id={target_id}): {error}")
             })?;
-        self.connect_build_node(deployment_id, node, platform)
+        let selected = self
+            .connect_build_node(deployment_id, node, platform)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Self::wait_for_offload_capacity(selected).await
+    }
+
+    /// Give a busy build node [`OFFLOAD_BUILD_QUEUE_WAIT`] to free a slot.
+    ///
+    /// `Ok` carries the node and, when the wait was long enough to matter, a
+    /// build-log line saying so; `Err` is the reason the build stays on the
+    /// control plane instead.
+    async fn wait_for_offload_capacity(
+        selected: SelectedNodeBuilder,
+    ) -> Result<(SelectedNodeBuilder, Option<String>), String> {
+        let (capacity, waited) = selected
+            .agent
+            .wait_for_build_capacity(OFFLOAD_BUILD_QUEUE_WAIT)
+            .await;
+        let notice = offload_capacity_verdict(
+            capacity,
+            waited,
+            &selected.node_name,
+            selected.node_id,
+            OFFLOAD_BUILD_QUEUE_WAIT,
+        )?;
+        Ok((selected, notice))
     }
 
     #[allow(dead_code)]
@@ -3320,11 +3387,13 @@ impl WorkflowExecutionService {
                 platform = %platform,
                 "Building one architecture of a mixed-architecture deployment on node"
             );
+            let remote = Arc::new(remote);
             Ok::<_, WorkflowExecutionError>(SelectedNodeBuilder {
                 node_id: node.id,
                 node_name: node.name.clone(),
                 platform: platform.clone(),
-                remote: Arc::new(remote),
+                remote: remote.clone(),
+                agent: remote,
             })
         }))
         .await
@@ -3359,11 +3428,13 @@ impl WorkflowExecutionService {
             platform = %platform,
             "Building source image on node"
         );
+        let remote = Arc::new(remote.with_platform(Some(platform.clone())));
         Ok(SelectedNodeBuilder {
             node_id: node.id,
             node_name: node.name.clone(),
-            platform: platform.clone(),
-            remote: Arc::new(remote.with_platform(Some(platform))),
+            platform,
+            remote: remote.clone(),
+            agent: remote,
         })
     }
 
@@ -4448,6 +4519,56 @@ mod tests {
             classified.code,
             crate::services::failure_classifier::DeploymentFailureCode::ImagePlatformMismatch
         );
+    }
+
+    #[test]
+    fn a_busy_build_node_sends_the_build_to_the_control_plane_with_a_reason() {
+        use temps_deployer::remote::BuildCapacity;
+        let queue_wait = std::time::Duration::from_secs(300);
+
+        let reason =
+            offload_capacity_verdict(BuildCapacity::Busy, queue_wait, "builder-1", 7, queue_wait)
+                .expect_err("a node that stays busy must not take the build");
+
+        assert!(reason.contains("builder-1"), "{reason}");
+        assert!(reason.contains("id=7"), "{reason}");
+        assert!(reason.contains("300s"), "{reason}");
+        assert!(reason.contains("temps.sh/role=builder"), "{reason}");
+    }
+
+    #[test]
+    fn a_build_node_that_frees_up_keeps_the_build_and_notes_a_long_wait() {
+        use temps_deployer::remote::BuildCapacity;
+        let queue_wait = std::time::Duration::from_secs(300);
+
+        let waited = offload_capacity_verdict(
+            BuildCapacity::Free,
+            std::time::Duration::from_secs(42),
+            "builder-1",
+            7,
+            queue_wait,
+        )
+        .expect("a free node takes the build");
+        let immediate = offload_capacity_verdict(
+            BuildCapacity::Free,
+            std::time::Duration::from_millis(30),
+            "builder-1",
+            7,
+            queue_wait,
+        )
+        .expect("a free node takes the build");
+        let unknown = offload_capacity_verdict(
+            BuildCapacity::Unknown,
+            std::time::Duration::ZERO,
+            "builder-1",
+            7,
+            queue_wait,
+        )
+        .expect("a node that does not report capacity still takes the build");
+
+        assert!(waited.expect("a long wait is logged").contains("42s"));
+        assert_eq!(immediate, None);
+        assert_eq!(unknown, None);
     }
 
     /// Build location `node` moves a build only when a worker can produce the
