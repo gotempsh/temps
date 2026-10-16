@@ -1315,6 +1315,71 @@ pub async fn runtime_env(
     }
 }
 
+/// Revoke a project environment's managed S3 credentials on the worker that
+/// owns the storage engine. Mirrors `runtime_env`: the control plane sends the
+/// stored service configuration and the tenant identity, nothing else.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/revoke-s3-access",
+    request_body = RemoteRuntimeEnvRequest,
+    responses(
+        (status = 200, description = "Credentials revoked", body = AgentResponse<String>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Revocation failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revoke_s3_access(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RemoteRuntimeEnvRequest>,
+) -> impl IntoResponse {
+    let service_name = request.service_config.name.clone();
+    let service_type = request.service_config.service_type;
+    tracing::info!(
+        service = %service_name,
+        service_type = %service_type,
+        project = %request.project_slug,
+        environment = %request.environment_slug,
+        "Revoking managed S3 credentials"
+    );
+
+    let docker = match state.docker.as_ref() {
+        Some(docker) => Arc::new(docker.clone()),
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Docker client is unavailable while revoking credentials for service '{}'",
+                    service_name
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    match temps_providers::externalsvc::revoke_runtime_environment(
+        service_name.clone(),
+        service_type,
+        request.service_config,
+        &request.project_slug,
+        &request.environment_slug,
+        docker,
+    )
+    .await
+    {
+        Ok(()) => ok_response("revoked".to_string()).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to revoke managed S3 credentials for service '{}': {}",
+                service_name, error
+            ),
+        )
+        .into_response(),
+    }
+}
+
 /// Run an authenticated, provider-specific health probe on this node.
 ///
 /// This endpoint intentionally does not accept arbitrary hosts, ports,

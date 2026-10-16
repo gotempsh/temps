@@ -61,6 +61,9 @@ urlencoding = "2.1"
 percent-encoding = { workspace = true }
 tokio-postgres = "0.7"
 base64 = { workspace = true }
+hmac = "0.13"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [features]
 docker-tests = []

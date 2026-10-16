@@ -43,7 +43,9 @@ import {
   backupDestinationState,
 } from '@/lib/service-backup-setup'
 import { ActiveRestoreBanner } from '@/pages/service-restore/ActiveRestoreBanner'
+import { MigrateS3Dialog } from '@/components/storage/MigrateS3Dialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
+import { s3EngineLabel, s3MigrationSupported } from '@/lib/s3-engine'
 import {
   listPgUpgrades,
   phaseIndex,
@@ -217,6 +219,7 @@ export function ServiceDetail() {
   const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
+  const [isMigrateS3DialogOpen, setIsMigrateS3DialogOpen] = useState(false)
   const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] =
     useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -738,6 +741,15 @@ export function ServiceDetail() {
     label: service.service.status,
   }
 
+  const s3Engine = s3EngineLabel(
+    service.service.service_type,
+    service.current_parameters
+  )
+  const canMigrateS3 = s3MigrationSupported(
+    service.service.service_type,
+    service.current_parameters
+  )
+
   const facts: DetailFact[] = [
     {
       label: 'Type',
@@ -751,6 +763,7 @@ export function ServiceDetail() {
         </span>
       ),
     },
+    ...(s3Engine ? [{ label: 'Engine', value: s3Engine }] : []),
     {
       label: 'Topology',
       value:
@@ -970,6 +983,15 @@ export function ServiceDetail() {
                   <ArrowUpCircle className="h-4 w-4 mr-2" />
                   Upgrade
                 </DropdownMenuItem>
+                {canMigrateS3 ? (
+                  <DropdownMenuItem
+                    className="min-h-12 sm:min-h-8"
+                    onClick={() => setIsMigrateS3DialogOpen(true)}
+                  >
+                    <DatabaseZap className="h-4 w-4 mr-2" />
+                    Migrate data from another S3 service…
+                  </DropdownMenuItem>
+                ) : null}
                 {service.service.service_type === 'postgres' ? (
                   <DropdownMenuItem
                     className="min-h-12 sm:min-h-8"
@@ -2054,6 +2076,14 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
+      />
+
+      <MigrateS3Dialog
+        open={isMigrateS3DialogOpen}
+        onOpenChange={setIsMigrateS3DialogOpen}
+        serviceId={parseInt(id!)}
+        serviceName={service.service.name}
         onSuccess={() => refetch()}
       />
 

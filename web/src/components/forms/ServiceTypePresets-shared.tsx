@@ -1,10 +1,18 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { DEFAULT_RUSTFS_IMAGE } from '@/lib/service-images'
+import {
+  DEFAULT_GARAGE_IMAGE,
+  DEFAULT_RUSTFS_IMAGE,
+} from '@/lib/service-images'
+import {
+  bucketNamesError,
+  bucketsParameter,
+  parseBucketInput,
+} from '@/lib/s3-buckets'
 import type { ReactNode } from 'react'
 import { useState } from 'react'
-import { PresetGroup } from './ServiceTypePresets-components'
+import { BucketListField, PresetGroup } from './ServiceTypePresets-components'
 
 /**
  * Preset option card. Used by every service preset to pick a common config
@@ -57,6 +65,13 @@ export interface PresetState {
   ownedFields: string[]
   /** React node to render above the JsonSchemaForm. */
   ui: ReactNode
+  /**
+   * Storage engine the preset selected, for service types that have several.
+   * The creation schema depends on it, so the page asks for the matching one.
+   */
+  backend?: string
+  /** A reason the current selection cannot be submitted, shown by the preset. */
+  error?: string | null
 }
 
 /**
@@ -71,7 +86,7 @@ export function useServiceTypePreset(serviceType: string | null): PresetState {
   const mariadb = useMariDbPreset()
   const redis = useRedisPreset()
   const mongodb = useMongodbPreset()
-  const s3 = useS3Preset()
+  const s3 = useS3Preset(serviceType)
 
   switch (serviceType) {
     case 'postgres':
@@ -301,48 +316,80 @@ export function useMongodbPreset(): PresetState {
 }
 
 // -----------------------------------------------------------------------------
-// S3 / RustFS / MinIO preset — engine pills.
+// S3 / RustFS preset — storage engine cards plus the buckets every linked
+// environment receives.
 // -----------------------------------------------------------------------------
 
 export const S3_OPTIONS: PresetOption[] = [
   {
     id: 'rustfs',
     title: 'RustFS',
-    subtitle: 'Rust-native',
+    subtitle: 'Full-featured, web console',
     value: DEFAULT_RUSTFS_IMAGE,
     hint: 'Default',
   },
   {
+    id: 'garage',
+    title: 'Garage',
+    subtitle: 'Lightweight, S3 API only',
+    value: DEFAULT_GARAGE_IMAGE,
+    hint: 'Small footprint',
+  },
+  {
     id: 'custom',
     title: 'Custom image',
-    subtitle: 'Bring your own',
+    subtitle: 'RustFS-compatible',
     custom: true,
   },
 ]
 
-export function useS3Preset(): PresetState {
+/** Garage is offered for `s3` services only; other types keep the RustFS cards. */
+export function s3OptionsFor(serviceType: string | null): PresetOption[] {
+  return serviceType === 's3'
+    ? S3_OPTIONS
+    : S3_OPTIONS.filter((option) => option.id !== 'garage')
+}
+
+export function useS3Preset(serviceType: string | null): PresetState {
   const [selected, setSelected] = useState('rustfs')
   const [custom, setCustom] = useState('')
-  const option = S3_OPTIONS.find((o) => o.id === selected)
+  const [bucketText, setBucketText] = useState('')
+  const options = s3OptionsFor(serviceType)
+  const option = options.find((o) => o.id === selected) ?? options[0]
   const resolved = option?.value ?? (option?.custom ? custom.trim() : '')
+  const buckets = parseBucketInput(bucketText)
+  const error = bucketNamesError(buckets)
+  const backend = option?.id === 'garage' ? 'garage' : 'rustfs'
   const overrides: Record<string, string | undefined> = {
     docker_image: resolved || undefined,
+    buckets: error ? undefined : bucketsParameter(buckets),
   }
+  if (serviceType === 's3') overrides.backend = backend
 
   return {
     overrides,
-    ownedFields: ['docker_image'],
+    ownedFields: ['docker_image', 'backend', 'buckets'],
+    backend: serviceType === 's3' ? backend : undefined,
+    error,
     ui: (
-      <PresetGroup
-        label="Storage engine"
-        description="RustFS is the default high-performance Rust-native S3-compatible storage engine."
-        options={S3_OPTIONS}
-        selected={selected}
-        customValue={custom}
-        onSelect={setSelected}
-        onCustomChange={setCustom}
-        customPlaceholder="e.g. rustfs/rustfs:latest"
-      />
+      <div className="space-y-6">
+        <PresetGroup
+          label="Storage engine"
+          description="Pick the S3-compatible engine. It cannot be changed later; data can be migrated to a new service."
+          options={options}
+          selected={option?.id ?? 'rustfs'}
+          customValue={custom}
+          onSelect={setSelected}
+          onCustomChange={setCustom}
+          customPlaceholder="e.g. rustfs/rustfs:1.0.0"
+        />
+        <BucketListField
+          value={bucketText}
+          onChange={setBucketText}
+          buckets={buckets}
+          error={error}
+        />
+      </div>
     ),
   }
 }

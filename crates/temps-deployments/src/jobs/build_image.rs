@@ -126,7 +126,10 @@ fn preset_build_root(
     Ok(app.to_path_buf())
 }
 
-fn write_workspace_ignore(root: &Path, dockerfile: &Path) -> Result<(), WorkflowError> {
+fn write_workspace_ignore(
+    root: &Path,
+    dockerfile: &Path,
+) -> Result<GeneratedFileUndo, WorkflowError> {
     // Widening the context must not let app-local negations expose siblings.
     // Builders recognize this internal marker and independently enforce both
     // root and specific rule sets, retaining each file's own negations.
@@ -135,13 +138,18 @@ fn write_workspace_ignore(root: &Path, dockerfile: &Path) -> Result<(), Workflow
     let path = Path::new(&specific);
     let existing = read_confined_control_file(root, path, 1024 * 1024)?;
     let create_new = existing.is_none();
+    let undo = match &existing {
+        Some(previous) => GeneratedFileUndo::Restore(path.to_path_buf(), previous.clone()),
+        None => GeneratedFileUndo::Remove(path.to_path_buf()),
+    };
     // Validate the root control file before handing either builder the context.
     read_confined_control_file(root, &root.join(".dockerignore"), 1024 * 1024)?;
     let mut ignore = existing.unwrap_or_else(|| "# SPDX-FileCopyrightText: 2024-2026 Temps Contributors\n# SPDX-License-Identifier: MIT OR Apache-2.0\n".to_string());
     ignore.push('\n');
     ignore.push_str(temps_deployer::build_protocol::WORKSPACE_ROOT_IGNORE_MARKER);
     ignore.push_str("\n**/node_modules\n**/.git\n**/.env\n**/.env.*\n");
-    write_no_follow(path, ignore.as_bytes(), create_new)
+    write_no_follow(path, ignore.as_bytes(), create_new)?;
+    Ok(undo)
 }
 
 /// Variable name prefixes that frontend frameworks inline into the
@@ -742,7 +750,122 @@ impl std::fmt::Debug for WorkerPlatformBuilder {
     }
 }
 
+/// Whether a build node has a free build slot, asked when a build is about to
+/// be sent to it.
+#[async_trait]
+pub trait BuildCapacityProbe: Send + Sync {
+    /// Wait up to `max_wait` for a free build slot; returns what was learned
+    /// and how long the wait took.
+    async fn wait_for_free_slot(
+        &self,
+        max_wait: Duration,
+    ) -> (temps_deployer::remote::BuildCapacity, Duration);
+}
+
+#[async_trait]
+impl BuildCapacityProbe for temps_deployer::remote::RemoteNodeDeployer {
+    async fn wait_for_free_slot(
+        &self,
+        max_wait: Duration,
+    ) -> (temps_deployer::remote::BuildCapacity, Duration) {
+        self.wait_for_build_capacity(max_wait).await
+    }
+}
+
+/// A build moved off the control plane that may still return to it.
+///
+/// Whether the chosen node has a free build slot is only knowable when the
+/// build is about to be sent: the repository download that precedes it takes
+/// long enough for a free node to fill. So the job asks then, and builds on
+/// the control plane's own daemon when the node stays busy or refuses the
+/// build for lack of a slot.
+#[derive(Clone)]
+pub struct OffloadFallback {
+    probe: Arc<dyn BuildCapacityProbe>,
+    node_id: i32,
+    node_name: String,
+    queue_wait: Duration,
+    /// The control plane's own builder, used when the node stays busy.
+    control_plane: Arc<dyn ImageBuilder>,
+    /// The platforms the build targets when it runs on the control plane:
+    /// what the job was configured with before the node's platform replaced
+    /// it. Set by [`BuildImageJobBuilder::offload_fallback`].
+    control_plane_target_platforms: Vec<String>,
+}
+
+impl OffloadFallback {
+    pub fn new(
+        probe: Arc<dyn BuildCapacityProbe>,
+        node_id: i32,
+        node_name: impl Into<String>,
+        queue_wait: Duration,
+        control_plane: Arc<dyn ImageBuilder>,
+    ) -> Self {
+        Self {
+            probe,
+            node_id,
+            node_name: node_name.into(),
+            queue_wait,
+            control_plane,
+            control_plane_target_platforms: Vec::new(),
+        }
+    }
+}
+
+/// What a build node's free-slot report means for an offloaded build: `Ok`
+/// with a build-log line when the build waited long enough to notice, or
+/// `Err` with the reason the build runs on the control plane instead.
+pub(crate) fn offload_capacity_verdict(
+    capacity: temps_deployer::remote::BuildCapacity,
+    waited: Duration,
+    node_name: &str,
+    node_id: i32,
+    queue_wait: Duration,
+) -> Result<Option<String>, String> {
+    use temps_deployer::remote::BuildCapacity;
+    match capacity {
+        BuildCapacity::Free if waited >= Duration::from_secs(1) => Ok(Some(format!(
+            "Build node '{node_name}' (id={node_id}) was busy; this build waited {}s for a free \
+             build slot",
+            waited.as_secs()
+        ))),
+        BuildCapacity::Free | BuildCapacity::Unknown => Ok(None),
+        BuildCapacity::Busy => Err(format!(
+            "build node '{node_name}' (id={node_id}) was busy: no build slot became free within \
+             {}s. Add a builder node (label it `{}={}`) so previews do not queue",
+            queue_wait.as_secs(),
+            crate::services::node_scheduler::NODE_ROLE_LABEL,
+            crate::services::node_scheduler::BUILDER_NODE_ROLE,
+        )),
+    }
+}
+
+/// Why one attempt to build an image failed.
+enum BuildAttemptError {
+    /// The build node had no free slot and refused before building anything,
+    /// and the files this attempt generated are already removed, so the
+    /// build can be attempted again on the control plane.
+    NodeBusy(String),
+    Workflow(WorkflowError),
+}
+
+impl From<WorkflowError> for BuildAttemptError {
+    fn from(error: WorkflowError) -> Self {
+        Self::Workflow(error)
+    }
+}
+
+impl From<BuildAttemptError> for WorkflowError {
+    fn from(error: BuildAttemptError) -> Self {
+        match error {
+            BuildAttemptError::NodeBusy(detail) => WorkflowError::JobExecutionFailed(detail),
+            BuildAttemptError::Workflow(error) => error,
+        }
+    }
+}
+
 /// Job for building container images from source code
+#[derive(Clone)]
 pub struct BuildImageJob {
     job_id: String,
     download_job_id: String,
@@ -795,10 +918,48 @@ pub struct BuildImageJob {
     /// every other build. When set, the first entry is also
     /// `image_builder`/`remote_builder_node_id` and owns the plain tag.
     platform_builders: Vec<WorkerPlatformBuilder>,
+    /// Set for a build offloaded from a control plane that could build it
+    /// itself: the way back to the control plane. `None` for every other
+    /// build.
+    offload_fallback: Option<OffloadFallback>,
+}
+
+/// A file an attempt generated in the build context, and how to put the
+/// context back as it was.
+#[derive(Debug, PartialEq, Eq)]
+enum GeneratedFileUndo {
+    /// The file did not exist before.
+    Remove(PathBuf),
+    /// The file existed and was appended to; these were its contents.
+    Restore(PathBuf, String),
+}
+
+/// Put the build context back as it was before an attempt generated files in
+/// it, so the next attempt generates them again from scratch. Best effort: a
+/// file that cannot be restored is logged and left, never fatal.
+fn undo_generated_files(undo: &[GeneratedFileUndo]) {
+    for entry in undo {
+        let (path, outcome) = match entry {
+            GeneratedFileUndo::Remove(path) => (path, fs::remove_file(path)),
+            GeneratedFileUndo::Restore(path, contents) => {
+                (path, fs::write(path, contents.as_bytes()))
+            }
+        };
+        if let Err(error) = outcome {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Could not restore a generated build file before rebuilding: {error}"
+                );
+            }
+        }
+    }
 }
 
 /// What `ensure_dockerfile` produced.
 struct GeneratedDockerfile {
+    /// How to undo the files this call wrote.
+    undo: Vec<GeneratedFileUndo>,
     /// Build arguments the preset itself asks for.
     build_args: HashMap<String, String>,
     /// The build context the Dockerfile expects.
@@ -880,6 +1041,56 @@ impl BuildImageJob {
             control_plane_copy: None,
             worker_build_arg_keys: BTreeSet::new(),
             platform_builders: Vec::new(),
+            offload_fallback: None,
+        }
+    }
+
+    pub fn with_offload_fallback(mut self, fallback: Option<OffloadFallback>) -> Self {
+        self.offload_fallback = fallback;
+        self
+    }
+
+    /// This job, rebuilt to run on the control plane's own daemon: the
+    /// worker-only settings are dropped and the configuration the job had
+    /// before it was offloaded is restored.
+    fn on_control_plane(&self, fallback: &OffloadFallback, reason: &str) -> Self {
+        let mut job = self.clone();
+        job.image_builder = fallback.control_plane.clone();
+        job.remote_builder_node_id = None;
+        job.control_plane_copy = None;
+        job.offload_fallback = None;
+        job.worker_build_arg_keys = BTreeSet::new();
+        job.build_config.target_platforms = fallback.control_plane_target_platforms.clone();
+        job.build_location_notice = Some(format!(
+            "⚠️ Build location is set to 'node', but this build runs on the control plane: \
+             {reason}"
+        ));
+        job
+    }
+
+    /// Ask the offload node for a free build slot, up to its queue window.
+    /// `Some(reason)` when the node stayed busy and the build must run on the
+    /// control plane instead.
+    async fn offload_node_stays_busy(
+        &self,
+        fallback: &OffloadFallback,
+        context: &WorkflowContext,
+    ) -> Result<Option<String>, WorkflowError> {
+        let (capacity, waited) = fallback.probe.wait_for_free_slot(fallback.queue_wait).await;
+        match offload_capacity_verdict(
+            capacity,
+            waited,
+            &fallback.node_name,
+            fallback.node_id,
+            fallback.queue_wait,
+        ) {
+            Ok(notice) => {
+                if let Some(notice) = notice {
+                    self.log(context, notice).await?;
+                }
+                Ok(None)
+            }
+            Err(reason) => Ok(Some(reason)),
         }
     }
 
@@ -1248,6 +1459,7 @@ impl BuildImageJob {
         // If Dockerfile exists, we're done (no preset build args)
         if fs::symlink_metadata(dockerfile_path).is_ok() {
             return Ok(GeneratedDockerfile {
+                undo: Vec::new(),
                 build_args: HashMap::new(),
                 build_root: build_context_dir.clone(),
                 generated: false,
@@ -1485,8 +1697,9 @@ impl BuildImageJob {
             true,
         )?;
 
+        let mut undo = vec![GeneratedFileUndo::Remove(dockerfile_path.clone())];
         if preset_root != *build_context_dir && preset_slug != "nextjs" {
-            write_workspace_ignore(&preset_root, dockerfile_path)?;
+            undo.push(write_workspace_ignore(&preset_root, dockerfile_path)?);
         }
 
         self.log(
@@ -1501,6 +1714,7 @@ impl BuildImageJob {
 
         // Return the preset build args so the caller can merge them
         Ok(GeneratedDockerfile {
+            undo,
             build_args: dockerfile_with_args.build_args,
             build_root: preset_root,
             generated: true,
@@ -1734,11 +1948,22 @@ impl BuildImageJob {
     }
 
     /// Build the container image with real-time logging
+    #[cfg(test)]
     async fn build_image(
         &self,
         repo_output: &RepositoryOutput,
         context: &WorkflowContext,
     ) -> Result<ImageOutput, WorkflowError> {
+        self.build_image_attempt(repo_output, context)
+            .await
+            .map_err(WorkflowError::from)
+    }
+
+    async fn build_image_attempt(
+        &self,
+        repo_output: &RepositoryOutput,
+        context: &WorkflowContext,
+    ) -> Result<ImageOutput, BuildAttemptError> {
         self.log(
             context,
             format!("Starting image build for {}", self.image_tag),
@@ -1761,7 +1986,8 @@ impl BuildImageJob {
                 return Err(WorkflowError::JobValidationFailed(format!(
                     "Build context '{}' must be relative and contained by the source root",
                     context_path.display()
-                )));
+                ))
+                .into());
             }
             repo_output.repo_dir.join(context_path)
         } else {
@@ -1790,7 +2016,8 @@ impl BuildImageJob {
                 "Build context '{}' escapes source root '{}'",
                 canonical_context.display(),
                 canonical_root.display()
-            )));
+            ))
+            .into());
         }
 
         let mut build_context = canonical_context.clone();
@@ -1815,7 +2042,8 @@ impl BuildImageJob {
                 "Dockerfile parent '{}' escapes build context '{}'",
                 canonical_parent.display(),
                 canonical_context.display()
-            )));
+            ))
+            .into());
         }
         if fs::symlink_metadata(&dockerfile_path).is_ok() {
             validate_confined_regular_file(&canonical_context, &dockerfile_path)?;
@@ -1829,9 +2057,12 @@ impl BuildImageJob {
 
         // Ensure Dockerfile exists (generate from preset if needed)
         // This returns build args from the preset
-        let dockerfile = self
+        let mut dockerfile = self
             .ensure_dockerfile(context, &build_context, &dockerfile_path, &canonical_root)
             .await?;
+        // What to put back if the node turns out to be busy and the build
+        // runs again on the control plane.
+        let generated_files = std::mem::take(&mut dockerfile.undo);
         build_context = dockerfile.build_root;
 
         // Write .npmrc into the build context when NPM_RC / NPM_TOKEN env vars
@@ -1995,6 +2226,15 @@ impl BuildImageJob {
                 .await
             {
                 Ok(result) => result,
+                // The node refused for lack of a free slot before building
+                // anything: put the generated files back and let the job
+                // build on the control plane.
+                Err(temps_deployer::BuilderError::Busy(detail))
+                    if index == 0 && self.offload_fallback.is_some() =>
+                {
+                    undo_generated_files(&generated_files);
+                    return Err(BuildAttemptError::NodeBusy(detail));
+                }
                 Err(e) => {
                     // The *daemon's* platform, not the binary's: with a
                     // cross-architecture DOCKER_HOST those differ, and using
@@ -2014,7 +2254,7 @@ impl BuildImageJob {
                     // clean `NoCompatibleNode` if there is no rest).
                     if index == 0 {
                         self.log(context, format!("ERROR: {}", message)).await?;
-                        return Err(WorkflowError::JobExecutionFailed(message));
+                        return Err(WorkflowError::JobExecutionFailed(message).into());
                     }
 
                     self.log(
@@ -2097,7 +2337,7 @@ impl BuildImageJob {
                         .await?;
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -2602,25 +2842,9 @@ impl BuildImageJob {
     }
 }
 
-#[async_trait]
-impl WorkflowTask for BuildImageJob {
-    fn job_id(&self) -> &str {
-        &self.job_id
-    }
-
-    fn name(&self) -> &str {
-        "Build Image"
-    }
-
-    fn description(&self) -> &str {
-        "Builds a container image from repository source code"
-    }
-
-    fn depends_on(&self) -> Vec<String> {
-        vec![self.download_job_id.clone()]
-    }
-
-    async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+impl BuildImageJob {
+    /// Build the image where this job is configured to build it.
+    async fn run(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         // Never fall through to the control plane's daemon when local
         // workloads are disabled. A remote builder must be selected first.
         if !self.local_workloads_enabled && self.remote_builder_node_id.is_none() {
@@ -2639,7 +2863,29 @@ impl WorkflowTask for BuildImageJob {
         let repo_output = RepositoryOutput::from_context(&context, &self.download_job_id)?;
 
         // Build the image (logs written in real-time)
-        let mut image_output = self.build_image(&repo_output, &context).await?;
+        let mut image_output = match self.build_image_attempt(&repo_output, &context).await {
+            Ok(output) => output,
+            // The node had a free slot when asked but filled before the
+            // build was admitted. Nothing was built and the generated files
+            // are removed, so build here instead of failing the deployment.
+            Err(BuildAttemptError::NodeBusy(detail)) => {
+                let Some(fallback) = &self.offload_fallback else {
+                    return Err(WorkflowError::JobExecutionFailed(detail));
+                };
+                tracing::warn!(
+                    node_id = fallback.node_id,
+                    node = %fallback.node_name,
+                    "Build node refused the build for lack of a slot; building on the \
+                     control plane: {detail}"
+                );
+                let reason = format!(
+                    "build node '{}' (id={}) refused the build for lack of a free slot: {detail}",
+                    fallback.node_name, fallback.node_id
+                );
+                return Box::pin(self.on_control_plane(fallback, &reason).run(context)).await;
+            }
+            Err(BuildAttemptError::Workflow(error)) => return Err(error),
+        };
         image_output.image_config = self
             .finish_worker_build(&context, &image_output.image_tag)
             .await?;
@@ -2701,6 +2947,41 @@ impl WorkflowTask for BuildImageJob {
         );
 
         Ok(JobResult::success(context))
+    }
+}
+
+#[async_trait]
+impl WorkflowTask for BuildImageJob {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn name(&self) -> &str {
+        "Build Image"
+    }
+
+    fn description(&self) -> &str {
+        "Builds a container image from repository source code"
+    }
+
+    fn depends_on(&self) -> Vec<String> {
+        vec![self.download_job_id.clone()]
+    }
+
+    async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        // A build offloaded from a control plane that could build it itself
+        // asks the node for a free slot now, when it is about to be sent.
+        if let Some(fallback) = &self.offload_fallback {
+            if let Some(reason) = self.offload_node_stays_busy(fallback, &context).await? {
+                tracing::warn!(
+                    node_id = fallback.node_id,
+                    node = %fallback.node_name,
+                    "Build node stayed busy; building on the control plane: {reason}"
+                );
+                return Box::pin(self.on_control_plane(fallback, &reason).run(context)).await;
+            }
+        }
+        self.run(context).await
     }
 
     async fn execute_with_cancellation(
@@ -2813,6 +3094,7 @@ pub struct BuildImageJobBuilder {
     control_plane_copy: Option<(Arc<dyn ImageBuilder>, String)>,
     worker_build_arg_keys: BTreeSet<String>,
     platform_builders: Vec<WorkerPlatformBuilder>,
+    offload_fallback: Option<OffloadFallback>,
 }
 
 impl BuildImageJobBuilder {
@@ -2833,7 +3115,18 @@ impl BuildImageJobBuilder {
             control_plane_copy: None,
             worker_build_arg_keys: BTreeSet::new(),
             platform_builders: Vec::new(),
+            offload_fallback: None,
         }
+    }
+
+    /// Let a build moved to a worker return to the control plane when the
+    /// worker has no free build slot. Records the platforms configured so
+    /// far, which the control-plane build restores, so call it **before**
+    /// [`Self::target_platforms`] sets the worker's.
+    pub fn offload_fallback(mut self, mut fallback: OffloadFallback) -> Self {
+        fallback.control_plane_target_platforms = self.build_config.target_platforms.clone();
+        self.offload_fallback = Some(fallback);
+        self
     }
 
     /// Build each platform natively on its own worker (a mixed-architecture
@@ -2987,7 +3280,8 @@ impl BuildImageJobBuilder {
             .with_build_location_notice(self.build_location_notice)
             .with_control_plane_copy(self.control_plane_copy)
             .with_worker_build_arg_keys(self.worker_build_arg_keys)
-            .with_platform_builders(self.platform_builders);
+            .with_platform_builders(self.platform_builders)
+            .with_offload_fallback(self.offload_fallback);
 
         Ok(job)
     }
@@ -4077,6 +4371,9 @@ mod tests {
         requests: std::sync::Mutex<Vec<BuildRequest>>,
         /// Platforms whose build should fail, with this error text.
         fail_platform: Option<(String, String)>,
+        /// When set, every build is refused with this "no free slot" reason,
+        /// as a worker whose queue window ran out refuses it.
+        busy: Option<String>,
     }
 
     impl RecordingImageBuilder {
@@ -4094,6 +4391,9 @@ mod tests {
                 .unwrap()
                 .push((request.image_name.clone(), request.platform.clone()));
 
+            if let Some(detail) = &self.busy {
+                return Err(BuilderError::Busy(detail.clone()));
+            }
             if let (Some((fail_platform, message)), Some(requested)) =
                 (self.fail_platform.as_ref(), request.platform.as_deref())
             {
@@ -4455,6 +4755,262 @@ mod tests {
         ),
         ("index.html", "<!doctype html><title>web</title>"),
     ];
+
+    #[test]
+    fn a_busy_build_node_sends_the_build_to_the_control_plane_with_a_reason() {
+        use temps_deployer::remote::BuildCapacity;
+        let queue_wait = std::time::Duration::from_secs(300);
+
+        let reason =
+            offload_capacity_verdict(BuildCapacity::Busy, queue_wait, "builder-1", 7, queue_wait)
+                .expect_err("a node that stays busy must not take the build");
+
+        assert!(reason.contains("builder-1"), "{reason}");
+        assert!(reason.contains("id=7"), "{reason}");
+        assert!(reason.contains("300s"), "{reason}");
+        assert!(reason.contains("temps.sh/role=builder"), "{reason}");
+    }
+
+    #[test]
+    fn a_build_node_that_frees_up_keeps_the_build_and_notes_a_long_wait() {
+        use temps_deployer::remote::BuildCapacity;
+        let queue_wait = std::time::Duration::from_secs(300);
+
+        let waited = offload_capacity_verdict(
+            BuildCapacity::Free,
+            std::time::Duration::from_secs(42),
+            "builder-1",
+            7,
+            queue_wait,
+        )
+        .expect("a free node takes the build");
+        let immediate = offload_capacity_verdict(
+            BuildCapacity::Free,
+            std::time::Duration::from_millis(30),
+            "builder-1",
+            7,
+            queue_wait,
+        )
+        .expect("a free node takes the build");
+        let unknown = offload_capacity_verdict(
+            BuildCapacity::Unknown,
+            std::time::Duration::ZERO,
+            "builder-1",
+            7,
+            queue_wait,
+        )
+        .expect("a node that does not report capacity still takes the build");
+
+        assert!(waited.expect("a long wait is logged").contains("42s"));
+        assert_eq!(immediate, None);
+        assert_eq!(unknown, None);
+    }
+
+    /// A fixed answer to "does the node have a free build slot".
+    struct FixedCapacity(temps_deployer::remote::BuildCapacity);
+
+    #[async_trait]
+    impl BuildCapacityProbe for FixedCapacity {
+        async fn wait_for_free_slot(
+            &self,
+            _max_wait: Duration,
+        ) -> (temps_deployer::remote::BuildCapacity, Duration) {
+            (self.0, Duration::ZERO)
+        }
+    }
+
+    /// A job that was offloaded to `worker` and may return to
+    /// `control_plane`, with the planned Vite variables (secrets among them).
+    fn offloaded_vite_job(
+        capacity: temps_deployer::remote::BuildCapacity,
+        worker: Arc<RecordingImageBuilder>,
+        control_plane: Arc<RecordingImageBuilder>,
+    ) -> BuildImageJob {
+        let (args, public) = planned_build_args(StoredPreset::Vite);
+        BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .preset(StoredPreset::Vite)
+            .build_args(args)
+            .worker_build_arg_keys(public)
+            // Before the worker's platform replaces the configured one.
+            .offload_fallback(OffloadFallback::new(
+                Arc::new(FixedCapacity(capacity)),
+                7,
+                "builder-1",
+                Duration::from_secs(300),
+                control_plane,
+            ))
+            .remote_builder_node_id(7)
+            .target_platforms(vec!["linux/arm64".to_string()])
+            .build(worker)
+            .unwrap()
+    }
+
+    fn built_output_node_id(result: &JobResult) -> Option<i32> {
+        result
+            .context
+            .get_output("build", "builder_node_id")
+            .unwrap()
+            .unwrap_or(None)
+    }
+
+    /// The decision is taken when the build is about to be sent, not when the
+    /// workflow was assembled: a node that is busy then never receives it,
+    /// and the build runs on the control plane with the configuration it had
+    /// before it was offloaded.
+    #[tokio::test]
+    async fn a_node_that_is_busy_when_the_build_is_sent_builds_on_the_control_plane() {
+        use temps_deployer::remote::BuildCapacity;
+        let worker = Arc::new(RecordingImageBuilder::default());
+        let control_plane = Arc::new(RecordingImageBuilder::default());
+        let job = offloaded_vite_job(BuildCapacity::Busy, worker.clone(), control_plane.clone());
+        let (_dir, _repo, context, logs) = worker_checkout(VITE_APP);
+
+        let result = job.execute(context).await.expect("the build succeeds");
+
+        assert!(worker.builds().is_empty(), "a busy node must get no build");
+        assert_eq!(
+            control_plane.builds(),
+            vec![("app:latest".to_string(), None)],
+            "the control-plane build uses the pre-offload platforms"
+        );
+        assert_eq!(built_output_node_id(&result), None);
+        let lines = logs.lines.lock().unwrap().join("\n");
+        assert!(
+            lines.contains("this build runs on the control plane"),
+            "{lines}"
+        );
+        assert!(lines.contains("builder-1"), "{lines}");
+    }
+
+    /// A node with a free slot keeps the build, on its own platform.
+    #[tokio::test]
+    async fn a_node_with_a_free_slot_keeps_the_build() {
+        use temps_deployer::remote::BuildCapacity;
+        let worker = Arc::new(RecordingImageBuilder::default());
+        let control_plane = Arc::new(RecordingImageBuilder::default());
+        let job = offloaded_vite_job(BuildCapacity::Free, worker.clone(), control_plane.clone());
+        let (_dir, _repo, context, _logs) = worker_checkout(VITE_APP);
+
+        let result = job.execute(context).await;
+
+        // The control plane is never asked, whatever happens after the worker
+        // builds (reading its image back is not part of this test).
+        assert_eq!(
+            worker.builds(),
+            vec![("app:latest".to_string(), Some("linux/arm64".to_string()))]
+        );
+        assert!(control_plane.builds().is_empty());
+        drop(result);
+    }
+
+    /// The node had a free slot when asked but filled before it admitted the
+    /// build, so it refused. Nothing was built there: the generated
+    /// Dockerfile is removed, and the build runs on the control plane from a
+    /// clean context, with every variable a local build receives.
+    #[tokio::test]
+    async fn a_node_that_refuses_the_build_for_lack_of_a_slot_gets_a_local_rebuild() {
+        use temps_deployer::remote::BuildCapacity;
+        let worker = Arc::new(RecordingImageBuilder {
+            busy: Some("Builder is busy: no build slot became free within 600s".to_string()),
+            ..Default::default()
+        });
+        let control_plane = Arc::new(RecordingImageBuilder::default());
+        let job = offloaded_vite_job(BuildCapacity::Free, worker.clone(), control_plane.clone());
+        let (dir, _repo, context, logs) = worker_checkout(VITE_APP);
+
+        let result = job.execute(context).await.expect("the build succeeds");
+
+        assert_eq!(worker.builds().len(), 1, "the node was tried once");
+        assert_eq!(
+            control_plane.builds(),
+            vec![("app:latest".to_string(), None)]
+        );
+        assert_eq!(built_output_node_id(&result), None);
+        // The rebuilt Dockerfile is the control plane's: it declares the
+        // secret variables a worker never receives.
+        let dockerfile = std::fs::read_to_string(dir.path().join("Dockerfile")).unwrap();
+        assert!(
+            declared_args(&dockerfile).contains("VITE_PRIVATE_TOKEN"),
+            "{dockerfile}"
+        );
+        let local_request = control_plane.requests.lock().unwrap()[0].clone();
+        assert!(
+            local_request.build_args.contains_key("VITE_PRIVATE_TOKEN"),
+            "a control-plane build receives every variable"
+        );
+        let lines = logs.lines.lock().unwrap().join("\n");
+        assert!(lines.contains("refused the build"), "{lines}");
+        assert!(lines.contains("Builder is busy"), "{lines}");
+    }
+
+    /// The refusal leaves the checkout as it found it, so the second attempt
+    /// generates its files from scratch rather than mistaking the first
+    /// attempt's Dockerfile for the repository's own.
+    #[tokio::test]
+    async fn a_busy_refusal_removes_the_files_the_attempt_generated() {
+        use temps_deployer::remote::BuildCapacity;
+        let worker = Arc::new(RecordingImageBuilder {
+            busy: Some("busy".to_string()),
+            ..Default::default()
+        });
+        let job = offloaded_vite_job(
+            BuildCapacity::Free,
+            worker,
+            Arc::new(RecordingImageBuilder::default()),
+        );
+        let (dir, repo, context, _logs) = worker_checkout(VITE_APP);
+
+        let error = job.build_image_attempt(&repo, &context).await.err();
+
+        assert!(matches!(error, Some(BuildAttemptError::NodeBusy(_))));
+        assert!(!dir.path().join("Dockerfile").exists());
+    }
+
+    /// Without a way back, a node's refusal fails the build and says why.
+    #[tokio::test]
+    async fn a_busy_refusal_without_a_fallback_fails_the_build_with_the_node_reason() {
+        let worker = Arc::new(RecordingImageBuilder {
+            busy: Some("Builder is busy: no build slot".to_string()),
+            ..Default::default()
+        });
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .remote_builder_node_id(7)
+            .build(worker)
+            .unwrap();
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+
+        assert!(error.to_string().contains("Builder is busy"), "{error}");
+    }
+
+    /// Putting a context back removes what the attempt created and restores
+    /// what it appended to.
+    #[test]
+    fn undoing_generated_files_removes_new_ones_and_restores_appended_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("Dockerfile");
+        let appended = dir.path().join("Dockerfile.dockerignore");
+        std::fs::write(&created, "FROM scratch\n").unwrap();
+        std::fs::write(&appended, "original\n+ marker\n").unwrap();
+
+        undo_generated_files(&[
+            GeneratedFileUndo::Remove(created.clone()),
+            GeneratedFileUndo::Restore(appended.clone(), "original\n".to_string()),
+            // Already gone: not an error.
+            GeneratedFileUndo::Remove(dir.path().join("missing")),
+        ]);
+
+        assert!(!created.exists());
+        assert_eq!(std::fs::read_to_string(appended).unwrap(), "original\n");
+    }
 
     /// Issue #1344: the generated Vite Dockerfile for a worker build declares
     /// the variables the worker receives -- the platform's public Sentry DSN
@@ -5112,6 +5668,7 @@ mod tests {
             builds: Default::default(),
             requests: Default::default(),
             fail_platform: Some(("linux/arm64".to_string(), "exec format error".to_string())),
+            busy: None,
         });
         let job = BuildImageJobBuilder::new()
             .job_id("build".to_string())
@@ -5152,6 +5709,7 @@ mod tests {
             builds: Default::default(),
             requests: Default::default(),
             fail_platform: Some(("linux/amd64".to_string(), "boom".to_string())),
+            busy: None,
         });
         let job = BuildImageJobBuilder::new()
             .job_id("build".to_string())

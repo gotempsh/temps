@@ -28,8 +28,8 @@ use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, ConfigureAgentsJobBuilder,
     ConfigureCronsJobBuilder, ConfigureMetricAlertsJobBuilder, CronConfigService,
     DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob,
-    DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, PrepareSourceBundleJob,
-    PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
+    DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, OffloadFallback,
+    PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -147,7 +147,19 @@ struct SelectedNodeBuilder {
     node_name: String,
     platform: String,
     remote: Arc<dyn ImageBuilder>,
+    /// The same connection as `remote`, for the node-specific calls an
+    /// `ImageBuilder` has no place for (build capacity).
+    agent: Arc<temps_deployer::remote::RemoteNodeDeployer>,
 }
+
+/// How long a build offloaded from a control plane that could build it
+/// itself waits for a busy build node before building on the control plane.
+/// The build job applies it when the build is about to be sent.
+///
+/// Builds on a node are meant to keep CPU off the control plane, so this is
+/// patient (a typical build is a few minutes), but bounded: a preview must not
+/// sit behind another build for as long as the node's own queue would hold it.
+const OFFLOAD_BUILD_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How many images a worker build of a non-static deployment produces.
 #[derive(Debug, PartialEq, Eq)]
@@ -1418,6 +1430,19 @@ impl WorkflowExecutionService {
                         .await
                     {
                         Ok(selected) => {
+                            // Whether the node has a free build slot is only
+                            // known when the build is about to be sent, after
+                            // the repository download. The build job asks
+                            // then, and builds on the control plane instead
+                            // when the node stays busy. This must come before
+                            // `target_platforms`, which it records to restore.
+                            builder = builder.offload_fallback(OffloadFallback::new(
+                                selected.agent.clone(),
+                                selected.node_id,
+                                selected.node_name.clone(),
+                                OFFLOAD_BUILD_QUEUE_WAIT,
+                                self.image_builder.clone(),
+                            ));
                             // The control plane's own post-build jobs read
                             // the image from its daemon, so the finished
                             // image is streamed back once the build is done.
@@ -2945,10 +2970,11 @@ impl WorkflowExecutionService {
         }
         .map_err(|error| format!("could not list build nodes: {error}"))?;
         if let Some((node, platform)) = dedicated {
-            return self
+            let selected = self
                 .connect_build_node(deployment_id, node, platform)
                 .await
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())?;
+            return Ok(selected);
         }
 
         let required_platforms: Vec<String> = candidate.platform.iter().cloned().collect();
@@ -3019,9 +3045,11 @@ impl WorkflowExecutionService {
             .map_err(|error| {
                 format!("could not load worker '{target_name}' (id={target_id}): {error}")
             })?;
-        self.connect_build_node(deployment_id, node, platform)
+        let selected = self
+            .connect_build_node(deployment_id, node, platform)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(selected)
     }
 
     #[allow(dead_code)]
@@ -3320,11 +3348,13 @@ impl WorkflowExecutionService {
                 platform = %platform,
                 "Building one architecture of a mixed-architecture deployment on node"
             );
+            let remote = Arc::new(remote);
             Ok::<_, WorkflowExecutionError>(SelectedNodeBuilder {
                 node_id: node.id,
                 node_name: node.name.clone(),
                 platform: platform.clone(),
-                remote: Arc::new(remote),
+                remote: remote.clone(),
+                agent: remote,
             })
         }))
         .await
@@ -3359,11 +3389,13 @@ impl WorkflowExecutionService {
             platform = %platform,
             "Building source image on node"
         );
+        let remote = Arc::new(remote.with_platform(Some(platform.clone())));
         Ok(SelectedNodeBuilder {
             node_id: node.id,
             node_name: node.name.clone(),
-            platform: platform.clone(),
-            remote: Arc::new(remote.with_platform(Some(platform))),
+            platform,
+            remote: remote.clone(),
+            agent: remote,
         })
     }
 

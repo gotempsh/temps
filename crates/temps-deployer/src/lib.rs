@@ -213,6 +213,12 @@ pub enum BuilderError {
     #[error("Other error: {0}")]
     Other(String),
 
+    /// The build node had no free build slot within its queue window and
+    /// refused the build before starting it. Nothing was built, so a caller
+    /// that can build elsewhere may do so.
+    #[error("Build node busy: {0}")]
+    Busy(String),
+
     /// The local Docker daemon is unavailable in this process. Returned when
     /// a build is requested on a control-plane node that runs no workloads;
     /// applications must be deployed on worker nodes joined with `temps join`.

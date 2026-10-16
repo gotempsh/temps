@@ -413,12 +413,8 @@ impl ManagerServiceTeardown {
 #[async_trait]
 impl UnpersistedServiceTeardown for ManagerServiceTeardown {
     async fn remove(&self, name: &str, service_type: ServiceType) -> Result<(), String> {
-        let instance = self
-            .manager
-            .get_service_instance(name.to_string(), service_type)
-            .map_err(|e| format!("could not resolve service '{}': {}", name, e))?;
-        instance
-            .remove()
+        self.manager
+            .remove_unregistered_service(name, service_type)
             .await
             .map_err(|e| format!("removing service '{}' failed: {}", name, e))
     }

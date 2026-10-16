@@ -37,12 +37,20 @@ const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// same reason as [`IMAGE_IMPORT_REQUEST_TIMEOUT`] — the control plane should
 /// see the worker's own timeout response rather than a client-side cutoff.
 const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
-const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Longest a worker build request stays open: the agent's 30-minute window to
+/// admit the build and receive its context (the queue wait is part of it),
+/// then a fresh 30-minute build deadline that starts once the build holds a
+/// slot, plus a minute so the agent's own timeout answer arrives before this
+/// client gives up. A build that queued must not lose build time to the time
+/// it spent queued.
+pub const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(61 * 60);
 /// Slightly exceeds the worker's 30-minute export deadline.
 const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// A node scan waits for an image-operation slot, then runs the scanner;
 /// the request outlasts both of the agent's deadlines.
 const IMAGE_SCAN_REQUEST_TIMEOUT: Duration = crate::image_scan::SCAN_REQUEST_TIMEOUT;
+/// How often a busy build node is asked again whether a slot is free.
+const BUILD_CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Longest agent error body quoted back into a deployment log.
 const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
 
@@ -1141,6 +1149,92 @@ impl ContainerDeployer for RemoteNodeDeployer {
     }
 }
 
+/// Whether a build node has a free build slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildCapacity {
+    /// A slot is free, so a build starts at once.
+    Free,
+    /// The node did not say (an agent that predates the report, or one that
+    /// did not answer). Callers proceed: a build then reports its own failure.
+    Unknown,
+    /// Every slot stayed taken for the whole wait, so a build would queue.
+    Busy,
+}
+
+/// Poll `probe` (the node's free build slots, `None` when unknown) every
+/// `interval` until a slot is free or `max_wait` has passed. Returns the
+/// outcome and how long it waited.
+///
+/// `max_wait` bounds the whole call, probes included: once a probe has seen
+/// the node busy, a later probe still in flight when the window runs out is
+/// dropped and the node is reported busy. The first probe is always allowed
+/// to answer (it is what tells busy from unknown, so a zero window still
+/// checks once), bounded only by the probe's own timeout.
+pub async fn wait_for_free_build_slot<F, Fut>(
+    mut probe: F,
+    max_wait: Duration,
+    interval: Duration,
+) -> (BuildCapacity, Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<u32>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut seen_busy = false;
+    loop {
+        let answer = if seen_busy {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, probe()).await {
+                Ok(answer) => answer,
+                Err(_) => return (BuildCapacity::Busy, started.elapsed()),
+            }
+        } else {
+            probe().await
+        };
+        match answer {
+            None => return (BuildCapacity::Unknown, started.elapsed()),
+            Some(free) if free > 0 => return (BuildCapacity::Free, started.elapsed()),
+            Some(_) => seen_busy = true,
+        }
+        let waited = started.elapsed();
+        if waited >= max_wait {
+            return (BuildCapacity::Busy, waited);
+        }
+        tokio::time::sleep(interval.min(max_wait - waited)).await;
+    }
+}
+
+impl RemoteNodeDeployer {
+    /// Wait up to `max_wait` for this node to have a free build slot.
+    ///
+    /// The agent queues builds itself; this lets the caller decide what to do
+    /// with a node that stays busy (build elsewhere) before a context is
+    /// archived and uploaded to it.
+    pub async fn wait_for_build_capacity(&self, max_wait: Duration) -> (BuildCapacity, Duration) {
+        #[derive(Deserialize)]
+        struct HealthSlots {
+            #[serde(default)]
+            build_slots_available: Option<u32>,
+        }
+        wait_for_free_build_slot(
+            || async {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.agent_get::<HealthSlots>("/agent/health"),
+                )
+                .await
+                {
+                    Ok(Ok(health)) => health.build_slots_available,
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            },
+            max_wait,
+            BUILD_CAPACITY_POLL_INTERVAL,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl ImageBuilder for RemoteNodeDeployer {
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
@@ -1223,6 +1317,15 @@ impl ImageBuilder for RemoteNodeDeployer {
             } else {
                 ""
             };
+            // The agent answers 503 when no build slot became free within its
+            // queue window. Nothing was built, which is what lets a caller
+            // that can build elsewhere do so.
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return Err(BuilderError::Busy(format!(
+                    "Worker '{}' had no free build slot (HTTP {status}): {detail}",
+                    self.node_name
+                )));
+            }
             return Err(BuilderError::Other(format!(
                 "Worker '{}' refused image build (HTTP {status}): {detail}{upgrade}",
                 self.node_name
@@ -2318,6 +2421,112 @@ mod tests {
             .contains("authorization: bearer test-token"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_build_slot_returns_as_soon_as_one_frees() {
+        let answers = std::sync::Mutex::new(vec![Some(0), Some(0), Some(1)].into_iter());
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let next = answers.lock().unwrap().next().flatten();
+                async move { next }
+            },
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Free);
+        assert_eq!(waited, Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_stays_busy_is_reported_busy_after_the_whole_window() {
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Some(0) }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_final_probe_cannot_stretch_the_wait_past_its_window() {
+        // First probe answers busy at once; the second starts at 5s and
+        // would only answer at 14s, past the 12s window.
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let n = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n > 0 {
+                        tokio::time::sleep(Duration::from_secs(9)).await;
+                    }
+                    Some(0)
+                }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_does_not_report_capacity_is_never_waited_on() {
+        let (capacity, waited) = wait_for_free_build_slot(
+            || async { None },
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Unknown);
+        assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn wait_for_build_capacity_reads_the_health_report() {
+        let (url, server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"cpu_percent":1.0,"build_slots_available":0},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let (capacity, _) = remote.wait_for_build_capacity(Duration::ZERO).await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /agent/health "), "{request}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_build_capacity_treats_an_older_agent_as_unknown() {
+        let (url, _server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"cpu_percent":1.0,"platform":"linux/amd64"},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let (capacity, _) = remote
+            .wait_for_build_capacity(Duration::from_secs(60))
+            .await;
+
+        assert_eq!(capacity, BuildCapacity::Unknown);
+    }
+
     #[tokio::test]
     async fn inspection_from_an_older_agent_reports_no_image_config() {
         let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":null}"#).await;
@@ -2500,6 +2709,45 @@ mod tests {
             message.contains("absent from the uploaded context"),
             "{message}"
         );
+    }
+
+    /// A worker with no free build slot refuses with 503 before building
+    /// anything. That is a distinct, typed answer so a caller that can build
+    /// elsewhere may, instead of failing the deployment.
+    #[tokio::test]
+    async fn worker_build_with_no_free_slot_is_a_typed_busy_refusal() {
+        let (url, _server) = spawn_one_shot_agent(
+            "503 Service Unavailable",
+            "application/problem+json",
+            br#"{"title":"Image operation unavailable","status":503,"detail":"Builder is busy: no build slot became free within 600s"}"#,
+        )
+        .await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+
+        let error = deployer
+            .build_image(context_request(source.path(), None))
+            .await
+            .expect_err("agent was busy");
+
+        match error {
+            BuilderError::Busy(message) => {
+                assert!(message.contains("builder-1"), "{message}");
+                assert!(message.contains("Builder is busy"), "{message}");
+            }
+            other => panic!("expected Busy, got {other}"),
+        }
+    }
+
+    /// The agent may spend up to 30 minutes admitting a build (the queue wait
+    /// is part of that window) and then 30 more building it; the client must
+    /// not cut the request off before the worker's own deadlines.
+    #[test]
+    fn worker_build_request_outlasts_admission_plus_build() {
+        let admission_and_build = Duration::from_secs(2 * 30 * 60);
+        assert!(IMAGE_BUILD_REQUEST_TIMEOUT > admission_and_build);
     }
 
     #[test]

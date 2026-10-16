@@ -77,6 +77,37 @@ impl From<AgentImageError> for Problem {
 
 const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Longest a build waits behind the node's other image operations for a slot.
+///
+/// Separate from [`BUILD_DEADLINE`] so a queued build is neither held for the
+/// whole of that budget nor left with what remains of it once admitted: past
+/// this wait the node answers 503 while the control plane can still choose
+/// another builder or build on itself.
+const BUILD_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Take one of the node's image-operation slots for a build, waiting at most
+/// `queue_timeout` behind the operations already running.
+///
+/// Answers [`AgentImageError::Unavailable`] (HTTP 503) when the node stays
+/// busy, so a caller can tell a full queue from a failed build.
+async fn acquire_build_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+    queue_timeout: std::time::Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, AgentImageError> {
+    match tokio::time::timeout(queue_timeout, slots.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(AgentImageError::Unavailable(
+            "Worker image operation capacity unavailable".into(),
+        )),
+        Err(_) => Err(AgentImageError::Unavailable(format!(
+            "Builder is busy: no build slot became free within {} minute(s); this node runs \
+             {} image operation(s) at a time. Retry later, or add a builder node",
+            queue_timeout.as_secs().div_ceil(60),
+            crate::handlers::MAX_CONCURRENT_IMAGE_IMPORTS
+        ))),
+    }
+}
+
 /// Own (rather than detach) the build future. Dropping it cancels the Docker
 /// request and releases its scratch directory and admission permit before the
 /// terminal event is sent. A disconnected/slow consumer cannot retain a slot.
@@ -246,7 +277,8 @@ fn bounded_log_line(mut line: String) -> String {
         (status = 403, description = "Deployment-create permission required"),
         (status = 500, description = "Worker build storage operation failed"),
         (status = 503, description = "Worker build capacity unavailable"),
-        (status = 504, description = "Build admission or upload deadline exceeded")
+        (status = 503, description = "Builder busy: no build slot became free in the queue window"),
+        (status = 504, description = "Build upload deadline exceeded")
     ),
     security(("bearer_auth" = []))
 )]
@@ -306,24 +338,7 @@ async fn receive_build(
         return Err(AgentImageError::Invalid(message).into());
     }
 
-    let permit =
-        match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned())
-            .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(AgentImageError::Unavailable(
-                    "Worker image operation capacity unavailable".into(),
-                )
-                .into())
-            }
-            Err(_) => {
-                return Err(AgentImageError::Deadline(
-                    "Worker build waited 30 minutes for capacity".into(),
-                )
-                .into())
-            }
-        };
+    let permit = acquire_build_slot(&limits.image_import_slots, BUILD_QUEUE_TIMEOUT).await?;
     let scratch = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -467,7 +482,13 @@ async fn receive_build(
         }
         Ok(result)
     };
-    tokio::spawn(supervise_build(build, tx, deadline));
+    // The build's own budget starts now that it holds a slot and has its
+    // context: time spent queued or uploading must not shorten it.
+    tokio::spawn(supervise_build(
+        build,
+        tx,
+        tokio::time::Instant::now() + BUILD_DEADLINE,
+    ));
     let output = stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -1250,6 +1271,63 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// The control plane holds one HTTP request open for the whole build. A
+    /// build admitted at the very end of the admission window still gets its
+    /// full, fresh build deadline here, so the client's request timeout must
+    /// cover both, or the stream is cut while the worker is still building.
+    #[test]
+    fn the_control_plane_request_outlasts_admission_plus_the_build_deadline() {
+        let worst_case = BUILD_DEADLINE + BUILD_DEADLINE;
+        assert!(
+            temps_deployer::remote::IMAGE_BUILD_REQUEST_TIMEOUT > worst_case,
+            "a build admitted late must keep its whole build deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_builder_answers_503_after_the_queue_window_not_after_the_build_deadline() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let running_build = slots.clone().acquire_owned().await.unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = acquire_build_slot(&slots, BUILD_QUEUE_TIMEOUT)
+            .await
+            .expect_err("the only slot is taken");
+
+        assert_eq!(started.elapsed(), BUILD_QUEUE_TIMEOUT);
+        assert!(BUILD_QUEUE_TIMEOUT < BUILD_DEADLINE);
+        let message = error.to_string();
+        assert!(message.contains("Builder is busy"), "{message}");
+        assert!(message.contains("10 minute"), "{message}");
+        assert_eq!(
+            Problem::from(error).status_code,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(running_build);
+        assert!(acquire_build_slot(&slots, BUILD_QUEUE_TIMEOUT)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_build_is_admitted_as_soon_as_a_slot_frees() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let running_build = slots.clone().acquire_owned().await.unwrap();
+        let waiting = tokio::spawn({
+            let slots = slots.clone();
+            async move { acquire_build_slot(&slots, BUILD_QUEUE_TIMEOUT).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(
+            !waiting.is_finished(),
+            "must keep queueing inside the window"
+        );
+
+        drop(running_build);
+
+        assert!(waiting.await.unwrap().is_ok());
     }
 
     #[tokio::test]
