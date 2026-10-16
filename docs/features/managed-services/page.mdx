@@ -422,16 +422,17 @@ curl -X POST "$TEMPS_URL/api/external-services/$TARGET_ID/migrate-s3" \
   -d "{\"source_service_id\": $SOURCE_ID}"
 ```
 
-Both services must run on the control-plane host. Garage services cannot be
-created on a worker node yet. Backups taken from either engine can be restored
-into the other.
+Both services must run on the control-plane host, and Garage services cannot
+be created on a worker node yet. Zero-byte objects are copied with direct
+requests, because the bulk-copy client uploads them in a way Garage rejects.
 
-<Note>
-Zero-byte objects are copied across backends with direct requests. Restoring a
-backup that contains zero-byte objects into a Garage service can fail, because
-the restore client uploads them as empty multipart uploads, which Garage
-rejects.
-</Note>
+Backups of a managed S3 service are plain object copies. Restoring one into a
+new service creates a service on the same engine as the source.
+
+Declared bucket names are 3-32 characters of lower-case letters, digits and
+hyphens, duplicates are dropped, and a service declares at most 16. A Garage
+service's own key cannot create buckets, so it cannot be registered directly as
+a backup destination; use a RustFS service or an external S3 bucket for that.
 
 ### Connecting to S3
 
