@@ -147,7 +147,7 @@ limits and account for image storage when allocating the sandbox.
 | `recover` / `recover_by_name` | SDK registry lookup by name; accepts bare labels |
 | `image_status` / `rebuild_image` | readiness + default image (`alpine:3.20`); no build step (images are pulled per sandbox) |
 
-VMs are created **detached**: they outlive the server process, like Firecracker VMs, and are recovered by name after a restart.
+VMs are created **detached**: they outlive the server process, like Firecracker VMs, and are recovered by name after a restart. "Outlive the process" does not cover a service manager that kills the unit's whole control group (systemd's default `KillMode=control-group` on `systemctl restart`) or a host reboot; in that case startup reconciliation moves the `running` rows whose VM is down to `stopped` (with a `vm_lost` event), `resume` boots them again, and exec/files/terminal on a down VM answer `409 Sandbox VM Not Running` instead of `404` (see ADR-029 §7).
 
 **`network_mode`** maps onto the host-side policy engine:
 

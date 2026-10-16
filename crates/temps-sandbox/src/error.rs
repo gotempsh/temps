@@ -143,6 +143,27 @@ pub enum SandboxError {
     #[error("Sandbox {sandbox_id} not found")]
     NotFound { sandbox_id: String },
 
+    /// The sandbox row exists (it is listed, and owned by the caller) but its
+    /// VM or container is not running and the provider cannot serve the
+    /// request: the VMM exited, was killed together with the Temps service,
+    /// or the host rebooted, or the provider no longer has the VM's files.
+    /// Distinct from [`SandboxError::NotFound`], which is only for ids that do
+    /// not exist, so the caller is told what happened and how to recover
+    /// instead of being sent looking for a sandbox that is still listed.
+    /// `backend` is `None` when the provider lost the VM entirely and
+    /// there is no handle to read it from. Mapped to HTTP 409.
+    #[error(
+        "Sandbox {sandbox_id} exists, but its {} is not running: {reason}. {}",
+        vm_label(backend.as_deref()),
+        recovery.advice(sandbox_id)
+    )]
+    VmNotRunning {
+        sandbox_id: String,
+        backend: Option<String>,
+        reason: String,
+        recovery: VmRecovery,
+    },
+
     /// A background job tracked by [`JobTracker`] was not found in the
     /// requested sandbox. Separate from `NotFound` so callers can tell the
     /// difference between "wrong sandbox id" and "wrong job id".
@@ -363,6 +384,45 @@ pub enum SandboxError {
     },
 }
 
+/// How to get a sandbox whose VM is not running back, which depends on what
+/// the provider reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmRecovery {
+    /// The provider found the VM and it is down: its disk is intact and
+    /// `sandbox resume` boots it again.
+    Resume,
+    /// The provider could not find the VM, or could not check it. Whether the
+    /// VM's files still exist is unknown, so the advice does not promise a
+    /// resume or a restart (a failed `resume` also lands here, and `restart`
+    /// refuses a stopped row): retry, then recreate.
+    RestartOrRecreate,
+}
+
+impl VmRecovery {
+    fn advice(self, sandbox_id: &str) -> String {
+        match self {
+            VmRecovery::Resume => format!(
+                "Run `bunx @temps-sdk/cli sandbox resume {sandbox_id}` to boot it again with its disk intact. \
+                 If that fails because the VM's files are gone, delete it with \
+                 `bunx @temps-sdk/cli sandbox rm {sandbox_id}` and create a new one."
+            ),
+            VmRecovery::RestartOrRecreate => format!(
+                "Retry in a moment. If it keeps failing, the VM's files are gone and it cannot be \
+                 started again: delete it with `bunx @temps-sdk/cli sandbox rm {sandbox_id}` \
+                 and create a new one."
+            ),
+        }
+    }
+}
+
+/// What the error message calls the thing that is not running.
+fn vm_label(backend: Option<&str>) -> String {
+    match backend {
+        Some(backend) => format!("{backend} VM"),
+        None => "VM".to_string(),
+    }
+}
+
 /// Translate a lower-level `AgentError` from the shared `SandboxProvider`
 /// into a `SandboxError` with the standalone sandbox ID attached. The
 /// provider's errors are keyed by `run_id` (an internal numeric id) — the
@@ -388,8 +448,24 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         };
     }
     match err {
-        AgentError::SandboxNotFound { .. } => SandboxError::NotFound {
+        // Every caller reaches the provider with a sandbox row already
+        // loaded (an id with no row is `NotFound` before the provider is
+        // asked), so a provider that cannot find the VM means the sandbox
+        // exists but has nothing running behind it: a 409 with the way back,
+        // not a 404 for an id that is still listed.
+        AgentError::SandboxNotFound { sandbox, .. } => SandboxError::VmNotRunning {
             sandbox_id: sandbox_id.to_string(),
+            backend: None,
+            reason: format!("the provider cannot find it ({sandbox})"),
+            recovery: VmRecovery::RestartOrRecreate,
+        },
+        AgentError::SandboxNotRunning {
+            backend, reason, ..
+        } => SandboxError::VmNotRunning {
+            sandbox_id: sandbox_id.to_string(),
+            backend: Some(backend),
+            reason,
+            recovery: VmRecovery::Resume,
         },
         AgentError::SandboxExecFailed { reason, .. } => SandboxError::ExecFailed {
             sandbox_id: sandbox_id.to_string(),
@@ -566,16 +642,96 @@ mod tests {
         assert!(msg.contains("stop or cancel"), "msg: {}", msg);
     }
 
+    /// A provider that cannot find the VM of a sandbox whose row exists is
+    /// not "not found": the id is valid and listed. It is a 409 that names
+    /// the public id (never the internal run id) and how to recover.
     #[test]
-    fn from_agent_error_preserves_not_found() {
+    fn provider_not_found_for_an_existing_row_is_vm_not_running() {
         let agent = AgentError::SandboxNotFound {
             run_id: 42,
-            sandbox: "sbx_test".into(),
+            sandbox: "temps-sandbox-test".into(),
         };
         let err = from_agent_error("sbx_public", agent);
-        assert!(matches!(err, SandboxError::NotFound { .. }));
-        // The public ID propagates, not the internal run_id
-        assert_eq!(err.to_string(), "Sandbox sbx_public not found");
+        assert!(
+            matches!(&err, SandboxError::VmNotRunning { sandbox_id, backend: None, .. }
+                if sandbox_id == "sbx_public"),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_public"), "{msg}");
+        assert!(msg.contains("temps-sandbox-test"), "{msg}");
+        // A failed `resume` lands here too, so it must not send the caller
+        // back to `resume`, nor to `restart` (which refuses a stopped row).
+        assert!(!msg.contains("sandbox resume"), "{msg}");
+        assert!(!msg.contains("sandbox restart"), "{msg}");
+        assert!(msg.contains("sandbox rm sbx_public"), "{msg}");
+        assert!(!msg.contains("42"), "internal run id leaked: {msg}");
+    }
+
+    #[test]
+    fn not_running_vm_keeps_the_backend_and_the_liveness_reason() {
+        let err = from_agent_error(
+            "sbx_public",
+            AgentError::SandboxNotRunning {
+                run_id: 42,
+                sandbox_id: "sbx_internal".into(),
+                container: "temps-sandbox-public".into(),
+                backend: "firecracker".into(),
+                reason: "its firecracker process exited".into(),
+            },
+        );
+        match &err {
+            SandboxError::VmNotRunning {
+                sandbox_id,
+                backend,
+                reason,
+                recovery,
+            } => {
+                assert_eq!(sandbox_id, "sbx_public");
+                assert_eq!(backend.as_deref(), Some("firecracker"));
+                assert_eq!(reason, "its firecracker process exited");
+                assert_eq!(*recovery, VmRecovery::Resume);
+            }
+            other => panic!("expected VmNotRunning, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_public exists"), "{msg}");
+        assert!(msg.contains("firecracker VM is not running"), "{msg}");
+        assert!(msg.contains("its firecracker process exited"), "{msg}");
+        assert!(msg.contains("sandbox resume sbx_public"), "{msg}");
+    }
+
+    #[test]
+    fn vm_not_running_is_a_409_problem_and_unknown_ids_stay_404() {
+        let not_running = temps_core::problemdetails::Problem::from(SandboxError::VmNotRunning {
+            sandbox_id: "sbx_a".into(),
+            backend: Some("microsandbox".into()),
+            reason: "its microsandbox process exited".into(),
+            recovery: VmRecovery::Resume,
+        });
+        assert_eq!(not_running.status_code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            not_running.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/sandbox-vm-not-running")
+        );
+        assert_eq!(
+            not_running.body.get("title").and_then(|v| v.as_str()),
+            Some("Sandbox VM Not Running")
+        );
+        let detail = not_running
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("sbx_a") && detail.contains("microsandbox VM"),
+            "{detail}"
+        );
+
+        let missing = temps_core::problemdetails::Problem::from(SandboxError::NotFound {
+            sandbox_id: "sbx_nope".into(),
+        });
+        assert_eq!(missing.status_code, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[test]

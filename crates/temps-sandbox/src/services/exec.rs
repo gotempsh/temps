@@ -99,12 +99,10 @@ impl SandboxService {
     ) -> Result<ExecResult, SandboxError> {
         options.validate()?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         let result = self
             .registry()
             .provider()
@@ -128,16 +126,14 @@ impl SandboxService {
     ) -> Result<String, SandboxError> {
         options.validate()?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id, row.timeout_secs).await;
 
         // Verify the sandbox is alive *before* spawning the background task,
         // so callers get a synchronous NotFound/ExecFailed instead of a
         // silently-dead job.
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
+        self.touch(internal_id, row.timeout_secs).await;
 
         let state = Arc::new(tokio::sync::Mutex::new(JobState::default()));
         let state_for_task = state.clone();

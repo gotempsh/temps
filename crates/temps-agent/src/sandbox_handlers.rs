@@ -258,6 +258,11 @@ async fn require_handle(
 fn provider_err(e: AgentError) -> ApiError {
     let status = match &e {
         AgentError::SandboxNotFound { .. } => StatusCode::NOT_FOUND,
+        // Only the control plane's registry reports this (it checks liveness
+        // of a recovered handle); a node never does. If one ever does, the
+        // sandbox is not reachable here, which the control plane already
+        // reads as "gone" from a 404.
+        AgentError::SandboxNotRunning { .. } => StatusCode::NOT_FOUND,
         AgentError::Validation { .. }
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,

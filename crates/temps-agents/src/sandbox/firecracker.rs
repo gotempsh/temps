@@ -256,6 +256,22 @@ impl FirecrackerSandboxConfig {
     }
 }
 
+/// What a VMM-process check plus an agent ping say about a VM. No VMM process
+/// is proof the VM is down. A VMM that is running but whose guest agent missed
+/// a ping is *not* proof of anything (a VM that is booting, swapping or
+/// saturated misses pings), so it is an error, not `false`: callers that
+/// act on "not running" (the row reconciliation) must not act on it.
+fn liveness_verdict(vmm_running: bool, agent_answered: bool) -> Result<bool, &'static str> {
+    match (vmm_running, agent_answered) {
+        (false, _) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(
+            "the VMM process is running but its guest agent did not answer a ping within 3s \
+             (the VM may still be booting or be overloaded)",
+        ),
+    }
+}
+
 pub struct FirecrackerSandboxProvider {
     config: FirecrackerSandboxConfig,
     docker: Arc<bollard::Docker>,
@@ -1941,14 +1957,15 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
-        if self.vm_pid(&handle.sandbox_name).is_none() {
-            return Ok(false);
-        }
-        Ok(matches!(
-            self.rpc(&handle.sandbox_name, &Request::Ping, Duration::from_secs(3))
-                .await,
-            Ok(Response::Pong)
-        ))
+        let vmm_running = self.vm_pid(&handle.sandbox_name).is_some();
+        let agent_answered = vmm_running
+            && matches!(
+                self.rpc(&handle.sandbox_name, &Request::Ping, Duration::from_secs(3))
+                    .await,
+                Ok(Response::Pong)
+            );
+        liveness_verdict(vmm_running, agent_answered)
+            .map_err(|reason| self.err(&handle.sandbox_name, reason))
     }
 
     async fn write_file(
@@ -2788,6 +2805,14 @@ fn firecracker_snapshot_host_available() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_vmm_is_down_but_a_missed_ping_is_not_proof() {
+        assert_eq!(liveness_verdict(false, false), Ok(false));
+        assert_eq!(liveness_verdict(true, true), Ok(true));
+        let unknown = liveness_verdict(true, false).expect_err("a missed ping is unknown");
+        assert!(unknown.contains("did not answer a ping"), "{unknown}");
+    }
+
     use super::*;
 
     fn provider_at(data_dir: PathBuf) -> FirecrackerSandboxProvider {

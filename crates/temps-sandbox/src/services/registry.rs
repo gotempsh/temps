@@ -33,6 +33,36 @@ use temps_agents::sandbox::{
     user::SANDBOX_CHOWN, RuntimeCompatibility, SandboxCreateConfig, SandboxHandle, SandboxProvider,
 };
 
+/// Outcome of [`StandaloneSandboxRegistry::probe`].
+#[derive(Debug)]
+pub enum VmProbe {
+    /// The VM answered its liveness check.
+    Alive(SandboxHandle),
+    /// The provider answered and the VM is not running, or it has no trace of
+    /// it (`SandboxNotRunning` / `SandboxNotFound`).
+    Down(AgentError),
+    /// The check itself failed (provider or node error): the VM may or may not
+    /// be running.
+    Unknown(AgentError),
+}
+
+/// Why a down VM is down, as far as the backend lets us say. Firecracker and
+/// microsandbox VMMs are children of the Temps service, so a restart that kills
+/// the service's whole control group (systemd's default) or a host reboot takes
+/// them down; Docker containers and local processes are not, so that guess
+/// would be wrong for them.
+fn not_running_reason(backend: temps_agents::sandbox::SandboxBackend) -> String {
+    use temps_agents::sandbox::SandboxBackend;
+    match backend {
+        SandboxBackend::Firecracker | SandboxBackend::Microsandbox => format!(
+            "its {backend} VM process exited or was stopped (for example when the Temps service \
+             restarted or the host rebooted)"
+        ),
+        SandboxBackend::Docker => "its container is stopped".to_string(),
+        SandboxBackend::Local => "its process is not running".to_string(),
+    }
+}
+
 pub struct StandaloneSandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     handles: RwLock<HashMap<i32, SandboxHandle>>,
@@ -327,9 +357,10 @@ impl StandaloneSandboxRegistry {
     }
 
     /// Look up an existing handle for use by exec/read/write. Verifies
-    /// liveness — returns `SandboxNotFound` if the container exists but
-    /// is stopped, because non-lifecycle operations need a running
-    /// sandbox. Lifecycle operations (`start`/`stop`/`restart`/`destroy`)
+    /// liveness — returns `SandboxNotRunning` (naming the backend and why)
+    /// if the VM or container is known but stopped, because non-lifecycle
+    /// operations need a running sandbox. `SandboxNotFound` is only for a
+    /// provider that has no trace of it at all. Lifecycle operations (`start`/`stop`/`restart`/`destroy`)
     /// use `get_or_recover` directly instead. A liveness check that fails
     /// outright is handled by [`Self::liveness_failure`]: `SandboxNotFound`
     /// for a local sandbox, the provider's error for a worker sandbox.
@@ -338,17 +369,56 @@ impl StandaloneSandboxRegistry {
     /// derives the container label from it so recovery after a server
     /// restart finds the container by name.
     pub async fn get(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
-        let handle = self.get_or_recover(id, public_id).await?;
+        match self.probe(id, public_id).await {
+            VmProbe::Alive(handle) => Ok(handle),
+            VmProbe::Down(error) | VmProbe::Unknown(error) => Err(error),
+        }
+    }
+
+    /// [`Self::get`] that also says whether the error proves the VM is gone.
+    /// Callers that act on that (reconciling a row to `stopped`) must not act
+    /// on [`VmProbe::Unknown`]: a liveness check that errors, or a worker that
+    /// cannot be reached, says nothing about whether the VM is running.
+    pub async fn probe(&self, id: i32, public_id: &str) -> VmProbe {
+        let handle = match self.get_or_recover(id, public_id).await {
+            Ok(handle) => handle,
+            // The control-plane provider answered and has no trace of the VM.
+            // A worker's "not found" is a reply over the network from a node
+            // that may be misrouted or mid-restart, so it is not proof.
+            Err(error @ AgentError::SandboxNotFound { .. }) => {
+                return match self.node_of(id).await {
+                    Ok(None) => VmProbe::Down(error),
+                    Ok(Some(_)) | Err(_) => VmProbe::Unknown(error),
+                };
+            }
+            Err(error) => return VmProbe::Unknown(error),
+        };
         match self.provider.is_alive(&handle).await {
-            Ok(true) => Ok(handle),
-            Ok(false) => Err(AgentError::SandboxNotFound {
-                run_id: id,
-                sandbox: format!(
-                    "{} (container {} is not running)",
-                    public_id, handle.sandbox_name
-                ),
-            }),
-            Err(error) => Err(Self::liveness_failure(id, public_id, &handle, error)),
+            Ok(true) => VmProbe::Alive(handle),
+            Ok(false) => VmProbe::Down(Self::not_running(id, public_id, &handle)),
+            Err(error) => VmProbe::Unknown(Self::liveness_failure(id, public_id, &handle, error)),
+        }
+    }
+
+    /// The provider answered the liveness check and the VM is down.
+    /// Typical causes: the Temps service was restarted (a systemd unit that
+    /// kills its whole control group takes Firecracker/microsandbox VMs with
+    /// it), the host rebooted, or the VMM crashed or was OOM-killed.
+    fn not_running(id: i32, public_id: &str, handle: &SandboxHandle) -> AgentError {
+        tracing::warn!(
+            sandbox_id = public_id,
+            internal_id = id,
+            backend = %handle.backend,
+            node_id = ?handle.node_id,
+            container = %handle.sandbox_name,
+            "Sandbox VM is not running"
+        );
+        AgentError::SandboxNotRunning {
+            run_id: id,
+            sandbox_id: public_id.to_string(),
+            container: handle.sandbox_name.clone(),
+            backend: handle.backend.to_string(),
+            reason: not_running_reason(handle.backend),
         }
     }
 
@@ -1074,8 +1144,12 @@ mod tests {
         }
     }
 
+    /// A VM that is known to the provider but not running (the state a
+    /// Firecracker or microsandbox sandbox is in after the Temps service
+    /// restarted and took the VMM with it) is "not running", not "not found":
+    /// the caller must be able to tell the user the sandbox exists.
     #[tokio::test]
-    async fn get_reports_stopped_container_as_missing_sandbox() {
+    async fn get_reports_stopped_container_as_not_running_with_backend_and_ids() {
         let provider = Arc::new(
             FakeProvider::new()
                 .with_known("abc123")
@@ -1084,10 +1158,77 @@ mod tests {
         let reg = StandaloneSandboxRegistry::local_only(provider);
 
         let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        match err {
+            AgentError::SandboxNotRunning {
+                run_id,
+                sandbox_id,
+                container,
+                backend,
+                reason,
+            } => {
+                assert_eq!(run_id, 42);
+                assert_eq!(sandbox_id, "sbx_abc123");
+                assert_eq!(container, "temps-sandbox-abc123");
+                assert_eq!(backend, "docker");
+                assert_eq!(reason, "its container is stopped");
+            }
+            other => panic!("expected SandboxNotRunning, got {other:?}"),
+        }
+    }
+
+    /// No trace of the sandbox at the provider (never created, or its files
+    /// were deleted) stays `SandboxNotFound`: there is no VM to describe.
+    #[tokio::test]
+    async fn get_still_reports_an_unknown_container_as_not_found() {
+        let provider = Arc::new(FakeProvider::new()); // No known containers.
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
         assert!(
             matches!(err, AgentError::SandboxNotFound { run_id: 42, .. }),
             "{err:?}"
         );
+    }
+
+    /// The control-plane provider having no trace of a VM is proof it is gone;
+    /// a worker saying so over the network is not, so it must not be used to
+    /// rewrite the row.
+    #[tokio::test]
+    async fn probe_trusts_a_local_not_found_but_not_a_workers() {
+        let local = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+        assert!(
+            matches!(
+                local.probe(42, "sbx_abc123").await,
+                VmProbe::Down(AgentError::SandboxNotFound { .. })
+            ),
+            "a local provider without the VM proves it is gone"
+        );
+
+        let worker = StandaloneSandboxRegistry::new(
+            Arc::new(FakeProvider::new()),
+            Arc::new(FixedNode(Ok(Some(2)))),
+        );
+        assert!(
+            matches!(
+                worker.probe(42, "sbx_abc123").await,
+                VmProbe::Unknown(AgentError::SandboxNotFound { .. })
+            ),
+            "a worker's not-found is not proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_treat_a_failed_liveness_check_as_proof() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::CheckFails),
+        );
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+        assert!(matches!(
+            reg.probe(42, "sbx_abc123").await,
+            VmProbe::Unknown(_)
+        ));
     }
 
     #[tokio::test]

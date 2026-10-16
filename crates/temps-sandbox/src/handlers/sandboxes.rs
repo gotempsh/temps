@@ -105,6 +105,10 @@ impl From<SandboxError> for Problem {
             SandboxError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Sandbox Not Found")
                 .with_detail(error.to_string()),
+            SandboxError::VmNotRunning { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/sandbox-vm-not-running")
+                .with_title("Sandbox VM Not Running")
+                .with_detail(error.to_string()),
             SandboxError::JobNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Job Not Found")
                 .with_detail(error.to_string()),

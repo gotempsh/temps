@@ -77,6 +77,24 @@ pub enum AgentError {
     #[error("Sandbox not found: {sandbox}")]
     SandboxNotFound { run_id: i32, sandbox: String },
 
+    /// The sandbox's provider state is known (its VM or container exists on
+    /// disk or in the runtime) but the VM is not running: the VMM process
+    /// exited, was killed with the Temps service, or the host rebooted. Kept
+    /// apart from [`AgentError::SandboxNotFound`] so callers can say "this
+    /// sandbox exists but is not running" (a 409 with the way back) instead
+    /// of "not found". `sandbox_id` is the public id when the caller has one
+    /// and `backend` names the isolation backend that lost the VM.
+    #[error(
+        "Sandbox {sandbox_id} ({backend} backend, container {container}) is not running: {reason}"
+    )]
+    SandboxNotRunning {
+        run_id: i32,
+        sandbox_id: String,
+        container: String,
+        backend: String,
+        reason: String,
+    },
+
     /// A guest did not answer a terminal request in time. Kept apart from
     /// [`AgentError::SandboxExecFailed`] so callers can tell "the guest is
     /// stalled" (retry, restart the sandbox: a 504) from "this sandbox has no

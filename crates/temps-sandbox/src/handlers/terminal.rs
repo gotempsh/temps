@@ -414,15 +414,13 @@ pub async fn terminal(
         .resolve_id(&id, auth.user_id())
         .await?;
 
+    // A VM that is down surfaces as a 409 naming the sandbox, its backend and
+    // how to bring it back, not as a 404 for an id that is still listed.
     let handle = state
         .sandbox_service
-        .registry()
-        .get(internal_id, &id)
+        .live_handle(&row)
         .await
-        .map_err(|e| {
-            let err = crate::services::sandbox_service::SandboxService::provider_err(&id, e);
-            Problem::from(err)
-        })?;
+        .map_err(Problem::from)?;
 
     let attachment = bounded_attach(
         &id,
@@ -854,6 +852,11 @@ fn attach_failure_problem(
         unsupported @ AgentError::SandboxUnsupportedOnNode { .. } => {
             Problem::from(crate::error::from_agent_error(sandbox_id, unsupported))
         }
+        // The VM died between the liveness check and the attach: the same
+        // problem (type, title, how to recover) the liveness check returns.
+        not_running @ AgentError::SandboxNotRunning { .. } => {
+            Problem::from(crate::error::from_agent_error(sandbox_id, not_running))
+        }
         timeout @ AgentError::SandboxTerminalTimeout { .. } => {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
@@ -1192,6 +1195,35 @@ mod tests {
                 "a stalled guest is not a setup problem: {body}"
             );
         }
+    }
+
+    /// A VM that dies between the liveness check and the attach gets the same
+    /// problem as one found dead by the liveness check, not the generic
+    /// "Terminal Unavailable" with backend setup advice.
+    #[test]
+    fn a_vm_lost_during_attach_is_the_vm_not_running_problem() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        let problem = attach_failure_problem(
+            "sbx_test",
+            SandboxBackend::Firecracker,
+            AgentError::SandboxNotRunning {
+                run_id: 0,
+                sandbox_id: "sbx_test".into(),
+                container: "temps-sandbox-test".into(),
+                backend: "firecracker".into(),
+                reason: "its firecracker process exited".into(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/sandbox-vm-not-running")
+        );
+        let body = format!("{problem:?}");
+        assert!(body.contains("sandbox resume sbx_test"), "{body}");
+        assert!(!body.contains("Terminal Unavailable"), "{body}");
     }
 
     #[test]

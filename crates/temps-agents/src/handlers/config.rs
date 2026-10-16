@@ -88,6 +88,9 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Not Found")
                     .with_detail(error.to_string())
             }
+            AgentError::SandboxNotRunning { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sandbox Not Running")
+                .with_detail(error.to_string()),
             AgentError::SandboxExecFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Exec Failed")
