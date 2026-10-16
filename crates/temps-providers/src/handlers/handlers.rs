@@ -1466,50 +1466,71 @@ async fn migrate_s3_service(
     )
     .await?;
 
-    let report = app_state
-        .external_service_manager
-        .migrate_s3_service(id, request.source_service_id)
-        .await
-        .map_err(|e| {
-            error!(
-                target_service_id = id,
-                source_service_id = request.source_service_id,
-                "Failed to migrate S3 data: {}",
-                e
-            );
-            external_service_problem(&e, format!("Failed to migrate S3 data: {}", e))
-        })?;
+    // The copy can run for hours on large buckets. It runs on its own task so
+    // a client or proxy timeout that drops this handler cannot abandon it
+    // half-way, and the audit entry is written by that same task so a copy
+    // that finished is never unaudited.
+    let source_service_id = request.source_service_id;
+    let user_id = auth.user_id();
+    let task_state = app_state.clone();
+    let task = tokio::spawn(async move {
+        let report = task_state
+            .external_service_manager
+            .migrate_s3_service(id, source_service_id)
+            .await
+            .map_err(|e| {
+                error!(
+                    target_service_id = id,
+                    source_service_id, "Failed to migrate S3 data: {}", e
+                );
+                external_service_problem(&e, format!("Failed to migrate S3 data: {}", e))
+            })?;
 
-    let target_name = match app_state
-        .external_service_manager
-        .get_service_details(id)
-        .await
-    {
-        Ok(details) => details.service.name,
-        Err(e) => {
-            warn!(
-                service_id = id,
-                "Could not load service name for audit: {}", e
-            );
-            String::new()
+        let target_name = match task_state
+            .external_service_manager
+            .get_service_details(id)
+            .await
+        {
+            Ok(details) => details.service.name,
+            Err(e) => {
+                warn!(
+                    service_id = id,
+                    "Could not load service name for audit: {}", e
+                );
+                String::new()
+            }
+        };
+        let audit = ExternalServiceS3MigratedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            target_service_id: id,
+            target_name,
+            source_service_id: report.source_service_id,
+            source_backend: report.source_backend.clone(),
+            target_backend: report.target_backend.clone(),
+            buckets: report.buckets.clone(),
+        };
+        if let Err(e) = task_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
         }
-    };
-    let audit = ExternalServiceS3MigratedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        target_service_id: id,
-        target_name,
-        source_service_id: report.source_service_id,
-        source_backend: report.source_backend.clone(),
-        target_backend: report.target_backend.clone(),
-        buckets: report.buckets.clone(),
-    };
-    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
+        Ok::<_, Problem>(report)
+    });
+    let report = task.await.map_err(|e| {
+        error!(
+            target_service_id = id,
+            source_service_id, "S3 migration task did not complete: {}", e
+        );
+        internal_server_error()
+            .title("S3 Migration Interrupted")
+            .detail(format!(
+                "The migration from service {} into service {} did not complete: {}",
+                source_service_id, id, e
+            ))
+            .build()
+    })??;
 
     Ok((StatusCode::OK, Json(report)))
 }

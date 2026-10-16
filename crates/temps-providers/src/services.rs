@@ -2481,14 +2481,20 @@ impl ExternalServiceManager {
         let Some(docker) = self.docker.get() else {
             return Ok(None);
         };
-        let instance = self
-            .create_service_instance(service_name.to_string(), service_type)
+        // An S3/Blob service may run on any managed engine, and a service
+        // that is not registered yet has no recorded one, so every engine
+        // that could own the name is fenced.
+        let instances = self
+            .candidate_instances(service_name, service_type)
             .map_err(|e| RestoreFenceError::Resolve {
                 service_name: service_name.to_string(),
                 service_type: service_type.to_string(),
                 reason: e.to_string(),
             })?;
-        let mut containers = BTreeSet::from([instance.get_docker_container_name()]);
+        let mut containers: BTreeSet<String> = instances
+            .iter()
+            .map(|instance| instance.get_docker_container_name())
+            .collect();
         if let Some(imported) = imported_container.filter(|c| !c.trim().is_empty()) {
             containers.insert(imported.to_string());
         }
@@ -2501,14 +2507,16 @@ impl ExternalServiceManager {
         }
         // A download the engine staged inside the service itself (not a
         // helper container) must be confirmed stopped too.
-        instance
-            .stop_staged_restore()
-            .await
-            .map_err(|e| RestoreFenceError::Stop {
-                target_container: instance.get_docker_container_name(),
-                helper: "staged restore download".to_string(),
-                reason: e.to_string(),
-            })?;
+        for instance in &instances {
+            instance
+                .stop_staged_restore()
+                .await
+                .map_err(|e| RestoreFenceError::Stop {
+                    target_container: instance.get_docker_container_name(),
+                    helper: "staged restore download".to_string(),
+                    reason: e.to_string(),
+                })?;
+        }
         Ok(Some(report))
     }
 
@@ -2835,6 +2843,27 @@ impl ExternalServiceManager {
                 self.encryption_service.clone(),
             )),
         })
+    }
+
+    /// Parameter-strategy key for updating a stored service. An S3/Blob
+    /// service on Garage is configured like Garage; every other service keeps
+    /// the strategy of its stored type (legacy MinIO included).
+    fn update_strategy_key(
+        service_type: &str,
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> String {
+        let is_s3_family = matches!(service_type, "s3" | "blob");
+        let garage = is_s3_family
+            && parameters
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|backend| ManagedS3BackendKind::parse(backend).ok())
+                == Some(ManagedS3BackendKind::Garage);
+        if garage {
+            ManagedS3BackendKind::Garage.as_str().to_string()
+        } else {
+            service_type.to_string()
+        }
     }
 
     #[allow(deprecated)]
@@ -4356,11 +4385,18 @@ impl ExternalServiceManager {
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
 
-        // Get the parameter strategy for this service type
-        let strategy = parameter_strategies::get_strategy(&service.service_type).ok_or(
+        // The stored parameters name the engine an S3/Blob service runs, so
+        // they are read first: the update rules follow the engine, exactly
+        // as they do at creation.
+        let mut existing_params = self.get_service_parameters(service_id).await?;
+        // The engine never changes on update (`backend` is read-only), so the
+        // pre-merge snapshot identifies the pre-rename container.
+        let stored_params = existing_params.clone();
+        let strategy_key = Self::update_strategy_key(&service.service_type, &existing_params);
+        let strategy = parameter_strategies::get_strategy(&strategy_key).ok_or(
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
-                service_type: service.service_type.clone(),
+                service_type: strategy_key.clone(),
             },
         )?;
 
@@ -4392,8 +4428,7 @@ impl ExternalServiceManager {
                 reason,
             })?;
 
-        // Get existing parameters and merge updates
-        let mut existing_params = self.get_service_parameters(service_id).await?;
+        // Merge the updates into the parameters read above
         strategy
             .merge_updates(&mut existing_params, update_params)
             .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
@@ -4453,8 +4488,14 @@ impl ExternalServiceManager {
                             service_type: service.service_type.clone(),
                         }
                     })?;
-                let old_instance =
-                    self.create_service_instance(service.name.clone(), service_type_enum)?;
+                // The stored parameters pick the engine, so a Garage service
+                // stops `garage-<old>` rather than a `rustfs-<old>` that
+                // does not exist.
+                let old_instance = self.create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type_enum,
+                    &stored_params,
+                )?;
                 if let Err(e) = old_instance.stop().await {
                     info!(
                         "Could not stop pre-rename container for service {} (may not exist): {}",
@@ -12611,6 +12652,14 @@ echo "[restore] Pre-seed complete"
             service_id_val,
             project_id,
         )?;
+        self.ensure_s3_scope_unambiguous(
+            service_id_val,
+            &service.service_type,
+            project_id,
+            &project_scope,
+            &environment_scope,
+        )
+        .await?;
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
             &crate::externalsvc::scoped_resource_name(&project_scope, &environment_scope),
         );
@@ -13206,6 +13255,113 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Bucket-name scopes (see `managed_s3::scope_slug`) that links of
+    /// `service_id` held by projects other than `excluding_project_id` map
+    /// to, each with the `(project_scope, environment_scope)` pairs behind it.
+    ///
+    /// `scope_slug` joins the two parts with `-`, so different pairs can
+    /// produce one slug (`acme-web` + `prod` and `acme` + `web-prod`). One
+    /// slug means one bucket and one derived key, so callers use this to
+    /// refuse a second tenant and to keep a revoke from reaching the first.
+    /// Three queries regardless of the number of links.
+    async fn other_projects_s3_scopes(
+        &self,
+        service_id: i32,
+        excluding_project_id: i32,
+    ) -> Result<HashMap<String, BTreeSet<(String, String)>>, ExternalServiceError> {
+        let links = project_services::Entity::find()
+            .filter(project_services::Column::ServiceId.eq(service_id))
+            .filter(project_services::Column::ProjectId.ne(excluding_project_id))
+            .all(self.db.as_ref())
+            .await?;
+        if links.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let project_ids: Vec<i32> = links.iter().map(|link| link.project_id).collect();
+        let project_slugs: HashMap<i32, String> = projects::Entity::find()
+            .filter(projects::Column::Id.is_in(project_ids.clone()))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|project| (project.id, project.slug))
+            .collect();
+        let mut environment_slugs: HashMap<i32, Vec<String>> = HashMap::new();
+        for environment in temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.is_in(project_ids))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?
+        {
+            environment_slugs
+                .entry(environment.project_id)
+                .or_default()
+                .push(environment.slug);
+        }
+
+        let mut scopes: HashMap<String, BTreeSet<(String, String)>> = HashMap::new();
+        for link in &links {
+            let Some(project_slug) = project_slugs.get(&link.project_id) else {
+                continue;
+            };
+            let provisioning = DatabaseProvisioningConfig::from_link(link)?;
+            let empty = Vec::new();
+            let environments = environment_slugs.get(&link.project_id).unwrap_or(&empty);
+            for environment_slug in environments {
+                let (project_scope, environment_scope) = provisioning.runtime_scope(
+                    project_slug,
+                    environment_slug,
+                    service_id,
+                    link.project_id,
+                )?;
+                scopes
+                    .entry(crate::externalsvc::managed_s3::scope_slug(
+                        &project_scope,
+                        &environment_scope,
+                    ))
+                    .or_default()
+                    .insert((project_scope, environment_scope));
+            }
+        }
+        Ok(scopes)
+    }
+
+    /// Refuse to provision a managed S3 scope that another project's link
+    /// already owns under a different `(project, environment)` pair. Linking
+    /// one custom scope from several projects is deliberate sharing (the pair
+    /// is identical) and passes.
+    async fn ensure_s3_scope_unambiguous(
+        &self,
+        service_id: i32,
+        service_type: &str,
+        project_id: i32,
+        project_scope: &str,
+        environment_scope: &str,
+    ) -> Result<(), ExternalServiceError> {
+        if !matches!(service_type, "s3" | "blob" | "rustfs") {
+            return Ok(());
+        }
+        let slug = crate::externalsvc::managed_s3::scope_slug(project_scope, environment_scope);
+        let others = self
+            .other_projects_s3_scopes(service_id, project_id)
+            .await?;
+        let own = (project_scope.to_string(), environment_scope.to_string());
+        if let Some(conflicting) = others
+            .get(&slug)
+            .and_then(|pairs| pairs.iter().find(|pair| **pair != own))
+        {
+            return Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: format!(
+                    "bucket scope '{slug}' for project '{project_scope}' environment '{environment_scope}' is already used by project '{}' environment '{}' on this service; \
+                     rename a project or environment, or link a different service",
+                    conflicting.0, conflicting.1
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Revoke the credentials a project link provisioned for its
     /// environments. Skips remote services (their engine is only reachable
     /// through the owning agent) and scopes still shared by another link.
@@ -13266,28 +13422,30 @@ echo "[restore] Pre-seed complete"
             )?);
         }
 
-        // A custom scope can be shared by several projects; its credentials
-        // stay until the last of them is unlinked.
-        if provisioning.mode == DatabaseProvisioningMode::Custom {
-            let still_shared = project_services::Entity::find()
-                .filter(project_services::Column::ServiceId.eq(service.id))
-                .filter(project_services::Column::ProjectId.ne(link.project_id))
-                .filter(
-                    project_services::Column::CustomDatabaseName
-                        .eq(link.custom_database_name.clone()),
-                )
-                .count(self.db.as_ref())
-                .await?
-                > 0;
-            if still_shared {
-                debug!(
-                    service_id = service.id,
-                    project_id = link.project_id,
-                    "Keeping managed S3 credentials: the custom scope is linked by another project"
-                );
-                return Ok(());
-            }
-        }
+        // A scope can be held by several projects: a custom scope is shared
+        // on purpose, and two different (project, environment) pairs can
+        // share a bucket slug. Its credentials stay until the last holder is
+        // unlinked.
+        let others = self
+            .other_projects_s3_scopes(service.id, link.project_id)
+            .await?;
+        let scopes: BTreeSet<(String, String)> = scopes
+            .into_iter()
+            .filter(|(project_scope, environment_scope)| {
+                let slug =
+                    crate::externalsvc::managed_s3::scope_slug(project_scope, environment_scope);
+                let still_shared = others.contains_key(&slug);
+                if still_shared {
+                    debug!(
+                        service_id = service.id,
+                        project_id = link.project_id,
+                        scope = %slug,
+                        "Keeping managed S3 credentials: the scope is linked by another project"
+                    );
+                }
+                !still_shared
+            })
+            .collect();
 
         for (project_scope, environment_scope) in scopes {
             backend
@@ -14056,6 +14214,14 @@ echo "[restore] Pre-seed complete"
                     proj_id,
                 )?;
 
+                self.ensure_s3_scope_unambiguous(
+                    service_id,
+                    &service.service_type,
+                    proj_id,
+                    &project_scope,
+                    &environment_scope,
+                )
+                .await?;
                 let runtime_vars = service_instance
                     .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
                     .await
@@ -16759,6 +16925,199 @@ mod tests {
             .docker_resource_names()
             .and_then(|names| names.containers.into_iter().next())
             .unwrap_or_default())
+    }
+
+    fn s3_link(project_id: i32, mode: &str) -> project_services::Model {
+        let now = Utc::now();
+        project_services::Model {
+            id: project_id,
+            project_id,
+            service_id: 41,
+            database_provisioning_mode: mode.to_string(),
+            custom_database_name: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn scope_project(id: i32, slug: &str) -> projects::Model {
+        let mut project = environment_preview_project(id);
+        project.slug = slug.to_string();
+        project
+    }
+
+    fn scope_environment(
+        id: i32,
+        project_id: i32,
+        slug: &str,
+    ) -> temps_entities::environments::Model {
+        let now = Utc::now();
+        temps_entities::environments::Model {
+            id,
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            subdomain: format!("{slug}-{project_id}"),
+            last_deployment: None,
+            host: String::new(),
+            upstreams: Default::default(),
+            created_at: now,
+            updated_at: now,
+            project_id,
+            current_deployment_id: None,
+            branch: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        }
+    }
+
+    /// Project `acme` + environment `web-prod` is already linked; the manager
+    /// is asked about project `acme-web` + `prod`.
+    fn manager_with_ambiguous_scope_holder() -> ExternalServiceManager {
+        mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![s3_link(7, "project_environment")]])
+                .append_query_results([vec![scope_project(7, "acme")]])
+                .append_query_results([vec![scope_environment(70, 7, "web-prod")]])
+                .into_connection(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_second_project_with_the_same_bucket_scope_is_refused() {
+        let manager = manager_with_ambiguous_scope_holder();
+
+        let error = manager
+            .ensure_s3_scope_unambiguous(41, "s3", 8, "acme-web", "prod")
+            .await
+            .expect_err("two different pairs must not share one bucket scope");
+
+        match error {
+            ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id: 41,
+                project_id: 8,
+                reason,
+            } => {
+                assert!(reason.contains("acme-web-prod"), "{reason}");
+                assert!(reason.contains("project 'acme'"), "{reason}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_scope_pair_held_by_another_project_is_deliberate_sharing() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![s3_link(7, "project_environment")]])
+                .append_query_results([vec![scope_project(7, "acme")]])
+                .append_query_results([vec![scope_environment(70, 7, "prod")]])
+                .into_connection(),
+        ));
+
+        manager
+            .ensure_s3_scope_unambiguous(41, "s3", 8, "acme", "prod")
+            .await
+            .expect("an identical pair is not ambiguous");
+    }
+
+    #[tokio::test]
+    async fn the_scope_guard_ignores_non_s3_services() {
+        let manager = mock_service_manager(vec![]);
+
+        manager
+            .ensure_s3_scope_unambiguous(41, "postgres", 8, "acme-web", "prod")
+            .await
+            .expect("only managed S3 scopes are checked");
+    }
+
+    #[tokio::test]
+    async fn other_projects_scopes_are_empty_when_nothing_else_is_linked() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<project_services::Model>::new()])
+                .into_connection(),
+        ));
+
+        let scopes = manager
+            .other_projects_s3_scopes(41, 8)
+            .await
+            .expect("scopes");
+
+        assert!(scopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_other_holder_of_an_ambiguous_scope_is_reported() {
+        let manager = manager_with_ambiguous_scope_holder();
+
+        let scopes = manager
+            .other_projects_s3_scopes(41, 8)
+            .await
+            .expect("scopes");
+
+        let holders = scopes.get("acme-web-prod").expect("slug is held");
+        assert_eq!(
+            holders.iter().collect::<Vec<_>>(),
+            vec![&("acme".to_string(), "web-prod".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_garage_service_is_updated_with_the_garage_strategy() {
+        let garage = HashMap::from([("backend".to_string(), serde_json::json!("garage"))]);
+        assert_eq!(
+            ExternalServiceManager::update_strategy_key("s3", &garage),
+            "garage"
+        );
+        assert_eq!(
+            ExternalServiceManager::update_strategy_key("blob", &garage),
+            "garage"
+        );
+    }
+
+    #[test]
+    fn other_services_keep_the_strategy_of_their_stored_type() {
+        let garage = HashMap::from([("backend".to_string(), serde_json::json!("garage"))]);
+        let rustfs = HashMap::from([("backend".to_string(), serde_json::json!("rustfs"))]);
+        let legacy = HashMap::new();
+        assert_eq!(
+            ExternalServiceManager::update_strategy_key("s3", &rustfs),
+            "s3"
+        );
+        assert_eq!(
+            ExternalServiceManager::update_strategy_key("s3", &legacy),
+            "s3"
+        );
+        assert_eq!(
+            ExternalServiceManager::update_strategy_key("blob", &legacy),
+            "blob"
+        );
+        assert_eq!(
+            ExternalServiceManager::update_strategy_key("postgres", &garage),
+            "postgres"
+        );
+    }
+
+    #[test]
+    fn a_renamed_garage_service_is_stopped_under_its_garage_container_name() {
+        let manager = mock_service_manager(vec![]);
+        let parameters = HashMap::from([("backend".to_string(), serde_json::json!("garage"))]);
+
+        let instance = manager
+            .create_service_instance_for_parameters(
+                "media".to_string(),
+                ServiceType::S3,
+                &parameters,
+            )
+            .expect("garage instance");
+
+        assert_eq!(instance.get_docker_container_name(), "garage-media");
     }
 
     #[tokio::test]

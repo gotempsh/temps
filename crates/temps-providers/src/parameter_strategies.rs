@@ -1391,6 +1391,11 @@ impl ParameterStrategy for GarageParameterStrategy {
                 ));
             }
         }
+        // The container is recreated on the new image with a `garage.toml`
+        // only Garage can read, so another engine's image is refused here
+        // just as it is at creation.
+        reject_known_cross_engine_image(updates, "minio/minio", "Garage")?;
+        reject_known_cross_engine_image(updates, "rustfs/rustfs", "Garage")?;
         Ok(())
     }
 
@@ -2773,6 +2778,25 @@ mod tests {
             .validate_for_creation(&string_params(&[("backend", "garage")]))
             .unwrap_err();
         assert!(err.contains("garage"), "{err}");
+    }
+
+    #[test]
+    fn garage_updates_allow_the_admin_port_and_reject_a_foreign_engine_image() {
+        let strategy = GarageParameterStrategy;
+        strategy
+            .validate_for_update(&string_params(&[("admin_port", "3903")]))
+            .unwrap();
+        strategy
+            .validate_for_update(&string_params(&[("docker_image", "dxflrs/garage:v2.0.0")]))
+            .unwrap();
+        let err = strategy
+            .validate_for_update(&string_params(&[("docker_image", "rustfs/rustfs:latest")]))
+            .unwrap_err();
+        assert!(err.contains("incompatible with Garage"), "{err}");
+        let err = strategy
+            .validate_for_update(&string_params(&[("console_port", "9001")]))
+            .unwrap_err();
+        assert!(err.contains("console_port"), "{err}");
     }
 
     #[test]

@@ -25,12 +25,75 @@ use super::managed_s3::{
 use super::rc_client::{self, TokenSide};
 use super::{SensitiveValues, ServiceConfig};
 
-/// A running `rc` helper container. Always call [`RcSession::finish`]: the
-/// container carries credentials and must not outlive the operation.
+/// A running `rc` helper container. Call [`RcSession::finish`] when the
+/// operation ends: the container carries credentials and must not outlive it.
+/// A session dropped without `finish` (the caller's future was cancelled
+/// mid-copy, e.g. a client disconnect) removes its container in the
+/// background instead of leaving it running.
 pub(crate) struct RcSession {
     docker: Arc<Docker>,
     container_id: String,
     service: String,
+    released: bool,
+}
+
+/// Force-remove a helper container; a container that is already gone is fine.
+async fn remove_helper_container(docker: &Docker, container_id: &str, service: &str) {
+    if let Err(e) = docker
+        .remove_container(
+            container_id,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+    {
+        if !matches!(
+            e,
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            }
+        ) {
+            warn!(
+                service = %service,
+                container = %container_id,
+                "Failed to remove credential-bearing rc helper container: {}",
+                e
+            );
+        }
+    }
+}
+
+impl Drop for RcSession {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let docker = self.docker.clone();
+        let container_id = std::mem::take(&mut self.container_id);
+        let service = std::mem::take(&mut self.service);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                warn!(
+                    service = %service,
+                    container = %container_id,
+                    "rc helper session dropped without finish(); removing its container in the background"
+                );
+                runtime.spawn(async move {
+                    remove_helper_container(&docker, &container_id, &service).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    service = %service,
+                    container = %container_id,
+                    "rc helper session dropped outside a runtime; its container must be removed manually"
+                );
+            }
+        }
+    }
 }
 
 impl RcSession {
@@ -98,6 +161,7 @@ impl RcSession {
             docker: docker.clone(),
             container_id: container.id.clone(),
             service: service.to_string(),
+            released: false,
         };
         if let Err(e) = docker
             .start_container(
@@ -192,33 +256,9 @@ impl RcSession {
     /// Remove the helper. Failure is logged, not returned: the operation's own
     /// result is what the caller needs, and a leftover helper is labelled so
     /// it can be found.
-    pub(crate) async fn finish(self) {
-        if let Err(e) = self
-            .docker
-            .remove_container(
-                &self.container_id,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            if !matches!(
-                e,
-                bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404,
-                    ..
-                }
-            ) {
-                warn!(
-                    service = %self.service,
-                    container = %self.container_id,
-                    "Failed to remove credential-bearing rc helper container: {}",
-                    e
-                );
-            }
-        }
+    pub(crate) async fn finish(mut self) {
+        self.released = true;
+        remove_helper_container(&self.docker, &self.container_id, &self.service).await;
     }
 }
 
@@ -864,5 +904,53 @@ mod tests {
         };
         let alias = service_alias("svc", &endpoint, "AK", "SK");
         assert_eq!(alias, "RC_HOST_svc=http://AK:SK@garage-media:3900");
+    }
+
+    /// A session whose owner is cancelled mid-operation (a dropped request
+    /// future) must not leave its credential-bearing container running.
+    #[tokio::test]
+    async fn a_dropped_session_removes_its_helper_container() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let docker = Arc::new(docker);
+        let session = match RcSession::start(
+            docker.clone(),
+            "drop-test",
+            vec!["RC_HOST_x=http://AK:SK@127.0.0.1:1".to_string()],
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                println!("Could not start the rc helper, skipping: {e}");
+                return;
+            }
+        };
+        let container_id = session.container_id().to_string();
+
+        drop(session);
+
+        let mut gone = false;
+        for _ in 0..50 {
+            if docker
+                .inspect_container(
+                    &container_id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .is_err()
+            {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(gone, "helper container {container_id} outlived its session");
     }
 }
