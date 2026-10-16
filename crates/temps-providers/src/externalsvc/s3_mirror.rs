@@ -322,10 +322,14 @@ fn host_gateway_endpoint(endpoint: &str) -> String {
 /// Garage service used as a backup destination) becomes that container's
 /// Docker-network address; any other loopback endpoint goes through the host
 /// gateway; everything else is used unchanged.
-async fn helper_reachable_endpoint(docker: &Docker, location: &S3Location) -> String {
+async fn helper_reachable_endpoint(
+    docker: &Docker,
+    service: &str,
+    location: &S3Location,
+) -> Result<String, ManagedS3Error> {
     let endpoint = location_endpoint(location);
     let Some(port) = loopback_endpoint_port(&endpoint) else {
-        return endpoint;
+        return Ok(endpoint);
     };
     let containers = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -356,10 +360,65 @@ async fn helper_reachable_endpoint(docker: &Docker, location: &S3Location) -> St
             } else {
                 "http"
             };
-            return format!("{scheme}://{name}:{internal_port}");
+            return Ok(format!("{scheme}://{name}:{internal_port}"));
         }
     }
-    host_gateway_endpoint(&endpoint)
+    ensure_host_gateway_reaches(docker, service, port).await?;
+    Ok(host_gateway_endpoint(&endpoint))
+}
+
+/// On Linux the host gateway is the Docker network's bridge address, which a
+/// listener bound only to the host's loopback interface never answers. Check
+/// that the port accepts connections there before starting a helper that
+/// could only time out, and say what to change instead. Other platforms
+/// forward `host.docker.internal` to the host's loopback, so nothing is
+/// checked there.
+async fn ensure_host_gateway_reaches(
+    docker: &Docker,
+    service: &str,
+    port: u16,
+) -> Result<(), ManagedS3Error> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let gateway = docker
+        .inspect_network(
+            temps_core::NETWORK_NAME.as_str(),
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+        .ok()
+        .and_then(|network| network.ipam)
+        .and_then(|ipam| ipam.config)
+        .and_then(|configs| configs.into_iter().find_map(|config| config.gateway));
+    let Some(gateway) = gateway else {
+        return Ok(());
+    };
+    if tcp_port_accepts(&format!("{gateway}:{port}")).await {
+        return Ok(());
+    }
+    Err(mirror_failure(
+        service,
+        "reaching the backup location",
+        format!(
+            "the endpoint on port {port} is reachable only from the Temps host's loopback \
+             interface, which Docker containers cannot use; make the storage server listen on \
+             an address the Docker network can reach (for example 0.0.0.0:{port}), or use its \
+             Docker network address or a public hostname as the endpoint"
+        ),
+    ))
+}
+
+/// Whether a TCP connection to `address` succeeds within a few seconds.
+async fn tcp_port_accepts(address: &str) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 fn location_path(alias: &str, location: &S3Location) -> String {
@@ -389,7 +448,7 @@ pub(crate) async fn backup_buckets(
         service_alias("svc", endpoint, admin_access_key, admin_secret_key),
         rc_client::rc_host_env(
             "dst",
-            &helper_reachable_endpoint(&docker, destination).await,
+            &helper_reachable_endpoint(&docker, service, destination).await?,
             &destination.access_key,
             &destination.secret_key,
         ),
@@ -442,7 +501,7 @@ pub(crate) async fn restore_buckets<B: ManagedS3Backend + ?Sized>(
         service_alias("svc", &endpoint, &admin_access_key, &admin_secret_key),
         rc_client::rc_host_env(
             "src",
-            &helper_reachable_endpoint(&docker, source).await,
+            &helper_reachable_endpoint(&docker, &service, source).await?,
             &source.access_key,
             &source.secret_key,
         ),
@@ -951,6 +1010,17 @@ mod tests {
         assert_eq!(loopback_endpoint_port("http://minio.internal:9000"), None);
         assert_eq!(loopback_endpoint_port("https://s3.amazonaws.com"), None);
         assert_eq!(loopback_endpoint_port("http://127.0.0.1"), None);
+    }
+
+    #[tokio::test]
+    async fn tcp_port_probe_tells_a_listener_from_a_closed_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let open = listener.local_addr().expect("bound address").to_string();
+        assert!(tcp_port_accepts(&open).await);
+        drop(listener);
+        assert!(!tcp_port_accepts(&open).await);
     }
 
     #[test]
