@@ -181,6 +181,9 @@ impl Drop for UsageRecorder {
         let latency_ms = i32::try_from(self.started.elapsed().as_millis()).unwrap_or(i32::MAX);
         let status = self.status;
         runtime.spawn(async move {
+            // `provider` is a route such as `gateway_key:7`; usage rows carry
+            // the provider name so totals and filters group with other calls.
+            let provider = usage.provider_name_for_route(&provider).await;
             // Cost 0 asks the usage service to price it from the catalog.
             if let Err(error) = usage
                 .log_usage_with_context(
@@ -334,25 +337,10 @@ impl StructuredOutputService {
 
         let caller_permit = self.acquire_caller_permit(&request).await?;
 
-        // From here the provider is billed for this request, however the
-        // stream ends, so its usage is recorded when the recorder drops.
-        let recorder = UsageRecorder {
-            usage: self.usage.clone(),
-            user_id: request.requester_id,
-            context: AiRequestContext {
-                project_id: Some(request.project_id),
-                token_id: request.token_id,
-                ..AiRequestContext::default()
-            },
-            provider: provider.clone(),
-            model: model.clone(),
-            input_tokens: estimate_tokens(
-                SYSTEM_PROMPT.len() + request.prompt.len() + request.schema.to_string().len(),
-            ),
-            output_bytes: 0,
-            started: Instant::now(),
-            status: STATUS_CLIENT_CLOSED,
-        };
+        // What the provider will be sent, sized before the request is moved.
+        let input_tokens = estimate_tokens(
+            SYSTEM_PROMPT.len() + request.prompt.len() + request.schema.to_string().len(),
+        );
 
         let deadline = tokio::time::Instant::now() + STREAM_TIMEOUT;
         let token_stream = tokio::time::timeout_at(
@@ -377,6 +365,26 @@ impl StructuredOutputService {
         .map_err(|_| StructuredOutputError::Timeout {
             seconds: STREAM_TIMEOUT.as_secs(),
         })??;
+
+        // The provider accepted the request, so it is billed for it however the
+        // stream ends: usage is recorded when the recorder drops. Requests
+        // refused before this point (no model, connection failure, rejection)
+        // reached no provider and are not charged.
+        let recorder = UsageRecorder {
+            usage: self.usage.clone(),
+            user_id: request.requester_id,
+            context: AiRequestContext {
+                project_id: Some(request.project_id),
+                token_id: request.token_id,
+                ..AiRequestContext::default()
+            },
+            provider: provider.clone(),
+            model: model.clone(),
+            input_tokens,
+            output_bytes: 0,
+            started: Instant::now(),
+            status: STATUS_CLIENT_CLOSED,
+        };
 
         let cache = self.cache.clone();
         let ttl = Duration::from_secs(
@@ -941,6 +949,67 @@ mod tests {
         )))
     }
 
+    fn provider_key() -> temps_entities::ai_provider_keys::Model {
+        temps_entities::ai_provider_keys::Model {
+            id: 1,
+            provider: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            api_key_encrypted: "enc".to_string(),
+            base_url: None,
+            default_model: None,
+            is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A provider that refuses every request before streaming anything.
+    struct RejectingAi;
+
+    #[async_trait]
+    impl AiService for RejectingAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn capabilities_for(
+            &self,
+            provider: Option<&str>,
+            refresh: temps_ai::RefreshPolicy,
+        ) -> Result<temps_ai::ProviderCapabilities, temps_ai::AiError> {
+            StreamingAi {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+            .capabilities_for(provider, refresh)
+            .await
+        }
+
+        async fn complete(
+            &self,
+            _request: AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: AiRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+    }
+
     fn usage_row() -> temps_entities::ai_usage_logs::Model {
         temps_entities::ai_usage_logs::Model {
             id: 1,
@@ -1041,6 +1110,7 @@ mod tests {
     async fn an_uncached_stream_records_usage_for_its_project_and_token() {
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![provider_key()]])
                 .append_query_results([vec![usage_row()]])
                 .into_connection(),
         );
@@ -1084,6 +1154,33 @@ mod tests {
         assert!(log.contains("Int(Some(5))"), "token id missing: {log}");
         assert!(log.contains("SmallInt(Some(200))"), "status missing: {log}");
         assert!(log.contains("ai_usage_logs"), "wrong table: {log}");
+        assert!(
+            log.contains("String(Some(\"openai\"))"),
+            "provider should be the key's provider, not its route: {log}"
+        );
+        assert!(!log.contains("gateway_key:1\"))"), "route leaked: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_request_the_provider_rejects_records_no_usage() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let service = StructuredOutputService::new(
+            Arc::new(RejectingAi),
+            Arc::new(UsageService::new(db.clone())),
+        );
+
+        let result = service.stream(request(false)).await;
+        assert!(result.is_err(), "the rejection should reach the caller");
+        drop(result);
+        drop(service);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let log = Arc::try_unwrap(db)
+            .expect("nothing is left holding the connection")
+            .into_transaction_log();
+        assert!(log.is_empty(), "a refused request was charged: {log:?}");
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set, Statement,
+    ActiveModelTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult, Set,
+    Statement,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -599,6 +600,30 @@ impl UsageService {
             .collect())
     }
 
+    /// The provider name behind a route such as `gateway_key:7` (the key's
+    /// provider, e.g. `openai`), so usage rows group with those logged by the
+    /// request handlers. Anything that is not a resolvable key route is
+    /// returned unchanged.
+    pub async fn provider_name_for_route(&self, route: &str) -> String {
+        let Some(key_id) = route
+            .strip_prefix("gateway_key:")
+            .and_then(|raw| raw.parse::<i32>().ok())
+        else {
+            return route.to_string();
+        };
+        match temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(key)) => key.provider,
+            Ok(None) => route.to_string(),
+            Err(error) => {
+                tracing::warn!(key_id, %error, "Could not resolve the provider of an AI key");
+                route.to_string()
+            }
+        }
+    }
+
     /// Operator-funded spend of one project since `since`, in microcents.
     /// Requests made with a caller-supplied provider key cost the operator
     /// nothing and are excluded. Served by `idx_ai_usage_logs_project_timestamp`.
@@ -1157,6 +1182,54 @@ mod tests {
         assert_eq!(projects[0].project_id, 7);
         assert_eq!(projects[0].estimated_cost_microcents, 900);
         assert_eq!(projects[0].operator_cost_microcents, 600);
+    }
+
+    #[tokio::test]
+    async fn a_key_route_resolves_to_the_key_provider() {
+        use sea_orm::MockDatabase;
+        let key = temps_entities::ai_provider_keys::Model {
+            id: 7,
+            provider: "anthropic".to_string(),
+            display_name: "Anthropic".to_string(),
+            api_key_encrypted: "enc".to_string(),
+            base_url: None,
+            default_model: None,
+            is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let service = UsageService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![key]])
+                .into_connection(),
+        ));
+        assert_eq!(
+            service.provider_name_for_route("gateway_key:7").await,
+            "anthropic"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_that_are_not_resolvable_keys_are_left_alone() {
+        use sea_orm::MockDatabase;
+        // No query results queued: a lookup that wrongly ran would error out.
+        let service = UsageService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        assert_eq!(service.provider_name_for_route("openai").await, "openai");
+        assert_eq!(
+            service.provider_name_for_route("gateway_key:abc").await,
+            "gateway_key:abc"
+        );
+        // A key that no longer exists, or a failing read, falls back to the route.
+        assert_eq!(
+            service.provider_name_for_route("gateway_key:9").await,
+            "gateway_key:9"
+        );
     }
 
     #[test]
