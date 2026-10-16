@@ -629,12 +629,18 @@ impl StandaloneSandboxRegistry {
     /// going through [`Self::restart`] / [`Self::resize_disk`] (snapshot
     /// capture) hold this around the whole stop-to-start window.
     pub async fn begin_planned_downtime(&self, id: i32) -> PlannedDowntimeGuard {
-        let claim = self.planned_downtime.lock_for(id).write_owned().await;
-        PlannedDowntimeGuard {
-            claim: Some(Claim::Planned(claim)),
+        // The guard exists before the wait so that a caller dropped while
+        // queued (client disconnect, timeout) still runs `release` and does
+        // not leave an idle entry in the map. It is declared before the lock
+        // handle, so the handle's clone is gone by the time `release` counts.
+        let mut guard = PlannedDowntimeGuard {
+            claim: None,
             owner: self.planned_downtime.clone(),
             id,
-        }
+        };
+        let lock = self.planned_downtime.lock_for(id);
+        guard.claim = Some(Claim::Planned(lock.write_owned().await));
+        guard
     }
 
     /// Claim the right to conclude that a sandbox's VM was lost. `None` while
@@ -1332,6 +1338,28 @@ mod tests {
         assert!(waiting.await.is_err(), "the planned stop must wait");
         drop(claim);
         let _ = reg.begin_planned_downtime(7).await;
+    }
+
+    /// A request that gives up while queued behind a planned stop must not
+    /// leave its lock entry behind, even when the stop it queued behind has
+    /// already finished (so nothing else is left to tidy the map).
+    #[tokio::test]
+    async fn a_cancelled_wait_for_a_planned_stop_leaves_no_entry() {
+        use futures::FutureExt;
+
+        let reg = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+
+        let held = reg.begin_planned_downtime(7).await;
+        let mut waiting = Box::pin(reg.begin_planned_downtime(7));
+        assert!(
+            (&mut waiting).now_or_never().is_none(),
+            "the wait must be queued behind the held stop"
+        );
+        drop(held);
+        drop(waiting);
+
+        let locks = reg.planned_downtime.locks.lock().expect("lock map");
+        assert!(locks.is_empty(), "{} stale entries", locks.len());
     }
 
     #[tokio::test]
