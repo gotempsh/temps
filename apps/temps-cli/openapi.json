@@ -6383,6 +6383,30 @@
         ],
         "type": "object"
       },
+      "BuildLimits": {
+        "description": "Operator settings persisted on each node. These are control-plane operations,\nindependent of the proxy request path. Existing agents keep their fixed limits.",
+        "properties": {
+          "build_timeout_seconds": {
+            "default": 1800,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "concurrency": {
+            "default": 1,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queue_wait_seconds": {
+            "default": 300,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "BuildLimitsSettings": {
         "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global semaphore in the deployer crate\ngates every `DockerRuntime::build_image` call to `max_concurrent`. When\nthe semaphore is full, additional builds queue and wait — they do not\nfail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
         "properties": {
@@ -6417,9 +6441,55 @@
         "description": "Where a source deployment's image is built.\n\nThe control plane is the default and the historical behaviour. `Node`\nmoves the build — the most CPU- and memory-hungry step of a deployment —\nonto a worker node so it stops competing with the proxy, the database\nand running workloads on the control plane. A node labelled\n`temps.sh/role=builder` is preferred; otherwise the node the deployment\nis placed on builds it.\n\n`Node` is a preference, not a requirement: when no worker can take the\nbuild (none joined, none of the right architecture, or a\nmulti-architecture build) the build runs on the control plane and the\nbuild log says why. A static site may build on a worker of any\narchitecture, since its output is read from that node and never runs.",
         "enum": [
           "control_plane",
-          "node"
+          "node",
+          "ci"
         ],
         "type": "string"
+      },
+      "BuildSpec": {
+        "description": "Paths are relative to the root of the tar archive.\n\nDeliberately not `Debug`: [`BuildSpec::build_args`] holds variable values,\nand a stray `{:?}` must not be able to put them in a log.",
+        "properties": {
+          "build_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values for the Dockerfile's `ARG` instructions, applied exactly as\n`docker build --build-arg` would be (protocol v2). The control plane\ndecides which values may leave it -- never one marked secret or a\nplatform credential -- and sends only names the Dockerfile declares.\nThey travel inside this spec over the node's authenticated build\nchannel and are held in memory on both sides; neither side writes\nthem to disk or to a log.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "cache_namespace": {
+            "description": "BuildKit's predefined `BUILDKIT_CACHE_MOUNT_NS`: the control plane's\nper-project/environment/ref namespace for `RUN --mount=type=cache`.\nNot a project variable and not a credential, so it is the one build\nargument a worker receives. Without it, every project built on the\nsame worker shares writable cache mounts. Optional on the wire: an\nagent that predates it ignores the field and builds as before.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dockerfile": {
+            "type": "string"
+          },
+          "image_name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "image_name",
+          "dockerfile"
+        ],
+        "type": "object"
       },
       "BulkActivationEstimateResponse": {
         "description": "The quote.",
@@ -7656,6 +7726,105 @@
         },
         "required": [
           "children"
+        ],
+        "type": "object"
+      },
+      "CiExecutorSettings": {
+        "properties": {
+          "control_plane_url": {
+            "type": "string"
+          },
+          "dispatch_token": {
+            "description": "Write-only. Stored encrypted; omitted by the status endpoint.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          },
+          "git_ref": {
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/TrustedIdentityIssuer"
+          },
+          "image_repository": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/BuildLimits"
+          },
+          "organization": {
+            "type": "boolean"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "registry_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RemotePullCredentials",
+                "description": "Repository-scoped push/pull credentials. Never included in status."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "writeOnly": true
+          },
+          "repository": {
+            "type": "string"
+          },
+          "runner_archive_sha256": {
+            "type": "string"
+          },
+          "runner_archive_url": {
+            "description": "Pinned release archive used by the generated CI shim.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "repository",
+          "organization",
+          "git_ref",
+          "control_plane_url",
+          "runner_archive_url",
+          "runner_archive_sha256",
+          "identity",
+          "image_repository",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "CiExecutorStatus": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CiExecutorSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -28976,6 +29145,109 @@
         ],
         "type": "object"
       },
+      "ImageConfig": {
+        "description": "Runtime configuration baked into an image, read on the node that owns it.\n\nA worker build returns this so the control plane never needs a local copy\nof the image to learn which port it listens on.",
+        "properties": {
+          "entrypoint": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "env": {
+            "description": "`ENV` entries as `NAME=value`. Values are whatever the Dockerfile\nbaked in; callers must not persist or log them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "exposed_ports": {
+            "description": "Ports from `EXPOSE`, sorted ascending, without protocol.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "user": {
+            "description": "`USER`, when the image sets one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ImageInfo": {
+        "description": "Information about a Docker image, including architecture and platform details",
+        "properties": {
+          "architecture": {
+            "description": "Image architecture (e.g., \"amd64\", \"arm64\")",
+            "type": "string"
+          },
+          "config": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ImageConfig",
+                "description": "The rest of the image's runtime configuration. `None` when the daemon\n(or an agent that predates this field) did not report it, which is\ndifferent from an image that declares none of it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created": {
+            "description": "Creation timestamp",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Image ID (sha256:...)",
+            "type": "string"
+          },
+          "os": {
+            "description": "Operating system (e.g., \"linux\")",
+            "type": "string"
+          },
+          "platform": {
+            "description": "Full platform string (e.g., \"linux/amd64\")",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Image size in bytes",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tags": {
+            "description": "Image tags",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "working_dir": {
+            "description": "Working directory (WORKDIR from Dockerfile)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "architecture",
+          "os",
+          "platform",
+          "size_bytes",
+          "tags"
+        ],
+        "type": "object"
+      },
       "ImageRetentionSettings": {
         "description": "System-wide retention policy for locally-built deployment images.\n\nThe nightly cleanup removes a Temps-built image only once *every*\ndeployment that references it is older than the owning project's retention\nwindow. Deleting an image makes rollback/promotion to that deployment\nimpossible, so the default is deliberately generous: it is a rollback\nwindow, not a cache TTL.",
         "properties": {
@@ -35743,6 +36015,9 @@
               "null"
             ]
           },
+          "build_limits": {
+            "$ref": "#/components/schemas/BuildLimits"
+          },
           "capacity": {
             "description": "Resource capacity/usage metrics from the latest heartbeat"
           },
@@ -35824,6 +36099,7 @@
           "status",
           "labels",
           "capacity",
+          "build_limits",
           "created_at",
           "public_ingress_enabled",
           "public_ingress_unsupported_reasons"
@@ -45972,6 +46248,38 @@
         ],
         "type": "object"
       },
+      "RemotePullCredentials": {
+        "description": "Registry credentials to forward to the worker's `POST /agent/images/pull`\ncall. Mirrors the wire shape of `temps_agent::RegistryCredentials` field\nfor field; `temps-deployer` does not depend on `temps-agent` (the same\nreason `import_image` below builds its own request rather than sharing a\nDTO type), so this struct only needs to serialize to the JSON body the\nagent handler already deserializes.",
+        "properties": {
+          "identity_token": {
+            "description": "**Never logged or included in error messages.**",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "password": {
+            "description": "**Never logged or included in error messages.**",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "server_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "RemoveNodeResponse": {
         "properties": {
           "id": {
@@ -48108,6 +48416,117 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "RunnerClaim": {
+        "properties": {
+          "identity_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_token"
+        ],
+        "type": "object"
+      },
+      "RunnerFailure": {
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "RunnerLogs": {
+        "properties": {
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines"
+        ],
+        "type": "object"
+      },
+      "RunnerResult": {
+        "properties": {
+          "build_id": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "image": {
+            "$ref": "#/components/schemas/ImageInfo"
+          },
+          "platforms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "build_id",
+          "run_id",
+          "digest",
+          "platforms",
+          "image",
+          "duration_ms"
+        ],
+        "type": "object"
+      },
+      "RunnerWork": {
+        "properties": {
+          "registry_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RemotePullCredentials"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "registry_tag": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/BuildSpec"
+          },
+          "timeout_seconds": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "spec",
+          "registry_tag",
+          "run_id",
+          "timeout_seconds"
+        ],
         "type": "object"
       },
       "RuntimeCredentialsResponse": {
@@ -58505,6 +58924,30 @@
           "scan_id",
           "status",
           "message"
+        ],
+        "type": "object"
+      },
+      "TrustedIdentityIssuer": {
+        "description": "Public trust policy; no hardcoded provider-specific token validator.",
+        "properties": {
+          "audience": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "jwks_url": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "jwks_url",
+          "audience",
+          "subject"
         ],
         "type": "object"
       },
@@ -92612,6 +93055,287 @@
         "x-maturity": "experimental"
       }
     },
+    "/internal/ci-builds/{build_id}/claim": {
+      "post": {
+        "operationId": "claim_ci_build",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunnerWork"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Runner identity rejected"
+          },
+          "409": {
+            "description": "Build already claimed or terminal"
+          },
+          "425": {
+            "description": "Provider run has not been recorded; retry claim"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/context": {
+      "get": {
+        "operationId": "get_ci_build_context",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/x-tar": {}
+            },
+            "description": "Streamed agent-protocol context tar"
+          },
+          "401": {
+            "description": "One-build token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build inactive"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/failure": {
+      "post": {
+        "operationId": "fail_ci_build",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerFailure"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Build failed and token revoked"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build inactive"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/lease": {
+      "get": {
+        "operationId": "check_ci_build_lease",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Lease active"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build cancelled or expired"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/logs": {
+      "post": {
+        "operationId": "append_ci_build_logs",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerLogs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Log batch appended"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build inactive or batch exceeds limit"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/result": {
+      "post": {
+        "operationId": "complete_ci_build",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerResult"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Verified result accepted and token revoked"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Verification rejected or build inactive"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
     "/internal/nodes": {
       "get": {
         "operationId": "admin_list_nodes",
@@ -92791,6 +93515,67 @@
           }
         ],
         "summary": "Get a specific node by ID (admin — session auth via RequireAuth)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/build-limits": {
+      "put": {
+        "operationId": "admin_set_node_build_limits",
+        "parameters": [
+          {
+            "description": "Worker node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildLimits"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildLimits"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid limits or node role"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Nodes"
         ]
@@ -130311,6 +131096,113 @@
         ],
         "tags": [
           "Agents"
+        ]
+      }
+    },
+    "/settings/ci-builder": {
+      "get": {
+        "operationId": "get_ci_builder",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiExecutorStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI builder"
+        ]
+      },
+      "put": {
+        "operationId": "set_ci_builder",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CiExecutorSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiExecutorStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI builder"
+        ]
+      }
+    },
+    "/settings/ci-builder/provision": {
+      "post": {
+        "operationId": "provision_ci_builder",
+        "responses": {
+          "204": {
+            "description": "Builder repository and pinned shim provisioned"
+          },
+          "400": {
+            "description": "Configuration/provider error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI builder"
         ]
       }
     },

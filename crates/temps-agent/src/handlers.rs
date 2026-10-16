@@ -40,6 +40,9 @@ use crate::{NodeHealthReport, PullImageRequest, PullImageResponse, RegistryCrede
 pub(crate) const MAX_CONCURRENT_OUTPUT_CAPTURES: usize = 4;
 pub(crate) const MAX_CONCURRENT_EXEC_OPERATIONS: usize = 4;
 pub(crate) const MAX_CONCURRENT_IMAGE_IMPORTS: usize = 1;
+// Bound accepted requests (uploads, waiters and up to 32 executing builds).
+// Reserve before reading specs so queue pressure cannot allocate unbounded buffers.
+pub(crate) const MAX_BUILD_REQUESTS: usize = 96;
 const MAX_IMAGE_IMPORT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const IMAGE_IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const CONTAINER_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -96,6 +99,8 @@ pub struct AgentResourceLimits {
     exec_operation_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) image_import_slots: Arc<tokio::sync::Semaphore>,
     container_operations: ContainerOperationRegistry,
+    pub(crate) build_admission: Arc<crate::build_admission::BuildAdmission>,
+    pub(crate) build_request_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AgentResourceLimits {
@@ -109,12 +114,9 @@ impl AgentResourceLimits {
             )),
             image_import_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IMAGE_IMPORTS)),
             container_operations: ContainerOperationRegistry::default(),
+            build_admission: Arc::new(Default::default()),
+            build_request_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BUILD_REQUESTS)),
         }
-    }
-
-    /// Image-operation slots that are free right now.
-    pub(crate) fn image_slots_available(&self) -> u32 {
-        u32::try_from(self.image_import_slots.available_permits()).unwrap_or(u32::MAX)
     }
 
     #[cfg(test)]
@@ -124,6 +126,8 @@ impl AgentResourceLimits {
             exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(operations)),
             image_import_slots: Arc::new(tokio::sync::Semaphore::new(imports)),
             container_operations: ContainerOperationRegistry::default(),
+            build_admission: Arc::new(Default::default()),
+            build_request_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BUILD_REQUESTS)),
         }
     }
 }
@@ -407,6 +411,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         import_image,
         pull_image,
         crate::build_handler::build_image,
+        crate::build_handler::fetch_registry_image,
         crate::build_handler::export_image,
         crate::build_handler::extract_image_path,
         crate::build_handler::scan_image,
@@ -460,6 +465,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         PullImageResponse,
         RegistryCredentials,
         NodeHealthReport,
+        crate::build_handler::FetchRegistryImage,
         temps_deployer::DeployRequest,
         temps_deployer::DeployResult,
         temps_deployer::ContainerInfo,
@@ -2286,7 +2292,16 @@ async fn collect_system_metrics(
         // Empty means "not discovered yet" — the control plane treats a blank
         // platform as unknown rather than as a claim about this node.
         platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
-        build_slots_available: Some(limits.image_slots_available()),
+        build_slots_available: Some(
+            if limits.build_admission.serial() && limits.image_import_slots.available_permits() == 0
+            {
+                0
+            } else {
+                limits.build_admission.available()
+            },
+        ),
+        build_limits_supported: true,
+        build_concurrency_limit: Some(limits.build_admission.concurrency_limit()),
     }
 }
 

@@ -12,6 +12,8 @@ pub mod m20260921_000003_detection_retry;
 pub mod m20260921_000004_credential_catalog;
 pub mod m20261002_000001_secret_checks_and_history;
 
+mod m20261016_000001_builder_limits;
+pub mod m20261016_000002_ci_build_dispatch;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -756,6 +758,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261014_000004_managed_daemon_unpublished_tags::Migration),
             Box::new(m20261015_000001_compose_validation_reports::Migration),
             Box::new(m20261016_000001_ai_usage_logs_project_attribution::Migration),
+            Box::new(m20261016_000001_builder_limits::Migration),
+            Box::new(m20261016_000002_ci_build_dispatch::Migration),
         ]
     }
 }

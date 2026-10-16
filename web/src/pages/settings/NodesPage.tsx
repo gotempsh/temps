@@ -10,10 +10,12 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { Skeleton } from '@/components/ui/skeleton'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
+import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
@@ -1455,6 +1457,9 @@ function NodeDetail({
       <NodeDetailLabels labels={node.labels} />
 
       {node.role === 'worker' && <WorkerIngressCard node={node} />}
+      {node.role === 'worker' && (
+        <BuilderLimitsPanel key={node.id} node={node} />
+      )}
 
       {/* Metrics */}
       {metrics && (
@@ -1926,6 +1931,7 @@ export function NodesPage() {
         onRetry={() => void refetchMesh()}
         retrying={meshFetching}
       />
+      <CiBuilderPanel />
       <ClusterDnsCard />
       <ClusterTrustCard />
     </div>

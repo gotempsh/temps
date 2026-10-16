@@ -2871,6 +2871,56 @@ impl DockerRuntime {
 
 #[async_trait]
 impl ImageBuilder for DockerRuntime {
+    async fn fetch_registry_image(
+        &self,
+        reference: &str,
+        tag: &str,
+        credentials: Option<crate::remote::RemotePullCredentials>,
+    ) -> Result<(), BuilderError> {
+        let docker = self.docker.require()?;
+        let auth = credentials.map(|c| bollard::auth::DockerCredentials {
+            username: c.username,
+            password: c.password,
+            identitytoken: c.identity_token,
+            serveraddress: c.server_address,
+            ..Default::default()
+        });
+        let mut stream = docker.create_image(
+            Some(bollard::query_parameters::CreateImageOptions {
+                from_image: Some(reference.into()),
+                ..Default::default()
+            }),
+            None,
+            auth,
+        );
+        while let Some(event) = stream.next().await {
+            let event = event.map_err(|error| {
+                BuilderError::Other(format!("Pull of '{reference}' failed: {error}"))
+            })?;
+            if event.error_detail.is_some() {
+                return Err(BuilderError::Other(format!(
+                    "Registry refused pull of '{reference}'"
+                )));
+            }
+        }
+        let (repo, image_tag) = split_repository_and_tag(tag);
+        docker
+            .tag_image(
+                reference,
+                Some(TagImageOptions {
+                    repo: Some(repo.into()),
+                    tag: Some(image_tag.into()),
+                }),
+            )
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot tag registry image '{reference}' as '{tag}': {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
         // Cheap when already known (a `OnceLock` read); one `docker info` when
         // discovery failed earlier. Doing it here means a daemon that wasn't up

@@ -31,6 +31,7 @@ pub mod build_verification;
 pub mod compose;
 pub mod compose_interpolation;
 mod compose_remote;
+pub mod runner_protocol;
 
 /// Callback function type for processing build logs in real-time
 pub type LogCallback =
@@ -890,6 +891,19 @@ pub trait ImageBuilder: Send + Sync {
         &self,
         request: BuildRequestWithCallback,
     ) -> Result<BuildResult, BuilderError>;
+
+    /// Materialize an immutable registry image under the deployment's local tag.
+    async fn fetch_registry_image(
+        &self,
+        reference: &str,
+        tag: &str,
+        credentials: Option<remote::RemotePullCredentials>,
+    ) -> Result<(), BuilderError> {
+        let _ = credentials;
+        Err(BuilderError::Other(format!(
+            "Cannot pull registry image '{reference}' as '{tag}' on this builder"
+        )))
+    }
 
     /// Import an image from a tar archive
     async fn import_image(&self, image_path: PathBuf, tag: &str) -> Result<String, BuilderError>;

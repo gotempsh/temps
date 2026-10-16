@@ -8064,6 +8064,7 @@ mod tests {
             labels: Set(serde_json::json!({})),
             capacity: Set(serde_json::json!({})),
             dns_resolver_consecutive_failures: Set(0),
+            build_limits: Set(None),
             public_ingress_enabled: Set(false),
             public_ingress_unsupported_reasons: Set(serde_json::json!([])),
             created_at: Set(Utc::now()),

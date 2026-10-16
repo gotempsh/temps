@@ -3042,6 +3042,16 @@ export type BuildConfiguration = {
 };
 
 /**
+ * Operator settings persisted on each node. These are control-plane operations,
+ * independent of the proxy request path. Existing agents keep their fixed limits.
+ */
+export type BuildLimits = {
+    build_timeout_seconds?: number;
+    concurrency?: number;
+    queue_wait_seconds?: number;
+};
+
+/**
  * Control-plane build resource limits.
  *
  * Caps how many builds run concurrently AND how much CPU/memory each build
@@ -3096,7 +3106,41 @@ export type BuildLimitsSettings = {
  * build log says why. A static site may build on a worker of any
  * architecture, since its output is read from that node and never runs.
  */
-export type BuildLocation = 'control_plane' | 'node';
+export type BuildLocation = 'control_plane' | 'node' | 'ci';
+
+/**
+ * Paths are relative to the root of the tar archive.
+ *
+ * Deliberately not `Debug`: [`BuildSpec::build_args`] holds variable values,
+ * and a stray `{:?}` must not be able to put them in a log.
+ */
+export type BuildSpec = {
+    /**
+     * Values for the Dockerfile's `ARG` instructions, applied exactly as
+     * `docker build --build-arg` would be (protocol v2). The control plane
+     * decides which values may leave it -- never one marked secret or a
+     * platform credential -- and sends only names the Dockerfile declares.
+     * They travel inside this spec over the node's authenticated build
+     * channel and are held in memory on both sides; neither side writes
+     * them to disk or to a log.
+     */
+    build_args?: {
+        [key: string]: string;
+    };
+    /**
+     * BuildKit's predefined `BUILDKIT_CACHE_MOUNT_NS`: the control plane's
+     * per-project/environment/ref namespace for `RUN --mount=type=cache`.
+     * Not a project variable and not a credential, so it is the one build
+     * argument a worker receives. Without it, every project built on the
+     * same worker shares writable cache mounts. Optional on the wire: an
+     * agent that predates it ignores the field and builds as before.
+     */
+    cache_namespace?: string | null;
+    dockerfile: string;
+    image_name: string;
+    platform?: string | null;
+    version: number;
+};
 
 /**
  * The quote.
@@ -3664,6 +3708,29 @@ export type ChildBackupListResponse = {
      * Zero or more child backup entries ordered by `external_service_backups.id` ASC.
      */
     children: Array<ChildBackupEntryResponse>;
+};
+
+export type CiExecutorSettings = {
+    control_plane_url: string;
+    git_ref: string;
+    identity: TrustedIdentityIssuer;
+    image_repository: string;
+    limits: BuildLimits;
+    organization: boolean;
+    owner: string;
+    repository: string;
+    runner_archive_sha256: string;
+    /**
+     * Pinned release archive used by the generated CI shim.
+     */
+    runner_archive_url: string;
+};
+
+export type CiExecutorStatus = {
+    configured: boolean;
+    reason?: string | null;
+    settings?: CiExecutorSettings | null;
+    setup_path: string;
 };
 
 export type CleanupExpiredBackupsRequest = {
@@ -13624,6 +13691,68 @@ export type HttpChecksCapabilities = {
 };
 
 /**
+ * Runtime configuration baked into an image, read on the node that owns it.
+ *
+ * A worker build returns this so the control plane never needs a local copy
+ * of the image to learn which port it listens on.
+ */
+export type ImageConfig = {
+    entrypoint?: Array<string>;
+    /**
+     * `ENV` entries as `NAME=value`. Values are whatever the Dockerfile
+     * baked in; callers must not persist or log them.
+     */
+    env?: Array<string>;
+    /**
+     * Ports from `EXPOSE`, sorted ascending, without protocol.
+     */
+    exposed_ports?: Array<number>;
+    /**
+     * `USER`, when the image sets one.
+     */
+    user?: string | null;
+};
+
+/**
+ * Information about a Docker image, including architecture and platform details
+ */
+export type ImageInfo = {
+    /**
+     * Image architecture (e.g., "amd64", "arm64")
+     */
+    architecture: string;
+    config?: ImageConfig | null;
+    /**
+     * Creation timestamp
+     */
+    created?: string | null;
+    /**
+     * Image ID (sha256:...)
+     */
+    id: string;
+    /**
+     * Operating system (e.g., "linux")
+     */
+    os: string;
+    /**
+     * Full platform string (e.g., "linux/amd64")
+     */
+    platform: string;
+    /**
+     * Image size in bytes
+     */
+    size_bytes: number;
+    /**
+     * Image tags
+     */
+    tags: Array<string>;
+    /**
+     * Working directory (WORKDIR from Dockerfile)
+     */
+    working_dir?: string | null;
+};
+
+/**
  * System-wide retention policy for locally-built deployment images.
  *
  * The nightly cleanup removes a Temps-built image only once *every*
@@ -16801,6 +16930,7 @@ export type NodeInfoResponse = {
      * `None` until an agent that reports it has heartbeated.
      */
     architecture?: string | null;
+    build_limits: BuildLimits;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -21868,6 +21998,27 @@ export type RemoteDeploymentResponse = {
     state: string;
 };
 
+/**
+ * Registry credentials to forward to the worker's `POST /agent/images/pull`
+ * call. Mirrors the wire shape of `temps_agent::RegistryCredentials` field
+ * for field; `temps-deployer` does not depend on `temps-agent` (the same
+ * reason `import_image` below builds its own request rather than sharing a
+ * DTO type), so this struct only needs to serialize to the JSON body the
+ * agent handler already deserializes.
+ */
+export type RemotePullCredentials = {
+    /**
+     * **Never logged or included in error messages.**
+     */
+    identity_token?: string | null;
+    /**
+     * **Never logged or included in error messages.**
+     */
+    password?: string | null;
+    server_address?: string | null;
+    username?: string | null;
+};
+
 export type RemoveNodeResponse = {
     id: number;
     message: string;
@@ -22910,6 +23061,36 @@ export type RunExternalServiceBackupRequest = {
      * ID of the S3 source to store the backup. If omitted, the current default S3 source is used.
      */
     s3_source_id?: number | null;
+};
+
+export type RunnerClaim = {
+    identity_token: string;
+};
+
+export type RunnerFailure = {
+    message: string;
+};
+
+export type RunnerLogs = {
+    lines: Array<string>;
+};
+
+export type RunnerResult = {
+    build_id: string;
+    digest: string;
+    duration_ms: number;
+    image: ImageInfo;
+    platforms: Array<string>;
+    run_id: string;
+};
+
+export type RunnerWork = {
+    registry_credentials?: RemotePullCredentials | null;
+    registry_tag: string;
+    run_id: string;
+    spec: BuildSpec;
+    timeout_seconds: number;
+    token: string;
 };
 
 /**
@@ -27813,6 +27994,16 @@ export type TriggerScanResponse = {
 };
 
 /**
+ * Public trust policy; no hardcoded provider-specific token validator.
+ */
+export type TrustedIdentityIssuer = {
+    audience: string;
+    issuer: string;
+    jwks_url: string;
+    subject: string;
+};
+
+/**
  * Request to get TTL for a key
  */
 export type TtlRequest = {
@@ -30672,6 +30863,34 @@ export type WriteFilesResponse = {
  */
 export type ZoneListResponse = {
     zones: Array<DnsZone>;
+};
+
+export type CiExecutorSettingsWritable = {
+    control_plane_url: string;
+    /**
+     * Write-only. Stored encrypted; omitted by the status endpoint.
+     */
+    dispatch_token?: string | null;
+    git_ref: string;
+    identity: TrustedIdentityIssuer;
+    image_repository: string;
+    limits: BuildLimits;
+    organization: boolean;
+    owner: string;
+    registry_credentials?: RemotePullCredentials | null;
+    repository: string;
+    runner_archive_sha256: string;
+    /**
+     * Pinned release archive used by the generated CI shim.
+     */
+    runner_archive_url: string;
+};
+
+export type CiExecutorStatusWritable = {
+    configured: boolean;
+    reason?: string | null;
+    settings?: CiExecutorSettingsWritable | null;
+    setup_path: string;
 };
 
 /**
@@ -47651,6 +47870,231 @@ export type RetryInstantiationResponses = {
 
 export type RetryInstantiationResponse = RetryInstantiationResponses[keyof RetryInstantiationResponses];
 
+export type ClaimCiBuildData = {
+    body: RunnerClaim;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/claim';
+};
+
+export type ClaimCiBuildErrors = {
+    /**
+     * Runner identity rejected
+     */
+    403: unknown;
+    /**
+     * Build already claimed or terminal
+     */
+    409: unknown;
+    /**
+     * Provider run has not been recorded; retry claim
+     */
+    425: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type ClaimCiBuildResponses = {
+    200: RunnerWork;
+};
+
+export type ClaimCiBuildResponse = ClaimCiBuildResponses[keyof ClaimCiBuildResponses];
+
+export type GetCiBuildContextData = {
+    body?: never;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/context';
+};
+
+export type GetCiBuildContextErrors = {
+    /**
+     * One-build token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build inactive
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type GetCiBuildContextResponses = {
+    /**
+     * Streamed agent-protocol context tar
+     */
+    200: Blob | File;
+};
+
+export type GetCiBuildContextResponse = GetCiBuildContextResponses[keyof GetCiBuildContextResponses];
+
+export type FailCiBuildData = {
+    body: RunnerFailure;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/failure';
+};
+
+export type FailCiBuildErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build inactive
+     */
+    409: unknown;
+};
+
+export type FailCiBuildResponses = {
+    /**
+     * Build failed and token revoked
+     */
+    204: void;
+};
+
+export type FailCiBuildResponse = FailCiBuildResponses[keyof FailCiBuildResponses];
+
+export type CheckCiBuildLeaseData = {
+    body?: never;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/lease';
+};
+
+export type CheckCiBuildLeaseErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build cancelled or expired
+     */
+    409: unknown;
+};
+
+export type CheckCiBuildLeaseResponses = {
+    /**
+     * Lease active
+     */
+    204: void;
+};
+
+export type CheckCiBuildLeaseResponse = CheckCiBuildLeaseResponses[keyof CheckCiBuildLeaseResponses];
+
+export type AppendCiBuildLogsData = {
+    body: RunnerLogs;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/logs';
+};
+
+export type AppendCiBuildLogsErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build inactive or batch exceeds limit
+     */
+    409: unknown;
+};
+
+export type AppendCiBuildLogsResponses = {
+    /**
+     * Log batch appended
+     */
+    204: void;
+};
+
+export type AppendCiBuildLogsResponse = AppendCiBuildLogsResponses[keyof AppendCiBuildLogsResponses];
+
+export type CompleteCiBuildData = {
+    body: RunnerResult;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/result';
+};
+
+export type CompleteCiBuildErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Verification rejected or build inactive
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type CompleteCiBuildResponses = {
+    /**
+     * Verified result accepted and token revoked
+     */
+    204: void;
+};
+
+export type CompleteCiBuildResponse = CompleteCiBuildResponses[keyof CompleteCiBuildResponses];
+
 export type AdminListNodesData = {
     body?: never;
     path?: never;
@@ -47791,6 +48235,47 @@ export type AdminGetNodeResponses = {
 };
 
 export type AdminGetNodeResponse = AdminGetNodeResponses[keyof AdminGetNodeResponses];
+
+export type AdminSetNodeBuildLimitsData = {
+    body: BuildLimits;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/build-limits';
+};
+
+export type AdminSetNodeBuildLimitsErrors = {
+    /**
+     * Invalid limits or node role
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type AdminSetNodeBuildLimitsResponses = {
+    200: BuildLimits;
+};
+
+export type AdminSetNodeBuildLimitsResponse = AdminSetNodeBuildLimitsResponses[keyof AdminSetNodeBuildLimitsResponses];
 
 export type AdminListNodeContainersData = {
     body?: never;
@@ -70414,6 +70899,101 @@ export type RunAiProviderSmokeResponses = {
 };
 
 export type RunAiProviderSmokeResponse = RunAiProviderSmokeResponses[keyof RunAiProviderSmokeResponses];
+
+export type GetCiBuilderData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/ci-builder';
+};
+
+export type GetCiBuilderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type GetCiBuilderResponses = {
+    200: CiExecutorStatus;
+};
+
+export type GetCiBuilderResponse = GetCiBuilderResponses[keyof GetCiBuilderResponses];
+
+export type SetCiBuilderData = {
+    body: CiExecutorSettingsWritable;
+    path?: never;
+    query?: never;
+    url: '/settings/ci-builder';
+};
+
+export type SetCiBuilderErrors = {
+    /**
+     * Invalid settings
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type SetCiBuilderResponses = {
+    200: CiExecutorStatus;
+};
+
+export type SetCiBuilderResponse = SetCiBuilderResponses[keyof SetCiBuilderResponses];
+
+export type ProvisionCiBuilderData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/ci-builder/provision';
+};
+
+export type ProvisionCiBuilderErrors = {
+    /**
+     * Configuration/provider error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type ProvisionCiBuilderResponses = {
+    /**
+     * Builder repository and pinned shim provisioned
+     */
+    204: void;
+};
+
+export type ProvisionCiBuilderResponse = ProvisionCiBuilderResponses[keyof ProvisionCiBuilderResponses];
 
 export type RotateClusterCaData = {
     body: RotateClusterCaRequest;

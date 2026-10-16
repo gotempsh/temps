@@ -1513,6 +1513,30 @@ impl NodeService {
             .ok_or(NodeError::NotFoundById { node_id })
     }
 
+    pub async fn set_build_limits(
+        &self,
+        node_id: i32,
+        limits: temps_deployer::build_protocol::BuildLimits,
+    ) -> Result<(), NodeError> {
+        limits
+            .validate()
+            .map_err(|message| NodeError::Validation { message })?;
+        let node = self.get_by_id(node_id).await?;
+        if node.role != "worker" {
+            return Err(NodeError::Validation {
+                message: format!("Node {node_id} is not a worker"),
+            });
+        }
+        let mut active: nodes::ActiveModel = node.into();
+        active.build_limits = Set(Some(serde_json::to_value(limits).map_err(|error| {
+            NodeError::Validation {
+                message: error.to_string(),
+            }
+        })?));
+        active.update(self.db.as_ref()).await?;
+        Ok(())
+    }
+
     pub async fn set_public_ingress_enabled(
         &self,
         node_id: i32,
@@ -3054,6 +3078,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,
@@ -5408,6 +5433,81 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             NodeError::NotFoundById { node_id: 999 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn builder_limits_update_only_the_worker_record() {
+        let node = sample_node();
+        let limits = temps_deployer::build_protocol::BuildLimits {
+            concurrency: 3,
+            queue_wait_seconds: 45,
+            build_timeout_seconds: 600,
+        };
+        let mut updated = node.clone();
+        updated.build_limits = Some(serde_json::to_value(limits).unwrap());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node], vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+        service.set_build_limits(1, limits).await.unwrap();
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap();
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("build_limits"));
+        assert!(log.contains("queue_wait_seconds"));
+        assert!(log.contains("600"));
+    }
+    #[tokio::test]
+    async fn builder_limits_reject_missing_node_and_non_worker() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+        assert!(matches!(
+            service.set_build_limits(99, Default::default()).await,
+            Err(NodeError::NotFoundById { node_id: 99 })
+        ));
+        let mut node = sample_node();
+        node.role = "edge".into();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+        assert!(matches!(
+            service.set_build_limits(1, Default::default()).await,
+            Err(NodeError::Validation { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn builder_limits_validate_before_accessing_storage() {
+        let service = NodeService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        assert!(matches!(
+            service
+                .set_build_limits(
+                    1,
+                    temps_deployer::build_protocol::BuildLimits {
+                        concurrency: 0,
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(NodeError::Validation { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn builder_limits_report_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("worker lookup unavailable".into())])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+        assert!(matches!(
+            service.set_build_limits(1, Default::default()).await,
+            Err(NodeError::Database(_))
         ));
     }
 

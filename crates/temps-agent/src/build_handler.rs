@@ -17,11 +17,11 @@ use axum::{
 };
 use futures::{stream, StreamExt};
 use serde::Deserialize;
-use std::{convert::Infallible, io::Write, path::Path, sync::Arc};
+use std::{convert::Infallible, path::Path, sync::Arc};
 use temps_deployer::{
     build_protocol::{
-        validate_archive_path, BuildEvent, BuildFailure, BuildFailureKind, BuildSpec,
-        MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES, MAX_BUILD_SPEC_BYTES,
+        safe_extract_context, BuildEvent, BuildFailure, BuildFailureKind, BuildSpec,
+        MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_SPEC_BYTES,
     },
     image_scan::{ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS},
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError,
@@ -77,37 +77,6 @@ impl From<AgentImageError> for Problem {
 
 const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Longest a build waits behind the node's other image operations for a slot.
-///
-/// Separate from [`BUILD_DEADLINE`] so a queued build is neither held for the
-/// whole of that budget nor left with what remains of it once admitted: past
-/// this wait the node answers 503 while the control plane can still choose
-/// another builder or build on itself.
-const BUILD_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// Take one of the node's image-operation slots for a build, waiting at most
-/// `queue_timeout` behind the operations already running.
-///
-/// Answers [`AgentImageError::Unavailable`] (HTTP 503) when the node stays
-/// busy, so a caller can tell a full queue from a failed build.
-async fn acquire_build_slot(
-    slots: &Arc<tokio::sync::Semaphore>,
-    queue_timeout: std::time::Duration,
-) -> Result<tokio::sync::OwnedSemaphorePermit, AgentImageError> {
-    match tokio::time::timeout(queue_timeout, slots.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(AgentImageError::Unavailable(
-            "Worker image operation capacity unavailable".into(),
-        )),
-        Err(_) => Err(AgentImageError::Unavailable(format!(
-            "Builder is busy: no build slot became free within {} minute(s); this node runs \
-             {} image operation(s) at a time. Retry later, or add a builder node",
-            queue_timeout.as_secs().div_ceil(60),
-            crate::handlers::MAX_CONCURRENT_IMAGE_IMPORTS
-        ))),
-    }
-}
-
 /// Own (rather than detach) the build future. Dropping it cancels the Docker
 /// request and releases its scratch directory and admission permit before the
 /// terminal event is sent. A disconnected/slow consumer cannot retain a slot.
@@ -130,116 +99,12 @@ async fn supervise_build(
             }),
             Err(_) => BuildEvent::Failure(BuildFailure {
                 kind: BuildFailureKind::Timeout,
-                message: "Worker build exceeded its 30-minute deadline".into(),
+                message: "Worker build exceeded its configured deadline".into(),
             }),
         }
     };
     // Do not leave even this small task waiting forever on a full log queue.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(event)).await;
-}
-
-fn safe_extract_context(archive: &Path, destination: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(archive)
-        .map_err(|error| format!("Cannot open uploaded build context: {error}"))?;
-    let mut archive = tar::Archive::new(file);
-    let entries = archive
-        .entries()
-        .map_err(|error| format!("Cannot read build context archive: {error}"))?;
-    let mut total_size = 0_u64;
-    let mut count = 0_usize;
-    for entry in entries {
-        count += 1;
-        if count > MAX_BUILD_CONTEXT_ENTRIES {
-            return Err(format!(
-                "Build context exceeds the {MAX_BUILD_CONTEXT_ENTRIES}-entry limit"
-            ));
-        }
-        let mut entry = entry.map_err(|error| format!("Invalid build context entry: {error}"))?;
-        let path = entry
-            .path()
-            .map_err(|error| format!("Invalid build context path: {error}"))?
-            .into_owned();
-        validate_archive_path(&path)?;
-        if path.components().any(|part| part.as_os_str() == ".git") {
-            return Err("Build context must not contain a .git directory".to_string());
-        }
-        let output = destination.join(&path);
-        let kind = entry.header().entry_type();
-        if kind.is_dir() {
-            std::fs::create_dir_all(&output).map_err(|error| {
-                format!(
-                    "Cannot create build context directory '{}': {error}",
-                    path.display()
-                )
-            })?;
-        } else if kind.is_file() {
-            let size = entry
-                .header()
-                .size()
-                .map_err(|error| format!("Invalid build context entry size: {error}"))?;
-            total_size = total_size
-                .checked_add(size)
-                .ok_or_else(|| "Build context size overflowed".to_string())?;
-            if total_size > MAX_BUILD_CONTEXT_BYTES {
-                return Err(format!(
-                    "Extracted build context exceeds the {MAX_BUILD_CONTEXT_BYTES}-byte limit"
-                ));
-            }
-            if let Some(parent) = output.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    format!(
-                        "Cannot create build context parent '{}': {error}",
-                        path.display()
-                    )
-                })?;
-            }
-            let mut target = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&output)
-                .map_err(|error| {
-                    format!(
-                        "Cannot create build context file '{}': {error}",
-                        path.display()
-                    )
-                })?;
-            std::io::copy(&mut entry, &mut target).map_err(|error| {
-                format!(
-                    "Cannot extract build context file '{}': {error}",
-                    path.display()
-                )
-            })?;
-            target.flush().map_err(|error| {
-                format!(
-                    "Cannot flush build context file '{}': {error}",
-                    path.display()
-                )
-            })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = entry
-                    .header()
-                    .mode()
-                    .map_err(|error| format!("Invalid mode for '{}': {error}", path.display()))?;
-                // Preserve executable source scripts, but never setuid/setgid.
-                target
-                    .set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
-                    .map_err(|error| {
-                        format!(
-                            "Cannot set source permissions for '{}': {error}",
-                            path.display()
-                        )
-                    })?;
-            }
-        } else {
-            return Err(format!(
-                "Build context entry '{}' is not a regular file or directory",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn event_bytes(event: BuildEvent) -> bytes::Bytes {
@@ -286,17 +151,60 @@ pub async fn build_image(
     RequireAgentAuth(auth): RequireAgentAuth,
     State(state): State<Arc<AgentState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, DeploymentsCreate);
-    let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
-    tokio::time::timeout_at(deadline, receive_build(state, limits, multipart, deadline))
-        .await
+    let mut settings = temps_deployer::build_protocol::BuildLimits::default();
+    for (name, target) in [
+        (
+            "x-temps-build-queue-seconds",
+            &mut settings.queue_wait_seconds,
+        ),
+        (
+            "x-temps-build-timeout-seconds",
+            &mut settings.build_timeout_seconds,
+        ),
+    ] {
+        if let Some(value) = headers.get(name) {
+            *target = value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| AgentImageError::Invalid(format!("Invalid {name}")))?;
+        }
+    }
+    if let Some(value) = headers.get("x-temps-build-concurrency") {
+        settings.concurrency = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| AgentImageError::Invalid("Invalid build concurrency".into()))?;
+    }
+    settings.validate().map_err(AgentImageError::Invalid)?;
+    let request_permit = limits
+        .build_request_slots
+        .clone()
+        .try_acquire_owned()
         .map_err(|_| {
-            Problem::from(AgentImageError::Deadline(
-                "Build admission/upload exceeded 30 minutes".into(),
+            AgentImageError::Unavailable(format!(
+                "Builder busy: all {} build request slots are queued or executing",
+                crate::handlers::MAX_BUILD_REQUESTS
             ))
-        })?
+        })?;
+    let deadline = tokio::time::Instant::now()
+        + BUILD_DEADLINE
+        + std::time::Duration::from_secs(u64::from(settings.queue_wait_seconds));
+    tokio::time::timeout_at(
+        deadline,
+        receive_build(state, limits, multipart, deadline, settings, request_permit),
+    )
+    .await
+    .map_err(|_| {
+        Problem::from(AgentImageError::Deadline(
+            "Build admission/upload exceeded its queue and upload deadline".into(),
+        ))
+    })?
 }
 
 async fn receive_build(
@@ -304,6 +212,8 @@ async fn receive_build(
     limits: Arc<AgentResourceLimits>,
     mut multipart: Multipart,
     deadline: tokio::time::Instant,
+    settings: temps_deployer::build_protocol::BuildLimits,
+    request_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Response, Problem> {
     let mut spec_field = match multipart.next_field().await {
         Ok(Some(field)) if field.name() == Some("spec") => field,
@@ -338,7 +248,36 @@ async fn receive_build(
         return Err(AgentImageError::Invalid(message).into());
     }
 
-    let permit = acquire_build_slot(&limits.image_import_slots, BUILD_QUEUE_TIMEOUT).await?;
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(settings.queue_wait_seconds)),
+        async {
+            let build = limits.build_admission.acquire(settings.concurrency).await;
+            // Preserve the one-operation default on small workers. Raising the
+            // build cap explicitly permits parallel builds beside artifact I/O.
+            let image = if settings.concurrency == 1 {
+                Some(
+                    limits
+                        .image_import_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            AgentImageError::Unavailable("Worker image capacity unavailable".into())
+                        })?,
+                )
+            } else {
+                None
+            };
+            Ok::<_, AgentImageError>((build, image))
+        },
+    )
+    .await
+    .map_err(|_| {
+        AgentImageError::Unavailable(format!(
+            "Builder busy: no slot within {}s at concurrency {}",
+            settings.queue_wait_seconds, settings.concurrency
+        ))
+    })??;
     let scratch = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -415,10 +354,11 @@ async fn receive_build(
     }
     let archive_for_extract = archive_path.clone();
     let context_for_extract = context_dir.clone();
-    let (scratch, permit) = match tokio::task::spawn_blocking(move || {
+    let (scratch, permit, request_permit) = match tokio::task::spawn_blocking(move || {
         // A blocking extraction cannot be aborted. Keep its resources owned
         // here if the HTTP handler disconnects or expires while it finishes.
-        safe_extract_context(&archive_for_extract, &context_for_extract).map(|()| (scratch, permit))
+        safe_extract_context(&archive_for_extract, &context_for_extract)
+            .map(|()| (scratch, permit, request_permit))
     })
     .await
     {
@@ -463,6 +403,7 @@ async fn receive_build(
     let builder = state.image_builder.clone();
     let build = async move {
         let _permit = permit;
+        let _request_permit = request_permit;
         let _scratch = scratch;
         let requested_platform = request.platform.clone();
         let result = builder
@@ -487,7 +428,8 @@ async fn receive_build(
     tokio::spawn(supervise_build(
         build,
         tx,
-        tokio::time::Instant::now() + BUILD_DEADLINE,
+        tokio::time::Instant::now()
+            + std::time::Duration::from_secs(u64::from(settings.build_timeout_seconds)),
     ));
     let output = stream::unfold(rx, |mut rx| async move {
         rx.recv()
@@ -953,6 +895,63 @@ fn worker_build_args(
     args
 }
 
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct FetchRegistryImage {
+    reference: String,
+    tag: String,
+    credentials: Option<temps_deployer::remote::RemotePullCredentials>,
+}
+#[utoipa::path(post, path = "/agent/images/fetch", tag = "Agent images",
+    request_body = FetchRegistryImage,
+    responses((status = 200, body = crate::handlers::AgentResponse<bool>),
+        (status = 400, description = "Invalid immutable reference or tag"),
+        (status = 401, description = "Node authentication required"),
+        (status = 403, description = "Deployment-create permission required"),
+        (status = 500, description = "Registry transfer failed"),
+        (status = 503, description = "Capacity unavailable"),
+        (status = 504, description = "Transfer deadline expired")),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn fetch_registry_image(
+    RequireAgentAuth(auth): RequireAgentAuth,
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    axum::Json(request): axum::Json<FetchRegistryImage>,
+) -> Result<axum::Json<crate::handlers::AgentResponse<bool>>, Problem> {
+    permission_guard!(auth, DeploymentsCreate);
+    let (repository, digest) = request.reference.rsplit_once('@').ok_or_else(|| {
+        AgentImageError::Invalid("Registry image must be addressed by digest".into())
+    })?;
+    temps_deployer::build_verification::validate_repository(0, repository)
+        .map_err(|error| AgentImageError::Invalid(error.to_string()))?;
+    temps_deployer::build_verification::ImageDigest::parse(digest)
+        .map_err(|error| AgentImageError::Invalid(error.to_string()))?;
+    if request.tag.is_empty()
+        || request.tag.len() > 256
+        || request.tag.chars().any(char::is_whitespace)
+        || request.tag.contains('@')
+    {
+        return Err(AgentImageError::Invalid(
+            "Expected a bounded image tag without whitespace".into(),
+        )
+        .into());
+    }
+    let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
+    let _permit = acquire_image_slot(&limits, deadline, "Registry image transfer").await?;
+    tokio::time::timeout_at(
+        deadline,
+        state.image_builder.fetch_registry_image(
+            &request.reference,
+            &request.tag,
+            request.credentials,
+        ),
+    )
+    .await
+    .map_err(|_| AgentImageError::Deadline("Registry image transfer".into()))?
+    .map_err(|error| AgentImageError::Storage(error.to_string()))?;
+    Ok(crate::handlers::AgentResponse::ok(true))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1012,6 +1011,7 @@ mod tests {
         });
         // Deliberately omit require_agent_auth middleware. Each real handler
         // must still reject credentials before touching Docker or source data.
+        let limits = Arc::new(AgentResourceLimits::new());
         let router = Router::new()
             .route("/build", post(build_image))
             .route("/inspect", get(inspect_image))
@@ -1020,7 +1020,7 @@ mod tests {
             .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
                 "node-token",
             ))))
-            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .layer(Extension(limits.clone()))
             .with_state(state);
         for (method, path) in [
             ("POST", "/build"),
@@ -1056,12 +1056,38 @@ mod tests {
                 );
             }
         }
+        let occupied = limits
+            .build_request_slots
+            .clone()
+            .acquire_many_owned(crate::handlers::MAX_BUILD_REQUESTS as u32)
+            .await
+            .unwrap();
+        let request = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/build")
+                .header("authorization", "Bearer node-token")
+                .header("content-type", "multipart/form-data; boundary=test")
+                .body(Body::from("--test--\r\n"))
+                .unwrap()
+        };
+        // A full pool rejects before reading even an invalid spec.
+        let response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(occupied);
+        let response = router.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            limits.build_request_slots.available_permits(),
+            crate::handlers::MAX_BUILD_REQUESTS
+        );
     }
 
     /// Records the request a worker build hands to the local daemon, and
     /// echoes the kind of progress line Docker prints.
     #[derive(Default)]
     struct RecordingBuilder {
+        delay: Option<std::time::Duration>,
         requests: std::sync::Mutex<Vec<BuildRequest>>,
     }
 
@@ -1086,6 +1112,9 @@ mod tests {
                 .lock()
                 .map_err(|error| BuilderError::Other(error.to_string()))?
                 .push(request.request);
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(BuildResult {
                 image_id: "sha256:worker-built".into(),
                 image_name,
@@ -1157,12 +1186,13 @@ mod tests {
             platform: Default::default(),
             host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
         });
+        let limits = Arc::new(AgentResourceLimits::new());
         let router = Router::new()
             .route("/agent/images/build", post(build_image))
             .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
                 "node-token",
             ))))
-            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .layer(Extension(limits.clone()))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1185,6 +1215,11 @@ mod tests {
             "worker-1".into(),
         )
         .unwrap();
+        let remote = remote.with_build_limits(temps_deployer::build_protocol::BuildLimits {
+            concurrency: 3,
+            queue_wait_seconds: 2,
+            build_timeout_seconds: 7,
+        });
         let logs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let log_sink = logs.clone();
         let callback: temps_deployer::LogCallback = Arc::new(move |line| {
@@ -1222,6 +1257,7 @@ mod tests {
         server.abort();
 
         assert_eq!(result.image_name, "web:worker");
+        assert_eq!(limits.build_admission.available(), 3);
         let requests = builder.requests.lock().unwrap();
         let request = requests.first().expect("the daemon received the build");
         assert_eq!(
@@ -1273,6 +1309,86 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn configured_queue_and_build_deadlines_are_enforced_over_the_wire() {
+        use axum::{routing::post, Router};
+        let builder = Arc::new(RecordingBuilder {
+            delay: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let container = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AgentState {
+            container_deployer: container,
+            image_builder: builder.clone(),
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+        let limits = Arc::new(AgentResourceLimits::new());
+        let occupied = limits.build_admission.acquire(1).await;
+        let router = Router::new()
+            .route("/agent/images/build", post(build_image))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(limits.clone()))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let remote = temps_deployer::remote::RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "node-token".into(),
+            "limited-builder".into(),
+        )
+        .unwrap()
+        .with_build_limits(temps_deployer::build_protocol::BuildLimits {
+            concurrency: 1,
+            queue_wait_seconds: 1,
+            build_timeout_seconds: 1,
+        });
+        let request = || BuildRequest {
+            context_path: source.path().into(),
+            dockerfile_path: None,
+            image_name: "app:limited".into(),
+            build_args: Default::default(),
+            build_args_buildkit: Default::default(),
+            platform: None,
+            log_path: source.path().join("build.log"),
+            cache_from: vec![],
+        };
+        let error = temps_deployer::ImageBuilder::build_image(&remote, request())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BuilderError::Busy(_)), "{error}");
+        assert!(builder.requests.lock().unwrap().is_empty());
+        drop(occupied);
+        let error = temps_deployer::ImageBuilder::build_image(&remote, request())
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(error, BuilderError::Busy(_)),
+            "an admitted build timeout must not trigger local fallback"
+        );
+        assert!(error.to_string().contains("configured deadline"));
+        assert_eq!(limits.build_admission.available(), 1);
+        assert_eq!(builder.requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
     /// The control plane holds one HTTP request open for the whole build. A
     /// build admitted at the very end of the admission window still gets its
     /// full, fresh build deadline here, so the client's request timeout must
@@ -1284,50 +1400,6 @@ mod tests {
             temps_deployer::remote::IMAGE_BUILD_REQUEST_TIMEOUT > worst_case,
             "a build admitted late must keep its whole build deadline"
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_busy_builder_answers_503_after_the_queue_window_not_after_the_build_deadline() {
-        let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let running_build = slots.clone().acquire_owned().await.unwrap();
-        let started = tokio::time::Instant::now();
-
-        let error = acquire_build_slot(&slots, BUILD_QUEUE_TIMEOUT)
-            .await
-            .expect_err("the only slot is taken");
-
-        assert_eq!(started.elapsed(), BUILD_QUEUE_TIMEOUT);
-        assert!(BUILD_QUEUE_TIMEOUT < BUILD_DEADLINE);
-        let message = error.to_string();
-        assert!(message.contains("Builder is busy"), "{message}");
-        assert!(message.contains("10 minute"), "{message}");
-        assert_eq!(
-            Problem::from(error).status_code,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        drop(running_build);
-        assert!(acquire_build_slot(&slots, BUILD_QUEUE_TIMEOUT)
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_queued_build_is_admitted_as_soon_as_a_slot_frees() {
-        let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let running_build = slots.clone().acquire_owned().await.unwrap();
-        let waiting = tokio::spawn({
-            let slots = slots.clone();
-            async move { acquire_build_slot(&slots, BUILD_QUEUE_TIMEOUT).await }
-        });
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        assert!(
-            !waiting.is_finished(),
-            "must keep queueing inside the window"
-        );
-
-        drop(running_build);
-
-        assert!(waiting.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -1765,6 +1837,105 @@ mod tests {
                     || detail["detail"].as_str().unwrap().contains("worker")
             );
         }
+    }
+
+    /// Opt-in only: never build against an operator's shared Docker daemon.
+    #[tokio::test]
+    async fn real_worker_build_returns_config_and_extracts_assets_without_local_image_transfer() {
+        use axum::{
+            routing::{get, post},
+            Router,
+        };
+        use futures::FutureExt;
+        use temps_deployer::ImageBuilder;
+        let Ok(expected_daemon) = std::env::var("TEMPS_TEST_DEDICATED_DOCKER_ID") else {
+            eprintln!("Dedicated Docker fixture not configured; skipping real worker smoke test");
+            return;
+        };
+        let docker = Arc::new(bollard::Docker::connect_with_defaults().unwrap());
+        assert_eq!(
+            docker.info().await.unwrap().id.as_deref(),
+            Some(expected_daemon.as_str()),
+            "Refusing to mutate a daemon other than the dedicated test fixture"
+        );
+        let builder = Arc::new(temps_deployer::docker::DockerRuntime::new(
+            docker,
+            true,
+            "bridge".into(),
+        ));
+        let platform = builder.ensure_platform_discovered().await.unwrap();
+        let state = Arc::new(AgentState {
+            container_deployer: Arc::new(
+                temps_deployer::remote::RemoteNodeDeployer::new(
+                    "http://127.0.0.1:9".into(),
+                    "unused".into(),
+                    "no-local-io".into(),
+                )
+                .unwrap(),
+            ),
+            image_builder: builder.clone(),
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+        let router = Router::new()
+            .route("/agent/images/build", post(build_image))
+            .route("/agent/images/inspect", get(inspect_image))
+            .route("/agent/images/extract", get(extract_image_path))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let image_name = format!("temps-agent-smoke:{}", uuid::Uuid::new_v4());
+        let outcome = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                let source = tempfile::tempdir().unwrap();
+                std::fs::create_dir(source.path().join("public")).unwrap();
+                std::fs::write(source.path().join("public/index.html"), "worker static fixture").unwrap();
+                std::fs::write(source.path().join("public/app.js.map"), r#"{"version":3,"sources":[]}"#).unwrap();
+                std::fs::write(source.path().join("Dockerfile"), "FROM scratch\nWORKDIR /srv\nCOPY public /srv/public\nEXPOSE 8080\nENV PUBLIC_MARKER=fixture-value\nUSER 10001\nENTRYPOINT [\"/app\"]\n").unwrap();
+                let remote = temps_deployer::remote::RemoteNodeDeployer::new(format!("http://{address}"), "node-token".into(), "real-worker".into()).unwrap();
+                let result = remote.build_image(BuildRequest {
+                    context_path: source.path().into(), dockerfile_path: None,
+                    image_name: image_name.clone(), build_args: Default::default(),
+                    build_args_buildkit: Default::default(), cache_from: vec![],
+                    platform: Some(platform.clone()), log_path: source.path().join("build.log"),
+                }).await.unwrap();
+                assert_eq!(result.image_name, image_name);
+                let image = remote.inspect_image(&image_name).await.unwrap();
+                assert_eq!(image.platform, platform);
+                assert_eq!(image.working_dir.as_deref(), Some("/srv"));
+                let config = image.config.unwrap();
+                assert!(config.exposed_ports.contains(&8080));
+                assert_eq!(config.user.as_deref(), Some("10001"));
+                assert!(config.env.iter().any(|value| value == "PUBLIC_MARKER=fixture-value"));
+                assert_eq!(config.entrypoint, vec!["/app".to_string()]);
+                let destination = source.path().join("extracted");
+                remote.extract_from_image(&image_name, "/srv/public", &destination).await.unwrap();
+                assert_eq!(std::fs::read_to_string(destination.join("index.html")).unwrap(), "worker static fixture");
+                assert!(destination.join("app.js.map").is_file());
+            }).await.expect("real worker build/extraction deadline");
+        }).catch_unwind().await;
+        let cleanup = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            builder.remove_image(&image_name),
+        )
+        .await;
+        server.abort();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        cleanup
+            .expect("image cleanup deadline")
+            .expect("remove test image");
     }
 
     #[test]

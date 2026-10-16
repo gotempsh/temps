@@ -28,7 +28,7 @@
 //!   a failed check has to fail the deployment, not quietly build something
 //!   else.
 //!
-//! Nothing here is wired into a deployment yet. See
+//! CI dispatch calls this verifier before accepting a registry result. See
 //! `docs/architecture/multi-node-and-build-dispatch.md` for where it sits.
 
 use std::collections::BTreeSet;
@@ -446,7 +446,10 @@ impl RemoteBuildFailure {
     }
 }
 
-fn validate_repository(deployment_id: i32, repository: &str) -> Result<(), BuildVerificationError> {
+pub fn validate_repository(
+    deployment_id: i32,
+    repository: &str,
+) -> Result<(), BuildVerificationError> {
     let invalid = |reason: &'static str| BuildVerificationError::InvalidRepository {
         deployment_id,
         repository: clip(repository),

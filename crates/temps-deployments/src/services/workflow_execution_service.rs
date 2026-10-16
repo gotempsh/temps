@@ -152,15 +152,6 @@ struct SelectedNodeBuilder {
     agent: Arc<temps_deployer::remote::RemoteNodeDeployer>,
 }
 
-/// How long a build offloaded from a control plane that could build it
-/// itself waits for a busy build node before building on the control plane.
-/// The build job applies it when the build is about to be sent.
-///
-/// Builds on a node are meant to keep CPU off the control plane, so this is
-/// patient (a typical build is a few minutes), but bounded: a preview must not
-/// sit behind another build for as long as the node's own queue would hold it.
-const OFFLOAD_BUILD_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
 /// How many images a worker build of a non-static deployment produces.
 #[derive(Debug, PartialEq, Eq)]
 enum WorkerBuildScope {
@@ -211,6 +202,14 @@ async fn connect_build_node(
             node.name, node.id
         )
     })?;
+    let limits = node
+        .build_limits
+        .clone()
+        .map(serde_json::from_value::<temps_deployer::build_protocol::BuildLimits>)
+        .transpose()
+        .map_err(|error| format!("Node {} has invalid builder limits: {error}", node.id))?
+        .unwrap_or_default();
+    limits.validate()?;
     crate::cluster_ca::build_node_deployer(
         &node.address,
         token,
@@ -219,6 +218,7 @@ async fn connect_build_node(
         encryption,
     )
     .await
+    .map(|remote| remote.with_build_limits(limits))
     .map_err(|error| {
         format!(
             "Cannot connect to build node '{}' (id={}): {error}",
@@ -1403,7 +1403,118 @@ impl WorkflowExecutionService {
                         environment.deployment_config.as_ref(),
                         project.deployment_config.as_ref(),
                     );
-                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled
+                let image_builder: Arc<dyn ImageBuilder> = if build_location
+                    == temps_entities::deployment_config::BuildLocation::Ci
+                {
+                    inlined_variables_allow_offload(&inlined_build_variables).map_err(
+                        |reason| {
+                            WorkflowExecutionError::InvalidJobConfig(format!(
+                                "Deployment {} CI build cannot transfer inlined secrets: {reason}",
+                                deployment.id
+                            ))
+                        },
+                    )?;
+                    if needs_npm_credentials {
+                        return Err(WorkflowExecutionError::InvalidJobConfig(format!(
+                            "Deployment {} CI build cannot transfer package-manager credentials",
+                            deployment.id
+                        )));
+                    }
+                    let encryption = self.encryption_service.get().ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "CI build encryption service unavailable".into(),
+                        )
+                    })?;
+                    let service = crate::services::ci_dispatch::CiDispatchService::new(
+                        self.db.clone(),
+                        encryption.clone(),
+                        self.config_service.data_dir(),
+                    )
+                    .map_err(|error| WorkflowExecutionError::InvalidJobConfig(error.to_string()))?;
+                    builder = builder.external_build(true);
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
+                    let local_platform = if local_workloads_enabled {
+                        self.image_builder.ensure_platform_discovered().await
+                    } else {
+                        None
+                    };
+                    let selected = if let Some(platform) = &local_platform {
+                        let platforms = if cross_build_platforms.is_empty() {
+                            vec![platform.clone()]
+                        } else {
+                            cross_build_platforms.clone()
+                        };
+                        self.select_platform_builders(
+                            deployment.id,
+                            &project.slug,
+                            target_nodes.as_deref(),
+                            target_labels.as_ref(),
+                            &platforms,
+                        )
+                        .await
+                    } else {
+                        let static_output_only = deployment_jobs::Entity::find()
+                            .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+                            .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
+                            .one(self.db.as_ref())
+                            .await?
+                            .is_some();
+                        self.select_node_builder(
+                            deployment.id,
+                            &project.slug,
+                            target_nodes.as_deref(),
+                            target_labels.as_ref(),
+                            static_output_only,
+                        )
+                        .await
+                    };
+                    match selected {
+                        Ok(selected) => {
+                            let targets: Vec<_> = selected
+                                .into_iter()
+                                .map(|selected| crate::jobs::build_image::WorkerPlatformBuilder {
+                                    platform: selected.platform,
+                                    node_id: selected.node_id,
+                                    node_name: selected.node_name,
+                                    builder: Arc::new(
+                                        crate::services::ci_dispatch::CiImageBuilder {
+                                            service: service.clone(),
+                                            deployment_id: deployment.id,
+                                            target: selected.remote,
+                                        },
+                                    ),
+                                })
+                                .collect();
+                            let primary = targets
+                                .first()
+                                .ok_or_else(|| {
+                                    WorkflowExecutionError::InvalidJobConfig(
+                                        "CI build has no artifact target worker".into(),
+                                    )
+                                })?
+                                .builder
+                                .clone();
+                            builder = builder.platform_builders(targets);
+                            primary
+                        }
+                        Err(error) if local_platform.is_some() => {
+                            if cross_build_platforms.is_empty() {
+                                builder =
+                                    builder.target_platforms(local_platform.into_iter().collect());
+                            }
+                            builder = builder.build_location_notice(format!("CI builds run remotely. Artifacts use the control plane's daemon because no eligible worker can receive them: {error}"));
+                            Arc::new(crate::services::ci_dispatch::CiImageBuilder {
+                                service,
+                                deployment_id: deployment.id,
+                                target: self.image_builder.clone(),
+                            })
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else if local_workloads_enabled
                     && build_location
                         == temps_entities::deployment_config::BuildLocation::ControlPlane
                 {
@@ -1440,7 +1551,7 @@ impl WorkflowExecutionService {
                                 selected.agent.clone(),
                                 selected.node_id,
                                 selected.node_name.clone(),
-                                OFFLOAD_BUILD_QUEUE_WAIT,
+                                selected.agent.build_queue_wait(),
                                 self.image_builder.clone(),
                             ));
                             // The control plane's own post-build jobs read
@@ -6628,6 +6739,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,

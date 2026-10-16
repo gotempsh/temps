@@ -820,6 +820,7 @@ export function EnvironmentConfigurationCard({
                   <SelectItem value="node">
                     {BUILD_LOCATION_LABELS.node}
                   </SelectItem>
+                  <SelectItem value="ci">{BUILD_LOCATION_LABELS.ci}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -827,22 +828,31 @@ export function EnvironmentConfigurationCard({
               A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
               <code>temps.sh/role=dedicated</code> node builds only for
               environments that select it in Target Nodes. When no worker can
-              take a build (none joined, none of the right architecture,
-              multi-architecture builds), it runs on the control plane and the
-              build log says why. Worker builds do not receive build arguments.
+              take a build, it runs on the control plane when local builds are
+              enabled, and the build log says why. CI uses the configured GitHub
+              Actions runner and never falls back locally.{' '}
+              <Link to="/settings/nodes#ci-builder" className="underline">
+                Configure CI builder
+              </Link>
+              .
             </p>
-            {nodesQuery.isSuccess && activeNodes.length === 0 && (
-              <p className="text-xs text-muted-foreground">
-                No worker node is active yet, so builds run on the control
-                plane.{' '}
-                <Link
-                  to="/settings/nodes"
-                  className="underline underline-offset-2"
-                >
-                  Add a worker node
-                </Link>
-              </p>
-            )}
+            {nodesQuery.isSuccess &&
+              activeNodes.length === 0 &&
+              (formData.build_location === 'inherit'
+                ? project.deployment_config?.buildLocation
+                : formData.build_location) !== 'ci' && (
+                <p className="text-xs text-muted-foreground">
+                  No worker node is active yet. Node builds use the control
+                  plane when local builds are enabled; otherwise they need a
+                  worker.{' '}
+                  <Link
+                    to="/settings/nodes"
+                    className="underline underline-offset-2"
+                  >
+                    Add a worker node
+                  </Link>
+                </p>
+              )}
           </div>
         </SettingsSection>
 

@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 # Adding servers over SSH (ADR 048 D2c).
 russh = "0.64"
 zeroize = "1"
@@ -89,6 +90,8 @@ rustls-pki-types = "1.12.0"
 base64 = "0.23"
 
 [dev-dependencies]
+sea-orm-migration = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }
 testcontainers = { workspace = true }
 tokio-test = "0.4"
 mockall = "0.15"

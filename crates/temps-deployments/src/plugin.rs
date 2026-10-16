@@ -248,6 +248,26 @@ impl TempsPlugin for DeploymentsPlugin {
                 }
             }
 
+            let ci_dispatch = crate::services::ci_dispatch::CiDispatchService::new(
+                db.clone(),
+                encryption_service.clone(),
+                config_service.data_dir(),
+            )
+            .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            if let Err(error) = ci_dispatch.reconcile().await {
+                tracing::warn!(%error, "CI cancellation reconciliation pending; leases remain fenced by deployment state and will be retried");
+            }
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = ci_dispatch.reconcile().await {
+                        tracing::warn!(%error, "CI cancellation reconciliation failed; will retry");
+                    }
+                }
+            });
+
             // Resolve the CAS asset store backend once and share it across every
             // write-side consumer in this plugin (the cleanup service below, and
             // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`
@@ -1070,6 +1090,7 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
+            .merge(handlers::ci_dispatch::routes())
             .with_state(app_state)
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
@@ -1101,6 +1122,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                <handlers::ci_dispatch::CiDispatchApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,
                 compose_check_schema,

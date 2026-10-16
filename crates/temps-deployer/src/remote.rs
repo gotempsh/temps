@@ -315,7 +315,7 @@ fn read_ignore_file(root: &Path, relative: &Path) -> Result<String, BuilderError
     Ok(contents)
 }
 
-fn prepare_build_context(
+pub fn prepare_build_context(
     request: &BuildRequest,
 ) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
     if !request.cache_from.is_empty() {
@@ -483,7 +483,7 @@ async fn dispatch_build_event(
 /// reason `import_image` below builds its own request rather than sharing a
 /// DTO type), so this struct only needs to serialize to the JSON body the
 /// agent handler already deserializes.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemotePullCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -543,6 +543,7 @@ pub struct RemoteNodeDeployer {
     /// filled in from the agent's health endpoint with
     /// [`Self::refresh_platform`].
     platform: std::sync::Arc<std::sync::OnceLock<String>>,
+    build_limits: crate::build_protocol::BuildLimits,
 }
 
 impl RemoteNodeDeployer {
@@ -567,6 +568,7 @@ impl RemoteNodeDeployer {
             node_name,
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
         })
     }
 
@@ -616,7 +618,17 @@ impl RemoteNodeDeployer {
             node_name,
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
         })
+    }
+
+    pub fn with_build_limits(mut self, limits: crate::build_protocol::BuildLimits) -> Self {
+        self.build_limits = limits;
+        self
+    }
+
+    pub fn build_queue_wait(&self) -> Duration {
+        Duration::from_secs(u64::from(self.build_limits.queue_wait_seconds))
     }
 
     /// Record the node's container platform, as stored on its `nodes` row.
@@ -1215,6 +1227,8 @@ impl RemoteNodeDeployer {
         struct HealthSlots {
             #[serde(default)]
             build_slots_available: Option<u32>,
+            #[serde(default)]
+            build_concurrency_limit: Option<u32>,
         }
         wait_for_free_build_slot(
             || async {
@@ -1224,7 +1238,18 @@ impl RemoteNodeDeployer {
                 )
                 .await
                 {
-                    Ok(Ok(health)) => health.build_slots_available,
+                    Ok(Ok(health)) => {
+                        match (health.build_slots_available, health.build_concurrency_limit) {
+                            // A settings change must not wait for a build to update
+                            // the agent before that build can pass this probe.
+                            (Some(free), Some(limit)) => Some(
+                                u32::from(self.build_limits.concurrency)
+                                    .saturating_sub(limit.saturating_sub(free)),
+                            ),
+                            (free, None) => free,
+                            (None, Some(_)) => None,
+                        }
+                    }
                     Ok(Err(_)) | Err(_) => None,
                 }
             },
@@ -1237,6 +1262,55 @@ impl RemoteNodeDeployer {
 
 #[async_trait]
 impl ImageBuilder for RemoteNodeDeployer {
+    async fn fetch_registry_image(
+        &self,
+        reference: &str,
+        tag: &str,
+        credentials: Option<RemotePullCredentials>,
+    ) -> Result<(), BuilderError> {
+        #[derive(Serialize)]
+        struct Request<'a> {
+            reference: &'a str,
+            tag: &'a str,
+            credentials: Option<RemotePullCredentials>,
+        }
+        let response = self
+            .client
+            .post(format!("{}/agent/images/fetch", self.agent_url))
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT)
+            .json(&Request {
+                reference,
+                tag,
+                credentials,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Registry transfer on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = agent_error_detail(response).await;
+            return Err(BuilderError::Other(format!(
+                "Registry transfer on node '{}' returned HTTP {status}: {detail}",
+                self.node_name
+            )));
+        }
+        let response: AgentResponse<bool> =
+            bounded_agent_json(response, "Registry transfer").await?;
+        if !response.success || response.data != Some(true) {
+            return Err(BuilderError::Other(format!(
+                "Registry transfer on node '{}' did not confirm success",
+                self.node_name
+            )));
+        }
+        Ok(())
+    }
+
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
         self.build_image_with_callback(BuildRequestWithCallback {
             request,
@@ -1253,6 +1327,30 @@ impl ImageBuilder for RemoteNodeDeployer {
             request,
             log_callback,
         } = request;
+        if self.build_limits != crate::build_protocol::BuildLimits::default() {
+            #[derive(Deserialize)]
+            struct Support {
+                #[serde(default)]
+                build_limits_supported: bool,
+            }
+            let supported = matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.agent_get::<Support>("/agent/health")
+                )
+                .await,
+                Ok(Ok(Support {
+                    build_limits_supported: true
+                }))
+            );
+            if let Some(callback) = &log_callback {
+                callback(if supported {
+                    format!("Builder '{}': concurrency {}, queue wait {}s, build deadline {}s", self.node_name, self.build_limits.concurrency, self.build_limits.queue_wait_seconds, self.build_limits.build_timeout_seconds)
+                } else {
+                    format!("Builder '{}' has not confirmed custom limit support; an older agent retains fixed limits. Upgrade its Temps agent to enforce this node's settings", self.node_name)
+                }).await;
+            }
+        }
         let node_name = self.node_name.clone();
         let (archive, spec) = tokio::task::spawn_blocking(move || prepare_build_context(&request))
             .await
@@ -1295,7 +1393,26 @@ impl ImageBuilder for RemoteNodeDeployer {
             .client
             .post(&url)
             .bearer_auth(&self.token)
-            .timeout(IMAGE_BUILD_REQUEST_TIMEOUT)
+            .header("x-temps-build-concurrency", self.build_limits.concurrency)
+            .header(
+                "x-temps-build-queue-seconds",
+                self.build_limits.queue_wait_seconds,
+            )
+            .header(
+                "x-temps-build-timeout-seconds",
+                self.build_limits.build_timeout_seconds,
+            )
+            // Older agents ignore the new headers and retain fixed deadlines.
+            // Keep their transport allowance while newer agents enforce shorter
+            // configured deadlines themselves.
+            .timeout(
+                Duration::from_secs(
+                    1800 + u64::from(self.build_limits.queue_wait_seconds)
+                        + u64::from(self.build_limits.build_timeout_seconds)
+                        + 60,
+                )
+                .max(IMAGE_BUILD_REQUEST_TIMEOUT),
+            )
             .multipart(form)
             .send()
             .await
@@ -2208,9 +2325,10 @@ mod tests {
     async fn spawn_one_shot_agent(
         status_line: &'static str,
         content_type: &'static str,
-        body: &'static [u8],
+        body: &[u8],
     ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = body.to_vec();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock agent");
@@ -2235,7 +2353,7 @@ mod tests {
                 body.len()
             );
             stream.write_all(head.as_bytes()).await.expect("write head");
-            stream.write_all(body).await.expect("write body");
+            stream.write_all(&body).await.expect("write body");
             let _ = stream.shutdown().await;
             String::from_utf8_lossy(&request).to_string()
         });
@@ -2508,6 +2626,35 @@ mod tests {
         assert_eq!(capacity, BuildCapacity::Busy);
         let request = server.await.unwrap();
         assert!(request.starts_with("GET /agent/health "), "{request}");
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_applies_changed_limits_before_the_next_build() {
+        for (reported_cap, free, requested_cap, expected) in [
+            (1, 0, 2, BuildCapacity::Free),
+            (3, 1, 1, BuildCapacity::Busy),
+            (3, 1, 3, BuildCapacity::Free),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "success": true,
+                "data": {"build_slots_available": free, "build_concurrency_limit": reported_cap},
+                "error": null,
+            }))
+            .unwrap();
+            let (url, server) = spawn_one_shot_agent("200 OK", "application/json", &body).await;
+            let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder".into())
+                .unwrap()
+                .with_build_limits(crate::build_protocol::BuildLimits {
+                    concurrency: requested_cap,
+                    ..Default::default()
+                });
+            let (capacity, _) = remote.wait_for_build_capacity(Duration::ZERO).await;
+            assert_eq!(
+                capacity, expected,
+                "reported={reported_cap}, free={free}, requested={requested_cap}"
+            );
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -18,3 +18,5 @@ pub mod remote_deployments;
 pub mod traefik_discovery;
 pub mod types;
 pub mod wireguard_mesh;
+
+pub mod ci_dispatch;

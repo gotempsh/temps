@@ -154,6 +154,10 @@ pub fn build_router(
             "/agent/images/extract",
             get(crate::build_handler::extract_image_path),
         )
+        .route(
+            "/agent/images/fetch",
+            post(crate::build_handler::fetch_registry_image),
+        )
         .route("/agent/images/scan", post(crate::build_handler::scan_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))

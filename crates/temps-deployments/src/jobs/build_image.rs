@@ -894,8 +894,9 @@ pub struct BuildImageJob {
     /// instead of reaching `ImageBuilder::build_image_with_callback` and
     /// surfacing a raw `BuilderError::DockerUnavailable`.
     local_workloads_enabled: bool,
-    /// Node whose agent owns the image produced by this job. `None` means
-    /// the historical control-plane-local builder was used.
+    /// Untrusted CI execution: apply worker secret policy and fail every rejected platform.
+    external_build: bool,
+    /// Node whose agent owns the produced image; None means the local daemon.
     remote_builder_node_id: Option<i32>,
     /// Why this build is not running where the deployment's build location
     /// asked for, written to the build log before the build starts so a
@@ -1036,6 +1037,7 @@ impl BuildImageJob {
             preset_config: None,
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
+            external_build: false,
             remote_builder_node_id: None,
             build_location_notice: None,
             control_plane_copy: None,
@@ -1114,6 +1116,13 @@ impl BuildImageJob {
 
     /// The worker(s) this build runs on, for build-log lines.
     fn worker_nodes_phrase(&self, primary_node_id: i32) -> String {
+        if self.external_build {
+            return if self.is_per_architecture_worker_build() {
+                "CI runners".into()
+            } else {
+                "the CI runner".into()
+            };
+        }
         if !self.is_per_architecture_worker_build() {
             return format!("worker node {primary_node_id}");
         }
@@ -1576,7 +1585,10 @@ impl BuildImageJob {
         // A worker build receives the values of the variables that are not
         // secret; the generated Dockerfile declares exactly those, so it
         // never asks a worker for a value that stays on the control plane.
-        if let Some(node_id) = self.remote_builder_node_id {
+        if let Some(node_id) = self
+            .remote_builder_node_id
+            .or(self.external_build.then_some(0))
+        {
             let split = self.worker_build_args();
             build_vars = split.variable_names();
             self.log_worker_build_args(context, node_id, &split).await?;
@@ -1911,7 +1923,7 @@ impl BuildImageJob {
             return Ok(());
         };
 
-        if self.remote_builder_node_id.is_some() {
+        if self.remote_builder_node_id.is_some() || self.external_build {
             return Err(WorkflowError::JobValidationFailed(
                 "Worker builds cannot generate or transfer NPM_TOKEN/NPM_RC credentials; deploy a prebuilt registry image until build-secret handling is supported".into(),
             ));
@@ -2071,7 +2083,10 @@ impl BuildImageJob {
 
         // A worker build receives only the values that may leave the control
         // plane; a local build receives every value, as it always has.
-        let (mut build_args, buildkit_args) = match self.remote_builder_node_id {
+        let (mut build_args, buildkit_args) = match self
+            .remote_builder_node_id
+            .or(self.external_build.then_some(0))
+        {
             Some(node_id) => {
                 let split = self.worker_build_args();
                 if !dockerfile.generated {
@@ -2252,7 +2267,7 @@ impl BuildImageJob {
                     // scheduler's architecture filter excludes those nodes and
                     // the deployment proceeds on the rest (or fails with a
                     // clean `NoCompatibleNode` if there is no rest).
-                    if index == 0 {
+                    if index == 0 || self.external_build {
                         self.log(context, format!("ERROR: {}", message)).await?;
                         return Err(WorkflowError::JobExecutionFailed(message).into());
                     }
@@ -2310,7 +2325,7 @@ impl BuildImageJob {
                             build_result.image_name.clone(),
                         );
                     }
-                    Err(e) if index > 0 => {
+                    Err(e) if index > 0 && !self.external_build => {
                         // The tag exists but holds the wrong architecture.
                         // Leaving it behind would let a mislabelled image be
                         // picked up by hand later, so drop it — best-effort,
@@ -3089,6 +3104,7 @@ pub struct BuildImageJobBuilder {
     preset_config: Option<StoredPresetConfig>,
     registry_mirror_prefix: Option<String>,
     local_workloads_enabled: bool,
+    external_build: bool,
     remote_builder_node_id: Option<i32>,
     build_location_notice: Option<String>,
     control_plane_copy: Option<(Arc<dyn ImageBuilder>, String)>,
@@ -3110,6 +3126,7 @@ impl BuildImageJobBuilder {
             preset_config: None,
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
+            external_build: false,
             remote_builder_node_id: None,
             build_location_notice: None,
             control_plane_copy: None,
@@ -3150,6 +3167,11 @@ impl BuildImageJobBuilder {
     /// profile explicitly disables it. See `BuildImageJob`'s field doc.
     pub fn local_workloads_enabled(mut self, enabled: bool) -> Self {
         self.local_workloads_enabled = enabled;
+        self
+    }
+
+    pub fn external_build(mut self, external: bool) -> Self {
+        self.external_build = external;
         self
     }
 
@@ -3273,6 +3295,7 @@ impl BuildImageJobBuilder {
         job = job.with_preset_config(self.preset_config);
         job = job.with_registry_mirror_prefix(self.registry_mirror_prefix);
         job = job.with_local_workloads_enabled(self.local_workloads_enabled);
+        job.external_build = self.external_build;
         if let Some(node_id) = self.remote_builder_node_id {
             job = job.with_remote_builder_node_id(node_id);
         }
@@ -5698,6 +5721,34 @@ mod tests {
             !output.image_tags_by_platform.contains_key("linux/arm64"),
             "a failed platform must not be advertised: {:?}",
             output.image_tags_by_platform
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_secondary_platform_rejection_fails_the_entire_build() {
+        let builder = Arc::new(RecordingImageBuilder {
+            builds: Default::default(),
+            requests: Default::default(),
+            fail_platform: Some((
+                "linux/arm64".into(),
+                "CI runner result verification rejected".into(),
+            )),
+            busy: None,
+        });
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:ci".into())
+            .target_platforms(vec!["linux/amd64".into(), "linux/arm64".into()])
+            .external_build(true)
+            .build(builder)
+            .unwrap();
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+        assert!(
+            error.to_string().contains("verification rejected"),
+            "{error}"
         );
     }
 

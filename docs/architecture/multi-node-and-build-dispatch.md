@@ -5,9 +5,10 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Multi-node deployments and build dispatch
 
-- **Status:** Proposed. Part of #30 and #1528. This document is a design and a gap
-  analysis; the only code that accompanies it is the verification contract in
-  `crates/temps-deployer/src/build_verification.rs`, which no deployment path calls yet.
+- **Status:** Partially implemented. Node builder limits and GitHub Actions CI
+  dispatch now execute through the deployment workflow. The broader placement,
+  pull-pool and other-provider design remains proposed. See section 9 for the
+  implemented boundary and verification limits.
 - **Builds on:** ADR-017 (split proxy/console), ADR-020 (multi-node hardening),
   ADR-048 (enrollment hubs and ingress), the worker build protocol (#1146), the
   per-environment build location (#1321).
@@ -320,7 +321,7 @@ All of this is control plane, none of it is the proxy hot path. What matters on 
 
 Each phase ships behind the `BuildLocation` opt-in, so none changes the default.
 
-## 8. What this increment implements
+## 8. Original verification increment (#1548)
 
 `crates/temps-deployer/src/build_verification.rs` (new, pure, no I/O):
 
@@ -329,11 +330,94 @@ Each phase ships behind the `BuildLocation` opt-in, so none changes the default.
 - `RemoteBuildFailure` and `FailureDisposition`, the single statement of which failures
   may fall back.
 
-It is exported from `temps-deployer` and is not called by any deployment path, so it
-changes no behaviour. It is the part of this design where a mistake is a security bug
-rather than a rework, which is why it is written and tested first, in a module no other
-open change touches (#1545 edits `lib.rs`, `remote.rs`, `build_image.rs` and the scan
-jobs; #1048 adds one ADR file).
+That increment exported the contract without changing deployment execution. The
+GitHub Actions implementation in section 9 now calls it before accepting each
+registry result. Pull pools and additional CI providers remain future work.
 
-Not implemented: the runner, pools and leases, tokens, issuers and JWT verification,
-dispatch adapters, `BuildLocation` variants, settings card, any migration or API change.
+
+## 9. Implemented node limits and CI dispatch
+
+Node rows carry optional `build_limits` settings (concurrency, queue wait and
+build timeout). Defaults preserve one concurrent build and a 30-minute build
+budget. The authenticated control plane sends the settings with each build;
+updated agents enforce admission separately from upload and execution deadlines.
+Lowering concurrency drains existing work. The node detail page edits the
+settings without a process restart. Health reports include the cap behind the
+slot count, so capacity probes account for a cap change before the next build
+applies it on the agent. Older agents keep their fixed limits and
+remain compatible; custom-limit builds log an upgrade notice if support cannot
+be confirmed. A busy node uses the existing node-preference fallback and its
+build-log reason. A server without local Docker fails with the remote reason;
+it does not attempt an unavailable local build. Builder selection still uses
+the existing architecture and placement rules, including one native build per
+architecture for mixed worker deployments.
+
+The first CI executor is GitHub Actions. Settings → Worker Nodes → CI builder
+stores one installation-wide builder repository, pinned runner archive checksum,
+registry namespace, issuer/JWKS URL, exact audience/subject, credentials and limits.
+Credentials and per-build executor snapshots are encrypted. Provisioning creates
+a private repository when absent and installs the shim through the provider API.
+When the subject is left empty, provisioning configures a stable `repository_id`
+and `ref` subject through the provider OIDC API and pins the exact value. Existing
+explicit trust subjects remain supported. The shim receives only an opaque build ID. Operators select `ci` on a project or
+environment; an unconfigured executor produces an actionable setup error.
+
+`temps runner` consumes the existing `BuildSpec`, bounded context archive and
+`ImageInfo`/`ImageConfig` contract. Its OIDC signature, issuer, audience, subject,
+workflow ref and independently observed provider run ID must match before a
+one-build `deployment_tokens` credential is minted. Tokens authorize context,
+logs, lease checks and one terminal result only. They expire and are revoked
+at completion, failure or cancellation, and cannot authorize normal application
+APIs. The build's own timeout starts at claim; queue waiting does not consume it.
+
+The runner pushes a unique server-chosen registry tag and reports a digest,
+platforms and image config. The control plane hashes the independently fetched
+manifest and invokes `verify_runner_report` against the persisted build/run and
+requested platform. It constructs the immutable registry reference itself.
+Only then does the existing artifact target pull/tag that reference. Eligible enrolled workers are preferred as artifact targets: scan, extraction
+and config continue through their existing agent endpoints, and a replica on
+the control plane copies the image only on demand. When no suitable worker is
+available, a local daemon may receive the artifacts; the source build still
+runs in CI. Without a local daemon, an eligible worker is required. Image environment values are removed before
+persisting the report. Missing or failed scans retain the existing non-blocking
+semantics. CI builds use no local fallback, including secondary-platform errors.
+
+Cancellation revokes the lease and reconciles provider cancellation in bounded
+batches. Restart follows Temps' existing policy of terminating interrupted
+deployments, revoking their build tokens and cancelling known provider runs;
+it does not silently dispatch another run. There is no reattachment policy in
+this increment. A run whose dispatch succeeded but whose provider handle was
+never discovered cannot yet be actively cancelled; its runner is refused a
+lease and exits. Provider-side timeouts bound runs if the console is unreachable.
+
+This is control-plane work, with no proxy changes. Contexts stream under the
+existing 512 MiB / 100,000-entry limits. Workers accept at most 96 build requests
+including uploads, waiters and executing work; encoded spec buffers are bounded
+at 24 MiB in total. Overflow returns busy before reading a spec. There are at most 16 waiting CI builds,
+plus the configured active cap (1–32). Logs use a bounded 64-line channel and
+batches capped at 64 KiB, written as one structured entry per batch;
+result/config and registry manifest reads are bounded.
+Reconciliation queries only active/failed dispatch rows, 20 at a time. Registry
+transport uses HTTPS with anonymous, Basic or same-host Bearer authentication;
+external token realms are refused except Docker Hub's standard auth service.
+
+### Reachability findings and remaining scope
+
+PR #1526 replaced privileged `ip` subprocesses with in-process link/route
+operations. It did not add an outbound build transport, NAT traversal, or a
+reverse agent connection. The broader mesh has direct links and hub relay
+selection, and unit tests cover their health diagnostics. Builder clients still
+dial the registered `nodes.address`; a private/mesh address reachable from the
+control plane must be registered and its TLS identity must cover it. A worker
+with neither a direct route nor a usable hub/mesh route remains unreachable.
+The #1526 real-traffic harness did not cover hub forwarding. A real NAT/hub
+builder deployment and control-plane CPU/process observation remain external
+verification work; code inspection and unit tests do not prove them.
+
+GitLab CI, Gitea Actions, Kubernetes Jobs, autonomous pull-mode pools, and
+multi-console fencing/reattachment are not implemented. The generated shim uses
+an amd64 hosted runner and a pinned QEMU setup action for ARM emulation;
+cross-architecture CI execution is not claimed as end-to-end verified. Existing single- and
+mixed-architecture enrolled-node builds remain separate and unchanged. Registry
+credentials must be operator-supplied with repository-scoped rights; Temps does
+not ship a registry or assume GitHub App tokens can pull from GHCR.

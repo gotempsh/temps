@@ -288,6 +288,7 @@ pub struct NodeInfoResponse {
     pub labels: serde_json::Value,
     /// Resource capacity/usage metrics from the latest heartbeat
     pub capacity: serde_json::Value,
+    pub build_limits: temps_deployer::build_protocol::BuildLimits,
     /// Container platform this node runs (`linux/amd64`, `linux/arm64`).
     /// `None` until an agent that reports it has heartbeated.
     pub architecture: Option<String>,
@@ -515,6 +516,7 @@ pub struct ClusterDnsStatusResponse {
         admin_remove_node,
         admin_drain_status,
         admin_set_node_public_ingress,
+        admin_set_node_build_limits,
         cluster_dns_status,
         node_docker_disk_usage,
         node_capability,
@@ -530,6 +532,7 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::node_ssh::get_node_ssh_enrollment,
     ),
     components(schemas(
+        temps_deployer::build_protocol::BuildLimits,
         RegisterNodeApiRequest,
         RegisterNodeResponse,
         HeartbeatApiRequest,
@@ -623,6 +626,10 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
 /// These are registered through the plugin system's AppState.
 pub fn configure_admin_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/internal/nodes/{node_id}/build-limits",
+            axum::routing::put(admin_set_node_build_limits),
+        )
         .route("/internal/nodes", get(admin_list_nodes))
         .route(
             "/internal/nodes/{node_id}",
@@ -2261,6 +2268,7 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
+        build_limits: Default::default(),
         public_ingress_enabled: false,
         public_ingress_running: None,
         public_ingress_last_error: None,
@@ -2305,6 +2313,10 @@ async fn admin_list_nodes(
             status: n.status,
             labels: n.labels,
             capacity: n.capacity,
+            build_limits: n
+                .build_limits
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
             architecture: n.architecture,
             last_heartbeat: n.last_heartbeat.map(|t| t.to_rfc3339()),
             created_at: n.created_at.to_rfc3339(),
@@ -2372,6 +2384,10 @@ async fn admin_get_node(
         status: node.status,
         labels: node.labels,
         capacity: node.capacity,
+        build_limits: node
+            .build_limits
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default(),
         architecture: node.architecture,
         last_heartbeat: node.last_heartbeat.map(|t| t.to_rfc3339()),
         created_at: node.created_at.to_rfc3339(),
@@ -2429,6 +2445,43 @@ async fn admin_set_node_public_ingress(
         node_id: node.id,
         enabled: node.public_ingress_enabled,
     }))
+}
+
+#[utoipa::path(
+    tag = "Nodes", put, path = "/internal/nodes/{node_id}/build-limits",
+    operation_id = "admin_set_node_build_limits",
+    request_body = temps_deployer::build_protocol::BuildLimits,
+    params(("node_id" = i32, Path, description = "Worker node ID")),
+    responses((status = 200, body = temps_deployer::build_protocol::BuildLimits),
+        (status = 400, description = "Invalid limits or node role"),
+        (status = 401, description = "Unauthorized"), (status = 403, description = "Forbidden"),
+        (status = 404, description = "Node not found"), (status = 500, description = "Storage failed")),
+    security(("bearer_auth" = []))
+)]
+async fn admin_set_node_build_limits(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(node_id): Path<i32>,
+    Json(limits): Json<temps_deployer::build_protocol::BuildLimits>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    app_state
+        .node_service
+        .set_build_limits(node_id, limits)
+        .await?;
+    let audit = crate::handlers::audit::NodeBuildLimitsChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: None,
+            user_agent: "temps-api".into(),
+        },
+        node_id,
+        limits,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(node_id, %error, "Builder limits saved but audit failed");
+    }
+    Ok(Json(limits))
 }
 
 /// Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is
@@ -4491,6 +4544,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,

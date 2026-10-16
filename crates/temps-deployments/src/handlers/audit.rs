@@ -220,6 +220,13 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeBuildLimitsChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub limits: temps_deployer::build_protocol::BuildLimits,
+}
+
 /// An operator removed a node, or asked to and was refused after Temps had
 /// already cleaned up containers on it. Container removal on the host is a
 /// write even when the node row stays.
@@ -523,6 +530,33 @@ pub struct NodeMeshKeyChangedAudit {
 }
 
 impl_audit_operation!(NodeMeshKeyChangedAudit, "NODE_MESH_KEY_CHANGED");
+
+impl_audit_operation!(NodeBuildLimitsChangedAudit, "NODE_BUILD_LIMITS_CHANGED");
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CiBuildAudit {
+    pub context: AuditContext,
+    pub action: String,
+    pub build_id: Option<uuid::Uuid>,
+}
+impl AuditOperation for CiBuildAudit {
+    fn operation_type(&self) -> String {
+        "CI_BUILD_DISPATCH".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        (self.context.user_id > 0).then_some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Cannot serialize CI dispatch audit: {error}"))
+    }
+}
 
 #[cfg(test)]
 mod node_audit_tests {

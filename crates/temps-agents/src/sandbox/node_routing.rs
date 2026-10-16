@@ -1092,6 +1092,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,
