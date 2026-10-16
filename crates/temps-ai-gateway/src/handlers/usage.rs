@@ -415,6 +415,7 @@ fn scope_usage_filter_for_caller(
     params(
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (deployment-token usage; instance administrators only)"),
     ),
     responses(
         (status = 200, description = "Usage summary for the time range", body = UsageSummary),
@@ -449,6 +450,7 @@ async fn get_usage_summary(
     params(
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (deployment-token usage; instance administrators only)"),
     ),
     responses(
         (status = 200, description = "Usage broken down by provider", body = Vec<ProviderUsage>),
@@ -542,6 +544,7 @@ async fn get_usage_by_project(
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
         ("bucket" = Option<String>, Query, description = "Bucket size: hour, day, week (defaults to day)"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (deployment-token usage; instance administrators only)"),
     ),
     responses(
         (status = 200, description = "Time-series usage data", body = Vec<TimeseriesBucket>),
@@ -578,6 +581,7 @@ async fn get_usage_timeseries(
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
         ("limit" = Option<u64>, Query, description = "Max results (defaults to 10)"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (deployment-token usage; instance administrators only)"),
     ),
     responses(
         (status = 200, description = "Top models by request count", body = Vec<ModelUsage>),
@@ -615,6 +619,7 @@ async fn get_usage_top_models(
         ("offset" = Option<u64>, Query, description = "Number of results to skip for pagination (defaults to 0)"),
         ("provider" = Option<String>, Query, description = "Filter by provider name"),
         ("model" = Option<String>, Query, description = "Filter by model name"),
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (deployment-token usage; instance administrators only)"),
         ("status" = Option<i16>, Query, description = "Filter by HTTP status code (exact match)"),
         ("cost_gte" = Option<i64>, Query, description = "Cost greater-than-or-equal, in microcents"),
         ("cost_gt" = Option<i64>, Query, description = "Cost strictly greater-than, in microcents"),
@@ -656,6 +661,7 @@ async fn get_usage_recent(
     get,
     path = "/ai/usage/conversations",
     params(
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (deployment-token usage; instance administrators only)"),
         ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
         ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
         ("limit" = Option<u64>, Query, description = "Max results (defaults to 50, max 100)"),

@@ -342,6 +342,8 @@ impl StructuredOutputService {
             SYSTEM_PROMPT.len() + request.prompt.len() + request.schema.to_string().len(),
         );
 
+        // Latency counts the wait for the provider to start responding.
+        let started = Instant::now();
         let deadline = tokio::time::Instant::now() + STREAM_TIMEOUT;
         let token_stream = tokio::time::timeout_at(
             deadline,
@@ -382,7 +384,7 @@ impl StructuredOutputService {
             model: model.clone(),
             input_tokens,
             output_bytes: 0,
-            started: Instant::now(),
+            started,
             status: STATUS_CLIENT_CLOSED,
         };
 
@@ -1010,6 +1012,50 @@ mod tests {
         }
     }
 
+    /// A provider that takes a while to start streaming.
+    struct SlowStartAi;
+
+    #[async_trait]
+    impl AiService for SlowStartAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn capabilities_for(
+            &self,
+            provider: Option<&str>,
+            refresh: temps_ai::RefreshPolicy,
+        ) -> Result<temps_ai::ProviderCapabilities, temps_ai::AiError> {
+            RejectingAi.capabilities_for(provider, refresh).await
+        }
+
+        async fn complete(
+            &self,
+            _request: AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn complete_stream(
+            &self,
+            request: AiRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            StreamingAi {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+            .complete_stream(request)
+            .await
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+    }
+
     fn usage_row() -> temps_entities::ai_usage_logs::Model {
         temps_entities::ai_usage_logs::Model {
             id: 1,
@@ -1159,6 +1205,51 @@ mod tests {
             "provider should be the key's provider, not its route: {log}"
         );
         assert!(!log.contains("gateway_key:1\"))"), "route leaked: {log}");
+    }
+
+    #[tokio::test]
+    async fn recorded_latency_includes_the_wait_for_the_provider_to_start() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![provider_key()]])
+                .append_query_results([vec![usage_row()]])
+                .into_connection(),
+        );
+        let service = StructuredOutputService::new(
+            Arc::new(SlowStartAi),
+            Arc::new(UsageService::new(db.clone())),
+        );
+
+        let events: Vec<_> = service
+            .stream(request(false))
+            .await
+            .expect("stream should start")
+            .collect()
+            .await;
+        assert!(matches!(
+            events.last(),
+            Some(StructuredOutputEvent::Complete { .. })
+        ));
+        drop(events);
+        drop(service);
+        for _ in 0..100 {
+            if Arc::strong_count(&db) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("the logging task released the connection")
+                .into_transaction_log()
+        );
+        let recorded_ms = log
+            .split("Int(Some(")
+            .skip(1)
+            .filter_map(|rest| rest.split(')').next()?.parse::<i32>().ok())
+            .any(|value| (300..5_000).contains(&value));
+        assert!(recorded_ms, "latency should include the 300ms start: {log}");
     }
 
     #[tokio::test]
