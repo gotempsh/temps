@@ -19,8 +19,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::error::AiGatewayError;
 use crate::handlers::types::AiGatewayAppState;
 use crate::services::usage_service::{
-    ConversationSummary, ModelUsage, ProviderUsage, TimeseriesBucket, UsageFilter, UsageLogEntry,
-    UsageLogPage, UsageSummary,
+    ConversationSummary, ModelUsage, ProjectUsage, ProviderUsage, TimeseriesBucket, UsageFilter,
+    UsageLogEntry, UsageLogPage, UsageSummary,
 };
 
 // ============================================================================
@@ -37,6 +37,7 @@ use crate::services::usage_service::{
         get_usage_recent,
         get_conversations,
         get_conversation_detail,
+        get_usage_by_project,
     ),
     components(schemas(
         UsageQueryParams,
@@ -51,6 +52,8 @@ use crate::services::usage_service::{
         UsageLogEntry,
         UsageLogPage,
         ConversationSummary,
+        ProjectUsage,
+        ProjectUsageQueryParams,
         UsageFilter,
     )),
     info(
@@ -68,6 +71,7 @@ pub fn configure_usage_routes() -> Router<Arc<AiGatewayAppState>> {
     Router::new()
         .route("/ai/usage/summary", get(get_usage_summary))
         .route("/ai/usage/by-provider", get(get_usage_by_provider))
+        .route("/ai/usage/by-project", get(get_usage_by_project))
         .route("/ai/usage/timeseries", get(get_usage_timeseries))
         .route("/ai/usage/top-models", get(get_usage_top_models))
         .route("/ai/usage/recent", get(get_usage_recent))
@@ -90,6 +94,8 @@ pub struct UsageQueryParams {
     pub to: Option<String>,
     /// Filter by user ID
     pub user_id: Option<i32>,
+    /// Filter by project ID (deployment-token usage; instance administrators only)
+    pub project_id: Option<i32>,
     /// Filter by conversation ID
     pub conversation_id: Option<String>,
     /// Filter by tags (comma-separated, AND logic)
@@ -104,6 +110,7 @@ impl UsageQueryParams {
     fn to_filter(&self) -> UsageFilter {
         UsageFilter {
             user_id: self.user_id,
+            project_id: self.project_id,
             conversation_id: self.conversation_id.clone(),
             tags: self.tags.clone(),
             model: self.model.clone(),
@@ -111,6 +118,16 @@ impl UsageQueryParams {
             ..Default::default()
         }
     }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ProjectUsageQueryParams {
+    /// ISO 8601 start time (defaults to 24h ago)
+    pub from: Option<String>,
+    /// ISO 8601 end time (defaults to now)
+    pub to: Option<String>,
+    /// Max projects returned (defaults to 50, max 100)
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -123,6 +140,8 @@ pub struct TimeseriesQueryParams {
     pub bucket: Option<String>,
     /// Filter by user ID
     pub user_id: Option<i32>,
+    /// Filter by project ID (deployment-token usage; instance administrators only)
+    pub project_id: Option<i32>,
     /// Filter by conversation ID
     pub conversation_id: Option<String>,
     /// Filter by tags (comma-separated, AND logic)
@@ -137,6 +156,7 @@ impl TimeseriesQueryParams {
     fn to_filter(&self) -> UsageFilter {
         UsageFilter {
             user_id: self.user_id,
+            project_id: self.project_id,
             conversation_id: self.conversation_id.clone(),
             tags: self.tags.clone(),
             model: self.model.clone(),
@@ -156,6 +176,8 @@ pub struct TopModelsQueryParams {
     pub limit: Option<u64>,
     /// Filter by user ID
     pub user_id: Option<i32>,
+    /// Filter by project ID (deployment-token usage; instance administrators only)
+    pub project_id: Option<i32>,
     /// Filter by tags (comma-separated, AND logic)
     pub tags: Option<String>,
 }
@@ -164,6 +186,7 @@ impl TopModelsQueryParams {
     fn to_filter(&self) -> UsageFilter {
         UsageFilter {
             user_id: self.user_id,
+            project_id: self.project_id,
             tags: self.tags.clone(),
             ..Default::default()
         }
@@ -182,6 +205,8 @@ pub struct RecentQueryParams {
     pub offset: Option<u64>,
     /// Filter by user ID
     pub user_id: Option<i32>,
+    /// Filter by project ID (deployment-token usage; instance administrators only)
+    pub project_id: Option<i32>,
     /// Filter by conversation ID
     pub conversation_id: Option<String>,
     /// Filter by tags (comma-separated, AND logic)
@@ -214,6 +239,7 @@ impl RecentQueryParams {
     fn to_filter(&self) -> UsageFilter {
         UsageFilter {
             user_id: self.user_id,
+            project_id: self.project_id,
             conversation_id: self.conversation_id.clone(),
             tags: self.tags.clone(),
             model: self.model.clone(),
@@ -248,6 +274,8 @@ pub struct ConversationsQueryParams {
     pub limit: Option<u64>,
     /// Filter by user ID
     pub user_id: Option<i32>,
+    /// Filter by project ID (deployment-token usage; instance administrators only)
+    pub project_id: Option<i32>,
     /// Filter by tags (comma-separated, AND logic)
     pub tags: Option<String>,
     /// Filter by model name
@@ -258,6 +286,7 @@ impl ConversationsQueryParams {
     fn to_filter(&self) -> UsageFilter {
         UsageFilter {
             user_id: self.user_id,
+            project_id: self.project_id,
             tags: self.tags.clone(),
             model: self.model.clone(),
             ..Default::default()
@@ -338,6 +367,22 @@ fn scope_usage_filter_for_caller(
     let Some(caller_id) = resolve_caller_scope(auth)? else {
         return Ok(());
     };
+
+    // Deployment-token usage has no user, so a user-pinned caller can never
+    // see it; per-project reporting is an operator view over shared spend.
+    if filter.project_id.is_some() {
+        return Err(temps_core::error_builder::ErrorBuilder::new(
+            ::axum::http::StatusCode::FORBIDDEN,
+        )
+        .type_("https://temps.sh/probs/project-ai-usage-requires-admin")
+        .title("Project AI Usage Requires An Administrator")
+        .detail("Filtering AI usage by project requires an instance administrator")
+        .permission_denial(
+            temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+            Some(Permission::SystemAdmin.to_string()),
+        )
+        .build());
+    }
 
     match filter.user_id {
         Some(requested) if requested != caller_id => Err(
@@ -429,6 +474,54 @@ async fn get_usage_by_provider(
         .await?;
 
     Ok(Json(usage))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Usage",
+    get,
+    path = "/ai/usage/by-project",
+    params(
+        ("from" = Option<String>, Query, description = "ISO 8601 start time (defaults to 24h ago)"),
+        ("to" = Option<String>, Query, description = "ISO 8601 end time (defaults to now)"),
+        ("limit" = Option<u64>, Query, description = "Max projects (defaults to 50, max 100)"),
+    ),
+    responses(
+        (status = 200, description = "Spend and volume per project, most expensive first", body = Vec<ProjectUsage>),
+        (status = 400, description = "Invalid query parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Requires an instance administrator", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_usage_by_project(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Query(params): Query<ProjectUsageQueryParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayRead);
+
+    // Instance-wide by nature: only an administrator may omit a user scope.
+    if resolve_caller_scope(&auth)?.is_some() {
+        return Err(temps_core::error_builder::ErrorBuilder::new(
+            ::axum::http::StatusCode::FORBIDDEN,
+        )
+        .type_("https://temps.sh/probs/project-ai-usage-requires-admin")
+        .title("Project AI Usage Requires An Administrator")
+        .detail("Per-project AI usage spans every project and requires an instance administrator")
+        .permission_denial(
+            temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+            Some(Permission::SystemAdmin.to_string()),
+        )
+        .build());
+    }
+    let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
+    let projects = app_state
+        .usage_service
+        .get_by_project(from, to, limit)
+        .await?;
+
+    Ok(Json(projects))
 }
 
 #[utoipa::path(

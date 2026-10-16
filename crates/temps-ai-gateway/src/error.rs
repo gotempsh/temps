@@ -64,6 +64,30 @@ pub enum AiGatewayError {
     #[error("AI batch upload capacity reached; retry when an upload finishes")]
     UploadCapacity,
 
+    #[error(
+        "Project {project_id} exceeded its AI gateway limit of {limit} requests per minute; \
+         retry in {retry_after_secs}s"
+    )]
+    RateLimited {
+        project_id: i32,
+        limit: u32,
+        retry_after_secs: u64,
+    },
+
+    #[error(
+        "Project {project_id} reached its monthly AI gateway budget of {limit_microcents} \
+         microcents ({used_microcents} used); it resets in {retry_after_secs}s"
+    )]
+    BudgetExceeded {
+        project_id: i32,
+        limit_microcents: i64,
+        used_microcents: i64,
+        retry_after_secs: u64,
+    },
+
+    #[error("Project {project_id} not found; cannot configure AI gateway limits for it")]
+    ProjectNotFound { project_id: i32 },
+
     #[error("No {kind} with id '{id}' was created through this gateway by the caller")]
     ObjectNotFound { kind: String, id: String },
 

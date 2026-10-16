@@ -407,6 +407,71 @@ fn build_pricing() -> Vec<ModelPricing> {
 }
 
 // ============================================================================
+// Cost estimation
+// ============================================================================
+
+/// Per-token rates derived from the price list above. Because the list is in
+/// USD per 1M tokens and usage costs are stored in microcents (1e-6 USD, as
+/// `estimated_cost_microcents` documents), a rate is directly the cost of one
+/// token in that unit: `$2.50 / 1M tokens` is `2.5` microcents per token.
+struct RateTable {
+    by_model: std::collections::HashMap<String, (f64, f64)>,
+    /// Most expensive listed rates, charged for models that are not priced so
+    /// an unlisted model can never be a way around a spend cap.
+    worst_case: (f64, f64),
+}
+
+fn rate_table() -> &'static RateTable {
+    static TABLE: std::sync::OnceLock<RateTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut by_model = std::collections::HashMap::new();
+        let mut worst_case = (0.0_f64, 0.0_f64);
+        for model in build_pricing() {
+            worst_case.0 = worst_case.0.max(model.input_per_million);
+            worst_case.1 = worst_case.1.max(model.output_per_million);
+            by_model.insert(
+                model.model,
+                (model.input_per_million, model.output_per_million),
+            );
+        }
+        RateTable {
+            by_model,
+            worst_case,
+        }
+    })
+}
+
+/// Estimate the provider cost of a request in microcents (1/10000 of a cent).
+///
+/// Exact model ids win; otherwise the longest listed id the model extends at a
+/// `-`, `:` or `@` boundary applies (so a dated snapshot `gpt-4o-2025-01-01`
+/// is priced as `gpt-4o`). Unlisted models are charged at the most expensive
+/// listed rate. This is an estimate from list prices: it ignores cache
+/// discounts and batch pricing, so it errs on the high side.
+pub(crate) fn estimate_cost_microcents(model: &str, input_tokens: i64, output_tokens: i64) -> i64 {
+    let table = rate_table();
+    let (input_rate, output_rate) = table
+        .by_model
+        .get(model)
+        .copied()
+        .or_else(|| {
+            table
+                .by_model
+                .iter()
+                .filter(|(id, _)| {
+                    model.strip_prefix(id.as_str()).is_some_and(|rest| {
+                        rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
+                    })
+                })
+                .max_by_key(|(id, _)| id.len())
+                .map(|(_, rates)| *rates)
+        })
+        .unwrap_or(table.worst_case);
+    let cost = input_tokens.max(0) as f64 * input_rate + output_tokens.max(0) as f64 * output_rate;
+    cost.ceil() as i64
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -439,6 +504,46 @@ async fn get_pricing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_cost_uses_listed_rates_in_microcents() {
+        // gpt-4o: $2.50 in / $10 out per 1M tokens => 2.5 and 10 microcents per token.
+        assert_eq!(
+            estimate_cost_microcents("gpt-4o", 1_000, 100),
+            2_500 + 1_000
+        );
+    }
+
+    #[test]
+    fn estimate_cost_prices_dated_snapshots_as_their_base_model() {
+        assert_eq!(
+            estimate_cost_microcents("gpt-4o-2025-01-01", 1_000, 100),
+            estimate_cost_microcents("gpt-4o", 1_000, 100)
+        );
+        // A longer listed id must win over a shorter prefix of it.
+        assert_eq!(
+            estimate_cost_microcents("gpt-4o-mini-2025-01-01", 1_000, 0),
+            estimate_cost_microcents("gpt-4o-mini", 1_000, 0)
+        );
+    }
+
+    #[test]
+    fn estimate_cost_charges_unlisted_models_at_worst_case() {
+        let unlisted = estimate_cost_microcents("totally-unlisted-model", 1_000, 1_000);
+        let cheapest = estimate_cost_microcents("gpt-4o-mini", 1_000, 1_000);
+        assert!(unlisted > cheapest);
+        let table = rate_table();
+        assert_eq!(
+            unlisted,
+            (1_000.0 * table.worst_case.0 + 1_000.0 * table.worst_case.1).ceil() as i64
+        );
+    }
+
+    #[test]
+    fn estimate_cost_is_zero_for_no_tokens_and_ignores_negatives() {
+        assert_eq!(estimate_cost_microcents("gpt-4o", 0, 0), 0);
+        assert_eq!(estimate_cost_microcents("gpt-4o", -5, -5), 0);
+    }
 
     #[test]
     fn test_build_pricing_has_all_providers() {

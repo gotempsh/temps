@@ -81,6 +81,9 @@ pub(crate) fn extract_ai_context(headers: &HeaderMap) -> AiRequestContext {
                 // W3C traceparent: {version}-{trace-id}-{parent-id}-{flags}
                 tp.split('-').nth(1).map(String::from)
             }),
+        // Attribution comes from the authenticated principal, never headers.
+        project_id: None,
+        token_id: None,
     }
 }
 
@@ -295,7 +298,32 @@ pub fn configure_gateway_routes() -> Router<Arc<AiGatewayAppState>> {
 // ============================================================================
 
 pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
+    let retry_after = match &error {
+        AiGatewayError::RateLimited {
+            retry_after_secs, ..
+        }
+        | AiGatewayError::BudgetExceeded {
+            retry_after_secs, ..
+        } => Some(*retry_after_secs),
+        _ => None,
+    };
     let (status, body) = match &error {
+        AiGatewayError::RateLimited { .. } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            OpenAiErrorResponse::rate_limit(error.to_string()),
+        ),
+        AiGatewayError::BudgetExceeded { .. } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            OpenAiErrorResponse::new(
+                error.to_string(),
+                "insufficient_quota",
+                Some("budget_exceeded"),
+            ),
+        ),
+        AiGatewayError::ProjectNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "not_found"),
+        ),
         AiGatewayError::UploadTooLarge { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             OpenAiErrorResponse::invalid_request(error.to_string(), "file_too_large"),
@@ -377,7 +405,23 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
         ),
     };
 
-    (status, Json(body))
+    let mut headers = HeaderMap::new();
+    if let Some(secs) = retry_after {
+        headers.insert(axum::http::header::RETRY_AFTER, secs.into());
+    }
+    (status, headers, Json(body))
+}
+
+/// Refuse a deployment-token request that is over its project's rate limit or
+/// monthly budget. Human callers (sessions, API keys) are not limited here.
+pub(crate) async fn enforce_project_limits(
+    app_state: &AiGatewayAppState,
+    auth: &temps_auth::AuthContext,
+) -> Result<(), AiGatewayError> {
+    match auth.deployment_token_info() {
+        Some(token) => app_state.limits_service.enforce(token.project_id).await,
+        None => Ok(()),
+    }
 }
 
 // ============================================================================
@@ -449,7 +493,10 @@ async fn chat_completions(
     if let Some(error) = reject_deployment_token_base_url(&auth, &byok) {
         return Ok(error_to_response(error).into_response());
     }
-    let ai_context = extract_ai_context(&headers);
+    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+        return Ok(error_to_response(limit_error).into_response());
+    }
+    let ai_context = extract_ai_context(&headers).attributed_to(&auth);
     let start = Instant::now();
     let model = request.model.clone();
     let is_streaming = request.stream;
@@ -719,7 +766,10 @@ async fn embeddings(
     if let Some(error) = reject_deployment_token_base_url(&auth, &byok) {
         return Ok(error_to_response(error).into_response());
     }
-    let ai_context = extract_ai_context(&headers);
+    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+        return Ok(error_to_response(limit_error).into_response());
+    }
+    let ai_context = extract_ai_context(&headers).attributed_to(&auth);
     let start = Instant::now();
     let user_id = auth.user_id_opt();
 
@@ -829,6 +879,99 @@ mod tests {
             user: None,
             extra: None,
         }
+    }
+
+    #[test]
+    fn rate_limited_response_is_429_with_retry_after() {
+        let response = error_to_response(AiGatewayError::RateLimited {
+            project_id: 7,
+            limit: 300,
+            retry_after_secs: 12,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("12")
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_response_is_429_with_retry_after() {
+        let response = error_to_response(AiGatewayError::BudgetExceeded {
+            project_id: 7,
+            limit_microcents: 5_000_000,
+            used_microcents: 5_000_001,
+            retry_after_secs: 86_400,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("86400")
+        );
+    }
+
+    #[test]
+    fn ordinary_errors_carry_no_retry_after() {
+        let response = error_to_response(AiGatewayError::Validation {
+            message: "bad".to_string(),
+        })
+        .into_response();
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_body_names_the_project_and_limit() {
+        use http_body_util::BodyExt;
+        let response = error_to_response(AiGatewayError::RateLimited {
+            project_id: 7,
+            limit: 300,
+            retry_after_secs: 3,
+        })
+        .into_response();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Project 7") && message.contains("300"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn deployment_token_requests_are_attributed_to_their_project_and_token() {
+        let auth = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            11,
+            "deployment-token".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::AiGatewayExecute],
+        );
+        let ctx = extract_ai_context(&HeaderMap::new()).attributed_to(&auth);
+        assert_eq!(ctx.project_id, Some(7));
+        assert_eq!(ctx.token_id, Some(11));
+    }
+
+    #[test]
+    fn attribution_cannot_be_spoofed_through_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-project-id", "999".parse().unwrap());
+        headers.insert("x-token-id", "999".parse().unwrap());
+        let ctx = extract_ai_context(&headers);
+        assert_eq!(ctx.project_id, None);
+        assert_eq!(ctx.token_id, None);
     }
 
     #[test]
@@ -1181,7 +1324,7 @@ mod tests {
         use tokio_stream::StreamExt;
         // "é" is two bytes; split the stream between them, mid-line. The
         // tracker buffers bytes, so the caller still gets every byte.
-        let line = "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"caf\u{e9}\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n";
+        let line = "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"r\u{e9}sum\u{e9}\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n";
         let bytes = line.as_bytes();
         let split = line.find('\u{e9}').expect("accented character") + 1;
         assert_eq!(
@@ -1277,6 +1420,8 @@ mod tests {
                             tags: vec![],
                             request_id: None,
                             trace_id: None,
+                            project_id: None,
+                            token_id: None,
                         }]])
                         .into_connection(),
                 );

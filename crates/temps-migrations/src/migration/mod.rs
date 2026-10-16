@@ -337,6 +337,7 @@ mod m20261014_000002_index_ip_geolocation_references;
 mod m20261014_000003_ip_geolocation_last_used_at;
 mod m20261014_000004_managed_daemon_unpublished_tags;
 mod m20261015_000001_compose_validation_reports;
+mod m20261016_000001_ai_usage_logs_project_attribution;
 
 pub struct Migrator;
 
@@ -754,6 +755,7 @@ impl MigratorTrait for Migrator {
             // Rewrite the never-published `:0.3.4` managed image tag to `:0.3.4-beta`.
             Box::new(m20261014_000004_managed_daemon_unpublished_tags::Migration),
             Box::new(m20261015_000001_compose_validation_reports::Migration),
+            Box::new(m20261016_000001_ai_usage_logs_project_attribution::Migration),
         ]
     }
 }

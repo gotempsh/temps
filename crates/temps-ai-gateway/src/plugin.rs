@@ -708,6 +708,7 @@ impl TempsPlugin for AiGatewayPlugin {
         // only runs on this router, not the public one.
         let routes = handlers::configure_admin_routes()
             .merge(handlers::configure_usage_routes())
+            .merge(handlers::configure_limits_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_native_routes())
@@ -726,6 +727,8 @@ impl TempsPlugin for AiGatewayPlugin {
         schema.merge(admin_schema);
         let usage_schema = <handlers::usage::AiGatewayUsageApiDoc as OpenApiTrait>::openapi();
         schema.merge(usage_schema);
+        let limits_schema = <handlers::limits::AiGatewayLimitsApiDoc as OpenApiTrait>::openapi();
+        schema.merge(limits_schema);
         let pricing_schema = <handlers::pricing::AiGatewayPricingApiDoc as OpenApiTrait>::openapi();
         schema.merge(pricing_schema);
         let provider_status_schema =

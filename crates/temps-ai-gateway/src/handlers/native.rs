@@ -31,8 +31,8 @@ use utoipa::OpenApi;
 use super::sse_usage::UsageKind;
 use crate::error::AiGatewayError;
 use crate::handlers::gateway::{
-    credential_type_str, error_to_response, extract_ai_context, extract_byok,
-    reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
+    credential_type_str, enforce_project_limits, error_to_response, extract_ai_context,
+    extract_byok, reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
 };
 use crate::handlers::types::AiGatewayAppState;
 use crate::native_types::*;
@@ -432,7 +432,10 @@ async fn create_response(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
-    let ai_context = extract_ai_context(&headers);
+    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+        return Ok(error_to_response(limit_error).into_response());
+    }
+    let ai_context = extract_ai_context(&headers).attributed_to(&auth);
     let start = Instant::now();
     let user_id = auth.user_id_opt();
     let model = request.model.clone();
@@ -579,6 +582,9 @@ async fn upload_file(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
+    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+        return Ok(error_to_response(limit_error).into_response());
+    }
 
     let _upload_slot = match app_state.native_api_service.acquire_upload_slot() {
         Ok(permit) => permit,
@@ -860,6 +866,9 @@ async fn create_batch(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
+    if let Err(limit_error) = enforce_project_limits(&app_state, &auth).await {
+        return Ok(error_to_response(limit_error).into_response());
+    }
     let credential_type = credential_kind(&headers);
     match app_state
         .native_api_service

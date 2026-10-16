@@ -1,0 +1,409 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Admin API for the AI gateway's per-project rate limit and monthly budget.
+//!
+//! Limits apply to deployment-token callers (the `TEMPS_API_TOKEN` every
+//! deployed container receives). A project's own limits override the
+//! instance-wide defaults, which override the built-in default. In every
+//! request/response a `null` limit inherits and `0` means unlimited.
+
+use anyhow::Result as AnyhowResult;
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use temps_auth::permission_guard;
+use temps_auth::RequireAuth;
+use temps_core::problemdetails::{Problem, ProblemDetails};
+use temps_core::{AuditContext, AuditOperation, RequestMetadata};
+use tracing::error;
+use utoipa::{OpenApi, ToSchema};
+
+use crate::handlers::types::AiGatewayAppState;
+use crate::services::limits_service::{
+    EffectiveLimits, LimitScope, LimitSettings, DEFAULT_MAX_REQUESTS_PER_MINUTE,
+};
+
+// ============================================================================
+// OpenAPI schema
+// ============================================================================
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_limits_overview,
+        update_instance_limits,
+        get_project_limits,
+        update_project_limits,
+        reset_project_limits,
+    ),
+    components(schemas(
+        LimitSettingsBody,
+        LimitsOverviewResponse,
+        ProjectLimitOverride,
+        ProjectLimitsResponse,
+        EffectiveLimits,
+        crate::services::limits_service::LimitSource,
+    )),
+    info(
+        title = "AI Gateway Limits API",
+        description = "Per-project rate limits and monthly budgets for deployment-token callers",
+        version = "1.0.0"
+    ),
+    tags(
+        (name = "AI Gateway Limits", description = "Rate limits and spend caps for AI gateway callers")
+    )
+)]
+pub struct AiGatewayLimitsApiDoc;
+
+pub fn configure_limits_routes() -> Router<Arc<AiGatewayAppState>> {
+    Router::new()
+        .route("/ai/limits", get(get_limits_overview))
+        .route(
+            "/ai/limits/instance",
+            axum::routing::put(update_instance_limits),
+        )
+        .route(
+            "/ai/limits/projects/{project_id}",
+            get(get_project_limits)
+                .put(update_project_limits)
+                .delete(reset_project_limits),
+        )
+}
+
+// ============================================================================
+// DTOs
+// ============================================================================
+
+/// Limits as stored for one scope. `null` inherits from the next level
+/// (project → instance → built-in); `0` means unlimited.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct LimitSettingsBody {
+    /// Requests per rolling minute
+    pub max_requests_per_minute: Option<i64>,
+    /// Operator-funded spend per UTC calendar month, in microcents
+    /// (1/10000 of a cent; 1 USD = 1,000,000 microcents)
+    pub max_cost_per_month_microcents: Option<i64>,
+}
+
+impl From<LimitSettings> for LimitSettingsBody {
+    fn from(settings: LimitSettings) -> Self {
+        Self {
+            max_requests_per_minute: settings.max_requests_per_minute,
+            max_cost_per_month_microcents: settings.max_cost_per_month_microcents,
+        }
+    }
+}
+
+impl From<LimitSettingsBody> for LimitSettings {
+    fn from(body: LimitSettingsBody) -> Self {
+        Self {
+            max_requests_per_minute: body.max_requests_per_minute,
+            max_cost_per_month_microcents: body.max_cost_per_month_microcents,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectLimitOverride {
+    pub project_id: i32,
+    pub limits: LimitSettingsBody,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LimitsOverviewResponse {
+    /// Instance-wide limits as stored (what the admin set)
+    pub instance: LimitSettingsBody,
+    /// Requests per minute applied to a project when nothing is configured
+    pub built_in_max_requests_per_minute: u32,
+    /// Projects that override the instance defaults
+    pub project_overrides: Vec<ProjectLimitOverride>,
+    /// Total number of projects with overrides, across all pages
+    pub total_project_overrides: u64,
+    pub page: u64,
+    pub page_size: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectLimitsResponse {
+    pub project_id: i32,
+    /// This project's own limits as stored; `null` fields inherit
+    pub stored: LimitSettingsBody,
+    /// Limits actually enforced after inheritance
+    pub effective: EffectiveLimits,
+    /// Operator-funded spend so far this UTC month, in microcents
+    pub month_spend_microcents: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct OverviewQuery {
+    /// Page of project overrides (default 1)
+    pub page: Option<u64>,
+    /// Page size (default 20, max 100)
+    pub page_size: Option<u64>,
+}
+
+// ============================================================================
+// Audit
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct AiGatewayLimitsUpdatedAudit {
+    context: AuditContext,
+    scope: String,
+    max_requests_per_minute: Option<i64>,
+    max_cost_per_month_microcents: Option<i64>,
+}
+
+impl AuditOperation for AiGatewayLimitsUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "ai_gateway.limits.updated".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> AnyhowResult<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    }
+}
+
+async fn audit_limits_change(
+    app_state: &AiGatewayAppState,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    scope: String,
+    settings: LimitSettings,
+) {
+    let audit = AiGatewayLimitsUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        scope: scope.clone(),
+        max_requests_per_minute: settings.max_requests_per_minute,
+        max_cost_per_month_microcents: settings.max_cost_per_month_microcents,
+    };
+    if let Err(audit_error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(scope, error = %audit_error, "Failed to create audit log for AI gateway limits change");
+    }
+}
+
+// ============================================================================
+// Handlers
+// ============================================================================
+
+#[utoipa::path(
+    tag = "AI Gateway Limits",
+    get,
+    path = "/ai/limits",
+    params(
+        ("page" = Option<u64>, Query, description = "Page of project overrides (default 1)"),
+        ("page_size" = Option<u64>, Query, description = "Page size (default 20, max 100)"),
+    ),
+    responses(
+        (status = 200, description = "Instance defaults and per-project overrides", body = LimitsOverviewResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_limits_overview(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Query(query): Query<OverviewQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayRead);
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let instance = app_state
+        .limits_service
+        .get_settings(LimitScope::Instance)
+        .await?
+        .unwrap_or_default();
+    let (overrides, total) = app_state
+        .limits_service
+        .list_project_overrides(page, page_size)
+        .await?;
+
+    Ok(Json(LimitsOverviewResponse {
+        instance: instance.into(),
+        built_in_max_requests_per_minute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
+        project_overrides: overrides
+            .into_iter()
+            .map(|(project_id, settings)| ProjectLimitOverride {
+                project_id,
+                limits: settings.into(),
+            })
+            .collect(),
+        total_project_overrides: total,
+        page,
+        page_size,
+    }))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Limits",
+    put,
+    path = "/ai/limits/instance",
+    request_body = LimitSettingsBody,
+    responses(
+        (status = 200, description = "Instance-wide defaults replaced", body = LimitSettingsBody),
+        (status = 400, description = "Invalid limit", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_instance_limits(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
+    Json(body): Json<LimitSettingsBody>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+
+    let saved = app_state
+        .limits_service
+        .set_settings(LimitScope::Instance, body.into())
+        .await?;
+    audit_limits_change(&app_state, &auth, &metadata, "instance".to_string(), saved).await;
+    Ok(Json(LimitSettingsBody::from(saved)))
+}
+
+async fn project_limits_response(
+    app_state: &AiGatewayAppState,
+    project_id: i32,
+) -> Result<ProjectLimitsResponse, Problem> {
+    let stored = app_state
+        .limits_service
+        .get_settings(LimitScope::Project(project_id))
+        .await?
+        .unwrap_or_default();
+    let effective = app_state
+        .limits_service
+        .effective_limits(project_id)
+        .await?;
+    let month_spend_microcents = app_state.limits_service.month_spend(project_id).await?;
+    Ok(ProjectLimitsResponse {
+        project_id,
+        stored: stored.into(),
+        effective,
+        month_spend_microcents,
+    })
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Limits",
+    get,
+    path = "/ai/limits/projects/{project_id}",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    responses(
+        (status = 200, description = "Stored and effective limits plus this month's spend", body = ProjectLimitsResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_project_limits(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayRead);
+
+    Ok(Json(project_limits_response(&app_state, project_id).await?))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Limits",
+    put,
+    path = "/ai/limits/projects/{project_id}",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    request_body = LimitSettingsBody,
+    responses(
+        (status = 200, description = "Project limits replaced", body = ProjectLimitsResponse),
+        (status = 400, description = "Invalid limit", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Project not found", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_project_limits(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
+    Path(project_id): Path<i32>,
+    Json(body): Json<LimitSettingsBody>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+
+    let saved = app_state
+        .limits_service
+        .set_settings(LimitScope::Project(project_id), body.into())
+        .await?;
+    audit_limits_change(
+        &app_state,
+        &auth,
+        &metadata,
+        format!("project:{project_id}"),
+        saved,
+    )
+    .await;
+    Ok(Json(project_limits_response(&app_state, project_id).await?))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Limits",
+    delete,
+    path = "/ai/limits/projects/{project_id}",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    responses(
+        (status = 204, description = "Project limits cleared; the project inherits the instance defaults"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Project not found", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn reset_project_limits(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+
+    let cleared = app_state
+        .limits_service
+        .set_settings(LimitScope::Project(project_id), LimitSettings::default())
+        .await?;
+    audit_limits_change(
+        &app_state,
+        &auth,
+        &metadata,
+        format!("project:{project_id}"),
+        cleared,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
