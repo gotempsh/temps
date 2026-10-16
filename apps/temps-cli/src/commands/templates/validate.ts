@@ -10,7 +10,8 @@ export interface NativeTemplateValidationResult {
   templateCount: number;
 }
 
-const SUPPORTED_KINDS = new Set(["starter", "service"]);
+const SUPPORTED_KINDS = new Set(["starter", "app", "service"]);
+const SUPPORTED_CATALOG_VERSIONS = new Set(["2", "3"]);
 const MAX_TEMPLATE_DIRECTORY_DEPTH = 16;
 const MAX_TEMPLATE_FILES = 1_000;
 const MAX_TEMPLATE_YAML_BYTES = 1024 * 1024;
@@ -26,34 +27,35 @@ const SUPPORTED_MANAGED_SERVICES = new Set([
   "blob",
   "rustfs",
 ]);
+// The slugs project creation accepts (temps_presets::all_presets() on the
+// server, mirrored by temps_core::templates::VALID_PRESETS).
 const SUPPORTED_PRESETS = new Set([
   "nextjs",
   "vite",
-  "astro",
-  "nuxt",
-  "remix",
-  "sveltekit",
-  "solidstart",
-  "angular",
-  "vue",
-  "react",
-  "docusaurus",
+  "react-app",
   "rsbuild",
-  "python",
-  "fastapi",
-  "flask",
-  "django",
-  "rails",
-  "go",
+  "docusaurus",
   "rust",
+  "go",
+  "python",
   "java",
-  "laravel",
-  "dockerfile",
-  "nixpacks",
-  "autopack",
-  "static",
   "docker-compose",
-  "nodejs",
+  "dockerfile",
+  "custom",
+  "autopack",
+  "nixpacks",
+  "nixpacks-node",
+  "nixpacks-python",
+  "nixpacks-rust",
+  "nixpacks-go",
+  "nixpacks-java",
+  "nixpacks-php",
+  "nixpacks-ruby",
+  "nixpacks-deno",
+  "nixpacks-elixir",
+  "nixpacks-csharp",
+  "nixpacks-dart",
+  "nixpacks-static",
 ]);
 const SEMANTIC_VERSION =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -136,11 +138,315 @@ function isSecretEnvironmentVariable(
   );
 }
 
+const SERVICE_FIELDS = [
+  "preset",
+  "preset_config",
+  "image",
+  "command",
+  "resources",
+  "exposed_port",
+  "health_check_path",
+  "managed_service_bindings",
+  "env_vars",
+] as const;
+
+const SERVICE_NAME = /^[a-z][a-z0-9-]{0,62}$/;
+
+function hasControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const code = character.codePointAt(0);
+    return code !== undefined && (code <= 31 || code === 127);
+  });
+}
+
+function isGitUrl(url: string): boolean {
+  return (
+    url.startsWith("http://") ||
+    url.startsWith("https://") ||
+    url.startsWith("git@")
+  );
+}
+
 /**
- * Fast, offline validation for contributors authoring Temps-native service
- * templates. The server remains authoritative; this mirrors its required
- * source, preset, managed-service, command, and resource checks and adds a few
+ * The ref a source-built service builds, as the server resolves it: the
+ * service's own `git` replaces the template's, and a `git` without `ref`
+ * means `main`. Only an explicitly empty ref is unpinned.
+ */
+function pinnedSourceRef(serviceGit: unknown, templateGit: unknown): boolean {
+  const git = isRecord(serviceGit) ? serviceGit : templateGit;
+  if (!isRecord(git) || git.ref === undefined) return true;
+  return typeof git.ref === "string" && git.ref.trim() !== "";
+}
+
+function isAppKind(kind: unknown): boolean {
+  return kind === "app" || kind === "service";
+}
+
+/** Where a service's fields live in the document, for error messages. */
+interface ServiceView {
+  path: string;
+  fields: Record<string, unknown>;
+  bindingsKey: "managed_service_bindings" | "database_bindings";
+  databasesKey: "services" | "databases";
+  name: string;
+}
+
+/**
+ * Variables: unique names, and no literal defaults on secrets.
+ */
+function validateVariables(
+  variables: unknown,
+  path: string,
+  errors: string[],
+  names: Set<string> = new Set(),
+): Set<string> {
+  if (variables === undefined) return names;
+  if (!Array.isArray(variables)) {
+    errors.push(`${path} must be an array`);
+    return names;
+  }
+  variables.forEach((variable, variableIndex) => {
+    if (!isRecord(variable)) {
+      errors.push(`${path}[${variableIndex}] must be an object`);
+      return;
+    }
+    const name = typeof variable.name === "string" ? variable.name.trim() : "";
+    if (name === "") {
+      errors.push(`${path}[${variableIndex}].name cannot be empty`);
+    } else if (names.has(name)) {
+      errors.push(`${path} name "${name}" is declared more than once`);
+    } else {
+      names.add(name);
+    }
+    if (
+      isSecretEnvironmentVariable(variable) &&
+      Object.prototype.hasOwnProperty.call(variable, "default")
+    ) {
+      errors.push(
+        `${path}[${variableIndex}] is secret and cannot declare a literal default; use a secure generator or require user input`,
+      );
+    }
+  });
+  return names;
+}
+
+function validateService(
+  service: ServiceView,
+  template: Record<string, unknown>,
+  databases: string[],
+  multiService: boolean,
+  errors: string[],
+): void {
+  const { path, fields } = service;
+  const app = isAppKind(template.kind);
+  const image = fields.image;
+  const isImage = typeof image === "string" && image.trim() !== "";
+
+  if (typeof fields.preset !== "string" || fields.preset.trim() === "") {
+    errors.push(`${path}.preset is required`);
+  } else if (!SUPPORTED_PRESETS.has(fields.preset)) {
+    errors.push(`${path}.preset "${fields.preset}" is not supported`);
+  }
+
+  if (app) {
+    if (isImage || !multiService) {
+      if (fields.preset !== "dockerfile") {
+        errors.push(`${path}.preset must be dockerfile for service templates`);
+      }
+      if (
+        typeof image !== "string" ||
+        utf8ByteLength(image) > 512 ||
+        !pinnedImageReference(image)
+      ) {
+        errors.push(
+          `${path}.image must be at most 512 bytes and use an immutable sha256 digest`,
+        );
+      }
+      if (
+        !Number.isInteger(fields.exposed_port) ||
+        Number(fields.exposed_port) <= 0 ||
+        Number(fields.exposed_port) > 65_535
+      ) {
+        errors.push(`${path}.exposed_port must be between 1 and 65535`);
+      }
+    } else if (!pinnedSourceRef(fields.git, template.git)) {
+      // Source-built service of a multi-service app: an upgrade must be a
+      // reviewable change to the reference, not whatever a branch moved to.
+      errors.push(
+        `${path} is built from source and must pin the git ref it builds (git.ref on the service or the template)`,
+      );
+    }
+    if (fields.resources !== undefined) {
+      if (!isRecord(fields.resources)) {
+        errors.push(`${path}.resources must be an object`);
+      } else {
+        for (const field of [
+          "cpu_request",
+          "cpu_limit",
+          "memory_request",
+          "memory_limit",
+        ]) {
+          const resource = fields.resources[field];
+          if (
+            resource !== undefined &&
+            (!Number.isInteger(resource) || Number(resource) <= 0)
+          ) {
+            errors.push(`${path}.resources.${field} must be a positive integer`);
+          }
+        }
+        const request = fields.resources.memory_request;
+        const limit = fields.resources.memory_limit;
+        if (
+          Number.isInteger(request) &&
+          Number.isInteger(limit) &&
+          Number(request) > Number(limit)
+        ) {
+          errors.push(
+            `${path}.resources.memory_request must not exceed memory_limit`,
+          );
+        }
+        const cpuRequest = fields.resources.cpu_request;
+        const cpuLimit = fields.resources.cpu_limit;
+        if (
+          Number.isInteger(cpuRequest) &&
+          Number.isInteger(cpuLimit) &&
+          Number(cpuRequest) > Number(cpuLimit)
+        ) {
+          errors.push(`${path}.resources.cpu_request must not exceed cpu_limit`);
+        }
+      }
+    }
+  }
+
+  if (fields.git !== undefined) {
+    const url =
+      isRecord(fields.git) && typeof fields.git.url === "string"
+        ? fields.git.url.trim()
+        : "";
+    if (!isGitUrl(url)) {
+      errors.push(`${path}.git.url must be an HTTP(S) or SSH Git URL`);
+    }
+  }
+  if (fields.directory !== undefined) {
+    const directory = fields.directory;
+    if (
+      typeof directory !== "string" ||
+      directory.trim() === "" ||
+      directory.startsWith("/") ||
+      directory.split("/").includes("..") ||
+      hasControlCharacter(directory)
+    ) {
+      errors.push(
+        `${path}.directory must be a relative path inside the repository`,
+      );
+    }
+  }
+
+  if (fields.command !== undefined) {
+    if (
+      !Array.isArray(fields.command) ||
+      fields.command.length === 0 ||
+      fields.command.some(
+        (part) => typeof part !== "string" || part.length === 0,
+      )
+    ) {
+      errors.push(`${path}.command must contain non-empty arguments`);
+    } else {
+      const command = fields.command as string[];
+      if (command.length > 64) {
+        errors.push(`${path}.command cannot contain more than 64 arguments`);
+      }
+      if (
+        command.some(
+          (part) =>
+            part.trim() === "" ||
+            utf8ByteLength(part) > 1_024 ||
+            hasControlCharacter(part),
+        )
+      ) {
+        errors.push(
+          `${path}.command arguments must be non-empty, at most 1024 bytes, and contain no control characters`,
+        );
+      }
+    }
+  }
+
+  if (fields.health_check_path !== undefined) {
+    const healthPath = fields.health_check_path;
+    if (
+      typeof healthPath !== "string" ||
+      utf8ByteLength(healthPath) > 2_048 ||
+      !healthPath.startsWith("/") ||
+      healthPath.includes("@") ||
+      healthPath.includes("://") ||
+      hasControlCharacter(healthPath)
+    ) {
+      errors.push(
+        `${path}.health_check_path must be a safe relative HTTP path starting with '/'`,
+      );
+    }
+  }
+
+  validateVariables(fields.env_vars, `${path}.env_vars`, errors);
+
+  const bindingsKey = service.bindingsKey;
+  const bindings = fields[bindingsKey];
+  if (bindings !== undefined && !isRecord(bindings)) {
+    errors.push(`${path}.${bindingsKey} must be an object`);
+  } else if (isRecord(bindings)) {
+    if (!app && Object.keys(bindings).length > 0) {
+      errors.push(
+        `${path}.${bindingsKey} are only applied for apps; a starter reads the database's variables directly`,
+      );
+    }
+    for (const [database, aliases] of Object.entries(bindings)) {
+      if (!databases.includes(database)) {
+        errors.push(
+          `${path}.${bindingsKey}.${database} must also be listed in ${service.databasesKey}`,
+        );
+      }
+      if (!isRecord(aliases) || Object.keys(aliases).length === 0) {
+        errors.push(
+          `${path}.${bindingsKey}.${database} must contain environment aliases`,
+        );
+      } else if (
+        Object.entries(aliases).some(
+          ([target, source]) =>
+            target.trim() === "" ||
+            typeof source !== "string" ||
+            source.trim() === "",
+        )
+      ) {
+        errors.push(
+          `${path}.${bindingsKey}.${database} aliases cannot be empty`,
+        );
+      }
+    }
+  }
+  if (fields.databases !== undefined) {
+    if (!Array.isArray(fields.databases)) {
+      errors.push(`${path}.databases must be an array`);
+    } else {
+      for (const database of fields.databases) {
+        if (typeof database !== "string" || !databases.includes(database)) {
+          errors.push(
+            `${path}.databases lists "${String(database)}", which the template's databases do not include`,
+          );
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Fast, offline validation for contributors authoring Temps-native templates.
+ * The server remains authoritative; this mirrors its source, preset,
+ * managed-service, command, resource, service and route checks and adds a few
  * contributor-facing constraints such as pinned service images.
+ *
+ * Both template shapes are accepted: a list of service definitions under
+ * `services` (ADR-051), or the original one-service shape whose fields sit at
+ * the top level and whose `services` lists managed databases.
  */
 export function validateNativeTemplateConfig(
   document: unknown,
@@ -156,10 +462,10 @@ export function validateNativeTemplateConfig(
 
   const catalog = Array.isArray(document.templates)
     ? document
-    : { version: "2", templates: [document] };
+    : { version: "3", templates: [document] };
 
-  if (catalog.version !== "2") {
-    errors.push('version must be "2"');
+  if (!SUPPORTED_CATALOG_VERSIONS.has(String(catalog.version))) {
+    errors.push('version must be "2" or "3"');
   }
   if (!Array.isArray(catalog.templates)) {
     errors.push("templates must be an array");
@@ -186,18 +492,13 @@ export function validateNativeTemplateConfig(
       errors.push(`${prefix}.name is required`);
     }
     if (typeof value.kind !== "string" || !SUPPORTED_KINDS.has(value.kind)) {
-      errors.push(`${prefix}.kind must be starter or service`);
+      errors.push(`${prefix}.kind must be starter or app`);
     }
-    if (value.kind === "service") {
+    if (isAppKind(value.kind)) {
       if (typeof value.version !== "string" || value.version.trim() === "") {
         errors.push(`${prefix}.version is required for service templates`);
       } else if (!isSemanticVersion(value.version)) {
         errors.push(`${prefix}.version must use Semantic Versioning`);
-      }
-      if (value.preset !== "dockerfile") {
-        errors.push(
-          `${prefix}.preset must be dockerfile for service templates`,
-        );
       }
     }
 
@@ -208,215 +509,175 @@ export function validateNativeTemplateConfig(
         typeof value.git.url === "string" ? value.git.url.trim() : "";
       if (gitUrl === "") {
         errors.push(`${prefix}.git.url is required`);
-      } else if (
-        !gitUrl.startsWith("http://") &&
-        !gitUrl.startsWith("https://") &&
-        !gitUrl.startsWith("git@")
-      ) {
+      } else if (!isGitUrl(gitUrl)) {
         errors.push(`${prefix}.git.url must be an HTTP(S) or SSH Git URL`);
-      }
-    }
-
-    if (typeof value.preset !== "string" || value.preset.trim() === "") {
-      errors.push(`${prefix}.preset is required`);
-    } else if (!SUPPORTED_PRESETS.has(value.preset)) {
-      errors.push(`${prefix}.preset "${value.preset}" is not supported`);
-    }
-
-    if (value.command !== undefined) {
-      if (
-        !Array.isArray(value.command) ||
-        value.command.length === 0 ||
-        value.command.some(
-          (part) => typeof part !== "string" || part.length === 0,
-        )
-      ) {
-        errors.push(`${prefix}.command must contain non-empty arguments`);
-      } else {
-        const command = value.command as string[];
-        if (command.length > 64) {
-          errors.push(
-            `${prefix}.command cannot contain more than 64 arguments`,
-          );
-        }
-        if (
-          command.some(
-            (part) =>
-              part.trim() === "" ||
-              utf8ByteLength(part) > 1_024 ||
-              Array.from(part).some((character) => {
-                const code = character.codePointAt(0);
-                return code !== undefined && (code <= 31 || code === 127);
-              }),
-          )
-        ) {
-          errors.push(
-            `${prefix}.command arguments must be non-empty, at most 1024 bytes, and contain no control characters`,
-          );
-        }
-      }
-    }
-
-    if (value.health_check_path !== undefined) {
-      const path = value.health_check_path;
-      if (
-        typeof path !== "string" ||
-        utf8ByteLength(path) > 2_048 ||
-        !path.startsWith("/") ||
-        path.includes("@") ||
-        path.includes("://") ||
-        Array.from(path).some((character) => {
-          const code = character.codePointAt(0);
-          return code !== undefined && (code <= 31 || code === 127);
-        })
-      ) {
-        errors.push(
-          `${prefix}.health_check_path must be a safe relative HTTP path starting with '/'`,
-        );
-      }
-    }
-
-    if (value.kind === "service") {
-      if (
-        typeof value.image !== "string" ||
-        utf8ByteLength(value.image) > 512 ||
-        !pinnedImageReference(value.image)
-      ) {
-        errors.push(
-          `${prefix}.image must be at most 512 bytes and use an immutable sha256 digest`,
-        );
-      }
-      if (value.resources !== undefined) {
-        if (!isRecord(value.resources)) {
-          errors.push(`${prefix}.resources must be an object`);
-        } else {
-          for (const field of [
-            "cpu_request",
-            "cpu_limit",
-            "memory_request",
-            "memory_limit",
-          ]) {
-            const resource = value.resources[field];
-            if (
-              resource !== undefined &&
-              (!Number.isInteger(resource) || Number(resource) <= 0)
-            ) {
-              errors.push(
-                `${prefix}.resources.${field} must be a positive integer`,
-              );
-            }
-          }
-          const request = value.resources.memory_request;
-          const limit = value.resources.memory_limit;
-          if (
-            Number.isInteger(request) &&
-            Number.isInteger(limit) &&
-            Number(request) > Number(limit)
-          ) {
-            errors.push(
-              `${prefix}.resources.memory_request must not exceed memory_limit`,
-            );
-          }
-          const cpuRequest = value.resources.cpu_request;
-          const cpuLimit = value.resources.cpu_limit;
-          if (
-            Number.isInteger(cpuRequest) &&
-            Number.isInteger(cpuLimit) &&
-            Number(cpuRequest) > Number(cpuLimit)
-          ) {
-            errors.push(
-              `${prefix}.resources.cpu_request must not exceed cpu_limit`,
-            );
-          }
-        }
-      }
-      if (
-        !Number.isInteger(value.exposed_port) ||
-        Number(value.exposed_port) <= 0 ||
-        Number(value.exposed_port) > 65_535
-      ) {
-        errors.push(`${prefix}.exposed_port must be between 1 and 65535`);
       }
     }
 
     if (value.services !== undefined && !Array.isArray(value.services)) {
       errors.push(`${prefix}.services must be an array`);
     }
-    const services = Array.isArray(value.services) ? value.services : [];
-    services.forEach((service) => {
-      if (
-        typeof service !== "string" ||
-        !SUPPORTED_MANAGED_SERVICES.has(service)
-      ) {
-        errors.push(
-          `${prefix}.services contains unsupported service "${String(service)}"`,
-        );
-      }
-    });
+    const rawServices = Array.isArray(value.services) ? value.services : [];
+    const listsDefinitions =
+      rawServices.length > 0 && rawServices.every((entry) => isRecord(entry));
 
-    if (value.env_vars !== undefined && !Array.isArray(value.env_vars)) {
-      errors.push(`${prefix}.env_vars must be an array`);
-    } else if (Array.isArray(value.env_vars)) {
-      const environmentVariableNames = new Set<string>();
-      value.env_vars.forEach((variable, variableIndex) => {
-        if (!isRecord(variable)) {
-          errors.push(`${prefix}.env_vars[${variableIndex}] must be an object`);
-          return;
+    let databases: string[];
+    let databasesPath: string;
+    let services: ServiceView[];
+    if (listsDefinitions) {
+      for (const field of SERVICE_FIELDS) {
+        if (value[field] !== undefined) {
+          errors.push(
+            `${prefix}.${field} belongs to one of the services, not to the template`,
+          );
         }
-        const name =
-          typeof variable.name === "string" ? variable.name.trim() : "";
-        if (name === "") {
+      }
+      databases = Array.isArray(value.databases)
+        ? value.databases.map(String)
+        : [];
+      databasesPath = `${prefix}.databases`;
+      if (value.databases !== undefined && !Array.isArray(value.databases)) {
+        errors.push(`${prefix}.databases must be an array`);
+      }
+      const names = new Set<string>();
+      services = rawServices.map((entry, serviceIndex) => {
+        const fields = entry as Record<string, unknown>;
+        const path = `${prefix}.services[${serviceIndex}]`;
+        const name = typeof fields.name === "string" ? fields.name : "";
+        if (!SERVICE_NAME.test(name) || name.endsWith("-")) {
           errors.push(
-            `${prefix}.env_vars[${variableIndex}].name cannot be empty`,
+            `${path}.name must be 1-63 lowercase letters, digits or '-', starting with a letter`,
           );
-        } else if (environmentVariableNames.has(name)) {
-          errors.push(
-            `${prefix}.env_vars name "${name}" is declared more than once`,
-          );
+        } else if (names.has(name)) {
+          errors.push(`${path}.name duplicates "${name}"`);
         } else {
-          environmentVariableNames.add(name);
+          names.add(name);
         }
+        return {
+          path,
+          fields,
+          bindingsKey: "database_bindings",
+          databasesKey: "databases",
+          name,
+        };
+      });
+    } else {
+      rawServices.forEach((service) => {
         if (
-          isSecretEnvironmentVariable(variable) &&
-          Object.prototype.hasOwnProperty.call(variable, "default")
+          typeof service !== "string" ||
+          !SUPPORTED_MANAGED_SERVICES.has(service)
         ) {
           errors.push(
-            `${prefix}.env_vars[${variableIndex}] is secret and cannot declare a literal default; use a secure generator or require user input`,
+            `${prefix}.services contains unsupported service "${String(service)}"`,
+          );
+        }
+      });
+      databases = rawServices.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+      databasesPath = `${prefix}.services`;
+      services = [
+        {
+          path: prefix,
+          fields: value,
+          bindingsKey: "managed_service_bindings",
+          databasesKey: "services",
+          name: slug,
+        },
+      ];
+    }
+    if (listsDefinitions) {
+      databases.forEach((database) => {
+        if (!SUPPORTED_MANAGED_SERVICES.has(database)) {
+          errors.push(
+            `${databasesPath} contains unsupported service "${database}"`,
           );
         }
       });
     }
 
-    if (
-      value.managed_service_bindings !== undefined &&
-      !isRecord(value.managed_service_bindings)
-    ) {
-      errors.push(`${prefix}.managed_service_bindings must be an object`);
-    } else if (isRecord(value.managed_service_bindings)) {
-      for (const [service, bindings] of Object.entries(
-        value.managed_service_bindings,
-      )) {
-        if (!services.includes(service)) {
+    const multiService = services.length > 1;
+    services.forEach((service) =>
+      validateService(service, value, databases, multiService, errors),
+    );
+
+    // Every database must be linked to at least one service.
+    if (listsDefinitions && multiService) {
+      for (const database of databases) {
+        const linked = services.some((service) => {
+          const own = Array.isArray(service.fields.databases)
+            ? service.fields.databases
+            : [];
+          const bindings = isRecord(service.fields.database_bindings)
+            ? Object.keys(service.fields.database_bindings)
+            : [];
+          return own.includes(database) || bindings.includes(database);
+        });
+        if (!linked) {
           errors.push(
-            `${prefix}.managed_service_bindings.${service} must also be listed in services`,
+            `${databasesPath} lists "${database}", but no service uses it; list it in a service's databases or database_bindings`,
           );
         }
-        if (!isRecord(bindings) || Object.keys(bindings).length === 0) {
+      }
+    }
+
+    const shared = validateVariables(
+      value.shared_env_vars,
+      `${prefix}.shared_env_vars`,
+      errors,
+    );
+    for (const service of services) {
+      if (service.path === prefix) continue;
+      const own = Array.isArray(service.fields.env_vars)
+        ? service.fields.env_vars
+        : [];
+      for (const variable of own) {
+        if (isRecord(variable) && shared.has(String(variable.name))) {
           errors.push(
-            `${prefix}.managed_service_bindings.${service} must contain environment aliases`,
-          );
-        } else if (
-          Object.entries(bindings).some(
-            ([target, source]) =>
-              target.trim() === "" ||
-              typeof source !== "string" ||
-              source.trim() === "",
-          )
-        ) {
-          errors.push(
-            `${prefix}.managed_service_bindings.${service} aliases cannot be empty`,
+            `${service.path}.env_vars "${String(variable.name)}" is also a shared variable`,
           );
         }
+      }
+    }
+
+    if (value.routes !== undefined) {
+      if (!Array.isArray(value.routes)) {
+        errors.push(`${prefix}.routes must be an array`);
+      } else {
+        const names = new Set(services.map((service) => service.name));
+        const seen = new Set<string>();
+        value.routes.forEach((route, routeIndex) => {
+          const path = `${prefix}.routes[${routeIndex}]`;
+          if (!isRecord(route)) {
+            errors.push(`${path} must be an object`);
+            return;
+          }
+          for (const role of ["source", "target"] as const) {
+            if (typeof route[role] !== "string" || !names.has(route[role])) {
+              errors.push(`${path}.${role} must name a service of the template`);
+            }
+          }
+          if (route.source === route.target) {
+            errors.push(`${path} points at the service it is on`);
+          }
+          const prefixValue = route.prefix;
+          if (
+            typeof prefixValue !== "string" ||
+            prefixValue.length < 2 ||
+            !prefixValue.startsWith("/") ||
+            prefixValue.endsWith("/") ||
+            prefixValue.includes("//") ||
+            /\s/.test(prefixValue) ||
+            hasControlCharacter(prefixValue)
+          ) {
+            errors.push(`${path}.prefix must be a path such as /api`);
+          }
+          const key = `${String(route.source)} ${String(prefixValue)}`;
+          if (seen.has(key)) {
+            errors.push(`${path} repeats ${String(prefixValue)} on ${String(route.source)}`);
+          }
+          seen.add(key);
+        });
       }
     }
   });
@@ -523,13 +784,14 @@ export async function readAndValidateTemplatePath(
       const directory = filePath.split("/", 1)[0];
       const expectedKind =
         directory === "services"
-          ? "service"
+          ? "app"
           : directory === "starters"
             ? "starter"
             : undefined;
+      const declaredKind = document.kind === "service" ? "app" : document.kind;
       if (!expectedKind) {
         errors.push(`${filePath} must be under services/ or starters/`);
-      } else if (document.kind !== expectedKind) {
+      } else if (declaredKind !== expectedKind) {
         errors.push(
           `${filePath} declares kind "${String(document.kind)}" but its directory requires "${expectedKind}"`,
         );
@@ -549,7 +811,7 @@ export async function readAndValidateTemplatePath(
     }
   }
 
-  const result = validateNativeTemplateConfig({ version: "2", templates });
+  const result = validateNativeTemplateConfig({ version: "3", templates });
   return {
     valid: errors.length === 0 && result.valid,
     errors: [...errors, ...result.errors],

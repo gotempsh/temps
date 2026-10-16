@@ -755,6 +755,11 @@ impl GitProviderService for BitbucketProvider {
             .send_with_retry(|| self.apply_auth(client.get(&url)))
             .await?;
 
+        if let Some(error) =
+            super::git_provider::file_not_found(response.status(), owner, repo, path, branch)
+        {
+            return Err(error);
+        }
         if !response.status().is_success() {
             return Err(GitProviderError::ApiError(format!(
                 "Failed to get file content for {}/{}/{}: {}",

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod audit;
+pub mod compose_check;
 pub mod container_exec;
 pub mod crons;
 pub mod deployment_tokens;

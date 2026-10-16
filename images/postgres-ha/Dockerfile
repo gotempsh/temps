@@ -37,14 +37,15 @@ ARG PG_VERSION=18
 
 FROM postgres:${PG_VERSION}-bookworm
 
-ARG PG_VERSION
 ARG WALG_VERSION=v3.0.8
 ARG TARGETARCH
 
 # 1. pg_auto_failover (cluster orchestration).
 #
-# Citus's apt repo ships postgresql-${PG_VERSION}-auto-failover and
-# pg-auto-failover-cli. The package depends on the matching postgres
+# Citus's apt repo ships postgresql-${PG_MAJOR}-auto-failover and
+# pg-auto-failover-cli. PG_MAJOR comes from the upstream postgres image's
+# ENV, not the build arg: PG_VERSION may be a pinned minor (`18.3`), which
+# is not a valid package name component. The package depends on the matching postgres
 # server package which the upstream postgres image already provides,
 # so we only pull the failover bits.
 RUN set -eux; \
@@ -61,7 +62,7 @@ RUN set -eux; \
         > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        postgresql-${PG_VERSION}-auto-failover \
+        postgresql-${PG_MAJOR}-auto-failover \
         pg-auto-failover-cli; \
     apt-get purge -y wget gnupg lsb-release; \
     apt-get autoremove -y; \

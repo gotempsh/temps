@@ -270,12 +270,15 @@ async fn run_events_backfill(
 ) -> anyhow::Result<()> {
     println!("{}", "▸ Domain: analytics events".bright_white().bold());
 
+    // The same wire-compression mode `temps serve` uses for this instance's
+    // ClickHouse: the stored `clickhouse.compression` setting.
     let ch_cfg = ClickHouseConfig::new(
         &args.clickhouse_url,
         &args.clickhouse_database,
         &args.clickhouse_user,
         &args.clickhouse_password,
-    );
+    )
+    .with_compression(temps_config::stored_clickhouse_compression(db.as_ref()).await);
     let backend = ClickHouseBackend::new(ch_cfg);
     let ch = Arc::new(backend.client_clone());
 

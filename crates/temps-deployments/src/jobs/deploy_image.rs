@@ -212,6 +212,10 @@ pub struct ReusedWorkerBuild {
     /// The id of each architecture's image as built; a reused tag is only
     /// fetched from a worker still holding exactly this image.
     pub image_ids_by_platform: HashMap<String, String>,
+    /// The image's configuration as the build node reported it. A rollback or
+    /// promotion has no workflow context from the original build and the
+    /// control plane may hold no copy to inspect, so the ports come from here.
+    pub image_config: Option<super::build_image::BuiltImageConfig>,
 }
 
 impl ReusedWorkerBuild {
@@ -265,6 +269,10 @@ impl ReusedWorkerBuild {
             builder_node_id: Some(builder_node_id),
             builder_node_ids_by_platform,
             image_ids_by_platform,
+            image_config: outputs
+                .get("image_config")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
         })
     }
 
@@ -2285,6 +2293,39 @@ impl DeployImageJob {
             return configured;
         }
 
+        // A worker build records the image's configuration as read from the
+        // node that owns it. It is authoritative: the control plane may hold
+        // no copy of the image to inspect, and a failed local inspection would
+        // otherwise silently fall back to a port the image does not listen on.
+        if let Some(config) = self.recorded_image_config(context) {
+            return match config.exposed_ports.first() {
+                Some(port) => {
+                    let _ = self
+                        .log(
+                            context,
+                            format!(
+                                "Detected EXPOSE directive in image (read from its build \
+                                 node): port {port}"
+                            ),
+                        )
+                        .await;
+                    *port
+                }
+                None => {
+                    let _ = self
+                        .log(
+                            context,
+                            format!(
+                                "No EXPOSE directive found in image, using configured port: {}",
+                                self.config.port
+                            ),
+                        )
+                        .await;
+                    self.config.port as u16
+                }
+            };
+        }
+
         // No explicit override — try to inspect the image and get exposed ports
         match bollard::Docker::connect_with_local_defaults() {
             Ok(docker) => {
@@ -2337,6 +2378,31 @@ impl DeployImageJob {
 
         // Fallback to configured/default port
         self.config.port as u16
+    }
+
+    /// The image configuration the build job recorded from its build node.
+    /// `None` for an image built on the control plane, one deployed by
+    /// reference with no worker build behind it, and a node that did not
+    /// report it.
+    fn recorded_image_config(
+        &self,
+        context: &WorkflowContext,
+    ) -> Option<super::build_image::BuiltImageConfig> {
+        if self.external_image_tag.is_some() {
+            // A rollback or promotion: what the original build's node
+            // reported travels with the reused worker build.
+            return self
+                .reused_worker_build
+                .as_ref()
+                .and_then(|reused| reused.image_config.clone());
+        }
+        if self.build_job_id.is_empty() {
+            return None;
+        }
+        context
+            .get_output::<super::build_image::BuiltImageConfig>(&self.build_job_id, "image_config")
+            .ok()
+            .flatten()
     }
 
     /// Public getter for config to allow test access
@@ -5374,6 +5440,7 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
@@ -6235,6 +6302,119 @@ mod tests {
             .await;
 
         assert_eq!(port, 4000);
+    }
+
+    fn port_job(configured_port: Option<u16>) -> DeployImageJob {
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(4000)
+        .configured_port(configured_port)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap()
+    }
+
+    fn context_with_built_config(exposed_ports: Vec<u16>) -> temps_core::WorkflowContext {
+        let mut context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+        context
+            .set_output(
+                "build_image",
+                "image_config",
+                super::super::build_image::BuiltImageConfig {
+                    exposed_ports,
+                    working_dir: Some("/app".to_string()),
+                    user: None,
+                    entrypoint: Vec::new(),
+                },
+            )
+            .unwrap();
+        context
+    }
+
+    /// A worker build records the image's `EXPOSE` ports from the node that
+    /// owns the image, so the port resolves without any local copy of it.
+    #[tokio::test]
+    async fn test_resolve_container_port_uses_the_config_recorded_by_the_build_node() {
+        let job = port_job(None);
+        let context = context_with_built_config(vec![8080, 9000]);
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, 8080);
+    }
+
+    /// A node that reported "no EXPOSE" means the configured port, and it is
+    /// answered from the record rather than a local inspection.
+    #[tokio::test]
+    async fn test_resolve_container_port_uses_configured_port_when_node_reports_no_expose() {
+        let job = port_job(None);
+        let context = context_with_built_config(Vec::new());
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, 4000);
+    }
+
+    /// The environment/project override still outranks what the image says.
+    #[tokio::test]
+    async fn test_resolve_container_port_override_wins_over_recorded_config() {
+        let job = port_job(Some(9090));
+        let context = context_with_built_config(vec![8080]);
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, 9090);
+    }
+
+    /// A rollback or promotion has no workflow context from the original
+    /// build; the ports its node reported travel with the reused worker
+    /// build, so the container port is still the image's own.
+    #[tokio::test]
+    async fn test_resolve_container_port_uses_the_config_of_a_reused_worker_build() {
+        let reused = ReusedWorkerBuild {
+            image_config: Some(super::super::build_image::BuiltImageConfig {
+                exposed_ports: vec![8080],
+                working_dir: None,
+                user: None,
+                entrypoint: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("external-image".to_string())
+        .external_image_tag("app:1".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(3000)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap()
+        .with_reused_worker_build(reused);
+        let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+
+        let port = job.resolve_container_port("app:1", &context).await;
+
+        assert_eq!(port, 8080);
     }
 
     #[test]
@@ -7249,6 +7429,7 @@ mod tests {
                     tags: vec![image_name.to_string()],
                     created: None,
                     working_dir: None,
+                    config: None,
                 });
             }
             // Reported as not found so `verify_image_platform_for_node` takes

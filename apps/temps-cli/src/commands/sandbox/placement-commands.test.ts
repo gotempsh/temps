@@ -307,6 +307,21 @@ describe('sandbox create / list with nodes', () => {
     expect(requests[0]?.body).toEqual({ backend: 'microsandbox' })
   })
 
+  it('sends the explicit Docker opt-in for microsandbox', async () => {
+    route = () => ({ status: 201, body: { sandbox: sandboxInner() } })
+    await run('create', '--backend', 'microsandbox', '--allow-docker', '--json')
+    expect(requests[0]?.body).toEqual({ backend: 'microsandbox', allow_docker: true })
+  })
+
+  it('rejects Docker opt-in without microsandbox before sending anything', async () => {
+    for (const args of [[], ['--backend', 'docker'], ['--backend', 'firecracker']]) {
+      await expect(run('create', ...args, '--allow-docker', '--json')).rejects.toThrow(
+        '--allow-docker requires --backend microsandbox',
+      )
+    }
+    expect(requests).toEqual([])
+  })
+
   it('rejects an unknown --backend before sending anything', async () => {
     route = () => ({ status: 201, body: { sandbox: sandboxInner() } })
     await expect(run('create', '--backend', 'kvm', '--json')).rejects.toThrow(

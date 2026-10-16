@@ -24,12 +24,15 @@ import {
 } from '@/api/client'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useQuery } from '@tanstack/react-query'
 import { ApplicationDataServicesPanel } from './ApplicationDataServicesPanel'
 import { RichProjectPicker, type ProjectPickerItem } from './RichProjectPicker'
 import { APPLICATION_PROJECT_DEFAULTS } from './application-project-defaults'
+
+type ApplicationService = ApplicationResponse['projects'][number]
 
 type Props = {
   application: ApplicationResponse
@@ -44,6 +47,9 @@ export function ApplicationProjectsPanel({
   const [linkId, setLinkId] = useState<number | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [unlinkTarget, setUnlinkTarget] = useState<ApplicationService | null>(
+    null
+  )
 
   const projectsQuery = useQuery({
     ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
@@ -67,7 +73,7 @@ export function ApplicationProjectsPanel({
       const { data } = await action()
       onApplicationChange(data)
     } catch (cause) {
-      setError(errorMessage(cause, 'The project operation failed.'))
+      setError(errorMessage(cause, 'The service operation failed.'))
     } finally {
       setBusy(null)
     }
@@ -101,9 +107,9 @@ export function ApplicationProjectsPanel({
   return (
     <div className="space-y-5">
       <div>
-        <p className="text-sm font-semibold">Application projects</p>
+        <p className="text-sm font-semibold">Application services</p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Each project has its own deployment settings while sharing this
+          Each service has its own deployment settings while sharing this
           application&apos;s persistent workspace.
         </p>
       </div>
@@ -164,22 +170,12 @@ export function ApplicationProjectsPanel({
                 <Button
                   aria-label={`Unlink ${project.name}`}
                   disabled={busy !== null || application.projects.length === 1}
-                  onClick={() =>
-                    void run(`unlink-${project.id}`, () =>
-                      unlinkApplicationProject({
-                        path: {
-                          application_public_id: application.public_id,
-                          project_id: project.id,
-                        },
-                        throwOnError: true,
-                      })
-                    )
-                  }
+                  onClick={() => setUnlinkTarget(project)}
                   size="icon"
                   title={
                     application.projects.length === 1
-                      ? 'An application must keep at least one project'
-                      : 'Unlink project'
+                      ? 'An application must keep at least one service'
+                      : 'Unlink service'
                   }
                   variant="ghost"
                 >
@@ -259,7 +255,7 @@ export function ApplicationProjectsPanel({
             </Button>
           </div>
           <p className="text-[10px] text-muted-foreground">
-            Creates the Temps project and projects/&lt;slug&gt; directory as one
+            Creates the Temps service and projects/&lt;slug&gt; directory as one
             operation.
           </p>
         </div>
@@ -269,7 +265,7 @@ export function ApplicationProjectsPanel({
             <Label htmlFor="application-project-link">Link existing</Label>
             <div className="flex gap-2">
               <RichProjectPicker
-                ariaLabel="Existing project to link"
+                ariaLabel="Existing service to link"
                 disabled={busy !== null}
                 onValueChange={setLinkId}
                 projects={unlinked.map(projectPickerItem)}
@@ -295,6 +291,32 @@ export function ApplicationProjectsPanel({
 
       <ApplicationDataServicesPanel application={application} />
 
+      <ConfirmDeleteDialog
+        open={unlinkTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setUnlinkTarget(null)
+        }}
+        resourceType="service"
+        resourceName={unlinkTarget?.name ?? ''}
+        verb="Unlink"
+        consequences={`It is detached from ${application.name}. The project itself, its deployments and its data are kept and can be linked again.`}
+        irreversible={false}
+        isPending={busy !== null && busy.startsWith('unlink-')}
+        onConfirm={() => {
+          if (!unlinkTarget) return
+          const target = unlinkTarget
+          void run(`unlink-${target.id}`, () =>
+            unlinkApplicationProject({
+              path: {
+                application_public_id: application.public_id,
+                project_id: target.id,
+              },
+              throwOnError: true,
+            })
+          ).then(() => setUnlinkTarget(null))
+        }}
+      />
+
       {error && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
           {error}
@@ -302,12 +324,12 @@ export function ApplicationProjectsPanel({
       )}
       {projectsQuery.isError && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
-          Could not load the projects available to link.
+          Could not load the services available to link.
         </div>
       )}
       <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
         <CheckCircle2 className="size-3.5 text-success" />
-        Project topology is injected fresh into every AI turn.
+        Service topology is injected fresh into every AI turn.
       </div>
     </div>
   )

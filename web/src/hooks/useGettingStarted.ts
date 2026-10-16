@@ -25,7 +25,7 @@ export function useGettingStarted() {
   const signals = useActivationSignals()
   const manualHarness = useManualHarnessCompletion()
 
-  const items: GettingStartedItem[] = [
+  const allItems: GettingStartedItem[] = [
     // First because nothing else on this list matters until something runs:
     // it proves Docker, image pulls and routing work on this host, and the
     // guide it opens offers a one-click sample when there is no code yet.
@@ -93,7 +93,7 @@ export function useGettingStarted() {
       key: 'database',
       label: 'Add a database',
       description:
-        'Provision a managed Postgres, Redis, or MongoDB to attach to a project.',
+        'Provision a managed Postgres, Redis, or MongoDB to attach to a service.',
       done: signals.hasDatabase,
       href: '/storage/create',
       cta: 'Add database',
@@ -110,12 +110,20 @@ export function useGettingStarted() {
     {
       key: 'team',
       label: 'Invite your team',
-      description: 'Add teammates so they can manage projects and deployments.',
+      description: 'Add teammates so they can manage services and deployments.',
       done: signals.teamInvited,
       href: '/settings/users',
       cta: 'Invite',
     },
   ]
+
+  // A step this role cannot read is left out rather than shown as "to do":
+  // nothing was checked, so neither answer would be true.
+  const items = allItems.filter(
+    (item) =>
+      !(item.key === 'dns' && signals.unreadable.dnsProviders) &&
+      !(item.key === 'team' && signals.unreadable.team)
+  )
 
   const completedCount = items.filter((i) => i.done).length
   const totalCount = items.length

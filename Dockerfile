@@ -226,6 +226,10 @@ CMD ["/app/temps", "serve"]
 # - TEMPS_DATA_DIR: Data directory (default: /app/data)
 # - TEMPS_CONSOLE_ADDRESS: Console API address (optional)
 # - TEMPS_LOG_LEVEL: Log level (default: info)
+# - TEMPS_DISABLE_SELF_UPDATE: true forbids "Update now" from the console
+#   (same as --disable-self-update; default: false)
+# - TEMPS_PRE_MIGRATION_BACKUP: true dumps the database before applying pending
+#   migrations (same as --pre-migration-backup; default: false)
 #
 # Volumes:
 # ========

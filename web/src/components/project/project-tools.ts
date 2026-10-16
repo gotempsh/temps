@@ -143,7 +143,7 @@ export const projectToolGroups: ProjectToolGroup[] = [
   },
   {
     label: 'Configure',
-    description: 'Connect runtime features and automate project workflows.',
+    description: 'Connect runtime features and automate service workflows.',
     items: [
       { title: 'Feature Flags', url: 'flags', icon: Flag },
       {
@@ -155,7 +155,7 @@ export const projectToolGroups: ProjectToolGroup[] = [
     ],
   },
   {
-    label: 'Project settings',
+    label: 'Service settings',
     description: 'Control secrets, access, schedules, and integrations.',
     items: [
       { title: 'General', url: 'settings/general', icon: SlidersHorizontal },

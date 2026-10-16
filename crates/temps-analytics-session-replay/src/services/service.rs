@@ -552,8 +552,20 @@ impl SessionReplayService {
             .one(&txn)
             .await?;
 
-        let visitor_id_int = match visitor {
-            Some(v) => v.id,
+        // A returning visitor's row is refreshed, not just read: retention
+        // purges visitors by `last_seen`, so a visitor who keeps replaying
+        // sessions but whose row is never bumped would be deleted out from
+        // under a session that references it. The row may also be purged
+        // between the lookup above and this write; it is then treated as a
+        // miss and created again below, under the same limits as any new
+        // visitor.
+        let existing_visitor_id = match visitor {
+            Some(v) => self.touch_visitor(&txn, v.id, project_id).await?,
+            None => None,
+        };
+
+        let visitor_id_int = match existing_visitor_id {
+            Some(id) => id,
             None => {
                 // The browser SDK fires `/event` and `session-replay/init` in
                 // the same page load with no ordering between them (issue
@@ -681,6 +693,33 @@ impl SessionReplayService {
         info!("Session {} initialized successfully", session_id);
 
         Ok(session_id.to_string())
+    }
+
+    /// Advance `last_seen` on a visitor row found by `initialize_session`.
+    /// `None` means the row no longer exists (retention removed it after the
+    /// lookup), so the caller resolves the visitor again through the upsert a
+    /// lookup miss uses instead of attaching a session to a stale id.
+    async fn touch_visitor(
+        &self,
+        txn: &DatabaseTransaction,
+        visitor_row_id: i32,
+        project_id: i32,
+    ) -> Result<Option<i32>, SessionReplayError> {
+        let result = visitor::Entity::update_many()
+            .col_expr(visitor::Column::LastSeen, Expr::value(Utc::now()))
+            .filter(visitor::Column::Id.eq(visitor_row_id))
+            .filter(visitor::Column::ProjectId.eq(project_id))
+            .exec(txn)
+            .await?;
+        if result.rows_affected == 0 {
+            tracing::warn!(
+                visitor_row_id,
+                project_id,
+                "Visitor row was removed (retention) before session-replay init could refresh                  it; creating it again"
+            );
+            return Ok(None);
+        }
+        Ok(Some(visitor_row_id))
     }
 
     /// Upsert a visitor row when this session's `visitor_id` has no matching
@@ -2217,6 +2256,11 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. visitor lookup
                 .append_query_results(vec![vec![make_visitor_model(3)]])
+                // 1b. the visitor's `last_seen` is refreshed
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 // 2. existing-session lookup (none)
                 .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
                 // 3. the insert
@@ -2269,11 +2313,122 @@ mod tests {
         );
     }
 
+    fn statements_of(log: Vec<sea_orm::Transaction>) -> Vec<String> {
+        log.iter()
+            .flat_map(|t| t.statements())
+            .map(|stmt| stmt.sql.clone())
+            .collect()
+    }
+
+    /// A returning visitor must stay alive: retention deletes visitors by
+    /// `last_seen`, so opening a replay session has to advance it.
+    #[tokio::test]
+    async fn initialize_session_refreshes_an_existing_visitors_last_seen() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+                .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
+                .into_connection(),
+        );
+        let service = SessionReplayService::new(db.clone());
+
+        service
+            .initialize_session(
+                "session-abc",
+                make_session_metadata(),
+                7,
+                None,
+                None,
+                "203.0.113.1",
+            )
+            .await
+            .expect("the session opens");
+
+        drop(service);
+        let log = match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        };
+        let sql = statements_of(log);
+        assert!(
+            sql.iter()
+                .any(|s| s.starts_with("UPDATE \"visitor\"") && s.contains("\"last_seen\"")),
+            "the visitor row must be refreshed: {sql:?}"
+        );
+    }
+
+    /// The row found by the lookup can be purged before the refresh lands. The
+    /// session must not be attached to that stale id (its foreign key would
+    /// reject the insert): the visitor is created again like any miss.
+    #[tokio::test]
+    async fn initialize_session_recreates_a_visitor_purged_after_the_lookup() {
+        let mut upserted = std::collections::BTreeMap::<String, sea_orm::Value>::new();
+        upserted.insert("id".to_string(), sea_orm::Value::Int(Some(9)));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_visitor_model(3)]])
+                // The refresh matches no row: retention removed it.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                // The upsert's RETURNING id.
+                .append_query_results(vec![vec![upserted]])
+                .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+                .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
+                .into_connection(),
+        );
+        let service = SessionReplayService::new(db.clone());
+
+        service
+            .initialize_session(
+                "session-abc",
+                make_session_metadata(),
+                7,
+                None,
+                None,
+                "203.0.113.1",
+            )
+            .await
+            .expect("the session opens against a re-created visitor");
+
+        drop(service);
+        let log = match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        };
+        let statements: Vec<_> = log.iter().flat_map(|t| t.statements()).collect();
+        assert!(
+            statements
+                .iter()
+                .any(|s| s.sql.contains("INSERT INTO visitor")),
+            "the visitor must be created again"
+        );
+        let insert = statements
+            .iter()
+            .find(|s| s.sql.starts_with("INSERT INTO") && s.sql.contains("session_replay_sessions"))
+            .map(|s| format!("{s:?}"))
+            .expect("a session insert");
+        assert!(
+            insert.contains("Int(Some(9))") && !insert.contains("Int(Some(3))"),
+            "the session is attached to the re-created visitor, not the purged id: {insert}"
+        );
+    }
+
     #[tokio::test]
     async fn initialize_session_preserves_concrete_scope() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
                 .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
                 .into_connection(),

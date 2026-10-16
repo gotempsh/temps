@@ -17,6 +17,7 @@
 //!   through a per-turn, authenticated loopback MCP bridge.
 
 pub mod dispatch;
+mod harness_update;
 pub mod model_relay;
 mod runtime_transport;
 pub mod service;

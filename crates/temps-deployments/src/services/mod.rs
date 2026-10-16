@@ -5,6 +5,7 @@
 pub mod services;
 pub use services::*;
 
+pub mod compose_check_service;
 pub mod container_operations;
 pub use container_operations::*;
 
@@ -27,6 +28,9 @@ pub mod managed_environment_variables;
 pub use managed_environment_variables::*;
 
 pub mod env_resolver;
+
+/// Variables inherited from the service's project (group)
+pub mod group_env;
 pub use env_resolver::*;
 
 pub mod port_resolver;

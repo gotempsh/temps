@@ -2138,7 +2138,12 @@ impl WorkflowExecutionService {
                     self.docker_handle.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
+                .with_log_service(self.log_service.clone())
+                .with_image_builder(self.image_builder.clone());
+                let job = match self.builder_node_resolver() {
+                    Some(resolver) => job.with_builder_node_resolver(resolver),
+                    None => job,
+                };
 
                 Ok(Arc::new(job))
             }
@@ -3040,6 +3045,24 @@ impl WorkflowExecutionService {
             config: self.config_service.clone(),
             encryption,
         }))
+    }
+
+    /// Routes scans that run after a deployment (the daily rescan, a manual
+    /// one) to the build node holding a worker-built image. `None` before
+    /// the scheduler and encryption service are wired, which is also before
+    /// any worker build can exist.
+    pub fn build_node_scanner_resolver(
+        &self,
+    ) -> Option<Arc<crate::jobs::scan_vulnerabilities::BuildNodeScannerResolver>> {
+        let nodes = self.builder_node_resolver()?;
+        Some(Arc::new(
+            crate::jobs::scan_vulnerabilities::BuildNodeScannerResolver::new(
+                self.db.clone(),
+                self.image_builder.clone(),
+                nodes,
+                self.docker_handle.clone(),
+            ),
+        ))
     }
 
     async fn select_node_builder(
@@ -5107,6 +5130,7 @@ mod tests {
                 tags: vec!["mock-image:latest".to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
@@ -5143,6 +5167,8 @@ mod tests {
                 file_count: 10,
                 total_size_bytes: 1024,
                 deployed_at: Utc::now(),
+                skipped_count: 0,
+                skipped_paths: Vec::new(),
             })
         }
 

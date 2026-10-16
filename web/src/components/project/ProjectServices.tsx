@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
-import { Navigate, Route, Routes } from 'react-router'
+import { Route, Routes } from 'react-router'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { KvService } from './services/KvService'
 import { BlobService } from './services/BlobService'
 
@@ -18,7 +19,7 @@ export function ProjectServices({ project }: ProjectServicesProps) {
           <Route
             index
             element={
-              <Navigate to={`/projects/${project.slug}/storage`} replace />
+              <RedirectWithQuery to={`/projects/${project.slug}/storage`} />
             }
           />
           <Route path="kv" element={<KvService project={project} />} />
@@ -26,7 +27,7 @@ export function ProjectServices({ project }: ProjectServicesProps) {
           <Route
             path="*"
             element={
-              <Navigate to={`/projects/${project.slug}/storage`} replace />
+              <RedirectWithQuery to={`/projects/${project.slug}/storage`} />
             }
           />
         </Routes>

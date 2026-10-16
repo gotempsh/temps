@@ -87,6 +87,27 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
+    /// A parameter value does not have the type the schema declares (today:
+    /// a list parameter that is not an array of the declared item type).
+    ///
+    /// Like [`Self::BadObjectShape`], this is raised during validation so the
+    /// mistake surfaces before a human is asked to approve a request the API
+    /// will certainly reject.
+    #[error(
+        "Parameter '{name}' has the wrong type for operation '{operation_id}': {problem}. \
+         Expected {expected}."
+    )]
+    BadParamType {
+        /// Name of the offending parameter.
+        name: String,
+        /// What is wrong with the supplied value.
+        problem: String,
+        /// Human-readable description of the accepted JSON.
+        expected: String,
+        /// The operation being called.
+        operation_id: String,
+    },
+
     /// A parameter value is not one of the declared enum members.
     #[error(
         "Parameter '{name}' has value '{value}' which is not one of the allowed values: \

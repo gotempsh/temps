@@ -11,16 +11,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -58,7 +49,7 @@ import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Link, useNavigate } from 'react-router'
-import { DataTable, type DataTableColumn } from '@temps-sdk/ds'
+import { DataTable, useUrlBoundText, type DataTableColumn } from '@temps-sdk/ds'
 import type { DomainSort } from './domain-sort'
 import { hasUrgentCertificate } from './domain-expiry'
 
@@ -99,6 +90,12 @@ export function DomainsManagement({
 }: DomainsManagementProps) {
   const [domainToDelete, setDomainToDelete] = useState<DomainResponse | null>(
     null
+  )
+  // The query lives in the URL; typing is mirrored locally so a router
+  // transition cannot reset the box and drop keystrokes.
+  const [searchText, setSearchText] = useUrlBoundText(
+    searchQuery,
+    onSearchChange
   )
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
@@ -301,8 +298,8 @@ export function DomainsManagement({
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <Input
-          value={searchQuery}
-          onChange={(e) => onSearchChange(e.target.value)}
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
           aria-label="Search domains"
           placeholder="Search domains..."
           className="pl-9 pr-10"
@@ -316,32 +313,19 @@ export function DomainsManagement({
 
       {verificationDialog}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={domainToDelete !== null}
-        onOpenChange={(open) => !open && setDomainToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              domain and remove all associated TLS certificates.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                domainToDelete && handleDeleteDomain(domainToDelete.domain)
-              }
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteDomain.isPending}
-            >
-              {deleteDomain.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences="All TLS certificates issued for this domain are removed with it."
+        isPending={deleteDomain.isPending}
+        onConfirm={() => {
+          if (domainToDelete) handleDeleteDomain(domainToDelete.domain)
+        }}
+      />
 
       {isError ? (
         <EmptyState

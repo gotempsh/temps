@@ -605,7 +605,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                         </div>
                         <div className="flex-1 text-sm">
                           {typeof value === 'object' && value !== null ? (
-                            <pre className="bg-muted rounded p-2 overflow-x-auto">
+                            <pre
+                              tabIndex={0}
+                              className="bg-muted rounded p-2 overflow-x-auto"
+                            >
                               <HighlightedCode
                                 code={JSON.stringify(value, null, 2)}
                                 language="json"

@@ -348,6 +348,14 @@ fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: us
             "invalid_query",
             Some("The query parameters are invalid for this data source".to_string()),
         ),
+        // The detail carries only the caller's own container path, depth and
+        // the backend's limit, so it is safe to return verbatim.
+        temps_query::DataError::ContainerPathTooDeep { .. } => (
+            StatusCode::BAD_REQUEST,
+            "Invalid Container Path",
+            "container_path_too_deep",
+            Some(error.to_string()),
+        ),
         temps_query::DataError::QueryFailed(_)
         | temps_query::DataError::BackendQueryFailed { .. } => (
             StatusCode::BAD_REQUEST,
@@ -382,6 +390,57 @@ fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: us
         problem = problem.with_detail(detail);
     }
     problem
+}
+
+/// Map a [`temps_query::DataError`] raised while *navigating* a data source
+/// (listing containers/entities, reading container or entity info) to an HTTP
+/// problem. `operation` completes "Failed to ..." in the detail.
+///
+/// Client mistakes (a path deeper than the backend's hierarchy, a malformed
+/// request, an unknown container) are 4xx; only backend/infrastructure
+/// failures are 5xx. The match is exhaustive on purpose: adding a
+/// [`temps_query::DataError`] variant must force a decision here.
+fn navigation_error_problem(
+    error: temps_query::DataError,
+    service_id: i32,
+    operation: &str,
+) -> Problem {
+    use temps_query::DataError;
+
+    let (status, title) = match &error {
+        DataError::ContainerPathTooDeep { .. } => {
+            (StatusCode::BAD_REQUEST, "Invalid Container Path")
+        }
+        DataError::InvalidQuery(_) | DataError::OperationNotSupported(_) => {
+            (StatusCode::BAD_REQUEST, "Invalid Request")
+        }
+        DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
+        DataError::QueryTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "Query Timed Out"),
+        DataError::ResultLimitExceeded { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "Query Result Too Large")
+        }
+        DataError::ConnectionFailed(_)
+        | DataError::ConnectionLost(_)
+        | DataError::QueryFailed(_)
+        | DataError::SchemaError(_)
+        | DataError::InvalidConfiguration(_)
+        | DataError::SerializationError(_)
+        | DataError::BackendQueryFailed { .. }
+        | DataError::PermissionDenied(_)
+        | DataError::InvalidCredentials
+        | DataError::BackendError(_)
+        | DataError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Query Error"),
+    };
+
+    if status.is_server_error() {
+        tracing::error!(service_id, operation, error = %error, "external-service navigation failed");
+    } else {
+        tracing::debug!(service_id, operation, error = %error, "external-service navigation rejected");
+    }
+
+    temps_core::problemdetails::new(status)
+        .with_title(title)
+        .with_detail(format!("Failed to {operation}: {error}"))
 }
 
 /// Whether an agent-originated request may read this service's rows.
@@ -1102,11 +1161,7 @@ pub async fn list_root_containers(
         .query_service
         .list_containers(service_id, &path)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to list containers: {}", e))
-        })?;
+        .map_err(|e| navigation_error_problem(e, service_id, "list containers"))?;
 
     let response: Vec<ContainerResponse> = containers.into_iter().map(Into::into).collect();
     Ok(Json(response))
@@ -1121,6 +1176,7 @@ pub async fn list_root_containers(
     tag = "External Services - Query",
     responses(
         (status = 200, description = "List of containers", body = Vec<ContainerResponse>),
+        (status = 400, description = "Path is deeper than this data source's container hierarchy (the container has no child containers; list its entities instead)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Service or container not found"),
@@ -1152,11 +1208,7 @@ pub async fn list_containers_at_path(
         .query_service
         .list_containers(service_id, &path)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to list containers: {}", e))
-        })?;
+        .map_err(|e| navigation_error_problem(e, service_id, "list containers"))?;
 
     let response: Vec<ContainerResponse> = containers.into_iter().map(Into::into).collect();
     Ok(Json(response))
@@ -1177,6 +1229,7 @@ pub async fn list_containers_at_path(
     tag = "External Services - Query",
     responses(
         (status = 200, description = "Container information", body = ContainerResponse),
+        (status = 400, description = "Path is not a valid container for this data source"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Service or container not found"),
@@ -1207,11 +1260,7 @@ pub async fn get_container_info(
         .query_service
         .get_container_info(service_id, &path)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to get container info: {}", e))
-        })?;
+        .map_err(|e| navigation_error_problem(e, service_id, "get container info"))?;
 
     Ok(Json(ContainerResponse::from(container)))
 }
@@ -1228,6 +1277,7 @@ pub async fn get_container_info(
     ),
     responses(
         (status = 200, description = "Paginated list of entities", body = PaginatedEntitiesResponse),
+        (status = 400, description = "Path is not a valid container for this data source"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Service or container not found"),
@@ -1270,11 +1320,7 @@ pub async fn list_entities(
         .query_service
         .list_entities_paginated(service_id, &path, limit, query.token)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to list entities: {}", e))
-        })?;
+        .map_err(|e| navigation_error_problem(e, service_id, "list entities"))?;
 
     let count = entities.len();
     let has_more = next_token.is_some();
@@ -1299,6 +1345,7 @@ pub async fn list_entities(
     tag = "External Services - Query",
     responses(
         (status = 200, description = "Entity details", body = EntityInfoResponse),
+        (status = 400, description = "Path is not a valid container for this data source"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Service, container, or entity not found"),
@@ -1339,11 +1386,7 @@ pub async fn get_entity_info(
         .query_service
         .get_entity_info(service_id, &path, &entity)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to get entity info: {}", e))
-        })?;
+        .map_err(|e| navigation_error_problem(e, service_id, "get entity info"))?;
 
     let fields = entity_info
         .schema
@@ -1851,6 +1894,66 @@ mod tests {
         let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
         assert!(!serialized.contains("alice@example.com"));
         assert!(!serialized.contains("tok_live_secret"));
+    }
+
+    #[test]
+    fn navigating_below_a_leaf_container_is_a_bad_request_not_a_server_error() {
+        // Reported as a 500 when the console asked for the child containers
+        // of a PostgreSQL schema.
+        let error = temps_query::DataError::container_path_too_deep(
+            "PostgreSQL",
+            &ContainerPath::from_slice(&["appdb", "pg_catalog"]),
+            2,
+        );
+        let problem = navigation_error_problem(error, 7, "list containers");
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(
+            serialized.contains("appdb/pg_catalog"),
+            "detail names the offending path: {serialized}"
+        );
+        assert!(serialized.contains("PostgreSQL"), "{serialized}");
+        assert!(serialized.contains("list containers"), "{serialized}");
+    }
+
+    #[test]
+    fn navigation_errors_are_classified_by_who_caused_them() {
+        use temps_query::DataError;
+        let status_of =
+            |error: DataError| navigation_error_problem(error, 7, "list entities").status_code;
+
+        assert_eq!(
+            status_of(DataError::InvalidQuery("bad path".into())),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(DataError::NotFound("database 'x'".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_of(DataError::QueryTimeout(5_000)),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            status_of(DataError::ConnectionFailed("refused".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status_of(DataError::QueryFailed("boom".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn data_query_with_too_deep_container_path_is_a_bad_request() {
+        let error = temps_query::DataError::container_path_too_deep(
+            "S3",
+            &ContainerPath::from_slice(&["bucket", "prefix"]),
+            1,
+        );
+        let problem = query_error_problem(error, 7, 100);
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
     }
 
     #[test]

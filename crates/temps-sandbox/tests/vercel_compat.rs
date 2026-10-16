@@ -378,6 +378,7 @@ fn cmd_response_serializes_finished_with_exit_code() {
 fn sandbox_response_matches_sdk_envelope() {
     let r = SandboxResponse {
         sandbox: SandboxInner {
+            allow_docker: false,
             id: "sbx_abc".into(),
             node_id: None,
             node_name: "control-plane".into(),
@@ -458,6 +459,7 @@ fn sandbox_status_uses_sdk_enum_values() {
     for status in valid {
         let r = SandboxResponse {
             sandbox: SandboxInner {
+                allow_docker: false,
                 id: "x".into(),
                 node_id: None,
                 node_name: "control-plane".into(),

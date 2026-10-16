@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import type {
   ApplicationResponse,
   ApplicationWorkspaceResponse,
@@ -89,6 +90,79 @@ describe('ManagedGlobalWorkspaceRow', () => {
   })
 })
 
+describe('workspaces empty state', () => {
+  function renderEmpty(role: string | null, computeOnly = false) {
+    return renderToStaticMarkup(
+      <MemoryRouter>
+        <AuthContext.Provider
+          value={{
+            user: role
+              ? {
+                  id: 1,
+                  name: 'Operator',
+                  username: 'operator',
+                  avatar_url: '',
+                  mfa_enabled: false,
+                  role,
+                }
+              : null,
+            isLoading: false,
+            error: null,
+            logout: async () => {},
+            refetch: () => {},
+          }}
+        >
+          <ManagedApplicationWorkspaces
+            entries={[]}
+            globalWorkspace={null}
+            loading={false}
+            error={false}
+            computeOnly={computeOnly}
+          />
+        </AuthContext.Provider>
+      </MemoryRouter>
+    )
+  }
+
+  test('explains what a workspace is and offers to create a project', () => {
+    const html = renderEmpty('admin')
+    expect(html).toContain('No workspaces yet')
+    expect(html).toContain('Create a project to start one.')
+    expect(html).toContain('href="/projects/new"')
+    expect(html).toContain('Create project')
+  })
+
+  test('does not offer project creation to a non-administrator', () => {
+    const html = renderEmpty('reader')
+    expect(html).toContain('No workspaces yet')
+    expect(html).not.toContain('/projects/new')
+    expect(html).not.toContain('Create project')
+    expect(html).toContain('href="/projects"')
+    expect(html).toContain('Open projects')
+  })
+
+  test('keeps the operator view note when no compute is attached', () => {
+    const html = renderEmpty('admin', true)
+    expect(html).toContain('No workspace-owned compute is attached.')
+    expect(html).not.toContain('No workspaces yet')
+  })
+
+  test('a failed read is not reported as having no workspaces', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ManagedApplicationWorkspaces
+          entries={[]}
+          globalWorkspace={null}
+          loading={false}
+          error
+        />
+      </MemoryRouter>
+    )
+    expect(html).not.toContain('No workspaces yet')
+    expect(html).toContain('could not be loaded')
+  })
+})
+
 describe('workspace and operator views', () => {
   function render(computeOnly: boolean, attached: boolean, error = false) {
     return renderToStaticMarkup(
@@ -150,7 +224,7 @@ describe('workspace and operator views', () => {
       </MemoryRouter>
     )
     expect(html).toContain('/ai-harnesses/claude-code.svg')
-    expect(html).toContain('aria-label="0 projects"')
+    expect(html).toContain('aria-label="0 services"')
     expect(html).toContain('aria-label="Threads running"')
     expect(html).toContain('aria-label="1 finished thread"')
     expect(html).toContain('aria-label="1 failed thread"')

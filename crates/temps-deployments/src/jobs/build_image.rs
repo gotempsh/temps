@@ -262,7 +262,7 @@ fn write_no_follow(path: &Path, contents: &[u8], create_new: bool) -> Result<(),
     file.write_all(contents).map_err(WorkflowError::IoError)
 }
 
-fn read_confined_control_file(
+pub(crate) fn read_confined_control_file(
     root: &Path,
     path: &Path,
     max_bytes: u64,
@@ -498,6 +498,39 @@ impl RepositoryOutput {
     }
 }
 
+/// The parts of a worker-built image's configuration that later jobs read.
+///
+/// Recorded from the node that owns the image, so a job on the control plane
+/// never needs a local copy to learn how the image runs. `ENV` is deliberately
+/// not carried: it is whatever the Dockerfile baked in, and job outputs are
+/// persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltImageConfig {
+    /// Ports from `EXPOSE`, ascending.
+    #[serde(default)]
+    pub exposed_ports: Vec<u16>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+}
+
+impl BuiltImageConfig {
+    /// `None` when the node did not report the image's configuration (an
+    /// agent that predates it): "unknown" must not read as "exposes nothing".
+    pub fn from_image_info(info: &temps_deployer::ImageInfo) -> Option<Self> {
+        let config = info.config.as_ref()?;
+        Some(Self {
+            exposed_ports: config.exposed_ports.clone(),
+            working_dir: info.working_dir.clone(),
+            user: config.user.clone(),
+            entrypoint: config.entrypoint.clone(),
+        })
+    }
+}
+
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageOutput {
@@ -527,6 +560,11 @@ pub struct ImageOutput {
     /// holds exactly this image.
     #[serde(default)]
     pub image_ids_by_platform: HashMap<String, String>,
+    /// Configuration of the primary image as its owning node reported it.
+    /// `None` for a build on the control plane's own daemon, and for a node
+    /// that predates the field.
+    #[serde(default)]
+    pub image_config: Option<BuiltImageConfig>,
 }
 
 /// What [`BuildImageJob::build_on_platform_workers`] produced.
@@ -538,7 +576,36 @@ struct PerArchitectureBuild {
     image_ids_by_platform: HashMap<String, String>,
 }
 
+/// The id a build recorded for `image_tag`: its own platform's entry on a
+/// mixed-architecture build, otherwise `image_id`. `None` when none was
+/// recorded.
+pub(crate) fn primary_image_id<'a>(
+    image_tag: &str,
+    image_id: &'a str,
+    image_tags_by_platform: &HashMap<String, String>,
+    image_ids_by_platform: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    image_tags_by_platform
+        .iter()
+        .find(|(_, built)| built.as_str() == image_tag)
+        .and_then(|(platform, _)| image_ids_by_platform.get(platform))
+        .map(String::as_str)
+        .or_else(|| (!image_id.trim().is_empty()).then_some(image_id))
+}
+
 impl ImageOutput {
+    /// The id the build recorded for the primary image: its own platform's
+    /// entry on a mixed-architecture build, otherwise the build's `image_id`.
+    /// `None` when none was recorded.
+    pub fn expected_image_id(&self) -> Option<&str> {
+        primary_image_id(
+            &self.image_tag,
+            &self.image_id,
+            &self.image_tags_by_platform,
+            &self.image_ids_by_platform,
+        )
+    }
+
     /// Extract ImageOutput from WorkflowContext
     pub fn from_context(
         context: &WorkflowContext,
@@ -580,6 +647,8 @@ impl ImageOutput {
         let image_ids_by_platform: HashMap<String, String> = context
             .get_output(build_job_id, "image_ids_by_platform")?
             .unwrap_or_default();
+        let image_config: Option<BuiltImageConfig> =
+            context.get_output(build_job_id, "image_config")?.flatten();
 
         Ok(Self {
             image_tag,
@@ -590,6 +659,7 @@ impl ImageOutput {
             image_tags_by_platform,
             builder_node_ids_by_platform,
             image_ids_by_platform,
+            image_config,
         })
     }
 }
@@ -874,6 +944,96 @@ impl BuildImageJob {
         self
     }
 
+    /// What happens to a worker-built image once the build succeeded: its
+    /// configuration is read from the node that owns it, and the image is
+    /// streamed to the control plane only when that cannot be done.
+    ///
+    /// The control plane reads nothing from its own copy of a node-built image
+    /// any more -- the scan runs on the node, extraction reads from it, and
+    /// the container port comes from the configuration recorded here -- so a
+    /// replica placed on the control plane is the only thing that needs the
+    /// image there, and it fetches the image itself. A node that did not
+    /// report the configuration predates all of that and still gets the copy
+    /// the older jobs expect.
+    async fn finish_worker_build(
+        &self,
+        context: &WorkflowContext,
+        image_tag: &str,
+    ) -> Result<Option<BuiltImageConfig>, WorkflowError> {
+        let config = self.read_worker_image_config(context, image_tag).await?;
+        if config.is_none() {
+            self.copy_image_to_control_plane(context, image_tag).await?;
+        }
+        Ok(config)
+    }
+
+    /// The configuration of the image a worker just built, read from the
+    /// worker that owns it.
+    ///
+    /// `Ok(None)` for a build on the control plane's own daemon (nothing to
+    /// record: its callers inspect the local image) and for a node that does
+    /// not report image configuration. A failed inspection is logged and also
+    /// yields `None`, which keeps the control plane's own copy of the image as
+    /// the source of truth, exactly as before.
+    async fn read_worker_image_config(
+        &self,
+        context: &WorkflowContext,
+        image_tag: &str,
+    ) -> Result<Option<BuiltImageConfig>, WorkflowError> {
+        let Some(node_id) = self.remote_builder_node_id else {
+            return Ok(None);
+        };
+        let info = match self.image_builder.inspect_image(image_tag).await {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(
+                    image_tag = %image_tag,
+                    node_id,
+                    "Could not read the configuration of a worker-built image: {error}"
+                );
+                self.log(
+                    context,
+                    format!(
+                        "⚠️ Could not read the image configuration from build node {node_id}: \
+                         {error}"
+                    ),
+                )
+                .await?;
+                return Ok(None);
+            }
+        };
+        let config = BuiltImageConfig::from_image_info(&info);
+        match &config {
+            Some(config) => {
+                self.log(
+                    context,
+                    format!(
+                        "Image '{}' stays on build node {}: exposed ports {:?}, user {}, \
+                         workdir {}. It is copied to the control plane only if a replica is \
+                         placed there",
+                        image_tag,
+                        node_id,
+                        config.exposed_ports,
+                        config.user.as_deref().unwrap_or("(default)"),
+                        config.working_dir.as_deref().unwrap_or("(none)"),
+                    ),
+                )
+                .await?;
+            }
+            None => {
+                self.log(
+                    context,
+                    format!(
+                        "Build node {node_id} did not report the image's configuration \
+                         (an older agent); the image will be copied to the control plane"
+                    ),
+                )
+                .await?;
+            }
+        }
+        Ok(config)
+    }
+
     /// After a build moved off the control plane, stream the image into the
     /// control plane's daemon. A failure is logged, not fatal: the image is
     /// on its worker and can still run there, and a replica placed on the
@@ -919,9 +1079,8 @@ impl BuildImageJob {
                 self.log(
                     context,
                     format!(
-                        "⚠️ Could not copy the image to the control plane: {error}. Source \
-                         maps, static assets and the vulnerability scan for this deployment \
-                         may be skipped"
+                        "⚠️ Could not copy the image to the control plane: {error}. A \
+                         replica placed on the control plane retries the copy before it starts"
                     ),
                 )
                 .await
@@ -1770,6 +1929,7 @@ impl BuildImageJob {
                 image_tags_by_platform: built.image_tags_by_platform,
                 builder_node_ids_by_platform: built.builder_node_ids_by_platform,
                 image_ids_by_platform: built.image_ids_by_platform,
+                image_config: None,
             });
         }
 
@@ -1962,6 +2122,7 @@ impl BuildImageJob {
             image_tags_by_platform,
             builder_node_ids_by_platform: HashMap::new(),
             image_ids_by_platform: HashMap::new(),
+            image_config: None,
         })
     }
 
@@ -2478,8 +2639,9 @@ impl WorkflowTask for BuildImageJob {
         let repo_output = RepositoryOutput::from_context(&context, &self.download_job_id)?;
 
         // Build the image (logs written in real-time)
-        let image_output = self.build_image(&repo_output, &context).await?;
-        self.copy_image_to_control_plane(&context, &image_output.image_tag)
+        let mut image_output = self.build_image(&repo_output, &context).await?;
+        image_output.image_config = self
+            .finish_worker_build(&context, &image_output.image_tag)
             .await?;
 
         // Set typed job outputs
@@ -2504,6 +2666,9 @@ impl WorkflowTask for BuildImageJob {
             &image_output.image_tags_by_platform,
         )?;
         context.set_output(&self.job_id, "builder_node_id", self.remote_builder_node_id)?;
+        if let Some(config) = &image_output.image_config {
+            context.set_output(&self.job_id, "image_config", config)?;
+        }
         // Only a mixed-architecture worker build has more than one builder.
         if !image_output.builder_node_ids_by_platform.is_empty() {
             context.set_output(
@@ -3408,6 +3573,7 @@ mod tests {
                 tags: vec!["test:latest".to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
@@ -3656,9 +3822,167 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Could not copy the image")
                     && line.contains("builder-1")
-                    && line.contains("Source maps")),
+                    && line.contains("replica placed on the control plane")),
             "{lines:?}"
         );
+    }
+
+    /// A node that reports the image's configuration keeps the image: the
+    /// control plane records the configuration and copies nothing.
+    #[tokio::test]
+    async fn node_reporting_image_config_keeps_the_image_off_the_control_plane() {
+        use super::super::node_image::fake::FakeImageStore;
+
+        let mut worker = FakeImageStore::holding("myapp:latest", "sha256:built");
+        worker.config = Some(temps_deployer::ImageConfig {
+            exposed_ports: vec![8080],
+            user: Some("app".to_string()),
+            env: vec!["SYNTHETIC_SETTING=1".to_string()],
+            entrypoint: vec!["/app/server".to_string()],
+        });
+        let worker = Arc::new(worker);
+        let control_plane = Arc::new(FakeImageStore::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .remote_builder_node_id(7)
+            .copy_image_to_control_plane(control_plane.clone(), "builder-1")
+            .build(worker)
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+        let config = job
+            .finish_worker_build(&context, "myapp:latest")
+            .await
+            .unwrap()
+            .expect("the node reported a configuration");
+
+        assert_eq!(config.exposed_ports, vec![8080]);
+        assert_eq!(config.working_dir.as_deref(), Some("/app"));
+        assert_eq!(config.user.as_deref(), Some("app"));
+        assert_eq!(config.entrypoint, vec!["/app/server".to_string()]);
+        assert!(
+            control_plane.images.lock().unwrap().is_empty(),
+            "the image must stay on its node"
+        );
+        let lines = writer.lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("stays on build node 7")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("SYNTHETIC_SETTING")),
+            "image ENV must never reach the build log: {lines:?}"
+        );
+    }
+
+    /// An agent that predates the field keeps the previous behaviour, so the
+    /// older jobs that read the control plane's copy still find it.
+    #[tokio::test]
+    async fn node_without_image_config_still_copies_the_image() {
+        use super::super::node_image::fake::FakeImageStore;
+
+        let worker = Arc::new(FakeImageStore::holding("myapp:latest", "sha256:built"));
+        let control_plane = Arc::new(FakeImageStore::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .remote_builder_node_id(7)
+            .copy_image_to_control_plane(control_plane.clone(), "builder-1")
+            .build(worker)
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+        let config = job
+            .finish_worker_build(&context, "myapp:latest")
+            .await
+            .unwrap();
+
+        assert!(config.is_none());
+        assert_eq!(
+            control_plane.images.lock().unwrap().get("myapp:latest"),
+            Some(&"sha256:built".to_string())
+        );
+    }
+
+    /// A build on the control plane's own daemon records no worker config.
+    #[tokio::test]
+    async fn control_plane_build_records_no_image_config() {
+        use super::super::node_image::fake::FakeImageStore;
+
+        let mut builder = FakeImageStore::holding("myapp:latest", "sha256:built");
+        builder.config = Some(temps_deployer::ImageConfig::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build(Arc::new(builder))
+            .unwrap();
+
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+        let config = job
+            .finish_worker_build(&context, "myapp:latest")
+            .await
+            .unwrap();
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn built_image_config_is_unknown_when_the_node_did_not_report_it() {
+        let mut info = temps_deployer::ImageInfo {
+            id: "sha256:built".to_string(),
+            architecture: "amd64".to_string(),
+            os: "linux".to_string(),
+            platform: "linux/amd64".to_string(),
+            size_bytes: 1,
+            tags: Vec::new(),
+            created: None,
+            working_dir: Some("/srv".to_string()),
+            config: None,
+        };
+        assert_eq!(BuiltImageConfig::from_image_info(&info), None);
+
+        info.config = Some(temps_deployer::ImageConfig::default());
+        let config = BuiltImageConfig::from_image_info(&info).expect("reported");
+        assert!(
+            config.exposed_ports.is_empty(),
+            "an image that exposes nothing is a known answer"
+        );
+        assert_eq!(config.working_dir.as_deref(), Some("/srv"));
+    }
+
+    #[test]
+    fn expected_image_id_prefers_the_platform_entry() {
+        let mut output = ImageOutput {
+            image_tag: "app:1".to_string(),
+            image_id: "sha256:primary".to_string(),
+            size_bytes: 1,
+            build_context: PathBuf::from("."),
+            dockerfile_path: PathBuf::from("Dockerfile"),
+            image_tags_by_platform: HashMap::new(),
+            builder_node_ids_by_platform: HashMap::new(),
+            image_ids_by_platform: HashMap::new(),
+            image_config: None,
+        };
+        assert_eq!(output.expected_image_id(), Some("sha256:primary"));
+
+        output
+            .image_tags_by_platform
+            .insert("linux/arm64".to_string(), "app:1".to_string());
+        output
+            .image_ids_by_platform
+            .insert("linux/arm64".to_string(), "sha256:arm".to_string());
+        assert_eq!(output.expected_image_id(), Some("sha256:arm"));
+
+        output.image_id = " ".to_string();
+        output.image_tags_by_platform.clear();
+        assert_eq!(output.expected_image_id(), None);
     }
 
     /// A build on the control plane has nothing to copy.
@@ -5420,6 +5744,7 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 

@@ -55,7 +55,7 @@ export function PresetGroup({
                 </span>
               )}
               {opt.hint && (
-                <span className="mt-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/70">
+                <span className="mt-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
                   {opt.hint}
                 </span>
               )}

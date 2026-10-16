@@ -20,6 +20,9 @@ use crate::build_protocol::{
     MAX_BUILD_EVENT_BYTES, MAX_BUILD_SPEC_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
+use crate::image_scan::{
+    ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS, MAX_SCAN_REPORT_BYTES,
+};
 use crate::{
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ContainerDeployer,
     ContainerInfo, ContainerStats, DeployRequest, DeployResult, DeployerError, ImageBuilder,
@@ -37,6 +40,9 @@ const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// Slightly exceeds the worker's 30-minute export deadline.
 const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// A node scan waits for an image-operation slot, then runs the scanner;
+/// the request outlasts both of the agent's deadlines.
+const IMAGE_SCAN_REQUEST_TIMEOUT: Duration = crate::image_scan::SCAN_REQUEST_TIMEOUT;
 /// Longest agent error body quoted back into a deployment log.
 const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
 
@@ -44,15 +50,25 @@ async fn bounded_agent_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     operation: &str,
 ) -> Result<T, BuilderError> {
+    bounded_json(response, operation, MAX_BUILD_EVENT_BYTES).await
+}
+
+/// Read a JSON response body of at most `limit` bytes, stopping as soon as
+/// the limit is crossed rather than buffering what a node chooses to send.
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+    limit: usize,
+) -> Result<T, BuilderError> {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             BuilderError::Other(format!("{operation}: response stream failed: {error}"))
         })?;
-        if body.len().saturating_add(chunk.len()) > MAX_BUILD_EVENT_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(BuilderError::ResourceLimitExceeded(format!(
-                "{operation}: response exceeds {MAX_BUILD_EVENT_BYTES} bytes"
+                "{operation}: response exceeds {limit} bytes"
             )));
         }
         body.extend_from_slice(&chunk);
@@ -1431,6 +1447,73 @@ impl ImageBuilder for RemoteNodeDeployer {
         })))
     }
 
+    async fn scan_image_vulnerabilities(
+        &self,
+        image_name: &str,
+        expected_image_id: Option<&str>,
+    ) -> Result<Option<ImageScanReport>, BuilderError> {
+        let response = self
+            .client
+            .post(format!("{}/agent/images/scan", self.agent_url))
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_SCAN_REQUEST_TIMEOUT)
+            .json(&ImageScanRequest {
+                image: image_name.to_string(),
+                expected_image_id: expected_image_id.map(str::to_string),
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot scan image '{image_name}' on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            // An agent that predates the endpoint answers with the router's
+            // empty 404 or 405. A node that has the endpoint but not the
+            // image answers 404 with a problem body, which is a real failure.
+            let is_problem = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("json"));
+            let route_missing = matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ) && !is_problem;
+            let detail = agent_error_detail(response).await;
+            if route_missing {
+                tracing::debug!(
+                    node = %self.node_name,
+                    "Node does not serve /agent/images/scan (HTTP {status}); scanning locally"
+                );
+                return Ok(None);
+            }
+            return Err(match status {
+                reqwest::StatusCode::NOT_FOUND => BuilderError::ImageNotFound(format!(
+                    "Node '{}' has no image '{image_name}' to scan: {detail}",
+                    self.node_name
+                )),
+                _ => BuilderError::Other(format!(
+                    "Node '{}' could not scan image '{image_name}' (HTTP {status}): {detail}",
+                    self.node_name
+                )),
+            });
+        }
+        let operation = format!("Scan image '{image_name}' on node '{}'", self.node_name);
+        let report: ImageScanReport =
+            bounded_json(response, &operation, MAX_SCAN_REPORT_BYTES).await?;
+        if report.findings.len() > MAX_SCAN_FINDINGS {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "{operation}: report lists {} findings, more than the {MAX_SCAN_FINDINGS} limit",
+                report.findings.len()
+            )));
+        }
+        Ok(Some(report))
+    }
+
     /// Extract from an image that lives on this worker.
     ///
     /// The worker only streams the raw archive; it is unpacked here under the
@@ -2233,6 +2316,144 @@ mod tests {
         assert!(request
             .to_lowercase()
             .contains("authorization: bearer test-token"));
+    }
+
+    #[tokio::test]
+    async fn inspection_from_an_older_agent_reports_no_image_config() {
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":null}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        assert!(
+            info.config.is_none(),
+            "an agent that does not report the config must read as unknown, not as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_carries_the_image_config_the_node_reports() {
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":"/app","config":{"exposed_ports":[8080],"user":"app","env":["A=1"],"entrypoint":["/app/server"]}}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        let config = info.config.expect("reported");
+        assert_eq!(config.exposed_ports, vec![8080]);
+        assert_eq!(config.user.as_deref(), Some("app"));
+        assert_eq!(config.entrypoint, vec!["/app/server".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_posts_the_expected_image_id_to_the_owning_node() {
+        let body = serde_json::to_vec(&ImageScanReport {
+            image_id: "sha256:built".into(),
+            scanner: "trivy".into(),
+            scanner_version: Some("0.58.1".into()),
+            findings: Vec::new(),
+        })
+        .unwrap();
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let report = remote
+            .scan_image_vulnerabilities("app:1", Some("sha256:built"))
+            .await
+            .unwrap()
+            .expect("the node scanned");
+
+        assert_eq!(report.scanner_version.as_deref(), Some("0.58.1"));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /agent/images/scan "), "{request}");
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer node-token"));
+        assert!(request.contains(r#""image":"app:1""#), "{request}");
+        assert!(
+            request.contains(r#""expected_image_id":"sha256:built""#),
+            "{request}"
+        );
+    }
+
+    /// An agent that predates the endpoint answers with the router's bare
+    /// 404: the caller must scan another way, not report a failed scan.
+    #[tokio::test]
+    async fn scan_against_an_agent_without_the_endpoint_is_not_an_error() {
+        let (url, _server) = spawn_one_shot_agent("404 Not Found", "text/plain", b"").await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let outcome = remote.scan_image_vulnerabilities("app:1", None).await;
+
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+    }
+
+    /// A node that serves the endpoint but lacks the image is a real answer.
+    #[tokio::test]
+    async fn scan_of_an_image_the_node_lacks_is_image_not_found() {
+        let (url, _server) = spawn_one_shot_agent(
+            "404 Not Found",
+            "application/problem+json",
+            br#"{"title":"Image not found","status":404,"detail":"Image 'app:1' is not present on this node"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", None)
+            .await
+            .expect_err("missing image");
+
+        assert!(matches!(error, BuilderError::ImageNotFound(_)), "{error}");
+        assert!(error.to_string().contains("builder-1"), "{error}");
+    }
+
+    /// A node that now serves a different image under the tag is refused.
+    #[tokio::test]
+    async fn scan_identity_conflict_is_an_error_naming_the_node() {
+        let (url, _server) = spawn_one_shot_agent(
+            "409 Conflict",
+            "application/problem+json",
+            br#"{"title":"Image identity mismatch","status":409,"detail":"tag names another image"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", Some("sha256:built"))
+            .await
+            .expect_err("identity conflict");
+
+        assert!(matches!(error, BuilderError::Other(_)), "{error}");
+        assert!(error.to_string().contains("409"), "{error}");
+    }
+
+    /// A node cannot make the control plane buffer or store an arbitrary
+    /// number of findings.
+    #[tokio::test]
+    async fn scan_report_over_the_finding_limit_is_refused() {
+        let finding = serde_json::json!({
+            "vulnerability_id": "CVE-2000-0001",
+            "package_name": "p",
+            "installed_version": "1",
+            "severity": "LOW",
+            "title": "t",
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "image_id": "sha256:built",
+            "scanner": "trivy",
+            "findings": vec![finding; MAX_SCAN_FINDINGS + 1],
+        }))
+        .unwrap();
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", None)
+            .await
+            .expect_err("too many findings");
+
+        assert!(
+            matches!(error, BuilderError::ResourceLimitExceeded(_)),
+            "{error}"
+        );
     }
 
     #[tokio::test]

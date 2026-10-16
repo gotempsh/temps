@@ -74,7 +74,7 @@ describe('WorkspaceGitConnections', () => {
     expect(html).toContain('origin')
     expect(html).toContain('backup')
     expect(html).toContain('does not publish files')
-    expect(html).toContain('Disconnect origin from project 1')
+    expect(html).toContain('Disconnect origin from service 1')
   })
   test('loading and failures are exposed accessibly', () => {
     const html = renderToStaticMarkup(

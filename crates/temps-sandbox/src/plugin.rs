@@ -182,6 +182,20 @@ impl TempsPlugin for SandboxPlugin {
 
             let sandbox_service = context.get_service::<SandboxService>();
 
+            // Firecracker and microsandbox VMs are children of this process,
+            // so a service manager that kills the whole unit on restart takes
+            // them down. Say so while the operator is looking at the logs, in
+            // the background: it shells out to `systemctl`.
+            {
+                use temps_agents::sandbox::SandboxBackend;
+                let provider = registry.provider();
+                if provider.supports_backend(SandboxBackend::Firecracker)
+                    || provider.supports_backend(SandboxBackend::Microsandbox)
+                {
+                    tokio::spawn(crate::services::service_manager::warn_if_restart_kills_vms());
+                }
+            }
+
             // Inject this plugin's service into the agents' sandbox registry
             // so agent runs (autofixer, workflow agents) create first-class
             // `sandboxes` rows instead of untracked containers.
@@ -213,13 +227,16 @@ impl TempsPlugin for SandboxPlugin {
                     // (ADR-048) are recovered lazily on first use (the
                     // registry reads the row's node): one unreachable worker
                     // must not add a timeout per sandbox to startup.
-                    let entries: Vec<(i32, String)> = rows
-                        .iter()
+                    let local_rows: Vec<sandboxes::Model> = rows
+                        .into_iter()
                         // Agent-run sandboxes use `temps-sandbox-<run_id>`
                         // container names and are recovered by the agents'
                         // own registry — skip them here.
                         .filter(|r| r.agent_run_id.is_none())
                         .filter(|r| r.node_id.is_none())
+                        .collect();
+                    let entries: Vec<(i32, String)> = local_rows
+                        .iter()
                         .map(|r| {
                             let label = r
                                 .public_id
@@ -236,6 +253,54 @@ impl TempsPlugin for SandboxPlugin {
                             recovered,
                             entries.len()
                         );
+                    }
+
+                    // Recovery only re-attaches handles; it does not prove the
+                    // VMs behind them are running. Firecracker and microsandbox
+                    // VMs die with the Temps process when the service manager
+                    // kills its whole control group on restart, and with the
+                    // host on reboot, leaving rows that say `running` for
+                    // sandboxes with nothing behind them. Move those to
+                    // `stopped` now so listings are true and `resume` works.
+                    match &sandbox_service {
+                        Some(service) => {
+                            let vm_rows: Vec<sandboxes::Model> = local_rows
+                                .into_iter()
+                                .filter(crate::services::sandbox_service::reconcilable_at_startup)
+                                .collect();
+                            if !vm_rows.is_empty() {
+                                // In the background: a wedged VM costs up to the
+                                // per-check deadline, and startup must not wait
+                                // for it. The same check runs lazily on first
+                                // access, so nothing depends on this finishing.
+                                let service = service.clone();
+                                tokio::spawn(async move {
+                                    let report = service.reconcile_running_vms(vm_rows).await;
+                                    if report.all_alive() {
+                                        info!(
+                                            checked = report.checked,
+                                            alive = report.alive,
+                                            "Sandbox plugin: every running VM sandbox row has a live VM"
+                                        );
+                                    } else {
+                                        warn!(
+                                            checked = report.checked,
+                                            alive = report.alive,
+                                            unverified = report.unverified,
+                                            not_marked = report.not_marked,
+                                            marked_stopped = report.marked_stopped_total,
+                                            marked_stopped_ids = ?report.marked_stopped,
+                                            "Sandbox plugin: not every running VM sandbox has a confirmed live VM; \
+                                             rows whose VM is down were marked stopped (resume them with \
+                                             `temps sandbox resume <id>`)"
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        None => warn!(
+                            "Sandbox plugin: sandbox service absent — skipping VM state reconciliation"
+                        ),
                     }
                 }
                 Err(e) => {

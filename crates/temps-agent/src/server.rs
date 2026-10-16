@@ -154,6 +154,7 @@ pub fn build_router(
             "/agent/images/extract",
             get(crate::build_handler::extract_image_path),
         )
+        .route("/agent/images/scan", post(crate::build_handler::scan_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
@@ -267,6 +268,10 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
         .route(
             "/agent/sandboxes/recover",
             post(sandbox_handlers::recover_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/release-orphaned",
+            post(sandbox_handlers::release_orphaned_sandbox_resources),
         )
         .route(
             "/agent/sandboxes/status",
@@ -1126,7 +1131,7 @@ mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 13] = [
+    const SANDBOX_ROUTES: [&str; 14] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1139,6 +1144,7 @@ mod tests {
         "/agent/sandboxes/stop",
         "/agent/sandboxes/start",
         "/agent/sandboxes/recover",
+        "/agent/sandboxes/release-orphaned",
         "/agent/sandboxes/status",
     ];
     const UPLOAD_ROUTES: [&str; 2] = [

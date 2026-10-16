@@ -9,6 +9,7 @@ pub mod global_handler;
 pub mod handler;
 pub mod ingest_keys;
 pub mod plugin;
+pub mod retention;
 pub mod traits;
 pub mod types;
 pub mod visitor_audit;

@@ -179,7 +179,7 @@ export function EnvironmentHeaderBar({
                     aria-hidden="true"
                   />
                   <span className="capitalize">{deployment.status}</span>
-                  <span className="text-neutral-500 dark:text-neutral-400">
+                  <span className="text-neutral-600 dark:text-neutral-400">
                     deployment
                   </span>
                   <ExternalLink className="size-3" aria-hidden="true" />

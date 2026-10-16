@@ -24,7 +24,8 @@ async function mockCrawlerPage(page: Page) {
         main_branch: 'main',
         directory: '.',
       }
-    else if (url.pathname.endsWith('/last-deployment')) json = null
+    else if (url.pathname.endsWith('/last-deployment'))
+      json = { deployment: null }
     else if (url.pathname.endsWith('/active-visitors')) json = { count: 0 }
     else if (url.pathname === '/api/proxy-logs') {
       const hours =

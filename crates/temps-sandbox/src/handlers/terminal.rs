@@ -171,6 +171,16 @@ const MISSED_PONGS_BEFORE_CLOSE: u32 = 3;
 /// timeout meaningful.
 const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest `attach_pty` may take before the request is answered with a 504.
+///
+/// Attaching can include first-use work inside the guest (installing and
+/// starting the terminal agent), and a guest that has stopped answering would
+/// otherwise hold this request — and its concurrent-terminal slot — open for
+/// as long as the client cares to wait. The providers bound their own steps
+/// (bootstrap 60 s plus relay start 20 s on microsandbox); this is the
+/// backstop above them, so it is deliberately a little larger.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(100);
+
 /// Hard ceiling on a single attachment.
 ///
 /// Authorization is evaluated once, at upgrade, and never revalidated — so a
@@ -247,10 +257,47 @@ enum ServerEvent<'a> {
     },
 }
 
+/// Command for the default terminal tab: a login `bash` when the guest has
+/// one, a login `sh` otherwise.
+///
+/// Login so `~/.bashrc` / `/etc/profile` run and the AI CLIs are on PATH; the
+/// image seeds PATH there precisely because non-login shells miss them.
+///
+/// The fallback matters for the microVM backends, whose default image is
+/// `alpine:3.20` — no `bash` at all, so a hardcoded `/bin/bash -l` made the
+/// tab exit with "not found" the moment it opened. `command -v` is a shell
+/// builtin (available in busybox `ash` and `dash` alike), so the probe costs
+/// no extra process and never depends on `which` being installed.
 fn default_shell_cmd() -> String {
-    // Login shell so ~/.bashrc runs and the AI CLIs are on PATH. The image
-    // seeds PATH there precisely because non-login shells miss them.
-    "/bin/bash -l".to_string()
+    "if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi".to_string()
+}
+
+/// Backend-specific remedy appended to a failed terminal attach.
+///
+/// The Docker backend's PTY agent ships *inside* the sandbox image, so a
+/// failure there points at the image. The microVM backends inject the agent
+/// from a binary staged on the host by their setup command, so the same
+/// hint would send the user hunting for an image problem that does not exist.
+fn terminal_unavailable_hint(backend: temps_agents::sandbox::SandboxBackend) -> &'static str {
+    use temps_agents::sandbox::SandboxBackend;
+    match backend {
+        SandboxBackend::Docker => {
+            "Interactive terminals need the temps PTY agent, which ships in the \
+             default sandbox image."
+        }
+        SandboxBackend::Firecracker => {
+            "Firecracker terminals need the guest PTY agent staged on the host \
+             (`temps firecracker setup --pty-agent-bin <path>`); sandboxes created \
+             before it was staged must be recreated."
+        }
+        SandboxBackend::Microsandbox => {
+            "microsandbox terminals need the guest PTY agent staged on the host \
+             (`temps microsandbox setup --pty-agent-bin <path>`) and a guest with `/bin/sh`."
+        }
+        SandboxBackend::Local => {
+            "Interactive terminals are not supported by the local sandbox backend."
+        }
+    }
 }
 
 /// Wrap the requested program so the PTY is in a sane line discipline before
@@ -309,7 +356,9 @@ fn wrap_with_sane_termios(cmd: &str) -> String {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Sandbox not found"),
-        (status = 409, description = "Sandbox is not in a state that can be attached to"),
+        (status = 409, description = "Terminal unavailable: the sandbox is not running, or its backend's guest terminal agent is missing (the problem detail names the fix)"),
+        (status = 429, description = "Too many concurrent terminals for this instance or account"),
+        (status = 504, description = "The sandbox's guest did not accept a terminal in time"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -365,41 +414,25 @@ pub async fn terminal(
         .resolve_id(&id, auth.user_id())
         .await?;
 
+    // A VM that is down surfaces as a 409 naming the sandbox, its backend and
+    // how to bring it back, not as a 404 for an id that is still listed.
     let handle = state
         .sandbox_service
-        .registry()
-        .get(internal_id, &id)
+        .live_handle(&row)
         .await
-        .map_err(|e| {
-            let err = crate::services::sandbox_service::SandboxService::provider_err(&id, e);
-            Problem::from(err)
-        })?;
+        .map_err(Problem::from)?;
 
-    let attachment = state
-        .sandbox_service
-        .registry()
-        .provider()
-        .attach_pty(&handle)
-        .await
-        .map_err(|e| {
-            // A sandbox on a worker node: terminals are not available there
-            // yet (ADR-048). Say exactly that — the PTY-agent hint below
-            // would send the user hunting for an image problem.
-            if let temps_agents::error::AgentError::SandboxUnsupportedOnNode { .. } = e {
-                return Problem::from(crate::error::from_agent_error(&id, e));
-            }
-            // Most likely cause on a real deployment: a sandbox created from
-            // a custom image that doesn't carry the PTY agent. Say so, rather
-            // than leaving the user with a terminal that never echoes.
-            problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Terminal Unavailable")
-                .with_detail(format!(
-                    "Could not attach a terminal to sandbox {}: {}. \
-                     Interactive terminals need the temps PTY agent, which \
-                     ships in the default sandbox image.",
-                    id, e
-                ))
-        })?;
+    let attachment = bounded_attach(
+        &id,
+        ATTACH_TIMEOUT,
+        state
+            .sandbox_service
+            .registry()
+            .provider()
+            .attach_pty(&handle),
+    )
+    .await?
+    .map_err(|e| attach_failure_problem(&id, handle.backend, e))?;
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
@@ -780,6 +813,131 @@ async fn send_error(ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>, 
     let _ = ws_tx.close().await;
 }
 
+/// The 504 for a guest that did not accept a terminal in time. Shared by the
+/// handler's own deadline and by providers that report their own step
+/// timeouts, so a stalled guest always looks the same to a client — and is
+/// never answered with the 409 "terminal unavailable" setup advice, which
+/// would send the operator to fix something that is not broken.
+fn attach_timeout_problem(sandbox_id: &str, what: &str) -> Problem {
+    problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+        .with_title("Terminal Attach Timed Out")
+        .with_detail(format!(
+            "Sandbox {} did not accept a terminal: {}. Its guest may be overloaded or \
+             unresponsive; retry in a moment, or restart the sandbox if this persists.",
+            sandbox_id, what
+        ))
+}
+
+/// Map a provider's `attach_pty` failure to the response a client should see.
+///
+/// Four different situations, four different answers:
+/// - the sandbox lives on a worker node, where terminals are not available
+///   yet (ADR-048): the node-specific 422, not a hunt for an image problem;
+/// - the guest stalled past a provider deadline: a 504 to retry or restart;
+/// - the provider could not offer a terminal on this sandbox: a 409 whose
+///   detail carries the provider's own cause plus where to fix it;
+/// - an agent-run, definition or secret error, which a sandbox provider never
+///   produces: a 500 with no setup advice, since there is nothing to set up.
+///
+/// Every `AgentError` variant is named so that a new one has to be placed in
+/// one of these groups instead of silently becoming setup advice.
+fn attach_failure_problem(
+    sandbox_id: &str,
+    backend: temps_agents::sandbox::SandboxBackend,
+    error: temps_agents::error::AgentError,
+) -> Problem {
+    use temps_agents::error::AgentError;
+
+    match error {
+        unsupported @ AgentError::SandboxUnsupportedOnNode { .. } => {
+            Problem::from(crate::error::from_agent_error(sandbox_id, unsupported))
+        }
+        // The VM died between the liveness check and the attach: the same
+        // problem (type, title, how to recover) the liveness check returns.
+        not_running @ AgentError::SandboxNotRunning { .. } => {
+            Problem::from(crate::error::from_agent_error(sandbox_id, not_running))
+        }
+        timeout @ AgentError::SandboxTerminalTimeout { .. } => {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error = %timeout,
+                "terminal attach timed out in the guest"
+            );
+            attach_timeout_problem(sandbox_id, &timeout.to_string())
+        }
+        unavailable @ (AgentError::SandboxExecFailed { .. }
+        | AgentError::SandboxCreationFailed { .. }
+        | AgentError::SandboxNotFound { .. }
+        | AgentError::SandboxProviderUnavailable { .. }
+        | AgentError::SandboxNodeUnavailable { .. }
+        | AgentError::SandboxConflictOnNode { .. }
+        | AgentError::Validation { .. }
+        | AgentError::ImmutableSandboxImageRebuild { .. }
+        | AgentError::SnapshotSizeLimitExceeded { .. }
+        | AgentError::Io(_)
+        | AgentError::Database(_)) => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Terminal Unavailable")
+            .with_detail(format!(
+                "Could not attach a terminal to sandbox {}: {}. {}",
+                sandbox_id,
+                unavailable,
+                terminal_unavailable_hint(backend)
+            )),
+        unexpected @ (AgentError::ConfigNotFound { .. }
+        | AgentError::AgentNotFound { .. }
+        | AgentError::RunNotFound { .. }
+        | AgentError::ProjectNotFound { .. }
+        | AgentError::BudgetExceeded { .. }
+        | AgentError::CooldownActive { .. }
+        | AgentError::AiCliNotInstalled { .. }
+        | AgentError::AiCliFailed { .. }
+        | AgentError::AiCliReportedError { .. }
+        | AgentError::AiCliTimeout { .. }
+        | AgentError::GitError { .. }
+        | AgentError::EncryptionError { .. }
+        | AgentError::SecretNotFound { .. }
+        | AgentError::SkillDefinitionNotFound { .. }
+        | AgentError::McpDefinitionNotFound { .. }
+        | AgentError::McpConfigFieldNotFound { .. }
+        | AgentError::SkillDefinitionAlreadyExists { .. }
+        | AgentError::McpDefinitionAlreadyExists { .. }
+        | AgentError::DockerSocketWriteRequiresAdmin { .. }) => {
+            tracing::error!(
+                sandbox_id = %sandbox_id,
+                error = %unexpected,
+                "sandbox provider returned an error it never produces for a terminal attach"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Terminal Attach Failed")
+                .with_detail(format!(
+                    "Could not attach a terminal to sandbox {}: {}",
+                    sandbox_id, unexpected
+                ))
+        }
+    }
+}
+
+/// Run an `attach_pty` future under `deadline`, answering 504 when the guest
+/// does not respond in time. The inner result is returned untouched so the
+/// caller keeps its backend-specific mapping.
+async fn bounded_attach<T>(
+    sandbox_id: &str,
+    deadline: Duration,
+    attach: impl std::future::Future<Output = Result<T, temps_agents::error::AgentError>>,
+) -> Result<Result<T, temps_agents::error::AgentError>, Problem> {
+    tokio::time::timeout(deadline, attach).await.map_err(|_| {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            deadline_secs = deadline.as_secs(),
+            "terminal attach timed out"
+        );
+        attach_timeout_problem(
+            sandbox_id,
+            &format!("no answer within {}s", deadline.as_secs()),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,7 +998,45 @@ mod tests {
         // inside a shell that does not work.
         let wrapped = wrap_with_sane_termios(&default_shell_cmd());
         assert!(wrapped.starts_with("stty sane"), "{wrapped}");
-        assert!(wrapped.contains("'/bin/bash -l'"), "{wrapped}");
+        assert!(wrapped.contains("exec bash -l"), "{wrapped}");
+        assert!(wrapped.contains("exec sh -l"), "{wrapped}");
+        // The default has no single quotes, so wrapping it leaves the inner
+        // command in one piece for the nested `sh -c`.
+        assert_eq!(wrapped.matches('\'').count(), 2, "{wrapped}");
+    }
+
+    /// Run `default_shell_cmd()` under `/bin/sh -c` with `PATH` restricted to
+    /// a directory holding only the named stand-in programs, each of which
+    /// prints `<name>:<args>` instead of starting a shell.
+    fn run_default_shell_with(programs: &[&str]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in programs {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho {name}:\"$@\"\n")).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(default_shell_cmd())
+            .env_clear()
+            .env("PATH", dir.path())
+            .output()
+            .expect("run /bin/sh");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn default_shell_prefers_bash_when_the_guest_has_it() {
+        assert_eq!(run_default_shell_with(&["bash", "sh"]), "bash:-l");
+    }
+
+    #[test]
+    fn default_shell_falls_back_to_sh_on_a_guest_without_bash() {
+        // The alpine microVM images: a tab that ran `bash -l` died with
+        // "not found" before the user saw a prompt.
+        assert_eq!(run_default_shell_with(&["sh"]), "sh:-l");
     }
 
     #[test]
@@ -895,6 +1091,31 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hints_point_each_backend_at_its_own_fix() {
+        use temps_agents::sandbox::SandboxBackend;
+        let docker = terminal_unavailable_hint(SandboxBackend::Docker);
+        assert!(docker.contains("sandbox image"), "{docker}");
+
+        // The microVM backends have no image-borne agent; sending their
+        // users to the sandbox image would be a dead end.
+        let firecracker = terminal_unavailable_hint(SandboxBackend::Firecracker);
+        assert!(
+            firecracker.contains("temps firecracker setup"),
+            "{firecracker}"
+        );
+        assert!(!firecracker.contains("sandbox image"), "{firecracker}");
+
+        let microsandbox = terminal_unavailable_hint(SandboxBackend::Microsandbox);
+        assert!(
+            microsandbox.contains("temps microsandbox setup"),
+            "{microsandbox}"
+        );
+        assert!(!microsandbox.contains("sandbox image"), "{microsandbox}");
+
+        assert!(terminal_unavailable_hint(SandboxBackend::Local).contains("not supported"));
+    }
+
+    #[test]
     fn tab_accepts_ordinary_names() {
         for ok in ["main", "claude", "tab-2", "my_work_1", &"a".repeat(64)] {
             assert!(validate_tab(ok).is_ok(), "should accept {ok:?}");
@@ -928,6 +1149,139 @@ mod tests {
         const _: () = assert!(MAX_CONCURRENT_TERMINALS > 0);
         const _: () = assert!(MAX_CONCURRENT_TERMINALS <= 128);
         assert_eq!(TERMINAL_SLOTS.available_permits(), MAX_CONCURRENT_TERMINALS);
+    }
+
+    #[tokio::test]
+    async fn attach_that_never_completes_is_answered_with_504() {
+        let problem = bounded_attach::<()>(
+            "sbx_test",
+            Duration::from_millis(20),
+            std::future::pending(),
+        )
+        .await
+        .expect_err("a hung attach must time out");
+        let body = format!("{problem:?}");
+        assert!(
+            body.contains("504") || body.contains("GATEWAY_TIMEOUT"),
+            "{body}"
+        );
+        assert!(body.contains("sbx_test"), "{body}");
+    }
+
+    #[test]
+    fn provider_step_timeouts_are_504_not_409() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        // A Firecracker handshake (10s) and a microsandbox bootstrap (60s)
+        // both fail well before the handler's 100s deadline. They must not
+        // surface as "terminal unavailable" with setup advice.
+        for backend in [SandboxBackend::Firecracker, SandboxBackend::Microsandbox] {
+            let problem = attach_failure_problem(
+                "sbx_test",
+                backend,
+                AgentError::terminal_timeout(
+                    "sbx_test",
+                    "agent handshake on vsock port 5000",
+                    Duration::from_secs(10),
+                ),
+            );
+            assert_eq!(problem.status_code, StatusCode::GATEWAY_TIMEOUT);
+            let body = format!("{problem:?}");
+            assert!(body.contains("Terminal Attach Timed Out"), "{body}");
+            assert!(body.contains("vsock port 5000"), "{body}");
+            assert!(
+                !body.contains("setup"),
+                "a stalled guest is not a setup problem: {body}"
+            );
+        }
+    }
+
+    /// A VM that dies between the liveness check and the attach gets the same
+    /// problem as one found dead by the liveness check, not the generic
+    /// "Terminal Unavailable" with backend setup advice.
+    #[test]
+    fn a_vm_lost_during_attach_is_the_vm_not_running_problem() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        let problem = attach_failure_problem(
+            "sbx_test",
+            SandboxBackend::Firecracker,
+            AgentError::SandboxNotRunning {
+                run_id: 0,
+                sandbox_id: "sbx_test".into(),
+                container: "temps-sandbox-test".into(),
+                backend: "firecracker".into(),
+                reason: "its firecracker process exited".into(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/sandbox-vm-not-running")
+        );
+        let body = format!("{problem:?}");
+        assert!(body.contains("sandbox resume sbx_test"), "{body}");
+        assert!(!body.contains("Terminal Unavailable"), "{body}");
+    }
+
+    #[test]
+    fn missing_terminal_support_stays_409_with_the_backend_hint() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        let problem = attach_failure_problem(
+            "sbx_test",
+            SandboxBackend::Firecracker,
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: "sbx_test".into(),
+                reason: "no terminal listener answered on vsock port 5000".into(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = format!("{problem:?}");
+        assert!(body.contains("Terminal Unavailable"), "{body}");
+        assert!(body.contains("no terminal listener"), "{body}");
+        assert!(
+            body.contains(terminal_unavailable_hint(SandboxBackend::Firecracker)),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn errors_a_provider_never_produces_are_500_without_setup_advice() {
+        use temps_agents::error::AgentError;
+        use temps_agents::sandbox::SandboxBackend;
+
+        let problem = attach_failure_problem(
+            "sbx_test",
+            SandboxBackend::Microsandbox,
+            AgentError::RunNotFound { run_id: 7 },
+        );
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = format!("{problem:?}");
+        assert!(body.contains("sbx_test"), "{body}");
+        assert!(
+            !body.contains(terminal_unavailable_hint(SandboxBackend::Microsandbox)),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_result_passes_through_inside_the_deadline() {
+        let ok = bounded_attach("sbx_test", Duration::from_secs(5), async { Ok(7u8) })
+            .await
+            .expect("no timeout");
+        assert_eq!(ok.expect("attach ok"), 7);
+    }
+
+    #[test]
+    fn attach_deadline_covers_the_providers_own_bounds() {
+        // Microsandbox: 60 s bootstrap + 20 s relay start. The backstop must
+        // sit above that or it would pre-empt the provider's better error.
+        assert!(ATTACH_TIMEOUT > Duration::from_secs(80));
     }
 
     #[test]

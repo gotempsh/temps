@@ -49,6 +49,7 @@ pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod rc_client;
+pub mod recreate_guard;
 pub mod redis;
 pub mod restore_helper;
 pub mod restore_image;
@@ -1905,6 +1906,20 @@ pub trait ExternalService: Send + Sync {
 
     /// Remove the service and its data completely
     async fn remove(&self) -> Result<()>;
+
+    /// The engine and storage a container created now from `service_config`
+    /// would use, so a caller that has to replace this service's container
+    /// can do it through [`recreate_guard`]. `None` means the engine cannot
+    /// be replaced by a generic caller, which must then refuse.
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        recreate_guard::ManagedEngine,
+        recreate_guard::ReplacementStorage,
+    )> {
+        None
+    }
 
     /// Docker container and volume names this service owns, derived from its
     /// name. `None` when the engine does not report them, which callers must

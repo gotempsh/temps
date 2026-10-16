@@ -497,7 +497,7 @@ export function CreateServiceForm({
                           <ChevronRight className="h-4 w-4" />
                         )}
                         Advanced configuration
-                        <span className="text-xs text-muted-foreground/70">
+                        <span className="text-xs text-muted-foreground">
                           {advancedParamsHint(serviceType)}
                         </span>
                       </button>

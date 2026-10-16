@@ -28,8 +28,8 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
     return (
       <div className="w-full py-4">
         <ErrorAlert
-          title="Failed to load project setup"
-          description="Temps could not check the current setup state for this project."
+          title="Failed to load service setup"
+          description="Temps could not check the current setup state for this service."
           retry={() => setup.refetch()}
         />
       </div>
@@ -71,18 +71,18 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
             <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
               {setup.allDone ? (
                 <div className="flex items-start gap-4">
-                  <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-500">
+                  <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-700 dark:text-emerald-500">
                     <CheckCircle2 className="size-5" />
                   </div>
                   <div>
-                    <p className="text-xs font-medium text-emerald-500">
+                    <p className="text-xs font-medium text-emerald-700 dark:text-emerald-500">
                       Setup complete
                     </p>
                     <h2 className="mt-0.5 text-lg font-semibold tracking-tight">
-                      This project is production-ready
+                      This service is production-ready
                     </h2>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      Every recommended project integration is connected and
+                      Every recommended service integration is connected and
                       reporting.
                     </p>
                   </div>
@@ -140,7 +140,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
 
       <section className="space-y-3">
         <div>
-          <h2 className="text-sm font-semibold">All project setup items</h2>
+          <h2 className="text-sm font-semibold">All service setup items</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
             Completed items remain available so you can revisit their
             configuration at any time.
@@ -164,7 +164,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
                     className={cn(
                       'flex size-10 items-center justify-center rounded-xl border bg-muted text-muted-foreground',
                       step.done &&
-                        'border-emerald-500/20 bg-emerald-500/10 text-emerald-500'
+                        'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500'
                     )}
                   >
                     {step.done ? (
@@ -182,7 +182,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
                   <div className="flex items-center gap-2">
                     <h3 className="text-sm font-semibold">{step.title}</h3>
                     {step.done && (
-                      <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-500">
+                      <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-500">
                         Complete
                       </span>
                     )}

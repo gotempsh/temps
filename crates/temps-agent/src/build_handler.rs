@@ -23,6 +23,7 @@ use temps_deployer::{
         validate_archive_path, BuildEvent, BuildFailure, BuildFailureKind, BuildSpec,
         MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES, MAX_BUILD_SPEC_BYTES,
     },
+    image_scan::{ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS},
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError,
 };
 use tokio::io::AsyncWriteExt;
@@ -46,6 +47,8 @@ enum AgentImageError {
     NotFound(String),
     #[error("Worker image storage operation failed: {0}")]
     Storage(String),
+    #[error("Worker image conflict: {0}")]
+    Conflict(String),
 }
 
 impl From<AgentImageError> for Problem {
@@ -64,6 +67,7 @@ impl From<AgentImageError> for Problem {
             AgentImageError::Storage(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Image operation failed")
             }
+            AgentImageError::Conflict(_) => (StatusCode::CONFLICT, "Image identity mismatch"),
         };
         problemdetails::new(status)
             .with_title(title)
@@ -593,6 +597,137 @@ pub async fn export_image(
         deadline,
         "Image export exceeded its 30-minute deadline",
     )))
+}
+
+/// Scan an image on this node for vulnerabilities, so the control plane never
+/// has to hold the image to do it.
+///
+/// The scan is a multi-minute CPU burst. It takes one of the node's
+/// image-operation slots for its whole run, so it queues behind -- and is
+/// bounded together with -- builds, imports and exports instead of competing
+/// with them. Only images already on this node are scanned; nothing is pulled
+/// on request.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/scan",
+    request_body = ImageScanRequest,
+    responses(
+        (status = 200, description = "Vulnerability findings for the image", body = ImageScanReport),
+        (status = 400, description = "Invalid image reference"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Deployment-read permission required"),
+        (status = 404, description = "Image not present on this node"),
+        (status = 409, description = "The tag names a different image than expected_image_id"),
+        (status = 413, description = "The report exceeds the finding limit"),
+        (status = 500, description = "Scan failed"),
+        (status = 503, description = "Docker unavailable or image operation capacity unavailable"),
+        (status = 504, description = "Scan or capacity wait exceeded its deadline")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn scan_image(
+    RequireAgentAuth(auth): RequireAgentAuth,
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    axum::Json(request): axum::Json<ImageScanRequest>,
+) -> Result<axum::Json<ImageScanReport>, Problem> {
+    permission_guard!(auth, DeploymentsRead);
+    let ImageScanRequest {
+        image,
+        expected_image_id,
+    } = request;
+    validate_image_reference(&image)?;
+    // The reference becomes an argument of the scanner container; a leading
+    // dash would be read as one of its options.
+    if image.starts_with('-') {
+        return Err(AgentImageError::Invalid(format!(
+            "Image reference '{image}' must not start with '-'"
+        ))
+        .into());
+    }
+    if let Some(expected) = expected_image_id.as_deref() {
+        validate_image_reference(expected)?;
+    }
+    let docker = state.docker.clone().ok_or_else(|| {
+        AgentImageError::Unavailable(format!(
+            "This node has no Docker client to scan '{image}' with"
+        ))
+    })?;
+    // Waiting for capacity has its own bound; the scan's deadline starts once
+    // it holds a slot, so a scan admitted late still gets its full time.
+    let admission_deadline =
+        tokio::time::Instant::now() + temps_deployer::image_scan::SCAN_ADMISSION_DEADLINE;
+    let _permit =
+        acquire_image_slot(&limits, admission_deadline, &format!("Scan of '{image}'")).await?;
+    let deadline = tokio::time::Instant::now() + temps_deployer::image_scan::SCAN_RUN_DEADLINE;
+
+    // Identity first: the report must describe the image that was built, and
+    // a tag can be re-pointed by a later build on the same node.
+    let info = state
+        .image_builder
+        .inspect_image(&image)
+        .await
+        .map_err(|error| match error {
+            BuilderError::ImageNotFound(_) => {
+                AgentImageError::NotFound(format!("Image '{image}' is not present on this node"))
+            }
+            error => AgentImageError::Storage(format!("Cannot inspect '{image}': {error}")),
+        })?;
+    if let Some(expected) = expected_image_id.as_deref() {
+        if !same_image_id(&info.id, expected) {
+            return Err(AgentImageError::Conflict(format!(
+                "Image '{image}' on this node is {}, not the {expected} built for the deployment; refusing to attribute its findings to that deployment",
+                info.id
+            ))
+            .into());
+        }
+    }
+
+    let scanner = temps_vulnerability_scanner::TrivyScanner::new(Arc::new(
+        temps_core::DockerHandle::available(Arc::new(docker)),
+    ));
+    // The scanner enforces the deadline itself and removes its container
+    // before returning, so the slot held by `_permit` is only released once
+    // nothing is left running on this node on the scan's behalf.
+    let result =
+        scanner
+            .scan_image_before(&image, deadline)
+            .await
+            .map_err(|error| match error {
+                temps_vulnerability_scanner::ScannerError::DeadlineExceeded { .. } => {
+                    tracing::error!(image = %image, "Image scan timed out: {error}");
+                    AgentImageError::Deadline(format!("Scan of '{image}' exceeded 30 minutes"))
+                }
+                error => {
+                    tracing::error!(image = %image, "Image scan failed: {error}");
+                    AgentImageError::Storage(format!("Cannot scan '{image}': {error}"))
+                }
+            })?;
+    if result.total_count > MAX_SCAN_FINDINGS {
+        return Err(AgentImageError::TooLarge(format!(
+            "Scan of '{image}' found {} vulnerabilities, more than the {MAX_SCAN_FINDINGS} a report may carry",
+            result.total_count
+        ))
+        .into());
+    }
+    tracing::info!(
+        image = %image,
+        total = result.total_count,
+        critical = result.critical_count,
+        high = result.high_count,
+        "Image scan completed on node"
+    );
+    Ok(axum::Json(
+        temps_vulnerability_scanner::node_report::report_from_result(info.id, &result),
+    ))
+}
+
+/// Whether two Docker image ids name the same image, with or without the
+/// `sha256:` prefix.
+fn same_image_id(a: &str, b: &str) -> bool {
+    let strip = |id: &str| id.trim().trim_start_matches("sha256:").to_ascii_lowercase();
+    !a.trim().is_empty() && strip(a) == strip(b)
 }
 
 /// Query for `GET /agent/images/extract`.
@@ -1303,6 +1438,208 @@ mod tests {
             assert_eq!(response.status(), status, "{query}");
             assert_eq!(limits.image_import_slots.available_permits(), slots);
         }
+    }
+
+    /// Answers `inspect_image` for one known image, as a node would.
+    struct InspectOnlyBuilder;
+
+    #[async_trait::async_trait]
+    impl temps_deployer::ImageBuilder for InspectOnlyBuilder {
+        async fn build_image(&self, _request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn build_image_with_callback(
+            &self,
+            _request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn import_image(
+            &self,
+            _image_path: std::path::PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &Path,
+        ) -> Result<(), BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn remove_image(&self, _image_name: &str) -> Result<(), BuilderError> {
+            unimplemented!("not used by scan")
+        }
+        async fn inspect_image(
+            &self,
+            image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, BuilderError> {
+            if image_name != "temps-app:abc" {
+                return Err(BuilderError::ImageNotFound(image_name.to_string()));
+            }
+            Ok(temps_deployer::ImageInfo {
+                id: "sha256:deadbeef".into(),
+                architecture: "amd64".into(),
+                os: "linux".into(),
+                platform: "linux/amd64".into(),
+                size_bytes: 1,
+                tags: vec![image_name.to_string()],
+                created: None,
+                working_dir: None,
+                config: None,
+            })
+        }
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".into()
+        }
+    }
+
+    fn scan_router(docker: Option<bollard::Docker>) -> (axum::Router, Arc<AgentResourceLimits>) {
+        use axum::routing::post;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AgentState {
+            container_deployer: remote,
+            image_builder: Arc::new(InspectOnlyBuilder),
+            docker,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+        let limits = Arc::new(AgentResourceLimits::new());
+        let router = axum::Router::new()
+            .route("/scan", post(scan_image))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(limits.clone()))
+            .with_state(state);
+        (router, limits)
+    }
+
+    fn scan_request(token: Option<&str>, body: serde_json::Value) -> axum::http::Request<Body> {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/scan")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scan_requires_agent_authentication() {
+        use tower::ServiceExt;
+        let (router, _limits) = scan_router(None);
+        let response = router
+            .oneshot(scan_request(
+                None,
+                serde_json::json!({"image": "temps-app:abc"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A node without a Docker client says so (503) instead of reporting a
+    /// clean scan; the control plane treats that as a failed, non-blocking
+    /// scan.
+    #[tokio::test]
+    async fn scan_without_a_docker_client_is_unavailable_and_keeps_capacity() {
+        use tower::ServiceExt;
+        let (router, limits) = scan_router(None);
+        let slots = limits.image_import_slots.available_permits();
+        let response = router
+            .oneshot(scan_request(
+                Some("node-token"),
+                serde_json::json!({"image": "temps-app:abc"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(limits.image_import_slots.available_permits(), slots);
+    }
+
+    #[tokio::test]
+    async fn scan_rejects_invalid_image_references() {
+        use tower::ServiceExt;
+        let (router, _limits) = scan_router(None);
+        for image in ["", "app:1; rm -rf /", "-flag"] {
+            let response = router
+                .clone()
+                .oneshot(scan_request(
+                    Some("node-token"),
+                    serde_json::json!({"image": image}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{image:?}");
+        }
+    }
+
+    /// The image checks run before any scanner container is started, so
+    /// they hold with a client that was never connected.
+    #[tokio::test]
+    async fn scan_refuses_missing_and_re_pointed_images_before_scanning() {
+        use tower::ServiceExt;
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let (router, limits) = scan_router(Some(docker));
+        let slots = limits.image_import_slots.available_permits();
+
+        let response = router
+            .clone()
+            .oneshot(scan_request(
+                Some("node-token"),
+                serde_json::json!({"image": "missing:1"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = router
+            .clone()
+            .oneshot(scan_request(
+                Some("node-token"),
+                serde_json::json!({
+                    "image": "temps-app:abc",
+                    "expected_image_id": "sha256:someoneelse",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(limits.image_import_slots.available_permits(), slots);
+    }
+
+    #[test]
+    fn image_ids_compare_with_or_without_the_digest_prefix() {
+        assert!(same_image_id("sha256:ABCDEF", "abcdef"));
+        assert!(same_image_id("abcdef", "sha256:abcdef"));
+        assert!(!same_image_id("sha256:abcdef", "sha256:abcdee"));
+        assert!(!same_image_id("", ""));
     }
 
     #[tokio::test]

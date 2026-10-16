@@ -14,20 +14,21 @@ use ::microsandbox::sandbox::{
     DeploymentProfile, FsEntryKind, FsSetAttrs, RlimitResource, SandboxHandle as MsbSandboxHandle,
     SandboxStatus, SecurityProfile,
 };
-use ::microsandbox::setup::{InstallOptions, ResolvedRuntime};
+use ::microsandbox::setup::{InstallOptions, ResolvedRuntime, RuntimeOrigin};
 use ::microsandbox::{
     ExecEvent, LocalBackend, MicrosandboxError, NetworkPolicy, NetworkProfile, Sandbox,
 };
 
 use super::{
     host_virtualization, MicrosandboxSandboxConfig, MicrosandboxUnavailable, MICROSANDBOX_VERSION,
-    MSB_SANDBOX_NAME_PREFIX, PROVIDER_NAME, WORK_DIR,
+    MSB_SANDBOX_NAME_PREFIX, PROVIDER_NAME, TERMINAL_SETUP_COMMAND, WORK_DIR,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
 use crate::sandbox::{
-    ExecStream, KillSignal, OnStreamEventCallback, SandboxBackend, SandboxCreateConfig,
-    SandboxExecResult, SandboxHandle, SandboxProvider,
+    check_guest_agent, ExecStream, KillSignal, OnStreamEventCallback, PtyAttachment,
+    SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
+    PTY_AGENT_SOCKET,
 };
 
 /// Image used when a sandbox doesn't specify one. Same default as the
@@ -55,6 +56,96 @@ const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
 /// How long `connect` waits for the in-guest agent handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Guest directory that holds the injected PTY agent. Created root-owned
+/// 0755 on first use, so a workload running as an unprivileged user can
+/// neither replace the binary nor plant a look-alike next to it.
+const GUEST_PTY_DIR: &str = "/usr/local/lib/temps";
+
+/// Guest directory of the agent's control socket. Owned by the sandbox's
+/// default exec user, mode 0700 (the ADR-008 trust boundary: the agent's
+/// socket is reachable by exactly the user the sandbox runs commands as).
+const GUEST_PTY_SOCKET_DIR: &str = "/run/temps-pty";
+
+/// How long a freshly started PTY agent has to begin accepting connections.
+const PTY_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause between probes while waiting for the PTY agent to come up.
+const PTY_PROBE_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Largest guest agent accepted from the host. The static build is a few
+/// MiB; the bound only keeps a wrong file from being read into memory and
+/// pushed through the guest filesystem API.
+const MAX_PTY_AGENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Longest a single guest command run for terminal bootstrap may take. These
+/// are `sh -c` one-liners that finish in milliseconds; the bound exists
+/// because the SDK's exec has no timeout of its own and a guest controls
+/// what `sh` does.
+const PTY_GUEST_EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Longest the whole first-use bootstrap (waiting for the per-sandbox lock,
+/// install, start, readiness) may take before the attach fails.
+const PTY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Terminal output the host will hold for one attachment while its client
+/// is not keeping up. The SDK's exec channel is unbounded and the guest does
+/// not slow down for a slow client, so this is drained eagerly into a queue
+/// with this byte budget; past it the attachment is cut and the user
+/// reattaches (the agent keeps the tab, and replays recent output).
+const PTY_OUTPUT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+/// Frame-count bound on the same queue (guards many tiny frames).
+const PTY_OUTPUT_QUEUE_FRAMES: usize = 1024;
+
+/// Longest one write to (or the close of) the relay's stdin may take. Each is
+/// one message to the guest; a stalled guest must not park the pump — and with
+/// it a task, a duplex buffer and the relay process — forever.
+const PTY_STDIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest the relay process is given to acknowledge a kill. After this the
+/// attachment is abandoned regardless: the process is the guest's to reap
+/// (it also exits by itself when its stdin closes or the socket drops).
+const PTY_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Buffer between the terminal handler's writes and the guest's stdin. One
+/// per attachment; a stalled guest back-pressures the handler (whose writes
+/// carry their own timeout) rather than growing memory.
+const PTY_INPUT_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Succeeds only when the agent binary is installed *and* answering on its
+/// socket. `$1` = binary, `$2` = socket. A stale socket file left by a
+/// crashed agent fails the probe, which is why this connects rather than
+/// testing for the file.
+const PTY_PROBE_SCRIPT: &str = r#"test -x "$1" && "$1" --probe --socket "$2" >/dev/null 2>&1"#;
+
+/// Installs a staged agent: root-owned directory, then an atomic rename so a
+/// concurrent attach never executes a half-written file.
+/// `$1` = directory, `$2` = temporary file, `$3` = final path.
+const PTY_INSTALL_SCRIPT: &str = r#"set -e
+mkdir -p "$1"
+chown 0:0 "$1"
+chmod 0755 "$1"
+chown 0:0 "$2"
+chmod 0755 "$2"
+mv -f "$2" "$3""#;
+
+/// Prepares the socket directory for the sandbox user.
+/// `$1` = directory, `$2` = uid, `$3` = gid.
+const PTY_SOCKET_DIR_SCRIPT: &str = r#"set -e
+mkdir -p "$1"
+chown "$2:$3" "$1"
+chmod 0700 "$1""#;
+
+/// Starts the agent detached from the exec session that launches it, so it
+/// outlives that session and keeps every terminal tab alive between
+/// attachments. `setsid` puts it in its own session where available;
+/// `nohup` is the fallback for images without util-linux/busybox `setsid`.
+/// Its output goes to a log in the 0700 socket directory, which is read back
+/// if it fails to come up. `$1` = binary, `$2` = socket, `$3` = log.
+const PTY_START_SCRIPT: &str = r#"if command -v setsid >/dev/null 2>&1; then
+  setsid "$1" --socket "$2" </dev/null >"$3" 2>&1 &
+else
+  nohup "$1" --socket "$2" </dev/null >"$3" 2>&1 &
+fi"#;
 
 /// Network policy a sandbox gets for a given `network_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +393,11 @@ pub struct MicrosandboxSandboxProvider {
     /// evicted on stop/destroy and on any SDK error, so a stale connection
     /// is re-established on the next call.
     live: Mutex<HashMap<String, Sandbox>>,
+    /// Per-sandbox locks serializing first-use installation of the guest PTY
+    /// agent, so two terminals opened at once on *one* sandbox don't race on
+    /// the same temporary file. Per sandbox, never provider-wide: a wedged
+    /// guest must not be able to stall terminals on every other sandbox.
+    pty_bootstrap: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl MicrosandboxSandboxProvider {
@@ -313,6 +409,7 @@ impl MicrosandboxSandboxProvider {
             config,
             backend: Arc::new(backend),
             live: Mutex::new(HashMap::new()),
+            pty_bootstrap: Mutex::new(HashMap::new()),
         })
     }
 
@@ -342,27 +439,64 @@ impl MicrosandboxSandboxProvider {
     /// Install the pinned runtime pair (`msb` + `libkrunfw`) into this
     /// provider's home. Downloads the official release archive for this
     /// platform and verifies the installed pair. Idempotent: an existing
-    /// complete installation is kept.
+    /// pair of the pinned version is kept; one of any other version (left by
+    /// an older Temps) is replaced, since the SDK refuses to launch with a
+    /// runtime that is not exactly its own version.
     pub async fn install_runtime(&self) -> Result<ResolvedRuntime, AgentError> {
         let home = self.config.home();
         std::fs::create_dir_all(&home)?;
         set_dir_private(&home);
         let local = self.local()?;
-        let options = InstallOptions {
+        let mut options = InstallOptions {
             version: MICROSANDBOX_VERSION.to_string(),
             ..InstallOptions::default()
         };
+
+        let install_error = |e: MicrosandboxError| AgentError::SandboxProviderUnavailable {
+            provider: PROVIDER_NAME.to_string(),
+            reason: format!(
+                "installing microsandbox runtime v{} into {} failed: {}",
+                MICROSANDBOX_VERSION,
+                home.display(),
+                e
+            ),
+        };
+
+        if let Ok(existing) = ::microsandbox::setup::resolve_runtime(local.config()) {
+            if let Err(mismatch) = check_runtime_version(&existing) {
+                // Only the copy under this home is ours to replace. A runtime
+                // chosen through MSB_PATH or the SDK config would keep winning
+                // over whatever is installed here, so replacing the home
+                // copy would not fix anything — say so instead.
+                if existing.origin != RuntimeOrigin::Home {
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: PROVIDER_NAME.to_string(),
+                        reason: format!(
+                            "{mismatch}; it was selected through {:?} rather than the Temps \
+                             runtime home {}, so it was left untouched — point it at a \
+                             v{} runtime or remove the override",
+                            existing.origin,
+                            home.display(),
+                            MICROSANDBOX_VERSION
+                        ),
+                    });
+                }
+                tracing::info!(
+                    msb_path = %existing.msb_path.display(),
+                    expected = MICROSANDBOX_VERSION,
+                    "replacing microsandbox runtime that does not match this build: {}",
+                    mismatch
+                );
+                options.force = true;
+                return ::microsandbox::setup::install_runtime(local.config(), options)
+                    .await
+                    .map_err(install_error);
+            }
+        }
+
         ::microsandbox::setup::ensure_runtime(local.config(), options)
             .await
-            .map_err(|e| AgentError::SandboxProviderUnavailable {
-                provider: PROVIDER_NAME.to_string(),
-                reason: format!(
-                    "installing microsandbox runtime v{} into {} failed: {}",
-                    MICROSANDBOX_VERSION,
-                    home.display(),
-                    e
-                ),
-            })
+            .map_err(install_error)
     }
 
     fn resolve_name(&self, config: &SandboxCreateConfig) -> String {
@@ -542,6 +676,229 @@ impl MicrosandboxSandboxProvider {
         })
     }
 
+    /// Run `script` under `sh -c` in the guest with positional `args`
+    /// (`$1`…). Arguments travel as argv, never interpolated into the
+    /// script text, so paths and ids need no quoting.
+    async fn guest_sh(
+        &self,
+        handle: &SandboxHandle,
+        user: Option<&str>,
+        script: &str,
+        args: &[&str],
+    ) -> Result<SandboxExecResult, AgentError> {
+        let mut cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "temps-pty".to_string(),
+        ];
+        cmd.extend(args.iter().map(|a| a.to_string()));
+        let name = handle.sandbox_name.as_str();
+        match tokio::time::timeout(
+            PTY_GUEST_EXEC_TIMEOUT,
+            self.run_exec(handle, cmd, HashMap::new(), user, OutputSink::None),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // The guest never answered; the cached connection may be
+                // wedged with it, so the next call reconnects.
+                self.evict(name);
+                Err(AgentError::terminal_timeout(
+                    name,
+                    format!(
+                        "guest command ({})",
+                        script.lines().next().unwrap_or_default().trim()
+                    ),
+                    PTY_GUEST_EXEC_TIMEOUT,
+                ))
+            }
+        }
+    }
+
+    /// The bootstrap lock for one sandbox. Entries nobody holds or waits on
+    /// are dropped as a side effect, so the map tracks only sandboxes with
+    /// a bootstrap in flight (plus the one being asked for).
+    fn bootstrap_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .pty_bootstrap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|key, lock| key == name || Arc::strong_count(lock) > 1);
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Whether the guest's PTY agent at `guest_bin` is installed and
+    /// accepting connections.
+    async fn pty_agent_listening(
+        &self,
+        handle: &SandboxHandle,
+        guest_bin: &str,
+    ) -> Result<bool, AgentError> {
+        let result = self
+            .guest_sh(
+                handle,
+                None,
+                PTY_PROBE_SCRIPT,
+                &[guest_bin, PTY_AGENT_SOCKET],
+            )
+            .await?;
+        Ok(result.exit_code == 0)
+    }
+
+    /// Make sure the guest has a running `temps-pty-agent` and return the
+    /// path of its binary. Idempotent: every step checks before acting, so
+    /// the common case (agent already up) is one probe exec.
+    ///
+    /// The agent runs as the sandbox's default exec user — the same identity
+    /// every `exec` runs as — so terminals expose nothing a command could
+    /// not already reach. The binary and its directory are root-owned.
+    async fn ensure_pty_agent(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        match tokio::time::timeout(PTY_BOOTSTRAP_TIMEOUT, self.ensure_pty_agent_inner(handle)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(AgentError::terminal_timeout(
+                name,
+                "guest terminal agent preparation",
+                PTY_BOOTSTRAP_TIMEOUT,
+            )),
+        }
+    }
+
+    async fn ensure_pty_agent_inner(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let staged = self.config.pty_agent_bin();
+        let bytes = read_staged_pty_agent(&staged)
+            .await
+            .map_err(|reason| Self::err(name, "terminal", reason))?;
+        let guest_bin = guest_pty_agent_path(&bytes);
+
+        let bootstrap_lock = self.bootstrap_lock(name);
+        let _bootstrap = bootstrap_lock.lock().await;
+        if self.pty_agent_listening(handle, &guest_bin).await? {
+            return Ok(guest_bin);
+        }
+
+        // Install the binary when this build of it is not in the guest yet.
+        let installed = self
+            .guest_sh(handle, None, r#"test -x "$1""#, &[&guest_bin])
+            .await?;
+        if installed.exit_code != 0 {
+            let tmp = format!("{}.tmp", guest_bin);
+            self.write_file(handle, &tmp, &bytes, 0o755).await?;
+            let result = self
+                .guest_sh(
+                    handle,
+                    Some("root"),
+                    PTY_INSTALL_SCRIPT,
+                    &[GUEST_PTY_DIR, &tmp, &guest_bin],
+                )
+                .await?;
+            if result.exit_code != 0 {
+                return Err(Self::err(
+                    name,
+                    "terminal",
+                    format!(
+                        "installing the PTY agent at {} failed (exit {}): {}",
+                        guest_bin,
+                        result.exit_code,
+                        result.stderr.trim()
+                    ),
+                ));
+            }
+            tracing::info!(
+                sandbox = %name,
+                guest_path = %guest_bin,
+                bytes = bytes.len(),
+                "installed temps-pty-agent in microsandbox guest"
+            );
+        }
+
+        // Start it, with its socket directory owned by the sandbox user.
+        let ids = self.guest_sh(handle, None, "id -u; id -g", &[]).await?;
+        let (uid, gid) = parse_uid_gid(&ids.stdout).ok_or_else(|| {
+            Self::err(
+                name,
+                "terminal",
+                format!(
+                    "could not determine the sandbox user (id exited {}): {}",
+                    ids.exit_code,
+                    ids.stderr.trim()
+                ),
+            )
+        })?;
+        let uid_arg = uid.to_string();
+        let gid_arg = gid.to_string();
+        let dir = self
+            .guest_sh(
+                handle,
+                Some("root"),
+                PTY_SOCKET_DIR_SCRIPT,
+                &[GUEST_PTY_SOCKET_DIR, &uid_arg, &gid_arg],
+            )
+            .await?;
+        if dir.exit_code != 0 {
+            return Err(Self::err(
+                name,
+                "terminal",
+                format!(
+                    "preparing {} for uid {} failed (exit {}): {}",
+                    GUEST_PTY_SOCKET_DIR,
+                    uid,
+                    dir.exit_code,
+                    dir.stderr.trim()
+                ),
+            ));
+        }
+        let log_path = format!("{}/agent.log", GUEST_PTY_SOCKET_DIR);
+        self.guest_sh(
+            handle,
+            None,
+            PTY_START_SCRIPT,
+            &[&guest_bin, PTY_AGENT_SOCKET, &log_path],
+        )
+        .await?;
+
+        let deadline = Instant::now() + PTY_START_TIMEOUT;
+        loop {
+            if self.pty_agent_listening(handle, &guest_bin).await? {
+                tracing::info!(
+                    sandbox = %name,
+                    uid,
+                    "started temps-pty-agent in microsandbox guest"
+                );
+                return Ok(guest_bin);
+            }
+            if Instant::now() >= deadline {
+                let log = self
+                    .guest_sh(handle, None, r#"tail -n 5 "$1" 2>&1"#, &[&log_path])
+                    .await
+                    .map(|r| r.stdout.trim().to_string())
+                    .unwrap_or_default();
+                return Err(Self::err(
+                    name,
+                    "terminal",
+                    format!(
+                        "temps-pty-agent did not start listening on {} within {:?}{}",
+                        PTY_AGENT_SOCKET,
+                        PTY_START_TIMEOUT,
+                        if log.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; agent log: {}", log)
+                        }
+                    ),
+                ));
+            }
+            tokio::time::sleep(PTY_PROBE_INTERVAL).await;
+        }
+    }
+
     async fn create_inner(
         &self,
         config: SandboxCreateConfig,
@@ -557,7 +914,7 @@ impl MicrosandboxSandboxProvider {
             .image(image)
             .cpus(plan.cpus)
             .memory(plan.memory_mib)
-            .security(SecurityProfile::Restricted)
+            .security(guest_security_profile(config.allow_docker))
             .labels([
                 ("sh.temps.backend", PROVIDER_NAME.to_string()),
                 ("sh.temps.run_id", run_id.to_string()),
@@ -922,6 +1279,87 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         self.run_exec(handle, cmd, env, None, sink).await
     }
 
+    /// Bridge to the guest's `temps-pty-agent`: an SDK exec running
+    /// `temps-pty-agent --relay` with stdin piped, so the SDK's exec channel
+    /// carries the ADR-008 frames. The agent itself is installed and started
+    /// on first use (see [`Self::ensure_pty_agent`]) and keeps every tab
+    /// alive; ending this exec only detaches.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let guest_bin = self.ensure_pty_agent(handle).await?;
+
+        let sandbox = self.connected(name).await?;
+        let started = tokio::time::timeout(
+            PTY_GUEST_EXEC_TIMEOUT,
+            sandbox.exec_stream_with(guest_bin.clone(), |opts| {
+                opts.args(["--relay", "--socket", PTY_AGENT_SOCKET])
+                    .cwd("/")
+                    .stdin_pipe()
+            }),
+        )
+        .await;
+        let mut exec = match started {
+            Ok(Ok(exec)) => exec,
+            Ok(Err(e)) => {
+                self.evict(name);
+                return Err(Self::err(name, "terminal relay exec", e));
+            }
+            Err(_) => {
+                self.evict(name);
+                return Err(AgentError::terminal_timeout(
+                    name,
+                    "relay start",
+                    PTY_GUEST_EXEC_TIMEOUT,
+                ));
+            }
+        };
+        let stdin = exec.take_stdin().ok_or_else(|| {
+            Self::err(
+                name,
+                "terminal relay exec",
+                "the SDK did not provide a stdin sink for the piped exec",
+            )
+        })?;
+
+        // `AsyncWrite` over the SDK's async `write`: a bounded duplex pipe
+        // whose far end is pumped into the sink by a task. Dropping the
+        // returned writer ends the pump, which closes the guest's stdin, so
+        // the relay exits and the attachment ends — the agent stays up.
+        //
+        // The pump is tied to the attachment, not just to its writer: it
+        // also stops when the *output* half is dropped (the handler's
+        // session ended), and every call into the guest is bounded, so a
+        // stalled guest cannot leave it parked on a write for good.
+        let (input, pump) = tokio::io::duplex(PTY_INPUT_BUFFER_BYTES);
+        let (alive, attachment_gone) = tokio::sync::oneshot::channel::<()>();
+        let terminator = exec.terminator();
+        let output =
+            bounded_terminal_output(exec, handle.sandbox_id.clone(), PTY_OUTPUT_BUDGET_BYTES);
+        tokio::spawn(pump_terminal_input(
+            pump,
+            TerminalStdinSink(stdin),
+            terminator,
+            attachment_gone,
+            handle.sandbox_id.clone(),
+            PTY_STDIN_TIMEOUT,
+        ));
+
+        // Keep `alive` for exactly as long as the output stream lives; its
+        // drop is what tells the input pump the attachment is over.
+        let output = futures::stream::unfold(
+            (Box::pin(output), alive),
+            |(mut stream, alive)| async move {
+                use futures::StreamExt;
+                let item = stream.next().await?;
+                Some((item, (stream, alive)))
+            },
+        );
+        Ok(PtyAttachment {
+            output: Box::pin(output),
+            input: Box::pin(input),
+        })
+    }
+
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
         Ok(self
             .lookup(&handle.sandbox_name)
@@ -1215,8 +1653,338 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
     }
 }
 
-/// Build the SDK backend bound to `<data_dir>/microsandbox`. Lazy: the SDK
-/// database and directories are only created on first sandbox operation.
+/// Destination for the relay's stdin. Abstracts the SDK's `ExecSink` so the
+/// input pump's deadlines can be tested without a hypervisor.
+#[async_trait]
+trait StdinSink: Send + 'static {
+    async fn write(&self, data: &[u8]) -> Result<(), String>;
+    async fn close(&self) -> Result<(), String>;
+}
+
+struct TerminalStdinSink(::microsandbox::sandbox::exec::ExecSink);
+
+#[async_trait]
+impl StdinSink for TerminalStdinSink {
+    async fn write(&self, data: &[u8]) -> Result<(), String> {
+        self.0.write(data).await.map_err(|e| e.to_string())
+    }
+
+    async fn close(&self) -> Result<(), String> {
+        self.0.close().await.map_err(|e| e.to_string())
+    }
+}
+
+/// Copy the terminal client's input into the relay's stdin until the
+/// attachment ends.
+///
+/// Ends on: the writer being dropped (client detached), `attachment_gone`
+/// resolving (the output half was dropped), a failed write, or a write that
+/// exceeds [`PTY_STDIN_TIMEOUT`]. On the last two the relay is also killed —
+/// closing stdin would not reach a guest that is not answering — and in every
+/// case stdin is closed, bounded, so a healthy relay exits by itself.
+async fn pump_terminal_input<K: StdinSink>(
+    mut input: tokio::io::DuplexStream,
+    sink: K,
+    terminator: Terminator,
+    mut attachment_gone: tokio::sync::oneshot::Receiver<()>,
+    sandbox_id: String,
+    call_timeout: Duration,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut kill = false;
+    loop {
+        let read = tokio::select! {
+            read = input.read(&mut buf) => read,
+            // `Err` means the sender was dropped: the stream is gone.
+            _ = &mut attachment_gone => break,
+        };
+        let n = match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        match tokio::time::timeout(call_timeout, sink.write(&buf[..n])).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(sandbox_id = %sandbox_id, error = %e, "terminal stdin pump stopped");
+                kill = true;
+                break;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_ms = call_timeout.as_millis() as u64,
+                    "terminal stdin write timed out; ending the attachment"
+                );
+                kill = true;
+                break;
+            }
+        }
+    }
+    if kill {
+        terminate_detached(&terminator, &sandbox_id);
+    }
+    if tokio::time::timeout(call_timeout, sink.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            timeout_ms = call_timeout.as_millis() as u64,
+            "closing terminal stdin timed out; killing the relay"
+        );
+        terminate_detached(&terminator, &sandbox_id);
+    }
+}
+
+/// Source of exec events. Abstracts the SDK's `ExecHandle` so the bounded
+/// output pump can be tested without a hypervisor.
+#[async_trait]
+trait ExecEventSource: Send + 'static {
+    async fn next_event(&mut self) -> Option<ExecEvent>;
+    /// A handle that stops the guest process and can be used while events
+    /// are still being received (and after the source is dropped).
+    fn terminator(&self) -> Terminator;
+}
+
+/// Stops the relay process in the guest. Best effort: the future resolves
+/// once the request was sent or failed, never errors.
+type Terminator = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+#[async_trait]
+impl ExecEventSource for ::microsandbox::ExecHandle {
+    async fn next_event(&mut self) -> Option<ExecEvent> {
+        self.recv().await
+    }
+
+    fn terminator(&self) -> Terminator {
+        let control = self.control();
+        Arc::new(move || {
+            let control = control.clone();
+            Box::pin(async move {
+                let _ = control.kill().await;
+            })
+        })
+    }
+}
+
+/// Ask `terminator` to stop the relay without waiting for the answer: the
+/// request runs detached under [`PTY_KILL_TIMEOUT`], so the caller can go on
+/// releasing the event channel (and so stop the SDK's unbounded queue
+/// growing) while a stalled guest sits on the kill.
+fn terminate_detached(terminator: &Terminator, sandbox_id: &str) {
+    let kill = (terminator.clone())();
+    let sandbox_id = sandbox_id.to_string();
+    tokio::spawn(async move {
+        if tokio::time::timeout(PTY_KILL_TIMEOUT, kill).await.is_err() {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                timeout_secs = PTY_KILL_TIMEOUT.as_secs(),
+                "terminal relay did not acknowledge a kill in time; abandoning it"
+            );
+        }
+    });
+}
+
+/// Terminal output from a relay exec as a stream whose host-side buffering is
+/// bounded.
+///
+/// The SDK queues guest output on an unbounded channel and the guest never
+/// slows down for a slow terminal client, so merely polling lazily would let
+/// that queue grow without limit behind a stalled WebSocket. Instead the
+/// events are drained eagerly by a task into a queue limited to
+/// `budget_bytes` (and [`PTY_OUTPUT_QUEUE_FRAMES`] frames). If the consumer
+/// falls that far behind, the relay process is killed and the stream ends
+/// with an error after delivering what was queued — the same "drop the slow
+/// subscriber" policy the PTY agent applies on its side. Nothing is lost:
+/// the tab keeps running in the guest and a reattach replays its scrollback.
+fn bounded_terminal_output<S: ExecEventSource>(
+    mut source: S,
+    sandbox_id: String,
+    budget_bytes: usize,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, AgentError>> + Send {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::mpsc::error::TrySendError;
+
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, AgentError>>(PTY_OUTPUT_QUEUE_FRAMES);
+    let queued = Arc::new(AtomicUsize::new(0));
+    let overflowed = Arc::new(AtomicBool::new(false));
+
+    let terminator = source.terminator();
+    let relay_failure = {
+        let sandbox_id = sandbox_id.clone();
+        move |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: sandbox_id.clone(),
+            reason,
+        }
+    };
+
+    {
+        let queued = queued.clone();
+        let overflowed = overflowed.clone();
+        let relay_failure = relay_failure.clone();
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    event = source.next_event() => event,
+                    // The consumer is gone (session ended): stop the relay
+                    // now rather than when the guest next produces output.
+                    _ = tx.closed() => {
+                        terminate_detached(&terminator, &sandbox_id);
+                        return;
+                    }
+                };
+                match event {
+                    Some(ExecEvent::Stdout(chunk)) => {
+                        let len = chunk.len();
+                        let total = queued.fetch_add(len, Ordering::AcqRel) + len;
+                        let sent = if total > budget_bytes {
+                            Err(TrySendError::Closed(Ok(chunk)))
+                        } else {
+                            tx.try_send(Ok(chunk))
+                        };
+                        match sent {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                overflowed.store(true, Ordering::Release);
+                                terminate_detached(&terminator, &sandbox_id);
+                                return;
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                // Over budget, or the consumer went away.
+                                if !tx.is_closed() {
+                                    overflowed.store(true, Ordering::Release);
+                                }
+                                terminate_detached(&terminator, &sandbox_id);
+                                return;
+                            }
+                        }
+                    }
+                    // The relay's stderr is its own diagnostics (cannot
+                    // connect, …), never protocol bytes: surface it as an
+                    // error and end the stream.
+                    Some(ExecEvent::Stderr(chunk)) => {
+                        let _ = tx.try_send(Err(relay_failure(format!(
+                            "PTY agent relay error: {}",
+                            String::from_utf8_lossy(&chunk).trim()
+                        ))));
+                        terminate_detached(&terminator, &sandbox_id);
+                        return;
+                    }
+                    Some(ExecEvent::Failed(failure)) => {
+                        let _ = tx.try_send(Err(relay_failure(format!(
+                            "PTY agent relay failed to start: {:?}",
+                            failure
+                        ))));
+                        return;
+                    }
+                    Some(ExecEvent::Exited { .. }) | None => return,
+                    Some(ExecEvent::Started { .. }) | Some(ExecEvent::StdinError(_)) => {}
+                }
+            }
+        });
+    }
+
+    futures::stream::unfold(Some((rx, queued, overflowed)), move |state| {
+        let relay_failure = relay_failure.clone();
+        async move {
+            let (mut rx, queued, overflowed) = state?;
+            match rx.recv().await {
+                Some(Ok(chunk)) => {
+                    queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+                    Some((Ok(chunk), Some((rx, queued, overflowed))))
+                }
+                // An error is always the last item.
+                Some(Err(e)) => Some((Err(e), None)),
+                None if overflowed.load(Ordering::Acquire) => Some((
+                    Err(relay_failure(format!(
+                        "terminal output backlog exceeded {} bytes: the client is reading \
+                             slower than the sandbox produces output. Reattach to the same tab \
+                             to resume; it keeps running",
+                        budget_bytes
+                    ))),
+                    None,
+                )),
+                None => None,
+            }
+        }
+    })
+}
+
+/// Guest path for a given build of the PTY agent. Content-addressed so a
+/// newer staged binary installs beside the old one instead of replacing a
+/// file a running agent is executing, and so "is it installed?" is a plain
+/// existence check.
+fn guest_pty_agent_path(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    format!("{}/pty-agent-{}", GUEST_PTY_DIR, hex::encode(&digest[..8]))
+}
+
+/// Read the host-staged guest agent, bounded and validated. The error is a
+/// complete, actionable sentence.
+async fn read_staged_pty_agent(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "the guest terminal agent (temps-pty-agent) is not staged at {} — \
+                 run `{}`",
+                path.display(),
+                TERMINAL_SETUP_COMMAND
+            )
+        } else {
+            format!(
+                "cannot read the guest terminal agent at {}: {}",
+                path.display(),
+                e
+            )
+        }
+    })?;
+    if metadata.len() > MAX_PTY_AGENT_BYTES {
+        return Err(format!(
+            "{} is {} bytes, over the {}-byte limit for a guest terminal agent",
+            path.display(),
+            metadata.len(),
+            MAX_PTY_AGENT_BYTES
+        ));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|e| {
+        format!(
+            "cannot read the guest terminal agent at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if let Err(rejection) = check_guest_agent(&bytes) {
+        return Err(format!(
+            "the staged guest terminal agent {} {}; stage a usable build with `{}`",
+            path.display(),
+            rejection,
+            TERMINAL_SETUP_COMMAND
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Parse the output of `id -u; id -g`.
+fn parse_uid_gid(stdout: &str) -> Option<(u32, u32)> {
+    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let uid = lines.next()?.parse().ok()?;
+    let gid = lines.next()?.parse().ok()?;
+    lines.next().is_none().then_some((uid, gid))
+}
+
+fn guest_security_profile(allow_docker: bool) -> SecurityProfile {
+    if allow_docker {
+        SecurityProfile::Default
+    } else {
+        SecurityProfile::Restricted
+    }
+}
+
 fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBackend, AgentError> {
     let home = config.home();
     LocalBackend::builder()
@@ -1235,11 +2003,45 @@ fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBacken
         })
 }
 
+/// Compare the installed `msb` with the version this build pins.
+///
+/// The SDK launches only a runtime whose embedded version equals its own
+/// crate version, and otherwise fails every sandbox create with an opaque
+/// "no tested sandbox launch contract" error. Checking here — by reading the
+/// binary's embedded version, never executing it — turns that into an
+/// up-front, actionable readiness failure.
+fn check_runtime_version(runtime: &ResolvedRuntime) -> Result<(), MicrosandboxUnavailable> {
+    let found = ::microsandbox::setup::resolve_runtime_version(&runtime.msb_path)
+        .map(|version| version.map(|v| v.to_string()))
+        .map_err(|e| e.to_string());
+    classify_runtime_version(&runtime.msb_path, found)
+}
+
+/// Pure half of [`check_runtime_version`], unit-tested below.
+fn classify_runtime_version(
+    msb_path: &Path,
+    found: Result<Option<String>, String>,
+) -> Result<(), MicrosandboxUnavailable> {
+    let mismatch = |installed: String| MicrosandboxUnavailable::RuntimeVersionMismatch {
+        msb_path: msb_path.display().to_string(),
+        installed,
+        expected: MICROSANDBOX_VERSION.to_string(),
+    };
+    match found {
+        Ok(Some(version)) if version == MICROSANDBOX_VERSION => Ok(()),
+        Ok(Some(version)) => Err(mismatch(format!("v{version}"))),
+        Ok(None) => Err(mismatch(
+            "an unversioned build (no embedded version)".to_string(),
+        )),
+        Err(detail) => Err(mismatch(format!("unreadable ({detail})"))),
+    }
+}
+
 fn resolve_runtime(
     local: &LocalBackend,
     home: &Path,
 ) -> Result<ResolvedRuntime, MicrosandboxUnavailable> {
-    ::microsandbox::setup::resolve_runtime(local.config()).map_err(|e| match e {
+    let runtime = ::microsandbox::setup::resolve_runtime(local.config()).map_err(|e| match e {
         MicrosandboxError::RuntimeNotInstalled(detail) => {
             MicrosandboxUnavailable::RuntimeNotInstalled {
                 home: home.display().to_string(),
@@ -1252,7 +2054,9 @@ fn resolve_runtime(
             version: MICROSANDBOX_VERSION.to_string(),
             detail: other.to_string(),
         },
-    })
+    })?;
+    check_runtime_version(&runtime)?;
+    Ok(runtime)
 }
 
 /// The SDK reserves the `MSB_` environment prefix for its own runtime
@@ -1343,6 +2147,50 @@ fn workspace_has_entries(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_runtime_version_matches_the_sdk_this_build_links() {
+        // The SDK launches only a runtime equal to its own version, and
+        // `install_runtime` downloads `MICROSANDBOX_VERSION`. If a dependency
+        // bump moves the crate without moving the constant, setup installs a
+        // runtime the SDK then rejects at every sandbox create.
+        assert_eq!(
+            MICROSANDBOX_VERSION,
+            InstallOptions::default().version,
+            "MICROSANDBOX_VERSION must equal the pinned microsandbox crate version"
+        );
+    }
+
+    #[test]
+    fn runtime_version_check_accepts_only_the_pinned_version() {
+        let msb = Path::new("/h/microsandbox/bin/msb");
+        assert!(classify_runtime_version(msb, Ok(Some(MICROSANDBOX_VERSION.into()))).is_ok());
+
+        let older = classify_runtime_version(msb, Ok(Some("0.7.7".into()))).unwrap_err();
+        match &older {
+            MicrosandboxUnavailable::RuntimeVersionMismatch {
+                msb_path,
+                installed,
+                expected,
+            } => {
+                assert_eq!(msb_path, "/h/microsandbox/bin/msb");
+                assert_eq!(installed, "v0.7.7");
+                assert_eq!(expected, MICROSANDBOX_VERSION);
+            }
+            other => panic!("expected RuntimeVersionMismatch, got {other:?}"),
+        }
+
+        for found in [Ok(None), Err("bad ELF header".to_string())] {
+            assert!(
+                matches!(
+                    classify_runtime_version(msb, found),
+                    Err(MicrosandboxUnavailable::RuntimeVersionMismatch { .. })
+                ),
+                "an unversioned or unreadable msb must not be reported as ready"
+            );
+        }
+    }
+
     use crate::sandbox::microsandbox::host_data_dir;
 
     fn create_config() -> SandboxCreateConfig {
@@ -1359,6 +2207,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1659,6 +2508,77 @@ mod tests {
         Some(provider)
     }
 
+    #[test]
+    fn docker_opt_in_selects_guest_root_semantics() {
+        assert_eq!(guest_security_profile(false), SecurityProfile::Restricted);
+        assert_eq!(guest_security_profile(true), SecurityProfile::Default);
+        let mut config = create_config();
+        config.allow_docker = true;
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Docker)
+            .is_err());
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Firecracker)
+            .is_err());
+        assert!(config.validate_allow_docker(SandboxBackend::Local).is_err());
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Microsandbox)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn e2e_allow_docker_installs_and_runs_nested_container() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        let mut config = e2e_config("nested-docker", "full");
+        config.allow_docker = true;
+        config.memory_limit_mb = Some(1024);
+        config.disk_size_mb = Some(4096);
+        let provider = &provider;
+        with_sandbox(provider, config, |handle| async move {
+            let result = sh(
+                provider,
+                &handle,
+                r#"
+                set -eu
+                grep -Eq '^NoNewPrivs:[[:space:]]+0$' /proc/self/status
+                apk add --no-cache docker
+                mkdir -p /sys/fs/cgroup
+                mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
+                dockerd --storage-driver=vfs --iptables=false --bridge=none >/tmp/dockerd.log 2>&1 &
+                daemon=$!
+                trap 'kill "$daemon" 2>/dev/null || true' EXIT
+                ready=0
+                for i in $(seq 1 30); do
+                    if docker info >/dev/null 2>&1; then ready=1; break; fi
+                    sleep 1
+                done
+                if [ "$ready" != 1 ]; then cat /tmp/dockerd.log; exit 1; fi
+                docker run --rm --network none alpine:3.20 echo temps-nested-docker-ok
+            "#,
+            )
+            .await;
+            assert_eq!(result.exit_code, 0, "{}\n{}", result.stdout, result.stderr);
+            assert!(result.stdout.contains("temps-nested-docker-ok"));
+            provider.stop(&handle).await.unwrap();
+            provider.start(&handle).await.unwrap();
+            provider.evict(&handle.sandbox_name);
+            let resumed = sh(
+                provider,
+                &handle,
+                "grep -Eq '^NoNewPrivs:[[:space:]]+0$' /proc/self/status && docker --version",
+            )
+            .await;
+            assert_eq!(
+                resumed.exit_code, 0,
+                "{}\n{}",
+                resumed.stdout, resumed.stderr
+            );
+        })
+        .await;
+    }
+
     fn e2e_config(label: &str, network_mode: &str) -> SandboxCreateConfig {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1730,9 +2650,146 @@ mod tests {
             .unwrap_or_else(|e| panic!("exec `{script}`: {e}"))
     }
 
+    #[test]
+    fn guest_agent_path_is_content_addressed_under_a_root_owned_dir() {
+        let a = guest_pty_agent_path(b"\x7fELF-build-a");
+        let b = guest_pty_agent_path(b"\x7fELF-build-b");
+        assert_ne!(a, b, "a new build must not overwrite the running one");
+        assert_eq!(a, guest_pty_agent_path(b"\x7fELF-build-a"));
+        assert!(a.starts_with("/usr/local/lib/temps/pty-agent-"), "{a}");
+        // The socket directory is the agent's, not the binary's.
+        assert!(!a.starts_with(GUEST_PTY_SOCKET_DIR));
+    }
+
+    #[test]
+    fn id_output_parses_to_a_single_uid_gid_pair() {
+        assert_eq!(parse_uid_gid("1000\n1000\n"), Some((1000, 1000)));
+        assert_eq!(parse_uid_gid("0\n0"), Some((0, 0)));
+        assert_eq!(parse_uid_gid(""), None);
+        assert_eq!(parse_uid_gid("1000\n"), None);
+        assert_eq!(parse_uid_gid("root\n0\n"), None);
+        // Extra output means `id` printed something unexpected; refuse to
+        // guess which lines are the ids.
+        assert_eq!(parse_uid_gid("1\n2\n3\n"), None);
+    }
+
+    #[test]
+    fn bootstrap_scripts_take_paths_as_arguments_not_text() {
+        // Paths and ids must reach the guest shell as `$n`, never spliced
+        // into the script — the staged path comes from configuration.
+        for script in [
+            PTY_PROBE_SCRIPT,
+            PTY_INSTALL_SCRIPT,
+            PTY_SOCKET_DIR_SCRIPT,
+            PTY_START_SCRIPT,
+        ] {
+            assert!(!script.contains("/usr/local"), "{script}");
+            assert!(!script.contains("/run/"), "{script}");
+            assert!(script.contains("\"$1\""), "{script}");
+        }
+        // The installer makes the directory and file root-owned before the
+        // rename publishes the binary under its final name.
+        let chown = PTY_INSTALL_SCRIPT
+            .find("chown 0:0 \"$2\"")
+            .expect("chown file");
+        let mv = PTY_INSTALL_SCRIPT.find("mv -f").expect("mv");
+        assert!(chown < mv, "ownership must be fixed before publishing");
+        assert!(PTY_INSTALL_SCRIPT.contains("chown 0:0 \"$1\""));
+        // The socket directory is private to the sandbox user.
+        assert!(PTY_SOCKET_DIR_SCRIPT.contains("chmod 0700"));
+    }
+
+    #[tokio::test]
+    async fn staged_agent_errors_name_the_path_and_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("temps-pty-agent");
+
+        let missing = read_staged_pty_agent(&staged).await.unwrap_err();
+        assert!(missing.contains(&staged.display().to_string()), "{missing}");
+        assert!(missing.contains("temps microsandbox setup"), "{missing}");
+
+        std::fs::write(&staged, b"MZ not an elf").unwrap();
+        let foreign = read_staged_pty_agent(&staged).await.unwrap_err();
+        assert!(foreign.contains("not a Linux executable"), "{foreign}");
+
+        // A Linux ELF the guest cannot run is refused with the reason.
+        let glibc = crate::sandbox::test_elf::elf(
+            crate::sandbox::test_elf::host_machine(),
+            Some("/lib64/ld-linux-x86-64.so.2"),
+            b"",
+        );
+        std::fs::write(&staged, glibc).unwrap();
+        let dynamic = read_staged_pty_agent(&staged).await.unwrap_err();
+        assert!(dynamic.contains("dynamically linked"), "{dynamic}");
+        assert!(dynamic.contains("--pty-agent-bin"), "{dynamic}");
+
+        let good = crate::sandbox::test_elf::static_for_host(b"rest");
+        std::fs::write(&staged, &good).unwrap();
+        let bytes = read_staged_pty_agent(&staged).await.unwrap();
+        assert_eq!(bytes, good);
+    }
+
     const EGRESS_PROBE: &str = "wget -q -T 5 -O - http://1.1.1.1/cdn-cgi/trace";
     /// Number of IPv4 routes in the guest (header line excluded).
     const ROUTE_COUNT: &str = "tail -n +2 /proc/net/route | wc -l";
+
+    /// What a service manager that kills the whole unit does to a VM: the VMM
+    /// process dies with nothing told to the SDK. The provider must then say
+    /// the VM is down (the verdict the sandbox API reconciles rows on), not
+    /// keep reporting a stale `running`, and `start` must boot it again.
+    #[tokio::test]
+    async fn e2e_a_killed_vm_is_reported_down_and_boots_again() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        with_sandbox(&provider, e2e_config("killed", "none"), |handle| {
+            let provider = &provider;
+            async move {
+                assert!(provider.is_alive(&handle).await.unwrap());
+
+                let killed = std::process::Command::new("pkill")
+                    .args(["-9", "-f", &handle.sandbox_name])
+                    .status()
+                    .expect("run pkill");
+                assert!(
+                    killed.success(),
+                    "no process matched {}",
+                    handle.sandbox_name
+                );
+
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while provider.is_alive(&handle).await.unwrap_or(true) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} still reported alive 15s after its VMM was killed",
+                        handle.sandbox_name
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                // A down VM is still found by name: that is what lets the
+                // registry say "not running" instead of "not found".
+                let recovered = provider
+                    .recover_by_name(&handle.sandbox_name)
+                    .await
+                    .unwrap();
+                assert!(recovered.is_some(), "a killed VM must still be recoverable");
+
+                provider.start(&handle).await.expect("boot the VM again");
+                assert!(provider.is_alive(&handle).await.unwrap());
+                let echoed = provider
+                    .exec(
+                        &handle,
+                        vec!["echo".into(), "back".into()],
+                        HashMap::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(echoed.stdout.trim(), "back");
+            }
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn e2e_lifecycle_exec_files_and_isolated_network() {
@@ -2206,6 +3263,470 @@ mod tests {
                 let egress = sh(provider, &handle, EGRESS_PROBE).await;
                 assert_eq!(egress.exit_code, 0, "stderr: {}", egress.stderr);
                 assert!(egress.stdout.contains("ip="), "{}", egress.stdout);
+            }
+        })
+        .await;
+    }
+
+    /// Terminal bridge end to end: stage the guest agent, attach, and drive
+    /// the ADR-008 protocol (PING, then OPEN a command and read its output).
+    /// Skips when the backend is unavailable or no guest agent is staged.
+    /// Scripted [`ExecEventSource`]: yields the queued events, then waits
+    /// forever (like a live relay that went quiet), and records `terminate`.
+    struct ScriptedSource {
+        events: std::collections::VecDeque<ExecEvent>,
+        terminated: Arc<std::sync::atomic::AtomicBool>,
+        /// Yield `None` once the script is exhausted instead of waiting.
+        end_when_empty: bool,
+    }
+
+    impl ScriptedSource {
+        fn new(events: Vec<ExecEvent>) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+            let terminated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    events: events.into(),
+                    terminated: terminated.clone(),
+                    end_when_empty: false,
+                },
+                terminated,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ExecEventSource for ScriptedSource {
+        async fn next_event(&mut self) -> Option<ExecEvent> {
+            match self.events.pop_front() {
+                Some(event) => Some(event),
+                None if self.end_when_empty => None,
+                None => std::future::pending().await,
+            }
+        }
+
+        fn terminator(&self) -> Terminator {
+            let terminated = self.terminated.clone();
+            Arc::new(move || {
+                let terminated = terminated.clone();
+                Box::pin(async move {
+                    terminated.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        }
+    }
+
+    fn stdout(bytes: &[u8]) -> ExecEvent {
+        ExecEvent::Stdout(bytes.to_vec().into())
+    }
+
+    async fn wait_for(flag: &Arc<std::sync::atomic::AtomicBool>) {
+        for _ in 0..200 {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("relay was never terminated");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_is_forwarded_in_order_until_the_relay_exits() {
+        use futures::StreamExt;
+        let (source, _) = ScriptedSource::new(vec![
+            stdout(b"one"),
+            stdout(b"two"),
+            ExecEvent::Exited { code: 0 },
+        ]);
+        let output: Vec<_> = bounded_terminal_output(source, "sbx_test".into(), 1024)
+            .collect()
+            .await;
+        let bytes: Vec<_> = output
+            .into_iter()
+            .map(|chunk| chunk.expect("no error expected"))
+            .collect();
+        assert_eq!(
+            bytes,
+            vec![bytes::Bytes::from("one"), bytes::Bytes::from("two")]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stderr_is_an_error_not_terminal_bytes() {
+        use futures::StreamExt;
+        let (source, terminated) = ScriptedSource::new(vec![
+            stdout(b"ok"),
+            ExecEvent::Stderr(b"cannot connect to the PTY agent socket\n".to_vec().into()),
+            // Must never be reached: the stream ended at the error.
+            stdout(b"after"),
+        ]);
+        let mut output = Box::pin(bounded_terminal_output(source, "sbx_test".into(), 1024));
+        assert_eq!(
+            output.next().await.unwrap().unwrap(),
+            bytes::Bytes::from("ok")
+        );
+        let error = output.next().await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("cannot connect"), "{error}");
+        assert!(error.contains("sbx_test"), "{error}");
+        assert!(output.next().await.is_none());
+        wait_for(&terminated).await;
+    }
+
+    #[tokio::test]
+    async fn a_stalled_consumer_cuts_the_attachment_at_the_byte_budget() {
+        use futures::StreamExt;
+        // Budget 10 bytes; five 4-byte chunks. The consumer does not read
+        // while they arrive, so the pump must stop buffering and kill the
+        // relay rather than hold everything the guest keeps producing.
+        let chunks: Vec<_> = (0..5).map(|_| stdout(b"abcd")).collect();
+        let (source, terminated) = ScriptedSource::new(chunks);
+        let mut output = Box::pin(bounded_terminal_output(source, "sbx_test".into(), 10));
+
+        wait_for(&terminated).await;
+
+        // What fit is delivered, in order, then a descriptive error.
+        let mut delivered = 0usize;
+        let error = loop {
+            match output.next().await {
+                Some(Ok(chunk)) => delivered += chunk.len(),
+                Some(Err(e)) => break e.to_string(),
+                None => panic!("stream ended without reporting the overflow"),
+            }
+        };
+        assert!(
+            delivered <= 10,
+            "buffered {delivered} bytes past the budget"
+        );
+        assert!(delivered >= 8, "delivered only {delivered} bytes");
+        assert!(error.contains("backlog exceeded 10 bytes"), "{error}");
+        assert!(error.contains("sbx_test"), "{error}");
+        assert!(output.next().await.is_none());
+    }
+
+    /// Source fed one event at a time by the test, so a consumer can be
+    /// shown keeping pace with the producer deterministically.
+    struct ChannelSource(tokio::sync::mpsc::UnboundedReceiver<ExecEvent>);
+
+    #[async_trait]
+    impl ExecEventSource for ChannelSource {
+        async fn next_event(&mut self) -> Option<ExecEvent> {
+            self.0.recv().await
+        }
+
+        fn terminator(&self) -> Terminator {
+            Arc::new(|| Box::pin(async {}))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_consumer_that_keeps_pace_never_hits_the_budget() {
+        use futures::StreamExt;
+        // 100 chunks of 8 bytes through a 16-byte budget: fine while each
+        // chunk is read before the next arrives, because delivered bytes are
+        // credited back to the budget.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut output = Box::pin(bounded_terminal_output(
+            ChannelSource(rx),
+            "sbx_test".into(),
+            16,
+        ));
+        let mut total = 0usize;
+        for _ in 0..100 {
+            tx.send(stdout(b"12345678")).expect("pump alive");
+            total += output
+                .next()
+                .await
+                .expect("stream open")
+                .expect("consumer kept up")
+                .len();
+        }
+        tx.send(ExecEvent::Exited { code: 0 }).expect("pump alive");
+        assert!(output.next().await.is_none());
+        assert_eq!(total, 800);
+    }
+
+    /// A stdin sink that records writes and can be made to hang.
+    struct FakeStdin {
+        written: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        hang_writes: bool,
+        hang_close: bool,
+    }
+
+    #[async_trait]
+    impl StdinSink for FakeStdin {
+        async fn write(&self, data: &[u8]) -> Result<(), String> {
+            if self.hang_writes {
+                std::future::pending::<()>().await;
+            }
+            self.written
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), String> {
+            if self.hang_close {
+                std::future::pending::<()>().await;
+            }
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct PumpHarness {
+        input: tokio::io::DuplexStream,
+        alive: tokio::sync::oneshot::Sender<()>,
+        written: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        killed: Arc<std::sync::atomic::AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn start_pump(hang_writes: bool, hang_close: bool) -> PumpHarness {
+        let (input, pump_end) = tokio::io::duplex(1024);
+        let (alive, gone) = tokio::sync::oneshot::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (source, killed) = ScriptedSource::new(vec![]);
+        let sink = FakeStdin {
+            written: written.clone(),
+            closed: closed.clone(),
+            hang_writes,
+            hang_close,
+        };
+        let task = tokio::spawn(pump_terminal_input(
+            pump_end,
+            sink,
+            source.terminator(),
+            gone,
+            "sbx_test".to_string(),
+            Duration::from_millis(50),
+        ));
+        PumpHarness {
+            input,
+            alive,
+            written,
+            closed,
+            killed,
+            task,
+        }
+    }
+
+    async fn finished(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the pump must end, not park")
+            .expect("pump task");
+    }
+
+    #[tokio::test]
+    async fn input_is_forwarded_and_a_detach_closes_stdin_without_killing() {
+        use tokio::io::AsyncWriteExt;
+        let mut h = start_pump(false, false);
+        h.input.write_all(b"ls\n").await.unwrap();
+        drop(h.input);
+        finished(h.task).await;
+        assert_eq!(
+            *h.written.lock().unwrap_or_else(|p| p.into_inner()),
+            b"ls\n"
+        );
+        assert!(h.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !h.killed.load(std::sync::atomic::Ordering::SeqCst),
+            "a clean detach lets the relay exit by itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stdin_write_ends_the_pump_and_kills_the_relay() {
+        use tokio::io::AsyncWriteExt;
+        let mut h = start_pump(true, false);
+        h.input.write_all(b"x").await.unwrap();
+        finished(h.task).await;
+        wait_for(&h.killed).await;
+        assert!(h.closed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_output_half_ends_the_pump_even_if_the_writer_lives() {
+        let h = start_pump(false, false);
+        // The writer (`input`) stays alive; only the attachment's output
+        // stream goes away, as when the handler's session ends.
+        drop(h.alive);
+        finished(h.task).await;
+        assert!(h.closed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(h.input);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stdin_close_kills_the_relay_instead_of_hanging() {
+        let h = start_pump(false, true);
+        drop(h.input);
+        finished(h.task).await;
+        wait_for(&h.killed).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_output_stops_the_relay_promptly() {
+        let (source, terminated) = ScriptedSource::new(vec![stdout(b"hello")]);
+        let output = bounded_terminal_output(source, "sbx_test".into(), 1024);
+        drop(output);
+        wait_for(&terminated).await;
+    }
+
+    #[test]
+    fn bootstrap_locks_are_per_sandbox_and_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider_at(dir.path().to_path_buf());
+
+        let a1 = provider.bootstrap_lock("sbx-a");
+        let a2 = provider.bootstrap_lock("sbx-a");
+        let b = provider.bootstrap_lock("sbx-b");
+        assert!(Arc::ptr_eq(&a1, &a2), "same sandbox must share a lock");
+        assert!(!Arc::ptr_eq(&a1, &b), "sandboxes must not share a lock");
+
+        // Holding sbx-a's lock does not block sbx-b.
+        {
+            let _held = a1.try_lock().expect("uncontended");
+            assert!(b.try_lock().is_ok());
+        }
+
+        // Once nobody holds an entry it is dropped on the next request, so
+        // the map cannot grow with the number of sandboxes ever seen.
+        drop((a1, a2, b));
+        let _fresh = provider.bootstrap_lock("sbx-c");
+        let tracked = provider
+            .pty_bootstrap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        assert_eq!(tracked, 1, "idle entries must be pruned");
+    }
+
+    #[tokio::test]
+    async fn e2e_terminal_attach_runs_a_command_and_reattaches() {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        let staged = provider.config.pty_agent_bin();
+        if !staged.exists() {
+            println!(
+                "no guest terminal agent staged at {}, skipping",
+                staged.display()
+            );
+            return;
+        }
+
+        fn frame(op: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(5 + payload.len());
+            out.extend_from_slice(&((payload.len() as u32) + 1).to_be_bytes());
+            out.push(op);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        async fn read_until(
+            output: &mut (impl futures::Stream<Item = Result<bytes::Bytes, AgentError>> + Unpin),
+            needle: &[u8],
+        ) -> Vec<u8> {
+            use futures::StreamExt;
+            let mut seen = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !seen.windows(needle.len()).any(|w| w == needle) {
+                let next = tokio::time::timeout_at(deadline, output.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out waiting for {:?}; saw {} bytes",
+                            needle,
+                            seen.len()
+                        )
+                    });
+                match next {
+                    Some(Ok(chunk)) => seen.extend_from_slice(&chunk),
+                    Some(Err(e)) => panic!("terminal stream error: {e}"),
+                    None => panic!("terminal stream ended before {:?}", needle),
+                }
+            }
+            seen
+        }
+
+        with_sandbox(&provider, e2e_config("term", "none"), |handle| {
+            let provider = &provider;
+            async move {
+                let open = |tab: &str, cmd: &str| {
+                    let body = serde_json::json!({
+                        "tab_id": tab, "kind": "shell", "cmd": cmd,
+                        "cols": 80, "rows": 24, "replay_bytes": 4096,
+                        "label": tab, "cwd": "/", "env": null,
+                    });
+                    frame(0x01, body.to_string().as_bytes())
+                };
+
+                // First attach: bootstrap installs and starts the agent.
+                let mut first = provider.attach_pty(&handle).await.expect("attach");
+                first.input.write_all(&frame(0x07, &[])).await.unwrap();
+                first
+                    .input
+                    .write_all(&open("e2e", "echo terminal-e2e-marker; sleep 300"))
+                    .await
+                    .unwrap();
+                read_until(&mut first.output, b"terminal-e2e-marker").await;
+                // The trust boundary: root-owned binary in a root-owned
+                // directory, a private socket directory and a 0600 socket.
+                let stat = sh(
+                    provider,
+                    &handle,
+                    "stat -c '%u %a %n' /usr/local/lib/temps \
+                     /usr/local/lib/temps/pty-agent-* /run/temps-pty \
+                     /run/temps-pty/agent.sock",
+                )
+                .await;
+                assert_eq!(stat.exit_code, 0, "stat failed: {}", stat.stderr);
+                let modes: Vec<(String, String)> = stat
+                    .stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(3, ' ');
+                        let owner = parts.next()?;
+                        let mode = parts.next()?;
+                        let path = parts.next()?;
+                        Some((path.to_string(), format!("{owner}:{mode}")))
+                    })
+                    .collect();
+                let mode_of = |needle: &str| {
+                    modes
+                        .iter()
+                        .find(|(path, _)| path.contains(needle))
+                        .map(|(_, m)| m.as_str())
+                        .unwrap_or_else(|| panic!("no stat line for {needle}: {modes:?}"))
+                };
+                assert_eq!(mode_of("pty-agent-"), "0:755");
+                assert_eq!(mode_of("lib/temps"), "0:755");
+                assert_eq!(mode_of("run/temps-pty/agent.sock"), "0:600");
+
+                // Detach: closing input ends the relay, not the tab.
+                first.input.shutdown().await.unwrap();
+                drop(first);
+
+                // Second attach to the same tab replays the scrollback.
+                let mut second = provider.attach_pty(&handle).await.expect("reattach");
+                second
+                    .input
+                    .write_all(&open("e2e", "echo should-not-run"))
+                    .await
+                    .unwrap();
+                let replay = read_until(&mut second.output, b"terminal-e2e-marker").await;
+                assert!(
+                    !replay
+                        .windows(b"should-not-run".len())
+                        .any(|w| w == b"should-not-run"),
+                    "reattach must not start a second program"
+                );
+                second.input.shutdown().await.unwrap();
             }
         })
         .await;

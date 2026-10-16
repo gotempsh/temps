@@ -1,18 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
@@ -57,7 +48,9 @@ export function GlobalSkillsSettings() {
   usePageTitle('Skills')
   const navigate = useNavigate()
 
-  const [skillToDelete, setSkillToDelete] = useState<string | null>(null)
+  const [skillToDelete, setSkillToDelete] = useState<SkillDefinition | null>(
+    null
+  )
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingSkill, setEditingSkill] = useState<SkillDefinition | null>(null)
 
@@ -95,7 +88,7 @@ export function GlobalSkillsSettings() {
         <div>
           <h2 className="text-lg font-semibold">Global Skills</h2>
           <p className="text-sm text-muted-foreground mt-1">
-            Platform-wide skill definitions available to all projects. Skills
+            Platform-wide skill definitions available to all services. Skills
             are injected as{' '}
             <code className="text-xs bg-muted px-1 rounded">
               .claude/skills/
@@ -143,7 +136,7 @@ export function GlobalSkillsSettings() {
             <FileCode className="h-12 w-12 text-muted-foreground/50 mb-4" />
             <h3 className="text-lg font-semibold mb-2">No global skills</h3>
             <p className="text-sm text-muted-foreground text-center mb-4 max-w-md">
-              Global skills are available to all projects. Define common
+              Global skills are available to all services. Define common
               patterns, coding standards, or reusable instructions here.
             </p>
             <Button onClick={openCreate}>
@@ -164,32 +157,25 @@ export function GlobalSkillsSettings() {
         }}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={skillToDelete !== null}
-        onOpenChange={() => setSkillToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete global skill?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this skill. All projects that
-              reference it will lose access.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (skillToDelete)
-                  deleteMutation.mutate({ path: { slug: skillToDelete } })
-              }}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setSkillToDelete(null)
+        }}
+        resourceType="global skill"
+        resourceName={skillToDelete?.name ?? ''}
+        consequences={
+          <>
+            Every service that references <code>{skillToDelete?.slug}</code>{' '}
+            will lose access to it.
+          </>
+        }
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (skillToDelete)
+            deleteMutation.mutate({ path: { slug: skillToDelete.slug } })
+        }}
+      />
     </div>
   )
 }
@@ -259,7 +245,7 @@ interface SkillsListProps {
   skills: SkillDefinition[]
   onOpen: (slug: string) => void
   onEdit: (skill: SkillDefinition) => void
-  onDelete: (slug: string) => void
+  onDelete: (skill: SkillDefinition) => void
 }
 
 function SkillsCompactRows({
@@ -307,7 +293,7 @@ function SkillsCompactRows({
               skill={skill}
               onView={() => onOpen(skill.slug)}
               onEdit={() => onEdit(skill)}
-              onDelete={() => onDelete(skill.slug)}
+              onDelete={() => onDelete(skill)}
             />
             <ChevronRight className="size-4 shrink-0 text-muted-foreground/50" />
           </li>
@@ -417,7 +403,7 @@ function GlobalSkillDialog({
           <DialogDescription>
             {isEdit
               ? 'Update this global skill definition.'
-              : 'Define a new global skill available to all projects.'}
+              : 'Define a new global skill available to all services.'}
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">

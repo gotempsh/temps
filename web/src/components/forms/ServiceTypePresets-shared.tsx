@@ -147,7 +147,7 @@ export function useMariDbPreset(): PresetState {
     ui: (
       <PresetGroup
         label="MariaDB version"
-        description="Create a shared MariaDB server. Linked projects get separate databases inside it; use the size profile below to tune the container for the host."
+        description="Create a shared MariaDB server. Linked services get separate databases inside it; use the size profile below to tune the container for the host."
         options={MARIADB_OPTIONS}
         selected={selected}
         customValue={custom}

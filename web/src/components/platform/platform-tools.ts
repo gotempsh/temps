@@ -72,7 +72,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
         description: 'Persistent working contexts with optional compute.',
         url: '/workspaces',
         icon: Folder,
-        keywords: ['context', 'workspace', 'projects'],
+        keywords: ['context', 'workspace', 'projects', 'services'],
       },
       {
         title: 'Git connections',
@@ -111,7 +111,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Domains',
-        description: 'Attach domains to projects and services.',
+        description: 'Attach domains to services.',
         url: '/domains',
         icon: Globe,
         keywords: ['hostname', 'dns'],
@@ -164,7 +164,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Analytics',
-        description: 'Compare traffic across projects.',
+        description: 'Compare traffic across services.',
         url: '/analytics',
         icon: BarChart3,
       },
@@ -186,7 +186,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Traces',
-        description: 'Follow requests across projects and services.',
+        description: 'Follow requests across services.',
         url: '/traces',
         icon: Workflow,
       },
@@ -198,7 +198,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Errors',
-        description: 'Review application issues across projects.',
+        description: 'Review application issues across services.',
         url: '/errors',
         icon: Bug,
       },
@@ -302,7 +302,7 @@ export const extensionToolGroupIcon = Puzzle
 
 export const platformToolShortcuts: PlatformToolItem[] = [
   {
-    title: 'Create a project',
+    title: 'Create a service',
     description: 'Deploy an application from Git, an image, or files.',
     url: '/projects/new',
     icon: Folder,

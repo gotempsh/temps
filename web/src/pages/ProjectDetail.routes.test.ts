@@ -207,6 +207,7 @@ function resolveUrl(routes: ParsedRoute[], url: string): string {
 /** Elements that only forward to another URL. */
 const REDIRECT_ELEMENTS = new Set([
   'Navigate',
+  'RedirectWithQuery',
   'LegacyProjectRouteRedirect',
   'RenamedProjectRouteRedirect',
 ])
@@ -242,6 +243,14 @@ function resolveLeaf(
     )
   }
   return { route, pattern }
+}
+
+/** The element name of every route in a table, nested children included. */
+function elementNames(routes: ParsedRoute[]): string[] {
+  return routes.flatMap((route) => [
+    ...(route.elementName ? [route.elementName] : []),
+    ...(route.children ? elementNames(route.children as ParsedRoute[]) : []),
+  ])
 }
 
 /** Paths registered more than once at the same level of a route table. */
@@ -406,6 +415,28 @@ describe('legacy routes', () => {
       expect(REDIRECT_ELEMENTS.has(landing?.route.elementName ?? '')).toBe(
         false
       )
+    }
+  })
+
+  test('no route forwards with a bare Navigate, which drops ?query#hash', () => {
+    const tables = [
+      PROJECT_ROUTES.hosted,
+      PROJECT_ROUTES.external,
+      readRouteTables('components/project/ProjectSettings.tsx').hosted[0],
+    ]
+    for (const table of tables) {
+      expect(elementNames(table).filter((name) => name === 'Navigate')).toEqual(
+        []
+      )
+    }
+  })
+
+  test('the retired repository and databases routes use the query-keeping redirect', () => {
+    for (const legacy of ['git/change-repository', 'databases']) {
+      expect({
+        legacy,
+        element: resolveLeaf(PROJECT_ROUTES.hosted, legacy)?.route.elementName,
+      }).toEqual({ legacy, element: 'RedirectWithQuery' })
     }
   })
 

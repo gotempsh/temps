@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -15,8 +17,9 @@ import {
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import type {
+  AnalyticsRetentionSettings,
   ContainerLogSettings,
   MetricsStoreKind,
   MonitoringSettings,
@@ -24,6 +27,13 @@ import type {
   ObservabilityRetentionSettings,
   PlatformSettings,
 } from '@/api/platformSettings'
+import {
+  type AnalyticsRetentionField,
+  ANALYTICS_RETENTION_DEFAULTS,
+  ANALYTICS_RETENTION_FIELDS,
+  emptyToNull,
+  validateRetentionWindow,
+} from './analytics-retention'
 import {
   AlertCircle,
   Archive,
@@ -37,13 +47,14 @@ import {
   Timer,
 } from 'lucide-react'
 import { forwardRef, useEffect, type ComponentProps } from 'react'
-import { useForm, useWatch } from 'react-hook-form'
+import { useForm, useWatch, type UseFormRegister } from 'react-hook-form'
 import { toast } from 'sonner'
 
 interface MonitoringFormData {
   monitoring: MonitoringSettings
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  analytics_retention: AnalyticsRetentionSettings
   container_logs: ContainerLogBudgetFormData
   geo: GeoFormData
 }
@@ -138,17 +149,6 @@ const DurationInput = forwardRef<HTMLInputElement, DurationInputProps>(
 )
 DurationInput.displayName = 'DurationInput'
 
-/**
- * A cleared number input yields `''`, which must become `null` ("use the
- * default") rather than `NaN` — the server rejects a non-number and would
- * otherwise report a validation error for a field the admin just cleared.
- */
-function emptyToNull(value: unknown): number | null {
-  if (value === '' || value === null || value === undefined) return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
 function describeGeoSource(source: string | null): string {
   if (source === 'maxmind_official') return 'MaxMind (license key)'
   if (source === 'bundled_github') return 'the bundled repository copy'
@@ -215,9 +215,55 @@ function estimateStorageMbPerDay(
   return Math.round(bytesPerDay / (1024 * 1024))
 }
 
+interface AnalyticsRetentionFieldCardProps {
+  field: AnalyticsRetentionField
+  register: UseFormRegister<MonitoringFormData>
+  error?: string
+}
+
+function AnalyticsRetentionFieldCard({
+  field,
+  register,
+  error,
+}: AnalyticsRetentionFieldCardProps) {
+  const id = `analytics-retention-${field.name}`
+  const fallback = ANALYTICS_RETENTION_DEFAULTS[field.name]
+  return (
+    <div className="space-y-3 rounded-lg border p-4">
+      <div className="flex items-center justify-between gap-3">
+        <Label htmlFor={id}>{field.label}</Label>
+        <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+          {field.stores}
+        </code>
+      </div>
+      <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+        {field.description}
+      </p>
+      <DurationInput
+        id={id}
+        unit="days"
+        min={1}
+        max={3650}
+        placeholder={field.optional ? 'Keep' : undefined}
+        {...register(`analytics_retention.${field.name}`, {
+          setValueAs: emptyToNull,
+          validate: (value) => validateRetentionWindow(value, field.optional),
+        })}
+      />
+      <p className="text-xs text-muted-foreground">
+        {field.optional
+          ? 'Leave empty to keep this data. Range 1–3650 days.'
+          : 'Range 1–3650 days.'}{' '}
+        Default: {fallback === null ? 'keep' : `${fallback} days`}.
+      </p>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  )
+}
+
 export function MonitoringSettingsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -232,6 +278,7 @@ export function MonitoringSettingsPage() {
       monitoring: DEFAULTS,
       observability_compression: COMPRESSION_DEFAULTS,
       observability_retention: RETENTION_DEFAULTS,
+      analytics_retention: ANALYTICS_RETENTION_DEFAULTS,
       container_logs: CONTAINER_LOG_BUDGET_DEFAULTS,
       geo: GEO_DEFAULTS,
     },
@@ -267,6 +314,8 @@ export function MonitoringSettingsPage() {
           settings.observability_compression ?? COMPRESSION_DEFAULTS,
         observability_retention:
           settings.observability_retention ?? RETENTION_DEFAULTS,
+        analytics_retention:
+          settings.analytics_retention ?? ANALYTICS_RETENTION_DEFAULTS,
         container_logs: {
           cache_mb:
             settings.container_logs?.cache_mb ??
@@ -293,6 +342,7 @@ export function MonitoringSettingsPage() {
         monitoring: data.monitoring,
         observability_compression: data.observability_compression,
         observability_retention: data.observability_retention,
+        analytics_retention: data.analytics_retention,
         container_logs: {
           // Keep the Docker rotation fields this page does not edit.
           ...(settings?.container_logs ??
@@ -334,11 +384,10 @@ export function MonitoringSettingsPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
@@ -1041,6 +1090,35 @@ export function MonitoringSettingsPage() {
               </div>
             </div>
           </section>
+        </div>
+      </SettingsSection>
+
+      {/* Analytics rows carry IP addresses and visitor identifiers, so how
+          long they live is a privacy decision the operator must be able to
+          see and make, not a behaviour buried in a background job. */}
+      <SettingsSection
+        title="Analytics Data Retention"
+        icon={BarChart2}
+        description="Control how long page views, error events, visitors and the IP addresses stored with them are kept. Expired rows are deleted by an hourly background job."
+      >
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {ANALYTICS_RETENTION_FIELDS.map((field) => (
+              <AnalyticsRetentionFieldCard
+                key={field.name}
+                field={field}
+                register={register}
+                error={errors.analytics_retention?.[field.name]?.message}
+              />
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Shortening a window permanently deletes data beyond that age. Leave
+            an optional window empty to keep that data indefinitely. A stored IP
+            address is only deleted once nothing refers to it and it has not
+            been looked up for the whole window; one that is still in use is
+            kept however long that takes.
+          </p>
         </div>
       </SettingsSection>
 

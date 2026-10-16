@@ -27,7 +27,7 @@ use crate::docker_network_isolation::{
 use crate::docker_network_isolation::{
     BRIDGE_GATEWAY_MODE_IPV4_OPTION, BRIDGE_INHIBIT_IPV4_OPTION,
 };
-use crate::error::AgentError;
+use crate::error::{is_network_pool_exhausted, network_pool_exhausted_reason, AgentError};
 
 /// Container naming prefix — used for recovery after server restarts.
 pub const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
@@ -156,6 +156,28 @@ fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
             ..
         }
     )
+}
+
+/// What a failed `inspect_container` says about liveness. The daemon
+/// answering "no such container" proves it is gone (`Ok(false)`). Anything
+/// else (socket down, daemon restarting, timeout) says nothing about the
+/// container, and `Ok(false)` is a verdict callers act on by rewriting the
+/// sandbox row, so it is an error and stays "unknown".
+fn inspect_failure_verdict(
+    handle: &SandboxHandle,
+    error: bollard::errors::Error,
+) -> Result<bool, AgentError> {
+    if docker_error_is_not_found(&error) {
+        return Ok(false);
+    }
+    Err(AgentError::SandboxExecFailed {
+        run_id: 0,
+        sandbox_id: handle.sandbox_id.clone(),
+        reason: format!(
+            "Failed to inspect container {}: {}",
+            handle.sandbox_name, error
+        ),
+    })
 }
 
 fn docker_network_matches_policy(
@@ -642,6 +664,10 @@ pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
 ///
 /// Keep in sync with `preview_gateway::PREVIEW_GATEWAY_NETWORK`.
 const SANDBOX_NETWORK_PREFIX: &str = "temps-sandbox-net-v3-";
+/// A sandbox network is only reaped as orphaned once it is at least this old.
+/// `create` makes the network before the container, so a younger network
+/// without a container may belong to a sandbox that is still being created.
+const ORPHANED_NETWORK_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
 pub(crate) const SANDBOX_PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway-for";
 
@@ -660,6 +686,83 @@ pub const SANDBOX_MODEL_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/model-relay";
 const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
 const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
+
+/// The sandbox a network belongs to, when the network is a candidate for
+/// being reaped as orphaned: it carries the ownership label, its name is the
+/// one this provider derives for that owner (so a user's own network that
+/// happens to copy the label is left alone), it is labelled for this
+/// instance's preview gateway (another Temps instance sharing this Docker
+/// daemon may be recreating that sandbox, which this instance's bookkeeping
+/// cannot see), and it is at least `min_age` old.
+///
+/// The gateway name is the instance scope: `DockerSandboxConfig` documents it
+/// as the gateway "owned by this Temps instance", and the gateway reconciler
+/// leaves a gateway container carrying another instance's secret alone, so
+/// two instances on one daemon are expected to use different names. Two
+/// instances configured with the *same* name are not separable by this
+/// bookkeeping and must not both run automatic reaping against one daemon.
+/// The reaper additionally never removes a network that has any workload
+/// attached (`network_has_foreign_endpoints`), so even then a running sandbox
+/// is not disconnected: removal detaches only the gateway
+/// (`NetworkDetach::OnlyGateway`), so Docker refuses to remove a network a
+/// workload has attached; at worst a create in its first seconds fails and is
+/// retried.
+///
+/// Whether the owner's container still exists is checked by the caller.
+fn orphan_candidate_owner<'a>(
+    network: &'a bollard::models::Network,
+    gateway: &str,
+    now_unix: i64,
+    min_age: std::time::Duration,
+) -> Option<&'a str> {
+    let labels = network.labels.as_ref()?;
+    // Positive ownership only: a network that predates the gateway label
+    // cannot be attributed to this instance (another one on the same daemon
+    // may have reused it as a legacy network), so it is left alone.
+    if labels
+        .get(SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map(String::as_str)
+        != Some(gateway)
+    {
+        return None;
+    }
+    let owner = labels.get(SANDBOX_NETWORK_OWNER_LABEL)?.as_str();
+    if owner.is_empty() || network.name.as_deref() != Some(sandbox_network_name(owner).as_str()) {
+        return None;
+    }
+    let age_secs = now_unix.checked_sub(network.created?.unix_timestamp())?;
+    (u64::try_from(age_secs).ok()? >= min_age.as_secs()).then_some(owner)
+}
+
+/// Which endpoints [`DockerSandboxProvider::remove_isolated_sandbox_network_with`]
+/// disconnects before removing the network.
+#[derive(Clone, Copy)]
+enum NetworkDetach<'a> {
+    /// Every attached endpoint: the caller knows the sandbox is gone.
+    Everything,
+    /// Only the preview gateway with this container name; anything else is
+    /// left attached so Docker refuses to remove a network a workload uses.
+    OnlyGateway(&'a str),
+}
+
+/// Containers attached to `network` other than the sandbox's own egress proxy
+/// and the preview gateway: anything else is a workload, so the network is in
+/// use and must not be torn down by the reaper, which would disconnect it.
+fn network_has_foreign_endpoints(
+    network: &bollard::models::NetworkInspect,
+    owner: &str,
+    gateway: &str,
+) -> bool {
+    let proxy = sandbox_egress_proxy_name(owner);
+    network.containers.as_ref().is_some_and(|containers| {
+        containers.values().any(|endpoint| {
+            endpoint
+                .name
+                .as_deref()
+                .is_none_or(|name| name != proxy && name != gateway)
+        })
+    })
+}
 
 fn isolated_sandbox_network_request(
     name: &str,
@@ -1505,6 +1608,95 @@ pub struct DockerSandboxProvider {
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
     network_lock: tokio::sync::Mutex<()>,
+    /// Which sandboxes are being created and which are being reaped, so the
+    /// two can never overlap. A creating sandbox's isolated network may be
+    /// reused from an earlier incarnation and so be arbitrarily old, yet its
+    /// container does not exist until the very end of `create`; the orphan
+    /// reaper must not mistake that gap for an abandoned network, and a
+    /// `create` must not start reusing a network the reaper is tearing down.
+    creates_in_flight: std::sync::Mutex<SandboxLifecycle>,
+}
+
+/// Per-sandbox-name bookkeeping behind
+/// [`DockerSandboxProvider::creates_in_flight`]. One lock covers both sets so
+/// "no create is running, so claim it for reaping" is a single atomic step.
+#[derive(Default)]
+struct SandboxLifecycle {
+    /// Running creates, with a count per name (overlapping creates of one
+    /// sandbox are possible).
+    creating: HashMap<String, usize>,
+    /// Names whose leftovers the reaper is currently removing.
+    reaping: std::collections::HashSet<String>,
+}
+
+type LifecycleRegistry = std::sync::Mutex<SandboxLifecycle>;
+
+fn lock_lifecycle(registry: &LifecycleRegistry) -> std::sync::MutexGuard<'_, SandboxLifecycle> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a sandbox as being created for as long as it lives. See
+/// [`DockerSandboxProvider::creates_in_flight`].
+struct CreateInFlight<'a> {
+    registry: &'a LifecycleRegistry,
+    name: String,
+}
+
+impl<'a> CreateInFlight<'a> {
+    /// Register a create, or `None` while the reaper holds this name.
+    fn try_new(registry: &'a LifecycleRegistry, name: &str) -> Option<Self> {
+        let mut state = lock_lifecycle(registry);
+        if state.reaping.contains(name) {
+            return None;
+        }
+        *state.creating.entry(name.to_string()).or_insert(0) += 1;
+        Some(Self {
+            registry,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for CreateInFlight<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_lifecycle(self.registry);
+        if let Some(count) = state.creating.get_mut(&self.name) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.creating.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// Held by the reaper while it removes a sandbox's leftovers; creates of the
+/// same name wait until it drops.
+struct ReapClaim<'a> {
+    registry: &'a LifecycleRegistry,
+    name: String,
+}
+
+impl<'a> ReapClaim<'a> {
+    /// Claim a name for reaping, or `None` if a create (or another reap) of
+    /// it is running.
+    fn try_new(registry: &'a LifecycleRegistry, name: &str) -> Option<Self> {
+        let mut state = lock_lifecycle(registry);
+        if state.creating.contains_key(name) || !state.reaping.insert(name.to_string()) {
+            return None;
+        }
+        Some(Self {
+            registry,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for ReapClaim<'_> {
+    fn drop(&mut self) {
+        lock_lifecycle(self.registry).reaping.remove(&self.name);
+    }
 }
 
 /// PATH used for every command Temps runs as root inside a sandbox.
@@ -1641,6 +1833,7 @@ impl DockerSandboxProvider {
             docker,
             config,
             network_lock: tokio::sync::Mutex::new(()),
+            creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),
         }
     }
 
@@ -2383,6 +2576,24 @@ impl DockerSandboxProvider {
                 self.quarantine_container(id, container_name).await?;
             }
         }
+        // Networks of sandboxes removed while Temps was down (or whose
+        // teardown failed) would otherwise keep their subnets until Docker
+        // runs out of address pools.
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        let reaped = self
+            .reap_orphaned_sandbox_networks(&gateway, ORPHANED_NETWORK_MIN_AGE)
+            .await;
+        if reaped > 0 {
+            tracing::info!(
+                networks = reaped,
+                "Released isolated networks of sandboxes that no longer exist"
+            );
+        }
         Ok(())
     }
 
@@ -2402,16 +2613,41 @@ impl DockerSandboxProvider {
         let network = match inspected {
             Ok(network) => network,
             Err(error) if docker_error_is_not_found(&error) => {
-                create_host_isolated_network(
+                let mut created = create_host_isolated_network(
                     &self.docker,
                     isolated_sandbox_network_request(name, container_name, gateway),
                 )
-                .await
-                .map_err(|source| AgentError::SandboxProviderUnavailable {
-                    provider: "docker".to_string(),
-                    reason: format!(
-                        "create isolated network for sandbox '{container_name}': {source}"
-                    ),
+                .await;
+                // Docker hands out a subnet per network from a finite pool.
+                // Networks of sandboxes that no longer exist hold subnets for
+                // nothing, so release those and retry once before telling the
+                // operator the host is out of address space.
+                if created
+                    .as_ref()
+                    .err()
+                    .is_some_and(|source| is_network_pool_exhausted(&source.to_string()))
+                    && self
+                        .reap_orphaned_sandbox_networks(gateway, ORPHANED_NETWORK_MIN_AGE)
+                        .await
+                        > 0
+                {
+                    created = create_host_isolated_network(
+                        &self.docker,
+                        isolated_sandbox_network_request(name, container_name, gateway),
+                    )
+                    .await;
+                }
+                created.map_err(|source| {
+                    let cause = source.to_string();
+                    let reason = if is_network_pool_exhausted(&cause) {
+                        network_pool_exhausted_reason(container_name, &cause)
+                    } else {
+                        format!("create isolated network for sandbox '{container_name}': {cause}")
+                    };
+                    AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason,
+                    }
                 })?;
                 self.docker
                     .inspect_network(
@@ -2573,7 +2809,142 @@ impl DockerSandboxProvider {
         }
     }
 
+    /// Remove isolated sandbox networks whose sandbox container no longer
+    /// exists, returning how many were removed.
+    ///
+    /// Every network pins a subnet from Docker's finite address pool, and a
+    /// sandbox that was removed behind Temps' back (or whose teardown failed
+    /// part-way) leaves its network, and the subnet, behind. Only networks
+    /// carrying this provider's ownership label whose name matches the owner
+    /// are candidates, and a network younger than `min_age` is skipped
+    /// because its container may not have been created yet. Networks
+    /// not labelled for `gateway` (another Temps instance on this daemon, or
+    /// a legacy network with no gateway label) are left alone. Best effort:
+    /// failures are logged and never block the caller.
+    async fn reap_orphaned_sandbox_networks(
+        &self,
+        gateway: &str,
+        min_age: std::time::Duration,
+    ) -> usize {
+        let networks = match self
+            .docker
+            .list_networks(Some(
+                bollard::query_parameters::ListNetworksOptionsBuilder::new()
+                    .filters(&HashMap::from([(
+                        "label".to_string(),
+                        vec![SANDBOX_NETWORK_OWNER_LABEL.to_string()],
+                    )]))
+                    .build(),
+            ))
+            .await
+        {
+            Ok(networks) => networks,
+            Err(error) => {
+                tracing::warn!("Could not list sandbox networks to reap orphans: {error}");
+                return 0;
+            }
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        let mut reaped = 0;
+        for network in &networks {
+            let Some(owner) = orphan_candidate_owner(network, gateway, now_unix, min_age) else {
+                continue;
+            };
+            // Claim the owner before looking at its container: from here a
+            // create of the same name waits for this reap, so it cannot
+            // start reusing the network between the check and the removal.
+            let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, owner) else {
+                continue;
+            };
+            match self
+                .docker
+                .inspect_container(
+                    owner,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Err(error) if docker_error_is_not_found(&error) => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        network = ?network.name,
+                        "Could not inspect owner '{owner}' of sandbox network: {error}"
+                    );
+                    continue;
+                }
+            }
+            // The owner's container is absent, but a sandbox another Temps
+            // process is creating right now would be attached by the time
+            // this looks again. Never force-disconnect a workload: a network
+            // with any endpoint besides its own proxy and the gateway is in
+            // use, so leave it for a later pass.
+            match self
+                .docker
+                .inspect_network(
+                    &sandbox_network_name(owner),
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+            {
+                Ok(inspected) if network_has_foreign_endpoints(&inspected, owner, gateway) => {
+                    tracing::debug!(
+                        network = ?network.name,
+                        sandbox = %owner,
+                        "Not reaping a sandbox network that still has attached workloads"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) if docker_error_is_not_found(&error) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        network = ?network.name,
+                        "Could not inspect sandbox network '{owner}' before reaping it: {error}"
+                    );
+                    continue;
+                }
+            }
+            if self
+                .remove_isolated_sandbox_network_with(owner, NetworkDetach::OnlyGateway(gateway))
+                .await
+                .is_empty()
+            {
+                tracing::info!(
+                    network = ?network.name,
+                    sandbox = %owner,
+                    "Removed isolated network of a sandbox that no longer exists"
+                );
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
     async fn remove_isolated_sandbox_network(&self, container_name: &str) -> Vec<String> {
+        self.remove_isolated_sandbox_network_with(container_name, NetworkDetach::Everything)
+            .await
+    }
+
+    /// Remove a sandbox's egress proxy and isolated network.
+    ///
+    /// `detach` decides which endpoints are disconnected before the network
+    /// is removed. [`NetworkDetach::Everything`] is right when the caller
+    /// knows the sandbox is gone. The orphan reaper can only infer that, and
+    /// another Temps process may have started the sandbox meanwhile, so it
+    /// passes [`NetworkDetach::OnlyGateway`]: the preview gateway is always
+    /// attached to a sandbox network and would otherwise pin the subnet
+    /// forever, while a workload that appeared since the check is left
+    /// attached and Docker refuses to remove the network under it.
+    async fn remove_isolated_sandbox_network_with(
+        &self,
+        container_name: &str,
+        detach: NetworkDetach<'_>,
+    ) -> Vec<String> {
         let mut cleanup_errors = Vec::new();
         let proxy_name = sandbox_egress_proxy_name(container_name);
         if let Err(error) = self
@@ -2640,7 +3011,17 @@ impl DockerSandboxProvider {
             );
             return cleanup_errors;
         }
-        for container_id in network.containers.unwrap_or_default().into_keys() {
+        let attached: Vec<String> = network
+            .containers
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, endpoint)| match detach {
+                NetworkDetach::Everything => true,
+                NetworkDetach::OnlyGateway(gateway) => endpoint.name.as_deref() == Some(gateway),
+            })
+            .map(|(container_id, _)| container_id)
+            .collect();
+        for container_id in attached {
             if let Err(error) = self
                 .docker
                 .disconnect_network(
@@ -3679,7 +4060,17 @@ impl SandboxProvider for DockerSandboxProvider {
         }
     }
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        // Held until the container exists: from here on this sandbox's
+        // network may be in use although no container carries its name.
+        // A create never overlaps a reap of the same name: wait it out.
+        let _create_in_flight = loop {
+            if let Some(guard) = CreateInFlight::try_new(&self.creates_in_flight, &container_name) {
+                break guard;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         // Resolve the request override exactly once. Provisioning, proxy
         // environment, and HostConfig must all use this same effective value;
         // otherwise `none -> full` references a bridge that was never created
@@ -3731,7 +4122,7 @@ impl SandboxProvider for DockerSandboxProvider {
                         return Err(AgentError::SandboxCreationFailed {
                             run_id: config.run_id,
                             provider: "docker".to_string(),
-                            reason: format!("Failed to pull image {}: {}", image, e),
+                            reason: crate::error::image_pull_failure_reason(image, &e.to_string()),
                         });
                     }
                 }
@@ -4461,7 +4852,7 @@ impl SandboxProvider for DockerSandboxProvider {
                     .await?;
                 Ok(false)
             }
-            Err(_) => Ok(false),
+            Err(error) => inspect_failure_verdict(handle, error),
         }
     }
 
@@ -5034,6 +5425,82 @@ impl SandboxProvider for DockerSandboxProvider {
     ) -> Result<Option<SandboxHandle>, AgentError> {
         let full_name = format!("{}{}", SANDBOX_NAME_PREFIX, container_name);
         self.recover_container(&full_name).await
+    }
+
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        let full_name = format!("{}{}", SANDBOX_NAME_PREFIX, container_name);
+        // Same exclusion the automatic reaper uses: refuse while a create of
+        // this name is running (it may already have reused the network), and
+        // keep creates of this name waiting until the release is done.
+        let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, &full_name) else {
+            return Err(AgentError::SandboxConflictOnNode {
+                sandbox: full_name,
+                node_name: "this node".to_string(),
+                reason: "the sandbox is being created or released right now; its network and egress proxy are in use".to_string(),
+            });
+        };
+        // The container may have been created since the caller looked.
+        match self
+            .docker
+            .inspect_container(
+                &full_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(_) => {
+                return Err(AgentError::SandboxConflictOnNode {
+                    sandbox: full_name,
+                    node_name: "this node".to_string(),
+                    reason: "the sandbox's container exists, so its network is in use; destroy the sandbox instead".to_string(),
+                });
+            }
+            Err(error) if docker_error_is_not_found(&error) => {}
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect sandbox '{full_name}' before releasing its leftover resources: {source}"
+                    ),
+                });
+            }
+        }
+        // A network labelled for another Temps instance's gateway is not
+        // ours to remove even when it carries this sandbox's name.
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        if let Ok(network) = self
+            .docker
+            .inspect_network(
+                &sandbox_network_name(&full_name),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            if let Some(labelled) = network_labelled_for_another_gateway(&network, &gateway) {
+                tracing::warn!(
+                    sandbox = %full_name,
+                    network_gateway = %labelled,
+                    "Leaving the network of a sandbox that belongs to another Temps instance's preview gateway"
+                );
+                return Ok(());
+            }
+        }
+        let errors = self.remove_isolated_sandbox_network(&full_name).await;
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!(
+                "release leftover resources of removed sandbox '{full_name}': {}",
+                errors.join("; ")
+            ),
+        })
     }
 
     fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
@@ -5632,6 +6099,7 @@ impl SandboxProvider for DockerSandboxProvider {
         artifact: &super::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let image_ref =
             artifact
                 .image_ref
@@ -6966,6 +7434,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(60),
@@ -7018,6 +7487,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(60),
@@ -7185,6 +7655,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -7548,6 +8019,7 @@ mod tests {
             memory_limit_mb: Some(512),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::from([("TEST_VAR".to_string(), "test_value".to_string())]),
             idle_timeout: Duration::from_secs(120),
@@ -7711,6 +8183,7 @@ mod tests {
                     memory_limit_mb: Some(512),
                     pids_limit: None,
                     disk_size_mb: None,
+                    allow_docker: false,
                     network_mode: Some("none".to_string()),
                     env_vars: HashMap::new(),
                     idle_timeout: Duration::from_secs(120),
@@ -7963,6 +8436,7 @@ mod tests {
                 memory_limit_mb: Some(512),
                 pids_limit: None,
                 disk_size_mb: None,
+                allow_docker: false,
                 network_mode: Some("none".to_string()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(120),
@@ -8331,6 +8805,7 @@ mod tests {
             memory_limit_mb: Some(256),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -8554,6 +9029,7 @@ mod tests {
             memory_limit_mb: Some(256),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -8706,6 +9182,7 @@ mod tests {
                 memory_limit_mb: Some(256),
                 pids_limit: None,
                 disk_size_mb: None,
+                allow_docker: false,
                 network_mode: Some("none".to_string()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(60),
@@ -10007,6 +10484,486 @@ function response() {{
             "a removed network still blocks gateway renames"
         );
     }
+
+    const TEST_GATEWAY: &str = "temps-preview-gateway-test";
+
+    fn labelled_network(
+        name: &str,
+        owner: Option<&str>,
+        created_unix: Option<i64>,
+    ) -> bollard::models::Network {
+        bollard::models::Network {
+            name: Some(name.to_string()),
+            created: created_unix.map(|secs| {
+                bollard::models::BollardDate::from_unix_timestamp(secs).expect("valid timestamp")
+            }),
+            labels: owner.map(|owner| {
+                HashMap::from([
+                    (SANDBOX_NETWORK_OWNER_LABEL.to_string(), owner.to_string()),
+                    (
+                        SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                        TEST_GATEWAY.to_string(),
+                    ),
+                ])
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_old_networks_with_a_matching_owner_are_orphan_candidates() {
+        let now = 1_800_000_000_i64;
+        let old = Some(now - 2 * 3600);
+        let owner = "temps-sandbox-abc123";
+        let name = sandbox_network_name(owner);
+        let min_age = ORPHANED_NETWORK_MIN_AGE;
+
+        // A leftover network of a long-gone sandbox is reapable.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            Some(owner)
+        );
+        // A legacy network with no gateway label cannot be attributed to
+        // this instance, so it is never reaped.
+        let mut unlabelled = labelled_network(&name, Some(owner), old);
+        if let Some(labels) = unlabelled.labels.as_mut() {
+            labels.remove(SANDBOX_PREVIEW_GATEWAY_LABEL);
+        }
+        assert_eq!(
+            orphan_candidate_owner(&unlabelled, TEST_GATEWAY, now, min_age),
+            None
+        );
+        // Labelled for another Temps instance's preview gateway: that
+        // instance may be recreating the sandbox, and this one cannot see it.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), old),
+                "another-instances-gateway",
+                now,
+                min_age
+            ),
+            None
+        );
+        // Younger than the grace period: its container may be mid-create.
+        let fresh = Some(now - 30);
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), fresh),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        // No creation time reported: cannot prove it is old, so keep it.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(owner), None),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        // Not carrying the ownership label: not one of ours.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, None, old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        // Name does not match what this provider derives for that owner.
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network("someone-elses-network", Some(owner), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+        assert_eq!(
+            orphan_candidate_owner(
+                &labelled_network(&name, Some(""), old),
+                TEST_GATEWAY,
+                now,
+                min_age
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn networks_with_attached_workloads_are_not_reapable() {
+        let owner = "temps-sandbox-abc123";
+        let gateway = "temps-preview-gateway";
+        let endpoint = |name: &str| bollard::models::EndpointResource {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let network = |members: &[&str]| bollard::models::NetworkInspect {
+            containers: Some(
+                members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (format!("id{index}"), endpoint(name)))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let proxy = sandbox_egress_proxy_name(owner);
+
+        // Only its own proxy and the gateway: a leftover.
+        assert!(!network_has_foreign_endpoints(
+            &network(&[]),
+            owner,
+            gateway
+        ));
+        assert!(!network_has_foreign_endpoints(
+            &network(&[proxy.as_str(), gateway]),
+            owner,
+            gateway
+        ));
+        // The sandbox's own container (a create that finished meanwhile) or
+        // anything else attached means the network is in use.
+        assert!(network_has_foreign_endpoints(
+            &network(&[proxy.as_str(), owner]),
+            owner,
+            gateway
+        ));
+        assert!(network_has_foreign_endpoints(
+            &network(&["some-other-container"]),
+            owner,
+            gateway
+        ));
+    }
+
+    #[test]
+    fn a_create_stays_in_flight_until_the_last_guard_for_its_name_drops() {
+        let registry = LifecycleRegistry::default();
+        let in_flight = |name: &str| lock_lifecycle(&registry).creating.contains_key(name);
+
+        let first = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        let second = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        let other = CreateInFlight::try_new(&registry, "temps-sandbox-b").unwrap();
+        assert!(in_flight("temps-sandbox-a") && in_flight("temps-sandbox-b"));
+
+        // Two overlapping creates of one sandbox: the first to finish must
+        // not unprotect the network the second is still about to attach.
+        drop(first);
+        assert!(in_flight("temps-sandbox-a"));
+        drop(second);
+        assert!(!in_flight("temps-sandbox-a"));
+        assert!(in_flight("temps-sandbox-b"));
+        drop(other);
+        assert!(lock_lifecycle(&registry).creating.is_empty());
+    }
+
+    #[test]
+    fn a_reap_and_a_create_of_the_same_sandbox_exclude_each_other() {
+        let registry = LifecycleRegistry::default();
+
+        // A running create blocks the reaper from claiming the name.
+        let create = CreateInFlight::try_new(&registry, "temps-sandbox-a").unwrap();
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-a").is_none());
+        // Other sandboxes are unaffected.
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-b").is_some());
+        drop(create);
+
+        // A held reap claim blocks a create (and a second reap) of the name,
+        // until it is released.
+        let claim = ReapClaim::try_new(&registry, "temps-sandbox-a").unwrap();
+        assert!(CreateInFlight::try_new(&registry, "temps-sandbox-a").is_none());
+        assert!(ReapClaim::try_new(&registry, "temps-sandbox-a").is_none());
+        drop(claim);
+        assert!(CreateInFlight::try_new(&registry, "temps-sandbox-a").is_some());
+        assert!(lock_lifecycle(&registry).reaping.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_orphaned_resources_removes_a_leftover_network_and_is_idempotent() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        // The label a standalone sandbox's container is named after.
+        let label = format!("orphan-test-{:016x}", rand::random::<u64>());
+        let container = format!("{SANDBOX_NAME_PREFIX}{label}");
+        let network = sandbox_network_name(&container);
+
+        // The state a failed create or a manual `docker rm` leaves: the
+        // network is there, its container is not. The subnet is pinned so
+        // the test does not depend on the daemon having address pools left,
+        // which is precisely the condition this cleanup exists to relieve.
+        let mut request = isolated_sandbox_network_request(
+            &network,
+            &container,
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER,
+        );
+        let octet = 16 + rand::random::<u8>() % 200;
+        request.ipam = Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                subnet: Some(format!("10.{octet}.{}.0/24", rand::random::<u8>())),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        if let Err(error) = create_host_isolated_network(&docker, request).await {
+            println!("Could not create a test network ({error}), skipping");
+            return;
+        }
+        assert!(docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>
+            )
+            .await
+            .is_ok());
+
+        // A create of this sandbox is running: it may have reused the
+        // network, so the release must refuse and touch nothing.
+        let busy = {
+            let _create = CreateInFlight::try_new(&provider.creates_in_flight, &container)
+                .expect("no reap is running");
+            provider.release_orphaned_resources(&label).await
+        };
+        assert!(
+            matches!(busy, Err(AgentError::SandboxConflictOnNode { .. })),
+            "release must refuse while a create is in flight: {busy:?}"
+        );
+        assert!(
+            docker
+                .inspect_network(
+                    &network,
+                    None::<bollard::query_parameters::InspectNetworkOptions>
+                )
+                .await
+                .is_ok(),
+            "the network of a sandbox being created must survive a release"
+        );
+
+        let released = provider.release_orphaned_resources(&label).await;
+        let after = docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let again = provider.release_orphaned_resources(&label).await;
+        // Never leave the test network behind, whatever the assertions say.
+        let _ = provider.remove_isolated_sandbox_network(&container).await;
+
+        released.expect("release the leftover network");
+        assert!(
+            matches!(&after, Err(error) if docker_error_is_not_found(error)),
+            "the leftover network must be gone: {after:?}"
+        );
+        again.expect("releasing twice is a no-op");
+    }
+    /// Starts a throwaway container named `name` from any image the daemon
+    /// already has, so the test never depends on a pull. `None` when none of
+    /// them can run `sleep`.
+    async fn start_throwaway_container(docker: &Docker, name: &str) -> Option<()> {
+        let images = docker
+            .list_images(None::<bollard::query_parameters::ListImagesOptions>)
+            .await
+            .ok()?;
+        for image in images
+            .iter()
+            .flat_map(|image| image.repo_tags.iter())
+            .filter(|tag| !tag.contains("<none>"))
+            .take(5)
+        {
+            let created = docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(name)
+                            .build(),
+                    ),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(image.clone()),
+                        entrypoint: Some(vec!["sleep".to_string()]),
+                        cmd: Some(vec!["120".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if created.is_err() {
+                continue;
+            }
+            let started = docker
+                .start_container(
+                    name,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await;
+            if started.is_ok() {
+                return Some(());
+            }
+            let _ = docker
+                .remove_container(
+                    name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn the_reaper_detaches_the_gateway_but_never_a_workload() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        // Unique per run, so the reaper only ever sees this test's networks.
+        let gateway = format!("reaper-test-gateway-{suffix}");
+        let workload = format!("reaper-test-workload-{suffix}");
+        let leftover = format!("{SANDBOX_NAME_PREFIX}reaper-leftover-{suffix}");
+        let busy = format!("{SANDBOX_NAME_PREFIX}reaper-busy-{suffix}");
+
+        let mut networks: Vec<(String, String)> = Vec::new();
+        for owner in [&leftover, &busy] {
+            let network = sandbox_network_name(owner);
+            let mut request = isolated_sandbox_network_request(&network, owner, &gateway);
+            let octet = 16 + rand::random::<u8>() % 200;
+            request.ipam = Some(bollard::models::Ipam {
+                config: Some(vec![bollard::models::IpamConfig {
+                    subnet: Some(format!("10.{octet}.{}.0/24", rand::random::<u8>())),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            if let Err(error) = create_host_isolated_network(&docker, request).await {
+                println!("Could not create a test network ({error}), skipping");
+                for (_, owner) in &networks {
+                    let _ = provider.remove_isolated_sandbox_network(owner).await;
+                }
+                return;
+            }
+            networks.push((network, owner.clone()));
+        }
+
+        let cleanup = |docker: Arc<Docker>, names: Vec<String>| async move {
+            for name in names {
+                let _ = docker
+                    .remove_container(
+                        &name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        };
+        let names = vec![gateway.clone(), workload.clone()];
+        if start_throwaway_container(&docker, &gateway).await.is_none()
+            || start_throwaway_container(&docker, &workload)
+                .await
+                .is_none()
+        {
+            println!("No local image can run a throwaway container, skipping");
+            cleanup(docker.clone(), names).await;
+            for (_, owner) in &networks {
+                let _ = provider.remove_isolated_sandbox_network(owner).await;
+            }
+            return;
+        }
+        let attach = |network: String, container: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .connect_network(
+                        &network,
+                        bollard::models::NetworkConnectRequest {
+                            container,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        };
+        // The leftover has only the gateway attached; the busy one also has a
+        // workload, which is what a sandbox started elsewhere looks like.
+        let attached = [
+            attach(sandbox_network_name(&leftover), gateway.clone()).await,
+            attach(sandbox_network_name(&busy), gateway.clone()).await,
+            attach(sandbox_network_name(&busy), workload.clone()).await,
+        ];
+
+        let reaped = if attached.iter().all(Result::is_ok) {
+            Some(
+                provider
+                    .reap_orphaned_sandbox_networks(&gateway, std::time::Duration::ZERO)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let inspect = |network: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .inspect_network(
+                        &network,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+            }
+        };
+        let leftover_after = inspect(sandbox_network_name(&leftover)).await;
+        let busy_after = inspect(sandbox_network_name(&busy)).await;
+
+        // Never leave anything behind, whatever the assertions say.
+        cleanup(docker.clone(), names).await;
+        for (_, owner) in &networks {
+            let _ = provider.remove_isolated_sandbox_network(owner).await;
+        }
+
+        assert!(
+            attached.iter().all(Result::is_ok),
+            "attach the test containers: {attached:?}"
+        );
+        assert_eq!(reaped, Some(1), "only the leftover network is reaped");
+        assert!(
+            matches!(&leftover_after, Err(error) if docker_error_is_not_found(error)),
+            "a network with only the gateway attached must be removed: {leftover_after:?}"
+        );
+        assert!(
+            busy_after.is_ok(),
+            "a network with a workload attached must be left alone"
+        );
+    }
 }
 #[test]
 fn docker_not_found_is_safe_for_idempotent_cleanup() {
@@ -10021,4 +10978,32 @@ fn docker_not_found_is_safe_for_idempotent_cleanup() {
 
     assert!(docker_error_is_not_found(&not_found));
     assert!(!docker_error_is_not_found(&conflict));
+}
+
+#[test]
+fn a_failed_inspection_is_unknown_unless_the_container_is_gone() {
+    let handle = SandboxHandle {
+        node_id: None,
+        sandbox_id: "abc123".to_string(),
+        sandbox_name: "temps-sandbox-test".to_string(),
+        work_dir: std::path::PathBuf::from("/workspace"),
+        backend: crate::sandbox::SandboxBackend::Docker,
+        image: String::new(),
+    };
+    let gone = bollard::errors::Error::DockerResponseServerError {
+        status_code: 404,
+        message: "No such container".to_string(),
+    };
+    let daemon_down = bollard::errors::Error::DockerResponseServerError {
+        status_code: 500,
+        message: "daemon is restarting".to_string(),
+    };
+
+    assert!(matches!(inspect_failure_verdict(&handle, gone), Ok(false)));
+    let unknown = inspect_failure_verdict(&handle, daemon_down);
+    assert!(
+        matches!(&unknown, Err(AgentError::SandboxExecFailed { reason, .. })
+            if reason.contains("temps-sandbox-test") && reason.contains("daemon is restarting")),
+        "{unknown:?}"
+    );
 }

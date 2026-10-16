@@ -491,6 +491,66 @@ async fn reserve_service_name(
         .map_err(ExternalServiceError::from)
 }
 
+/// Longest a service-config transaction waits for a row or advisory lock
+/// held by another transaction. Every holder of these locks is a short
+/// database transaction, so a wait this long means the holder is stuck;
+/// failing with [`ExternalServiceError::LockTimeout`] names the service and
+/// the operation where an unbounded wait would hang the request (and, in a
+/// test, the whole CI job) with nothing in the log.
+const SERVICE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open a transaction whose lock waits are capped at `timeout`.
+///
+/// `SET LOCAL` scopes the cap to this transaction, so it cannot leak onto
+/// the pooled connection's next user.
+async fn begin_bounded_transaction(
+    db: &DatabaseConnection,
+    service_id: i32,
+    operation: &'static str,
+    timeout: std::time::Duration,
+) -> Result<sea_orm::DatabaseTransaction, ExternalServiceError> {
+    use sea_orm::ConnectionTrait;
+    let txn = db.begin().await?;
+    // The value is an integer we format ourselves; `SET` cannot bind a
+    // parameter.
+    let statement = format!(
+        "SET LOCAL lock_timeout = '{}ms'",
+        timeout.as_millis().max(1)
+    );
+    if let Err(error) = txn.execute_unprepared(&statement).await {
+        let error = lock_timeout_or_database_error(service_id, operation, timeout, error.into());
+        return Err(rollback_before_error(txn, error).await);
+    }
+    Ok(txn)
+}
+
+/// Whether a database error message is Postgres's "lock_not_available"
+/// (SQLSTATE 55P03), which `lock_timeout` raises as "canceling statement
+/// due to lock timeout".
+fn is_lock_timeout_message(message: &str) -> bool {
+    message.contains("55P03") || message.contains("due to lock timeout")
+}
+
+/// Turn a lock-wait failure into [`ExternalServiceError::LockTimeout`];
+/// every other error passes through unchanged.
+fn lock_timeout_or_database_error(
+    service_id: i32,
+    operation: &'static str,
+    timeout: std::time::Duration,
+    error: ExternalServiceError,
+) -> ExternalServiceError {
+    match error {
+        ExternalServiceError::DatabaseError { reason } if is_lock_timeout_message(&reason) => {
+            ExternalServiceError::LockTimeout {
+                service_id,
+                operation,
+                timeout_secs: timeout.as_secs().max(1),
+            }
+        }
+        other => other,
+    }
+}
+
 /// `pg_advisory_xact_lock` key serializing cluster port-block reservation
 /// ("TEMPSPRT"), so two concurrent creations cannot pick the same block.
 const CLUSTER_PORT_LOCK_KEY: i64 = 0x5445_4D50_5350_5254;
@@ -702,6 +762,17 @@ pub enum ExternalServiceError {
     #[error("Parameter validation failed for service {service_id}: {reason}")]
     ParameterValidationFailed { service_id: i32, reason: String },
 
+    /// A change was refused because carrying it out would leave the service
+    /// running without the data it has: its container would be replaced by
+    /// one on other storage, or a rename would start it on a new, empty
+    /// volume (#1415). Nothing was changed.
+    #[error("Refusing to change service {service_id} ('{name}'): {reason}")]
+    DataSafetyRefusal {
+        service_id: i32,
+        name: String,
+        reason: String,
+    },
+
     #[error("Failed to start service {id}: {reason}")]
     StartFailed { id: i32, reason: String },
 
@@ -744,6 +815,24 @@ pub enum ExternalServiceError {
     ClusterBusy {
         service_id: i32,
         action: &'static str,
+    },
+
+    /// A database lock this operation needs was still held by another
+    /// transaction after `timeout_secs`. The wait is bounded so a stuck
+    /// holder surfaces as this error naming the service and the operation,
+    /// not as a request that never returns. Only the database write was
+    /// refused: a caller that saves after Docker work (an upgrade, say) may
+    /// already have changed the container, so this does not promise the
+    /// service is untouched.
+    #[error(
+        "Timed out after {timeout_secs}s waiting for a database lock while {operation} \
+         service {service_id}: another operation is holding it. The database change was \
+         not applied; check the service's state, and retry once the other operation finishes"
+    )]
+    LockTimeout {
+        service_id: i32,
+        operation: &'static str,
+        timeout_secs: u64,
     },
 
     #[error("Failed to delete service {id}: {reason}")]
@@ -2301,6 +2390,11 @@ pub struct ResourceLimitsUpdateResponse {
     pub limits: crate::externalsvc::ServiceResourceLimits,
     /// Per-container result of trying to apply the limits live.
     pub applied: Vec<ResourceLimitApplyResult>,
+    /// Set when a new `/dev/shm` size was saved but could not be applied,
+    /// because that needs a new container and replacing it was refused or
+    /// failed (the reason says which, and that no data was changed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shm_not_applied: Option<String>,
 }
 
 /// TTL for the `<service>.temps.local` A record of a standalone managed
@@ -3445,6 +3539,165 @@ impl ExternalServiceManager {
         })
     }
 
+    /// Refuse a change that recreates `service`'s local container with
+    /// `parameters` when the new container would not see the data the
+    /// current one uses. Read-only; a no-op when there is no container yet,
+    /// or the service is remote or a cluster (whose paths guard themselves).
+    async fn ensure_recreate_keeps_data(
+        &self,
+        service: &external_services::Model,
+        parameters: &HashMap<String, serde_json::Value>,
+        operation: &str,
+    ) -> Result<(), ExternalServiceError> {
+        if service.node_id.is_some() || service.topology == "cluster" {
+            return Ok(());
+        }
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            parameters,
+        )?;
+        let config = ServiceConfig {
+            name: service.name.clone(),
+            service_type,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to serialize parameters of service {}: {}",
+                        service.id, e
+                    ),
+                }
+            })?,
+        };
+        // Imported services are never recreated, so there is nothing to check.
+        let Some((engine, replacement)) = instance.recreate_plan(&config) else {
+            return Ok(());
+        };
+        let docker = self.require_docker()?;
+        crate::externalsvc::recreate_guard::preflight(
+            docker.as_ref(),
+            engine,
+            &service.name,
+            &instance.get_docker_container_name(),
+            &replacement,
+            operation,
+        )
+        .await
+        .map_err(|e| {
+            if e.is_refusal() {
+                ExternalServiceError::DataSafetyRefusal {
+                    service_id: service.id,
+                    name: service.name.clone(),
+                    reason: e.to_string(),
+                }
+            } else {
+                ExternalServiceError::DockerError {
+                    id: service.id,
+                    reason: e.to_string(),
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Refuse to rename a local service that already has Docker resources
+    /// under its current name: its data volume cannot follow the rename, so
+    /// the renamed service would come up empty (#1415 class).
+    async fn ensure_rename_keeps_data(
+        &self,
+        service: &external_services::Model,
+        new_name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        if service.node_id.is_some() {
+            // Its resources are on a worker this process cannot inspect, and
+            // they are named after the service just the same.
+            return Err(ExternalServiceError::DataSafetyRefusal {
+                service_id: service.id,
+                name: service.name.clone(),
+                reason: format!(
+                    "renaming it to '{new_name}' would start it on new, empty storage on its \
+                     worker node: its container and volume are named after the current name. \
+                     Nothing was changed. Keep the current name, or back the service up and \
+                     restore it into a new service with the name you want"
+                ),
+            });
+        }
+        let parameters = self.get_service_parameters(service.id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
+        let refuse = |resource: String| ExternalServiceError::DataSafetyRefusal {
+            service_id: service.id,
+            name: service.name.clone(),
+            reason: format!(
+                "renaming it to '{new_name}' would start it on new, empty storage: its data is in \
+                 Docker resource '{resource}', which is named after the current service name and \
+                 cannot be renamed. Nothing was changed. Keep the current name, or back the \
+                 service up and restore it into a new service with the name you want"
+            ),
+        };
+        let Some(names) = instance.docker_resource_names() else {
+            return Err(refuse(instance.get_docker_container_name()));
+        };
+        let docker = self.require_docker()?;
+        for volume in names.volumes {
+            match docker.inspect_volume(&volume).await {
+                Ok(_) => return Err(refuse(volume)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to check volume '{}' before renaming service {}: {}",
+                            volume, service.id, e
+                        ),
+                    })
+                }
+            }
+        }
+        for container in names.containers {
+            match docker
+                .inspect_container(
+                    &container,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) => return Err(refuse(container)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to check container '{}' before renaming service {}: {}",
+                            container, service.id, e
+                        ),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_new_local_service_resources_unused(
         &self,
         service: &external_services::Model,
@@ -4429,12 +4682,34 @@ impl ExternalServiceManager {
             })?;
 
         // Merge the updates into the parameters read above
+        let previous_image = existing_params.get("docker_image").cloned();
+        let previous_replica_set = existing_params.get("replica_set").cloned();
         strategy
             .merge_updates(&mut existing_params, update_params)
             .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason,
             })?;
+        // A new image means a new container. Refuse before saving anything
+        // or stopping the service when that container would not see the
+        // current one's data (#1415).
+        if existing_params.get("docker_image") != previous_image.as_ref() {
+            self.ensure_recreate_keeps_data(&service, &existing_params, "changing its image")
+                .await?;
+        }
+        // Enabling a MongoDB replica set also means a new container (the
+        // flag is on its command line): refuse before saving when the data
+        // would not come along, rather than report a setting that can't apply.
+        let replica_set_enabled = existing_params
+            .get("replica_set")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty());
+        if replica_set_enabled
+            && existing_params.get("replica_set") != previous_replica_set.as_ref()
+        {
+            self.ensure_recreate_keeps_data(&service, &existing_params, "enabling its replica set")
+                .await?;
+        }
 
         // Serialize and encrypt the merged parameters
         let config_json = serde_json::to_string(&existing_params).map_err(|e| {
@@ -4450,24 +4725,32 @@ impl ExternalServiceManager {
                 reason: format!("Failed to encrypt config: {}", e),
             })?;
 
-        let name_transaction = if let Some(new_name) = request.name.as_deref() {
-            let txn = self.db.begin().await?;
-            reserve_service_name(&txn, new_name, Some(service_id)).await?;
-            Some(txn)
-        } else {
-            None
-        };
+        // Fail fast on a taken name, before anything is stopped. This is a
+        // short transaction that is rolled back before any Docker work: the
+        // name lock is never held across a container call. The save below
+        // reserves the name again, atomically with the write.
+        if let Some(new_name) = request.name.as_deref() {
+            self.ensure_service_name_available(service_id, new_name)
+                .await?;
+        }
 
         // Update service config (and optionally name/slug) in database.
         // `name` was previously accepted by the request but silently dropped;
         // applying it here keeps the API contract honest.
         let mut service_update: external_services::ActiveModel = service.clone().into();
         service_update.config = Set(Some(encrypted_config));
+        // Set when the rename moves the service off a running container that
+        // is identified by its pre-rename name.
+        let mut pre_rename_instance: Option<Box<dyn ExternalService>> = None;
         if let Some(new_name) = request.name {
             if new_name != service.name {
                 // Reserving a database name does not grant ownership of an
                 // existing Docker resource. Refuse a rename destination before
                 // stopping the original service or persisting its new identity.
+                // Every resource is named after the service, and Docker cannot
+                // rename a volume: a rename would start the service on a new,
+                // empty volume and leave its data behind under the old name.
+                self.ensure_rename_keeps_data(&service, &new_name).await?;
                 let mut renamed_service = service.clone();
                 renamed_service.name = new_name.clone();
                 self.ensure_new_local_service_resources_unused(&renamed_service)
@@ -4476,11 +4759,13 @@ impl ExternalServiceManager {
                 // current (pre-rename) name (see create_service_instance).
                 // initialize_service() below rebuilds its stop-then-recreate
                 // instance from whatever name is in the DB at that point --
-                // if we persist the rename first, it looks for a container
-                // under the *new* name, finds nothing, and the still-running
-                // old container is left holding the host port, so the new
+                // once the rename is saved, it looks for a container under
+                // the *new* name, finds nothing, and the still-running old
+                // container is left holding the host port, so the new
                 // container's start fails with "port is already allocated".
-                // Stop the old container by its pre-rename identity first.
+                // Build the instance for the pre-rename identity now (so a
+                // failure to build it stops nothing), and stop it after the
+                // rename is saved and before initialize_service().
                 let service_type_enum =
                     ServiceType::from_str(&service.service_type).map_err(|_| {
                         ExternalServiceError::InvalidServiceType {
@@ -4491,30 +4776,30 @@ impl ExternalServiceManager {
                 // The stored parameters pick the engine, so a Garage service
                 // stops `garage-<old>` rather than a `rustfs-<old>` that
                 // does not exist.
-                let old_instance = self.create_service_instance_for_parameters(
+                pre_rename_instance = Some(self.create_service_instance_for_parameters(
                     service.name.clone(),
                     service_type_enum,
                     &stored_params,
-                )?;
-                if let Err(e) = old_instance.stop().await {
-                    info!(
-                        "Could not stop pre-rename container for service {} (may not exist): {}",
-                        service_id, e
-                    );
-                }
+                )?);
             }
             let new_slug = Self::generate_slug(&new_name);
             service_update.name = Set(new_name);
             service_update.slug = Set(Some(new_slug));
         }
         service_update.updated_at = Set(Utc::now());
-        if let Some(txn) = name_transaction {
-            self.persist_service_config_in_transaction(service_id, service_update, &txn)
-                .await?;
-            txn.commit().await?;
-        } else {
-            self.persist_service_config(service_id, service_update)
-                .await?;
+        // The save reserves the name and writes the row in one short
+        // transaction, so a name taken since the check above is refused
+        // before the original container is stopped.
+        self.persist_service_config(service_id, service_update)
+            .await?;
+
+        if let Some(old_instance) = pre_rename_instance {
+            if let Err(e) = old_instance.stop().await {
+                info!(
+                    "Could not stop pre-rename container for service {} (may not exist): {}",
+                    service_id, e
+                );
+            }
         }
 
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
@@ -4808,6 +5093,17 @@ impl ExternalServiceManager {
                     service_type_enum,
                     &parameters,
                 )?;
+                // An original kept aside by an interrupted recreate still
+                // mounts the data volume and would make removing it fail.
+                // Deleting the service deletes that data anyway.
+                if let Ok(docker) = self.require_docker() {
+                    crate::externalsvc::recreate_guard::remove_set_aside_originals(
+                        docker.as_ref(),
+                        &service_instance.get_docker_container_name(),
+                        &service_instance.get_name(),
+                    )
+                    .await;
+                }
                 service_instance.remove().await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
                         id: service_id,
@@ -4984,6 +5280,69 @@ impl ExternalServiceManager {
     }
 
     // Helper methods
+    /// Why a WAL-G backup of `service_id` would restart PostgreSQL right
+    /// now, or `None` when it would not. A restart is needed when a managed,
+    /// local, standalone service has `archive_mode` off: turning it on
+    /// recreates the container. When the setting cannot be read the answer
+    /// is "it may", so the caller asks for confirmation rather than assume.
+    /// Bounded: one SQL round trip to the service.
+    pub async fn backup_restart_reason(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<String>, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let is_postgres = matches!(
+            ServiceType::from_str(&service.service_type),
+            Ok(ServiceType::Postgres)
+        );
+        if !is_postgres || service.topology == "cluster" || service.node_id.is_some() {
+            return Ok(None);
+        }
+        let parameters = self.get_service_parameters(service_id).await?;
+        let docker = self.require_docker()?;
+        let postgres =
+            crate::externalsvc::postgres::PostgresService::new(service.name.clone(), docker);
+        let config = ServiceConfig {
+            name: service.name.clone(),
+            service_type: ServiceType::Postgres,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to serialize parameters of service {}: {}",
+                        service_id, e
+                    ),
+                }
+            })?,
+        };
+        Ok(
+            match postgres.backup_requires_restart(config.clone()).await {
+                Ok(false) => None,
+                Ok(true) => match postgres.backup_restart_refusal(config).await {
+                    Ok(Some(refusal)) => Some(format!(
+                    "WAL archiving is off for PostgreSQL service '{}', and turning it on needs a \
+                     new container that Temps cannot create safely, so this backup will fail \
+                     without changing anything: {}",
+                    service.name, refusal
+                )),
+                    Ok(None) | Err(_) => Some(format!(
+                "WAL archiving is off for PostgreSQL service '{}'. The first WAL-G backup turns \
+                 it on, which restarts PostgreSQL in a new container (usually under a minute). \
+                 Temps keeps the current container until the new one is verified to hold the same \
+                 data, and puts it back otherwise",
+                    service.name
+                )),
+                },
+                Err(e) => Some(format!(
+                    "Temps could not read whether WAL archiving is on for PostgreSQL service '{}' \
+                 ({}). If it is off, this backup restarts PostgreSQL in a new container to turn it \
+                 on",
+                    service.name, e
+                )),
+            },
+        )
+    }
+
     /// Read a single `external_services` row by id. Public so handlers can
     /// branch on per-service fields (e.g. `topology`) without redoing the
     /// existence check.
@@ -7454,12 +7813,60 @@ echo "[restore] Pre-seed complete"
         service_id: i32,
         active: external_services::ActiveModel,
     ) -> Result<external_services::Model, ExternalServiceError> {
-        let txn = self.db.begin().await?;
-        let updated = self
+        let txn = begin_bounded_transaction(
+            &self.db,
+            service_id,
+            "saving the configuration of",
+            SERVICE_LOCK_TIMEOUT,
+        )
+        .await?;
+        let updated = match self
             .persist_service_config_in_transaction(service_id, active, &txn)
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                // Roll back now: leaving it to Drop keeps the row lock and
+                // the name's advisory lock until the connection is recycled.
+                let error = lock_timeout_or_database_error(
+                    service_id,
+                    "saving the configuration of",
+                    SERVICE_LOCK_TIMEOUT,
+                    error,
+                );
+                return Err(rollback_before_error(txn, error).await);
+            }
+        };
         txn.commit().await?;
         Ok(updated)
+    }
+
+    /// Refuse a service name that is already taken or reserved, without
+    /// keeping any lock: the check runs in a short transaction that is rolled
+    /// back before this returns, so callers can go on to Docker work.
+    async fn ensure_service_name_available(
+        &self,
+        service_id: i32,
+        name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        let txn = begin_bounded_transaction(
+            &self.db,
+            service_id,
+            "checking the new name of",
+            SERVICE_LOCK_TIMEOUT,
+        )
+        .await?;
+        if let Err(error) = reserve_service_name(&txn, name, Some(service_id)).await {
+            let error = lock_timeout_or_database_error(
+                service_id,
+                "checking the new name of",
+                SERVICE_LOCK_TIMEOUT,
+                error,
+            );
+            return Err(rollback_before_error(txn, error).await);
+        }
+        txn.rollback().await?;
+        Ok(())
     }
 
     async fn persist_service_config_in_transaction(
@@ -8068,9 +8475,16 @@ echo "[restore] Pre-seed complete"
 
         // Initialize the service
         let inferred_params = service_instance.init(config).await.map_err(|e| {
-            ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: e.to_string(),
+            match e.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>() {
+                Some(guard) if guard.is_refusal() => ExternalServiceError::DataSafetyRefusal {
+                    service_id,
+                    name: service.name.clone(),
+                    reason: guard.to_string(),
+                },
+                _ => ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: e.to_string(),
+                },
             }
         })?;
 
@@ -11708,9 +12122,82 @@ echo "[restore] Pre-seed complete"
                 }
             }
 
-            match service_instance.start().await {
+            // A managed PostgreSQL service is started with its stored
+            // configuration loaded (`force_recreate` = load it, then
+            // `start()`), so start-time drift repair (archive_mode,
+            // shared_preload_libraries) has a specification to rebuild from.
+            // Without it, start() can only start the existing container as
+            // it is. The repair itself goes through the recreate guard.
+            let managed_postgres = matches!(service_type_enum, ServiceType::Postgres)
+                && !parameters.contains_key("container_name");
+            // A managed container that no longer exists is created afresh
+            // by re-initialisation, which stores the host port it actually
+            // bound (a port retry happens when the old one is now taken).
+            // Starting it through the provider would keep that port only in
+            // memory and leave the service's connection details stale.
+            if managed_postgres {
+                let docker = self.require_docker()?;
+                let container = service_instance.get_docker_container_name();
+                match docker
+                    .inspect_container(
+                        &container,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => {
+                        info!(
+                            "Container {} of service {} ({}) is missing; re-initializing it",
+                            container, service_id, service.name
+                        );
+                        self.initialize_service(service_id).await?;
+                        return self.get_service_info(service_id).await;
+                    }
+                    Err(e) => {
+                        return Err(ExternalServiceError::DockerError {
+                            id: service_id,
+                            reason: format!(
+                                "Failed to inspect container '{}' before starting service {}: {}",
+                                container, service_id, e
+                            ),
+                        })
+                    }
+                }
+            }
+            let start_result = if managed_postgres {
+                let service_config = ServiceConfig {
+                    name: service.name.clone(),
+                    service_type: service_type_enum,
+                    version: service.version.clone(),
+                    parameters: serde_json::to_value(&parameters).map_err(|e| {
+                        ExternalServiceError::InternalError {
+                            reason: format!(
+                                "Failed to serialize parameters of service {}: {}",
+                                service_id, e
+                            ),
+                        }
+                    })?,
+                };
+                service_instance.force_recreate(service_config).await
+            } else {
+                service_instance.start().await
+            };
+            match start_result {
                 Ok(()) => {}
                 Err(e) => {
+                    // The guard's verdict is final. Re-initialising would
+                    // stop whatever holds the container's name and recreate
+                    // it again -- over an original that is still set aside,
+                    // or a replacement that failed verification.
+                    if let Some(guard_failure) =
+                        Self::guard_failure_for_start(service_id, &service.name, &e)
+                    {
+                        return Err(guard_failure);
+                    }
                     info!(
                         "Direct start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
@@ -11770,6 +12257,33 @@ echo "[restore] Pre-seed complete"
         }
 
         self.get_service_info(service_id).await
+    }
+
+    /// The error to return from a failed start when the failure came from
+    /// the recreate guard, or `None` for any other failure (which may fall
+    /// back to re-initialising the service). A guard error is never retried
+    /// through `initialize_service`: it stops the container that holds the
+    /// name and recreates it again, which is exactly what the guard just
+    /// refused or failed to complete safely.
+    fn guard_failure_for_start(
+        service_id: i32,
+        name: &str,
+        error: &anyhow::Error,
+    ) -> Option<ExternalServiceError> {
+        let guard =
+            error.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>()?;
+        Some(if guard.is_refusal() {
+            ExternalServiceError::DataSafetyRefusal {
+                service_id,
+                name: name.to_string(),
+                reason: guard.to_string(),
+            }
+        } else {
+            ExternalServiceError::StartFailed {
+                id: service_id,
+                reason: guard.to_string(),
+            }
+        })
     }
 
     /// Wipe `health_metadata.postgres_wal` then immediately run the WAL probe
@@ -15347,52 +15861,69 @@ echo "[restore] Pre-seed complete"
         // a hard requirement (the caller already ruled out remote/cluster).
         let docker = self.docker.require()?;
 
-        // Stop, then DELETE the container (volume preserved). Stop is
-        // best-effort — the container may already be stopped or gone.
-        let _ = docker
-            .stop_container(
-                &container_name,
-                None::<bollard::query_parameters::StopContainerOptions>,
-            )
-            .await;
-        match docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    v: false, // keep the data volume — only the container is recreated
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            Ok(()) => {
-                info!(
-                    service_id = service.id,
-                    container = %container_name,
-                    "Removed container to apply new /dev/shm size (data volume preserved)"
-                );
+        // Through the shared guard (#1415): refuse unless the new container
+        // mounts the data the current one uses, keep the current one until
+        // the new one is verified to hold the same data, restore it otherwise.
+        let service_config = ServiceConfig {
+            name: service.name.clone(),
+            service_type: ServiceType::from_str(&service.service_type).map_err(|_| {
+                ExternalServiceError::InvalidServiceType {
+                    id: service.id,
+                    service_type: service.service_type.clone(),
+                }
+            })?,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to serialize parameters of service {}: {}",
+                        service.id, e
+                    ),
+                }
+            })?,
+        };
+        let (engine, replacement) = instance.recreate_plan(&service_config).ok_or_else(|| {
+            ExternalServiceError::DataSafetyRefusal {
+                service_id: service.id,
+                name: service.name.clone(),
+                reason: format!(
+                    "its {} container '{}' cannot be recreated safely by Temps (imported, or an engine without a known storage layout), so the new /dev/shm size was saved but not applied. Recreate the container by hand with the same mounts",
+                    service.service_type, container_name
+                ),
             }
-            Err(e) => {
-                // "no such container" is benign — nothing to recreate-from,
-                // initialize_service will just create it fresh. Surface other
-                // errors so the caller can warn.
-                let msg = e.to_string();
-                if !msg.contains("No such container") && !msg.contains("no such container") {
-                    return Err(ExternalServiceError::InternalError {
-                        reason: format!(
-                            "Failed to remove container '{}' for shm recreate: {}",
-                            container_name, msg
-                        ),
-                    });
+        })?;
+        let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
+            crate::externalsvc::recreate_guard::RecreateRequest {
+                docker: docker.as_ref(),
+                engine,
+                service_name: &service.name,
+                container_name: &container_name,
+                replacement,
+                operation: "applying a new /dev/shm size",
+            },
+            || self.initialize_service(service.id),
+        )
+        .await
+        .map_err(|e| {
+            if e.is_refusal() {
+                ExternalServiceError::DataSafetyRefusal {
+                    service_id: service.id,
+                    name: service.name.clone(),
+                    reason: e.to_string(),
+                }
+            } else {
+                ExternalServiceError::InternalError {
+                    reason: e.to_string(),
                 }
             }
-        }
-
-        // Recreate from the now-persisted config (incl. the new resources
-        // block). With the old container gone, `create_container` takes the
-        // create branch and applies the new shm.
-        self.initialize_service(service.id).await
+        })?;
+        info!(
+            service_id = service.id,
+            container = %container_name,
+            replaced = report.replaced,
+            "Recreated container to apply new /dev/shm size; data verified"
+        );
+        Ok(())
     }
 
     pub async fn update_service_resource_limits(
@@ -15488,8 +16019,10 @@ echo "[restore] Pre-seed complete"
         // Best-effort: the limits are already persisted, so a recreate failure
         // must not roll them back. We log and fall through to report the
         // per-member outcome — the operator can recreate manually.
+        let mut shm_not_applied = None;
         if shm_changed {
             if let Err(e) = self.recreate_service_container_for_shm(&service).await {
+                shm_not_applied = Some(e.to_string());
                 tracing::warn!(
                     service_id,
                     error = %e,
@@ -15512,6 +16045,7 @@ echo "[restore] Pre-seed complete"
         Ok(ResourceLimitsUpdateResponse {
             limits: new_limits,
             applied,
+            shm_not_applied,
         })
     }
 }
@@ -15947,6 +16481,43 @@ impl temps_metrics::ClusterPrimaryConnector for ExternalServiceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guard_error(restored: bool) -> anyhow::Error {
+        crate::externalsvc::recreate_guard::RecreateGuardError::DataNotPreserved {
+            engine: crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
+            service: "app".into(),
+            container: "postgres-app".into(),
+            operation: "a test".into(),
+            reason: "identity changed".into(),
+            rollback: "rollback note".into(),
+            original_in_place: restored,
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_failed_start_after_a_guard_error_is_never_retried_by_reinitialising() {
+        // Whether or not the rollback completed, the guard's verdict is
+        // returned as the start failure instead of recreating again.
+        for restored in [true, false] {
+            let failure =
+                ExternalServiceManager::guard_failure_for_start(7, "app", &guard_error(restored));
+            assert!(
+                matches!(
+                    failure,
+                    Some(ExternalServiceError::StartFailed { id: 7, ref reason })
+                        if reason.contains("postgres-app")
+                ),
+                "restored={restored}: {failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_start_without_a_guard_error_may_fall_back_to_reinitialising() {
+        let other = anyhow::anyhow!("container is missing");
+        assert!(ExternalServiceManager::guard_failure_for_start(7, "app", &other).is_none());
+    }
 
     #[test]
     fn readiness_is_reported_only_for_the_phase_the_status_is_in() {
@@ -18643,6 +19214,19 @@ mod tests {
                 .exec(manager.db.as_ref())
                 .await
                 .unwrap();
+            // Its data volume cannot follow a rename, so a service that
+            // already owns Docker resources is refused before its container
+            // is stopped, whatever the destination (#1455). The destination
+            // checks below are only reachable from a service that owns none.
+            let free_name = format!("rename-free-{}", uuid::Uuid::new_v4());
+            let refused = manager
+                .update_service(original.id, rename(free_name))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, ExternalServiceError::DataSafetyRefusal { service_id, .. } if service_id == original.id),
+                "renaming a service that owns Docker resources must be refused: {refused:?}"
+            );
             let occupied_name = format!("rename-occupied-{}", uuid::Uuid::new_v4());
             let occupied_container = postgres_container_name(&occupied_name);
             let docker = manager.require_docker().unwrap();
@@ -18690,14 +19274,34 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            // A stopped service with no Docker resources of its own passes the
+            // data-safety guard, so the occupied destination is what refuses.
+            let renamable_name = format!("rename-source-{}", uuid::Uuid::new_v4());
+            let mut renamable: external_services::ActiveModel =
+                manager.get_service(original.id).await.unwrap().into();
+            renamable.id = sea_orm::ActiveValue::NotSet;
+            renamable.name = Set(renamable_name.clone());
+            renamable.status = Set("stopped".to_string());
+            let renamable = renamable.insert(manager.db.as_ref()).await.unwrap();
             let conflict = manager
-                .update_service(original.id, rename(occupied_name))
+                .update_service(renamable.id, rename(occupied_name))
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                conflict,
-                ExternalServiceError::ServiceResourceConflict { .. }
-            ));
+            assert!(
+                matches!(
+                    conflict,
+                    ExternalServiceError::ServiceResourceConflict { .. }
+                ),
+                "an occupied rename destination must be refused: {conflict:?}"
+            );
+            assert_eq!(
+                manager.get_service(renamable.id).await.unwrap().name,
+                renamable_name
+            );
+            external_services::Entity::delete_by_id(renamable.id)
+                .exec(manager.db.as_ref())
+                .await
+                .unwrap();
             let after = docker
                 .inspect_container(
                     &container_name,
@@ -19431,22 +20035,11 @@ mod tests {
     }
 
     #[cfg(feature = "docker-tests")]
-    #[tokio::test]
-    async fn test_update_service_parameters() {
-        let (manager, _test_db) = setup_test_manager_or_skip!();
-
-        // Create a service first. Use an explicit unused port and unique names
-        // so the Postgres container (and its post-rename recreate) does not
-        // collide with the default port (5449) or another test's container name
-        // on the shared CI runner.
-        let random_unused_port = get_unused_port();
-        let ts = chrono::Utc::now().timestamp_millis();
-        let service_name = format!("test-update-{}", ts);
-        let renamed_name = format!("test-update-renamed-{}", ts);
+    fn postgres_create_request(name: &str, database: &str) -> CreateExternalServiceRequest {
         let mut params = HashMap::new();
         params.insert(
             "database".to_string(),
-            JsonValue::String("original_db".to_string()),
+            JsonValue::String(database.to_string()),
         );
         params.insert(
             "username".to_string(),
@@ -19456,31 +20049,81 @@ mod tests {
             "password".to_string(),
             JsonValue::String("original_pass".to_string()),
         );
+        // An explicit unused port keeps the container from colliding with the
+        // default port (5449) or another test's container on a shared runner.
         params.insert(
             "port".to_string(),
-            JsonValue::String(random_unused_port.to_string()),
+            JsonValue::String(get_unused_port().to_string()),
         );
-
-        let request = CreateExternalServiceRequest {
-            name: service_name,
+        CreateExternalServiceRequest {
+            name: name.to_string(),
             service_type: ServiceType::Postgres,
             version: None,
             parameters: params,
             node_id: None,
             topology: "standalone".to_string(),
             members: Vec::new(),
-        };
+        }
+    }
 
-        let service = manager.create_service(request).await.unwrap();
+    /// Whether another connection can take the advisory lock that serializes
+    /// writers of `name`. Runs on its own thread and runtime and is joined,
+    /// so the calling test's runtime is blocked meanwhile: a transaction the
+    /// service dropped without rolling back stays open here, exactly as it
+    /// does under a test database's synchronous cleanup (sea-orm only queues
+    /// the ROLLBACK, and a task on the blocked runtime would send it).
+    #[cfg(feature = "docker-tests")]
+    fn service_name_lock_is_free(database_url: &str, name: &str) -> Result<bool, String> {
+        let database_url = database_url.to_string();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start probe runtime: {e}"))?;
+            runtime.block_on(async {
+                use sea_orm::ConnectionTrait;
+                let conn = sea_orm::Database::connect(&database_url)
+                    .await
+                    .map_err(|e| format!("probe connection failed: {e}"))?;
+                let row = conn
+                    .query_one(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT pg_try_advisory_lock(hashtextextended('external-service-name:' || $1, 0)) AS free",
+                        [name.into()],
+                    ))
+                    .await
+                    .map_err(|e| format!("probe query failed: {e}"))?
+                    .ok_or_else(|| "probe query returned no row".to_string())?;
+                row.try_get::<bool>("", "free")
+                    .map_err(|e| format!("probe result unreadable: {e}"))
+            })
+        })
+        .join()
+        .map_err(|_| "probe thread panicked".to_string())?
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_update_service_parameters() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+
+        let service_name = format!("test-update-{}", chrono::Utc::now().timestamp_millis());
+        let service = manager
+            .create_service(postgres_create_request(&service_name, "original_db"))
+            .await
+            .unwrap();
         let service_id = service.id;
 
-        // Update only updateable fields — Postgres marks `database`,
+        // Update only updateable fields -- Postgres marks `database`,
         // `username`, `password`, and `host` as readonly (see
         // parameter_strategies.rs), so the request must not touch them or
         // the strategy rejects the whole update with a validation error.
-        // The test asserts the rename + docker_image path works.
+        // A rename is not part of this case: it is refused for a service that
+        // owns Docker resources (#1455), covered by
+        // `test_update_service_rename_refusal_leaves_no_lock_held`.
         let update_request = UpdateExternalServiceRequest {
-            name: Some(renamed_name.clone()),
+            name: None,
             parameters: HashMap::new(),
             docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         };
@@ -19491,8 +20134,7 @@ mod tests {
             "update_service failed: {:?}",
             updated_service.err()
         );
-        let updated = updated_service.unwrap();
-        assert_eq!(updated.name, renamed_name);
+        assert_eq!(updated_service.unwrap().name, service_name);
 
         // Sensitive readonly fields must NOT have been mutated.
         let params_after = manager.get_service_parameters(service_id).await.unwrap();
@@ -19504,6 +20146,200 @@ mod tests {
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
+    }
+
+    /// A refused rename is an early return from the middle of
+    /// `update_service`. It must not leave the destination name's lock held:
+    /// a transaction left to sea-orm's lazy Drop-time ROLLBACK keeps that
+    /// lock, and on a blocked current-thread runtime -- as in a test
+    /// database's synchronous cleanup -- is never rolled back at all, which
+    /// hung CI until the job's own timeout.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_update_service_rename_refusal_leaves_no_lock_held() {
+        let (manager, test_db) = setup_test_manager_or_skip!();
+
+        let ts = chrono::Utc::now().timestamp_millis();
+        let service_name = format!("test-refuse-{ts}");
+        let renamed_name = format!("test-refuse-renamed-{ts}");
+        let service = manager
+            .create_service(postgres_create_request(&service_name, "original_db"))
+            .await
+            .unwrap();
+
+        let refused = manager
+            .update_service(
+                service.id,
+                UpdateExternalServiceRequest {
+                    name: Some(renamed_name.clone()),
+                    parameters: HashMap::new(),
+                    docker_image: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                ExternalServiceError::DataSafetyRefusal { service_id, .. } if service_id == service.id
+            ),
+            "renaming a service that owns Docker resources must be refused: {refused:?}"
+        );
+
+        // Probed without yielding to this runtime, so a rollback that was
+        // only queued has not been sent yet.
+        let free = service_name_lock_is_free(&test_db.database_url, &renamed_name).unwrap();
+        assert!(
+            free,
+            "the refused rename left a transaction open holding the lock on '{renamed_name}'"
+        );
+        assert_eq!(
+            manager.get_service(service.id).await.unwrap().name,
+            service_name,
+            "a refused rename must not change the service's name"
+        );
+
+        // Cleanup
+        let _ = manager.delete_service(service.id).await;
+    }
+
+    /// A lock another transaction holds forever must surface as a typed
+    /// error naming the service and operation, not as a wait that never ends.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_bounded_transaction_gives_up_on_a_held_lock() {
+        use sea_orm::ConnectionTrait;
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                let error = format!("test database is unavailable: {error}");
+                if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                    eprintln!("Skipping Docker-dependent test: {error}");
+                    return;
+                }
+                panic!("Failed to set up test database: {error}");
+            }
+        };
+        let db = test_db.db.clone();
+        let advisory = "SELECT pg_advisory_xact_lock(7243)";
+
+        let holder = db.begin().await.unwrap();
+        holder.execute_unprepared(advisory).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let waiter = begin_bounded_transaction(
+            &db,
+            42,
+            "saving the configuration of",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        let waited = waiter.execute_unprepared(advisory).await;
+        let error = lock_timeout_or_database_error(
+            42,
+            "saving the configuration of",
+            std::time::Duration::from_millis(300),
+            waited.unwrap_err().into(),
+        );
+        assert!(
+            matches!(
+                error,
+                ExternalServiceError::LockTimeout {
+                    service_id: 42,
+                    operation: "saving the configuration of",
+                    ..
+                }
+            ),
+            "a held lock must surface as LockTimeout: {error:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the wait must be bounded by the lock timeout, took {:?}",
+            started.elapsed()
+        );
+
+        // The timeout aborts the waiter's transaction only; once the holder
+        // lets go, the same lock is available again.
+        let error = rollback_before_error(waiter, error).await;
+        assert!(matches!(error, ExternalServiceError::LockTimeout { .. }));
+        holder.rollback().await.unwrap();
+        let retry = begin_bounded_transaction(
+            &db,
+            42,
+            "saving the configuration of",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        retry.execute_unprepared(advisory).await.unwrap();
+        retry.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn lock_timeout_message_is_recognised() {
+        assert!(is_lock_timeout_message(
+            "Query Error: error returned from database: canceling statement due to lock timeout"
+        ));
+        assert!(is_lock_timeout_message("error with SQLSTATE 55P03"));
+        assert!(!is_lock_timeout_message(
+            "duplicate key value violates unique constraint"
+        ));
+    }
+
+    #[test]
+    fn only_lock_timeouts_are_reclassified() {
+        let timeout = std::time::Duration::from_secs(30);
+        let classified = lock_timeout_or_database_error(
+            9,
+            "saving the configuration of",
+            timeout,
+            ExternalServiceError::DatabaseError {
+                reason: "canceling statement due to lock timeout".to_string(),
+            },
+        );
+        match &classified {
+            ExternalServiceError::LockTimeout {
+                service_id,
+                operation,
+                timeout_secs,
+            } => {
+                assert_eq!(*service_id, 9);
+                assert_eq!(*operation, "saving the configuration of");
+                assert_eq!(*timeout_secs, 30);
+            }
+            other => panic!("expected LockTimeout, got {other:?}"),
+        }
+        let message = classified.to_string();
+        assert!(message.contains("service 9"), "{message}");
+        assert!(message.contains("saving the configuration of"), "{message}");
+        assert!(message.contains("30s"), "{message}");
+
+        let unrelated = lock_timeout_or_database_error(
+            9,
+            "saving the configuration of",
+            timeout,
+            ExternalServiceError::DatabaseError {
+                reason: "connection reset by peer".to_string(),
+            },
+        );
+        assert!(
+            matches!(unrelated, ExternalServiceError::DatabaseError { .. }),
+            "{unrelated:?}"
+        );
+        let other_variant = lock_timeout_or_database_error(
+            9,
+            "saving the configuration of",
+            timeout,
+            ExternalServiceError::ServiceNotFound { id: 9 },
+        );
+        assert!(
+            matches!(
+                other_variant,
+                ExternalServiceError::ServiceNotFound { id: 9 }
+            ),
+            "{other_variant:?}"
+        );
     }
 
     #[cfg(feature = "docker-tests")]
@@ -20927,6 +21763,7 @@ mod tests {
             source_type: Default::default(),
             project_type: temps_entities::types::ProjectType::Server,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             template_slug: None,
             service_template: None,
             gitlab_webhook_id: None,
@@ -20942,6 +21779,7 @@ mod tests {
             cloud_telemetry_attribute_allowlist: Vec::new(),
             cloud_telemetry_write_mode: Default::default(),
             cloud_analytics_write_mode: Default::default(),
+            instantiation_token: None,
         }
     }
 

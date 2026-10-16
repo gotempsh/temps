@@ -663,11 +663,66 @@ impl AgentExecutor {
                                 sandbox_env.insert(env_var.to_string(), key);
                             }
                             Some(crate::ai_cli::catalog::CredentialFormat::OauthToken) => {
-                                sandbox_env
-                                    .insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), key.clone());
-                                deferred_credential = Some((key, auth_type));
+                                use crate::ai_cli::credential_snapshot::{
+                                    resolve_claude_oauth, StoredClaudeCredential,
+                                };
+                                match StoredClaudeCredential::classify(&key) {
+                                    StoredClaudeCredential::LegacyToken(_) => {
+                                        // A pasted `setup-token` bearer is static
+                                        // (no refresh token), so every run may
+                                        // hold a copy.
+                                        sandbox_env.insert(
+                                            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                                            key.clone(),
+                                        );
+                                        deferred_credential = Some((key, auth_type));
+                                    }
+                                    StoredClaudeCredential::LoginSnapshot(_) => {
+                                        // A console sign-in rotates its refresh
+                                        // token, so a sandbox receives only an
+                                        // access token that outlives the run and
+                                        // never a credential file: the refresh
+                                        // token stays with the host CLI.
+                                        let needed = Duration::from_secs(
+                                            u64::try_from(timeout_seconds).unwrap_or(0) + 300,
+                                        );
+                                        let resolved = resolve_claude_oauth(&key, needed)
+                                            .await
+                                            .map_err(|error| AgentError::Validation {
+                                                message: format!(
+                                                    "Agent run {run_id} cannot use {ai_provider}: {error}"
+                                                ),
+                                            })?;
+                                        sandbox_env.insert(
+                                            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                                            resolved.access_token,
+                                        );
+                                    }
+                                }
                             }
                             Some(crate::ai_cli::catalog::CredentialFormat::ConfigFile) => {
+                                // A console sign-in is stored without its
+                                // refresh token; make sure the copy a sandbox
+                                // receives outlives the run. Pasted auth files
+                                // are passed through unchanged.
+                                let key = if ai_provider == "codex_cli" {
+                                    let needed = Duration::from_secs(
+                                        u64::try_from(timeout_seconds).unwrap_or(0) + 300,
+                                    );
+                                    crate::ai_cli::credential_snapshot::resolve_codex_auth(
+                                        &key, needed,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        AgentError::Validation {
+                                            message: format!(
+                                            "Agent run {run_id} cannot use {ai_provider}: {error}"
+                                        ),
+                                        }
+                                    })?
+                                } else {
+                                    key
+                                };
                                 deferred_credential = Some((key, auth_type));
                             }
                             Some(crate::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
@@ -778,6 +833,7 @@ impl AgentExecutor {
             memory_limit_mb: Some(memory_limit_mb),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: Some(global_sandbox.network_mode.clone()),
             env_vars: sandbox_env,
             idle_timeout: Duration::from_secs(timeout_seconds as u64 + 60),
@@ -4459,6 +4515,7 @@ mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: "test-app".into(),
             repo_name: "repo".into(),
@@ -4490,6 +4547,7 @@ mod tests {
             ai_debug_chat_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_write_actions_enabled: false,
             error_source_context_enabled: true,
             vulnerability_scanning_enabled: false,

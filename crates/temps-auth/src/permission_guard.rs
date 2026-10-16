@@ -1177,6 +1177,9 @@ mod tests {
             "temps-environments",
             "temps-error-tracking",
             "temps-flags",
+            // The Compose preview resolves a project's environment variables
+            // when it is given a project ID.
+            "temps-git",
             "temps-kv",
             "temps-log-aggregator",
             "temps-monitoring",
@@ -1299,6 +1302,11 @@ mod tests {
             // member of a project could otherwise flip that project's flags
             // with the instance-wide FlagsWrite the default role carries.
             "temps-flags",
+            // Group membership, per-member repository inheritance and path
+            // routes between member services rewrite what a specific project
+            // serves or inherits, so each of those handlers narrows the
+            // instance-wide permission to the project(s) it touches.
+            "temps-project-groups",
             "temps-projects",
             "temps-providers",
             "temps-proxy",

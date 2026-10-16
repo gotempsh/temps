@@ -239,6 +239,88 @@ impl AuditOperation for EnvironmentVariablePromotedToSecretAudit {
     }
 }
 
+/// Emitted when a project environment variable is created or updated.
+///
+/// Never carries the value, old or new: `value_rotated` only records whether a
+/// new value was supplied. A promotion to secret additionally emits
+/// [`EnvironmentVariablePromotedToSecretAudit`].
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVariableWrittenAudit {
+    pub context: AuditContext,
+    /// `ENVIRONMENT_VARIABLE_CREATED` or `ENVIRONMENT_VARIABLE_UPDATED`.
+    #[serde(skip)]
+    pub operation: &'static str,
+    pub project_id: i32,
+    pub var_id: i32,
+    pub key: String,
+    /// Environments the variable applies to afterwards.
+    pub environment_ids: Vec<i32>,
+    pub include_in_preview: bool,
+    pub is_secret: bool,
+    /// Fields an update changed (`key`, `value`, `environments`,
+    /// `include_in_preview`, `is_secret`); empty for a create.
+    pub changed_fields: Vec<&'static str>,
+}
+
+impl AuditOperation for EnvironmentVariableWrittenAudit {
+    fn operation_type(&self) -> String {
+        self.operation.to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
+/// Emitted when a project environment variable is deleted. Never carries the
+/// value.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVariableDeletedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub var_id: i32,
+    pub key: String,
+    pub is_secret: bool,
+    /// Environments the variable applied to before it was removed.
+    pub environment_ids: Vec<i32>,
+}
+
+impl AuditOperation for EnvironmentVariableDeletedAudit {
+    fn operation_type(&self) -> String {
+        "ENVIRONMENT_VARIABLE_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
 /// Emitted when a project secret is created or updated. Never carries the
 /// value: `value_rotated` only records whether a new value was supplied.
 #[derive(Debug, Clone, Serialize)]
@@ -347,5 +429,47 @@ mod tests {
             key: "TLS_CERT".into(),
         };
         assert_eq!(deleted.operation_type(), "PROJECT_SECRET_DELETED");
+    }
+
+    #[test]
+    fn environment_variable_write_audits_never_include_a_value_field() {
+        let context = AuditContext {
+            user_id: 1,
+            ip_address: None,
+            user_agent: "test".into(),
+        };
+        let written = EnvironmentVariableWrittenAudit {
+            context: context.clone(),
+            operation: "ENVIRONMENT_VARIABLE_UPDATED",
+            project_id: 10,
+            var_id: 7,
+            key: "DATABASE_URL".into(),
+            environment_ids: vec![3, 4],
+            include_in_preview: true,
+            is_secret: false,
+            changed_fields: vec!["value", "environments"],
+        };
+        assert_eq!(written.operation_type(), "ENVIRONMENT_VARIABLE_UPDATED");
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&written).unwrap()).unwrap();
+        assert_eq!(json["var_id"], 7);
+        assert_eq!(json["key"], "DATABASE_URL");
+        assert_eq!(json["changed_fields"][0], "value");
+        assert!(json.get("value").is_none());
+        assert!(json.get("operation").is_none());
+
+        let deleted = EnvironmentVariableDeletedAudit {
+            context,
+            project_id: 10,
+            var_id: 7,
+            key: "DATABASE_URL".into(),
+            is_secret: true,
+            environment_ids: vec![3],
+        };
+        assert_eq!(deleted.operation_type(), "ENVIRONMENT_VARIABLE_DELETED");
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&deleted).unwrap()).unwrap();
+        assert_eq!(json["var_id"], 7);
+        assert!(json.get("value").is_none());
     }
 }

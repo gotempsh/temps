@@ -262,6 +262,17 @@ pub struct LatestDeploymentMediaResponse {
     pub projects: std::collections::HashMap<String, LatestDeploymentMediaResponseItem>,
 }
 
+/// Most recent deployment of a project.
+///
+/// A project that has never been deployed is a normal state, so it is
+/// reported as `deployment: null` with a 200 instead of a 404.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct LastDeploymentResponse {
+    /// The most recent deployment, or `null` when the project exists but has
+    /// no deployments yet.
+    pub deployment: Option<DeploymentResponse>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeploymentResponse {
     pub id: i32,

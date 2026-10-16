@@ -59,13 +59,13 @@ function statusClassName(status: unknown): string {
       'healthy',
     ].includes(value)
   ) {
-    return 'text-emerald-600 dark:text-emerald-400'
+    return 'text-emerald-700 dark:text-emerald-400'
   }
   if (['warning', 'pending', 'queued', 'running', 'starting'].includes(value)) {
     return 'text-amber-700 dark:text-amber-400'
   }
   if (['error', 'failed', 'failure', 'down', 'unhealthy'].includes(value)) {
-    return 'text-red-600 dark:text-red-400'
+    return 'text-red-700 dark:text-red-400'
   }
   return 'text-muted-foreground'
 }
@@ -167,7 +167,7 @@ function FormArtifact({
         {submitted && (
           <p
             role="status"
-            className="text-xs text-emerald-600 dark:text-emerald-400"
+            className="text-xs text-emerald-700 dark:text-emerald-400"
           >
             Form response captured for this view.
           </p>
@@ -205,7 +205,7 @@ function ProjectCollectionArtifact({
 
   return (
     <GeneratedProjectCollection
-      title={artifact.title ?? 'Projects'}
+      title={artifact.title ?? 'Services'}
       presentation={{
         items: projects,
         total: projects.length,

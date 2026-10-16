@@ -34,7 +34,6 @@ use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use super::walg_size::load_backup_size_bytes;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-use temps_providers::externalsvc::ExternalService;
 
 pub(crate) const ENGINE_KEY: &str = "postgres_walg";
 
@@ -200,15 +199,66 @@ impl BackupEngine for PostgresWalgEngine {
             version: None,
             parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
         };
-        postgres_service
-            .enable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
+        // When archive_mode is off this restarts PostgreSQL in a recreated
+        // container. The provider refuses unless the new container mounts
+        // the same data and only reports success once it has verified the
+        // same cluster (system identifier, databases, roles) came back, so a
+        // base backup is never pushed from a freshly initialised, empty
+        // cluster (#1415).
+        //
+        // A manual run records whether its caller confirmed a restart;
+        // scheduled runs (no caller to ask) do not set it and may restart.
+        let allow_restart = ctx
+            .params
+            .get("allow_restart")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !allow_restart {
+            let probe = postgres_service
+                .backup_requires_restart(service_config.clone())
+                .await
+                .map_err(|error| error.to_string());
+            unconfirmed_restart_gate(service.id, &service.name, probe)?;
+        }
+        let archiving = postgres_service
+            .enable_continuous_archiving_reporting(
+                service_config,
+                &s3_credentials,
+                &walg_prefix,
+                // Enforced where the restart is decided, not only probed
+                // above: archiving can be turned off in between (an in-place
+                // restore finishing).
+                allow_restart,
+            )
             .await
-            .map_err(|error| BackupError::Failed {
-                reason: format!(
+            .map_err(|error| {
+                let reason = format!(
                     "Cannot create a recoverable WAL-G backup for service {} ('{}'): continuous archiving could not be enabled and verified: {}",
                     service.id, service.name, error
-                ),
+                );
+                // A refusal is decided by the container's storage layout;
+                // retrying cannot change it, only repeat the refusal.
+                let refused = error
+                    .downcast_ref::<temps_providers::externalsvc::recreate_guard::RecreateGuardError>()
+                    .is_some_and(|guard| guard.is_refusal())
+                    || error
+                        .downcast_ref::<temps_providers::externalsvc::postgres::PostgresRestartNotConfirmed>()
+                        .is_some();
+                if refused {
+                    BackupError::PermanentFailure { reason }
+                } else {
+                    BackupError::Failed { reason }
+                }
             })?;
+        if archiving.restarted {
+            warn!(
+                backup_id,
+                service_id,
+                service = %service.name,
+                "PostgresWalgEngine: PostgreSQL was restarted to enable WAL archiving \
+                 (archive_mode was off); its data was verified intact before the base backup"
+            );
+        }
 
         // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
         // because each in-flight tar buffer is held fully in RAM. These values
@@ -321,6 +371,7 @@ impl BackupEngine for PostgresWalgEngine {
             "lz4",
             Some(json!({
                 "backup_tool": "wal-g",
+                "database_restarted_to_enable_archiving": archiving.restarted,
                 "lsn": lsn,
                 "service": { "id": service_id, "name": service.name },
             })),
@@ -344,6 +395,35 @@ impl BackupEngine for PostgresWalgEngine {
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
+
+/// What to do with a run whose caller did not confirm a restart, given the
+/// probe of whether one is needed now. Only a probe that answered "restart
+/// needed" is final (the run would restart PostgreSQL unconfirmed). A probe
+/// that could not reach PostgreSQL (restarting, at its connection limit) is
+/// a transient outage and retries like any other.
+fn unconfirmed_restart_gate(
+    service_id: i32,
+    service_name: &str,
+    probe: Result<bool, String>,
+) -> Result<(), BackupError> {
+    match probe {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(BackupError::PermanentFailure {
+            reason: format!(
+                "Backup of service {service_id} ('{service_name}') would restart PostgreSQL to \
+                 turn WAL archiving on, and that was not confirmed when the backup was requested \
+                 (archiving was on then). Nothing was changed. Run the backup again and confirm \
+                 the restart"
+            ),
+        }),
+        Err(error) => Err(BackupError::Failed {
+            reason: format!(
+                "Could not check whether backing up service {service_id} ('{service_name}') \
+                 would restart PostgreSQL: {error}"
+            ),
+        }),
+    }
+}
 struct PgParams {
     username: String,
     password: String,
@@ -602,5 +682,31 @@ mod tests {
         let (cmd, env) = build_lsn_exec_args(&pg);
         assert_eq!(cmd.len(), 4);
         assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn an_unreachable_restart_probe_is_retried_not_final() {
+        let err = unconfirmed_restart_gate(7, "app", Err("connection refused".into()))
+            .expect_err("unknown is not a pass");
+        assert!(
+            matches!(err, BackupError::Failed { ref reason } if reason.contains("connection refused")),
+            "{err:?}"
+        );
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn a_needed_unconfirmed_restart_is_refused_for_good() {
+        let err = unconfirmed_restart_gate(7, "app", Ok(true)).expect_err("restart needed");
+        assert!(
+            matches!(err, BackupError::PermanentFailure { ref reason } if reason.contains("not confirmed")),
+            "{err:?}"
+        );
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn no_restart_needed_lets_the_backup_run() {
+        assert!(unconfirmed_restart_gate(7, "app", Ok(false)).is_ok());
     }
 }

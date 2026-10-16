@@ -89,7 +89,7 @@ export function CloudTelemetryWriteStatusCard() {
               Cloud telemetry writes
             </CardTitle>
             <CardDescription>
-              Projects whose spans go straight to Temps Cloud instead of being
+              Services whose spans go straight to Temps Cloud instead of being
               stored here, and whether this instance still needs a span store.
             </CardDescription>
           </div>
@@ -194,10 +194,10 @@ function WriteStatusBody({
         <Alert>
           <CheckCircle2 className="h-4 w-4" />
           <AlertTitle>
-            No project writes spans to this instance any more
+            No service writes spans to this instance any more
           </AlertTitle>
           <AlertDescription>
-            Every project is Cloud-primary and no local span history remains
+            Every service is Cloud-primary and no local span history remains
             inside retention, so a local span backend (ClickHouse, or the
             `otel_spans` hypertable) is no longer required for traces. Metrics,
             logs and every other signal still use local storage — only spans
@@ -237,7 +237,7 @@ function WriteStatusBody({
             Cloud-primary writes are suspended — spans are being stored here
           </AlertTitle>
           <AlertDescription>
-            {data.write_suspension} Project settings are unchanged and resume
+            {data.write_suspension} Service settings are unchanged and resume
             automatically once Cloud accepts again.
           </AlertDescription>
         </Alert>
@@ -299,7 +299,7 @@ function WriteStatusBody({
               className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs leading-5"
             >
               <p className="font-medium">
-                Project {gap.project_id}: {gap.dropped_spans.toLocaleString()}{' '}
+                Service {gap.project_id}: {gap.dropped_spans.toLocaleString()}{' '}
                 span
                 {gap.dropped_spans === 1 ? '' : 's'} (
                 {formatBytes(gap.dropped_bytes)}) between{' '}

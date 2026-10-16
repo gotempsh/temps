@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -155,16 +156,23 @@ export function AlertRulesManagement({
     },
   })
 
-  const handleDelete = async (rule: AlertRuleResponse) => {
-    if (!projectId) return
-    await deleteMutation.mutateAsync({
-      path: { project_id: projectId, rule_id: rule.id },
+  const [ruleToDelete, setRuleToDelete] = useState<AlertRuleResponse | null>(
+    null
+  )
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!projectId || !ruleToDelete) return
+    deleteMutation.mutate({
+      path: { project_id: projectId, rule_id: ruleToDelete.id },
     })
+    setRuleToDelete(null)
   }
 
-  const handleToggleEnabled = async (rule: AlertRuleResponse) => {
+  const handleToggleEnabled = (rule: AlertRuleResponse) => {
     if (!projectId) return
-    await updateMutation.mutateAsync({
+    updateMutation.mutate({
       path: { project_id: projectId, rule_id: rule.id },
       body: { enabled: !rule.enabled },
     })
@@ -180,13 +188,13 @@ export function AlertRulesManagement({
     return (
       <EmptyState
         icon={ShieldAlert}
-        title="No projects found"
-        description="Error alert rules belong to a project. Create one to configure them."
+        title="No services found"
+        description="Error alert rules belong to a service. Create one to configure them."
         action={
           <Button asChild>
             <Link to="/projects/new">
               <Plus className="h-4 w-4 mr-2" />
-              Create project
+              Create service
             </Link>
           </Button>
         }
@@ -221,9 +229,9 @@ export function AlertRulesManagement({
             >
               <SelectTrigger
                 className="w-full sm:w-[200px]"
-                aria-label="Project"
+                aria-label="Service"
               >
-                <SelectValue placeholder="Select project" />
+                <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
                 {projectList!.map((p) => (
@@ -303,7 +311,7 @@ export function AlertRulesManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(rule)}
+                        onClick={() => setRuleToDelete(rule)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -332,6 +340,16 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
+      <ConfirmDeleteDialog
+        open={ruleToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setRuleToDelete(null)
+        }}
+        resourceType="alert rule"
+        resourceName={ruleToDelete?.name ?? ''}
+        consequences="It will stop sending notifications immediately."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

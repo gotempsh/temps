@@ -98,6 +98,7 @@ pub(crate) fn worker_node_required(
         | E::DatabaseError { .. }
         | E::ArchiveSourceDesynced { .. }
         | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
         | E::StartFailed { .. }
         | E::UpgradeInProgress { .. }
         | E::StopFailed { .. }
@@ -116,7 +117,8 @@ pub(crate) fn worker_node_required(
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -134,28 +136,33 @@ pub(crate) fn external_service_problem(
     detail: String,
 ) -> Problem {
     worker_node_required(error)
+        .or_else(|| data_safety_problem(error))
         .or_else(|| service_name_problem(error))
         .or_else(|| cluster_placement_problem(error))
         .unwrap_or_else(|| internal_server_error().detail(detail).build())
 }
 
-fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+/// A change refused because it would leave the service without its data
+/// (#1415): a 409 with the reason and the safe manual steps in `detail`.
+fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
     match error {
+        E::DataSafetyRefusal { service_id, .. } => Some(
+            conflict()
+                .title("Change Would Lose Data")
+                .detail(error.to_string())
+                .value("error_code", "DATA_SAFETY_REFUSAL")
+                .value("service_id", *service_id)
+                .build(),
+        ),
+        // Every other condition keeps its own classification.
         E::ServiceNameConflict { .. }
         | E::ServiceNameRestoreConflict { .. }
         | E::ServiceContainerRestoreConflict { .. }
         | E::AmbiguousServiceName { .. }
         | E::ServiceResourceConflict { .. }
-        | E::ServiceContainerConflict { .. } => Some(
-            conflict()
-                .title("Service Name Conflict")
-                .detail(error.to_string())
-                .value("error_code", "SERVICE_NAME_CONFLICT")
-                .build(),
-        ),
-        // Other conditions retain the worker, placement or handler classification.
-        E::ServiceNotFound { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
         | E::InitializationFailed { .. }
@@ -191,7 +198,66 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
+    }
+}
+
+fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. } => Some(
+            conflict()
+                .title("Service Name Conflict")
+                .detail(error.to_string())
+                .value("error_code", "SERVICE_NAME_CONFLICT")
+                .build(),
+        ),
+        // Other conditions retain the worker, placement or handler classification.
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -213,6 +279,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterMemberProvisioning { .. } => "Cluster Member Still Provisioning",
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
+        E::LockTimeout { .. } => "Service Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(
@@ -246,6 +313,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DatabaseError { .. }
         | E::ArchiveSourceDesynced { .. }
         | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
         | E::StartFailed { .. }
         | E::UpgradeInProgress { .. }
         | E::StopFailed { .. }

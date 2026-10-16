@@ -11,10 +11,25 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+# `ClickHouseCompression` lives next to `AppSettings` (the stored setting), so
+# this crate re-exports it instead of defining a second copy.
+temps-core = { path = "../temps-core" }
 clickhouse = { workspace = true }
+chrono = { workspace = true }
+# Only used by the one-shot raw probe that reads the compression method byte
+# off a response the `clickhouse` client could not decode.
+reqwest = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `start_paused` for the retry-cadence tests.
+tokio = { workspace = true, features = ["test-util"] }
+# Real-ClickHouse tests (compression modes against a server whose default
+# `network_compression_method` is ZSTD). Same pinned version as the other
+# crates' ClickHouse integration tests; Docker is detected at runtime.
+testcontainers = { workspace = true, features = ["http_wait_plain"] }

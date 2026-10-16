@@ -101,6 +101,20 @@ describe('flat project navigation', () => {
       expect(resolveProjectPrimaryRoute(route)).toBe('settings')
     }
   })
+  test('monitoring lists metrics, uptime, status pages and alert rules', () => {
+    expect(PROJECT_SECTION_LINKS.monitoring?.map((link) => link.url)).toEqual([
+      'metrics',
+      'monitors',
+      'status-pages',
+      'errors/alert-rules',
+    ])
+    for (const route of ['status-pages', 'status-pages/7']) {
+      expect(resolveProjectPrimaryRoute(route)).toBe('monitoring')
+      expect(resolveProjectSectionLink('monitoring', route, '')).toBe(
+        'status-pages'
+      )
+    }
+  })
   test('settings has only seven destinations', () => {
     expect(PROJECT_SECTION_LINKS.settings).toHaveLength(7)
   })

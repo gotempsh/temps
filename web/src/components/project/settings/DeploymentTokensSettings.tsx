@@ -36,6 +36,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Badge } from '@/components/ui/badge'
@@ -364,9 +365,7 @@ export function DeploymentTokensSettings({
                             ) : (
                               <RefreshCw className="h-4 w-4" />
                             )}
-                            <span className="hidden sm:inline ml-1">
-                              Rotate
-                            </span>
+                            <span className="max-sm:sr-only ml-1">Rotate</span>
                           </Button>
                           <Button
                             size="sm"
@@ -383,9 +382,7 @@ export function DeploymentTokensSettings({
                             ) : (
                               <Trash2 className="h-4 w-4" />
                             )}
-                            <span className="hidden sm:inline ml-1">
-                              Delete
-                            </span>
+                            <span className="max-sm:sr-only ml-1">Delete</span>
                           </Button>
                         </div>
                       </TableCell>
@@ -509,46 +506,22 @@ export function DeploymentTokensSettings({
         </DialogContent>
       </Dialog>
 
-      {/* Delete confirmation dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteTarget !== null}
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Delete token &quot;{deleteTarget?.name}&quot;?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently revoke the token. Any deployed application
-              still using it will lose API access immediately. This action
-              cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (!deleteTarget) return
-                deleteMutation.mutate({
-                  path: { project_id: project.id, token_id: deleteTarget.id },
-                })
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-white hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending && (
-                <Loader2 className="h-4 w-4 animate-spin mr-1" />
-              )}
-              Delete Token
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="deployment token"
+        resourceName={deleteTarget?.name ?? ''}
+        consequences="The token is permanently revoked. Any deployed application still using it will lose API access immediately."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (!deleteTarget) return
+          deleteMutation.mutate({
+            path: { project_id: project.id, token_id: deleteTarget.id },
+          })
+        }}
+      />
 
       {/* Rotate confirmation dialog */}
       <AlertDialog

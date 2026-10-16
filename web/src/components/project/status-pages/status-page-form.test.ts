@@ -5,7 +5,11 @@ import { describe, expect, it } from 'bun:test'
 import { QueryClient } from '@tanstack/react-query'
 import type { MonitorResponse, StatusPageResponse } from '@/api/client'
 import {
+  addDomainSchema,
   buildMonitorRows,
+  daysUntil,
+  domainActions,
+  domainStatusLabel,
   incidentUpdateSchema,
   initialIncidentStatus,
   MAX_INCIDENT_UPDATE_CHARS,
@@ -174,5 +178,78 @@ describe('incidentUpdateSchema', () => {
   it('falls back to investigating for an unknown incident status', () => {
     expect(initialIncidentStatus('monitoring')).toBe('monitoring')
     expect(initialIncidentStatus('something-else')).toBe('investigating')
+  })
+})
+
+describe('addDomainSchema', () => {
+  it('accepts a hostname and refuses URLs, wildcards and bare labels', () => {
+    const ok = (hostname: string) =>
+      addDomainSchema.safeParse({ hostname, verification_method: 'http-01' })
+        .success
+    expect(ok('status.example.com')).toBe(true)
+    expect(ok('status.example.com.')).toBe(true)
+    expect(ok('https://status.example.com')).toBe(false)
+    expect(ok('status.example.com/path')).toBe(false)
+    expect(ok('*.example.com')).toBe(false)
+    expect(ok('localhost')).toBe(false)
+    expect(ok('')).toBe(false)
+  })
+})
+
+describe('domainStatusLabel', () => {
+  it('distinguishes serving from verified-but-unpublished', () => {
+    expect(domainStatusLabel({ status: 'active', serving: true })).toBe(
+      'Serving'
+    )
+    expect(domainStatusLabel({ status: 'active', serving: false })).toContain(
+      'unpublished'
+    )
+    expect(domainStatusLabel({ status: 'pending', serving: false })).toBe(
+      'Waiting for DNS'
+    )
+  })
+})
+
+describe('domain renewal states', () => {
+  it('labels renewals as still serving', () => {
+    expect(
+      domainStatusLabel({ status: 'renewal_pending', serving: true })
+    ).toContain('renewal in progress')
+    expect(
+      domainStatusLabel({ status: 'renewal_failed', serving: true })
+    ).toContain('renewal failed')
+  })
+
+  it('offers renew for a held certificate and verify to finish an open order', () => {
+    expect(domainActions({ status: 'active' }, true)).toEqual({
+      verify: false,
+      renew: true,
+    })
+    expect(domainActions({ status: 'renewal_failed' }, true)).toEqual({
+      verify: false,
+      renew: true,
+    })
+    expect(domainActions({ status: 'renewal_pending' }, true)).toEqual({
+      verify: true,
+      renew: false,
+    })
+    expect(domainActions({ status: 'unverified' }, true)).toEqual({
+      verify: true,
+      renew: false,
+    })
+  })
+
+  it('offers nothing on an unpublished page, which holds no certificates', () => {
+    expect(domainActions({ status: 'unverified' }, false)).toEqual({
+      verify: false,
+      renew: false,
+    })
+  })
+
+  it('counts whole days to expiry', () => {
+    const now = new Date('2026-10-12T00:00:00Z')
+    expect(daysUntil('2026-10-22T12:00:00Z', now)).toBe(10)
+    expect(daysUntil(null, now)).toBeNull()
+    expect(daysUntil('not a date', now)).toBeNull()
   })
 })

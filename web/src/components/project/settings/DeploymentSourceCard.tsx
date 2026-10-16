@@ -135,8 +135,8 @@ export function DeploymentSourceCard({
       }
       toast.success(
         allow
-          ? 'This project can now also be deployed from an uploaded folder'
-          : 'This project now only deploys from its configured source'
+          ? 'This service can now also be deployed from an uploaded folder'
+          : 'This service now only deploys from its configured source'
       )
       refetch()
     } catch (e) {
@@ -180,7 +180,7 @@ export function DeploymentSourceCard({
       <CardHeader>
         <CardTitle>Deployment source</CardTitle>
         <CardDescription>
-          How this project is built and deployed.
+          How this service is built and deployed.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2">
@@ -221,7 +221,7 @@ export function DeploymentSourceCard({
             <div className="text-base font-medium">Allow other sources too</div>
             <p className="text-sm text-muted-foreground">
               Keep deploying from {SOURCE_LABELS[current]} by default, and also
-              allow pushing a local folder straight to this project:
+              allow pushing a local folder straight to this service:
             </p>
             <HighlightedCode
               language="bash"
@@ -230,7 +230,7 @@ export function DeploymentSourceCard({
             />
             <p className="text-sm text-muted-foreground">
               {alternatesAreImplicit
-                ? 'This project already deploys from uploaded source, so it always accepts one.'
+                ? 'This service already deploys from uploaded source, so it always accepts one.'
                 : 'Uploading a folder re-detects the build directory and preset, which is why it is off by default. Docker images and static bundles are always accepted and are unaffected by this setting.'}
             </p>
           </div>
@@ -238,7 +238,7 @@ export function DeploymentSourceCard({
             checked={alternatesAreImplicit || allowsAlternates}
             disabled={savingAlternates || alternatesAreImplicit}
             onCheckedChange={setAlternates}
-            aria-label="Allow deploying this project from other sources"
+            aria-label="Allow deploying this service from other sources"
           />
         </div>
       </CardContent>

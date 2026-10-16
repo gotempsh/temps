@@ -3702,6 +3702,16 @@ impl ImageBuilder for DockerRuntime {
             .and_then(|c| c.working_dir.clone())
             .filter(|w| !w.is_empty());
 
+        let config = inspect.config.as_ref().map(|c| {
+            let exposed = c.exposed_ports.clone().unwrap_or_default();
+            crate::ImageConfig::from_raw(
+                &exposed,
+                c.user.as_deref(),
+                c.env.as_deref().unwrap_or_default(),
+                c.entrypoint.as_deref().unwrap_or_default(),
+            )
+        });
+
         Ok(crate::ImageInfo {
             id: inspect.id.unwrap_or_default(),
             architecture,
@@ -3711,6 +3721,7 @@ impl ImageBuilder for DockerRuntime {
             tags,
             created,
             working_dir,
+            config,
         })
     }
 

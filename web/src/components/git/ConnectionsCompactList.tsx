@@ -11,16 +11,7 @@ import {
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -366,7 +357,7 @@ export function ConnectionsCompactList({
                 unhealthy
                   ? 'font-medium text-destructive'
                   : healthy
-                    ? 'text-emerald-600 dark:text-emerald-400'
+                    ? 'text-emerald-700 dark:text-emerald-400'
                     : ''
               }
             >
@@ -501,47 +492,19 @@ export function ConnectionsCompactList({
 
       {verificationDialog}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={deleteDialog.open}
         onOpenChange={(open) => setDeleteDialog({ ...deleteDialog, open })}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete Connection</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete the connection for{' '}
-              <strong>{deleteDialog.connectionName}</strong>? This action cannot
-              be undone and will remove all associated repositories.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteConnectionMut.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                deleteConnectionMut.mutate({
-                  path: { connection_id: deleteDialog.connectionId },
-                })
-              }
-              disabled={deleteConnectionMut.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteConnectionMut.isPending ? (
-                <>
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                <>
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete
-                </>
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="git connection"
+        resourceName={deleteDialog.connectionName}
+        consequences="All repositories associated with this connection are removed from Temps. Projects that still deploy from it block the deletion."
+        isPending={deleteConnectionMut.isPending}
+        onConfirm={() =>
+          deleteConnectionMut.mutate({
+            path: { connection_id: deleteDialog.connectionId },
+          })
+        }
+      />
     </>
   )
 }

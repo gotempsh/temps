@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Button, Disclosure, Field, FormErrors } from '@temps-sdk/ds'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -21,14 +23,13 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePublicIngress } from '@/hooks/usePublicIngress'
 import {
-  useSettings,
+  useSettingsPage,
   useUpdateSettings,
   type PlatformSettings,
 } from '@/hooks/useSettings'
 import { client } from '@/api/client/client.gen'
 import { getPublicIngressStatusQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import {
-  AlertCircle,
   AlertTriangle,
   Loader2,
   RefreshCw,
@@ -122,7 +123,7 @@ function PublicIngressSummary({
 
 export function Settings() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
   const queryClient = useQueryClient()
   const location = useLocation()
@@ -246,13 +247,10 @@ export function Settings() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>
-          Failed to load settings. Please try again later.
-        </AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 

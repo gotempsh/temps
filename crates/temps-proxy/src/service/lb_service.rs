@@ -22,6 +22,9 @@ pub enum LbServiceError {
     #[error("Route already exists for domain: {domain}")]
     RouteAlreadyExists { domain: String },
 
+    #[error("Domain {domain} is attached to a status page; remove it there first")]
+    AttachedToStatusPage { domain: String },
+
     #[error("Route not found for domain: {domain}")]
     RouteNotFound { domain: String },
 
@@ -230,10 +233,34 @@ impl LbService {
             ..Default::default()
         };
 
-        let route = custom_routes::Entity::insert(new_route)
-            .exec_with_returning(self.db.as_ref())
-            .await
-            .map_err(LbServiceError::DatabaseError)?;
+        // A hostname attached to a status page (#1412) is reserved for it;
+        // checked and claimed under the shared hostname lock.
+        let txn = self.db.begin().await?;
+        let inserted = async {
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, &domain).await?;
+            if temps_entities::status_page_domains::attached_hostname_conflict(&txn, &domain)
+                .await?
+            {
+                return Err(LbServiceError::AttachedToStatusPage {
+                    domain: domain.clone(),
+                });
+            }
+            custom_routes::Entity::insert(new_route)
+                .exec_with_returning(&txn)
+                .await
+                .map_err(LbServiceError::DatabaseError)
+        }
+        .await;
+        let route = match inserted {
+            Ok(route) => {
+                txn.commit().await?;
+                route
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        };
 
         // Write-through: refresh the snapshot on this instance after the DB
         // write. This is immediately visible to any hot-path reads on the SAME
