@@ -32994,6 +32994,10 @@ export type GetUsageByProviderData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/by-provider';
 };
@@ -33028,6 +33032,10 @@ export type GetConversationsData = {
     body?: never;
     path?: never;
     query?: {
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
         /**
          * ISO 8601 start time (defaults to 24h ago)
          */
@@ -33142,6 +33150,10 @@ export type GetUsageRecentData = {
          */
         model?: string;
         /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
+        /**
          * Filter by HTTP status code (exact match)
          */
         status?: number;
@@ -33215,6 +33227,10 @@ export type GetUsageSummaryData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/summary';
 };
@@ -33261,6 +33277,10 @@ export type GetUsageTimeseriesData = {
          * Bucket size: hour, day, week (defaults to day)
          */
         bucket?: string;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/timeseries';
 };
@@ -33307,6 +33327,10 @@ export type GetUsageTopModelsData = {
          * Max results (defaults to 10)
          */
         limit?: number;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/top-models';
 };

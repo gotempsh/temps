@@ -70021,6 +70021,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -70083,6 +70093,16 @@
       "get": {
         "operationId": "get_conversations",
         "parameters": [
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
           {
             "description": "ISO 8601 start time (defaults to 24h ago)",
             "in": "query",
@@ -70313,6 +70333,16 @@
             }
           },
           {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
             "description": "Filter by HTTP status code (exact match)",
             "in": "query",
             "name": "status",
@@ -70467,6 +70497,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -70551,6 +70591,16 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
             }
           }
         ],
@@ -70640,6 +70690,16 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
               "type": "integer"
             }
           }
