@@ -5569,6 +5569,10 @@ export type ConversationsQueryParams = {
      */
     model?: string | null;
     /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
+    /**
      * Filter by tags (comma-separated, AND logic)
      */
     tags?: string | null;
@@ -9563,6 +9567,23 @@ export type DropSkippedPath = {
      */
     path: string;
     reason: DropSkipReason;
+};
+
+/**
+ * The limits that apply to one project after inheritance.
+ */
+export type EffectiveLimits = {
+    /**
+     * Operator-funded spend per UTC calendar month, in microcents
+     * (1/10000 of a cent); `null` means unlimited
+     */
+    max_cost_per_month_microcents?: number | null;
+    max_cost_per_month_source: LimitSource;
+    /**
+     * Requests per rolling minute; `null` means unlimited
+     */
+    max_requests_per_minute?: number | null;
+    max_requests_per_minute_source: LimitSource;
 };
 
 export type EligibleGitRepositoryResponse = {
@@ -14844,6 +14865,48 @@ export type LetsEncryptSettings = {
 };
 
 /**
+ * Limits as stored for one scope. `null` inherits from the next level
+ * (project → instance → built-in); `0` means unlimited.
+ */
+export type LimitSettingsBody = {
+    /**
+     * Operator-funded spend per UTC calendar month, in microcents
+     * (1/10000 of a cent; 1 USD = 1,000,000 microcents)
+     */
+    max_cost_per_month_microcents?: number | null;
+    /**
+     * Requests per rolling minute
+     */
+    max_requests_per_minute?: number | null;
+};
+
+/**
+ * Where an effective limit came from.
+ */
+export type LimitSource = 'project' | 'instance' | 'built_in';
+
+export type LimitsOverviewResponse = {
+    /**
+     * Requests per minute applied to a project when nothing is configured
+     */
+    built_in_max_requests_per_minute: number;
+    /**
+     * Instance-wide limits as stored (what the admin set)
+     */
+    instance: LimitSettingsBody;
+    page: number;
+    page_size: number;
+    /**
+     * Projects that override the instance defaults
+     */
+    project_overrides: Array<ProjectLimitOverride>;
+    /**
+     * Total number of projects with overrides, across all pages
+     */
+    total_project_overrides: number;
+};
+
+/**
  * Raw surrounding lines for a single match (grep -C style).
  */
 export type LineContext = {
@@ -19858,6 +19921,27 @@ export type ProjectIpAccessResponse = {
     updated_at?: string | null;
 };
 
+export type ProjectLimitOverride = {
+    limits: LimitSettingsBody;
+    project_id: number;
+};
+
+export type ProjectLimitsResponse = {
+    /**
+     * Limits actually enforced after inheritance
+     */
+    effective: EffectiveLimits;
+    /**
+     * Operator-funded spend so far this UTC month, in microcents
+     */
+    month_spend_microcents: number;
+    project_id: number;
+    /**
+     * This project's own limits as stored; `null` fields inherit
+     */
+    stored: LimitSettingsBody;
+};
+
 /**
  * Health summary for a single project based on its production monitors
  */
@@ -20208,12 +20292,46 @@ export type ProjectTemplate = {
  */
 export type ProjectType = 'static' | 'docker' | 'buildpack' | 'git';
 
+/**
+ * Per-project spend and volume, for cost reporting.
+ */
+export type ProjectUsage = {
+    /**
+     * Requests served with a caller-supplied provider key (not operator spend)
+     */
+    byok_request_count: number;
+    error_count: number;
+    /**
+     * Estimated cost in microcents (1/10000 of a cent), from the model price list
+     */
+    estimated_cost_microcents: number;
+    input_tokens: number;
+    output_tokens: number;
+    project_id: number;
+    request_count: number;
+};
+
 export type ProjectUsageInfoResponse = {
     connection_id: number;
     connection_name: string;
     id: number;
     name: string;
     slug: string;
+};
+
+export type ProjectUsageQueryParams = {
+    /**
+     * ISO 8601 start time (defaults to 24h ago)
+     */
+    from?: string | null;
+    /**
+     * Max projects returned (defaults to 50, max 100)
+     */
+    limit?: number | null;
+    /**
+     * ISO 8601 end time (defaults to now)
+     */
+    to?: string | null;
 };
 
 /**
@@ -21348,6 +21466,10 @@ export type RecentQueryParams = {
      * Number of results to skip for pagination (defaults to 0)
      */
     offset?: number | null;
+    /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
     /**
      * Filter by provider name
      */
@@ -27089,6 +27211,10 @@ export type TimeseriesQueryParams = {
      */
     model?: string | null;
     /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
+    /**
      * Filter by provider name
      */
     provider?: string | null;
@@ -27204,6 +27330,10 @@ export type TopModelsQueryParams = {
      * Max results (defaults to 10)
      */
     limit?: number | null;
+    /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
     /**
      * Filter by tags (comma-separated, AND logic)
      */
@@ -29319,6 +29449,10 @@ export type UsageFilter = {
      */
     cost_lte?: number | null;
     model?: string | null;
+    /**
+     * Restrict to usage attributed to this project (deployment-token callers).
+     */
+    project_id?: number | null;
     provider?: string | null;
     /**
      * Filter by HTTP status code (exact match).
@@ -29363,11 +29497,19 @@ export type UsageLogEntry = {
     latency_ms: number;
     model: string;
     output_tokens: number;
+    /**
+     * Project the call is attributed to (deployment-token callers only)
+     */
+    project_id?: number | null;
     provider: string;
     request_id?: string | null;
     status: number;
     tags: Array<string>;
     timestamp: string;
+    /**
+     * Deployment token the call is attributed to
+     */
+    token_id?: number | null;
     trace_id?: string | null;
 };
 
@@ -29398,6 +29540,10 @@ export type UsageQueryParams = {
      * Filter by model name
      */
     model?: string | null;
+    /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
     /**
      * Filter by provider name
      */
@@ -32410,6 +32556,191 @@ export type StopUserTurnResponses = {
 
 export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
 
+export type GetLimitsOverviewData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page of project overrides (default 1)
+         */
+        page?: number;
+        /**
+         * Page size (default 20, max 100)
+         */
+        page_size?: number;
+    };
+    url: '/ai/limits';
+};
+
+export type GetLimitsOverviewErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetLimitsOverviewError = GetLimitsOverviewErrors[keyof GetLimitsOverviewErrors];
+
+export type GetLimitsOverviewResponses = {
+    /**
+     * Instance defaults and per-project overrides
+     */
+    200: LimitsOverviewResponse;
+};
+
+export type GetLimitsOverviewResponse = GetLimitsOverviewResponses[keyof GetLimitsOverviewResponses];
+
+export type UpdateInstanceLimitsData = {
+    body: LimitSettingsBody;
+    path?: never;
+    query?: never;
+    url: '/ai/limits/instance';
+};
+
+export type UpdateInstanceLimitsErrors = {
+    /**
+     * Invalid limit
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type UpdateInstanceLimitsError = UpdateInstanceLimitsErrors[keyof UpdateInstanceLimitsErrors];
+
+export type UpdateInstanceLimitsResponses = {
+    /**
+     * Instance-wide defaults replaced
+     */
+    200: LimitSettingsBody;
+};
+
+export type UpdateInstanceLimitsResponse = UpdateInstanceLimitsResponses[keyof UpdateInstanceLimitsResponses];
+
+export type ResetProjectLimitsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/limits/projects/{project_id}';
+};
+
+export type ResetProjectLimitsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+};
+
+export type ResetProjectLimitsError = ResetProjectLimitsErrors[keyof ResetProjectLimitsErrors];
+
+export type ResetProjectLimitsResponses = {
+    /**
+     * Project limits cleared; the project inherits the instance defaults
+     */
+    204: void;
+};
+
+export type ResetProjectLimitsResponse = ResetProjectLimitsResponses[keyof ResetProjectLimitsResponses];
+
+export type GetProjectLimitsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/limits/projects/{project_id}';
+};
+
+export type GetProjectLimitsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetProjectLimitsError = GetProjectLimitsErrors[keyof GetProjectLimitsErrors];
+
+export type GetProjectLimitsResponses = {
+    /**
+     * Stored and effective limits plus this month's spend
+     */
+    200: ProjectLimitsResponse;
+};
+
+export type GetProjectLimitsResponse = GetProjectLimitsResponses[keyof GetProjectLimitsResponses];
+
+export type UpdateProjectLimitsData = {
+    body: LimitSettingsBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/limits/projects/{project_id}';
+};
+
+export type UpdateProjectLimitsErrors = {
+    /**
+     * Invalid limit
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+};
+
+export type UpdateProjectLimitsError = UpdateProjectLimitsErrors[keyof UpdateProjectLimitsErrors];
+
+export type UpdateProjectLimitsResponses = {
+    /**
+     * Project limits replaced
+     */
+    200: ProjectLimitsResponse;
+};
+
+export type UpdateProjectLimitsResponse = UpdateProjectLimitsResponses[keyof UpdateProjectLimitsResponses];
+
 export type GetUserPendingActionData = {
     body?: never;
     path: {
@@ -32976,6 +33307,52 @@ export type UpdateAiSummaryPreferenceResponses = {
 };
 
 export type UpdateAiSummaryPreferenceResponse = UpdateAiSummaryPreferenceResponses[keyof UpdateAiSummaryPreferenceResponses];
+
+export type GetUsageByProjectData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * ISO 8601 start time (defaults to 24h ago)
+         */
+        from?: string;
+        /**
+         * ISO 8601 end time (defaults to now)
+         */
+        to?: string;
+        /**
+         * Max projects (defaults to 50, max 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/usage/by-project';
+};
+
+export type GetUsageByProjectErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Requires an instance administrator
+     */
+    403: ProblemDetails;
+};
+
+export type GetUsageByProjectError = GetUsageByProjectErrors[keyof GetUsageByProjectErrors];
+
+export type GetUsageByProjectResponses = {
+    /**
+     * Spend and volume per project, most expensive first
+     */
+    200: Array<ProjectUsage>;
+};
+
+export type GetUsageByProjectResponse = GetUsageByProjectResponses[keyof GetUsageByProjectResponses];
 
 export type GetUsageByProviderData = {
     body?: never;

@@ -11564,6 +11564,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "tags": {
             "description": "Filter by tags (comma-separated, AND logic)",
             "type": [
@@ -19885,6 +19893,39 @@
           "path",
           "reason",
           "files"
+        ],
+        "type": "object"
+      },
+      "EffectiveLimits": {
+        "description": "The limits that apply to one project after inheritance.",
+        "properties": {
+          "max_cost_per_month_microcents": {
+            "description": "Operator-funded spend per UTC calendar month, in microcents\n(1/10000 of a cent); `null` means unlimited",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_cost_per_month_source": {
+            "$ref": "#/components/schemas/LimitSource"
+          },
+          "max_requests_per_minute": {
+            "description": "Requests per rolling minute; `null` means unlimited",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_requests_per_minute_source": {
+            "$ref": "#/components/schemas/LimitSource"
+          }
+        },
+        "required": [
+          "max_requests_per_minute_source",
+          "max_cost_per_month_source"
         ],
         "type": "object"
       },
@@ -31378,6 +31419,83 @@
         },
         "type": "object"
       },
+      "LimitSettingsBody": {
+        "description": "Limits as stored for one scope. `null` inherits from the next level\n(project → instance → built-in); `0` means unlimited.",
+        "properties": {
+          "max_cost_per_month_microcents": {
+            "description": "Operator-funded spend per UTC calendar month, in microcents\n(1/10000 of a cent; 1 USD = 1,000,000 microcents)",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_requests_per_minute": {
+            "description": "Requests per rolling minute",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "LimitSource": {
+        "description": "Where an effective limit came from.",
+        "enum": [
+          "project",
+          "instance",
+          "built_in"
+        ],
+        "type": "string"
+      },
+      "LimitsOverviewResponse": {
+        "properties": {
+          "built_in_max_requests_per_minute": {
+            "description": "Requests per minute applied to a project when nothing is configured",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instance": {
+            "$ref": "#/components/schemas/LimitSettingsBody",
+            "description": "Instance-wide limits as stored (what the admin set)"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_overrides": {
+            "description": "Projects that override the instance defaults",
+            "items": {
+              "$ref": "#/components/schemas/ProjectLimitOverride"
+            },
+            "type": "array"
+          },
+          "total_project_overrides": {
+            "description": "Total number of projects with overrides, across all pages",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instance",
+          "built_in_max_requests_per_minute",
+          "project_overrides",
+          "total_project_overrides",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "LineContext": {
         "description": "Raw surrounding lines for a single match (grep -C style).",
         "properties": {
@@ -41867,6 +41985,50 @@
         ],
         "type": "object"
       },
+      "ProjectLimitOverride": {
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/LimitSettingsBody"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "ProjectLimitsResponse": {
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveLimits",
+            "description": "Limits actually enforced after inheritance"
+          },
+          "month_spend_microcents": {
+            "description": "Operator-funded spend so far this UTC month, in microcents",
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stored": {
+            "$ref": "#/components/schemas/LimitSettingsBody",
+            "description": "This project's own limits as stored; `null` fields inherit"
+          }
+        },
+        "required": [
+          "project_id",
+          "stored",
+          "effective",
+          "month_spend_microcents"
+        ],
+        "type": "object"
+      },
       "ProjectMonitorHealth": {
         "description": "Health summary for a single project based on its production monitors",
         "properties": {
@@ -42517,6 +42679,51 @@
         ],
         "type": "string"
       },
+      "ProjectUsage": {
+        "description": "Per-project spend and volume, for cost reporting.",
+        "properties": {
+          "byok_request_count": {
+            "description": "Requests served with a caller-supplied provider key (not operator spend)",
+            "format": "int64",
+            "type": "integer"
+          },
+          "error_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "estimated_cost_microcents": {
+            "description": "Estimated cost in microcents (1/10000 of a cent), from the model price list",
+            "format": "int64",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "request_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "request_count",
+          "input_tokens",
+          "output_tokens",
+          "estimated_cost_microcents",
+          "byok_request_count",
+          "error_count"
+        ],
+        "type": "object"
+      },
       "ProjectUsageInfoResponse": {
         "properties": {
           "connection_id": {
@@ -42544,6 +42751,34 @@
           "connection_id",
           "connection_name"
         ],
+        "type": "object"
+      },
+      "ProjectUsageQueryParams": {
+        "properties": {
+          "from": {
+            "description": "ISO 8601 start time (defaults to 24h ago)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Max projects returned (defaults to 50, max 100)",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "to": {
+            "description": "ISO 8601 end time (defaults to now)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "ProjectsHealthResponse": {
@@ -45011,6 +45246,14 @@
             "description": "Number of results to skip for pagination (defaults to 0)",
             "format": "int64",
             "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
             "type": [
               "integer",
               "null"
@@ -56803,6 +57046,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "description": "Filter by provider name",
             "type": [
@@ -57009,6 +57260,14 @@
             "description": "Max results (defaults to 10)",
             "format": "int64",
             "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
             "type": [
               "integer",
               "null"
@@ -61588,6 +61847,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Restrict to usage attributed to this project (deployment-token callers).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "type": [
               "string",
@@ -61710,6 +61977,14 @@
             "format": "int64",
             "type": "integer"
           },
+          "project_id": {
+            "description": "Project the call is attributed to (deployment-token callers only)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "type": "string"
           },
@@ -61731,6 +62006,14 @@
           },
           "timestamp": {
             "type": "string"
+          },
+          "token_id": {
+            "description": "Deployment token the call is attributed to",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "trace_id": {
             "type": [
@@ -61797,6 +62080,14 @@
             "description": "Filter by model name",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -68171,6 +68462,345 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/limits": {
+      "get": {
+        "operationId": "get_limits_overview",
+        "parameters": [
+          {
+            "description": "Page of project overrides (default 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default 20, max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitsOverviewResponse"
+                }
+              }
+            },
+            "description": "Instance defaults and per-project overrides"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/limits/instance": {
+      "put": {
+        "operationId": "update_instance_limits",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitSettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitSettingsBody"
+                }
+              }
+            },
+            "description": "Instance-wide defaults replaced"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid limit"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/limits/projects/{project_id}": {
+      "delete": {
+        "operationId": "reset_project_limits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project limits cleared; the project inherits the instance defaults"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "get_project_limits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectLimitsResponse"
+                }
+              }
+            },
+            "description": "Stored and effective limits plus this month's spend"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "update_project_limits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitSettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectLimitsResponse"
+                }
+              }
+            },
+            "description": "Project limits replaced"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid limit"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/pending-actions/{action_public_id}": {
       "get": {
         "operationId": "get_user_pending_action",
@@ -69262,6 +69892,96 @@
         ],
         "tags": [
           "AI Provider Status"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/usage/by-project": {
+      "get": {
+        "operationId": "get_usage_by_project",
+        "parameters": [
+          {
+            "description": "ISO 8601 start time (defaults to 24h ago)",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 8601 end time (defaults to now)",
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max projects (defaults to 50, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectUsage"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Spend and volume per project, most expensive first"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid query parameters"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Requires an instance administrator"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Usage"
         ],
         "x-maturity": "experimental"
       }
@@ -137412,6 +138132,10 @@
     {
       "description": "Usage analytics and reporting endpoints",
       "name": "AI Gateway Usage"
+    },
+    {
+      "description": "Rate limits and spend caps for AI gateway callers",
+      "name": "AI Gateway Limits"
     },
     {
       "description": "Model pricing endpoints",
