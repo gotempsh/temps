@@ -394,7 +394,9 @@ pub enum VmRecovery {
     /// The provider could not find the VM, or could not check it. Whether the
     /// VM's files still exist is unknown, so the advice does not promise a
     /// resume or a restart (a failed `resume` also lands here, and `restart`
-    /// refuses a stopped row): retry, then recreate.
+    /// refuses a stopped row), and does not tell the caller to delete it: a
+    /// guest that is merely slow to answer lands here too. Retry, then look at
+    /// the server logs; delete only if the sandbox is not needed.
     RestartOrRecreate,
 }
 
@@ -407,8 +409,9 @@ impl VmRecovery {
                  `bunx @temps-sdk/cli sandbox rm {sandbox_id}` and create a new one."
             ),
             VmRecovery::RestartOrRecreate => format!(
-                "Retry in a moment. If it keeps failing, the VM's files are gone and it cannot be \
-                 started again: delete it with `bunx @temps-sdk/cli sandbox rm {sandbox_id}` \
+                "Retry in a moment. If it keeps failing, check the Temps server logs for sandbox \
+                 {sandbox_id}: its VM may be gone, or its guest may not be answering. If you no \
+                 longer need its disk, delete it with `bunx @temps-sdk/cli sandbox rm {sandbox_id}` \
                  and create a new one."
             ),
         }
@@ -665,6 +668,10 @@ mod tests {
         assert!(!msg.contains("sandbox resume"), "{msg}");
         assert!(!msg.contains("sandbox restart"), "{msg}");
         assert!(msg.contains("sandbox rm sbx_public"), "{msg}");
+        // Unknown liveness lands here too: the advice must not claim the
+        // VM's files are gone.
+        assert!(msg.contains("server logs"), "{msg}");
+        assert!(!msg.contains("files are gone"), "{msg}");
         assert!(!msg.contains("42"), "internal run id leaked: {msg}");
     }
 

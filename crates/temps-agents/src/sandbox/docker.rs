@@ -158,6 +158,28 @@ fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
     )
 }
 
+/// What a failed `inspect_container` says about liveness. The daemon
+/// answering "no such container" proves it is gone (`Ok(false)`). Anything
+/// else (socket down, daemon restarting, timeout) says nothing about the
+/// container, and `Ok(false)` is a verdict callers act on by rewriting the
+/// sandbox row, so it is an error and stays "unknown".
+fn inspect_failure_verdict(
+    handle: &SandboxHandle,
+    error: bollard::errors::Error,
+) -> Result<bool, AgentError> {
+    if docker_error_is_not_found(&error) {
+        return Ok(false);
+    }
+    Err(AgentError::SandboxExecFailed {
+        run_id: 0,
+        sandbox_id: handle.sandbox_id.clone(),
+        reason: format!(
+            "Failed to inspect container {}: {}",
+            handle.sandbox_name, error
+        ),
+    })
+}
+
 fn docker_network_matches_policy(
     network: &bollard::models::NetworkInspect,
     internal: bool,
@@ -4830,7 +4852,7 @@ impl SandboxProvider for DockerSandboxProvider {
                     .await?;
                 Ok(false)
             }
-            Err(_) => Ok(false),
+            Err(error) => inspect_failure_verdict(handle, error),
         }
     }
 
@@ -10956,4 +10978,32 @@ fn docker_not_found_is_safe_for_idempotent_cleanup() {
 
     assert!(docker_error_is_not_found(&not_found));
     assert!(!docker_error_is_not_found(&conflict));
+}
+
+#[test]
+fn a_failed_inspection_is_unknown_unless_the_container_is_gone() {
+    let handle = SandboxHandle {
+        node_id: None,
+        sandbox_id: "abc123".to_string(),
+        sandbox_name: "temps-sandbox-test".to_string(),
+        work_dir: std::path::PathBuf::from("/workspace"),
+        backend: crate::sandbox::SandboxBackend::Docker,
+        image: String::new(),
+    };
+    let gone = bollard::errors::Error::DockerResponseServerError {
+        status_code: 404,
+        message: "No such container".to_string(),
+    };
+    let daemon_down = bollard::errors::Error::DockerResponseServerError {
+        status_code: 500,
+        message: "daemon is restarting".to_string(),
+    };
+
+    assert!(matches!(inspect_failure_verdict(&handle, gone), Ok(false)));
+    let unknown = inspect_failure_verdict(&handle, daemon_down);
+    assert!(
+        matches!(&unknown, Err(AgentError::SandboxExecFailed { reason, .. })
+            if reason.contains("temps-sandbox-test") && reason.contains("daemon is restarting")),
+        "{unknown:?}"
+    );
 }

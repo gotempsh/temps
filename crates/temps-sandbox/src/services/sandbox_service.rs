@@ -460,9 +460,20 @@ pub struct VmReconcileReport {
     /// Public ids of rows moved from `running` to `stopped` because their VM
     /// is not running.
     pub marked_stopped: Vec<String>,
+    /// Rows whose VM is down but whose row was left as it was: a managed
+    /// application workspace (which reports a lost runtime as `recovering`),
+    /// a row that changed since it was read, or a failed database write.
+    pub not_marked: usize,
     /// Rows left as they were because the check neither confirmed nor ruled
     /// out a live VM (error or timeout).
     pub unverified: usize,
+}
+
+impl VmReconcileReport {
+    /// Whether every row examined has a confirmed live VM.
+    pub fn all_alive(&self) -> bool {
+        self.alive == self.checked
+    }
 }
 
 /// Whether the startup reconciliation may judge this row. Firecracker and
@@ -4813,7 +4824,9 @@ TEMPS_ASKPASS_EOF\n\
     /// Move a `running` row whose VM the provider reports as down to `stopped`,
     /// leaving `expires_at` and the rest of the row untouched, and record a
     /// `vm_lost` event naming the cause. Conditional on the row still being
-    /// `running`, so it never overwrites a concurrent pause or destroy.
+    /// `running` *and* untouched since `row` was read, so it never overwrites a
+    /// concurrent pause or destroy, nor a resume that landed after the probe
+    /// (a resume moves `last_activity_at`).
     /// Returns whether this call changed the row. Failures are logged, not
     /// raised: the caller is already reporting the underlying problem.
     pub(crate) async fn mark_vm_lost(
@@ -4834,7 +4847,13 @@ TEMPS_ASKPASS_EOF\n\
             status: Set("stopped".to_string()),
             ..Default::default()
         };
-        match row_status::update_when(self.db.as_ref(), changes, Expect::Status("running")).await {
+        match row_status::update_when(
+            self.db.as_ref(),
+            changes,
+            Expect::RunningSince(row.last_activity_at),
+        )
+        .await
+        {
             Ok(Some(_)) => {
                 // Only once the row really moved: a stale copy of the row must
                 // not kill the jobs of a sandbox that was resumed meanwhile.
@@ -4916,6 +4935,8 @@ TEMPS_ASKPASS_EOF\n\
                 VmCheck::Down(cause) => {
                     if self.mark_vm_lost(&row, &cause, "startup").await {
                         report.marked_stopped.push(row.public_id.clone());
+                    } else {
+                        report.not_marked += 1;
                     }
                 }
                 VmCheck::Unknown(reason) => {
@@ -7788,10 +7809,65 @@ mod storage_cleanup_tests {
                 checked: 1,
                 alive: 0,
                 marked_stopped: vec![PUBLIC_ID.to_string()],
+                not_marked: 0,
                 unverified: 0,
             }
         );
         assert!(sql.contains("vm_lost"), "{sql}");
+    }
+
+    /// A resume that lands after the probe moves `last_activity_at`; the
+    /// verdict about the old row must not stop the sandbox that came back.
+    #[tokio::test]
+    async fn a_stale_verdict_is_pinned_to_the_activity_timestamp_it_was_read_at() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: 7,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let (_, sql) = with_statement_log(
+            "mark-pinned",
+            [Vec::<sandboxes::Model>::new()],
+            0,
+            FakeProvider::new(),
+            |service| async move { service.mark_vm_lost(&row, &cause, "startup").await },
+        )
+        .await;
+
+        // The statement log is the Debug form of the transaction, so the
+        // quotes around identifiers are escaped.
+        assert!(sql.contains(r#"last_activity_at\" = $4"#), "{sql}");
+        assert!(sql.contains("ChronoDateTimeUtc"), "{sql}");
+        assert!(sql.contains(r#"String(Some("running"))"#), "{sql}");
+    }
+
+    /// A down VM whose row is not rewritten (here a managed application
+    /// workspace) is counted, so the startup log cannot claim every VM is
+    /// alive.
+    #[tokio::test]
+    async fn startup_reconciliation_counts_down_rows_it_did_not_rewrite() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let mut managed = row_with(PUBLIC_ID, "ephemeral", "running");
+        managed.name = format!("{APPLICATION_WORKSPACE_NAME_PREFIX}app_0123456789abcdef");
+        let (report, sql) = with_statement_log(
+            "reconcile-managed",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            provider,
+            |service| async move { service.reconcile_running_vms(vec![managed]).await },
+        )
+        .await;
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.alive, 0);
+        assert_eq!(report.not_marked, 1);
+        assert!(report.marked_stopped.is_empty());
+        assert!(!report.all_alive());
+        assert!(!sql.contains("UPDATE"), "{sql}");
     }
 
     #[tokio::test]

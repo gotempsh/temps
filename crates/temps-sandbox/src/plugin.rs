@@ -262,7 +262,7 @@ impl TempsPlugin for SandboxPlugin {
                                 let service = service.clone();
                                 tokio::spawn(async move {
                                     let report = service.reconcile_running_vms(vm_rows).await;
-                                    if report.marked_stopped.is_empty() && report.unverified == 0 {
+                                    if report.all_alive() {
                                         info!(
                                             checked = report.checked,
                                             alive = report.alive,
@@ -273,9 +273,11 @@ impl TempsPlugin for SandboxPlugin {
                                             checked = report.checked,
                                             alive = report.alive,
                                             unverified = report.unverified,
+                                            not_marked = report.not_marked,
                                             marked_stopped = ?report.marked_stopped,
-                                            "Sandbox plugin: sandbox rows whose VM is not running were marked stopped; \
-                                             resume them with `temps sandbox resume <id>`"
+                                            "Sandbox plugin: not every running VM sandbox has a confirmed live VM; \
+                                             rows whose VM is down were marked stopped (resume them with \
+                                             `temps sandbox resume <id>`)"
                                         );
                                     }
                                 });
