@@ -44,6 +44,7 @@ import {
 import type { AgentRunLogResponse as AgentRunLog } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'
+import { invalidateOperations } from '@/lib/operations'
 import {
   addContext,
   createPr,
@@ -1044,6 +1045,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       eventSource.close()
       setStoppedStreamKey(streamKey)
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
     })
 
     eventSource.onerror = () => {
@@ -1147,6 +1149,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       })
       setStreamLogs([])
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
       toast.success('Fix generation started')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to start fix')
@@ -1167,6 +1170,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to create PR')
     } finally {
+      void invalidateOperations(queryClient)
       setIsCreatingPr(false)
     }
   }
@@ -1189,6 +1193,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         })
       }
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to send message')
     } finally {

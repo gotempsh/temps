@@ -16378,7 +16378,7 @@ export type OperationStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | '
 /**
  * Which slice of the feed to return.
  */
-export type OperationStatusFilter = 'running' | 'finished' | 'all';
+export type OperationStatusFilter = 'running' | 'waiting' | 'finished' | 'all';
 
 /**
  * A page of the operations feed. Sorted by `created_at` descending (fixed).
@@ -16388,7 +16388,7 @@ export type OperationsListResponse = {
     page: number;
     page_size: number;
     /**
-     * Queued, running and waiting operations matching the scope, `kind` and
+     * Queued and running operations matching the scope, `kind` and
      * `project_id` filters — independent of the `status` filter, so the tray
      * badge stays correct while browsing finished operations.
      */
@@ -48342,8 +48342,8 @@ export type ListOperationsData = {
          */
         page_size?: number;
         /**
-         * `running` (queued, running, waiting), `finished` (succeeded, failed,
-         * cancelled) or `all` (default).
+         * `running` (queued, running), `waiting` (needs human review),
+         * `finished` (succeeded, failed, cancelled) or `all` (default).
          */
         status?: OperationStatusFilter;
         /**

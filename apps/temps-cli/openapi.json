@@ -29982,7 +29982,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/OperationStatusFilter",
-                "description": "`running` (queued, running, waiting), `finished` (succeeded, failed,\ncancelled) or `all` (default)."
+                "description": "`running` (queued, running), `waiting` (needs human review),\n`finished` (succeeded, failed, cancelled) or `all` (default)."
               },
               {
                 "type": "null"
@@ -35342,6 +35342,7 @@
         "description": "Which slice of the feed to return.",
         "enum": [
           "running",
+          "waiting",
           "finished",
           "all"
         ],
@@ -35367,7 +35368,7 @@
             "type": "integer"
           },
           "running_count": {
-            "description": "Queued, running and waiting operations matching the scope, `kind` and\n`project_id` filters — independent of the `status` filter, so the tray\nbadge stays correct while browsing finished operations.",
+            "description": "Queued and running operations matching the scope, `kind` and\n`project_id` filters — independent of the `status` filter, so the tray\nbadge stays correct while browsing finished operations.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -93065,7 +93066,7 @@
             }
           },
           {
-            "description": "`running` (queued, running, waiting), `finished` (succeeded, failed,\ncancelled) or `all` (default).",
+            "description": "`running` (queued, running), `waiting` (needs human review),\n`finished` (succeeded, failed, cancelled) or `all` (default).",
             "in": "query",
             "name": "status",
             "required": false,
