@@ -91,6 +91,9 @@ pub async fn stream_structured_output(
     permission_guard!(auth, AiGatewayExecute);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // Deployment-token callers share the project's gateway rate limit and
+    // budget; other principals pass through.
+    crate::handlers::gateway::enforce_project_limits(&state, &auth).await?;
 
     authorize_structured_purpose(state.db.as_ref(), project_id, &request.purpose).await?;
     apply_summary_preference(&state, &mut request).await?;

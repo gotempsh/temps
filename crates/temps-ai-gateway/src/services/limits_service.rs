@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    sea_query::OnConflict, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set,
 };
 use serde::Serialize;
 use temps_entities::ai_gateway_config::{self, Column};
@@ -372,37 +372,51 @@ impl AiLimitsService {
         &self,
         project_id: i32,
     ) -> Result<EffectiveLimits, AiGatewayError> {
-        if let Some(cached) = self.limits_cache.get(&project_id).await {
-            return Ok(cached);
-        }
-        let rows = ai_gateway_config::Entity::find()
-            .filter(Column::Scope.is_in([INSTANCE_SCOPE.to_string(), project_scope(project_id)]))
-            .all(self.db.as_ref())
-            .await?;
-        let settings_of = |scope: &str| {
-            rows.iter()
-                .find(|row| row.scope == scope)
-                .map(LimitSettings::from)
-        };
-        let limits = resolve(
-            settings_of(&project_scope(project_id)),
-            settings_of(INSTANCE_SCOPE),
-        );
-        self.limits_cache.insert(project_id, limits.clone()).await;
-        Ok(limits)
+        // `try_get_with` coalesces concurrent misses: when an entry expires,
+        // one request loads it and the rest wait for that result instead of
+        // each hitting the database.
+        self.limits_cache
+            .try_get_with(project_id, async {
+                let rows = ai_gateway_config::Entity::find()
+                    .filter(
+                        Column::Scope
+                            .is_in([INSTANCE_SCOPE.to_string(), project_scope(project_id)]),
+                    )
+                    .all(self.db.as_ref())
+                    .await?;
+                let settings_of = |scope: &str| {
+                    rows.iter()
+                        .find(|row| row.scope == scope)
+                        .map(LimitSettings::from)
+                };
+                Ok::<_, AiGatewayError>(resolve(
+                    settings_of(&project_scope(project_id)),
+                    settings_of(INSTANCE_SCOPE),
+                ))
+            })
+            .await
+            .map_err(|error| AiGatewayError::Internal {
+                message: format!(
+                    "Failed to load AI gateway limits for project {project_id}: {error}"
+                ),
+            })
     }
 
     /// Operator-funded spend of `project_id` this UTC month, in microcents.
     pub async fn month_spend(&self, project_id: i32) -> Result<i64, AiGatewayError> {
-        if let Some(cached) = self.spend_cache.get(&project_id).await {
-            return Ok(cached);
-        }
-        let used = self
-            .usage_service
-            .project_spend_since(project_id, month_start(Utc::now()))
-            .await?;
-        self.spend_cache.insert(project_id, used).await;
-        Ok(used)
+        // Coalesced for the same reason as `effective_limits`: the SUM below
+        // scans the project's month of usage rows, so a burst of requests
+        // arriving as the entry expires must share one query.
+        self.spend_cache
+            .try_get_with(project_id, async {
+                self.usage_service
+                    .project_spend_since(project_id, month_start(Utc::now()))
+                    .await
+            })
+            .await
+            .map_err(|error| AiGatewayError::Internal {
+                message: format!("Failed to read AI spend for project {project_id}: {error}"),
+            })
     }
 
     /// Stored (un-inherited) limits for a scope, if the scope has a row.
@@ -427,8 +441,15 @@ impl AiLimitsService {
     ) -> Result<(Vec<(i32, LimitSettings)>, u64), AiGatewayError> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
+        // A reset clears both columns but keeps the row; a row that sets
+        // nothing is not an override, so it must not be listed (or counted).
         let paginator = ai_gateway_config::Entity::find()
             .filter(Column::Scope.like("project:%"))
+            .filter(
+                Condition::any()
+                    .add(Column::MaxRequestsPerMinute.is_not_null())
+                    .add(Column::MaxCostPerMonthMicrocents.is_not_null()),
+            )
             .order_by_desc(Column::UpdatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
@@ -451,41 +472,46 @@ impl AiLimitsService {
         settings: LimitSettings,
     ) -> Result<LimitSettings, AiGatewayError> {
         validate_settings(scope, settings)?;
+        // Clearing a project's override must work even after the project was
+        // deleted (its row would otherwise be stuck in the overrides list), so
+        // existence is only required when something is being set.
+        let sets_a_limit = settings.max_requests_per_minute.is_some()
+            || settings.max_cost_per_month_microcents.is_some();
         if let LimitScope::Project(project_id) = scope {
-            let exists = temps_entities::projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .is_some();
-            if !exists {
-                return Err(AiGatewayError::ProjectNotFound { project_id });
+            if sets_a_limit {
+                let exists = temps_entities::projects::Entity::find_by_id(project_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .is_some();
+                if !exists {
+                    return Err(AiGatewayError::ProjectNotFound { project_id });
+                }
             }
         }
 
-        let existing = ai_gateway_config::Entity::find()
-            .filter(Column::Scope.eq(scope.key()))
-            .one(self.db.as_ref())
-            .await?;
-        let saved = match existing {
-            Some(row) => {
-                let mut active = ai_gateway_config::ActiveModel::from(row);
-                active.max_requests_per_minute = Set(settings.max_requests_per_minute);
-                active.max_cost_per_month_microcents = Set(settings.max_cost_per_month_microcents);
-                active.update(self.db.as_ref()).await?
-            }
-            None => {
-                ai_gateway_config::ActiveModel {
-                    scope: Set(scope.key()),
-                    max_requests_per_minute: Set(settings.max_requests_per_minute),
-                    max_cost_per_month_microcents: Set(settings.max_cost_per_month_microcents),
-                    provider_type: Set("gateway".to_string()),
-                    agent_cli_provider_id: Set(None),
-                    interactive_bridge_enabled: Set(false),
-                    ..Default::default()
-                }
-                .insert(self.db.as_ref())
-                .await?
-            }
-        };
+        // One statement, so two concurrent first writes to the same scope
+        // cannot trip the UNIQUE(scope) constraint.
+        let saved = ai_gateway_config::Entity::insert(ai_gateway_config::ActiveModel {
+            scope: Set(scope.key()),
+            max_requests_per_minute: Set(settings.max_requests_per_minute),
+            max_cost_per_month_microcents: Set(settings.max_cost_per_month_microcents),
+            provider_type: Set("gateway".to_string()),
+            agent_cli_provider_id: Set(None),
+            interactive_bridge_enabled: Set(false),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(Column::Scope)
+                .update_columns([
+                    Column::MaxRequestsPerMinute,
+                    Column::MaxCostPerMonthMicrocents,
+                    Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec_with_returning(self.db.as_ref())
+        .await?;
 
         // Limits are cached per project and an instance change affects all of
         // them. Spend is unaffected by a limit change.
@@ -872,5 +898,75 @@ mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_project_overrides_skips_rows_that_set_no_limit() {
+        use std::collections::BTreeMap;
+
+        let count: BTreeMap<String, sea_orm::Value> =
+            BTreeMap::from([("num_items".to_string(), sea_orm::Value::BigInt(Some(1)))]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![count]])
+                .append_query_results([vec![config_row("project:7", Some(60), None)]])
+                .into_connection(),
+        );
+        let service = AiLimitsService::new(db.clone(), Arc::new(UsageService::new(db.clone())));
+
+        let (overrides, total) = service.list_project_overrides(1, 20).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].0, 7);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("mock connection still shared"))
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("max_requests_per_minute\\\" IS NOT NULL")
+                && sql.contains("max_cost_per_month_microcents\\\" IS NOT NULL"),
+            "reset rows (both limits NULL) must be excluded: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_an_override_does_not_require_the_project_to_exist() {
+        // No project row is queued: if the service looked the project up, the
+        // mock would have nothing to return and the call would fail.
+        let service = service_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![config_row("project:404", None, None)]])
+                .into_connection(),
+        );
+        let saved = service
+            .set_settings(LimitScope::Project(404), LimitSettings::default())
+            .await
+            .expect("a deleted project's override must still be clearable");
+        assert_eq!(saved, LimitSettings::default());
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_misses_share_one_spend_query() {
+        use std::collections::BTreeMap;
+
+        let sum: BTreeMap<String, sea_orm::Value> =
+            BTreeMap::from([("spend".to_string(), sea_orm::Value::BigInt(Some(1_234)))]);
+        // One result queued: a second query would return no rows and fail.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![sum]])
+                .into_connection(),
+        );
+        let service = AiLimitsService::new(db.clone(), Arc::new(UsageService::new(db.clone())));
+        let (a, b, c) = tokio::join!(
+            service.month_spend(5),
+            service.month_spend(5),
+            service.month_spend(5)
+        );
+        assert_eq!(a.unwrap(), 1_234);
+        assert_eq!(b.unwrap(), 1_234);
+        assert_eq!(c.unwrap(), 1_234);
     }
 }

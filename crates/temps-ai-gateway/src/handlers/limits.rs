@@ -210,6 +210,14 @@ async fn audit_limits_change(
 // Handlers
 // ============================================================================
 
+/// Limits and spend are an operator view over every project. `AiGatewayRead`
+/// is held by ordinary users and readers, and would expose other projects'
+/// limits and month-to-date spend, so reads require an administrator.
+fn require_limits_reader(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, SystemAdmin);
+    Ok(())
+}
+
 #[utoipa::path(
     tag = "AI Gateway Limits",
     get,
@@ -230,7 +238,7 @@ async fn get_limits_overview(
     State(app_state): State<Arc<AiGatewayAppState>>,
     Query(query): Query<OverviewQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayRead);
+    require_limits_reader(&auth)?;
 
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
@@ -328,7 +336,7 @@ async fn get_project_limits(
     State(app_state): State<Arc<AiGatewayAppState>>,
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayRead);
+    require_limits_reader(&auth)?;
 
     Ok(Json(project_limits_response(&app_state, project_id).await?))
 }
@@ -406,4 +414,54 @@ async fn reset_project_limits(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use temps_auth::permissions::Role;
+    use temps_auth::AuthContext;
+    use temps_entities::users;
+
+    fn test_auth(role: Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            users::Model {
+                id: 7,
+                name: "Limits Tester".to_string(),
+                email: "limits-tester@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    #[test]
+    fn administrators_may_read_limits() {
+        assert!(require_limits_reader(&test_auth(Role::Admin)).is_ok());
+    }
+
+    #[test]
+    fn ordinary_users_and_readers_cannot_read_other_projects_limits() {
+        for role in [Role::User, Role::Reader] {
+            let err = require_limits_reader(&test_auth(role))
+                .expect_err("limits and spend span every project");
+            assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        }
+    }
 }

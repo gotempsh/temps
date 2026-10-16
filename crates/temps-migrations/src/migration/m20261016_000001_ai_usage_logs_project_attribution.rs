@@ -11,7 +11,9 @@
 //!
 //! The partial indexes serve per-project aggregation (spend caps, cost reports)
 //! and only cover rows that are attributed, so they stay small on instances
-//! where most traffic comes from human users.
+//! where most traffic comes from human users. The project index also carries
+//! the cost and BYOK columns (`INCLUDE`), so the monthly-budget SUM is answered
+//! from the index alone instead of fetching every row the project wrote.
 
 use sea_orm_migration::prelude::*;
 
@@ -30,6 +32,7 @@ ALTER TABLE ai_usage_logs ADD COLUMN IF NOT EXISTS token_id INTEGER;
 
 CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_project_timestamp
     ON ai_usage_logs (project_id, timestamp DESC)
+    INCLUDE (estimated_cost_microcents, is_byok)
     WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_token_timestamp
     ON ai_usage_logs (token_id, timestamp DESC)
