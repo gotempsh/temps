@@ -182,6 +182,20 @@ impl TempsPlugin for SandboxPlugin {
 
             let sandbox_service = context.get_service::<SandboxService>();
 
+            // Firecracker and microsandbox VMs are children of this process,
+            // so a service manager that kills the whole unit on restart takes
+            // them down. Say so while the operator is looking at the logs, in
+            // the background: it shells out to `systemctl`.
+            {
+                use temps_agents::sandbox::SandboxBackend;
+                let provider = registry.provider();
+                if provider.supports_backend(SandboxBackend::Firecracker)
+                    || provider.supports_backend(SandboxBackend::Microsandbox)
+                {
+                    tokio::spawn(crate::services::service_manager::warn_if_restart_kills_vms());
+                }
+            }
+
             // Inject this plugin's service into the agents' sandbox registry
             // so agent runs (autofixer, workflow agents) create first-class
             // `sandboxes` rows instead of untracked containers.

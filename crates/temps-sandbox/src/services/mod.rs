@@ -16,6 +16,7 @@ pub mod public_id;
 pub mod registry;
 pub mod row_status;
 pub mod sandbox_service;
+pub mod service_manager;
 pub mod snapshot_service;
 
 pub use exec::{ExecOptions, ExecResult};

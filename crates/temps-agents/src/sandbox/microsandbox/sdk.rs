@@ -2733,6 +2733,64 @@ mod tests {
     /// Number of IPv4 routes in the guest (header line excluded).
     const ROUTE_COUNT: &str = "tail -n +2 /proc/net/route | wc -l";
 
+    /// What a service manager that kills the whole unit does to a VM: the VMM
+    /// process dies with nothing told to the SDK. The provider must then say
+    /// the VM is down (the verdict the sandbox API reconciles rows on), not
+    /// keep reporting a stale `running`, and `start` must boot it again.
+    #[tokio::test]
+    async fn e2e_a_killed_vm_is_reported_down_and_boots_again() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        with_sandbox(&provider, e2e_config("killed", "none"), |handle| {
+            let provider = &provider;
+            async move {
+                assert!(provider.is_alive(&handle).await.unwrap());
+
+                let killed = std::process::Command::new("pkill")
+                    .args(["-9", "-f", &handle.sandbox_name])
+                    .status()
+                    .expect("run pkill");
+                assert!(
+                    killed.success(),
+                    "no process matched {}",
+                    handle.sandbox_name
+                );
+
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while provider.is_alive(&handle).await.unwrap_or(true) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} still reported alive 15s after its VMM was killed",
+                        handle.sandbox_name
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                // A down VM is still found by name: that is what lets the
+                // registry say "not running" instead of "not found".
+                let recovered = provider
+                    .recover_by_name(&handle.sandbox_name)
+                    .await
+                    .unwrap();
+                assert!(recovered.is_some(), "a killed VM must still be recoverable");
+
+                provider.start(&handle).await.expect("boot the VM again");
+                assert!(provider.is_alive(&handle).await.unwrap());
+                let echoed = provider
+                    .exec(
+                        &handle,
+                        vec!["echo".into(), "back".into()],
+                        HashMap::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(echoed.stdout.trim(), "back");
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn e2e_lifecycle_exec_files_and_isolated_network() {
         let Some(provider) = e2e_provider() else {
