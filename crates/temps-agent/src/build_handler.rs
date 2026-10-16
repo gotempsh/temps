@@ -1273,6 +1273,19 @@ mod tests {
         ));
     }
 
+    /// The control plane holds one HTTP request open for the whole build. A
+    /// build admitted at the very end of the admission window still gets its
+    /// full, fresh build deadline here, so the client's request timeout must
+    /// cover both, or the stream is cut while the worker is still building.
+    #[test]
+    fn the_control_plane_request_outlasts_admission_plus_the_build_deadline() {
+        let worst_case = BUILD_DEADLINE + BUILD_DEADLINE;
+        assert!(
+            temps_deployer::remote::IMAGE_BUILD_REQUEST_TIMEOUT > worst_case,
+            "a build admitted late must keep its whole build deadline"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_busy_builder_answers_503_after_the_queue_window_not_after_the_build_deadline() {
         let slots = Arc::new(tokio::sync::Semaphore::new(1));

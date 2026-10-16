@@ -37,7 +37,13 @@ const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// same reason as [`IMAGE_IMPORT_REQUEST_TIMEOUT`] — the control plane should
 /// see the worker's own timeout response rather than a client-side cutoff.
 const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
-const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Longest a worker build request stays open: the agent's 30-minute window to
+/// admit the build and receive its context (the queue wait is part of it),
+/// then a fresh 30-minute build deadline that starts once the build holds a
+/// slot, plus a minute so the agent's own timeout answer arrives before this
+/// client gives up. A build that queued must not lose build time to the time
+/// it spent queued.
+pub const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(61 * 60);
 /// Slightly exceeds the worker's 30-minute export deadline.
 const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// A node scan waits for an image-operation slot, then runs the scanner;
@@ -1295,6 +1301,15 @@ impl ImageBuilder for RemoteNodeDeployer {
             } else {
                 ""
             };
+            // The agent answers 503 when no build slot became free within its
+            // queue window. Nothing was built, which is what lets a caller
+            // that can build elsewhere do so.
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return Err(BuilderError::Busy(format!(
+                    "Worker '{}' had no free build slot (HTTP {status}): {detail}",
+                    self.node_name
+                )));
+            }
             return Err(BuilderError::Other(format!(
                 "Worker '{}' refused image build (HTTP {status}): {detail}{upgrade}",
                 self.node_name
@@ -2654,6 +2669,45 @@ mod tests {
             message.contains("absent from the uploaded context"),
             "{message}"
         );
+    }
+
+    /// A worker with no free build slot refuses with 503 before building
+    /// anything. That is a distinct, typed answer so a caller that can build
+    /// elsewhere may, instead of failing the deployment.
+    #[tokio::test]
+    async fn worker_build_with_no_free_slot_is_a_typed_busy_refusal() {
+        let (url, _server) = spawn_one_shot_agent(
+            "503 Service Unavailable",
+            "application/problem+json",
+            br#"{"title":"Image operation unavailable","status":503,"detail":"Builder is busy: no build slot became free within 600s"}"#,
+        )
+        .await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+
+        let error = deployer
+            .build_image(context_request(source.path(), None))
+            .await
+            .expect_err("agent was busy");
+
+        match error {
+            BuilderError::Busy(message) => {
+                assert!(message.contains("builder-1"), "{message}");
+                assert!(message.contains("Builder is busy"), "{message}");
+            }
+            other => panic!("expected Busy, got {other}"),
+        }
+    }
+
+    /// The agent may spend up to 30 minutes admitting a build (the queue wait
+    /// is part of that window) and then 30 more building it; the client must
+    /// not cut the request off before the worker's own deadlines.
+    #[test]
+    fn worker_build_request_outlasts_admission_plus_build() {
+        let admission_and_build = Duration::from_secs(2 * 30 * 60);
+        assert!(IMAGE_BUILD_REQUEST_TIMEOUT > admission_and_build);
     }
 
     #[test]
