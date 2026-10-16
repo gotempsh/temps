@@ -14,6 +14,7 @@ import {
   parsePositiveIntId,
   isValidComparator,
   isValidSeverity,
+  applyS3Flags,
 } from './index.js'
 
 describe('schemaToPromptParams', () => {
@@ -219,5 +220,31 @@ describe('isValidSeverity', () => {
   test('rejects any other value', () => {
     expect(isValidSeverity('catastrophic')).toBe(false)
     expect(isValidSeverity('')).toBe(false)
+  })
+})
+
+describe('applyS3Flags', () => {
+  test('is a no-op without flags, even for non-S3 types', () => {
+    const params = { database: 'app' }
+    expect(applyS3Flags('postgres', params, {})).toBe(params)
+    expect(applyS3Flags('postgres', params, { bucket: [] })).toBe(params)
+  })
+
+  test('adds backend and buckets for S3-compatible services', () => {
+    expect(
+      applyS3Flags('s3', {}, { backend: 'Garage', bucket: ['uploads', ' assets '] })
+    ).toEqual({ backend: 'garage', buckets: ['uploads', 'assets'] })
+    expect(applyS3Flags('blob', {}, { backend: 'rustfs' })).toEqual({ backend: 'rustfs' })
+  })
+
+  test('the dedicated flags win over --set', () => {
+    expect(
+      applyS3Flags('s3', { backend: 'rustfs', buckets: ['x'] }, { backend: 'garage', bucket: ['y'] })
+    ).toEqual({ backend: 'garage', buckets: ['y'] })
+  })
+
+  test('rejects unknown backends and non-S3 service types with context', () => {
+    expect(() => applyS3Flags('s3', {}, { backend: 'minio' })).toThrow(/Unknown --backend "minio"/)
+    expect(() => applyS3Flags('redis', {}, { bucket: ['a'] })).toThrow(/not "redis"/)
   })
 })
