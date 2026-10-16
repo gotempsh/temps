@@ -36,6 +36,7 @@ pub mod cluster_role;
 pub mod container_download;
 pub(crate) mod container_upload;
 pub mod exec_util;
+pub mod garage;
 pub mod managed_s3;
 pub mod mariadb;
 pub mod mariadb_binlog_health;
@@ -54,6 +55,7 @@ pub mod restore_image;
 pub(crate) mod restore_staging;
 pub mod rustfs;
 pub mod s3;
+pub(crate) mod s3_mirror;
 pub mod s3_util;
 
 // Test utilities for backup and restore testing
@@ -218,7 +220,11 @@ mod cluster_integration_tests;
 
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
-pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};
+pub use garage::GarageService;
+pub use managed_s3::{
+    ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Error,
+    ManagedS3MirrorReport, MigrationSource,
+};
 pub use mariadb::{BinlogManifest, MariaDbService};
 pub use mongodb::MongodbService;
 pub use naming::{legacy_managed_instance_names, managed_instance_name};
@@ -326,7 +332,7 @@ pub async fn probe_service_health(
         ServiceType::Redis | ServiceType::Kv => Box::new(RedisService::new(name, docker.clone())),
         ServiceType::S3 | ServiceType::Blob => {
             let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)
-                .map_err(ServiceHealthProbeError::Configuration)?;
+                .map_err(|e| ServiceHealthProbeError::Configuration(e.into()))?;
             let encryption = request_scoped_encryption_service()
                 .map_err(ServiceHealthProbeError::Configuration)?;
             match selection.backend {
@@ -341,11 +347,12 @@ pub async fn probe_service_health(
                         "managed S3 backend 'minio' is only supported for S3 services"
                     )));
                 }
-                ManagedS3BackendKind::Garage => {
-                    return Err(ServiceHealthProbeError::Configuration(anyhow::anyhow!(
-                        "managed S3 backend 'garage' is not supported for health probes"
-                    )));
-                }
+                ManagedS3BackendKind::Garage => Box::new(GarageService::new(
+                    name,
+                    docker.clone(),
+                    encryption,
+                    service_type,
+                )),
             }
         }
         ServiceType::Rustfs => Box::new(RustfsService::new(
@@ -515,7 +522,7 @@ pub async fn provision_runtime_environment(
         }
         ServiceType::S3 | ServiceType::Blob => {
             let selection = ManagedS3BackendSelection::from_parameters(parameters)
-                .map_err(RuntimeProvisioningError::Provider)?;
+                .map_err(|e| RuntimeProvisioningError::Provider(e.into()))?;
 
             // Runtime provisioning does not use the backup encryption APIs,
             // but these providers require the dependency at construction.
@@ -542,11 +549,12 @@ pub async fn provision_runtime_environment(
                         "managed S3 backend 'minio' is only supported for S3 services"
                     )));
                 }
-                ManagedS3BackendKind::Garage => {
-                    return Err(RuntimeProvisioningError::Provider(anyhow::anyhow!(
-                        "managed S3 backend 'garage' is not supported for runtime provisioning"
-                    )));
-                }
+                ManagedS3BackendKind::Garage => Box::new(GarageService::new(
+                    instance_name,
+                    docker.clone(),
+                    encryption,
+                    service_type,
+                )),
             }
         }
         ServiceType::Rustfs => {

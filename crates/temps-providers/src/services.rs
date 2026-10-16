@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::externalsvc::{
+    garage::GarageService,
     legacy_managed_instance_names, managed_instance_name,
     mariadb::{validate_mariadb_image, MariaDbService, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     mongodb::MongodbService,
@@ -11,8 +12,8 @@ use crate::externalsvc::{
     rustfs::{RustfsService, DEFAULT_RUSTFS_IMAGE},
     s3::S3Service,
     AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState, ServiceConfig,
-    ServiceType,
+    ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Error,
+    MigrationSource, PgAutoFailoverState, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::readiness::{
@@ -53,6 +54,17 @@ const NONCE_LENGTH: usize = 12;
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// Outcome of copying one managed S3 service's buckets into another.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct S3MigrationReport {
+    pub source_service_id: i32,
+    pub target_service_id: i32,
+    pub source_backend: String,
+    pub target_backend: String,
+    /// Buckets that were copied, by their name on the source.
+    pub buckets: Vec<String>,
+}
 
 /// Controls which logical database a deployment receives through a
 /// project-to-service link.
@@ -986,11 +998,7 @@ pub fn parameter_schema_for_parameters(
             reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
                 .to_string(),
         }),
-        ManagedS3BackendKind::Garage => Err(ExternalServiceError::ParameterValidationFailed {
-            service_id: 0,
-            reason: "managed S3 backend 'garage' is not supported for service operations"
-                .to_string(),
-        }),
+        ManagedS3BackendKind::Garage => Ok(GarageService::parameter_schema()),
     }
 }
 
@@ -2797,11 +2805,13 @@ impl ExternalServiceManager {
                     .to_string(),
             }),
             ManagedS3BackendKind::Garage => {
-                Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
-                    reason: "managed S3 backend 'garage' is not supported for service operations"
-                        .to_string(),
-                })
+                let docker = self.require_docker()?;
+                Ok(Box::new(GarageService::new(
+                    name,
+                    docker,
+                    self.encryption_service.clone(),
+                    service_type,
+                )))
             }
         }
     }
@@ -3018,6 +3028,19 @@ impl ExternalServiceManager {
                 return Err(ExternalServiceError::ParameterValidationFailed {
                     service_id: 0,
                     reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services".to_string(),
+                });
+            }
+            (ServiceType::S3 | ServiceType::Blob, Some(backend)) if backend == "garage" => {
+                // Garage reads its configuration from a `garage.toml` that has
+                // to be written into the container before it starts; the
+                // agent's generic create request carries no files, so a worker
+                // cannot create one yet.
+                return Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: format!(
+                        "managed S3 backend 'garage' cannot be created on a remote node for service '{}': the agent cannot yet deliver garage.toml. Create it on the control-plane host, or use the default 'rustfs' backend on the worker",
+                        service_name
+                    ),
                 });
             }
             _ => *service_type,
@@ -3621,13 +3644,15 @@ impl ExternalServiceManager {
                 None
             };
 
+        // The strategy key follows the engine that will run, not the stored
+        // service type: an S3 service on Garage is configured like Garage.
         #[allow(deprecated)]
-        let strategy_service_type = match backend_selection
+        let strategy_key = match backend_selection
             .as_ref()
             .map(|selection| selection.backend)
         {
             Some(ManagedS3BackendKind::Minio) if request.service_type == ServiceType::S3 => {
-                ServiceType::Minio
+                ServiceType::Minio.to_string()
             }
             Some(ManagedS3BackendKind::Minio) => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
@@ -3635,16 +3660,18 @@ impl ExternalServiceManager {
                     reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services".to_string(),
                 });
             }
-            _ => request.service_type,
+            Some(ManagedS3BackendKind::Garage) => ManagedS3BackendKind::Garage.as_str().to_string(),
+            Some(ManagedS3BackendKind::Rustfs) | None => request.service_type.to_string(),
         };
 
         // Get the parameter strategy for the selected backend defaults. The
         // stored service type remains the requested S3-compatible type.
-        let strategy = parameter_strategies::get_strategy(&strategy_service_type.to_string())
-            .ok_or(ExternalServiceError::InvalidServiceType {
+        let strategy = parameter_strategies::get_strategy(&strategy_key).ok_or(
+            ExternalServiceError::InvalidServiceType {
                 id: 0,
-                service_type: strategy_service_type.to_string(),
-            })?;
+                service_type: strategy_key.clone(),
+            },
+        )?;
 
         // Validate required parameters
         strategy
@@ -3659,6 +3686,12 @@ impl ExternalServiceManager {
         strategy
             .auto_generate_missing(&mut parameters)
             .map_err(|reason| ExternalServiceError::InternalError { reason })?;
+
+        // Store the validated, normalised backend selection rather than the
+        // raw request, so every later read sees one canonical shape.
+        if let Some(selection) = backend_selection.as_ref() {
+            selection.write_into_parameters(&mut parameters);
+        }
 
         // Serialize parameters to JSON and encrypt
         let config_json = serde_json::to_string(&parameters).map_err(|e| {
@@ -12999,7 +13032,34 @@ echo "[restore] Pre-seed complete"
         project_id_val: i32,
     ) -> Result<(), ExternalServiceError> {
         // Verify service exists
-        self.get_service(service_id_val).await?;
+        let service = self.get_service(service_id_val).await?;
+
+        let link = project_services::Entity::find()
+            .filter(
+                project_services::Column::ServiceId
+                    .eq(service_id_val)
+                    .and(project_services::Column::ProjectId.eq(project_id_val)),
+            )
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotLinkedToProject {
+                service_id: service_id_val,
+                project_id: project_id_val,
+            })?;
+
+        // Credentials minted for the project's environments must not outlive
+        // the link. A failure here is logged, not fatal: the operator asked to
+        // unlink, and a storage engine that is down must not make that
+        // impossible. The credentials are deterministic, so a later unlink or
+        // relink converges.
+        if let Err(error) = self.revoke_managed_s3_credentials(&service, &link).await {
+            error!(
+                service_id = service_id_val,
+                project_id = project_id_val,
+                "Failed to revoke managed S3 credentials while unlinking: {}",
+                error
+            );
+        }
 
         // Delete the link
         let deleted = project_services::Entity::delete_many()
@@ -13019,6 +13079,257 @@ echo "[restore] Pre-seed complete"
         }
 
         Ok(())
+    }
+
+    /// The managed-S3 engine handle for a service, or `None` when the service
+    /// is not managed S3 storage (or is a legacy MinIO service, which has no
+    /// per-environment credentials to manage).
+    fn managed_s3_backend(
+        &self,
+        name: &str,
+        service_type: ServiceType,
+        parameters: &serde_json::Value,
+    ) -> Result<Option<Box<dyn ManagedS3Backend>>, ExternalServiceError> {
+        if !matches!(
+            service_type,
+            ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs
+        ) {
+            return Ok(None);
+        }
+        let selection = ManagedS3BackendSelection::from_parameters(parameters).map_err(|e| {
+            ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            }
+        })?;
+        let docker = self.require_docker()?;
+        match selection.backend {
+            ManagedS3BackendKind::Minio => Ok(None),
+            ManagedS3BackendKind::Rustfs => {
+                let instance_name = if service_type == ServiceType::Blob {
+                    managed_instance_name(name, service_type)
+                } else {
+                    name.to_string()
+                };
+                Ok(Some(Box::new(RustfsService::new(
+                    instance_name,
+                    docker,
+                    self.encryption_service.clone(),
+                ))))
+            }
+            ManagedS3BackendKind::Garage => Ok(Some(Box::new(GarageService::new(
+                name.to_string(),
+                docker,
+                self.encryption_service.clone(),
+                service_type,
+            )))),
+        }
+    }
+
+    /// Revoke the credentials a project link provisioned for its
+    /// environments. Skips remote services (their engine is only reachable
+    /// through the owning agent) and scopes still shared by another link.
+    async fn revoke_managed_s3_credentials(
+        &self,
+        service: &external_services::Model,
+        link: &project_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        if !matches!(
+            service_type,
+            ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs
+        ) {
+            return Ok(());
+        }
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            warn!(
+                service_id = service.id,
+                project_id = link.project_id,
+                node_id,
+                "Skipping credential revocation for a service hosted on a remote node"
+            );
+            return Ok(());
+        }
+
+        let config = self.get_service_config(service.id).await?;
+        let Some(backend) =
+            self.managed_s3_backend(&service.name, service_type, &config.parameters)?
+        else {
+            return Ok(());
+        };
+
+        let provisioning = DatabaseProvisioningConfig::from_link(link)?;
+        let project = projects::Entity::find_by_id(link.project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ProjectNotFound {
+                id: link.project_id,
+            })?;
+        let environments = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(link.project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut scopes = BTreeSet::new();
+        for environment in &environments {
+            scopes.insert(provisioning.runtime_scope(
+                &project.slug,
+                &environment.slug,
+                service.id,
+                link.project_id,
+            )?);
+        }
+
+        // A custom scope can be shared by several projects; its credentials
+        // stay until the last of them is unlinked.
+        if provisioning.mode == DatabaseProvisioningMode::Custom {
+            let still_shared = project_services::Entity::find()
+                .filter(project_services::Column::ServiceId.eq(service.id))
+                .filter(project_services::Column::ProjectId.ne(link.project_id))
+                .filter(
+                    project_services::Column::CustomDatabaseName
+                        .eq(link.custom_database_name.clone()),
+                )
+                .count(self.db.as_ref())
+                .await?
+                > 0;
+            if still_shared {
+                debug!(
+                    service_id = service.id,
+                    project_id = link.project_id,
+                    "Keeping managed S3 credentials: the custom scope is linked by another project"
+                );
+                return Ok(());
+            }
+        }
+
+        for (project_scope, environment_scope) in scopes {
+            backend
+                .revoke_access_key(&config, &project_scope, &environment_scope)
+                .await
+                .map_err(|e| Self::managed_s3_error(service.id, e))?;
+            info!(
+                service_id = service.id,
+                project_id = link.project_id,
+                project_scope = %project_scope,
+                environment_scope = %environment_scope,
+                "Revoked managed S3 credentials"
+            );
+        }
+        Ok(())
+    }
+
+    fn managed_s3_error(service_id: i32, error: ManagedS3Error) -> ExternalServiceError {
+        match error {
+            ManagedS3Error::UnsupportedBackend { .. }
+            | ManagedS3Error::BackendNotAString { .. }
+            | ManagedS3Error::DeprecatedBackend
+            | ManagedS3Error::BucketsNotAList { .. }
+            | ManagedS3Error::InvalidBucketName { .. }
+            | ManagedS3Error::TooManyBuckets { .. }
+            | ManagedS3Error::InvalidConfig { .. }
+            | ManagedS3Error::Unsupported { .. } => {
+                ExternalServiceError::ParameterValidationFailed {
+                    service_id,
+                    reason: error.to_string(),
+                }
+            }
+            ManagedS3Error::Admin { .. }
+            | ManagedS3Error::NotReady { .. }
+            | ManagedS3Error::Docker { .. }
+            | ManagedS3Error::Mirror { .. } => ExternalServiceError::InternalError {
+                reason: format!(
+                    "Managed S3 operation failed for service {}: {}",
+                    service_id, error
+                ),
+            },
+        }
+    }
+
+    /// Copy every bucket of `source_service_id` into `target_service_id` with
+    /// plain S3 semantics, so data can move between backends (RustFS ↔
+    /// Garage). Existing objects in the target are left in place; the source
+    /// is never modified.
+    pub async fn migrate_s3_service(
+        &self,
+        target_service_id: i32,
+        source_service_id: i32,
+    ) -> Result<S3MigrationReport, ExternalServiceError> {
+        if target_service_id == source_service_id {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: target_service_id,
+                reason: "cannot migrate a service into itself".to_string(),
+            });
+        }
+        let target = self.get_service(target_service_id).await?;
+        let source = self.get_service(source_service_id).await?;
+        for service in [&target, &source] {
+            if service.node_id.is_some() {
+                return Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id: service.id,
+                    reason: format!(
+                        "service {} ('{}') is hosted on a remote node; S3 migration runs on the control plane against local services only",
+                        service.id, service.name
+                    ),
+                });
+            }
+        }
+
+        let target_config = self.get_service_config(target.id).await?;
+        let source_config = self.get_service_config(source.id).await?;
+        let backend_of = |service: &external_services::Model,
+                          config: &ServiceConfig|
+         -> Result<Box<dyn ManagedS3Backend>, ExternalServiceError> {
+            self.managed_s3_backend(&service.name, config.service_type, &config.parameters)?
+                .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                    service_id: service.id,
+                    reason: format!(
+                        "service {} ('{}') is not a managed S3 service with a migratable backend (legacy MinIO services cannot be migrated)",
+                        service.id, service.name
+                    ),
+                })
+        };
+        let target_backend = backend_of(&target, &target_config)?;
+        let source_backend = backend_of(&source, &source_config)?;
+
+        let (admin_access_key, admin_secret_key) = source_backend
+            .admin_credentials(&source_config)
+            .map_err(|e| Self::managed_s3_error(source.id, e))?;
+        let migration_source = MigrationSource {
+            service: source_backend.service_name(),
+            backend: source_backend.kind(),
+            endpoint: source_backend
+                .endpoint(&source_config)
+                .map_err(|e| Self::managed_s3_error(source.id, e))?,
+            admin_access_key,
+            admin_secret_key,
+        };
+
+        info!(
+            source_service_id = source.id,
+            target_service_id = target.id,
+            source_backend = %source_backend.kind().as_str(),
+            target_backend = %target_backend.kind().as_str(),
+            "Migrating S3 data between managed services"
+        );
+        let report = target_backend
+            .migrate_from(&target_config, &migration_source)
+            .await
+            .map_err(|e| Self::managed_s3_error(target.id, e))?;
+
+        Ok(S3MigrationReport {
+            source_service_id: source.id,
+            target_service_id: target.id,
+            source_backend: source_backend.kind().as_str().to_string(),
+            target_backend: target_backend.kind().as_str().to_string(),
+            buckets: report.buckets,
+        })
     }
 
     pub async fn list_service_projects(
@@ -16313,6 +16624,80 @@ mod tests {
                 assert_eq!(params.image, expected_image);
             }
         }
+    }
+
+    /// A worker cannot be handed `garage.toml` by the generic agent create
+    /// request, so a remote Garage service is refused up front with the
+    /// service name rather than started without its config.
+    #[test]
+    fn remote_garage_creation_is_refused_with_an_actionable_error() {
+        let manager = mock_service_manager(vec![]);
+        for service_type in [ServiceType::S3, ServiceType::Blob] {
+            let parameters = HashMap::from([("backend".to_string(), "Garage".to_string())]);
+            let err = manager
+                .build_remote_create_params("orders", &service_type, &parameters)
+                .unwrap_err();
+            match err {
+                ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+                    assert!(
+                        reason.contains("garage") && reason.contains("orders"),
+                        "{reason}"
+                    );
+                    assert!(reason.contains("control-plane"), "{reason}");
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn managed_s3_errors_map_to_typed_service_errors() {
+        use crate::externalsvc::ManagedS3Error;
+        let validation = ExternalServiceManager::managed_s3_error(
+            7,
+            ManagedS3Error::InvalidBucketName {
+                bucket: "Bad_Name".to_string(),
+                reason: "uppercase".to_string(),
+            },
+        );
+        assert!(matches!(
+            validation,
+            ExternalServiceError::ParameterValidationFailed { service_id: 7, .. }
+        ));
+
+        let internal = ExternalServiceManager::managed_s3_error(
+            7,
+            ManagedS3Error::Admin {
+                backend: "garage",
+                service: "files".to_string(),
+                operation: "apply layout".to_string(),
+                reason: "connection refused".to_string(),
+            },
+        );
+        match internal {
+            ExternalServiceError::InternalError { reason } => {
+                assert!(
+                    reason.contains("service 7") && reason.contains("apply layout"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migrating_a_service_into_itself_is_rejected_before_any_lookup() {
+        let manager = mock_service_manager(vec![]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(manager.migrate_s3_service(5, 5))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { service_id: 5, .. }
+        ));
     }
 
     /// The remote MinIO-engine path configures the container from the

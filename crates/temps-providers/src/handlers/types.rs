@@ -735,6 +735,14 @@ pub struct UpgradeExternalServiceRequest {
     pub docker_image: String,
 }
 
+/// Copy every bucket of another managed S3 service into this one.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MigrateS3ServiceRequest {
+    /// Managed S3 service to copy from (RustFS or Garage). It is only read.
+    #[schema(example = 12)]
+    pub source_service_id: i32,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct LinkServiceRequest {
     pub project_id: i32,

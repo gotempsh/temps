@@ -31,6 +31,12 @@ use tracing::{debug, error, info, warn};
 use crate::readiness::{ReadinessObservation, ReadinessPolicy, ReadinessTarget};
 use crate::utils::ensure_network_exists;
 
+use super::managed_s3::{
+    derive_grant, scope_slug, CredentialFormat, ManagedS3AccessKeyRequest, ManagedS3Backend,
+    ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Endpoint, ManagedS3Error,
+    ManagedS3Grant, S3BucketPlan,
+};
+use super::s3_mirror::RcSession;
 use super::{
     ExternalService, HealthProbeResult, SensitiveValues, ServiceConfig, ServiceResourceLimits,
     ServiceType,
@@ -116,6 +122,17 @@ pub struct RustfsInputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub metrics_ingest_url: Option<String>,
+
+    /// Managed S3 storage engine: `rustfs` (default). Services created before
+    /// the field existed have none and are RustFS.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub backend: Option<String>,
+
+    /// Logical bucket names every linked environment receives.
+    #[serde(default)]
+    #[schemars(with = "Option<Vec<String>>")]
+    pub buckets: Option<serde_json::Value>,
 }
 
 /// Internal runtime configuration for RustFS service
@@ -962,92 +979,354 @@ impl RustfsService {
         }
     }
 
-    /// Ensure the given bucket exists, creating it if missing.
-    async fn ensure_bucket(&self, config: ServiceConfig, name: &str) -> Result<()> {
-        let runtime_config: RustfsConfig = {
-            let input_config: RustfsInputConfig = serde_json::from_value(config.parameters.clone())
-                .context("Failed to parse RustFS configuration")?;
-            RustfsConfig::from(input_config)
-        };
-
-        let client = self.create_s3_client(&runtime_config).await?;
-        let sanitized_name = name.replace('_', "-").to_lowercase();
-
-        match client.head_bucket().bucket(&sanitized_name).send().await {
-            Ok(_) => {
-                info!("RustFS bucket {} already exists", sanitized_name);
-                return Ok(());
-            }
-            Err(err) => {
-                tracing::debug!("RustFS bucket {} does not exist: {}", sanitized_name, err);
-            }
+    fn managed_error(&self, operation: &str, reason: impl std::fmt::Display) -> ManagedS3Error {
+        ManagedS3Error::Admin {
+            backend: "rustfs",
+            service: self.name.clone(),
+            operation: operation.to_string(),
+            reason: reason.to_string(),
         }
+    }
 
-        client
-            .create_bucket()
-            .bucket(sanitized_name.clone())
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to create RustFS bucket {}: {:?}", sanitized_name, e)
+    fn stored_config(&self, config: &ServiceConfig) -> Result<RustfsConfig, ManagedS3Error> {
+        let input: RustfsInputConfig =
+            serde_json::from_value(config.parameters.clone()).map_err(|e| {
+                ManagedS3Error::InvalidConfig {
+                    backend: "rustfs",
+                    service: self.name.clone(),
+                    reason: format!("stored configuration did not parse: {e}"),
+                }
             })?;
-
-        info!("Created RustFS bucket {}", sanitized_name);
-        Ok(())
+        let missing = |field: &str| ManagedS3Error::InvalidConfig {
+            backend: "rustfs",
+            service: self.name.clone(),
+            reason: format!("stored configuration is missing required field '{field}'"),
+        };
+        // Never generate here: a service that exists already has its ports and
+        // credentials, and a generated one could not match the container.
+        if input.port.is_none() {
+            return Err(missing("port"));
+        }
+        if input.access_key.is_none() {
+            return Err(missing("access_key"));
+        }
+        if input.secret_key.is_none() {
+            return Err(missing("secret_key"));
+        }
+        Ok(RustfsConfig::from(input))
     }
 }
 
-impl RustfsService {
-    /// Per-tenant bucket name shared between provisioning and preview paths.
-    fn bucket_name_for(project_id: &str, environment: &str) -> String {
-        format!("{}-{}", project_id, environment)
-            .replace('_', "-")
-            .to_lowercase()
+/// `rc admin` access policy that reaches exactly `buckets`: list/locate each
+/// bucket and read, write and delete its objects. Nothing else, so an
+/// environment key can neither see nor touch another environment's data.
+pub(crate) fn bucket_scoped_policy(buckets: &[S3BucketPlan]) -> String {
+    let bucket_arns: Vec<String> = buckets
+        .iter()
+        .map(|plan| format!("\"arn:aws:s3:::{}\"", plan.physical))
+        .collect();
+    let object_arns: Vec<String> = buckets
+        .iter()
+        .map(|plan| format!("\"arn:aws:s3:::{}/*\"", plan.physical))
+        .collect();
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[\
+         {{\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\",\"s3:GetBucketLocation\",\"s3:ListBucketMultipartUploads\"],\"Resource\":[{}]}},\
+         {{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:AbortMultipartUpload\",\"s3:ListMultipartUploadParts\"],\"Resource\":[{}]}}]}}",
+        bucket_arns.join(","),
+        object_arns.join(",")
+    )
+}
+
+/// Name of the per-environment IAM policy. One stable name per environment,
+/// so re-applying a changed bucket list replaces the policy in place.
+pub(crate) fn env_policy_name(scope: &str) -> String {
+    format!(
+        "te-{}",
+        super::managed_s3::physical_bucket_name(scope, None)
+    )
+}
+
+/// Shape of RustFS credentials: 20-character upper-case access key, 40
+/// character secret (the maximums RustFS accepts).
+pub(crate) const RUSTFS_CREDENTIAL_FORMAT: CredentialFormat = CredentialFormat {
+    access_prefix: "TMPS",
+    access_hex_len: 16,
+    secret_hex_len: 40,
+    upper_case_access: true,
+};
+
+#[async_trait]
+impl ManagedS3Backend for RustfsService {
+    fn kind(&self) -> ManagedS3BackendKind {
+        ManagedS3BackendKind::Rustfs
     }
 
-    /// Build the `S3_*` / `AWS_*` env vars for a given bucket. Shared between
-    /// `get_runtime_env_vars` and `preview_runtime_env_vars`.
-    fn build_runtime_env_vars(
+    fn service_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn docker(&self) -> Arc<Docker> {
+        self.docker.clone()
+    }
+
+    fn endpoint(&self, config: &ServiceConfig) -> Result<ManagedS3Endpoint, ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let host_port = stored
+            .port
+            .parse::<u16>()
+            .map_err(|_| ManagedS3Error::InvalidConfig {
+                backend: "rustfs",
+                service: self.name.clone(),
+                reason: format!("'port' value '{}' is not a valid TCP port", stored.port),
+            })?;
+        Ok(ManagedS3Endpoint {
+            internal_host: self.get_container_name(),
+            internal_port: DEFAULT_RUSTFS_API_PORT,
+            host: stored.host,
+            host_port,
+            region: stored.region,
+        })
+    }
+
+    fn admin_credentials(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<(String, String), ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        Ok((stored.access_key, stored.secret_key))
+    }
+
+    async fn provision_service(
         &self,
         config: ServiceConfig,
-        bucket_name: &str,
-    ) -> Result<HashMap<String, String>> {
-        let effective_host = self.get_container_name();
-        let effective_port = DEFAULT_RUSTFS_API_PORT.to_string();
-        let endpoint = format!("http://{}:{}", effective_host, effective_port);
+    ) -> Result<HashMap<String, String>, ManagedS3Error> {
+        ExternalService::init(self, config)
+            .await
+            .map_err(|e| self.managed_error("initializing the service", format!("{e:#}")))
+    }
 
-        let access_key = config
-            .parameters
-            .get("access_key")
-            .and_then(|v| v.as_str())
-            .context("Missing RustFS access_key parameter")?;
-        let secret_key = config
-            .parameters
-            .get("secret_key")
-            .and_then(|v| v.as_str())
-            .context("Missing RustFS secret_key parameter")?;
-        let region = config
-            .parameters
-            .get("region")
-            .and_then(|v| v.as_str())
-            .unwrap_or("us-east-1");
+    async fn create_bucket(
+        &self,
+        config: &ServiceConfig,
+        bucket: &str,
+    ) -> Result<(), ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let client = self
+            .create_s3_client(&stored)
+            .await
+            .map_err(|e| self.managed_error("building the S3 client", e))?;
+        if client.head_bucket().bucket(bucket).send().await.is_ok() {
+            return Ok(());
+        }
+        match client.create_bucket().bucket(bucket).send().await {
+            Ok(_) => {
+                info!(service = %self.name, bucket, "Created RustFS bucket");
+                Ok(())
+            }
+            // Created concurrently between the check and the create.
+            Err(e)
+                if e.as_service_error().is_some_and(|se| {
+                    se.is_bucket_already_owned_by_you() || se.is_bucket_already_exists()
+                }) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(self.managed_error(
+                &format!("creating bucket '{bucket}'"),
+                aws_sdk_s3::error::DisplayErrorContext(&e),
+            )),
+        }
+    }
 
-        let mut env_vars = HashMap::new();
+    async fn create_access_key(
+        &self,
+        config: &ServiceConfig,
+        request: &ManagedS3AccessKeyRequest,
+    ) -> Result<ManagedS3Grant, ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let scope = request.scope();
+        let grant = derive_grant(
+            ManagedS3BackendKind::Rustfs,
+            &stored.secret_key,
+            &scope,
+            &request.buckets,
+            RUSTFS_CREDENTIAL_FORMAT,
+        );
+        for plan in &grant.buckets {
+            self.create_bucket(config, &plan.physical).await?;
+        }
 
-        env_vars.insert("S3_BUCKET".to_string(), bucket_name.to_string());
-        env_vars.insert("S3_ENDPOINT".to_string(), endpoint.clone());
-        env_vars.insert("S3_HOST".to_string(), effective_host.clone());
-        env_vars.insert("S3_PORT".to_string(), effective_port);
-        env_vars.insert("S3_ACCESS_KEY".to_string(), access_key.to_string());
-        env_vars.insert("S3_SECRET_KEY".to_string(), secret_key.to_string());
-        env_vars.insert("S3_REGION".to_string(), region.to_string());
+        let policy = bucket_scoped_policy(&grant.buckets);
+        // Bucket names are validated to `[a-z0-9-]`, so the document holds no
+        // quote that could end the shell string below.
+        if policy.contains('\'') {
+            return Err(self.managed_error(
+                "building the access policy",
+                "the generated policy contains a quote character",
+            ));
+        }
+        let policy_name = env_policy_name(&scope);
+        let write_policy = format!("printf '%s' '{policy}' > /tmp/temps-policy.json");
 
-        env_vars.insert("AWS_ACCESS_KEY_ID".to_string(), access_key.to_string());
-        env_vars.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string());
-        env_vars.insert("AWS_DEFAULT_REGION".to_string(), region.to_string());
-        env_vars.insert("AWS_ENDPOINT_URL".to_string(), endpoint);
+        let endpoint = self.endpoint(config)?;
+        let env = vec![super::rc_client::rc_host_env(
+            "svc",
+            &endpoint.internal_url(),
+            &stored.access_key,
+            &stored.secret_key,
+        )];
+        let sensitive = SensitiveValues::new()
+            .credential(&stored.access_key, &stored.secret_key, None)
+            .credential(&grant.access_key_id, &grant.secret_access_key, None);
+        let session = RcSession::start(self.docker.clone(), &self.name, env).await?;
+        let applied = async {
+            session
+                .run(
+                    "writing the access policy",
+                    &["sh", "-c", &write_policy],
+                    &sensitive,
+                )
+                .await?;
+            // `user add` is an upsert, `policy create` replaces a policy of the
+            // same name and `attach` is idempotent, so a redeploy re-applies
+            // the same state and a changed bucket list takes effect.
+            session
+                .run(
+                    "creating the environment user",
+                    &[
+                        "rc",
+                        "admin",
+                        "user",
+                        "add",
+                        "svc",
+                        &grant.access_key_id,
+                        &grant.secret_access_key,
+                    ],
+                    &sensitive,
+                )
+                .await?;
+            session
+                .run(
+                    "creating the environment policy",
+                    &[
+                        "rc",
+                        "admin",
+                        "policy",
+                        "create",
+                        "svc",
+                        &policy_name,
+                        "/tmp/temps-policy.json",
+                    ],
+                    &sensitive,
+                )
+                .await?;
+            session
+                .run(
+                    "attaching the environment policy",
+                    &[
+                        "rc",
+                        "admin",
+                        "policy",
+                        "attach",
+                        "svc",
+                        &policy_name,
+                        "--user",
+                        &grant.access_key_id,
+                    ],
+                    &sensitive,
+                )
+                .await?;
+            Ok::<_, ManagedS3Error>(())
+        }
+        .await;
+        session.finish().await;
+        applied?;
+        info!(
+            service = %self.name,
+            scope = %scope,
+            buckets = grant.buckets.len(),
+            "Provisioned RustFS environment key"
+        );
+        Ok(grant)
+    }
 
-        Ok(env_vars)
+    async fn revoke_access_key(
+        &self,
+        config: &ServiceConfig,
+        project_scope: &str,
+        environment_scope: &str,
+    ) -> Result<(), ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let scope = scope_slug(project_scope, environment_scope);
+        let (access_key_id, _) = super::managed_s3::derive_env_credentials(
+            ManagedS3BackendKind::Rustfs,
+            &stored.secret_key,
+            &scope,
+            RUSTFS_CREDENTIAL_FORMAT,
+        );
+        let policy_name = env_policy_name(&scope);
+        let endpoint = self.endpoint(config)?;
+        let env = vec![super::rc_client::rc_host_env(
+            "svc",
+            &endpoint.internal_url(),
+            &stored.access_key,
+            &stored.secret_key,
+        )];
+        let sensitive =
+            SensitiveValues::new().credential(&stored.access_key, &stored.secret_key, None);
+        // Already-gone entities are the goal, not an error.
+        const GONE: &[&str] = &["does not exist", "not found", "no such"];
+        let session = RcSession::start(self.docker.clone(), &self.name, env).await?;
+        let removed = async {
+            session
+                .run_tolerant(
+                    "detaching the environment policy",
+                    &[
+                        "rc",
+                        "admin",
+                        "policy",
+                        "detach",
+                        "svc",
+                        &policy_name,
+                        "--user",
+                        &access_key_id,
+                    ],
+                    &sensitive,
+                    GONE,
+                )
+                .await?;
+            session
+                .run_tolerant(
+                    "removing the environment user",
+                    &["rc", "admin", "user", "rm", "svc", &access_key_id],
+                    &sensitive,
+                    GONE,
+                )
+                .await?;
+            session
+                .run_tolerant(
+                    "removing the environment policy",
+                    &["rc", "admin", "policy", "rm", "svc", &policy_name],
+                    &sensitive,
+                    GONE,
+                )
+                .await
+        }
+        .await;
+        session.finish().await;
+        removed?;
+        info!(service = %self.name, scope = %scope, "Revoked RustFS environment key");
+        Ok(())
+    }
+
+    async fn health_check(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<HealthProbeResult, ManagedS3Error> {
+        ExternalService::health_probe(self, config.clone())
+            .await
+            .map_err(|e| self.managed_error("health probe", format!("{e:#}")))
     }
 }
 
@@ -1177,7 +1456,7 @@ fn restart_loop_note(container_name: &str, restart_count: i64) -> Option<String>
 /// Docker's restart count for `container_name`, bounded by
 /// [`RESTART_NOTE_TIMEOUT`]. `None` when Docker is slow or the container is
 /// missing: restart evidence is best-effort and never blocks a probe.
-async fn container_restart_count(docker: &Docker, container_name: &str) -> Option<i64> {
+pub(crate) async fn container_restart_count(docker: &Docker, container_name: &str) -> Option<i64> {
     let inspect = docker.inspect_container(container_name, None::<InspectContainerOptions>);
     match tokio::time::timeout(RESTART_NOTE_TIMEOUT, inspect).await {
         Ok(Ok(info)) => Some(info.restart_count.unwrap_or(0)),
@@ -1872,9 +2151,14 @@ impl ExternalService for RustfsService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let bucket_name = Self::bucket_name_for(project_id, environment);
-        self.ensure_bucket(config.clone(), &bucket_name).await?;
-        self.build_runtime_env_vars(config, &bucket_name)
+        let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)?;
+        let request = ManagedS3AccessKeyRequest {
+            project_scope: project_id.to_string(),
+            environment_scope: environment.to_string(),
+            buckets: selection.buckets,
+        };
+        let grant = self.create_access_key(&config, &request).await?;
+        Ok(self.render_runtime_env(&config, &grant)?)
     }
 
     async fn preview_runtime_env_vars(
@@ -1883,9 +2167,19 @@ impl ExternalService for RustfsService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let bucket_name = Self::bucket_name_for(project_id, environment);
-        // Preview: skip ensure_bucket so the UI doesn't provision buckets.
-        self.build_runtime_env_vars(config, &bucket_name)
+        let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)?;
+        let stored = self.get_rustfs_config(config.clone())?;
+        // Preview: no bucket, user or policy is created. The grant is a pure
+        // function of the stored secret, so the UI shows what a deployment
+        // will actually receive.
+        let grant = derive_grant(
+            ManagedS3BackendKind::Rustfs,
+            &stored.secret_key,
+            &scope_slug(project_id, environment),
+            &selection.buckets,
+            RUSTFS_CREDENTIAL_FORMAT,
+        );
+        Ok(self.render_runtime_env(&config, &grant)?)
     }
 
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
@@ -3262,6 +3556,8 @@ mod tests {
     #[test]
     fn test_rustfs_config_defaults() {
         let input = RustfsInputConfig {
+            backend: None,
+            buckets: None,
             port: None,
             console_port: None,
             access_key: None,
@@ -3295,6 +3591,8 @@ mod tests {
     #[test]
     fn test_rustfs_config_custom() {
         let input = RustfsInputConfig {
+            backend: None,
+            buckets: None,
             port: Some("9100".to_string()),
             console_port: Some("9101".to_string()),
             access_key: Some("myaccesskey".to_string()),
