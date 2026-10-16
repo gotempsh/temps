@@ -13757,10 +13757,45 @@ echo "[restore] Pre-seed complete"
         &self,
         service_type: ServiceType,
     ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
+        self.get_service_type_schema_for_backend(service_type, None)
+            .await
+    }
+
+    /// Creation schema for `service_type`, for a specific managed-S3 `backend`
+    /// when one is named (`rustfs` when it is not). Backends other than the
+    /// default configure different engine parameters, so the console asks for
+    /// the schema of the engine the operator picked. `backend` is ignored for
+    /// service types that have no backends.
+    pub async fn get_service_type_schema_for_backend(
+        &self,
+        service_type: ServiceType,
+        backend: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
         // Pure metadata: no engine instance, no Docker client. A control
         // plane must answer this identically to a full node.
-        Ok(parameter_schema_for_service_type(service_type)
-            .map(|schema| service_creation_schema(service_type, schema)))
+        let schema = match (service_type, backend.map(str::trim)) {
+            (ServiceType::S3 | ServiceType::Blob, Some(backend)) if !backend.is_empty() => {
+                let selection = ManagedS3BackendSelection::from_parameters(
+                    &serde_json::json!({ "backend": backend }),
+                )
+                .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: e.to_string(),
+                })?;
+                if !selection.backend.is_creatable() {
+                    return Err(ExternalServiceError::ParameterValidationFailed {
+                        service_id: 0,
+                        reason: ManagedS3Error::DeprecatedBackend.to_string(),
+                    });
+                }
+                parameter_schema_for_parameters(
+                    service_type,
+                    &serde_json::json!({ "backend": selection.backend.as_str() }),
+                )?
+            }
+            _ => parameter_schema_for_service_type(service_type),
+        };
+        Ok(schema.map(|schema| service_creation_schema(service_type, schema)))
     }
 
     pub async fn get_service_details_by_slug(
@@ -16624,6 +16659,55 @@ mod tests {
                 assert_eq!(params.image, expected_image);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn creation_schema_follows_the_requested_s3_backend() {
+        let manager = mock_service_manager(vec![]);
+        let default = manager
+            .get_service_type_schema_for_backend(ServiceType::S3, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let rustfs = manager
+            .get_service_type_schema_for_backend(ServiceType::S3, Some("rustfs"))
+            .await
+            .unwrap()
+            .unwrap();
+        let garage = manager
+            .get_service_type_schema_for_backend(ServiceType::S3, Some(" Garage "))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(default["properties"].get("console_port").is_some());
+        assert_eq!(default["properties"], rustfs["properties"]);
+        assert!(garage["properties"].get("console_port").is_none());
+        assert!(garage["properties"].get("admin_port").is_some());
+        assert!(
+            garage["x-temps-creation-defaults"]["parameters"]["docker_image"]
+                .as_str()
+                .is_some_and(|image| image.starts_with("dxflrs/garage:"))
+        );
+
+        for backend in ["minio", "ceph"] {
+            let err = manager
+                .get_service_type_schema_for_backend(ServiceType::S3, Some(backend))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ExternalServiceError::ParameterValidationFailed { .. }),
+                "{backend}: {err:?}"
+            );
+        }
+
+        // Backends mean nothing to other service types.
+        let redis = manager
+            .get_service_type_schema_for_backend(ServiceType::Redis, Some("garage"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(redis["properties"].get("admin_port").is_none());
     }
 
     /// A worker cannot be handed `garage.toml` by the generic agent create

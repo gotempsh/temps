@@ -45,8 +45,8 @@ use crate::handlers::types::{
     ProviderMetadata, RepointContinuousArchiveSourceRequest, RetryClusterRequest,
     RuntimeCredentialsResponse, SensitiveValueResponse, ServiceDownAlertResponse,
     ServiceHealthResponse, ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse,
-    ServiceMemberInfo, ServiceParameter, ServiceTypeInfo, ServiceTypeRoute,
-    UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
+    ServiceMemberInfo, ServiceParameter, ServiceTypeInfo, ServiceTypeParametersQuery,
+    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
 };
 use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
@@ -588,20 +588,22 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         (status = 500, description = "Internal server error")
     ),
     params(
-        ("service_type" = String, Path, description = "Service type")
+        ("service_type" = String, Path, description = "Service type"),
+        ServiceTypeParametersQuery
     )
 )]
 async fn get_service_type_parameters(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path(service_type): Path<String>,
+    Query(query): Query<ServiceTypeParametersQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
     match ServiceTypeRoute::from_str(&service_type) {
         Ok(service_type) => match app_state
             .external_service_manager
-            .get_service_type_schema(service_type.into())
+            .get_service_type_schema_for_backend(service_type.into(), query.backend.as_deref())
             .await
         {
             Ok(schema) => Ok((StatusCode::OK, Json(schema))),
