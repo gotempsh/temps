@@ -54,7 +54,17 @@ fn bearer(headers: &HeaderMap) -> Result<&str, Problem> {
                 .with_title("One-build runner token required")
         })
 }
-async fn audit(state: &AppState, user_id: i32, action: &str, build_id: Option<Uuid>) {
+pub struct CiRunnerState {
+    pub dispatch: Arc<CiDispatchService>,
+    pub log_service: Arc<temps_logs::LogService>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
+}
+async fn audit(
+    audit_service: &dyn temps_core::AuditLogger,
+    user_id: i32,
+    action: &str,
+    build_id: Option<Uuid>,
+) {
     let event = super::audit::CiBuildAudit {
         context: AuditContext {
             user_id,
@@ -64,7 +74,7 @@ async fn audit(state: &AppState, user_id: i32, action: &str, build_id: Option<Uu
         action: action.into(),
         build_id,
     };
-    if let Err(error) = state.audit_service.create_audit_log(&event).await {
+    if let Err(error) = audit_service.create_audit_log(&event).await {
         tracing::error!(%error, action, "CI write succeeded but audit failed");
     }
 }
@@ -90,7 +100,13 @@ async fn save_settings(
     permission_guard!(auth, SettingsWrite);
     let service = service(&state)?;
     service.save(config).await?;
-    audit(&state, auth.user_id(), "settings_saved", None).await;
+    audit(
+        state.audit_service.as_ref(),
+        auth.user_id(),
+        "settings_saved",
+        None,
+    )
+    .await;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(service.status().await?),
@@ -104,38 +120,50 @@ async fn provision(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
     service(&state)?.provision().await?;
-    audit(&state, auth.user_id(), "shim_provisioned", None).await;
+    audit(
+        state.audit_service.as_ref(),
+        auth.user_id(),
+        "shim_provisioned",
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(post, path = "/internal/ci-builds/{build_id}/claim", tag = "CI runner", operation_id = "claim_ci_build", request_body = RunnerClaim,
     params(("build_id" = String, Path, description = "Opaque build UUID")),
     responses((status = 200, body = RunnerWork), (status = 403, description = "Runner identity rejected"), (status = 409, description = "Build already claimed or terminal"), (status = 425, description = "Provider run has not been recorded; retry claim"), (status = 500, description = "Storage failed")))]
 async fn claim(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<CiRunnerState>>,
     Path(id): Path<Uuid>,
     Json(request): Json<RunnerClaim>,
 ) -> Result<impl IntoResponse, Problem> {
-    let result = match service(&state)?.claim(id, &request.identity_token).await {
+    let result = match state.dispatch.claim(id, &request.identity_token).await {
         Ok(result) => result,
         Err(error) => {
             if matches!(error, CiError::Identity { .. }) {
-                audit(&state, 0, "runner_identity_rejected", Some(id)).await;
+                audit(
+                    state.audit_service.as_ref(),
+                    0,
+                    "runner_identity_rejected",
+                    Some(id),
+                )
+                .await;
             }
             return Err(error.into());
         }
     };
-    audit(&state, 0, "runner_claimed", Some(id)).await;
+    audit(state.audit_service.as_ref(), 0, "runner_claimed", Some(id)).await;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 #[utoipa::path(get, path = "/internal/ci-builds/{build_id}/context", tag = "CI runner", operation_id = "get_ci_build_context",
     params(("build_id" = String, Path, description = "Opaque build UUID")),
     responses((status = 200, description = "Streamed agent-protocol context tar", content_type = "application/x-tar"), (status = 401, description = "One-build token required"), (status = 403, description = "Token rejected"), (status = 409, description = "Build inactive"), (status = 500, description = "Storage failed")), security(("bearer_auth" = [])))]
 async fn context(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<CiRunnerState>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, Problem> {
-    let service = service(&state)?;
+    let service = &state.dispatch;
     service.authorize(id, bearer(&headers)?).await?;
     let file = tokio::fs::File::open(service.context_path(id))
         .await
@@ -152,59 +180,69 @@ async fn context(
     params(("build_id" = String, Path, description = "Opaque build UUID")),
     responses((status = 204, description = "Lease active"), (status = 401, description = "Token required"), (status = 403, description = "Token rejected"), (status = 409, description = "Build cancelled or expired")), security(("bearer_auth" = [])))]
 async fn lease(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<CiRunnerState>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, Problem> {
-    service(&state)?.authorize(id, bearer(&headers)?).await?;
+    state.dispatch.authorize(id, bearer(&headers)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(post, path = "/internal/ci-builds/{build_id}/result", tag = "CI runner", operation_id = "complete_ci_build", request_body = RunnerResult,
     params(("build_id" = String, Path, description = "Opaque build UUID")),
     responses((status = 204, description = "Verified result accepted and token revoked"), (status = 401, description = "Token required"), (status = 403, description = "Token rejected"), (status = 409, description = "Verification rejected or build inactive"), (status = 500, description = "Storage failed")), security(("bearer_auth" = [])))]
 async fn complete(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<CiRunnerState>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(result): Json<RunnerResult>,
 ) -> Result<impl IntoResponse, Problem> {
-    if let Err(error) = service(&state)?
-        .complete(id, bearer(&headers)?, result)
-        .await
-    {
+    if let Err(error) = state.dispatch.complete(id, bearer(&headers)?, result).await {
         if matches!(error, CiError::Verification { .. }) {
-            audit(&state, 0, "runner_result_rejected", Some(id)).await;
+            audit(
+                state.audit_service.as_ref(),
+                0,
+                "runner_result_rejected",
+                Some(id),
+            )
+            .await;
         }
         return Err(error.into());
     }
-    audit(&state, 0, "runner_result_verified", Some(id)).await;
+    audit(
+        state.audit_service.as_ref(),
+        0,
+        "runner_result_verified",
+        Some(id),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(post, path = "/internal/ci-builds/{build_id}/failure", tag = "CI runner", operation_id = "fail_ci_build", request_body = RunnerFailure,
     params(("build_id" = String, Path, description = "Opaque build UUID")),
     responses((status = 204, description = "Build failed and token revoked"), (status = 401, description = "Token required"), (status = 403, description = "Token rejected"), (status = 409, description = "Build inactive")), security(("bearer_auth" = [])))]
 async fn fail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<CiRunnerState>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(request): Json<RunnerFailure>,
 ) -> Result<impl IntoResponse, Problem> {
-    let service = service(&state)?;
+    let service = &state.dispatch;
     service.authorize(id, bearer(&headers)?).await?;
     service.fail(id, &request.message).await?;
-    audit(&state, 0, "runner_failed", Some(id)).await;
+    audit(state.audit_service.as_ref(), 0, "runner_failed", Some(id)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(post, path = "/internal/ci-builds/{build_id}/logs", tag = "CI runner", operation_id = "append_ci_build_logs", request_body = temps_deployer::runner_protocol::RunnerLogs,
     params(("build_id" = String, Path, description = "Opaque build UUID")),
     responses((status = 204, description = "Log batch appended"), (status = 401, description = "Token required"), (status = 403, description = "Token rejected"), (status = 409, description = "Build inactive or batch exceeds limit")), security(("bearer_auth" = [])))]
 async fn logs(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<CiRunnerState>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(logs): Json<temps_deployer::runner_protocol::RunnerLogs>,
 ) -> Result<impl IntoResponse, Problem> {
-    service(&state)?
+    state
+        .dispatch
         .append_logs(id, bearer(&headers)?, logs, state.log_service.as_ref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -235,10 +273,13 @@ async fn logs(
     ))
 )]
 pub struct CiDispatchApiDoc;
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn admin_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/settings/ci-builder", get(get_settings).put(save_settings))
         .route("/settings/ci-builder/provision", post(provision))
+}
+pub fn runner_routes() -> Router<Arc<CiRunnerState>> {
+    Router::new()
         .route("/internal/ci-builds/{build_id}/claim", post(claim))
         .route("/internal/ci-builds/{build_id}/context", get(context))
         .route("/internal/ci-builds/{build_id}/lease", get(lease))

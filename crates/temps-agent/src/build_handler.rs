@@ -182,6 +182,17 @@ pub async fn build_image(
             .ok_or_else(|| AgentImageError::Invalid("Invalid build concurrency".into()))?;
     }
     settings.validate().map_err(AgentImageError::Invalid)?;
+    let settings_version = headers
+        .get("x-temps-build-limits-version")
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| AgentImageError::Invalid("Invalid build limits version".into()))
+        })
+        .transpose()?
+        .unwrap_or(0);
     let request_permit = limits
         .build_request_slots
         .clone()
@@ -197,7 +208,15 @@ pub async fn build_image(
         + std::time::Duration::from_secs(u64::from(settings.queue_wait_seconds));
     tokio::time::timeout_at(
         deadline,
-        receive_build(state, limits, multipart, deadline, settings, request_permit),
+        receive_build(
+            state,
+            limits,
+            multipart,
+            deadline,
+            settings,
+            settings_version,
+            request_permit,
+        ),
     )
     .await
     .map_err(|_| {
@@ -213,6 +232,7 @@ async fn receive_build(
     mut multipart: Multipart,
     deadline: tokio::time::Instant,
     settings: temps_deployer::build_protocol::BuildLimits,
+    settings_version: u64,
     request_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Response, Problem> {
     let mut spec_field = match multipart.next_field().await {
@@ -251,10 +271,13 @@ async fn receive_build(
     let permit = tokio::time::timeout(
         std::time::Duration::from_secs(u64::from(settings.queue_wait_seconds)),
         async {
-            let build = limits.build_admission.acquire(settings.concurrency).await;
+            let build = limits
+                .build_admission
+                .acquire(settings.concurrency, settings_version)
+                .await;
             // Preserve the one-operation default on small workers. Raising the
             // build cap explicitly permits parallel builds beside artifact I/O.
-            let image = if settings.concurrency == 1 {
+            let image = if limits.build_admission.serial() {
                 Some(
                     limits
                         .image_import_slots
@@ -1334,7 +1357,7 @@ mod tests {
             host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
         });
         let limits = Arc::new(AgentResourceLimits::new());
-        let occupied = limits.build_admission.acquire(1).await;
+        let occupied = limits.build_admission.acquire(1, 0).await;
         let router = Router::new()
             .route("/agent/images/build", post(build_image))
             .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
@@ -1359,7 +1382,8 @@ mod tests {
             concurrency: 1,
             queue_wait_seconds: 1,
             build_timeout_seconds: 1,
-        });
+        })
+        .with_build_limits_version(19);
         let request = || BuildRequest {
             context_path: source.path().into(),
             dockerfile_path: None,
@@ -1375,6 +1399,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, BuilderError::Busy(_)), "{error}");
         assert!(builder.requests.lock().unwrap().is_empty());
+        // The real remote client must carry the version header through parsing.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            limits.build_admission.acquire(8, 18)
+        )
+        .await
+        .is_err());
+        assert_eq!(limits.build_admission.concurrency_limit(), 1);
         drop(occupied);
         let error = temps_deployer::ImageBuilder::build_image(&remote, request())
             .await

@@ -4,7 +4,7 @@
 //! Node management service — CRUD operations for the `nodes` table.
 
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
     DatabaseConnection, EntityTrait, JoinType, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, RelationTrait, TransactionTrait,
 };
@@ -1527,13 +1527,19 @@ impl NodeService {
                 message: format!("Node {node_id} is not a worker"),
             });
         }
-        let mut active: nodes::ActiveModel = node.into();
-        active.build_limits = Set(Some(serde_json::to_value(limits).map_err(|error| {
-            NodeError::Validation {
-                message: error.to_string(),
-            }
-        })?));
-        active.update(self.db.as_ref()).await?;
+        let value = serde_json::to_value(limits).map_err(|error| NodeError::Validation {
+            message: error.to_string(),
+        })?;
+        // Increment under the same row lock as the settings write: concurrent
+        // saves must never publish the same revision for different limits.
+        let changed = self.db.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE nodes SET build_limits = jsonb_set($2::jsonb, '{_version}', to_jsonb(COALESCE((build_limits->>'_version')::bigint, 0) + 1)) WHERE id = $1 AND role = 'worker'",
+            vec![node_id.into(), value.into()],
+        )).await?.rows_affected();
+        if changed != 1 {
+            return Err(NodeError::NotFoundById { node_id });
+        }
         Ok(())
     }
 
@@ -5444,11 +5450,13 @@ mod tests {
             queue_wait_seconds: 45,
             build_timeout_seconds: 600,
         };
-        let mut updated = node.clone();
-        updated.build_limits = Some(serde_json::to_value(limits).unwrap());
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results(vec![vec![node], vec![updated]])
+                .append_query_results(vec![vec![node]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
         let service = NodeService::new(db.clone());
@@ -5459,6 +5467,47 @@ mod tests {
         assert!(log.contains("build_limits"));
         assert!(log.contains("queue_wait_seconds"));
         assert!(log.contains("600"));
+    }
+    #[tokio::test]
+    async fn builder_limits_versions_increase_under_concurrent_saves() {
+        let db = match temps_database::test_utils::TestDatabase::new().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping builder version integration: {error}");
+                return;
+            }
+        };
+        let conn = db.db.clone();
+        let schema = sea_orm::Schema::new(sea_orm::DatabaseBackend::Postgres);
+        conn.execute(
+            conn.get_database_backend()
+                .build(&schema.create_table_from_entity(nodes::Entity)),
+        )
+        .await
+        .unwrap();
+        let active: nodes::ActiveModel = sample_node().into();
+        active.insert(conn.as_ref()).await.unwrap();
+        let service = NodeService::new(conn.clone());
+        let first = temps_deployer::build_protocol::BuildLimits {
+            concurrency: 8,
+            ..Default::default()
+        };
+        let last = temps_deployer::build_protocol::BuildLimits {
+            concurrency: 1,
+            ..Default::default()
+        };
+        let (a, b) = tokio::join!(
+            service.set_build_limits(1, first),
+            service.set_build_limits(1, last)
+        );
+        a.unwrap();
+        b.unwrap();
+        let value = service.get_by_id(1).await.unwrap().build_limits.unwrap();
+        assert_eq!(value["_version"], 2);
+        service.set_build_limits(1, last).await.unwrap();
+        let value = service.get_by_id(1).await.unwrap().build_limits.unwrap();
+        assert_eq!(value["_version"], 3);
+        assert_eq!(value["concurrency"], 1);
     }
     #[tokio::test]
     async fn builder_limits_reject_missing_node_and_non_worker() {
@@ -5497,6 +5546,21 @@ mod tests {
                 )
                 .await,
             Err(NodeError::Validation { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn builder_limits_report_node_removed_during_save() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![sample_node()]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+        assert!(matches!(
+            service.set_build_limits(1, Default::default()).await,
+            Err(NodeError::NotFoundById { node_id: 1 })
         ));
     }
     #[tokio::test]

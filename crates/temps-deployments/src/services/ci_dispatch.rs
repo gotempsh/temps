@@ -81,6 +81,20 @@ pub struct CiExecutorStatus {
     pub setup_path: String,
     pub settings: Option<CiExecutorSettings>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+struct AutomaticSubject {
+    subject: String,
+    owner: String,
+    repository: String,
+    git_ref: String,
+}
+#[derive(Serialize, Deserialize)]
+struct StoredExecutor {
+    #[serde(flatten)]
+    settings: CiExecutorSettings,
+    #[serde(default)]
+    automatic_subject: Option<AutomaticSubject>,
+}
 #[derive(FromQueryResult)]
 struct StoredConfig {
     config_encrypted: String,
@@ -88,7 +102,7 @@ struct StoredConfig {
 #[derive(FromQueryResult)]
 pub struct CiBuild {
     pub id: Uuid,
-    pub deployment_id: i32,
+    pub deployment_id: Option<i32>,
     pub state: String,
     pub run_id: Option<String>,
     pub token_id: Option<i32>,
@@ -236,6 +250,15 @@ impl CiDispatchService {
         &self,
         connection: &C,
     ) -> Result<Option<CiExecutorSettings>, CiError> {
+        Ok(self
+            .stored_config_on(connection)
+            .await?
+            .map(|stored| stored.settings))
+    }
+    async fn stored_config_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+    ) -> Result<Option<StoredExecutor>, CiError> {
         let row = StoredConfig::find_by_statement(statement(
             "SELECT config_encrypted FROM ci_build_executor WHERE id = 1",
             vec![],
@@ -279,19 +302,38 @@ impl CiDispatchService {
         })
     }
     pub async fn save(&self, config: CiExecutorSettings) -> Result<(), CiError> {
-        self.save_if_unchanged(config, None).await
+        self.save_if_unchanged(config, None, None).await
     }
     async fn save_if_unchanged(
         &self,
         mut config: CiExecutorSettings,
         expected: Option<Vec<u8>>,
+        provisioned_subject: Option<AutomaticSubject>,
     ) -> Result<(), CiError> {
         config.validate()?;
         let transaction = self.db.begin().await?;
         transaction
             .execute(statement("SELECT pg_advisory_xact_lock(1528, 1)", vec![]))
             .await?;
-        if let Some(previous) = self.config_on(&transaction).await? {
+        let mut automatic_subject = provisioned_subject;
+        if let Some(stored) = self.stored_config_on(&transaction).await? {
+            let previous = stored.settings;
+            if expected.is_none() {
+                if let Some(automatic) = stored.automatic_subject {
+                    // Unchanged generated text remains managed by Temps. An
+                    // explicitly edited subject becomes operator-owned instead.
+                    if config.identity.subject == automatic.subject {
+                        if config.owner != automatic.owner
+                            || config.repository != automatic.repository
+                            || config.git_ref != automatic.git_ref
+                        {
+                            config.identity.subject.clear();
+                        } else {
+                            automatic_subject = Some(automatic);
+                        }
+                    }
+                }
+            }
             if let Some(expected) = &expected {
                 let actual = serde_json::to_vec(&previous)
                     .map_err(|error| CiError::Configuration(error.to_string()))?;
@@ -313,8 +355,11 @@ impl CiDispatchService {
                 "A repository API token is required".into(),
             ));
         }
-        let bytes =
-            serde_json::to_vec(&config).map_err(|e| CiError::Configuration(e.to_string()))?;
+        let bytes = serde_json::to_vec(&StoredExecutor {
+            settings: config,
+            automatic_subject,
+        })
+        .map_err(|e| CiError::Configuration(e.to_string()))?;
         let encrypted = self.encryption.encrypt(&bytes).map_err(|_| {
             CiError::Configuration("Could not encrypt CI executor configuration".into())
         })?;
@@ -337,36 +382,70 @@ impl CiDispatchService {
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
-    async fn checked(
+    fn provider_error(
+        config: &CiExecutorSettings,
+        operation: &str,
+        reason: impl std::fmt::Display,
+    ) -> CiError {
+        CiError::Configuration(format!(
+            "CI provider {operation} for builder repository {}/{}: {reason}",
+            config.owner, config.repository
+        ))
+    }
+    async fn provider_request(
         &self,
+        config: &CiExecutorSettings,
+        operation: &str,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, CiError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|_| CiError::Configuration("CI provider request failed".into()))?;
+        request.send().await.map_err(|error| {
+            // Request URLs can contain credentials/query parameters. Preserve
+            // the transport cause, never a URL or provider response body.
+            let error = error.without_url();
+            let mut reason = error.to_string();
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                reason.push_str(": ");
+                reason.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            Self::provider_error(config, operation, reason)
+        })
+    }
+    async fn checked(
+        &self,
+        config: &CiExecutorSettings,
+        operation: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, CiError> {
+        let response = self.provider_request(config, operation, request).await?;
         if !response.status().is_success() {
-            return Err(CiError::Configuration(format!(
-                "CI provider returned HTTP {}",
-                response.status()
-            )));
+            return Err(Self::provider_error(
+                config,
+                operation,
+                format!("HTTP {}", response.status()),
+            ));
         }
         Ok(response)
     }
     pub async fn provision(&self) -> Result<(), CiError> {
         use base64::Engine;
-        let mut config = self
-            .config()
+        let stored = self
+            .stored_config_on(self.db.as_ref())
             .await?
             .ok_or_else(|| CiError::Configuration("Save CI builder settings first".into()))?;
+        let mut config = stored.settings;
+        let mut automatic_subject = stored.automatic_subject;
         let original_config = serde_json::to_vec(&config)
             .map_err(|error| CiError::Configuration(error.to_string()))?;
         let repo = format!("/repos/{}/{}", config.owner, config.repository);
         let response = self
-            .github(&config, reqwest::Method::GET, &repo)
-            .send()
-            .await
-            .map_err(|_| CiError::Configuration("Cannot check builder repository".into()))?;
+            .provider_request(
+                &config,
+                "inspect builder repository",
+                self.github(&config, reqwest::Method::GET, &repo),
+            )
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             if !config.organization {
                 #[derive(Deserialize)]
@@ -374,7 +453,11 @@ impl CiDispatchService {
                     login: String,
                 }
                 let response = self
-                    .checked(self.github(&config, reqwest::Method::GET, "/user"))
+                    .checked(
+                        &config,
+                        "inspect API token account",
+                        self.github(&config, reqwest::Method::GET, "/user"),
+                    )
                     .await?;
                 let account: Account = self.read_json(response, 64 * 1024).await?;
                 if !account.login.eq_ignore_ascii_case(&config.owner) {
@@ -387,15 +470,16 @@ impl CiDispatchService {
             } else {
                 "/user/repos".into()
             };
-            self.checked(self.github(&config, reqwest::Method::POST, &path).json(
+            self.checked(&config, "create private repository", self.github(&config, reqwest::Method::POST, &path).json(
                 &serde_json::json!({"name": config.repository, "private": true, "auto_init": true}),
             ))
             .await?;
         } else if !response.status().is_success() {
-            return Err(CiError::Configuration(format!(
-                "Cannot inspect builder repository: HTTP {}",
-                response.status()
-            )));
+            return Err(Self::provider_error(
+                &config,
+                "inspect builder repository",
+                format!("HTTP {}", response.status()),
+            ));
         }
         if config.identity.subject.is_empty() {
             #[derive(Deserialize)]
@@ -404,7 +488,11 @@ impl CiDispatchService {
                 full_name: String,
             }
             let response = self
-                .checked(self.github(&config, reqwest::Method::GET, &repo))
+                .checked(
+                    &config,
+                    "read immutable repository identity",
+                    self.github(&config, reqwest::Method::GET, &repo),
+                )
                 .await?;
             let repository: Repository = self.read_json(response, 128 * 1024).await?;
             if !repository
@@ -419,7 +507,7 @@ impl CiDispatchService {
                 config.owner = owner.into();
                 config.repository = name.into();
             }
-            self.checked(self.github(&config, reqwest::Method::PUT, &format!("{repo}/actions/oidc/customization/sub"))
+            self.checked(&config, "configure OIDC subject", self.github(&config, reqwest::Method::PUT, &format!("{repo}/actions/oidc/customization/sub"))
                 .json(&serde_json::json!({"use_default": false, "include_claim_keys": ["repository_id", "ref"]}))).await?;
             let git_ref = if config.git_ref.starts_with("refs/") {
                 config.git_ref.clone()
@@ -427,6 +515,12 @@ impl CiDispatchService {
                 format!("refs/heads/{}", config.git_ref)
             };
             config.identity.subject = format!("repository_id:{}:ref:{git_ref}", repository.id);
+            automatic_subject = Some(AutomaticSubject {
+                subject: config.identity.subject.clone(),
+                owner: config.owner.clone(),
+                repository: config.repository.clone(),
+                git_ref: config.git_ref.clone(),
+            });
         }
         #[derive(Deserialize)]
         struct File {
@@ -434,17 +528,23 @@ impl CiDispatchService {
         }
         let file_path = format!("{repo}/contents/.github/workflows/temps-build.yml");
         let response = self
-            .github(&config, reqwest::Method::GET, &file_path)
-            .query(&[("ref", &config.git_ref)])
-            .send()
-            .await
-            .map_err(|_| CiError::Configuration("Cannot inspect CI shim".into()))?;
+            .provider_request(
+                &config,
+                "inspect runner workflow",
+                self.github(&config, reqwest::Method::GET, &file_path)
+                    .query(&[("ref", &config.git_ref)]),
+            )
+            .await?;
         let sha = if response.status().is_success() {
             Some(self.read_json::<File>(response, 64 * 1024).await?.sha)
         } else if response.status() == reqwest::StatusCode::NOT_FOUND {
             None
         } else {
-            return Err(CiError::Configuration("Cannot inspect CI shim".into()));
+            return Err(Self::provider_error(
+                &config,
+                "inspect runner workflow",
+                format!("HTTP {}", response.status()),
+            ));
         };
         let workflow = workflow(&config);
         let mut body = serde_json::json!({"message": "ci(build): configure Temps runner", "branch": config.git_ref, "content": base64::engine::general_purpose::STANDARD.encode(workflow)});
@@ -452,11 +552,13 @@ impl CiDispatchService {
             body["sha"] = sha.into();
         }
         self.checked(
+            &config,
+            "write runner workflow",
             self.github(&config, reqwest::Method::PUT, &file_path)
                 .json(&body),
         )
         .await?;
-        self.save_if_unchanged(config, Some(original_config))
+        self.save_if_unchanged(config, Some(original_config), automatic_subject)
             .await?;
         Ok(())
     }
@@ -649,6 +751,8 @@ impl CiDispatchService {
         }
         let base = format!("/repos/{}/{}", config.owner, config.repository);
         self.checked(
+            config,
+            "dispatch runner workflow",
             self.github(
                 config,
                 reqwest::Method::POST,
@@ -681,6 +785,8 @@ impl CiDispatchService {
             if build.run_id.is_none() {
                 let response = self
                     .checked(
+                        config,
+                        "discover dispatched runner run",
                         self.github(
                             config,
                             reqwest::Method::GET,
@@ -921,7 +1027,9 @@ impl CiDispatchService {
             verify_runner_report(
                 &DispatchedBuild {
                     build_id: id.to_string(),
-                    deployment_id: build.deployment_id,
+                    deployment_id: build
+                        .deployment_id
+                        .ok_or_else(|| build_error(id, "Deployment was deleted"))?,
                     run_id: build.run_id,
                     platforms: spec.platform.clone().into_iter().collect(),
                     image_repository: build.image_repository,
@@ -1112,11 +1220,25 @@ impl CiDispatchService {
     /// The existing restart policy terminates interrupted deployments. Revoke
     /// their leases and cancel provider runs before allowing any late result.
     pub async fn reconcile(&self) -> Result<(), CiError> {
-        let rows = CiBuild::find_by_statement(statement("SELECT b.id, b.deployment_id, b.state, b.run_id, b.token_id, b.spec_encrypted, b.executor_encrypted, b.image_repository, b.result, b.failure, b.expires_at FROM ci_builds b JOIN deployments d ON d.id = b.deployment_id WHERE (b.state IN ('queued', 'dispatched', 'running') AND (d.state != 'running' OR b.expires_at <= NOW() OR (b.state = 'running' AND NOT EXISTS (SELECT 1 FROM deployment_tokens t WHERE t.id = b.token_id AND t.is_active = TRUE AND t.expires_at > NOW())))) OR (b.state = 'failed' AND b.cancellation_reconciled_at IS NULL) ORDER BY b.updated_at LIMIT 20", vec![])).all(self.db.as_ref()).await?;
+        // Every disjunct is covered by the active/reconcile/orphan partial
+        // indexes; completed deployment history is never scanned every tick.
+        let rows = CiBuild::find_by_statement(statement("SELECT b.id, b.deployment_id, b.state, b.run_id, b.token_id, b.spec_encrypted, b.executor_encrypted, b.image_repository, b.result, b.failure, b.expires_at FROM ci_builds b LEFT JOIN deployments d ON d.id = b.deployment_id WHERE (b.deployment_id IS NULL OR b.state IN ('queued', 'dispatched', 'running') OR (b.state = 'failed' AND b.cancellation_reconciled_at IS NULL)) AND (b.deployment_id IS NULL OR (b.state IN ('queued', 'dispatched', 'running') AND (d.state != 'running' OR b.expires_at <= NOW() OR (b.state = 'running' AND NOT EXISTS (SELECT 1 FROM deployment_tokens t WHERE t.id = b.token_id AND t.is_active = TRUE AND t.expires_at > NOW())))) OR (b.state = 'failed' AND b.cancellation_reconciled_at IS NULL)) ORDER BY b.updated_at LIMIT 20", vec![])).all(self.db.as_ref()).await?;
         if rows.is_empty() {
             return Ok(());
         }
         for build in rows {
+            if build.deployment_id.is_none()
+                && matches!(build.state.as_str(), "complete" | "cancelled")
+            {
+                let _ = tokio::fs::remove_file(self.context_path(build.id)).await;
+                self.db
+                    .execute(statement(
+                        "DELETE FROM ci_builds WHERE id = $1 AND deployment_id IS NULL",
+                        vec![build.id.into()],
+                    ))
+                    .await?;
+                continue;
+            }
             let config = self.build_config(&build)?;
             self.db
                 .execute(statement(
@@ -1138,29 +1260,42 @@ impl CiDispatchService {
                 if !run.bytes().all(|b| b.is_ascii_digit()) {
                     continue;
                 }
+                let operation = format!("cancel runner run {run}");
                 let response = self
-                    .github(
+                    .provider_request(
                         &config,
-                        reqwest::Method::POST,
-                        &format!(
-                            "/repos/{}/{}/actions/runs/{run}/cancel",
-                            config.owner, config.repository
+                        &operation,
+                        self.github(
+                            &config,
+                            reqwest::Method::POST,
+                            &format!(
+                                "/repos/{}/{}/actions/runs/{run}/cancel",
+                                config.owner, config.repository
+                            ),
                         ),
                     )
-                    .send()
-                    .await
-                    .map_err(|_| {
-                        build_error(build.id, "Cannot cancel CI provider run; will retry")
-                    })?;
+                    .await?;
                 if !response.status().is_success()
                     && response.status() != reqwest::StatusCode::CONFLICT
                     && response.status() != reqwest::StatusCode::NOT_FOUND
                 {
+                    let error = Self::provider_error(
+                        &config,
+                        &operation,
+                        format!("HTTP {}; will retry", response.status()),
+                    );
+                    tracing::warn!(%error, build_id = %build.id, "CI cancellation remains pending");
                     continue;
                 }
             }
             self.db.execute(statement("UPDATE ci_builds SET state = $2, cancellation_reconciled_at = NOW(), updated_at = NOW() WHERE id = $1 AND state = 'failed'", vec![build.id.into(), terminal.into()])).await?;
             let _ = tokio::fs::remove_file(self.context_path(build.id)).await;
+            self.db
+                .execute(statement(
+                    "DELETE FROM ci_builds WHERE id = $1 AND deployment_id IS NULL",
+                    vec![build.id.into()],
+                ))
+                .await?;
         }
         Ok(())
     }
@@ -1531,6 +1666,7 @@ mod tests {
     struct Provider {
         build_id: Arc<Mutex<Option<Uuid>>>,
         cancels: Arc<AtomicUsize>,
+        cancel_failure: Arc<AtomicBool>,
         jwks: serde_json::Value,
         created: Arc<AtomicBool>,
         claim_template: Arc<Mutex<Option<serde_json::Value>>>,
@@ -1554,12 +1690,12 @@ mod tests {
             state.created.store(true, Ordering::SeqCst);
             return axum::http::StatusCode::CREATED.into_response();
         }
-        if path == "/repos/builder-owner/builder-repo" {
+        if path.starts_with("/repos/") && path.split('/').count() == 4 {
             if !state.created.load(Ordering::SeqCst) {
                 return axum::http::StatusCode::NOT_FOUND.into_response();
             }
             return axum::Json(
-                serde_json::json!({"id": 73, "full_name": "builder-owner/builder-repo"}),
+                serde_json::json!({"id": if path.ends_with("/builder-repo") {73} else {74}, "full_name": path.trim_start_matches("/repos/")}),
             )
             .into_response();
         }
@@ -1600,6 +1736,9 @@ mod tests {
         }
         if path.ends_with("/cancel") {
             state.cancels.fetch_add(1, Ordering::SeqCst);
+            if state.cancel_failure.load(Ordering::SeqCst) {
+                return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             return axum::http::StatusCode::ACCEPTED.into_response();
         }
         if path.starts_with("/v2/") {
@@ -1681,10 +1820,28 @@ mod tests {
             INSERT INTO deployments VALUES (1, 1, 1, 'running');
             CREATE TABLE deployment_jobs (id INTEGER PRIMARY KEY, deployment_id INTEGER, job_type TEXT, log_id TEXT);
             INSERT INTO deployment_jobs VALUES (1, 1, 'BuildImageJob', 'ci-test-build');
-            CREATE TABLE deployment_tokens (id SERIAL PRIMARY KEY, project_id INTEGER, environment_id INTEGER, deployment_id INTEGER, name TEXT, token_hash TEXT, token_prefix TEXT, permissions JSONB, is_active BOOLEAN, expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ);").await.unwrap();
+            CREATE TABLE deployment_tokens (id SERIAL PRIMARY KEY, project_id INTEGER, environment_id INTEGER, deployment_id INTEGER REFERENCES deployments(id) ON DELETE CASCADE, name TEXT, token_hash TEXT, token_prefix TEXT, permissions JSONB, is_active BOOLEAN, expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ);").await.unwrap();
         use sea_orm_migration::MigrationTrait;
         temps_migrations::CiBuildDispatchMigration
             .up(&sea_orm_migration::SchemaManager::new(conn.as_ref()))
+            .await
+            .unwrap();
+        let manager = sea_orm_migration::SchemaManager::new(conn.as_ref());
+        // Upgrade the original CASCADE schema, including rollback/reapply.
+        temps_migrations::RetainCiCancellationMigration
+            .up(&manager)
+            .await
+            .unwrap();
+        temps_migrations::RetainCiCancellationMigration
+            .down(&manager)
+            .await
+            .unwrap();
+        temps_migrations::RetainCiCancellationMigration
+            .up(&manager)
+            .await
+            .unwrap();
+        temps_migrations::RetainCiCancellationMigration
+            .up(&manager)
             .await
             .unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1697,6 +1854,7 @@ mod tests {
         let provider = Provider {
             build_id: Arc::new(Mutex::new(None)),
             cancels: Arc::new(AtomicUsize::new(0)),
+            cancel_failure: Arc::new(AtomicBool::new(false)),
             jwks,
             created: Arc::new(AtomicBool::new(false)),
             claim_template: Default::default(),
@@ -1747,6 +1905,48 @@ mod tests {
         let status = service.status().await.unwrap();
         assert!(status.configured);
         assert!(status.settings.unwrap().dispatch_token.is_none());
+        // Reprovisioning does not lose provenance, and changing either source
+        // invalidates managed identity before the next deployment can dispatch.
+        service.provision().await.unwrap();
+        for (repository, git_ref, expected) in [
+            (
+                "builder-repo",
+                "next",
+                "repository_id:73:ref:refs/heads/next",
+            ),
+            (
+                "builder-next",
+                "main",
+                "repository_id:74:ref:refs/heads/main",
+            ),
+        ] {
+            let mut changed = service.config().await.unwrap().unwrap();
+            changed.repository = repository.into();
+            changed.git_ref = git_ref.into();
+            service.save(changed).await.unwrap();
+            assert!(!service.status().await.unwrap().configured);
+            service.provision().await.unwrap();
+            assert_eq!(
+                service.config().await.unwrap().unwrap().identity.subject,
+                expected
+            );
+        }
+        let mut custom = service.config().await.unwrap().unwrap();
+        custom.identity.subject = "operator-custom-subject".into();
+        service.save(custom.clone()).await.unwrap();
+        custom.repository = "builder-repo".into();
+        custom.git_ref = "main".into();
+        service.save(custom).await.unwrap();
+        service.provision().await.unwrap();
+        assert_eq!(
+            service.config().await.unwrap().unwrap().identity.subject,
+            "operator-custom-subject"
+        );
+        // Restore managed settings for the identity and dispatch checks below.
+        config.identity.subject.clear();
+        service.save(config).await.unwrap();
+        service.provision().await.unwrap();
+        config = service.config().await.unwrap().unwrap();
         // The crypto validator checks each trust dimension against the pinned policy.
         for (field, value) in [
             ("iss", serde_json::json!("https://other.example.test")),
@@ -1938,5 +2138,110 @@ mod tests {
         assert_eq!(service.get(cancelled).await.unwrap().state, "cancelled");
         assert!(provider.cancels.load(Ordering::SeqCst) >= 1);
         assert_eq!(target.pulls.lock().unwrap().len(), 1);
+        // Deleting a project cascades through deployments and deployment tokens.
+        // Known provider runs must survive both deletes and a provider outage.
+        conn.execute_unprepared("UPDATE deployments SET state = 'running' WHERE id = 1")
+            .await
+            .unwrap();
+        let orphan = seed(&service, &config, "running", Some(&token)).await;
+        std::fs::create_dir_all(service.context_path(orphan).parent().unwrap()).unwrap();
+        std::fs::write(service.context_path(orphan), "private-build-context").unwrap();
+        conn.execute_unprepared("DELETE FROM deployments WHERE id = 1")
+            .await
+            .unwrap();
+        let tombstone = service.get(orphan).await.unwrap();
+        assert!(tombstone.token_id.is_none());
+        assert!(tombstone.deployment_id.is_none());
+        let rollback = temps_migrations::RetainCiCancellationMigration
+            .down(&manager)
+            .await
+            .unwrap_err();
+        assert!(rollback.to_string().contains("orphan builds remain"));
+        assert!(service.authorize(orphan, &token).await.is_err());
+        provider.cancel_failure.store(true, Ordering::SeqCst);
+        let attempts = provider.cancels.load(Ordering::SeqCst);
+        service.reconcile().await.unwrap();
+        assert!(provider.cancels.load(Ordering::SeqCst) > attempts);
+        assert_eq!(service.get(orphan).await.unwrap().state, "failed");
+        assert!(service.context_path(orphan).exists());
+        provider.cancel_failure.store(false, Ordering::SeqCst);
+        service.reconcile().await.unwrap();
+        assert!(
+            service.get(orphan).await.is_err(),
+            "successful orphan cleanup removes encrypted spec/executor secrets"
+        );
+        assert!(!service.context_path(orphan).exists());
+    }
+
+    #[tokio::test]
+    async fn provider_errors_include_operation_repository_and_safe_transport_cause() {
+        let service = CiDispatchService::new(
+            Arc::new(sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            Arc::new(EncryptionService::new_from_password("synthetic-error-test")),
+            PathBuf::new(),
+        )
+        .unwrap();
+        let config = settings();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = service
+            .checked(
+                &config,
+                "write runner workflow",
+                service
+                    .client
+                    .get(format!(
+                        "http://test-user:transport-password@{address}/private?token=query-secret"
+                    ))
+                    .bearer_auth("authorization-secret"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("write runner workflow"), "{error}");
+        assert!(error.contains("builder-owner/builder-repo"), "{error}");
+        assert!(
+            error.contains("connect") || error.contains("refused"),
+            "{error}"
+        );
+        for secret in [
+            "transport-password",
+            "query-secret",
+            "authorization-secret",
+            "test-user",
+            &address.to_string(),
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async {
+                    (axum::http::StatusCode::FORBIDDEN, "provider-secret-body")
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let error = service
+            .checked(
+                &config,
+                "create private repository",
+                service.client.get(format!("http://{address}/")),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("create private repository")
+                && error.contains("builder-owner/builder-repo")
+                && error.contains("403"),
+            "{error}"
+        );
+        assert!(!error.contains("provider-secret-body"));
+        server.abort();
     }
 }

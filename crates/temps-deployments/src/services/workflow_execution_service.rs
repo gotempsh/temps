@@ -210,6 +210,12 @@ async fn connect_build_node(
         .map_err(|error| format!("Node {} has invalid builder limits: {error}", node.id))?
         .unwrap_or_default();
     limits.validate()?;
+    let version = node
+        .build_limits
+        .as_ref()
+        .and_then(|value| value.get("_version"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     crate::cluster_ca::build_node_deployer(
         &node.address,
         token,
@@ -218,7 +224,11 @@ async fn connect_build_node(
         encryption,
     )
     .await
-    .map(|remote| remote.with_build_limits(limits))
+    .map(|remote| {
+        remote
+            .with_build_limits(limits)
+            .with_build_limits_version(version)
+    })
     .map_err(|error| {
         format!(
             "Cannot connect to build node '{}' (id={}): {error}",

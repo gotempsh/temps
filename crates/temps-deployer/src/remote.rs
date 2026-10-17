@@ -544,6 +544,7 @@ pub struct RemoteNodeDeployer {
     /// [`Self::refresh_platform`].
     platform: std::sync::Arc<std::sync::OnceLock<String>>,
     build_limits: crate::build_protocol::BuildLimits,
+    build_limits_version: u64,
 }
 
 impl RemoteNodeDeployer {
@@ -569,6 +570,7 @@ impl RemoteNodeDeployer {
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
             build_limits: Default::default(),
+            build_limits_version: 0,
         })
     }
 
@@ -619,9 +621,14 @@ impl RemoteNodeDeployer {
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
             build_limits: Default::default(),
+            build_limits_version: 0,
         })
     }
 
+    pub fn with_build_limits_version(mut self, version: u64) -> Self {
+        self.build_limits_version = version;
+        self
+    }
     pub fn with_build_limits(mut self, limits: crate::build_protocol::BuildLimits) -> Self {
         self.build_limits = limits;
         self
@@ -1394,6 +1401,7 @@ impl ImageBuilder for RemoteNodeDeployer {
             .post(&url)
             .bearer_auth(&self.token)
             .header("x-temps-build-concurrency", self.build_limits.concurrency)
+            .header("x-temps-build-limits-version", self.build_limits_version)
             .header(
                 "x-temps-build-queue-seconds",
                 self.build_limits.queue_wait_seconds,

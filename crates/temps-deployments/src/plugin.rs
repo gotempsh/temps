@@ -254,6 +254,8 @@ impl TempsPlugin for DeploymentsPlugin {
                 config_service.data_dir(),
             )
             .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            let ci_dispatch = Arc::new(ci_dispatch);
+            context.register_service(ci_dispatch.clone());
             if let Err(error) = ci_dispatch.reconcile().await {
                 tracing::warn!(%error, "CI cancellation reconciliation pending; leases remain fenced by deployment state and will be retried");
             }
@@ -1090,13 +1092,24 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
-            .merge(handlers::ci_dispatch::routes())
+            .merge(handlers::ci_dispatch::admin_routes())
             .with_state(app_state)
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes);
 
         Some(PluginRoutes::new(routes))
+    }
+
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let state = Arc::new(handlers::ci_dispatch::CiRunnerState {
+            dispatch: context.require_service::<crate::services::ci_dispatch::CiDispatchService>(),
+            log_service: context.require_service::<temps_logs::LogService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+        });
+        Some(PluginRoutes::new(
+            handlers::ci_dispatch::runner_routes().with_state(state),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -1156,6 +1169,114 @@ mod tests {
 
         // The actual job processor functionality is tested separately
         // This test just verifies the plugin structure is correct
+    }
+
+    struct RunnerAudit;
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RunnerAudit {
+        async fn create_audit_log(
+            &self,
+            _: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn ci_runner_routes_are_public_while_settings_stay_admin() {
+        use temps_core::plugin::ServiceRegistrationContext;
+        use tower::ServiceExt;
+        let context = ServiceRegistrationContext::new();
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let dispatch = Arc::new(
+            crate::services::ci_dispatch::CiDispatchService::new(
+                db,
+                Arc::new(temps_core::EncryptionService::new_from_password(
+                    "synthetic-route-test",
+                )),
+                root.path().into(),
+            )
+            .unwrap(),
+        );
+        context.register_service(dispatch);
+        context.register_service(Arc::new(temps_logs::LogService::new(
+            root.path().join("logs"),
+        )));
+        context.register_service::<dyn temps_core::AuditLogger>(Arc::new(RunnerAudit));
+        let plugin = DeploymentsPlugin::new();
+        let public = plugin
+            .configure_public_routes(&context.create_plugin_context())
+            .unwrap()
+            .router;
+        let id = uuid::Uuid::new_v4();
+        // No console session or API key: runner endpoints execute their own
+        // authentication/extractors, including all six routes, on the public surface.
+        for (method, suffix, body, expected) in [
+            (
+                "POST",
+                "claim",
+                "{}",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("GET", "context", "", axum::http::StatusCode::UNAUTHORIZED),
+            ("GET", "lease", "", axum::http::StatusCode::UNAUTHORIZED),
+            (
+                "POST",
+                "result",
+                "{}",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "POST",
+                "failure",
+                r#"{"message":"stopped"}"#,
+                axum::http::StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                "logs",
+                r#"{"lines":[]}"#,
+                axum::http::StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let response = public
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(format!("/internal/ci-builds/{id}/{suffix}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{suffix}");
+        }
+        for (method, path) in [
+            ("GET", "/settings/ci-builder"),
+            ("PUT", "/settings/ci-builder"),
+            ("POST", "/settings/ci-builder/provision"),
+        ] {
+            let response = public
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
     }
 
     // Guards against the deployment-token router/schema being dropped from the

@@ -14,6 +14,7 @@ pub mod m20261002_000001_secret_checks_and_history;
 
 mod m20261016_000001_builder_limits;
 pub mod m20261016_000002_ci_build_dispatch;
+pub mod m20261017_000001_retain_ci_cancellation;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -760,6 +761,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261016_000001_ai_usage_logs_project_attribution::Migration),
             Box::new(m20261016_000001_builder_limits::Migration),
             Box::new(m20261016_000002_ci_build_dispatch::Migration),
+            Box::new(m20261017_000001_retain_ci_cancellation::Migration),
         ]
     }
 }
