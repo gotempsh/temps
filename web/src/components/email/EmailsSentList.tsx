@@ -195,7 +195,7 @@ export function EmailsSentList() {
 
       {/* Stats Cards */}
       {stats && (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-7">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4 md:gap-4 xl:grid-cols-7">
           <StatsCard
             title="Total Emails"
             value={stats.total}
@@ -367,7 +367,7 @@ export function EmailsSentList() {
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <p className="text-sm text-muted-foreground">
                 Showing {(filters.page - 1) * filters.page_size + 1} to{' '}
                 {Math.min(filters.page * filters.page_size, emails.total)} of{' '}

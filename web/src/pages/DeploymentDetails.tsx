@@ -225,7 +225,12 @@ function Field({
   return (
     <div className="space-y-0.5">
       <dt className="text-sm font-medium text-foreground">{label}</dt>
-      <dd className={cn('text-sm text-muted-foreground', mono && 'font-mono')}>
+      <dd
+        className={cn(
+          'break-words text-sm text-muted-foreground',
+          mono && 'font-mono'
+        )}
+      >
         {value}
       </dd>
     </div>
@@ -720,7 +725,7 @@ function DeployFailureReport({
                 )}
               </Tooltip>
             </TooltipProvider>
-            <DialogContent className="max-w-2xl">
+            <DialogContent className="max-h-[90dvh] max-w-2xl overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>Send failure report</DialogTitle>
                 <DialogDescription>
@@ -854,7 +859,7 @@ function BrowserFrameScreenshot({
                   <Globe className="h-3.5 w-3.5 shrink-0" />
                   <span className="truncate">{display}</span>
                   {selected && (
-                    <span className="shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4">
+                    <span className="shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4 max-sm:hidden">
                       {urlEntryLabel(selected)}
                     </span>
                   )}
@@ -992,7 +997,7 @@ function DeploymentHeader({
           className="hidden h-5 w-px shrink-0 bg-gray-950/10 sm:block"
           aria-hidden="true"
         />
-        <div className="shrink-0">
+        <div className="min-w-0 sm:shrink-0">
           <StatusBadges deployment={deployment} isLive={isLive} />
         </div>
         {hasCommit && (
@@ -1008,12 +1013,12 @@ function DeploymentHeader({
                   href={commitUrls.commit}
                   target="_blank"
                   rel="noreferrer"
-                  className="hidden shrink-0 font-mono text-sm font-medium text-foreground hover:underline sm:inline"
+                  className="shrink-0 font-mono text-sm font-medium text-foreground hover:underline"
                 >
                   {shortHash}
                 </a>
               ) : (
-                <span className="hidden shrink-0 font-mono text-sm font-medium text-foreground sm:inline">
+                <span className="shrink-0 font-mono text-sm font-medium text-foreground">
                   {shortHash}
                 </span>
               ))}

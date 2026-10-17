@@ -658,7 +658,7 @@ export function ProjectDetail() {
             .attack_mode && (
             <Alert className="mb-4 border-primary bg-primary/10">
               <ShieldAlert className="h-4 w-4 text-primary" />
-              <AlertDescription className="flex items-center justify-between">
+              <AlertDescription className="flex items-center justify-between gap-3">
                 <span className="text-foreground">
                   Attack Mode is enabled for this service
                 </span>

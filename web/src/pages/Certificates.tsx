@@ -31,6 +31,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings } from '@/hooks/useSettings'
 import { formatLocalDateTime } from '@/lib/date'
+import { PageContainer } from '@/components/layout/PageContainer'
 import {
   errorCategoryLabel,
   listOnDemandCertsOptions,
@@ -123,7 +124,7 @@ export function Certificates() {
   )
 
   return (
-    <div className="space-y-4">
+    <PageContainer innerClassName="space-y-4">
       {/* Page header */}
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">Certificates</h1>
@@ -258,7 +259,7 @@ export function Certificates() {
           if (!open) setSelected(null)
         }}
       />
-    </div>
+    </PageContainer>
   )
 }
 

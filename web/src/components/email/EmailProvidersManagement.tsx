@@ -972,7 +972,7 @@ export function EmailProvidersManagement() {
 
   return (
     <div className="space-y-4">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Email Providers</h2>
           <p className="text-muted-foreground">

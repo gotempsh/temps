@@ -66,7 +66,7 @@ import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, type LucideIcon } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useLocation } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -353,9 +353,16 @@ function NavCommandTrigger() {
 }
 
 export default function AppSidebar() {
-  const { isMinimal, isMobile } = useSidebar()
+  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const { platformNavEntries } = usePluginsContext()
   const location = useLocation()
+
+  // The phone sidebar is a sheet over the page. Only a few links close it
+  // themselves, so without this a tap on any other destination navigates
+  // underneath a still-open sheet and the new page looks like it didn't load.
+  useEffect(() => {
+    setOpenMobile(false)
+  }, [location.pathname, setOpenMobile])
   const { logoBadge, logoText, logoIcon } = useConsoleExtensions()
 
   // Convert plugin nav entries to sidebar item format

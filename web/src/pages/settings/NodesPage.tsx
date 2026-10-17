@@ -1172,9 +1172,11 @@ function NodeDetail({
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <Server className="h-5 w-5 text-muted-foreground" />
-            <h3 className="text-lg font-semibold truncate">{node.name}</h3>
+            <h3 className="max-w-full min-w-0 text-lg font-semibold truncate">
+              {node.name}
+            </h3>
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />

@@ -176,7 +176,7 @@ export function ProjectDetailHeader({
   return (
     <header className="flex h-12 sm:h-16 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
       <div className="flex flex-1 items-center justify-between gap-4 min-w-0">
-        <div className="flex items-center gap-4">
+        <div className="flex min-w-0 items-center gap-2 sm:gap-4">
           <ServiceIcon service={project} size="md" className="shrink-0" />
           <div className="flex items-center gap-2 min-w-0">
             <h1 className="text-base sm:text-lg font-semibold truncate">
@@ -260,7 +260,7 @@ export function ProjectDetailHeader({
             <ServiceGroupControl project={project} />
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           {activeVisitorsCount !== undefined && (
             <button
               type="button"

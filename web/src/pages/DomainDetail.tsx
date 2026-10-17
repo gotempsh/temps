@@ -1063,7 +1063,7 @@ export function DomainDetail() {
         <Card>
           <div className="p-5 space-y-4">
             <h2 className="text-sm font-semibold">Key facts</h2>
-            <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
+            <dl className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
               <KeyFact label="Method" value={domain.verification_method} />
               <KeyFact
                 label="Wildcard"

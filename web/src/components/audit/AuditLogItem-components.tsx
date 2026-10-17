@@ -735,8 +735,8 @@ export function AuditLogItemRow({
           <TableCell colSpan={6} className="py-3">
             <div className="space-y-1.5 text-sm">
               {Object.entries(data).map(([key, value]) => (
-                <div key={key} className="flex gap-3">
-                  <span className="w-[160px] shrink-0 font-medium text-muted-foreground">
+                <div key={key} className="flex flex-col gap-1 sm:flex-row sm:gap-3">
+                  <span className="font-medium text-muted-foreground sm:w-[160px] sm:shrink-0">
                     {key}
                   </span>
                   <pre className="flex-1 whitespace-pre-wrap break-all font-mono text-xs">

@@ -292,7 +292,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
           value={plainTextLogs}
           label="Copy logs"
           disabled={logs.length === 0}
-          className="absolute top-2 right-2 z-10 h-7 gap-1 rounded-md px-2 bg-background/80 text-muted-foreground opacity-0 backdrop-blur-sm group-hover:opacity-100 focus-visible:opacity-100 dark:bg-zinc-800/50 [&_svg]:h-3 [&_svg]:w-3"
+          className="absolute top-2 right-2 z-10 h-7 gap-1 rounded-md px-2 bg-background/80 text-muted-foreground opacity-100 backdrop-blur-sm sm:opacity-0 sm:group-hover:opacity-100 focus-visible:opacity-100 dark:bg-zinc-800/50 [&_svg]:h-3 [&_svg]:w-3"
         >
           <span className="text-xs">Copy</span>
         </CopyButton>
@@ -602,7 +602,7 @@ export function DeploymentStages({
                   {getStatusBadge(stage.status)}
                 </div>
               </div>
-              <div className="flex items-center gap-2 sm:gap-3">
+              <div className="flex shrink-0 items-center gap-2 sm:gap-3">
                 {stage.status === 'failure' && (
                   <Button
                     variant="outline"

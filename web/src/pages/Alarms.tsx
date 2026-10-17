@@ -788,7 +788,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         )}
         <div className="overflow-x-auto">
-          <Table>
+          <Table className="min-w-[760px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[40px]">

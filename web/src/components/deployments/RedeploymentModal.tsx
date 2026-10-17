@@ -597,7 +597,7 @@ export function RedeploymentModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && closeDialog()}>
-      <DialogContent className="sm:max-w-[640px]">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
             {mode === 'redeploy' ? 'Redeploy' : 'Deploy Service'}

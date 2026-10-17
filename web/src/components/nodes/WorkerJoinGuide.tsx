@@ -232,7 +232,7 @@ export function WorkerJoinGuide({
         value={activePath}
         onValueChange={(value) => setPath(value as JoinPath)}
       >
-        <TabsList className="grid w-full grid-cols-2">
+        <TabsList className="w-full">
           <TabsTrigger value="private" className="gap-1.5">
             <Network className="h-4 w-4" />
             Same private network

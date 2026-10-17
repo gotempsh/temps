@@ -165,7 +165,7 @@ export function Storage() {
             className="self-start border-b pb-4 lg:border-b-0 lg:border-r lg:pr-4 lg:pb-0"
             aria-label="Databases navigation"
           >
-            <p className="mb-3 text-sm font-semibold">Databases</p>
+            <p className="mb-3 text-sm font-semibold max-lg:sr-only">Databases</p>
             <nav aria-label="Database pages" className="flex gap-1 lg:flex-col">
               {[
                 {

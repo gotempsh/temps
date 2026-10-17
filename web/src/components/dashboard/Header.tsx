@@ -185,7 +185,7 @@ export function Header() {
           </Breadcrumb>
           <FeatureMaturityBadge featureKey={featureKey} className="ml-2" />
         </div>
-        <div className="ml-auto flex shrink-0 items-center space-x-2">
+        <div className="ml-auto flex shrink-0 items-center space-x-0 sm:space-x-2">
           {headerActions?.map((action) => (
             <React.Fragment key={action.id}>{action.element}</React.Fragment>
           ))}

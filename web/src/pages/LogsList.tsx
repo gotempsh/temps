@@ -318,7 +318,7 @@ export default function LogsList({ project }: LogsListProps) {
                   <button
                     type="button"
                     onClick={() => toggleExpand(i)}
-                    className="flex w-full items-start gap-3 px-3 py-1.5 text-left hover:bg-muted/50"
+                    className="flex w-full flex-wrap items-start gap-x-3 gap-y-1 px-3 py-1.5 text-left hover:bg-muted/50"
                   >
                     <span className="shrink-0 text-muted-foreground tabular-nums">
                       {format(new Date(log.timestamp), 'MMM d HH:mm:ss.SSS')}
@@ -329,7 +329,7 @@ export default function LogsList({ project }: LogsListProps) {
                     <span className="shrink-0 max-w-[140px] truncate text-muted-foreground">
                       {log.resource?.service_name || '—'}
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-foreground">
+                    <span className="min-w-0 flex-1 basis-full truncate text-foreground sm:basis-0">
                       {log.body}
                     </span>
                     {log.trace_id && (

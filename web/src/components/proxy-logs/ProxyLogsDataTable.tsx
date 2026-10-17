@@ -736,7 +736,7 @@ export function ProxyLogsDataTable({
 
       {/* Toolbar */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* Time range. The listing is always bounded (the API defaults to
               1h when no start_date is sent, and rejects a custom range wider
               than 7 days), so this control is the primary way to reach older
@@ -1362,7 +1362,7 @@ export function ProxyLogsDataTable({
             </div>
 
             {/* Apply Filters Button */}
-            <div className="flex items-center justify-between pt-4 border-t mt-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-4 border-t mt-4">
               <Button variant="outline" onClick={clearFilters}>
                 Clear All Filters
               </Button>
@@ -1478,7 +1478,7 @@ export function ProxyLogsDataTable({
               </div>
 
               {/* Pagination */}
-              <div className="flex items-center justify-between px-4 py-4 border-t">
+              <div className="flex flex-col items-center gap-3 px-4 py-4 border-t sm:flex-row sm:justify-between">
                 <div className="text-sm text-muted-foreground">
                   Showing {(page - 1) * pageSize + 1} to{' '}
                   {Math.min(page * pageSize, data.total)} of {data.total}{' '}

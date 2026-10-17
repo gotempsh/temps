@@ -1196,7 +1196,7 @@ export function ServiceDetail() {
                                 <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                               )}
                               <div className="flex flex-col min-w-0">
-                                <div className="flex items-center gap-2">
+                                <div className="flex min-w-0 items-center gap-2">
                                   <span className="font-mono text-sm truncate">
                                     {member.container_name}
                                   </span>
