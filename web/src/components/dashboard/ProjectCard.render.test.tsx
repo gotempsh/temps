@@ -35,6 +35,20 @@ describe('ProjectCard deployment state', () => {
     expect(markup).toContain('flex shrink-0 items-center gap-2')
   })
 
+  test('compact card drops the traffic block and fixed height on phones', () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProjectCard project={project} layout="compact" />
+      </MemoryRouter>
+    )
+
+    // The traffic panel stays in the DOM for sm+ but is hidden below `sm`,
+    // so a phone shows more than two cards per screen.
+    expect(markup).toContain('max-sm:hidden')
+    expect(markup).toContain('sm:min-h-44')
+    expect(markup).not.toContain(' min-h-44 ')
+  })
+
   test('does not repeat a slug that is identical to the project name', () => {
     const markup = renderToStaticMarkup(
       <MemoryRouter>

@@ -274,7 +274,7 @@ export function ProjectCard({
     return (
       <Link
         to={`/projects/${project.slug}/project`}
-        className="group flex min-h-44 min-w-0 flex-col gap-4 rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="group flex min-w-0 flex-col gap-4 rounded-xl border bg-card p-4 transition-colors sm:min-h-44 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
           <span className="truncate font-semibold">{project.name}</span>
@@ -318,7 +318,7 @@ export function ProjectCard({
     return (
       <Link
         to={`/projects/${project.slug}`}
-        className="group flex min-h-44 flex-col rounded-xl border bg-card p-4 transition-colors hover:border-foreground/20 hover:bg-accent/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="group flex flex-col rounded-xl border bg-card p-4 transition-colors sm:min-h-44 hover:border-foreground/20 hover:bg-accent/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex min-w-0 items-start justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-3">
@@ -362,11 +362,15 @@ export function ProjectCard({
           </div>
         </div>
 
-        <div className="mt-4 rounded-lg bg-muted/35 px-3 py-2.5">
+        {/* Traffic is the first thing to go on a phone: with it, every card is
+            ~190px tall and a screen shows two. Name, health and the latest
+            deployment are what identify a service; the full numbers are on
+            its overview. */}
+        <div className="mt-4 rounded-lg bg-muted/35 px-3 py-2.5 max-sm:hidden">
           {activityContent}
         </div>
 
-        <div className="mt-auto flex items-end justify-between gap-3 border-t pt-3">
+        <div className="mt-auto flex items-end justify-between gap-3 border-t pt-3 max-sm:mt-3">
           <div className="min-w-0">
             <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
               Latest deployment

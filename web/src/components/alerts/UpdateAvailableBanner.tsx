@@ -117,7 +117,12 @@ export function UpdateAvailableBanner() {
           href={data.docs_url}
           target="_blank"
           rel="noreferrer"
-          className="shrink-0 font-medium underline-offset-2 hover:underline text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100"
+          className={cn(
+            'shrink-0 font-medium underline-offset-2 hover:underline text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100',
+            // With "Update now" present the strip is already full on a phone;
+            // the upgrade itself is one tap away in the dialog.
+            canOfferUpdate && 'max-sm:hidden'
+          )}
         >
           How to upgrade
         </a>

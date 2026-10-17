@@ -61,8 +61,8 @@ export function OnboardingNextStepCard() {
       aria-labelledby="dashboard-onboarding-title"
       className="rounded-xl border border-primary/20 bg-card px-4 py-3"
     >
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-        <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+        <div className="flex min-w-0 flex-1 items-start gap-3 lg:items-center">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-muted/50 text-primary">
             <Icon className="size-4" />
           </div>
@@ -88,13 +88,13 @@ export function OnboardingNextStepCard() {
                 </span>
               )}
             </div>
-            <p className="mt-0.5 text-xs leading-5 text-muted-foreground sm:truncate">
+            <p className="mt-0.5 text-xs leading-5 text-muted-foreground lg:truncate">
               {selectedStep.description}
             </p>
           </div>
         </div>
 
-        <div className="flex w-full shrink-0 flex-col items-stretch gap-2 sm:w-auto sm:flex-row sm:items-center sm:justify-end">
+        <div className="flex w-full shrink-0 flex-col items-stretch gap-2 lg:w-auto lg:flex-row lg:items-center lg:justify-end">
           {selectedStep.key === 'ai' && !selectedStep.done && (
             <Button
               variant="link"
@@ -119,7 +119,7 @@ export function OnboardingNextStepCard() {
               Mark as completed
             </Button>
           )}
-          <Button asChild size="sm" className="w-full sm:w-auto">
+          <Button asChild size="sm" className="w-full lg:w-auto">
             <Link to={selectedStep.href}>
               <span className="truncate">{selectedStep.cta}</span>
               <ArrowRight className="size-3.5" />

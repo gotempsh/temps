@@ -21,8 +21,8 @@ export function ProjectCardSkeleton({
             <Skeleton className="h-3 w-1/2" />
           </div>
         </div>
-        <Skeleton className="h-4 w-2/3" />
-        <Skeleton className="h-14 w-full rounded-lg" />
+        <Skeleton className="h-4 w-2/3 max-sm:hidden" />
+        <Skeleton className="h-14 w-full rounded-lg max-sm:hidden" />
         <div className="flex justify-between border-t pt-3">
           <Skeleton className="h-8 w-24" />
           <Skeleton className="h-5 w-16" />

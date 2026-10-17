@@ -41,7 +41,7 @@ export function ProjectGroupCard({ group }: { group: ProjectGroupResponse }) {
   const latest = latestDeployed(services)
 
   return (
-    <div className="group relative flex min-h-44 flex-col rounded-xl border bg-card p-4 transition-colors focus-within:ring-2 focus-within:ring-ring hover:border-foreground/20 hover:bg-accent/70">
+    <div className="group relative flex flex-col rounded-xl border bg-card p-4 transition-colors sm:min-h-44 focus-within:ring-2 focus-within:ring-ring hover:border-foreground/20 hover:bg-accent/70">
       <div className="flex min-w-0 items-start justify-between gap-3">
         <div className="flex min-w-0 flex-1 items-center gap-3">
           <PresetStack services={services} />
