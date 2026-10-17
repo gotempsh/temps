@@ -1273,7 +1273,7 @@ pub async fn list_containers(
     // Collect unique node_ids to resolve names in a single batch
     let node_ids: Vec<i32> = containers
         .iter()
-        .filter_map(|(_, node_id, _)| *node_id)
+        .filter_map(|container| container.row.node_id)
         .collect::<std::collections::HashSet<i32>>()
         .into_iter()
         .collect();
@@ -1292,7 +1292,11 @@ pub async fn list_containers(
 
     let container_responses: Vec<ContainerInfoResponse> = containers
         .into_iter()
-        .map(|(info, node_id, service_name)| {
+        .map(|container| {
+            let info = container.info;
+            let row = container.row;
+            let node_id = row.node_id;
+            let service_name = row.service_name.clone();
             let node_name = node_id.and_then(|id| presentation.node_names.get(&id).cloned());
             // Build URLs only for services with a configured public port.
             // The first public route uses the canonical environment URL;
@@ -1310,7 +1314,19 @@ pub async fn list_containers(
                     )
                 })
                 .unwrap_or_default();
-            ContainerInfoResponse::from_info(info, node_name, service_name, service_urls)
+            let mut response =
+                ContainerInfoResponse::from_info(info, node_name, service_name, service_urls);
+            response.container_port = row.container_port;
+            response.health_state = row.health_state;
+            response.health_checked_at = row
+                .health_checked_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            response.health_detail = row.health_detail;
+            if row.container_port.is_none() {
+                response.service_url = None;
+                response.service_urls.clear();
+            }
+            response
         })
         .collect();
 
@@ -2184,6 +2200,11 @@ pub async fn get_container_detail(
         deployed_at: container.deployed_at.to_rfc3339(),
         ready_at: container.ready_at.map(|dt| dt.to_rfc3339()),
         container_port: container.container_port,
+        health_state: container.health_state,
+        health_checked_at: container
+            .health_checked_at
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        health_detail: container.health_detail,
         host_port: container.host_port,
         environment_variables: env_vars,
         restart_count,
@@ -4224,7 +4245,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set(real_container_id.clone()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("alpine:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -4439,7 +4460,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set(stale_container_id.clone()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("alpine:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -4632,7 +4653,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set(real_container1_id.clone()),
             container_name: Set("web-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("alpine:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),

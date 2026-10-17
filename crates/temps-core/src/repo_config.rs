@@ -125,8 +125,16 @@ pub struct BuildConfig {
 }
 
 /// Health check configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
 pub struct HealthCheckConfig {
+    /// Probe kind. Unset selects HTTP for a declared port, process otherwise.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub probe_type: Option<String>,
+    /// Continuous running window for a process probe, in seconds.
+    pub stable_for: u64,
+    /// Argument vector executed directly inside the container (no implicit shell).
+    pub command: Vec<String>,
     /// HTTP path for health checks
     pub path: String,
 
@@ -145,6 +153,66 @@ pub struct HealthCheckConfig {
     /// Number of consecutive failures before marking unhealthy (default: 3)
     #[serde(default = "default_health_retries")]
     pub retries: u32,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            probe_type: None,
+            stable_for: 15,
+            command: Vec::new(),
+            path: "/".to_string(),
+            status: default_health_status(),
+            interval: default_health_interval(),
+            timeout: default_health_timeout(),
+            retries: default_health_retries(),
+        }
+    }
+}
+
+impl HealthCheckConfig {
+    pub fn kind(&self, has_port: bool) -> &str {
+        self.probe_type
+            .as_deref()
+            .unwrap_or(if has_port { "http" } else { "process" })
+    }
+
+    /// Validate before running a gate; malformed settings must never skip health.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.probe_type.as_deref() {
+            None | Some("http" | "tcp" | "process" | "exec") => {}
+            Some(kind) => {
+                return Err(format!(
+                    "Unsupported health.type '{kind}'; choose http, tcp, process or exec"
+                ))
+            }
+        }
+        if self.interval == 0 || self.interval > 3600 || self.timeout == 0 || self.timeout > 300 {
+            return Err(
+                "Health interval must be 1-3600 seconds and timeout must be 1-300 seconds"
+                    .to_string(),
+            );
+        }
+        if self
+            .probe_type
+            .as_deref()
+            .is_none_or(|kind| kind == "process")
+            && self.stable_for == 0
+        {
+            return Err("health.stable_for must be at least one second".to_string());
+        }
+        if self.kind(true) == "exec"
+            && (self.command.is_empty() || self.command[0].trim().is_empty())
+        {
+            return Err(
+                "health.type: exec requires a nonempty command argument vector".to_string(),
+            );
+        }
+        if self.kind(true) == "http" && !self.path.starts_with('/') {
+            return Err("health.path must start with '/'".to_string());
+        }
+        Ok(())
+    }
 }
 
 fn default_health_status() -> u16 {
@@ -1629,5 +1697,45 @@ alerts:
         let config = TempsConfig::from_yaml(yaml).unwrap();
         assert!(config.has_crons());
         assert!(config.has_alerts());
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+
+    #[test]
+    fn health_probe_defaults_preserve_http_and_detect_portless_workers() {
+        let config = HealthCheckConfig::default();
+        assert_eq!(config.kind(true), "http");
+        assert_eq!(config.kind(false), "process");
+        assert_eq!(config.stable_for, 15);
+        let legacy: HealthCheckConfig = yaml_serde::from_str("path: /ready").unwrap();
+        assert_eq!(legacy.kind(true), "http");
+        assert_eq!(legacy.path, "/ready");
+    }
+
+    #[test]
+    fn health_probe_yaml_accepts_each_kind_and_rejects_misconfiguration() {
+        for kind in ["http", "tcp", "process", "exec"] {
+            let config: TempsConfig = yaml_serde::from_str(&format!("health:\n  type: {kind}\n  command: [redis-cli, ping]\n  stable_for: 15\n  timeout: 5\n")).unwrap();
+            assert!(config.health.unwrap().validate().is_ok());
+        }
+        for yaml in [
+            "type: heartbeat",
+            "type: exec",
+            "type: process\nstable_for: 0",
+            "type: tcp\ntimeout: 0",
+            "type: exec\ncommand: ['']",
+            "type: http\npath: ready",
+            "interval: 0",
+        ] {
+            let config: HealthCheckConfig = yaml_serde::from_str(yaml).unwrap();
+            assert!(config.validate().is_err(), "{yaml}");
+        }
+        assert!(
+            yaml_serde::from_str::<HealthCheckConfig>("type: exec\ncommand: redis-cli ping")
+                .is_err()
+        );
     }
 }

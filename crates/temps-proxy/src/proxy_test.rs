@@ -1341,7 +1341,7 @@ pub mod proxy_tests {
             deployment_id: Set(deployment.id),
             container_id: Set("test-container-123".to_string()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             host_port: Set(Some(8080)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("running".to_string())),

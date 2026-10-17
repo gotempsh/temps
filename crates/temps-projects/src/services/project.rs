@@ -5494,11 +5494,15 @@ impl ProjectService {
         // `ProjectService::update_automatic_deploy` guards, and `exposed_port`
         // republishes a *different* port of a host-root-equivalent container
         // on the node's private address -- both change the attack surface of
-        // a granted project without going through a deploy at all.
-        if config.exposed_port.is_some() || config.automatic_deploy.is_some() {
+        // a granted project without going through a deploy at all. A health
+        // command is another executable input to the next granted deployment.
+        if config.exposed_port.is_some()
+            || config.automatic_deploy.is_some()
+            || config.health.is_some()
+        {
             self.guard_granted_project_write(
                 &project.slug,
-                "the exposed port or whether pushes deploy automatically",
+                "the exposed port, health command or whether pushes deploy automatically",
                 caller,
             )?;
         }
@@ -5520,7 +5524,7 @@ impl ProjectService {
             deployment_config.memory_limit = Some(memory_limit);
         }
         if let Some(exposed_port) = config.exposed_port {
-            deployment_config.exposed_port = Some(exposed_port);
+            deployment_config.exposed_port = exposed_port;
         }
         if let Some(automatic_deploy) = config.automatic_deploy {
             deployment_config.automatic_deploy = Some(automatic_deploy);
@@ -5560,6 +5564,10 @@ impl ProjectService {
         }
         if let Some(health_check_timeout_seconds) = config.health_check_timeout_seconds {
             deployment_config.health_check_timeout_seconds = Some(health_check_timeout_seconds);
+        }
+
+        if let Some(health) = config.health {
+            deployment_config.health = Some(health);
         }
 
         // Validate the deployment config
@@ -11696,6 +11704,58 @@ templates:
             "hosting": "hosted"
         }))
         .expect("valid project fixture")
+    }
+
+    #[tokio::test]
+    async fn health_probe_updates_require_admin_on_socket_granted_projects() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (slug, caller, allowed) in [
+            ("node-daemon", DeployCaller::ProjectWriter, false),
+            ("node-daemon", DeployCaller::InstanceAdmin, true),
+            ("ordinary-app", DeployCaller::ProjectWriter, true),
+        ] {
+            let project = project_for_hosting_lock_test(slug);
+            let mut updated = project.clone();
+            let health = temps_core::repo_config::HealthCheckConfig {
+                probe_type: Some("exec".into()),
+                command: vec!["check-worker".into()],
+                ..Default::default()
+            };
+            updated.deployment_config = Some(temps_entities::deployment_config::DeploymentConfig {
+                health: Some(health.clone()),
+                ..Default::default()
+            });
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![project], vec![updated]])
+                    .into_connection(),
+            );
+            let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new()))
+                .await
+                .with_docker_socket_grant(
+                    temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon")),
+                );
+            let request = serde_json::from_value(serde_json::json!({"health": health})).unwrap();
+            let result = service
+                .update_project_deployment_config(
+                    10,
+                    request,
+                    temps_core::CeilingEnforcement::Bypass,
+                    caller,
+                )
+                .await;
+            if allowed {
+                assert_eq!(
+                    result.unwrap().deployment_config.unwrap().health,
+                    Some(health)
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ProjectError::DockerSocketWriteRequiresAdmin { .. })
+                ));
+            }
+        }
     }
 
     #[tokio::test]

@@ -16369,9 +16369,6 @@ export const deleteEnvironmentDomainMutation = (options?: Partial<Options<Delete
     return mutationOptions;
 };
 
-/**
- * Update environment settings
- */
 export const updateEnvironmentSettingsMutation = (options?: Partial<Options<UpdateEnvironmentSettingsData>>): UseMutationOptions<UpdateEnvironmentSettingsResponse, DefaultError, Options<UpdateEnvironmentSettingsData>> => {
     const mutationOptions: UseMutationOptions<UpdateEnvironmentSettingsResponse, DefaultError, Options<UpdateEnvironmentSettingsData>> = {
         mutationFn: async (fnOptions) => {

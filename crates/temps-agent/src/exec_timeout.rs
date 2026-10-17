@@ -11,12 +11,21 @@
 //! stops the complete exec workload for both local and remote Docker hosts.
 //! The container is restarted rather than left manually stopped so production
 //! services recover even when they use an `unless-stopped` restart policy.
+//! Deployment health probes select stop-only cleanup, including cancellation
+//! and retries, so cleanup cannot resurrect a retained failed candidate.
 
 use bollard::query_parameters::RestartContainerOptionsBuilder;
 use bollard::Docker;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExecCleanupMode {
+    #[default]
+    Restart,
+    Stop,
+}
 
 const ORPHAN_INITIAL_RETRY: Duration = Duration::from_secs(5);
 const ORPHAN_MAX_RETRY: Duration = Duration::from_secs(5 * 60);
@@ -25,12 +34,20 @@ const RESTART_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub(crate) enum ExecDeadlineOutcome<T> {
     Completed(T),
-    ContainerRestarted,
+    ContainerTerminated,
     TerminationFailed(ExecTerminationError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExecTerminationError {
+    #[error(
+        "Failed to stop container '{container_id}' for timed-out Docker exec '{exec_id}': {reason}"
+    )]
+    StopContainer {
+        exec_id: String,
+        container_id: String,
+        reason: String,
+    },
     #[error("Failed to inspect timed-out Docker exec '{exec_id}': {source}")]
     Inspect {
         exec_id: String,
@@ -131,7 +148,8 @@ pub(crate) fn exec_start_was_rejected(error: &bollard::errors::Error) -> bool {
 /// upstream request times out). Keeping this guard armed across every await
 /// ensures that cancellation and ambiguous output/inspection failures retain
 /// operation and per-container ownership while starting the same pinned-
-/// container restart workflow. Capture capacity is released as soon as its
+/// container cleanup workflow (restart for operator exec, stop for probes).
+/// Capture capacity is released as soon as its
 /// buffers disappear. Only a positively completed exec or a successful
 /// synchronous restart may disarm the lifecycle guard.
 pub(crate) struct ExecCleanupGuard {
@@ -142,6 +160,7 @@ pub(crate) struct ExecCleanupGuard {
     operation_permit: Option<OwnedSemaphorePermit>,
     container_permit: Option<OwnedSemaphorePermit>,
     armed: bool,
+    cleanup_mode: ExecCleanupMode,
 }
 
 impl ExecCleanupGuard {
@@ -161,6 +180,7 @@ impl ExecCleanupGuard {
             operation_permit: Some(operation_permit),
             container_permit: Some(container_permit),
             armed: true,
+            cleanup_mode: ExecCleanupMode::Restart,
         }
     }
 
@@ -179,7 +199,13 @@ impl ExecCleanupGuard {
             operation_permit,
             container_permit: Some(container_permit),
             armed: true,
+            cleanup_mode: ExecCleanupMode::Restart,
         }
+    }
+
+    pub(crate) fn with_cleanup_mode(mut self, mode: ExecCleanupMode) -> Self {
+        self.cleanup_mode = mode;
+        self
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -219,6 +245,7 @@ impl Drop for ExecCleanupGuard {
                 self.container_id.clone(),
                 None,
                 container_permit,
+                self.cleanup_mode,
             );
             return;
         };
@@ -231,6 +258,7 @@ impl Drop for ExecCleanupGuard {
             self.container_id.clone(),
             Some(operation_permit),
             container_permit,
+            self.cleanup_mode,
         );
     }
 }
@@ -295,10 +323,72 @@ pub(crate) async fn run_exec_with_deadline<T, F>(
 where
     F: Future<Output = T>,
 {
+    run_exec_with_cleanup_mode(
+        docker,
+        exec_id,
+        container_id,
+        deadline,
+        ExecCleanupMode::Restart,
+        operation,
+    )
+    .await
+}
+
+pub(crate) async fn run_exec_with_cleanup_mode<T, F>(
+    docker: &Docker,
+    exec_id: &str,
+    container_id: &str,
+    deadline: Duration,
+    mode: ExecCleanupMode,
+    operation: F,
+) -> ExecDeadlineOutcome<T>
+where
+    F: Future<Output = T>,
+{
     run_with_timeout_cleanup(deadline, operation, || {
-        restart_exec_container(docker, exec_id, container_id)
+        terminate_exec_container(docker, exec_id, container_id, mode)
     })
     .await
+}
+
+async fn terminate_exec_container(
+    docker: &Docker,
+    exec_id: &str,
+    container_id: &str,
+    mode: ExecCleanupMode,
+) -> Result<(), ExecTerminationError> {
+    if mode == ExecCleanupMode::Restart {
+        return restart_exec_container(docker, exec_id, container_id).await;
+    }
+    let stop = tokio::time::timeout(
+        RESTART_REQUEST_TIMEOUT,
+        docker.stop_container(
+            container_id,
+            Some(
+                bollard::query_parameters::StopContainerOptionsBuilder::default()
+                    .t(0)
+                    .build(),
+            ),
+        ),
+    )
+    .await
+    .map_err(|_| ExecTerminationError::StopContainer {
+        exec_id: exec_id.into(),
+        container_id: container_id.into(),
+        reason: "stop request timed out".into(),
+    })?;
+    match stop {
+        Ok(())
+        | Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 304 | 404,
+            ..
+        }) => Ok(()),
+        Err(error) => Err(ExecTerminationError::StopContainer {
+            exec_id: exec_id.into(),
+            container_id: container_id.into(),
+            reason: error.to_string(),
+        }),
+    }
 }
 
 async fn run_with_timeout_cleanup<T, F, C, CleanupFuture>(
@@ -314,7 +404,7 @@ where
     match tokio::time::timeout(deadline, operation).await {
         Ok(output) => ExecDeadlineOutcome::Completed(output),
         Err(_) => match cleanup().await {
-            Ok(()) => ExecDeadlineOutcome::ContainerRestarted,
+            Ok(()) => ExecDeadlineOutcome::ContainerTerminated,
             Err(error) => ExecDeadlineOutcome::TerminationFailed(error),
         },
     }
@@ -389,9 +479,9 @@ fn is_canonical_container_id(container_id: &str) -> bool {
 }
 
 /// Keep an operation slot charged to an exec whose container could not
-/// initially be restarted. The memory-capture slot is released separately
+/// initially be terminated. The memory-capture slot is released separately
 /// when the request ends; this permit prevents overlapping mutating work until
-/// Docker confirms the restart (or that the pinned container no longer
+/// Docker confirms termination (or that the pinned container no longer
 /// exists). Retry traffic and journal volume remain bounded during outages.
 pub(crate) fn hold_permits_until_exec_stops(
     docker: Docker,
@@ -399,11 +489,12 @@ pub(crate) fn hold_permits_until_exec_stops(
     container_id: String,
     operation_permit: Option<OwnedSemaphorePermit>,
     container_permit: OwnedSemaphorePermit,
+    cleanup_mode: ExecCleanupMode,
 ) {
     tokio::spawn(async move {
         let mut retry_delay = ORPHAN_INITIAL_RETRY;
         loop {
-            match restart_exec_container(&docker, &exec_id, &container_id).await {
+            match terminate_exec_container(&docker, &exec_id, &container_id, cleanup_mode).await {
                 Ok(()) => break,
                 Err(error) => {
                     let sleep_for = retry_delay;
@@ -411,8 +502,9 @@ pub(crate) fn hold_permits_until_exec_stops(
                         exec_id = %exec_id,
                         container_id = %container_id,
                         retry_seconds = sleep_for.as_secs(),
+                        cleanup_mode = ?cleanup_mode,
                         reason = %error,
-                        "Timed-out Docker exec restart still pending; retaining lifecycle slots"
+                        "Timed-out Docker exec cleanup still pending; retaining lifecycle slots"
                     );
                     retry_delay = retry_delay.saturating_mul(2).min(ORPHAN_MAX_RETRY);
                     tokio::time::sleep(sleep_for).await;
@@ -421,7 +513,7 @@ pub(crate) fn hold_permits_until_exec_stops(
         }
         drop(operation_permit);
         drop(container_permit);
-        tracing::info!(exec_id = %exec_id, container_id = %container_id, "Timed-out Docker exec container restarted; released lifecycle slots");
+        tracing::info!(exec_id = %exec_id, container_id = %container_id, "Timed-out Docker exec workload stopped; released lifecycle slots");
     });
 }
 
@@ -471,6 +563,8 @@ mod tests {
 
     struct MockDockerState {
         restart_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+        fail_stop: AtomicBool,
         stall_restart: AtomicBool,
         exec_running: AtomicBool,
     }
@@ -492,6 +586,17 @@ mod tests {
                 "Id": CONTAINER_ID,
             }))
             .into_response();
+        }
+        if path.ends_with(&format!("/containers/{CONTAINER_ID}/stop")) {
+            state.stop_calls.fetch_add(1, Ordering::SeqCst);
+            if state.fail_stop.swap(false, Ordering::SeqCst) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message":"temporary stop failure"})),
+                )
+                    .into_response();
+            }
+            return StatusCode::NO_CONTENT.into_response();
         }
         if path.ends_with(&format!("/containers/{CONTAINER_ID}/restart")) {
             state.restart_calls.fetch_add(1, Ordering::SeqCst);
@@ -515,6 +620,8 @@ mod tests {
     > {
         let state = Arc::new(MockDockerState {
             restart_calls: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+            fail_stop: AtomicBool::new(false),
             stall_restart: AtomicBool::new(stall_restart),
             exec_running: AtomicBool::new(true),
         });
@@ -533,6 +640,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_probe_deadline_stops_without_restarting(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (docker, state, server) = mock_docker(false).await?;
+        let outcome = run_exec_with_cleanup_mode(
+            &docker,
+            "exec-1",
+            CONTAINER_ID,
+            Duration::ZERO,
+            ExecCleanupMode::Stop,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(matches!(outcome, ExecDeadlineOutcome::ContainerTerminated));
+        assert_eq!(state.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.restart_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_probe_cancelled_cleanup_retries_only_stop_after_retention(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (docker, state, server) = mock_docker(false).await?;
+        state.fail_stop.store(true, Ordering::SeqCst);
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let guard = ExecCleanupGuard::new_without_capture(
+            docker,
+            "exec-1".into(),
+            CONTAINER_ID.into(),
+            None,
+            slots.clone().acquire_owned().await?,
+        )
+        .with_cleanup_mode(ExecCleanupMode::Stop);
+        drop(guard); // Simulates the control plane cancelling its timed-out HTTP request.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.stop_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // Retention has already stopped the candidate before the cleanup retry.
+        assert_eq!(slots.available_permits(), 0);
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(state.stop_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.restart_calls.load(Ordering::SeqCst),
+            0,
+            "late cleanup must never resurrect a failed candidate"
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn timeout_waits_for_cleanup_before_returning() {
         let cleaned_up = Arc::new(AtomicBool::new(false));
         let cleanup_flag = cleaned_up.clone();
@@ -547,7 +713,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, ExecDeadlineOutcome::ContainerRestarted));
+        assert!(matches!(outcome, ExecDeadlineOutcome::ContainerTerminated));
         assert!(cleaned_up.load(Ordering::SeqCst));
     }
 
@@ -797,6 +963,7 @@ mod tests {
             CONTAINER_ID.to_string(),
             Some(operation_permit),
             container_permit,
+            ExecCleanupMode::Restart,
         );
         tokio::time::timeout(Duration::from_secs(1), async {
             while operation_slots.available_permits() == 0 {

@@ -14377,6 +14377,7 @@ name = "temps-migrations"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "bollard",
  "sea-orm 1.1.20",
  "sea-orm-migration 1.1.20",
  "temps-core",
@@ -15039,6 +15040,22 @@ dependencies = [
  "tokio",
  "tracing",
  "x509-parser",
+]
+
+[[package]]
+name = "temps-runtime-health"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

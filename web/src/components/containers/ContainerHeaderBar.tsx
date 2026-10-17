@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
+import { Status } from '@temps-sdk/ds'
 import { ContainerInfoResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
@@ -125,13 +127,39 @@ export function ContainerHeaderBar({
                   <span>{selectedContainer.node_name}</span>
                 </div>
               )}
-              {(metrics?.started_at || selectedContainer?.created_at) && (
-                <UptimeInline
-                  startedAt={
-                    metrics?.started_at || selectedContainer?.created_at || null
-                  }
-                />
-              )}
+              {selectedContainer &&
+                containerWorkload(selectedContainer) === 'worker' && (
+                  <div
+                    className="inline-flex items-center gap-2"
+                    title={
+                      selectedContainer.health_detail ??
+                      'Deploy-time health; runtime probing is not enabled'
+                    }
+                  >
+                    <span>Background worker</span>
+                    <Status
+                      tone={
+                        selectedContainer.health_state === 'healthy'
+                          ? 'ok'
+                          : selectedContainer.health_state === 'unhealthy'
+                            ? 'error'
+                            : 'idle'
+                      }
+                      label={selectedContainer.health_state || 'unknown'}
+                    />
+                    <span>at deploy</span>
+                  </div>
+                )}
+              {selectedContainer?.container_port != null &&
+                (metrics?.started_at || selectedContainer?.created_at) && (
+                  <UptimeInline
+                    startedAt={
+                      metrics?.started_at ||
+                      selectedContainer?.created_at ||
+                      null
+                    }
+                  />
+                )}
               {(metrics?.restart_count ?? 0) > 0 && (
                 <RestartCountChip count={metrics?.restart_count ?? 0} />
               )}

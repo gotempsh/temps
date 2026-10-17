@@ -376,8 +376,26 @@ where
     }
 }
 
+fn deserialize_optional_optional_health<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<temps_core::repo_config::HealthCheckConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<temps_core::repo_config::HealthCheckConfig>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateEnvironmentSettingsRequest {
+    /// Deploy-time probe override. Null restores project inheritance; omitted leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_health",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub health: Option<Option<temps_core::repo_config::HealthCheckConfig>>,
+    #[serde(default)]
+    pub health_check_timeout_seconds: Option<i32>,
     /// Minimum (request) CPU in microcores. Send JSON `null` to clear (no request).
     /// Absent leaves the current value unchanged.
     #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
@@ -405,7 +423,8 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// 4. Default: 3000
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 8080)]
-    pub exposed_port: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub exposed_port: Option<Option<i32>>,
     /// Enable/disable automatic deployments for this environment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automatic_deploy: Option<bool>,
@@ -781,5 +800,47 @@ mod tests {
             serde_json::from_str(r#"{"attack_mode":true}"#).unwrap();
         assert_eq!(only_attack.attack_mode, Some(Some(true)));
         assert_eq!(only_attack.force_https, None);
+    }
+}
+
+#[cfg(test)]
+mod health_probe_openapi_tests {
+    use utoipa::OpenApi;
+    #[test]
+    fn health_probe_override_distinguishes_missing_null_and_replacement() {
+        use super::UpdateEnvironmentSettingsRequest;
+        let absent: UpdateEnvironmentSettingsRequest = serde_json::from_str("{}").unwrap();
+        let cleared: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"health":null}"#).unwrap();
+        let replaced: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"health":{"type":"process"}}"#).unwrap();
+        assert_eq!(absent.health, None);
+        assert_eq!(cleared.health, Some(None));
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("health")
+            .is_none());
+        assert!(serde_json::to_value(&cleared).unwrap()["health"].is_null());
+        assert_eq!(
+            replaced.health.unwrap().unwrap().probe_type.as_deref(),
+            Some("process")
+        );
+    }
+
+    #[test]
+    fn health_probe_openapi_contract() {
+        let doc = super::super::ApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(!json["components"]["schemas"]["HealthCheckConfig"].is_null());
+        assert!(
+            !json["components"]["schemas"]["UpdateEnvironmentSettingsRequest"]["properties"]
+                ["health"]
+                .is_null()
+        );
+        let absent: super::UpdateEnvironmentSettingsRequest = serde_json::from_str("{}").unwrap();
+        let cleared: super::UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"exposed_port":null}"#).unwrap();
+        assert_eq!(absent.exposed_port, None);
+        assert_eq!(cleared.exposed_port, Some(None));
     }
 }

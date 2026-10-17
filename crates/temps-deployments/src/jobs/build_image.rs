@@ -2949,6 +2949,7 @@ impl BuildImageJob {
         let build_context_dir = &image_output.build_context;
         if let Some(temps_config) = self.load_temps_config(build_context_dir)? {
             if let Some(health) = &temps_config.health {
+                context.set_output(&self.job_id, "health", health)?;
                 context.set_output(&self.job_id, "health_check_path", &health.path)?;
                 context.set_output(&self.job_id, "health_check_timeout", health.timeout)?;
             }

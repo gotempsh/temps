@@ -634,6 +634,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.max_concurrent_connections),
+                health: project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.health.clone()),
                 health_check_timeout_seconds: project
                     .deployment_config
                     .clone()
@@ -789,7 +793,9 @@ pub struct UpdateDeploymentConfigRequest {
     pub cpu_limit: Option<i32>,
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
-    pub exposed_port: Option<i32>,
+    /// Null clears the port override; omitted leaves it unchanged.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub exposed_port: Option<Option<i32>>,
     pub automatic_deploy: Option<bool>,
     pub performance_metrics_enabled: Option<bool>,
     pub session_recording_enabled: Option<bool>,
@@ -837,6 +843,8 @@ pub struct UpdateDeploymentConfigRequest {
     /// 300 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<temps_core::repo_config::HealthCheckConfig>,
 }
 
 /// Complete replacement for the editable runtime of a single-container
@@ -1757,5 +1765,25 @@ mod tests {
 
         assert_eq!(problem.status_code, StatusCode::PRECONDITION_REQUIRED);
         assert_eq!(problem.body, built.body);
+    }
+}
+
+#[cfg(test)]
+mod health_probe_openapi_tests {
+    use utoipa::OpenApi;
+    #[test]
+    fn health_probe_openapi_contract() {
+        let doc = super::super::ApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(!json["components"]["schemas"]["HealthCheckConfig"].is_null());
+        assert!(
+            !json["components"]["schemas"]["UpdateDeploymentConfigRequest"]["properties"]["health"]
+                .is_null()
+        );
+        let absent: super::UpdateDeploymentConfigRequest = serde_json::from_str("{}").unwrap();
+        let cleared: super::UpdateDeploymentConfigRequest =
+            serde_json::from_str(r#"{"exposedPort":null}"#).unwrap();
+        assert_eq!(absent.exposed_port, None);
+        assert_eq!(cleared.exposed_port, Some(None));
     }
 }

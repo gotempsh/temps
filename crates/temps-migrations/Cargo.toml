@@ -18,6 +18,7 @@ sea-orm = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bollard = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

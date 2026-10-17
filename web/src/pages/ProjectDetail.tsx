@@ -641,6 +641,7 @@ export function ProjectDetail() {
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
+          lastDeploymentEnvironmentId={lastDeployment?.environment_id}
           isLoadingLastDeployment={isLoadingLastDeployment}
           onDeploy={() => {
             if (projectDeployLaunchMode(project.source_type) === 'upload') {

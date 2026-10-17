@@ -376,13 +376,34 @@ jobs:
             }' > /tmp/e2e-console-ui-project.json
           jq -e '.id and .slug' /tmp/e2e-console-ui-project.json >/dev/null
 
+      - name: Start registry for health-probe fixtures
+        id: health-probe-registry
+        run: |
+          set -euo pipefail
+          CONTAINER_ID=$(docker run --detach --publish 127.0.0.1:5113:5000 registry:2)
+          echo "container-id=$CONTAINER_ID" >> "$GITHUB_OUTPUT"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:5113/v2/; then exit 0; fi
+            printf 'Waiting for fixture registry (%s/30)\n' "$attempt"
+            sleep 1
+          done
+          exit 1
+
       - name: Console UI end-to-end tests
         env:
           E2E_BASE_URL: http://localhost:8081
           E2E_EMAIL: ${{ env.ADMIN_EMAIL }}
           E2E_PASSWORD: ${{ env.ADMIN_PASSWORD }}
           E2E_REPO_URL: https://github.com/${{ github.repository }}.git
+          HEALTH_PROBE_E2E_REGISTRY: localhost:5113
+          HEALTH_PROBE_E2E_PROXY_URL: http://127.0.0.1:5002
         run: cd web && bun run e2e
+
+      - name: Stop health-probe fixture registry
+        if: always() && steps.health-probe-registry.outputs.container-id != ''
+        env:
+          FIXTURE_REGISTRY_ID: ${{ steps.health-probe-registry.outputs.container-id }}
+        run: docker rm --force "$FIXTURE_REGISTRY_ID"
 
       - name: Upload Playwright report
         if: always()

@@ -1313,7 +1313,21 @@ fn environment_variable_value_response(
     )
 }
 
-/// Update environment settings
+/// Whether an environment settings write can change a granted runtime.
+fn settings_change_granted_runtime(settings: &UpdateEnvironmentSettingsRequest) -> bool {
+    settings.branch.is_some()
+        || settings.automatic_deploy.is_some()
+        || settings.protected.is_some()
+        || settings.target_nodes.is_some()
+        || settings.target_labels.is_some()
+        || settings.exposed_port.is_some()
+        || settings.health.is_some()
+        || settings.password.is_some()
+        || settings.security.is_some()
+        || settings.force_https.is_some()
+        || settings.attack_mode.is_some()
+}
+
 #[utoipa::path(
     put,
     path = "/projects/{project_id}/environments/{env_id}/settings",
@@ -1363,29 +1377,31 @@ pub async fn update_environment_settings(
     // public URL -- disabling the HTTPS redirect makes an operator's
     // environment password interceptable on-path, and disabling the CAPTCHA
     // challenge removes the other half of what stands in front of a
-    // host-root-equivalent service's public endpoint.
-    if settings.branch.is_some()
-        || settings.automatic_deploy.is_some()
-        || settings.protected.is_some()
-        || settings.target_nodes.is_some()
-        || settings.target_labels.is_some()
-        || settings.exposed_port.is_some()
-        || settings.password.is_some()
-        || settings.security.is_some()
-        || settings.force_https.is_some()
-        || settings.attack_mode.is_some()
-    {
+    // host-root-equivalent service's public endpoint. A health command runs
+    // inside the next candidate and inherits that same Docker socket grant.
+    if settings_change_granted_runtime(&settings) {
         require_granted_project_write_authority(
             &state.environment_service,
             &auth,
             project_id,
-            "the tracked branch, exposed port, public access or deployment triggers",
+            "the tracked branch, exposed port, health command, public access or deployment triggers",
         )
         .await?;
     }
 
     // Get project details for audit log
     let project = state.environment_service.get_project(project_id).await?;
+
+    if settings.health.is_some()
+        && temps_core::docker_socket_grant::process_grant().declares(&project.slug)
+    {
+        temps_auth::require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            temps_core::SensitiveAction::ChangeDockerSocketHealth { project_id },
+        )
+        .await?;
+    }
 
     // Get environment details for audit log
     let environment = state
@@ -1424,6 +1440,7 @@ pub async fn update_environment_settings(
         branch: settings.branch,
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
+        health_updated: settings.health.is_some(),
         attack_mode: settings.attack_mode,
         force_https: settings.force_https,
         build_location: settings.build_location,
@@ -2605,6 +2622,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     ),
     components(
         schemas(
+            temps_core::repo_config::HealthCheckConfig,
             EnvironmentResponse,
             CreateEnvironmentRequest,
             UpdateEnvironmentSettingsRequest,
@@ -2811,6 +2829,65 @@ mod tests {
         use temps_core::docker_socket_grant::DockerSocketGrant;
         use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, projects};
+
+        #[tokio::test]
+        async fn health_probe_only_settings_enforce_granted_project_authority() {
+            use sea_orm::{DatabaseBackend, MockDatabase};
+            for body in [
+                serde_json::json!({"health":{"type":"exec","command":["check-worker"]}}),
+                serde_json::json!({"health":null}),
+            ] {
+                let request: UpdateEnvironmentSettingsRequest =
+                    serde_json::from_value(body).unwrap();
+                assert!(
+                    settings_change_granted_runtime(&request),
+                    "setting and clearing health must both be guarded"
+                );
+                for (slug, role, allowed) in [
+                    ("node-daemon", temps_auth::Role::User, false),
+                    ("node-daemon", temps_auth::Role::Admin, true),
+                    ("ordinary-app", temps_auth::Role::User, true),
+                ] {
+                    let project: projects::Model = serde_json::from_value(serde_json::json!({
+                        "id":10,"name":"Worker","slug":slug,"repo_name":"worker","repo_owner":"operator","directory":"/","main_branch":"main","preset":"dockerfile",
+                        "pull_only_root_directory":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"is_deleted":false,"is_public_repo":false,"attack_mode":false,"ai_write_actions_enabled":false,
+                        "error_source_context_enabled":false,"vulnerability_scanning_enabled":false,"enable_preview_environments":false,"preview_envs_on_demand":false,"preview_envs_idle_timeout_seconds":300,"preview_envs_wake_timeout_seconds":30,
+                        "source_type":"docker_image","project_type":"Server","cross_project_trace_sharing":true,"cloud_telemetry_fidelity":"metered","cloud_telemetry_attribute_allowlist":[],"cloud_telemetry_write_mode":"local","cloud_analytics_write_mode":"local","hosting":"hosted"
+                    })).unwrap();
+                    let db = Arc::new(
+                        MockDatabase::new(DatabaseBackend::Postgres)
+                            .append_query_results([vec![project]])
+                            .into_connection(),
+                    );
+                    let config = Arc::new(ConfigService::new(
+                        Arc::new(
+                            ServerConfig::new(
+                                "127.0.0.1:3000".into(),
+                                "postgres://localhost/test".into(),
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                        ),
+                        db.clone(),
+                    ));
+                    let service =
+                        crate::services::environment_service::EnvironmentService::new(db, config);
+                    let result = require_granted_project_write_authority_against(
+                        &service,
+                        &DockerSocketGrant::parse(Some("node-daemon")),
+                        &test_auth_context(role),
+                        10,
+                        "health command",
+                    )
+                    .await;
+                    assert_eq!(result.is_ok(), allowed);
+                    if let Err(problem) = result {
+                        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+                    }
+                }
+            }
+        }
 
         async fn test_database() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {

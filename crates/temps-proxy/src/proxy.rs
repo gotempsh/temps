@@ -11051,7 +11051,7 @@ mod stopped_app_tests {
             deployment_id: Set(deployment.id),
             container_id: Set("stopped-app-container".to_string()),
             container_name: Set("stopped-app-container".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             host_port: Set(None),
             status: Set(Some("exited".to_string())),
             deployed_at: Set(chrono::Utc::now()),

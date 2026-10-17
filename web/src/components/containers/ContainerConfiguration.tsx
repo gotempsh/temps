@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
 import {
   ContainerDetailResponse,
   getContainerEnvironmentVariable,
@@ -70,13 +71,28 @@ export function ContainerConfiguration({
           />
           <Field label="Image" mono copyable value={container.image_name} />
           <Field label="Status" value={container.status} />
-          <Field
-            label="Uptime"
-            // Prefer started_at — uptime should reset on a restart-in-place.
-            // Fall back to created_at on older rows the migration hasn't
-            // populated yet.
-            value={formatUptimeFromTimestamp(startedAt || container.created_at)}
-          />
+          {containerWorkload(container) === 'worker' ? (
+            <Field
+              label="Background worker health at deploy"
+              value={container.health_state || 'unknown'}
+            />
+          ) : (
+            <Field
+              label="Uptime"
+              value={formatUptimeFromTimestamp(
+                startedAt || container.created_at
+              )}
+            />
+          )}
+          {container.health_checked_at && (
+            <Field
+              label="Health checked at deploy"
+              value={container.health_checked_at}
+            />
+          )}
+          {container.health_detail && (
+            <Field label="Health detail" value={container.health_detail} />
+          )}
           {container.service_name && (
             <Field label="Service" mono value={container.service_name} />
           )}

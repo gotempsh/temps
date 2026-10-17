@@ -800,10 +800,16 @@ impl DatabaseCronConfigService {
         })?;
 
         // Use deployment mode to determine the correct host/port for container access
-        let host_port = container.host_port.unwrap_or(container.container_port) as u16;
+        let container_port =
+            container
+                .container_port
+                .ok_or(CronServiceError::NoActiveDeployment {
+                    env_id: cron.environment_id,
+                })?;
+        let host_port = container.host_port.unwrap_or(container_port) as u16;
         let url = temps_core::DeploymentMode::build_container_url(
             &container.container_name,
-            container.container_port as u16,
+            container_port as u16,
             host_port,
             None,
         );
@@ -1124,7 +1130,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("final-run-container-id".to_string()),
             container_name: Set("final-run-container.invalid".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             deployed_at: Set(Utc::now()),
             created_at: Set(Utc::now()),
             ..Default::default()
@@ -1861,7 +1867,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("cron-alarm-container-id".to_string()),
             container_name: Set("127.0.0.1".to_string()),
-            container_port: Set(i32::from(port)),
+            container_port: Set(Some(i32::from(port))),
             host_port: Set(Some(i32::from(port))),
             deployed_at: Set(Utc::now()),
             created_at: Set(Utc::now()),

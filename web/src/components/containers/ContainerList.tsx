@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
 import { ContainerInfoResponse, ProjectResponse } from '@/api/client'
 import {
   getContainerMetricsOptions,
@@ -14,7 +15,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { ResourceStat, fmtBytes, fmtPercent } from '@temps-sdk/ds'
+import { ResourceStat, Status, fmtBytes, fmtPercent } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   Box,
@@ -175,20 +176,46 @@ function ContainerRow({
               {container.node_name}
             </span>
           )}
-          {container.created_at && (
+          {containerWorkload(container) === 'worker' && (
+            <span
+              className="inline-flex items-center gap-2"
+              title={
+                container.health_detail ??
+                'Deploy-time health; runtime probing is not enabled'
+              }
+            >
+              Background worker
+              <Status
+                tone={
+                  container.health_state === 'healthy'
+                    ? 'ok'
+                    : container.health_state === 'unhealthy'
+                      ? 'error'
+                      : 'idle'
+                }
+                label={container.health_state || 'unknown'}
+              />
+              <span>at deploy</span>
+            </span>
+          )}
+          {container.container_port != null && container.created_at && (
             <UptimeInline createdAt={container.created_at} />
           )}
           {running && metrics && (
             <>
               <ResourceStat
                 icon={Cpu}
-                value={formatCpuUsage(metrics.cpu_percent, metrics.cpu_limit_cores)}
+                value={formatCpuUsage(
+                  metrics.cpu_percent,
+                  metrics.cpu_limit_cores
+                )}
               />
               <ResourceStat
                 icon={HardDrive}
                 value={fmtBytes(metrics.memory_bytes)}
                 limit={
-                  (metrics.memory_limit_bytes ?? 0) > 0 && metrics.memory_percent != null
+                  (metrics.memory_limit_bytes ?? 0) > 0 &&
+                  metrics.memory_percent != null
                     ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
                     : undefined
                 }

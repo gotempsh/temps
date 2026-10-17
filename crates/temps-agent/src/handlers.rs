@@ -29,8 +29,9 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::exec_timeout::{
     completed_exec_exit_code, exec_start_was_rejected, monitor_exec_until_stopped,
-    resolve_container_id, resolve_exec_container_id, run_exec_with_deadline,
-    ContainerIdentityError, ExecCleanupGuard, ExecCompletionError, ExecDeadlineOutcome,
+    resolve_container_id, resolve_exec_container_id, run_exec_with_cleanup_mode,
+    ContainerIdentityError, ExecCleanupGuard, ExecCleanupMode, ExecCompletionError,
+    ExecDeadlineOutcome,
 };
 use crate::output_buffer::{
     json_response_with_capture_permit, BoundedTailBuffer, MAX_CAPTURED_STREAM_BYTES,
@@ -384,7 +385,9 @@ pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) ->
 fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
     match error {
         temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
-        temps_deployer::DeployerError::DeploymentFailed(_)
+        temps_deployer::DeployerError::ExecFailed { .. }
+        | temps_deployer::DeployerError::ExecTimeout { .. }
+        | temps_deployer::DeployerError::DeploymentFailed(_)
         | temps_deployer::DeployerError::ImageNotFound(_)
         | temps_deployer::DeployerError::NetworkError(_)
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)
@@ -405,6 +408,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         remove_container,
         get_container_logs,
         exec_container,
+        exec_health_probe,
         get_container_info,
         list_containers,
         image_exists,
@@ -912,6 +916,41 @@ pub async fn exec_container(
     Path(container_id): Path<String>,
     Json(request): Json<AgentExecRequest>,
 ) -> impl IntoResponse {
+    exec_container_with_cleanup(
+        state,
+        limits,
+        container_id,
+        request,
+        ExecCleanupMode::Restart,
+    )
+    .await
+}
+
+/// Deployment probes use stop-only cleanup, including cancellation and retries.
+/// A separate endpoint makes older agents fail closed rather than restart a candidate.
+#[utoipa::path(
+    tag = "Containers", post, path = "/agent/containers/{id}/health-exec",
+    params(("id" = String, Path, description = "Candidate container ID")),
+    request_body = AgentExecRequest,
+    responses((status = 200, body = AgentResponse<AgentExecResponse>), (status = 504, description = "Probe timed out; candidate stopped")),
+    security(("bearer_auth" = []))
+)]
+pub async fn exec_health_probe(
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    Path(container_id): Path<String>,
+    Json(request): Json<AgentExecRequest>,
+) -> impl IntoResponse {
+    exec_container_with_cleanup(state, limits, container_id, request, ExecCleanupMode::Stop).await
+}
+
+async fn exec_container_with_cleanup(
+    state: Arc<AgentState>,
+    limits: Arc<AgentResourceLimits>,
+    container_id: String,
+    request: AgentExecRequest,
+    cleanup_mode: ExecCleanupMode,
+) -> Response {
     if request.command.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "Command cannot be empty".into())
             .into_response();
@@ -1032,18 +1071,20 @@ pub async fn exec_container(
         capture_permit,
         operation_permit,
         permits.container,
-    );
+    )
+    .with_cleanup_mode(cleanup_mode);
 
     let start_config = bollard::exec::StartExecOptions {
         detach: false,
         ..Default::default()
     };
 
-    let result = run_exec_with_deadline(
+    let result = run_exec_with_cleanup_mode(
         &docker,
         &exec.id,
         &cleanup_container_id,
         std::time::Duration::from_secs(timeout_secs),
+        cleanup_mode,
         async {
             let output = docker
                 .start_exec(&exec.id, Some(start_config))
@@ -1093,6 +1134,11 @@ pub async fn exec_container(
     )
     .await;
 
+    let cleanup_action = if cleanup_mode == ExecCleanupMode::Stop {
+        "stopped"
+    } else {
+        "restarted"
+    };
     match result {
         ExecDeadlineOutcome::Completed(Ok((exit_code, stdout, stderr))) => {
             let Some(capture_permit) = cleanup_guard.disarm_and_take_capture() else {
@@ -1129,7 +1175,7 @@ pub async fn exec_container(
             }
             let cleanup_note = if cleanup_scheduled {
                 format!(
-                    "container {container_id} restart was scheduled to stop any ambiguous command workload"
+                    "container {container_id} cleanup was scheduled to stop any ambiguous command workload"
                 )
             } else {
                 "Docker definitively rejected the command before it started; the container was not restarted".to_string()
@@ -1141,13 +1187,13 @@ pub async fn exec_container(
             )
             .into_response()
         }
-        ExecDeadlineOutcome::ContainerRestarted => {
+        ExecDeadlineOutcome::ContainerTerminated => {
             cleanup_guard.disarm();
-            tracing::warn!(container_id = %container_id, timeout_secs, "Exec timed out; containing container was restarted to stop the complete workload");
+            tracing::warn!(container_id = %container_id, timeout_secs, cleanup_action, "Exec timed out; containing container cleanup completed");
             error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
-                    "Command timed out after {timeout_secs}s; container {container_id} was restarted to stop the complete command workload"
+                    "Command timed out after {timeout_secs}s; container {container_id} was {cleanup_action} to stop the complete command workload"
                 ),
             )
             .into_response()
@@ -1157,12 +1203,12 @@ pub async fn exec_container(
                 container_id = %container_id,
                 timeout_secs,
                 reason = %error,
-                "Exec timed out and its container could not be restarted"
+                "Exec timed out and its container could not be terminated"
             );
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
-                    "Command timed out after {timeout_secs}s, but the worker could not restart its container to stop the complete workload: {error}"
+                    "Command timed out after {timeout_secs}s, but the worker could not terminate its container to stop the complete workload: {error}"
                 ),
             )
             .into_response()

@@ -294,7 +294,7 @@ pub struct DeploymentOutput {
     /// List of all allocated host ports (one per replica)
     pub host_ports: Vec<u16>,
     /// The resolved container port (from image EXPOSE, config, or default)
-    pub container_port: u16,
+    pub container_port: Option<u16>,
     /// Node IDs for each replica (None = local node). Parallel to container_ids.
     #[serde(default)]
     pub node_ids: Vec<Option<i32>>,
@@ -531,6 +531,7 @@ pub struct DeploymentJobConfig {
     /// Maximum time to wait for the application to become ready (container
     /// start + health checks). Defaults to 300 seconds (5 minutes).
     pub health_check_timeout_secs: u64,
+    pub health: Option<temps_core::repo_config::HealthCheckConfig>,
     /// Optional list of node IDs to deploy to. When set, replicas are distributed
     /// only across these specific nodes. When None, all active nodes are eligible.
     pub target_nodes: Option<Vec<i32>>,
@@ -626,6 +627,7 @@ impl Default for DeploymentJobConfig {
             ingress_enabled: false,
             ingress_host: None,
             health_check_timeout_secs: 300,
+            health: None,
             target_nodes: None,
             target_labels: None,
             project_slug: None,
@@ -731,7 +733,7 @@ enum ControlPlaneImage {
 struct FailedContainerCandidate {
     container_id: String,
     container_name: String,
-    container_port: u16,
+    container_port: Option<u16>,
     host_port: u16,
     image_name: String,
     node_id: Option<i32>,
@@ -1113,6 +1115,36 @@ struct ReadinessProbeState {
     last_was_request_error: bool,
 }
 
+fn http_probe_status_is_healthy(status: reqwest::StatusCode) -> bool {
+    status.is_success() || status.is_redirection() || matches!(status.as_u16(), 404 | 405)
+}
+
+/// A published-port proxy can complete the handshake before discovering that
+/// the application refuses connections. Reject that immediate EOF/reset rather
+/// than promoting a deployment whose only listener is the forwarding proxy.
+async fn confirm_tcp_probe_connection(
+    stream: &tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
+    let confirmation_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout_at(deadline.min(confirmation_deadline), stream.peek(&mut byte))
+        .await
+    {
+        Ok(Ok(0)) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "TCP connection closed before readiness was confirmed; check the application listener behind the published port",
+        )),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) if confirmation_deadline <= deadline => Ok(()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "TCP probe deadline expired before the connection could be confirmed",
+        )),
+    }
+}
+
 impl ReadinessProbeState {
     fn record_transport_error(&mut self, error: &reqwest::Error) {
         self.last_was_connect_error = error.is_connect();
@@ -1136,12 +1168,12 @@ impl ReadinessProbeState {
         if !self.responded && (self.last_was_connect_error || self.last_failure.is_none()) {
             format!(
                 "Application never accepted connections on port {port} within the readiness \
-                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path})"
+                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path}). This container did not open port {port}; if it is a background worker, set health.type: process"
             )
         } else if !self.responded && self.last_was_request_error {
             format!(
                 "Application never returned an HTTP response on port {port} within the readiness \
-                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path})"
+                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path}). If it is a background worker, set health.type: process"
             )
         } else {
             format!(
@@ -1150,6 +1182,208 @@ impl ReadinessProbeState {
                  {last} for {path})"
             )
         }
+    }
+}
+
+/// Control-plane polling only: one in-flight probe and at most 4 KiB of output
+/// per candidate. The deployment startup deadline bounds every external call.
+async fn wait_for_non_http_probe(
+    deployer: &dyn ContainerDeployer,
+    container_id: &str,
+    health: &temps_core::repo_config::HealthCheckConfig,
+    address: Option<&str>,
+    budget: Duration,
+    job_log: Option<(&DeployImageJob, &WorkflowContext)>,
+) -> Result<(), WorkflowError> {
+    health.validate().map_err(|reason| {
+        WorkflowError::JobValidationFailed(format!(
+            "Invalid probe for container {container_id}: {reason}"
+        ))
+    })?;
+    let kind = health.kind(address.is_some());
+    if !matches!(kind, "process" | "tcp" | "exec") {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Unsupported health.type '{kind}' for container {container_id}"
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut stable_since = tokio::time::Instant::now();
+    let mut last_restarts = None;
+    let mut was_running = false;
+    let mut last_failure = "no probe completed".to_string();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(WorkflowError::JobExecutionFailed(format!("Container {container_id} health.type: {kind} exceeded startup timeout: {last_failure}")));
+        }
+        let info = tokio::time::timeout_at(deadline, deployer.get_container_info(container_id))
+            .await
+            .map_err(|_| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Container {container_id} inspection exceeded startup timeout"
+                ))
+            })?
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot evaluate {kind} probe for container {container_id}: {error}"
+                ))
+            })?;
+        let restarts = info.restart_count.ok_or_else(|| WorkflowError::JobExecutionFailed(format!("Cannot evaluate {kind} probe for container {container_id}: RestartCount is unknown")))?;
+        if matches!(
+            info.status,
+            DeployerContainerStatus::Exited | DeployerContainerStatus::Dead
+        ) {
+            return Err(WorkflowError::JobExecutionFailed(
+                container_exit_failure_message(
+                    &info,
+                    budget
+                        .saturating_sub(
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .as_secs(),
+                ),
+            ));
+        }
+        if restarts >= CRASH_LOOP_RESTART_THRESHOLD {
+            return Err(WorkflowError::JobExecutionFailed(
+                container_crash_loop_message(&info, restarts),
+            ));
+        }
+        if !was_running
+            || last_restarts.is_some_and(|previous| previous != restarts)
+            || info.status != DeployerContainerStatus::Running
+        {
+            stable_since = tokio::time::Instant::now();
+        }
+        last_restarts = Some(restarts);
+        was_running = info.status == DeployerContainerStatus::Running;
+        if info.status == DeployerContainerStatus::Running {
+            match kind {
+                "process" => {
+                    if stable_since.elapsed() >= Duration::from_secs(health.stable_for) {
+                        return Ok(());
+                    }
+                    last_failure = format!(
+                        "waiting for {}s continuously Running without restarts",
+                        health.stable_for
+                    );
+                }
+                "exec" => {
+                    let timeout = Duration::from_secs(health.timeout)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    // ExecTimeout fails immediately: Docker cannot kill only an exec;
+                    // the runtime stops the candidate to contain the command.
+                    let execution = tokio::time::timeout_at(
+                        deadline,
+                        deployer.exec_in_container(container_id, health.command.clone(), timeout),
+                    )
+                    .await
+                    .map_err(|_| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Container {container_id} exec probe exceeded startup timeout"
+                        ))
+                    })?;
+                    let result = match execution {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some((job, context)) = job_log {
+                                let _ = tokio::time::timeout_at(deadline, job.log(context,
+                                    format!("Exec probe runtime error for container {container_id}: {error}"))).await;
+                            }
+                            // Runtime errors can contain command diagnostics too. Keep
+                            // those in the authorized log, never in a persisted reason.
+                            let reason = if matches!(
+                                error,
+                                temps_deployer::DeployerError::ExecTimeout { .. }
+                            ) {
+                                "timeout; candidate requires stop-only cleanup"
+                            } else {
+                                "runtime could not complete the command; inspect authorized job logs"
+                            };
+                            return Err(WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} exec probe failed: {reason}"
+                            )));
+                        }
+                    };
+                    if let Some((job, context)) = job_log {
+                        // Captured output may contain credentials. Only authorized job logs
+                        // receive it; persisted health details contain an exit code only.
+                        tokio::time::timeout_at(deadline, job.log(
+                            context,
+                            format!("Exec probe exited {}: {}", result.exit_code, result.output),
+                        )).await.map_err(|_| WorkflowError::JobExecutionFailed(format!("Container {container_id} exec probe logging exceeded startup timeout")))?
+                            .map_err(|_| WorkflowError::JobExecutionFailed(format!("Container {container_id} exec probe log could not be written")))?;
+                    }
+                    if result.exit_code == 0 {
+                        let after = tokio::time::timeout_at(
+                            deadline,
+                            deployer.get_container_info(container_id),
+                        )
+                        .await
+                        .map_err(|_| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} post-exec inspection timed out"
+                            ))
+                        })?
+                        .map_err(|e| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} post-exec inspection failed: {e}"
+                            ))
+                        })?;
+                        if after.status == DeployerContainerStatus::Running
+                            && after.restart_count == Some(restarts)
+                        {
+                            return Ok(());
+                        }
+                        return Err(WorkflowError::JobExecutionFailed(format!(
+                            "Container {container_id} exited or restarted during its exec probe"
+                        )));
+                    }
+                    // Exit 126/127 means the configured executable cannot be run.
+                    if matches!(result.exit_code, 126 | 127) {
+                        return Err(WorkflowError::JobValidationFailed(format!(
+                            "Container {container_id} health.command could not execute (exit {})",
+                            result.exit_code
+                        )));
+                    }
+                    last_failure = format!("exec exited {}", result.exit_code);
+                }
+                "tcp" => {
+                    let address = address.ok_or_else(|| {
+                        WorkflowError::JobValidationFailed(format!(
+                            "Container {container_id} health.type: tcp requires a port"
+                        ))
+                    })?;
+                    let attempt_deadline = deadline
+                        .min(tokio::time::Instant::now() + Duration::from_secs(health.timeout));
+                    match tokio::time::timeout_at(
+                        attempt_deadline,
+                        tokio::net::TcpStream::connect(address),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => {
+                            match confirm_tcp_probe_connection(&stream, attempt_deadline).await {
+                                Ok(()) => return Ok(()),
+                                Err(error) => last_failure = error.to_string(),
+                            }
+                        }
+                        Ok(Err(error)) => last_failure = error.to_string(),
+                        Err(_) => last_failure = "TCP connection timed out".to_string(),
+                    }
+                }
+                _ => {
+                    return Err(WorkflowError::JobValidationFailed(format!(
+                        "Unsupported health.type '{kind}' for container {container_id}"
+                    )))
+                }
+            }
+        }
+        let interval = if kind == "process" {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(health.interval)
+        };
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
     }
 }
 
@@ -2279,7 +2513,11 @@ impl DeployImageJob {
     ///
     /// This method inspects the built image and extracts exposed ports, but
     /// only when neither scope explicitly configures a port.
-    async fn resolve_container_port(&self, image_tag: &str, context: &WorkflowContext) -> u16 {
+    async fn resolve_container_port(
+        &self,
+        image_tag: &str,
+        context: &WorkflowContext,
+    ) -> Option<u16> {
         if let Some(configured) = self.config.configured_port {
             let _ = self
                 .log(
@@ -2290,7 +2528,7 @@ impl DeployImageJob {
                     ),
                 )
                 .await;
-            return configured;
+            return Some(configured);
         }
 
         // A worker build records the image's configuration as read from the
@@ -2309,20 +2547,9 @@ impl DeployImageJob {
                             ),
                         )
                         .await;
-                    *port
+                    Some(*port)
                 }
-                None => {
-                    let _ = self
-                        .log(
-                            context,
-                            format!(
-                                "No EXPOSE directive found in image, using configured port: {}",
-                                self.config.port
-                            ),
-                        )
-                        .await;
-                    self.config.port as u16
-                }
+                None => None,
             };
         }
 
@@ -2337,19 +2564,9 @@ impl DeployImageJob {
                                 format!("Detected EXPOSE directive in image: port {}", port),
                             )
                             .await;
-                        return port;
+                        return Some(port);
                     }
-                    Ok(None) => {
-                        let _ = self
-                            .log(
-                                context,
-                                format!(
-                                    "No EXPOSE directive found in image, using configured port: {}",
-                                    self.config.port
-                                ),
-                            )
-                            .await;
-                    }
+                    Ok(None) => return None,
                     Err(e) => {
                         let _ = self
                             .log(
@@ -2377,7 +2594,7 @@ impl DeployImageJob {
         }
 
         // Fallback to configured/default port
-        self.config.port as u16
+        Some(self.config.port as u16)
     }
 
     /// The image configuration the build job recorded from its build node.
@@ -2680,8 +2897,11 @@ impl DeployImageJob {
                 deployment_id: Set(deployment_id),
                 container_id: Set(candidate.container_id.clone()),
                 container_name: Set(candidate.container_name.clone()),
-                container_port: Set(i32::from(candidate.container_port)),
-                host_port: Set(Some(i32::from(candidate.host_port))),
+                container_port: Set(candidate.container_port.map(i32::from)),
+                health_state: Set("unhealthy".to_string()),
+                health_checked_at: Set(Some(now)),
+                health_detail: Set(context.get_output::<String>(&self.job_id, "health_detail")?.map(|s| s.chars().take(4096).collect())),
+                host_port: Set(candidate.container_port.map(|_| i32::from(candidate.host_port))),
                 image_name: Set(Some(candidate.image_name.clone())),
                 status: Set(Some("retained:stopped-after-failed-readiness".to_string())),
                 service_name: Set(Some(self.config.service_name.clone())),
@@ -3178,7 +3398,7 @@ impl DeployImageJob {
                     all_node_ids.push(assignment.node_id());
                     all_image_names.push(replica_image_tag.clone());
                     // All replicas share the same container port
-                    resolved_container_port = Some(container_port);
+                    resolved_container_port = container_port;
                 }
                 Err(e) => {
                     self.log(
@@ -3231,7 +3451,7 @@ impl DeployImageJob {
             resources: self.config.resources.clone(),
             container_ids: all_container_ids,
             host_ports: all_host_ports,
-            container_port: resolved_container_port.unwrap_or(self.config.port as u16),
+            container_port: resolved_container_port,
             node_ids: all_node_ids,
             image_names: all_image_names,
         })
@@ -3308,7 +3528,7 @@ impl DeployImageJob {
         health_check_override: Option<&str>,
         deployer: &Arc<dyn ContainerDeployer>,
         target: ReplicaTarget<'_>,
-    ) -> Result<(String, u16, u16), WorkflowError> {
+    ) -> Result<(String, u16, Option<u16>), WorkflowError> {
         let ReplicaTarget {
             assignment,
             docker_socket_required,
@@ -3319,13 +3539,38 @@ impl DeployImageJob {
 
         let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
 
+        let repository_health = context.get_output::<temps_core::repo_config::HealthCheckConfig>(
+            &self.build_job_id,
+            "health",
+        )?;
+        let health = repository_health
+            .or_else(|| self.config.health.clone())
+            .unwrap_or_default();
+        health.validate().map_err(|reason| {
+            WorkflowError::JobValidationFailed(format!(
+                "Invalid health probe for deployment {}: {reason}",
+                context.deployment_id
+            ))
+        })?;
+
         // Determine the actual container port to expose
         // Priority: explicit environment/project override > Image EXPOSE directive > default
-        let container_port = self.resolve_container_port(image_tag, context).await;
+        let container_port = if self.config.configured_port.is_some() || assignment.is_local() {
+            self.resolve_container_port(image_tag, context).await
+        } else if let Some(node_id) = assignment.node_id() {
+            let remote = self.remote_deployer_for_node_id(node_id).await?;
+            let image = remote.inspect_image(image_tag).await.map_err(|error| WorkflowError::JobExecutionFailed(format!("Cannot determine declared ports for image {image_tag} on node {node_id}: {error}")))?;
+            match image.config {
+                Some(config) => config.exposed_ports.into_iter().min(),
+                None => Some(self.config.port as u16), // Compatibility with older agents.
+            }
+        } else {
+            self.resolve_container_port(image_tag, context).await
+        };
 
         // For local deployments, allocate a port on this host.
         // For remote deployments, set host_port=0 so Docker on the agent picks an available port.
-        let host_port = if assignment.is_local() {
+        let host_port = if assignment.is_local() && container_port.is_some() {
             Self::find_available_port()?
         } else {
             0
@@ -3345,6 +3590,8 @@ impl DeployImageJob {
                     host_port.to_string()
                 },
                 container_port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "none (background worker)".to_string())
             ),
         )
         .await?;
@@ -3353,12 +3600,15 @@ impl DeployImageJob {
             .private_address()
             .map(private_remote_bind_address)
             .transpose()?;
-        let port_mappings = vec![PortMapping {
-            host_port,
-            container_port,
-            protocol: Protocol::Tcp,
-            host_ip,
-        }];
+        let port_mappings = container_port
+            .map(|container_port| PortMapping {
+                host_port,
+                container_port,
+                protocol: Protocol::Tcp,
+                host_ip,
+            })
+            .into_iter()
+            .collect();
 
         // Convert k8s-style strings ("1000m", "512Mi", "2", "1Gi") into the
         // numeric ResourceLimits the deployer feeds to bollard. The previous
@@ -3437,19 +3687,21 @@ impl DeployImageJob {
         environment_vars.insert("TEMPS_NODE_ID".to_string(), assigned_node_id);
         environment_vars.insert("TEMPS_REPLICA".to_string(), (replica_index + 1).to_string());
 
-        if let Some(previous) = align_port_env_with_container_port(
-            &mut environment_vars,
-            self.config.configured_port,
-            container_port,
-        ) {
-            self.log(
-                context,
-                format!(
-                    "Setting PORT={} to match the port detected from the image (was {})",
-                    container_port, previous
-                ),
-            )
-            .await?;
+        if let Some(container_port) = container_port {
+            if let Some(previous) = align_port_env_with_container_port(
+                &mut environment_vars,
+                self.config.configured_port,
+                container_port,
+            ) {
+                self.log(
+                    context,
+                    format!(
+                        "Setting PORT={} to match the port detected from the image (was {})",
+                        container_port, previous
+                    ),
+                )
+                .await?;
+            }
         }
 
         tracing::info!(
@@ -3583,7 +3835,10 @@ impl DeployImageJob {
         // PortMapping.host_ip. Inspect what Docker actually published before
         // this container becomes eligible for retention; fail closed if the
         // worker cannot prove a private-only bind.
-        if let Some(expected_host_ip) = assignment.private_address() {
+        if let Some(expected_host_ip) = assignment
+            .private_address()
+            .filter(|_| container_port.is_some())
+        {
             let private_host_ip = private_remote_bind_address(expected_host_ip)?;
             let binding_is_private = deployer
                 .get_container_info(&deploy_result.container_id)
@@ -3611,7 +3866,7 @@ impl DeployImageJob {
             candidates.push(FailedContainerCandidate {
                 container_id: deploy_result.container_id.clone(),
                 container_name: deploy_result.container_name.clone(),
-                container_port: deploy_result.container_port,
+                container_port,
                 host_port: deploy_result.host_port,
                 image_name: image_tag.to_string(),
                 node_id: assignment.node_id(),
@@ -3634,10 +3889,17 @@ impl DeployImageJob {
         loop {
             // Try to get container info, but don't fail hard if it can't be found
             // (container might have been removed by Docker or other processes)
-            let container_info = match deployer
-                .get_container_info(&deploy_result.container_id)
-                .await
-            {
+            let container_info = match tokio::time::timeout(
+                max_wait_time.saturating_sub(start_time.elapsed()),
+                deployer.get_container_info(&deploy_result.container_id),
+            )
+            .await
+            .map_err(|_| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Container {} inspection exceeded startup timeout",
+                    deploy_result.container_id
+                ))
+            })? {
                 Ok(info) => info,
                 Err(e) => {
                     // Container not found - might have been removed, but that's okay
@@ -3658,15 +3920,34 @@ impl DeployImageJob {
 
                     // Wait a bit and try again, but don't fail if we can't verify
                     if start_time.elapsed() > max_wait_time {
-                        self.log(context, "Container verification timeout - proceeding anyway (container may be running)".to_string())
-                            .await?;
-                        break;
+                        return Err(WorkflowError::JobExecutionFailed(format!(
+                            "Container {} could not be inspected within the startup timeout",
+                            deploy_result.container_id
+                        )));
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(
+                        Duration::from_secs(5)
+                            .min(max_wait_time.saturating_sub(start_time.elapsed())),
+                    )
+                    .await;
                     continue;
                 }
             };
 
+            if container_info.restart_count.unwrap_or(0) >= CRASH_LOOP_RESTART_THRESHOLD {
+                self.write_startup_log_excerpt(
+                    context,
+                    deployer.as_ref(),
+                    &deploy_result.container_id,
+                )
+                .await;
+                return Err(WorkflowError::JobExecutionFailed(
+                    container_crash_loop_message(
+                        &container_info,
+                        container_info.restart_count.unwrap_or(0),
+                    ),
+                ));
+            }
             match container_info.status {
                 DeployerContainerStatus::Running => {
                     self.log(context, "✅ Container is running".to_string())
@@ -3703,7 +3984,11 @@ impl DeployImageJob {
                         format!("Container status: {:?}, waiting...", container_info.status),
                     )
                     .await?;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(
+                        Duration::from_secs(5)
+                            .min(max_wait_time.saturating_sub(start_time.elapsed())),
+                    )
+                    .await;
                 }
                 _ => {
                     if start_time.elapsed() > max_wait_time {
@@ -3722,7 +4007,11 @@ impl DeployImageJob {
                         format!("Container status: {:?}, waiting...", container_info.status),
                     )
                     .await?;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(
+                        Duration::from_secs(5)
+                            .min(max_wait_time.saturating_sub(start_time.elapsed())),
+                    )
+                    .await;
                 }
             }
         }
@@ -3829,8 +4118,48 @@ impl DeployImageJob {
             .health_check_path_override
             .clone()
             .or_else(|| health_check_override.map(String::from))
+            .or_else(|| self.config.health.as_ref().map(|h| h.path.clone()))
             .or_else(|| self.config.health_check_path.clone());
-        if let Some(ref health_path) = effective_health_path {
+        let kind = health.kind(container_port.is_some());
+        if matches!(kind, "http" | "tcp") && container_port.is_none() {
+            return Err(WorkflowError::JobValidationFailed(format!("health.type: {kind} requires a declared port; for a background worker set health.type: process")));
+        }
+        if kind != "http" {
+            let address = if let Some(port) = container_port {
+                let url = if let Some(private_addr) = assignment.private_address() {
+                    format!("http://{}:{}", private_addr, deploy_result.host_port)
+                } else {
+                    temps_core::DeploymentMode::build_container_url(
+                        &deploy_result.container_name,
+                        port,
+                        deploy_result.host_port,
+                        None,
+                    )
+                };
+                Some(url.trim_start_matches("http://").to_string())
+            } else {
+                None
+            };
+            let remaining = max_wait_time.saturating_sub(start_time.elapsed());
+            if let Err(error) = wait_for_non_http_probe(
+                deployer.as_ref(),
+                &deploy_result.container_id,
+                &health,
+                address.as_deref(),
+                remaining,
+                Some((self, context)),
+            )
+            .await
+            {
+                self.write_startup_log_excerpt(
+                    context,
+                    deployer.as_ref(),
+                    &deploy_result.container_id,
+                )
+                .await;
+                return Err(error);
+            }
+        } else if let Some(ref health_path) = effective_health_path {
             self.log(
                 context,
                 "Waiting for application to be ready...".to_string(),
@@ -3889,10 +4218,24 @@ impl DeployImageJob {
                 // This prevents waiting the full timeout for a container that
                 // already exited — or that Docker keeps restarting, which
                 // `RestartPolicy::Always` reports as running between crashes.
-                if let Ok(container_info) = deployer
-                    .get_container_info(&deploy_result.container_id)
-                    .await
                 {
+                    let container_info = tokio::time::timeout(
+                        max_wait_time.saturating_sub(start_time.elapsed()),
+                        deployer.get_container_info(&deploy_result.container_id),
+                    )
+                    .await
+                    .map_err(|_| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Container {} inspection exceeded startup timeout",
+                            deploy_result.container_id
+                        ))
+                    })?
+                    .map_err(|error| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Cannot evaluate HTTP probe for container {}: {error}",
+                            deploy_result.container_id
+                        ))
+                    })?;
                     let restarts = container_info.restart_count.unwrap_or(0);
                     match container_info.status {
                         DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
@@ -3926,7 +4269,15 @@ impl DeployImageJob {
                     }
                 }
 
-                match client.get(&health_check_url).send().await {
+                let request_budget = max_wait_time
+                    .saturating_sub(start_time.elapsed())
+                    .min(Duration::from_secs(5));
+                match client
+                    .get(&health_check_url)
+                    .timeout(request_budget)
+                    .send()
+                    .await
+                {
                     Ok(response) => {
                         let status = response.status();
 
@@ -3934,10 +4285,7 @@ impl DeployImageJob {
                         // 2xx, 3xx, 404, and 405 are all valid — the health check
                         // path may not exist but the server is up and responding.
                         // Only 5xx indicates a real problem.
-                        let is_healthy = status.is_success()
-                            || status.is_redirection()
-                            || status.as_u16() == 404
-                            || status.as_u16() == 405;
+                        let is_healthy = http_probe_status_is_healthy(status);
                         probe.responded = true;
                         if is_healthy {
                             consecutive_successes += 1;
@@ -3967,7 +4315,11 @@ impl DeployImageJob {
                                     .await?;
                                 break;
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            tokio::time::sleep(
+                                Duration::from_secs(2)
+                                    .min(max_wait_time.saturating_sub(start_time.elapsed())),
+                            )
+                            .await;
                         } else {
                             // 4xx, 5xx = application error
                             consecutive_successes = 0;
@@ -3981,7 +4333,11 @@ impl DeployImageJob {
                                 ),
                             )
                             .await?;
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(
+                                Duration::from_secs(5)
+                                    .min(max_wait_time.saturating_sub(start_time.elapsed())),
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -3992,7 +4348,11 @@ impl DeployImageJob {
                             format!("Connectivity check failed ({}), retrying...", e),
                         )
                         .await?;
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::time::sleep(
+                            Duration::from_secs(5)
+                                .min(max_wait_time.saturating_sub(start_time.elapsed())),
+                        )
+                        .await;
                     }
                 }
             }
@@ -4004,7 +4364,9 @@ impl DeployImageJob {
             .await?;
         }
 
-        let endpoint_url = if let Some(private_addr) = assignment.private_address() {
+        let endpoint_url = if container_port.is_none() {
+            "background worker (healthy)".to_string()
+        } else if let Some(private_addr) = assignment.private_address() {
             format!("http://{}:{}", private_addr, deploy_result.host_port)
         } else {
             temps_core::DeploymentMode::build_container_url(
@@ -4024,7 +4386,7 @@ impl DeployImageJob {
         Ok((
             deploy_result.container_id,
             deploy_result.host_port,
-            deploy_result.container_port,
+            container_port,
         ))
     }
 
@@ -4173,6 +4535,12 @@ impl WorkflowTask for DeployImageJob {
             .health_check_path_override
             .clone()
             .or_else(|| health_override.clone())
+            .or_else(|| {
+                self.config
+                    .health
+                    .as_ref()
+                    .map(|health| health.path.clone())
+            })
             .or_else(|| self.config.health_check_path.clone());
         if let Some(ref effective) = effective_health_path {
             context.set_output(&self.job_id, "health_check_path", effective)?;
@@ -4185,6 +4553,7 @@ impl WorkflowTask for DeployImageJob {
         {
             Ok(output) => output,
             Err(deploy_error) => {
+                context.set_output(&self.job_id, "health_detail", deploy_error.to_string())?;
                 if let Err(retention_error) = self.retain_failed_containers(&context).await {
                     // A container without a committed ownership row would be
                     // unreachable through the authenticated API. Tear it down
@@ -4202,6 +4571,20 @@ impl WorkflowTask for DeployImageJob {
         };
 
         // Set typed job outputs
+        context.set_output(
+            &self.job_id,
+            "portless",
+            deployment_output.container_port.is_none(),
+        )?;
+        context.set_output(
+            &self.job_id,
+            "health_state",
+            if deployment_output.container_port.is_some() && effective_health_path.is_none() {
+                "unknown"
+            } else {
+                "healthy"
+            },
+        )?;
         context.set_output(&self.job_id, "status", &deployment_output.status)?;
         context.set_output(&self.job_id, "replicas", deployment_output.replicas)?;
         context.set_output(
@@ -4228,7 +4611,7 @@ impl WorkflowTask for DeployImageJob {
             context.set_output(
                 &self.job_id,
                 "container_port",
-                deployment_output.container_port as i32,
+                deployment_output.container_port.map(i32::from),
             )?;
 
             // Set artifact for first container
@@ -4558,6 +4941,11 @@ impl DeployImageJobBuilder {
 
     /// Set the maximum time (in seconds) to wait for the application to become
     /// ready. Defaults to 300 seconds (5 minutes).
+    pub fn health(mut self, health: Option<temps_core::repo_config::HealthCheckConfig>) -> Self {
+        self.config.health = health;
+        self
+    }
+
     pub fn health_check_timeout_secs(mut self, secs: u64) -> Self {
         self.config.health_check_timeout_secs = secs;
         self
@@ -5501,7 +5889,7 @@ mod tests {
             resources: ResourceUsage::default(),
             container_ids: vec!["c1".to_string(), "c2".to_string()],
             host_ports: vec![30001, 30002],
-            container_port: 3000,
+            container_port: Some(3000),
             node_ids: vec![None, Some(7)],
             image_names: vec!["app:latest".to_string(), "app:latest-arm64".to_string()],
         };
@@ -5753,6 +6141,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for TrackingMockContainerDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             request: DeployRequest,
@@ -5937,7 +6337,7 @@ mod tests {
             .push(FailedContainerCandidate {
                 container_id: "failed-app-id".to_string(),
                 container_name: "checkout-production".to_string(),
-                container_port: 3000,
+                container_port: Some(3000),
                 host_port: 18080,
                 image_name: "checkout:broken".to_string(),
                 node_id: Some(7),
@@ -6269,7 +6669,7 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 9090);
+        assert_eq!(port, Some(9090));
     }
 
     /// When neither environment nor project configures a port, image
@@ -6301,7 +6701,7 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 4000);
+        assert_eq!(port, Some(4000));
     }
 
     fn port_job(configured_port: Option<u16>) -> DeployImageJob {
@@ -6350,13 +6750,13 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 8080);
+        assert_eq!(port, Some(8080));
     }
 
-    /// A node that reported "no EXPOSE" means the configured port, and it is
-    /// answered from the record rather than a local inspection.
+    /// A node that reports no EXPOSE declares a portless worker, without
+    /// needing a local copy of the image to inspect.
     #[tokio::test]
-    async fn test_resolve_container_port_uses_configured_port_when_node_reports_no_expose() {
+    async fn test_resolve_container_port_is_portless_when_node_reports_no_expose() {
         let job = port_job(None);
         let context = context_with_built_config(Vec::new());
 
@@ -6364,7 +6764,7 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 4000);
+        assert_eq!(port, None);
     }
 
     /// The environment/project override still outranks what the image says.
@@ -6377,7 +6777,7 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 9090);
+        assert_eq!(port, Some(9090));
     }
 
     /// A rollback or promotion has no workflow context from the original
@@ -6414,7 +6814,7 @@ mod tests {
 
         let port = job.resolve_container_port("app:1", &context).await;
 
-        assert_eq!(port, 8080);
+        assert_eq!(port, Some(8080));
     }
 
     #[test]
@@ -8586,5 +8986,510 @@ mod tests {
             unbound.expected_image_identity(&context),
             Some(ExpectedImageIdentity::ImageId("sha256:aaa".to_string()))
         );
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use temps_core::repo_config::HealthCheckConfig;
+    use temps_deployer::{ContainerInfo, DeployerError, ExecResult};
+
+    struct ProbeDeployer {
+        states: Mutex<VecDeque<ContainerInfo>>,
+        exits: Mutex<VecDeque<i64>>,
+        exec_timeout: bool,
+        exec_error: bool,
+    }
+
+    impl ProbeDeployer {
+        fn running() -> Self {
+            Self {
+                states: Mutex::new(VecDeque::from([ContainerInfo {
+                    status: DeployerContainerStatus::Running,
+                    restart_count: Some(0),
+                    ..Default::default()
+                }])),
+                exits: Mutex::new(VecDeque::from([0])),
+                exec_timeout: false,
+                exec_error: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for ProbeDeployer {
+        async fn get_container_info(&self, _id: &str) -> Result<ContainerInfo, DeployerError> {
+            let mut states = self.states.lock().unwrap();
+            let state = states.front().unwrap().clone();
+            if states.len() > 1 {
+                states.pop_front();
+            }
+            Ok(state)
+        }
+        async fn exec_in_container(
+            &self,
+            id: &str,
+            _command: Vec<String>,
+            timeout: Duration,
+        ) -> Result<ExecResult, DeployerError> {
+            if self.exec_timeout {
+                return Err(DeployerError::ExecTimeout {
+                    container_id: id.into(),
+                    timeout_secs: timeout.as_secs(),
+                });
+            }
+            if self.exec_error {
+                return Err(DeployerError::ExecFailed {
+                    container_id: id.into(),
+                    reason: "probe output".into(),
+                });
+            }
+            let mut exits = self.exits.lock().unwrap();
+            let code = *exits.front().unwrap();
+            if exits.len() > 1 {
+                exits.pop_front();
+            }
+            Ok(ExecResult {
+                exit_code: code,
+                output: "probe output".into(),
+                truncated: false,
+            })
+        }
+        async fn deploy_container(
+            &self,
+            _: DeployRequest,
+        ) -> Result<temps_deployer::DeployResult, DeployerError> {
+            unreachable!()
+        }
+        async fn start_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn stop_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn pause_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn resume_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn remove_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn get_container_stats(
+            &self,
+            _: &str,
+        ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+            unreachable!()
+        }
+        async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
+            unreachable!()
+        }
+        async fn get_container_logs(&self, _: &str) -> Result<String, DeployerError> {
+            unreachable!()
+        }
+        async fn stream_container_logs(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Send + Unpin>, DeployerError> {
+            unreachable!()
+        }
+    }
+
+    fn probe(kind: &str) -> HealthCheckConfig {
+        HealthCheckConfig {
+            probe_type: Some(kind.into()),
+            stable_for: 1,
+            interval: 1,
+            command: vec!["check-worker".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn health_probe_http_keeps_existing_accepted_and_failed_statuses() {
+        for code in [200, 204, 301, 302, 404, 405] {
+            assert!(http_probe_status_is_healthy(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+        for code in [400, 401, 403, 429, 500, 502, 503] {
+            assert!(!http_probe_status_is_healthy(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_process_requires_stability_and_is_bounded_by_startup_timeout() {
+        let deployer = ProbeDeployer::running();
+        let start = tokio::time::Instant::now();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_ok());
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_crash_after_start_and_restart_loop_fail_for_every_kind() {
+        for kind in ["process", "exec", "tcp"] {
+            let deployer = ProbeDeployer::running();
+            deployer.states.lock().unwrap().front_mut().unwrap().status =
+                DeployerContainerStatus::Exited;
+            let result = wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe(kind),
+                Some("127.0.0.1:1"),
+                Duration::from_secs(2),
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "{kind}");
+            let deployer = ProbeDeployer::running();
+            deployer
+                .states
+                .lock()
+                .unwrap()
+                .front_mut()
+                .unwrap()
+                .restart_count = Some(CRASH_LOOP_RESTART_THRESHOLD);
+            assert!(wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe(kind),
+                Some("127.0.0.1:1"),
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .is_err());
+        }
+        let deployer = ProbeDeployer::running();
+        let mut exited = deployer.states.lock().unwrap().front().unwrap().clone();
+        exited.status = DeployerContainerStatus::Exited;
+        deployer.states.lock().unwrap().push_back(exited);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_process_restart_resets_the_stability_window() {
+        let deployer = ProbeDeployer::running();
+        let mut restarted = deployer.states.lock().unwrap().front().unwrap().clone();
+        restarted.restart_count = Some(1);
+        deployer.states.lock().unwrap().push_back(restarted);
+        let start = tokio::time::Instant::now();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_secs(4),
+            None,
+        )
+        .await
+        .is_ok());
+        assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_retries_nonzero_then_passes_and_rejects_unknown_commands() {
+        let deployer = ProbeDeployer::running();
+        *deployer.exits.lock().unwrap() = VecDeque::from([1, 0]);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .is_ok());
+        *deployer.exits.lock().unwrap() = VecDeque::from([127]);
+        let error = wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("health.command"));
+        *deployer.exits.lock().unwrap() = VecDeque::from([1]);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    struct ProbeLog(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl temps_core::LogWriter for ProbeLog {
+        async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
+            self.0.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_output_is_only_written_to_authorized_job_log() {
+        let deployer = Arc::new(ProbeDeployer::running());
+        *deployer.exits.lock().unwrap() = VecDeque::from([127]);
+        let job = DeployImageJobBuilder::new(
+            "worker",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".into())
+        .build_job_id("build".into())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".into(),
+            network: None,
+        })
+        .service_name("worker".into())
+        .build(deployer.clone())
+        .unwrap();
+        let log = Arc::new(ProbeLog(Mutex::new(Vec::new())));
+        let context = WorkflowContext::new("worker".into(), 1, 1, 1, log.clone());
+        let error = wait_for_non_http_probe(
+            deployer.as_ref(),
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            Some((&job, &context)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("probe output"));
+        assert!(log
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("probe output")));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_output_never_enters_failure_details() {
+        for exit in [1, 126, 127] {
+            let deployer = ProbeDeployer::running();
+            *deployer.exits.lock().unwrap() = VecDeque::from([exit]);
+            let error = wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe("exec"),
+                None,
+                Duration::from_millis(20),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&exit.to_string()), "{error}");
+            assert!(
+                !error.contains("probe output"),
+                "exec output must only appear in authorized job logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_runtime_diagnostics_are_not_persisted() {
+        let mut deployer = ProbeDeployer::running();
+        deployer.exec_error = true;
+        let error = wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exec probe failed"));
+        assert!(!error.contains("probe output"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_timeout_crash_during_command_and_unknown_kind_fail_closed() {
+        let mut deployer = ProbeDeployer::running();
+        deployer.exec_timeout = true;
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("timeout"));
+        let deployer = ProbeDeployer::running();
+        let mut exited = deployer.states.lock().unwrap().front().unwrap().clone();
+        exited.status = DeployerContainerStatus::Exited;
+        deployer.states.lock().unwrap().push_back(exited);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_err());
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("typo"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_err());
+        let mut malformed = probe("exec");
+        malformed.command.clear();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &malformed,
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_success_refused_connection_and_missing_port() {
+        let deployer = ProbeDeployer::running();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .is_ok());
+        drop(listener);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .is_err());
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "tcp-service",
+            &probe("tcp"),
+            None,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_rejects_a_forwarder_that_accepts_then_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let forwarder = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let error = wait_for_non_http_probe(
+            &ProbeDeployer::running(),
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_millis(250),
+            None,
+        )
+        .await
+        .unwrap_err();
+        forwarder.abort();
+        assert!(error.to_string().contains("TCP connection closed"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_confirmation_accepts_a_banner_and_honors_deadlines() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        assert!(confirm_tcp_probe_connection(
+            &stream,
+            tokio::time::Instant::now() + Duration::from_millis(10)
+        )
+        .await
+        .is_err());
+        server.write_all(b"ready\n").await.unwrap();
+        assert!(confirm_tcp_probe_connection(
+            &stream,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_ok());
     }
 }

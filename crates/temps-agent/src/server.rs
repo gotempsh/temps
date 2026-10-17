@@ -114,6 +114,10 @@ pub fn build_router(
             post(handlers::exec_container),
         )
         .route(
+            "/agent/containers/{id}/health-exec",
+            post(handlers::exec_health_probe),
+        )
+        .route(
             "/agent/containers/{id}/terminal",
             get(handlers::terminal_container),
         )

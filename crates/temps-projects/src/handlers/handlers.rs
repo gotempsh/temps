@@ -496,6 +496,7 @@ async fn canonical_template_app_url(
     ),
     components(
         schemas(
+            temps_core::repo_config::HealthCheckConfig,
             CreateProjectRequest,
             super::types::ProjectEnvVarInput,
             DropInspectionResponse,
@@ -2292,6 +2293,18 @@ pub async fn update_project_deployment_config(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    if config.health.is_some() && auth.is_instance_admin() {
+        let project = state.project_service.get_project(project_id).await?;
+        if temps_core::docker_socket_grant::process_grant().declares(&project.slug) {
+            temps_auth::require_sensitive_action(
+                state.sensitive_action_authorizer.as_ref(),
+                &auth,
+                temps_core::SensitiveAction::ChangeDockerSocketHealth { project_id },
+            )
+            .await?;
+        }
+    }
+
     info!("Updating deployment config for project: {}", project_id);
 
     let updated_project = state
@@ -2387,6 +2400,9 @@ pub async fn update_project_deployment_config(
             "max_concurrent_connections".to_string(),
             "updated".to_string(),
         );
+    }
+    if config.health.is_some() {
+        updated_fields.insert("health".to_string(), "updated".to_string());
     }
     if config.health_check_timeout_seconds.is_some() {
         updated_fields.insert(

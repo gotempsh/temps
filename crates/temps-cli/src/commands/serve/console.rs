@@ -4091,8 +4091,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("Event-driven outage detection service started (listening to StatusCheckCompleted jobs)");
 
         // Start container health monitoring (restart count, resource usage)
-        if let Some(container_deployer) =
-            service_context.get_service::<dyn temps_deployer::ContainerDeployer>()
         {
             // Build the metrics store if monitoring is enabled, so container
             // resource metrics are written alongside the alarm logic.
@@ -4129,11 +4127,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 service_context.require_service::<dyn ContainerRuntimeResolver>();
             let mut health_monitor = ContainerHealthMonitor::new(
                 db.clone(),
-                container_deployer,
+                runtime_resolver,
                 alarm_service.clone(),
                 ContainerHealthConfig::default(),
-            )
-            .with_runtime_resolver(runtime_resolver);
+            );
 
             if let Some(ms) = container_metrics_store {
                 health_monitor = health_monitor.with_metrics_store(ms);
@@ -4145,8 +4142,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             });
 
             debug!("Container health monitor started (poll interval: 30s)");
-        } else {
-            debug!("ContainerDeployer not available - container health monitoring disabled");
         }
 
         // Start MetricsScraper for external service DB-level metrics

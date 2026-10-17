@@ -1207,7 +1207,7 @@ async fn execute_plan(
             deployment_id: Set(deployment.id),
             container_id: Set(plan.source_id.clone()),
             container_name: Set(container_name),
-            container_port: Set(port_mapping.container_port as i32),
+            container_port: Set(Some(port_mapping.container_port as i32)),
             host_port: Set(port_mapping.host_port.map(|p| p as i32)),
             image_name: Set(Some(plan.deployment.image.clone())),
             status: Set(Some("pending".to_string())),

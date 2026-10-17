@@ -10260,7 +10260,10 @@
           "container_port": {
             "description": "Port inside the container",
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "cpu_limit_cores": {
             "description": "CPU limit in whole cores (e.g. 1.0). None when no limit is configured.",
@@ -10318,6 +10321,21 @@
               "string",
               "null"
             ]
+          },
+          "health_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_state": {
+            "type": "string"
           },
           "host_port": {
             "description": "Port on the host machine",
@@ -10409,7 +10427,7 @@
           "deployment_id",
           "created_at",
           "deployed_at",
-          "container_port",
+          "health_state",
           "environment_variables"
         ],
         "type": "object"
@@ -10510,6 +10528,13 @@
           "container_name": {
             "type": "string"
           },
+          "container_port": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "cpu_limit_cores": {
             "description": "CPU limit in whole cores (e.g. 1.0). None when no limit is configured.",
             "format": "double",
@@ -10551,6 +10576,21 @@
               "string",
               "null"
             ]
+          },
+          "health_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_state": {
+            "type": "string"
           },
           "image_name": {
             "type": "string"
@@ -16117,6 +16157,17 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig",
+                "description": "Deploy-time probe; environment overrides project, repository config overrides both."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "healthCheckTimeoutSeconds": {
@@ -28379,6 +28430,68 @@
         "required": [
           "has_traces"
         ],
+        "type": "object"
+      },
+      "HealthCheckConfig": {
+        "description": "Health check configuration",
+        "properties": {
+          "command": {
+            "default": [],
+            "description": "Argument vector executed directly inside the container (no implicit shell).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "interval": {
+            "default": 30,
+            "description": "Interval between health checks in seconds (default: 30)",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "default": "/",
+            "description": "HTTP path for health checks",
+            "type": "string"
+          },
+          "retries": {
+            "default": 3,
+            "description": "Number of consecutive failures before marking unhealthy (default: 3)",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stable_for": {
+            "default": 15,
+            "description": "Continuous running window for a process probe, in seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "default": 200,
+            "description": "Expected HTTP status code (default: 200)",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timeout": {
+            "default": 5,
+            "description": "Timeout for health check requests in seconds (default: 5)",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": {
+            "default": null,
+            "description": "Probe kind. Unset selects HTTP for a declared port, process otherwise.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "HealthCheckConfiguration": {
@@ -59905,10 +60018,21 @@
             ]
           },
           "exposedPort": {
+            "description": "Null clears the port override; omitted leaves it unchanged.",
             "format": "int32",
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "healthCheckTimeoutSeconds": {
@@ -60212,6 +60336,24 @@
             "description": "Per-environment HTTP→HTTPS redirect override (tri-state):\n- absent → leave the current override unchanged\n- JSON `null` → clear the override (inherit the proxy default, which\n  redirects only when the host has an active TLS certificate)\n- `true` → always redirect plain HTTP to HTTPS for this environment,\n  even when no local certificate exists (TLS terminated upstream)\n- `false` → never redirect this environment, even when a certificate does\n  exist\n\nRequests under `/.well-known/acme-challenge/` are never redirected\nregardless of this setting, so ACME HTTP-01 validation always completes.",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig",
+                "description": "Deploy-time probe override. Null restores project inheritance; omitted leaves it unchanged."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "health_check_timeout_seconds": {
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -116210,7 +116352,6 @@
             "description": "Internal server error"
           }
         },
-        "summary": "Update environment settings",
         "tags": [
           "Projects"
         ]

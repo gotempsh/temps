@@ -1833,6 +1833,11 @@ impl WorkflowExecutionService {
                 .audit_logger(self.audit_logger.get().cloned())
                 .port(port as u32)
                 .configured_port(configured_port)
+                .health(
+                    env_cfg
+                        .and_then(|c| c.health.clone())
+                        .or_else(|| proj_cfg.and_then(|c| c.health.clone())),
+                )
                 .health_check_timeout_secs(health_check_timeout_secs)
                 .replicas(replicas)
                 .environment_variables(env_variables)
@@ -3577,7 +3582,17 @@ impl WorkflowExecutionService {
         match status {
             temps_entities::types::PipelineStatus::Completed => {
                 // Get deployment URL from environment: prefer custom host, fall back to preview domain
-                let url = if !environment.host.is_empty() {
+                use temps_entities::deployment_containers;
+                let portless = deployment_containers::Entity::find()
+                    .filter(deployment_containers::Column::DeploymentId.eq(updated_deployment.id))
+                    .filter(deployment_containers::Column::DeletedAt.is_null())
+                    .filter(deployment_containers::Column::ContainerPort.is_null())
+                    .one(self.db.as_ref())
+                    .await?
+                    .is_some();
+                let url = if portless {
+                    None
+                } else if !environment.host.is_empty() {
                     Some(format!("https://{}", environment.host))
                 } else if !environment.subdomain.is_empty() {
                     // No custom host set — construct URL from preview domain
@@ -3760,11 +3775,18 @@ impl WorkflowExecutionService {
                 .flatten()
                 .unwrap_or_else(|| format!("container-{}", deployment_id));
 
-            let container_port = context
-                .get_output::<i32>("deploy_container", "container_port")
-                .ok()
-                .flatten()
-                .unwrap_or(8080);
+            let container_port = if context
+                .get_output::<bool>("deploy_container", "portless")?
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                Some(
+                    context
+                        .get_output::<i32>("deploy_container", "container_port")?
+                        .unwrap_or(8080),
+                )
+            };
 
             let host_port = context
                 .get_output::<i32>("deploy_container", "host_port")
@@ -3779,7 +3801,7 @@ impl WorkflowExecutionService {
                 container_id: Set(container_id.clone()),
                 container_name: Set(container_name.clone()),
                 container_port: Set(container_port),
-                host_port: Set(host_port),
+                host_port: Set(container_port.and(host_port)),
                 image_name: Set(match &active_deployment.image_name {
                     sea_orm::ActiveValue::Set(v) => v.clone(),
                     sea_orm::ActiveValue::Unchanged(v) => v.clone(),
@@ -5367,6 +5389,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for MockContainerDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             _request: temps_deployer::DeployRequest,
@@ -6019,6 +6053,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for AssertDeletedBeforeStopDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             _request: temps_deployer::DeployRequest,
@@ -6182,7 +6228,7 @@ mod tests {
                 deployment_id: Set(previous_deployment.id),
                 container_id: Set(container_id.to_string()),
                 container_name: Set(container_id.to_string()),
-                container_port: Set(3000),
+                container_port: Set(Some(3000)),
                 status: Set(Some(status.to_string())),
                 node_id: Set(Some(node_id)),
                 deleted_at: Set(Some(handled_at)),
@@ -6297,7 +6343,7 @@ mod tests {
             deployment_id: Set(previous_deployment.id),
             container_id: Set("old-container-1".to_string()),
             container_name: Set("old-container-1".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             deployed_at: Set(Utc::now()),
             ..Default::default()
         }
@@ -6325,7 +6371,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("failed-container-1".to_string()),
             container_name: Set("failed-container-1".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             status: Set(Some("retained:failed-readiness".to_string())),
             deployed_at: Set(Utc::now()),
             ..Default::default()
@@ -6356,7 +6402,7 @@ mod tests {
             deployment_id: Set(stopped_deployment.id),
             container_id: Set("leaked-stopped-container".to_string()),
             container_name: Set("leaked-stopped-container".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             status: Set(Some("exited".to_string())),
             deployed_at: Set(Utc::now()),
             ..Default::default()
@@ -6375,7 +6421,7 @@ mod tests {
                 deployment_id: Set(failed_deployment.id),
                 container_id: Set(format!("legacy-failed-{index}")),
                 container_name: Set(format!("legacy-failed-{index}")),
-                container_port: Set(3000),
+                container_port: Set(Some(3000)),
                 status: Set(status.map(str::to_string)),
                 deployed_at: Set(Utc::now()),
                 ..Default::default()
@@ -6407,7 +6453,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("failed-remote-container".to_string()),
             container_name: Set("failed-remote-container".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             status: Set(Some("retained:failed-readiness".to_string())),
             node_id: Set(Some(unavailable_node.id)),
             deployed_at: Set(Utc::now()),
@@ -6420,7 +6466,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("legacy-remote-failure".to_string()),
             container_name: Set("legacy-remote-failure".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             status: Set(None),
             node_id: Set(Some(unavailable_node.id)),
             deployed_at: Set(Utc::now()),
@@ -6436,7 +6482,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("legacy-remove-error".to_string()),
             container_name: Set("legacy-remove-error".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             status: Set(None),
             deployed_at: Set(Utc::now()),
             ..Default::default()
@@ -6465,7 +6511,7 @@ mod tests {
             deployment_id: Set(newer_deployment.id),
             container_id: Set("newer-container-1".to_string()),
             container_name: Set("newer-container-1".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             deployed_at: Set(Utc::now()),
             ..Default::default()
         }
@@ -6588,7 +6634,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("stale-cleanup-race".to_string()),
             container_name: Set("stale-cleanup-race".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             status: Set(Some("retained:failed-readiness".to_string())),
             deployed_at: Set(Utc::now()),
             ..Default::default()

@@ -4062,7 +4062,10 @@ mod tests {
             deployment_id,
             container_id: format!("container-{}", id),
             container_name: format!("app-{}", id),
-            container_port: 8080,
+            container_port: Some(8080),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(30000 + id),
             image_name: Some("myapp:latest".to_string()),
             status: Some("running".to_string()),
@@ -4755,6 +4758,12 @@ mod tests {
             Deployer {}
             #[async_trait::async_trait]
             impl temps_deployer::ContainerDeployer for Deployer {
+        async fn exec_in_container(
+            &self, container_id: &str, _command: Vec<String>, _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed { container_id: container_id.to_string(), reason: "exec is not scripted by this test deployer".to_string() })
+        }
+
                 async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
                 async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
                 async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
@@ -5086,7 +5095,7 @@ mod tests {
                 node_id: Set(Some(node_id)),
                 container_id: Set(container_id.to_string()),
                 container_name: Set(container_id.to_string()),
-                container_port: Set(8080),
+                container_port: Set(Some(8080)),
                 status: Set(Some(status.to_string())),
                 deleted_at: Set(retired.then(chrono::Utc::now)),
                 created_at: Set(chrono::Utc::now()),

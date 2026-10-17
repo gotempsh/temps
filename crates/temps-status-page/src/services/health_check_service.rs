@@ -5,7 +5,7 @@ use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect, Select, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Select, Set, TransactionTrait,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
@@ -728,11 +728,57 @@ impl HealthCheckService {
         // still land *during* the request below (which may take several
         // seconds across retries), so `record_check` re-checks live again
         // right before persisting any outcome.
-        if Self::is_deployment_paused(&db, current_deployment_id).await {
+        let deployment = deployments::Entity::find_by_id(current_deployment_id)
+            .one(db.as_ref())
+            .await?;
+        let Some(deployment) = deployment else {
+            return Ok(());
+        };
+        if deployment.state == "paused" {
             debug!(
                 "Skipping monitor {} for paused deployment {}",
                 monitor.id, current_deployment_id
             );
+            return Ok(());
+        }
+        if deployment.static_dir_location.is_none()
+            && Self::is_portless_deployment(db.as_ref(), current_deployment_id).await?
+        {
+            debug!(
+                monitor_id = monitor.id,
+                deployment_id = current_deployment_id,
+                "Retiring HTTP monitor for background worker"
+            );
+            let already_retired = status_checks::Entity::find()
+                .filter(status_checks::Column::MonitorId.eq(monitor.id))
+                .order_by_desc(status_checks::Column::CheckedAt)
+                .order_by_desc(status_checks::Column::Id)
+                .one(db.as_ref())
+                .await?
+                .is_some_and(|check| {
+                    check.status == "unknown"
+                        && check.error_message.as_deref()
+                            == Some("HTTP monitoring does not apply to a background worker")
+                });
+            if already_retired {
+                return Ok(());
+            }
+            // This is retirement of an inapplicable HTTP monitor, not a successful
+            // HTTP check or a runtime worker probe. The outage service rechecks the
+            // current deployment and idempotently retires its old incidents/alarms.
+            job_queue
+                .send(Job::StatusCheckCompleted(StatusCheckCompletedJob {
+                    monitor_id: monitor.id,
+                    status: "not_applicable".into(),
+                    error_message: None,
+                }))
+                .await
+                .map_err(|error| {
+                    StatusPageError::Internal(format!(
+                        "Cannot retire HTTP monitor {}: {error}",
+                        monitor.id
+                    ))
+                })?;
             return Ok(());
         }
         let probe = MonitorProbeSnapshot {
@@ -1115,18 +1161,27 @@ impl HealthCheckService {
         .await
     }
 
-    /// Check if a deployment is currently paused. Always a live read (never
-    /// cached or captured earlier), since it feeds an alarm-suppression
-    /// decision that must reflect `pause_deployment`'s state at the moment
-    /// the caller is about to act, not at some earlier point in the check.
-    async fn is_deployment_paused(db: &Arc<DatabaseConnection>, deployment_id: i32) -> bool {
-        deployments::Entity::find_by_id(deployment_id)
-            .one(db.as_ref())
-            .await
-            .ok()
-            .flatten()
-            .map(|d| d.state == "paused")
-            .unwrap_or(false)
+    /// Whether the deployment has containers but none declares a port.
+    /// Static deployments are handled by the caller because they need no container.
+    async fn is_portless_deployment(
+        db: &DatabaseConnection,
+        deployment_id: i32,
+    ) -> Result<bool, sea_orm::DbErr> {
+        // One aggregate row, regardless of replica count. Keep stopped workers
+        // in this test so HTTP outages are never inferred from a missing port.
+        let counts = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .select_only()
+            .column_as(deployment_containers::Column::Id.count(), "container_count")
+            .column_as(
+                deployment_containers::Column::ContainerPort.count(),
+                "port_count",
+            )
+            .into_tuple::<(i64, i64)>()
+            .one(db)
+            .await?;
+        Ok(counts.is_some_and(|(containers, ports)| containers > 0 && ports == 0))
     }
 
     /// Record a check result in the database with retry logic and emit job for outage detection.
@@ -1553,11 +1608,11 @@ impl HealthCheckService {
             return Ok(("no_container".to_string(), None));
         };
 
+        let Some(container_port) = container.container_port else {
+            return Ok(("unknown".to_string(), None));
+        };
         // Construct the check URL
-        let check_url = format!(
-            "http://{}:{}/",
-            container.container_name, container.container_port
-        );
+        let check_url = format!("http://{}:{}/", container.container_name, container_port);
 
         // Perform the check
         let start_time = std::time::Instant::now();
@@ -2391,6 +2446,146 @@ mod tests {
             Arc::new(config),
             db.clone(),
         ))
+    }
+
+    fn health_probe_deployment() -> deployments::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "project_id": 1, "environment_id": 1,
+            "slug": "worker", "state": "completed", "docker_socket_mounted": false,
+            "created_at": Utc::now(), "updated_at": Utc::now()
+        }))
+        .unwrap()
+    }
+
+    fn health_probe_counts(
+        containers: i64,
+        ports: i64,
+    ) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([
+            ("container_count".into(), containers.into()),
+            ("port_count".into(), ports.into()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn health_probe_portless_monitor_requests_retirement_without_checking_http() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        // Every entry path (periodic, MonitorCreated and DeploymentSucceeded)
+        // uses check_monitor. Supplying only these reads also makes any attempt
+        // to resolve an HTTP URL or write a status check fail the test.
+        for managed in [true, false] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![make_env(1, false)]])
+                    .append_query_results([vec![health_probe_deployment()]])
+                    .append_query_results([vec![health_probe_counts(2, 0)]])
+                    .append_query_results([Vec::<status_checks::Model>::new()])
+                    .into_connection(),
+            );
+            let config = test_config_service(&db, "postgres://localhost/test");
+            let mut monitor = make_monitor(1, Some(1));
+            monitor.is_managed = managed;
+            let queue: Arc<dyn JobQueue> = Arc::new(RejectHealthProbeJobs);
+            HealthCheckService::check_monitor(
+                db.clone(),
+                reqwest::Client::new(),
+                config,
+                monitor,
+                queue,
+            )
+            .await
+            .unwrap();
+            let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            assert_eq!(log.len(), 4);
+            let log = format!("{log:?}");
+            assert!(!log.contains("INSERT"));
+            assert!(
+                log.contains("deleted_at"),
+                "retired containers must not decide portlessness"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_retired_http_monitor_does_not_repeat_retirement_jobs() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        struct NoJobs;
+        #[async_trait::async_trait]
+        impl JobQueue for NoJobs {
+            async fn send(&self, _: Job) -> Result<(), QueueError> {
+                panic!("completed retirement must not be requeued");
+            }
+            fn subscribe(&self) -> Box<dyn JobReceiver> {
+                panic!("not used");
+            }
+        }
+        let now = Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 0)]])
+                .append_query_results([vec![status_checks::Model {
+                    id: 1,
+                    monitor_id: 1,
+                    status: "unknown".into(),
+                    checked_at: now,
+                    created_at: now,
+                    response_time_ms: None,
+                    error_message: Some(
+                        "HTTP monitoring does not apply to a background worker".into(),
+                    ),
+                }]])
+                .into_connection(),
+        );
+        HealthCheckService::check_monitor(
+            db.clone(),
+            reqwest::Client::new(),
+            test_config_service(&db, "postgres://localhost/test"),
+            make_monitor(1, Some(1)),
+            Arc::new(NoJobs),
+        )
+        .await
+        .unwrap();
+    }
+
+    struct RejectHealthProbeJobs;
+    #[async_trait::async_trait]
+    impl JobQueue for RejectHealthProbeJobs {
+        async fn send(&self, _job: Job) -> Result<(), QueueError> {
+            match _job {
+                Job::StatusCheckCompleted(job) => assert_eq!(job.status, "not_applicable"),
+                _ => panic!("portless HTTP monitoring must only retire its old HTTP state"),
+            }
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("probe test does not subscribe")
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_http_monitor_only_skips_deployments_with_no_declared_ports() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (containers, ports, portless) in
+            [(2, 0, true), (2, 1, false), (2, 2, false), (0, 0, false)]
+        {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![health_probe_counts(containers, ports)]])
+                .into_connection();
+            assert_eq!(
+                HealthCheckService::is_portless_deployment(&db, 1)
+                    .await
+                    .unwrap(),
+                portless
+            );
+        }
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("probe metadata unavailable".into())])
+            .into_connection();
+        assert!(HealthCheckService::is_portless_deployment(&db, 1)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -1210,7 +1210,7 @@ pub async fn service_exec(
             )
             .into_response();
         }
-        ExecDeadlineOutcome::ContainerRestarted => {
+        ExecDeadlineOutcome::ContainerTerminated => {
             cleanup_guard.disarm();
             return error_response(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -1762,7 +1762,7 @@ pub async fn backup_service(
             )
             .into_response();
         }
-        ExecDeadlineOutcome::ContainerRestarted => {
+        ExecDeadlineOutcome::ContainerTerminated => {
             cleanup_guard.disarm();
             return error_response(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -2052,7 +2052,7 @@ pub async fn restore_service(
             )
             .into_response();
         }
-        ExecDeadlineOutcome::ContainerRestarted => {
+        ExecDeadlineOutcome::ContainerTerminated => {
             cleanup_guard.disarm();
             return error_response(
                 StatusCode::GATEWAY_TIMEOUT,

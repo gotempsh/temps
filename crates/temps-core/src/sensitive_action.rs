@@ -132,6 +132,10 @@ pub enum SensitiveAction {
     ReleaseDockerSocketSlug {
         project_id: i32,
     },
+    /// Change a probe that can execute code with the host Docker socket.
+    ChangeDockerSocketHealth {
+        project_id: i32,
+    },
 }
 
 impl SensitiveAction {
@@ -173,6 +177,7 @@ impl SensitiveAction {
             Self::RetentionRetroactiveApply { .. } => "retention_retroactive_apply",
             Self::ClaimDockerSocketSlug { .. } => "claim_docker_socket_slug",
             Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
+            Self::ChangeDockerSocketHealth { .. } => "change_docker_socket_health",
         }
     }
 }

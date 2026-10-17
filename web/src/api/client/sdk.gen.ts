@@ -8207,9 +8207,6 @@ export const addEnvironmentDomain = <ThrowOnError extends boolean = false>(optio
  */
 export const deleteEnvironmentDomain = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentDomainData, ThrowOnError>): RequestResult<DeleteEnvironmentDomainResponses, DeleteEnvironmentDomainErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentDomainResponses, DeleteEnvironmentDomainErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}/domains/{domain_id}', ...options });
 
-/**
- * Update environment settings
- */
 export const updateEnvironmentSettings = <ThrowOnError extends boolean = false>(options: Options<UpdateEnvironmentSettingsData, ThrowOnError>): RequestResult<UpdateEnvironmentSettingsResponses, UpdateEnvironmentSettingsErrors, ThrowOnError> => (options.client ?? client).put<UpdateEnvironmentSettingsResponses, UpdateEnvironmentSettingsErrors, ThrowOnError>({
     url: '/projects/{project_id}/environments/{env_id}/settings',
     ...options,

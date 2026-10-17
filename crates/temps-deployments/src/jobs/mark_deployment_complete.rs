@@ -454,13 +454,19 @@ impl MarkDeploymentCompleteJob {
             .ok();
         }
 
+        let portless = context
+            .get_output::<bool>("deploy_container", "portless")?
+            .unwrap_or(false);
+        let gate_health = context
+            .get_output::<String>("deploy_container", "health_state")?
+            .unwrap_or_else(|| "unknown".to_string());
         if let Some(container_ids) = container_ids {
             let now = chrono::Utc::now();
             let container_port = context
                 .get_output::<i32>("deploy_container", "container_port")
                 .ok()
                 .flatten()
-                .unwrap_or(8080);
+                .or(if portless { None } else { Some(8080) });
 
             // Compose-specific: per-container data arrays (set by DeployComposeJob)
             let service_names: Option<Vec<String>> = context
@@ -514,7 +520,7 @@ impl MarkDeploymentCompleteJob {
                 let effective_port = container_ports_list
                     .as_ref()
                     .and_then(|ports| ports.get(index).copied())
-                    .unwrap_or(container_port);
+                    .or(container_port);
 
                 let host_port = host_ports
                     .as_ref()
@@ -551,7 +557,14 @@ impl MarkDeploymentCompleteJob {
                     container_id: Set(container_id.clone()),
                     container_name: Set(container_name.clone()),
                     container_port: Set(effective_port),
-                    host_port: Set(host_port),
+                    health_state: Set(gate_health.clone()),
+                    health_checked_at: Set((gate_health != "unknown").then_some(now)),
+                    health_detail: Set(None),
+                    host_port: Set(if effective_port.is_some() {
+                        host_port
+                    } else {
+                        None
+                    }),
                     port_bindings: Set(port_bindings_list
                         .as_ref()
                         .and_then(|bindings| bindings.get(index).cloned())),
@@ -789,6 +802,9 @@ impl MarkDeploymentCompleteJob {
         // environment_id + deployment_id. We wait here until we see the
         // matching event or timeout.
         const ROUTE_READY_TIMEOUT_SECS: u64 = 60;
+        // A portless deployment still changes routing: the previous HTTP
+        // routes must be withdrawn before any previous containers are stopped.
+        // Successful reloads also confirm empty tables; no new route is required.
         let route_ready = Self::wait_for_route_ready(
             &mut route_receiver,
             self.db.as_ref(),
@@ -835,8 +851,12 @@ impl MarkDeploymentCompleteJob {
             )));
         }
 
-        self.log("Route table confirmed — new deployment is routable".to_string())
-            .await?;
+        self.log(if portless {
+            "Route table confirmed — previous HTTP routes withdrawn".to_string()
+        } else {
+            "Route table confirmed — new deployment is routable".to_string()
+        })
+        .await?;
 
         // ── Phase 2.5: Wait for every worker to apply the new generation ──
         //
@@ -866,8 +886,8 @@ impl MarkDeploymentCompleteJob {
         if !cluster_dns_enabled {
             self.log(
                 "Cluster DNS is disabled — skipping the DNS-generation propagation check \
-                 (only route propagation is verified). Enable it under Settings > Nodes if \
-                 deployed containers need to resolve *.temps.local hostnames."
+             (only route propagation is verified). Enable it under Settings > Nodes if \
+             deployed containers need to resolve *.temps.local hostnames."
                     .to_string(),
             )
             .await
@@ -886,12 +906,12 @@ impl MarkDeploymentCompleteJob {
                 "Worker propagation gate exceeded {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
             );
             self.log(format!(
-                "Worker propagation incomplete after {WORKER_APPLY_TIMEOUT_SECS}s ({reason}) — reverting to the last usable deployment"
-            ))
-            .await?;
+            "Worker propagation incomplete after {WORKER_APPLY_TIMEOUT_SECS}s ({reason}) — reverting to the last usable deployment"
+        ))
+        .await?;
             let failure_reason = format!(
-                "Worker route/DNS propagation did not complete within {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
-            );
+            "Worker route/DNS propagation did not complete within {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
+        );
             self.reject_unusable_deployment(
                 environment_id,
                 last_successful_deployment_id,
@@ -1109,7 +1129,9 @@ impl MarkDeploymentCompleteJob {
         // Get deployment URL from environment: prefer custom host, fall back to preview domain.
         // Use the scheme from external_url so HTTP-only installs (sslip.io quick/local
         // modes) don't emit dead https:// links for custom-host environments.
-        let url = if !environment.host.is_empty() {
+        let url = if portless {
+            None
+        } else if !environment.host.is_empty() {
             let scheme = if let Some(ref cs) = self.config_service {
                 cs.get_url_scheme()
                     .await
@@ -2921,6 +2943,142 @@ mod teardown_tests {
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
 
+    struct RouteEvents(std::collections::VecDeque<Job>);
+
+    #[async_trait]
+    impl JobReceiver for RouteEvents {
+        async fn recv(&mut self) -> Result<Job, QueueError> {
+            if let Some(job) = self.0.pop_front() {
+                return Ok(job);
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn portless_environment(current_deployment_id: i32) -> environments::Model {
+        serde_json::from_value(serde_json::json!({
+            "id":1, "project_id":1, "name":"production", "slug":"production", "subdomain":"worker-production",
+            "host":"worker.example.com", "upstreams":[], "current_deployment_id":current_deployment_id,
+            "created_at":chrono::Utc::now(), "updated_at":chrono::Utc::now(), "is_preview":false, "protected":false, "sleeping":false
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_probe_portless_completion_requires_a_successful_reload_even_with_zero_routes() {
+        for event_environment in [Some(1), None] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![portless_environment(2)]])
+                .into_connection();
+            let mut events: Box<dyn JobReceiver> =
+                Box::new(RouteEvents(std::collections::VecDeque::from([
+                    Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
+                        environment_id: event_environment,
+                        deployment_id: Some(2),
+                        route_count: 0,
+                    }),
+                ])));
+            MarkDeploymentCompleteJob::wait_for_route_ready(
+                &mut events,
+                &db,
+                1,
+                2,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        }
+        // A failed/missing reload must leave the completion gate closed. No
+        // database pointer alone can prove stale in-memory routes were removed.
+        let mut events: Box<dyn JobReceiver> = Box::new(RouteEvents(Default::default()));
+        assert!(MarkDeploymentCompleteJob::wait_for_route_ready(
+            &mut events,
+            &DbConnection::Disconnected,
+            1,
+            2,
+            std::time::Duration::from_millis(20)
+        )
+        .await
+        .unwrap_err()
+        .contains("Timed out"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![portless_environment(3)]])
+            .into_connection();
+        let mut events: Box<dyn JobReceiver> =
+            Box::new(RouteEvents(std::collections::VecDeque::from([
+                Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
+                    environment_id: Some(1),
+                    deployment_id: Some(2),
+                    route_count: 0,
+                }),
+            ])));
+        assert!(MarkDeploymentCompleteJob::wait_for_route_ready(
+            &mut events,
+            &db,
+            1,
+            2,
+            std::time::Duration::from_millis(50)
+        )
+        .await
+        .unwrap_err()
+        .contains("superseded"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_portless_withdrawal_requires_worker_route_and_enabled_dns_acknowledgements(
+    ) {
+        for (dns_enabled, route_ack, dns_ack, success) in [
+            (false, 7, 0, true),
+            (false, 6, 0, false),
+            (true, 7, 9, true),
+            (true, 7, 8, false),
+        ] {
+            let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[BTreeMap::from([("current", Value::BigInt(Some(7)))])]]);
+            if dns_enabled {
+                mock = mock.append_query_results([[BTreeMap::from([(
+                    "current",
+                    Value::BigInt(Some(9)),
+                )])]]);
+            }
+            mock = mock
+                .append_query_results([[BTreeMap::from([("id", Value::Int(Some(1)))])]])
+                .append_query_results([vec![temps_entities::node_route_state::Model {
+                    node_id: 1,
+                    applied_generation: route_ack,
+                    last_sync_at: None,
+                    health: "healthy".into(),
+                }]]);
+            if dns_enabled {
+                mock = mock.append_query_results([vec![temps_entities::node_dns_state::Model {
+                    node_id: 1,
+                    applied_generation: dns_ack,
+                    last_sync_at: None,
+                    health: "healthy".into(),
+                }]]);
+            }
+            if route_ack < 7 {
+                mock = mock.append_query_results([[BTreeMap::from([
+                    ("id", Value::Int(Some(1))),
+                    ("name", Value::String(Some(Box::new("worker-a".into())))),
+                ])]]);
+            }
+            let result = MarkDeploymentCompleteJob::wait_for_worker_apply(
+                &mock.into_connection(),
+                std::time::Duration::ZERO,
+                dns_enabled,
+            )
+            .await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            if !success {
+                assert!(result.unwrap_err().contains(if route_ack < 7 {
+                    "behind on route_gen"
+                } else {
+                    "behind on dns_gen"
+                }));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_worker_barrier_fails_closed_when_route_generation_cannot_be_loaded() {
         for (case, mock) in [
@@ -3017,6 +3175,18 @@ mod teardown_tests {
 
     #[async_trait]
     impl ContainerDeployer for RecordingDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             request: DeployRequest,
@@ -3150,7 +3320,7 @@ mod teardown_tests {
             deployment_id: Set(deployment_id),
             container_id: Set(container_id.to_string()),
             container_name: Set(container_id.to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             status: Set(Some("running".to_string())),
             created_at: Set(chrono::Utc::now()),
             deployed_at: Set(chrono::Utc::now()),
