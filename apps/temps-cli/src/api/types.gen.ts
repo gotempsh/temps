@@ -4538,7 +4538,7 @@ export type ContainerDetailResponse = {
     /**
      * Port inside the container
      */
-    container_port: number;
+    container_port?: number | null;
     /**
      * CPU limit in whole cores (e.g. 1.0). None when no limit is configured.
      */
@@ -4566,6 +4566,9 @@ export type ContainerDetailResponse = {
      * When the container exited (Docker's FinishedAt). None while running.
      */
     finished_at?: string | null;
+    health_checked_at?: string | null;
+    health_detail?: string | null;
+    health_state: string;
     /**
      * Port on the host machine
      */
@@ -4642,6 +4645,7 @@ export type ContainerHistoryListResponse = {
 export type ContainerInfoResponse = {
     container_id: string;
     container_name: string;
+    container_port?: number | null;
     /**
      * CPU limit in whole cores (e.g. 1.0). None when no limit is configured.
      */
@@ -4664,6 +4668,9 @@ export type ContainerInfoResponse = {
      * When the container exited (Docker's FinishedAt). None while running.
      */
     finished_at?: string | null;
+    health_checked_at?: string | null;
+    health_detail?: string | null;
+    health_state?: string;
     image_name: string;
     /**
      * Node name where this container is running. None for local (single-node) deployments.
@@ -7246,6 +7253,7 @@ export type DeploymentConfig = {
      * If not specified, will be auto-detected from Docker image or default to 3000
      */
     exposedPort?: number | null;
+    health?: HealthCheckConfig | null;
     /**
      * How long, in seconds, a new container may take to start and pass its
      * readiness check before the deployment fails. Covers apps that boot
@@ -12519,6 +12527,44 @@ export type HasMetricsResponse = {
 
 export type HasTracesResponse = {
     has_traces: boolean;
+};
+
+/**
+ * Health check configuration
+ */
+export type HealthCheckConfig = {
+    /**
+     * Argument vector executed directly inside the container (no implicit shell).
+     */
+    command?: Array<string>;
+    /**
+     * Interval between health checks in seconds (default: 30)
+     */
+    interval?: number;
+    /**
+     * HTTP path for health checks
+     */
+    path?: string;
+    /**
+     * Number of consecutive failures before marking unhealthy (default: 3)
+     */
+    retries?: number;
+    /**
+     * Continuous running window for a process probe, in seconds.
+     */
+    stable_for?: number;
+    /**
+     * Expected HTTP status code (default: 200)
+     */
+    status?: number;
+    /**
+     * Timeout for health check requests in seconds (default: 5)
+     */
+    timeout?: number;
+    /**
+     * Probe kind. Unset selects HTTP for a declared port, process otherwise.
+     */
+    type?: string | null;
 };
 
 /**
@@ -26165,7 +26211,11 @@ export type UpdateDeploymentConfigRequest = {
      * opted into rather than triggered by cluster topology.
      */
     crossArchitectureBuilds?: boolean | null;
+    /**
+     * Null clears the port override; omitted leaves it unchanged.
+     */
     exposedPort?: number | null;
+    health?: HealthCheckConfig | null;
     /**
      * How long, in seconds (30-3600), a new deployment's containers may take
      * to start and pass their readiness check before the deployment fails.
@@ -26320,6 +26370,8 @@ export type UpdateEnvironmentSettingsRequest = {
      * regardless of this setting, so ACME HTTP-01 validation always completes.
      */
     force_https?: boolean | null;
+    health?: HealthCheckConfig | null;
+    health_check_timeout_seconds?: number | null;
     /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
