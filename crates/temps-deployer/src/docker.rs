@@ -43,6 +43,85 @@ const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
 const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
 
+/// Own a possibly running deployment probe across cancellation and error paths.
+/// Docker cannot kill only an exec, so cleanup stops its immutable candidate ID.
+struct ProbeExecCleanup {
+    docker: Arc<Docker>,
+    container_id: String,
+    armed: bool,
+}
+
+impl ProbeExecCleanup {
+    fn new(docker: Arc<Docker>, container_id: String) -> Self {
+        Self {
+            docker,
+            container_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeExecCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let docker = self.docker.clone();
+        let container_id = self.container_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                container_id,
+                "Probe cleanup could not start because the async runtime stopped"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            // Bound both request duration and retries. No container restart is
+            // ever issued, even if retention has already stopped this candidate.
+            for attempt in 0..3 {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    docker.stop_container(
+                        &container_id,
+                        Some(StopContainerOptions {
+                            t: Some(0),
+                            ..Default::default()
+                        }),
+                    ),
+                )
+                .await;
+                if matches!(
+                    result,
+                    Ok(Ok(()))
+                        | Ok(Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 304 | 404,
+                            ..
+                        }))
+                ) {
+                    return;
+                }
+                warn!(
+                    container_id,
+                    attempt = attempt + 1,
+                    "Probe candidate stop could not be confirmed"
+                );
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * (1 << attempt)))
+                        .await;
+                }
+            }
+            error!(
+                container_id,
+                "Probe candidate cleanup exhausted its bounded stop retries"
+            );
+        });
+    }
+}
+
 /// Write the build context under `root` into `archive` the way the Docker
 /// CLI sends it: paths the Dockerfile's ignore rules exclude are left out,
 /// symlinks are archived as links, and every entry is owned by root.
@@ -4010,6 +4089,25 @@ impl ContainerDeployer for DockerRuntime {
                 )
                 .await
                 .map_err(|e| failure(e.to_string()))?;
+            // Creating an exec does not start it. Pin Docker's canonical container
+            // identity before the first start await, so cleanup cannot stop a
+            // replacement that later acquires the same operator-facing name.
+            let prepared = docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|error| failure(error.to_string()))?;
+            let pinned_id = prepared
+                .container_id
+                .filter(|id| {
+                    id.len() == 64
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(|| {
+                    failure("probe exec did not report a canonical container ID".into())
+                })?;
+            let mut cleanup = ProbeExecCleanup::new(docker.clone(), pinned_id);
             let bollard::exec::StartExecResults::Attached { mut output, .. } = docker
                 .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
                 .await
@@ -4032,6 +4130,8 @@ impl ContainerDeployer for DockerRuntime {
                     "command completion could not be confirmed".to_string(),
                 ));
             }
+            // Positive stopped state is the only proof that no command remains.
+            cleanup.disarm();
             let exit_code = inspect
                 .exit_code
                 .ok_or_else(|| failure("completed command has no exit code".to_string()))?;
@@ -4044,25 +4144,8 @@ impl ContainerDeployer for DockerRuntime {
         match tokio::time::timeout(timeout, operation).await {
             Ok(result) => result,
             Err(_) => {
-                // Docker has no kill-exec API. Stop this new candidate so a hung
-                // health command cannot survive and accumulate on retries.
-                let cleanup_container_id = container_id.to_string();
-                tokio::spawn(async move {
-                    let cleanup = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        docker.stop_container(
-                            &cleanup_container_id,
-                            Some(StopContainerOptions {
-                                t: Some(0),
-                                ..Default::default()
-                            }),
-                        ),
-                    )
-                    .await;
-                    if !matches!(cleanup, Ok(Ok(()))) {
-                        warn!(container_id = %cleanup_container_id, "Timed-out probe container stop could not be confirmed");
-                    }
-                });
+                // Dropping the armed guard also handles an outer deadline, task
+                // cancellation, a broken output stream or ambiguous inspection.
                 Err(DeployerError::ExecTimeout {
                     container_id: container_id.to_string(),
                     timeout_secs: timeout.as_secs(),
@@ -8708,23 +8791,73 @@ mod health_probe_exec_tests {
 #[cfg(test)]
 mod health_probe_docker_protocol_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CANDIDATE_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProbeScript {
+        Complete,
+        StallStart,
+        StallStream,
+        BrokenStream,
+        InspectFailed,
+        InspectRunning,
+        InspectUnknown,
+        StartFailed,
+        StopFailsOnce,
+    }
+
+    #[derive(Default)]
+    struct ProbeDockerState {
+        started: AtomicBool,
+        stopped: AtomicBool,
+        inspections: AtomicUsize,
+        stop_calls: AtomicUsize,
+        restart_calls: AtomicUsize,
+        stop_notice: tokio::sync::Notify,
+    }
 
     async fn runtime(
         output: Vec<u8>,
         exit_code: Option<i64>,
         stall: bool,
-    ) -> (DockerRuntime, tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+    ) -> (
+        DockerRuntime,
+        tokio::task::JoinHandle<()>,
+        Arc<ProbeDockerState>,
+    ) {
+        scripted_runtime(
+            output,
+            exit_code,
+            if stall {
+                ProbeScript::StallStart
+            } else {
+                ProbeScript::Complete
+            },
+        )
+        .await
+    }
+
+    async fn scripted_runtime(
+        output: Vec<u8>,
+        exit_code: Option<i64>,
+        script: ProbeScript,
+    ) -> (
+        DockerRuntime,
+        tokio::task::JoinHandle<()>,
+        Arc<ProbeDockerState>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
-        let stopped = Arc::new(AtomicBool::new(false));
-        let stopped_server = stopped.clone();
+        let state = Arc::new(ProbeDockerState::default());
+        let state_server = state.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let output = output.clone();
-                let stopped = stopped_server.clone();
+                let state = state_server.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buffer = [0; 1024];
@@ -8757,28 +8890,68 @@ mod health_probe_docker_protocol_tests {
                         .unwrap()
                         .to_string();
                     if path.contains("/start") {
-                        if stall {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        state.started.store(true, Ordering::SeqCst);
+                        if matches!(script, ProbeScript::StallStart | ProbeScript::StopFailsOnce) {
+                            state.stop_notice.notified().await;
+                            return;
+                        }
+                        if script == ProbeScript::StartFailed {
+                            let _ = socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
                             return;
                         }
                         socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n").await.unwrap();
                         let mut frame = vec![1, 0, 0, 0];
-                        frame.extend_from_slice(&(output.len() as u32).to_be_bytes());
-                        frame.extend_from_slice(&output);
-                        socket.write_all(&frame).await.unwrap();
+                        if script == ProbeScript::BrokenStream {
+                            frame.extend_from_slice(&1024_u32.to_be_bytes());
+                            frame.extend_from_slice(b"incomplete output");
+                        } else {
+                            frame.extend_from_slice(&(output.len() as u32).to_be_bytes());
+                            frame.extend_from_slice(&output);
+                        }
+                        let _ = socket.write_all(&frame).await;
+                        if script == ProbeScript::StallStream {
+                            state.stop_notice.notified().await;
+                        }
                     } else {
+                        let mut status = "200 OK";
                         let body = if path.contains("/stop") {
-                            stopped.store(true, Ordering::Relaxed);
+                            assert!(
+                                path.contains(&format!("/containers/{CANDIDATE_ID}/stop")),
+                                "cleanup must use the immutable ID: {path}"
+                            );
+                            let call = state.stop_calls.fetch_add(1, Ordering::SeqCst);
+                            if script == ProbeScript::StopFailsOnce && call == 0 {
+                                status = "500 Internal Server Error";
+                                "{}".into()
+                            } else {
+                                state.stopped.store(true, Ordering::SeqCst);
+                                state.stop_notice.notify_waiters();
+                                String::new()
+                            }
+                        } else if path.contains("/restart") {
+                            state.restart_calls.fetch_add(1, Ordering::SeqCst);
                             String::new()
                         } else if path.contains("/json") {
-                            serde_json::json!({"Running": false, "ExitCode": exit_code}).to_string()
+                            let prepared = state.inspections.fetch_add(1, Ordering::SeqCst) == 0;
+                            if !prepared && script == ProbeScript::InspectFailed {
+                                status = "500 Internal Server Error";
+                                "{}".into()
+                            } else {
+                                let running = if !prepared && script == ProbeScript::InspectUnknown
+                                {
+                                    None
+                                } else {
+                                    Some(!prepared && script == ProbeScript::InspectRunning)
+                                };
+                                serde_json::json!({ "ContainerID": CANDIDATE_ID, "Running": running, "ExitCode": exit_code }).to_string()
+                            }
                         } else {
-                            "{\"Id\":\"health-exec\"}".to_string()
+                            "{\"Id\":\"health-exec\"}".into()
                         };
-                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-                        socket.write_all(response.as_bytes()).await.unwrap();
+                        let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        let _ = socket.write_all(response.as_bytes()).await;
                     }
-                    socket.shutdown().await.unwrap();
+                    let _ = socket.shutdown().await;
                 });
             }
         });
@@ -8787,14 +8960,96 @@ mod health_probe_docker_protocol_tests {
         (
             DockerRuntime::new(docker, false, "unused-test-network".into()),
             task,
-            stopped,
+            state,
         )
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_probe_local_cleanup_survives_outer_deadlines_and_task_cancellation() {
+        for script in [
+            ProbeScript::StallStart,
+            ProbeScript::StallStream,
+            ProbeScript::StopFailsOnce,
+        ] {
+            for abort_task in [false, true] {
+                let (runtime, server, state) =
+                    scripted_runtime(b"waiting".to_vec(), Some(0), script).await;
+                let operation = async move {
+                    runtime
+                        .exec_in_container(
+                            "candidate-alias",
+                            vec!["check-worker".into()],
+                            std::time::Duration::from_secs(30),
+                        )
+                        .await
+                };
+                if abort_task {
+                    let task = tokio::spawn(operation);
+                    wait_for_flag(&state.started).await;
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(50), operation)
+                            .await
+                            .is_err()
+                    );
+                }
+                wait_for_flag(&state.stopped).await;
+                assert_eq!(state.restart_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    state.stop_calls.load(Ordering::SeqCst),
+                    if script == ProbeScript::StopFailsOnce {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_local_cleanup_runs_on_ambiguous_start_stream_and_inspect_errors() {
+        for script in [
+            ProbeScript::StartFailed,
+            ProbeScript::BrokenStream,
+            ProbeScript::InspectFailed,
+            ProbeScript::InspectRunning,
+            ProbeScript::InspectUnknown,
+        ] {
+            let (runtime, server, state) =
+                scripted_runtime(b"output".to_vec(), Some(0), script).await;
+            let error = runtime
+                .exec_in_container(
+                    "candidate-alias",
+                    vec!["check-worker".into()],
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DeployerError::ExecFailed { .. }));
+            wait_for_flag(&state.stopped).await;
+            assert_eq!(state.restart_calls.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
     }
 
     #[tokio::test]
     async fn health_probe_local_docker_protocol_captures_exit_status_and_truncates_output() {
         for code in [0, 1, 127] {
-            let (runtime, server, _) = runtime(vec![b'x'; 8192], Some(code), false).await;
+            let (runtime, server, state) = runtime(vec![b'x'; 8192], Some(code), false).await;
             let result = runtime
                 .exec_in_container(
                     "worker-container",
@@ -8806,6 +9061,12 @@ mod health_probe_docker_protocol_tests {
             assert_eq!(result.exit_code, code);
             assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
             assert!(result.truncated);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(
+                state.stop_calls.load(Ordering::SeqCst),
+                0,
+                "completed commands must disarm candidate cleanup, including nonzero exits"
+            );
             server.abort();
         }
         let (runtime, server, _) = runtime(b"ready".to_vec(), None, false).await;
@@ -8834,13 +9095,13 @@ mod health_probe_docker_protocol_tests {
         assert!(matches!(result, Err(DeployerError::ExecTimeout { .. })));
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         for _ in 0..20 {
-            if stopped.load(Ordering::Relaxed) {
+            if stopped.stopped.load(Ordering::Relaxed) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            stopped.load(Ordering::Relaxed),
+            stopped.stopped.load(Ordering::Relaxed),
             "hung exec cleanup must target the candidate container"
         );
         server.abort();

@@ -802,18 +802,17 @@ impl MarkDeploymentCompleteJob {
         // environment_id + deployment_id. We wait here until we see the
         // matching event or timeout.
         const ROUTE_READY_TIMEOUT_SECS: u64 = 60;
-        let route_ready = if portless {
-            Ok(())
-        } else {
-            Self::wait_for_route_ready(
-                &mut route_receiver,
-                self.db.as_ref(),
-                environment_id,
-                self.deployment_id,
-                std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
-            )
-            .await
-        };
+        // A portless deployment still changes routing: the previous HTTP
+        // routes must be withdrawn before any previous containers are stopped.
+        // Successful reloads also confirm empty tables; no new route is required.
+        let route_ready = Self::wait_for_route_ready(
+            &mut route_receiver,
+            self.db.as_ref(),
+            environment_id,
+            self.deployment_id,
+            std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
+        )
+        .await;
 
         if let Err(ref reason) = route_ready {
             // ── Timeout / failure path ───────────────────────────────────
@@ -852,8 +851,12 @@ impl MarkDeploymentCompleteJob {
             )));
         }
 
-        self.log("Route table confirmed — new deployment is routable".to_string())
-            .await?;
+        self.log(if portless {
+            "Route table confirmed — previous HTTP routes withdrawn".to_string()
+        } else {
+            "Route table confirmed — new deployment is routable".to_string()
+        })
+        .await?;
 
         // ── Phase 2.5: Wait for every worker to apply the new generation ──
         //
@@ -877,56 +880,51 @@ impl MarkDeploymentCompleteJob {
         // this check it would wait for an ACK that can structurally never
         // arrive and revert every single deployment after the full 10s,
         // regardless of whether routing actually propagated fine.
-        let cluster_dns_enabled = if portless {
-            false
-        } else {
-            self.cluster_dns_enabled_or_reject(environment_id, last_successful_deployment_id)
-                .await?
-        };
-        if !portless {
-            if !cluster_dns_enabled {
-                self.log(
-                    "Cluster DNS is disabled — skipping the DNS-generation propagation check \
-                 (only route propagation is verified). Enable it under Settings > Nodes if \
-                 deployed containers need to resolve *.temps.local hostnames."
-                        .to_string(),
-                )
-                .await
-                .ok();
-            }
-            if let Err(reason) = Self::wait_for_worker_apply(
-                self.db.as_ref(),
-                std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
-                cluster_dns_enabled,
+        let cluster_dns_enabled = self
+            .cluster_dns_enabled_or_reject(environment_id, last_successful_deployment_id)
+            .await?;
+        if !cluster_dns_enabled {
+            self.log(
+                "Cluster DNS is disabled — skipping the DNS-generation propagation check \
+             (only route propagation is verified). Enable it under Settings > Nodes if \
+             deployed containers need to resolve *.temps.local hostnames."
+                    .to_string(),
             )
             .await
-            {
-                tracing::error!(
-                    deployment_id = self.deployment_id,
-                    environment_id,
-                    "Worker propagation gate exceeded {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
-                );
-                self.log(format!(
-                "Worker propagation incomplete after {WORKER_APPLY_TIMEOUT_SECS}s ({reason}) — reverting to the last usable deployment"
-            ))
-            .await?;
-                let failure_reason = format!(
-                "Worker route/DNS propagation did not complete within {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
+            .ok();
+        }
+        if let Err(reason) = Self::wait_for_worker_apply(
+            self.db.as_ref(),
+            std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+            cluster_dns_enabled,
+        )
+        .await
+        {
+            tracing::error!(
+                deployment_id = self.deployment_id,
+                environment_id,
+                "Worker propagation gate exceeded {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
             );
-                self.reject_unusable_deployment(
-                    environment_id,
-                    last_successful_deployment_id,
-                    &failure_reason,
-                    false,
-                )
+            self.log(format!(
+            "Worker propagation incomplete after {WORKER_APPLY_TIMEOUT_SECS}s ({reason}) — reverting to the last usable deployment"
+        ))
+        .await?;
+            let failure_reason = format!(
+            "Worker route/DNS propagation did not complete within {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
+        );
+            self.reject_unusable_deployment(
+                environment_id,
+                last_successful_deployment_id,
+                &failure_reason,
+                false,
+            )
+            .await?;
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "{failure_reason} — deployment rolled back"
+            )));
+        } else {
+            self.log("All workers acknowledged new route + DNS generations".to_string())
                 .await?;
-                return Err(WorkflowError::JobExecutionFailed(format!(
-                    "{failure_reason} — deployment rolled back"
-                )));
-            } else {
-                self.log("All workers acknowledged new route + DNS generations".to_string())
-                    .await?;
-            }
         }
 
         // ── Pre-completion staleness check ────────────────────────────────
@@ -1011,7 +1009,7 @@ impl MarkDeploymentCompleteJob {
                     "Failed to reset sleeping state for environment {environment_id}: {error}"
                 ))
             })?;
-        if sleeping_reset.rows_affected > 0 && !portless {
+        if sleeping_reset.rows_affected > 0 {
             let wake_result: Result<(), String> = async {
                 self.queue
                     .send(Job::ForceRouteReload(temps_core::ForceRouteReloadJob {
@@ -2944,6 +2942,142 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
+
+    struct RouteEvents(std::collections::VecDeque<Job>);
+
+    #[async_trait]
+    impl JobReceiver for RouteEvents {
+        async fn recv(&mut self) -> Result<Job, QueueError> {
+            if let Some(job) = self.0.pop_front() {
+                return Ok(job);
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn portless_environment(current_deployment_id: i32) -> environments::Model {
+        serde_json::from_value(serde_json::json!({
+            "id":1, "project_id":1, "name":"production", "slug":"production", "subdomain":"worker-production",
+            "host":"worker.example.com", "upstreams":[], "current_deployment_id":current_deployment_id,
+            "created_at":chrono::Utc::now(), "updated_at":chrono::Utc::now(), "is_preview":false, "protected":false, "sleeping":false
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_probe_portless_completion_requires_a_successful_reload_even_with_zero_routes() {
+        for event_environment in [Some(1), None] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![portless_environment(2)]])
+                .into_connection();
+            let mut events: Box<dyn JobReceiver> =
+                Box::new(RouteEvents(std::collections::VecDeque::from([
+                    Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
+                        environment_id: event_environment,
+                        deployment_id: Some(2),
+                        route_count: 0,
+                    }),
+                ])));
+            MarkDeploymentCompleteJob::wait_for_route_ready(
+                &mut events,
+                &db,
+                1,
+                2,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        }
+        // A failed/missing reload must leave the completion gate closed. No
+        // database pointer alone can prove stale in-memory routes were removed.
+        let mut events: Box<dyn JobReceiver> = Box::new(RouteEvents(Default::default()));
+        assert!(MarkDeploymentCompleteJob::wait_for_route_ready(
+            &mut events,
+            &DbConnection::Disconnected,
+            1,
+            2,
+            std::time::Duration::from_millis(20)
+        )
+        .await
+        .unwrap_err()
+        .contains("Timed out"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![portless_environment(3)]])
+            .into_connection();
+        let mut events: Box<dyn JobReceiver> =
+            Box::new(RouteEvents(std::collections::VecDeque::from([
+                Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
+                    environment_id: Some(1),
+                    deployment_id: Some(2),
+                    route_count: 0,
+                }),
+            ])));
+        assert!(MarkDeploymentCompleteJob::wait_for_route_ready(
+            &mut events,
+            &db,
+            1,
+            2,
+            std::time::Duration::from_millis(50)
+        )
+        .await
+        .unwrap_err()
+        .contains("superseded"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_portless_withdrawal_requires_worker_route_and_enabled_dns_acknowledgements(
+    ) {
+        for (dns_enabled, route_ack, dns_ack, success) in [
+            (false, 7, 0, true),
+            (false, 6, 0, false),
+            (true, 7, 9, true),
+            (true, 7, 8, false),
+        ] {
+            let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[BTreeMap::from([("current", Value::BigInt(Some(7)))])]]);
+            if dns_enabled {
+                mock = mock.append_query_results([[BTreeMap::from([(
+                    "current",
+                    Value::BigInt(Some(9)),
+                )])]]);
+            }
+            mock = mock
+                .append_query_results([[BTreeMap::from([("id", Value::Int(Some(1)))])]])
+                .append_query_results([vec![temps_entities::node_route_state::Model {
+                    node_id: 1,
+                    applied_generation: route_ack,
+                    last_sync_at: None,
+                    health: "healthy".into(),
+                }]]);
+            if dns_enabled {
+                mock = mock.append_query_results([vec![temps_entities::node_dns_state::Model {
+                    node_id: 1,
+                    applied_generation: dns_ack,
+                    last_sync_at: None,
+                    health: "healthy".into(),
+                }]]);
+            }
+            if route_ack < 7 {
+                mock = mock.append_query_results([[BTreeMap::from([
+                    ("id", Value::Int(Some(1))),
+                    ("name", Value::String(Some(Box::new("worker-a".into())))),
+                ])]]);
+            }
+            let result = MarkDeploymentCompleteJob::wait_for_worker_apply(
+                &mock.into_connection(),
+                std::time::Duration::ZERO,
+                dns_enabled,
+            )
+            .await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            if !success {
+                assert!(result.unwrap_err().contains(if route_ack < 7 {
+                    "behind on route_gen"
+                } else {
+                    "behind on dns_gen"
+                }));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_worker_barrier_fails_closed_when_route_generation_cannot_be_loaded() {

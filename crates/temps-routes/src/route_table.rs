@@ -4928,7 +4928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_probe_paused_workers_have_no_live_or_unavailable_hostnames() {
+    async fn health_probe_portless_reload_withdraws_existing_routes_and_paused_web_routes() {
         use sea_orm::{DatabaseBackend, MockDatabase};
         use temps_entities::{
             custom_routes, dns_managed_domains, environment_domains, environments,
@@ -4961,67 +4961,96 @@ mod tests {
         .unwrap();
         // Exercise every hostname-producing branch in a full reload, including
         // stale Running metadata left behind by a failed pause-status write.
-        for port in [None, Some(8080)] {
-            for status in ["stopped", "running"] {
-                let mut container = route_test_container(1, None, 8080);
-                container.container_port = port;
-                container.status = Some(status.into());
-                let containers = vec![container];
-                let custom_domain: project_custom_domains::Model = serde_json::from_value(serde_json::json!({
+        for state in ["completed", "paused"] {
+            for port in [None, Some(8080)] {
+                if state == "completed" && port.is_some() {
+                    continue;
+                }
+                let mut deployment = deployment.clone();
+                deployment.state = state.into();
+                for status in ["stopped", "running"] {
+                    let mut container = route_test_container(1, None, 8080);
+                    container.container_port = port;
+                    container.status = Some(status.into());
+                    let containers = vec![container];
+                    let custom_domain: project_custom_domains::Model = serde_json::from_value(serde_json::json!({
                     "id": 1, "project_id": 1, "environment_id": 1, "domain": "custom-worker.example.com",
                     "status": "active", "created_at": now, "updated_at": now
                 })).unwrap();
-                let db = MockDatabase::new(DatabaseBackend::Postgres)
-                    .append_query_results([vec![settings::Model {
-                        id: 1,
-                        data: serde_json::json!({"preview_domain":"preview.example.com"}),
-                        created_at: now,
-                        updated_at: now,
-                    }]])
-                    .append_query_results([Vec::<dns_managed_domains::Model>::new()])
-                    .append_query_results([vec![environment_domains::Model {
-                        id: 1,
-                        environment_id: 1,
-                        domain: "worker.example.com".into(),
-                        created_at: now,
-                    }]])
-                    .append_query_results([vec![environment.clone()]])
-                    .append_query_results([vec![deployment.clone()]])
-                    .append_query_results([containers.clone()])
-                    .append_query_results([vec![project.clone()]])
-                    .append_query_results([Vec::<custom_routes::Model>::new()])
-                    .append_query_results([vec![custom_domain]])
-                    .append_query_results([containers.clone()])
-                    .append_query_results([vec![environment.clone()]])
-                    .append_query_results([containers.clone()])
-                    .append_query_results([vec![environment.clone()]])
-                    .append_query_results([containers])
-                    .append_query_results([
-                        Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
-                    ])
-                    .into_connection();
-                let table = CachedPeerTable::new(Arc::new(db));
-                table
-                    .generation_authoritative
-                    .store(false, Ordering::Release);
-                table.load_routes().await.unwrap();
-                assert!(!table.has_route_for_deployment(1));
-                for host in [
-                    "worker.example.com",
-                    "custom-worker.example.com",
-                    "worker-production",
-                    "worker-production.preview.example.com",
-                    "worker-deploy.preview.example.com",
-                ] {
+                    let db = MockDatabase::new(DatabaseBackend::Postgres)
+                        .append_query_results([vec![settings::Model {
+                            id: 1,
+                            data: serde_json::json!({"preview_domain":"preview.example.com"}),
+                            created_at: now,
+                            updated_at: now,
+                        }]])
+                        .append_query_results([Vec::<dns_managed_domains::Model>::new()])
+                        .append_query_results([vec![environment_domains::Model {
+                            id: 1,
+                            environment_id: 1,
+                            domain: "worker.example.com".into(),
+                            created_at: now,
+                        }]])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([vec![deployment.clone()]])
+                        .append_query_results([containers.clone()])
+                        .append_query_results([vec![project.clone()]])
+                        .append_query_results([Vec::<custom_routes::Model>::new()])
+                        .append_query_results([vec![custom_domain]])
+                        .append_query_results([containers.clone()])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([containers.clone()])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([containers])
+                        .append_query_results([Vec::<
+                            std::collections::BTreeMap<String, sea_orm::Value>,
+                        >::new()])
+                        .into_connection();
+                    let table = CachedPeerTable::new(Arc::new(db));
+                    table
+                        .generation_authoritative
+                        .store(false, Ordering::Release);
+                    // Seed the previous web deployment's public and internal routes.
+                    // A successful empty reload must actively withdraw cached entries.
+                    let mut previous = snapshot_test_route();
+                    previous.environment = Some(Arc::new(environment.clone()));
+                    let mut old_deployment = deployment.clone();
+                    old_deployment.id = 99;
+                    previous.deployment = Some(Arc::new(old_deployment));
+                    for host in [
+                        "worker.example.com",
+                        "custom-worker.example.com",
+                        "worker-production",
+                        "worker-production.preview.example.com",
+                        "worker-deploy.preview.example.com",
+                    ] {
+                        table.insert_route_for_test(host, previous.clone());
+                        assert!(table.get_route(host).is_some());
+                    }
+                    assert!(table.has_route_for_deployment(99));
+                    table.load_routes().await.unwrap();
                     assert!(
-                        table.get_route(host).is_none(),
-                        "paused deployment must not serve {host}"
+                        !table.has_route_for_deployment(99),
+                        "old deployment routes must be withdrawn"
                     );
-                    assert_eq!(
+                    assert!(!table.has_route_for_deployment(1));
+                    for host in [
+                        "worker.example.com",
+                        "custom-worker.example.com",
+                        "worker-production",
+                        "worker-production.preview.example.com",
+                        "worker-deploy.preview.example.com",
+                    ] {
+                        assert!(
+                            table.get_route(host).is_none(),
+                            "portless or paused deployment must not serve {host} ({state})"
+                        );
+                        assert_eq!(
                         table.get_unavailable_route(host).is_some(),
                         port.is_some(),
                         "portless worker must not reserve unavailable hostname {host} ({status})"
                     );
+                    }
                 }
             }
         }
