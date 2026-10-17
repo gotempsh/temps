@@ -37,8 +37,30 @@ struct GateState {
     /// Permits currently held. May exceed `limit` right after the limit was
     /// lowered, until enough holders finish.
     running: usize,
-    /// Builds waiting for a permit, oldest first.
-    waiters: VecDeque<oneshot::Sender<BuildPermit>>,
+    /// Builds waiting for a permit, oldest first, each with the id its
+    /// [`WaiterGuard`] uses to take itself out again.
+    waiters: VecDeque<(u64, oneshot::Sender<BuildPermit>)>,
+    /// Id for the next waiter.
+    next_waiter_id: u64,
+}
+
+/// Removes a waiting build from the queue if its future is dropped before it
+/// was granted a slot (the deployment was cancelled or timed out), so an
+/// abandoned build does not occupy the queue while a long build holds the
+/// gate.
+struct WaiterGuard<'a> {
+    gate: &'a BuildGate,
+    id: u64,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.lock();
+        // Already gone when the slot was granted: nothing to remove.
+        if let Some(position) = state.waiters.iter().position(|(id, _)| *id == self.id) {
+            state.waiters.remove(position);
+        }
+    }
 }
 
 /// Proof that a build holds a slot; the slot is released when this is dropped,
@@ -62,6 +84,7 @@ impl BuildGate {
                 limit: limit.max(1),
                 running: 0,
                 waiters: VecDeque::new(),
+                next_waiter_id: 0,
             }),
         })
     }
@@ -85,15 +108,9 @@ impl BuildGate {
         self.lock().running
     }
 
-    /// Builds currently waiting for a permit. A build whose future was
-    /// dropped is not counted, even though its entry stays in the queue until
-    /// the next grant sweeps it out.
+    /// Builds currently waiting for a permit.
     pub fn queued(&self) -> usize {
-        self.lock()
-            .waiters
-            .iter()
-            .filter(|waiter| !waiter.is_closed())
-            .count()
+        self.lock().waiters.len()
     }
 
     /// Whether a build arriving now would have to wait. Waiters only exist
@@ -123,15 +140,17 @@ impl BuildGate {
     /// Wait for a slot. Waiting builds are served oldest first.
     pub async fn acquire(self: &Arc<Self>) -> BuildPermit {
         loop {
-            let receiver = {
+            let (receiver, guard) = {
                 let mut state = self.lock();
                 if state.waiters.is_empty() && state.running < state.limit {
                     state.running += 1;
                     return BuildPermit { gate: self.clone() };
                 }
                 let (sender, receiver) = oneshot::channel();
-                state.waiters.push_back(sender);
-                receiver
+                let id = state.next_waiter_id;
+                state.next_waiter_id = id.wrapping_add(1);
+                state.waiters.push_back((id, sender));
+                (receiver, WaiterGuard { gate: self, id })
             };
             // The sender lives in `waiters`, which this gate (kept alive by
             // `self`) owns, so a closed channel is not expected; if it ever
@@ -139,11 +158,14 @@ impl BuildGate {
             if let Ok(permit) = receiver.await {
                 return permit;
             }
+            drop(guard);
         }
     }
 
-    /// Hand slots to the oldest waiters while there is room. Builds that gave
-    /// up waiting (their future was dropped) are skipped. The permits are
+    /// Hand slots to the oldest waiters while there is room. A build that gave
+    /// up waiting removes itself (see [`WaiterGuard`]); one that vanished
+    /// between being granted and being sent its permit hands it back in
+    /// [`Self::deliver`]. The permits are
     /// returned, not sent: dropping one re-enters the gate, so sending must
     /// happen after the lock is released (see [`Self::deliver`]).
     fn grant_waiting(
@@ -152,12 +174,9 @@ impl BuildGate {
     ) -> Vec<(oneshot::Sender<BuildPermit>, BuildPermit)> {
         let mut grants = Vec::new();
         while state.running < state.limit {
-            let Some(sender) = state.waiters.pop_front() else {
+            let Some((_, sender)) = state.waiters.pop_front() else {
                 break;
             };
-            if sender.is_closed() {
-                continue;
-            }
             state.running += 1;
             grants.push((sender, BuildPermit { gate: self.clone() }));
         }
@@ -318,6 +337,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_waiter_leaves_the_queue_at_once() {
+        let gate = BuildGate::new(1);
+        let _held = gate.acquire().await;
+
+        let mut cancelled = Vec::new();
+        for expected in 1..=3 {
+            let task_gate = gate.clone();
+            cancelled.push(tokio::spawn(async move { task_gate.acquire().await }));
+            while gate.queued() != expected {
+                tokio::task::yield_now().await;
+            }
+        }
+        for task in &cancelled {
+            task.abort();
+        }
+        for task in cancelled {
+            drop(task.await);
+        }
+
+        // The gate is still held, so nothing swept the queue: the waiters
+        // removed themselves.
+        assert_eq!(gate.queued(), 0);
+        assert_eq!(gate.running(), 1);
+    }
+
+    #[tokio::test]
     async fn a_cancelled_waiter_does_not_leak_a_slot() {
         let gate = BuildGate::new(1);
         let held = gate.acquire().await;
@@ -326,7 +371,9 @@ mod tests {
             let gate = gate.clone();
             tokio::spawn(async move { gate.acquire().await })
         };
-        tokio::time::sleep(SETTLE).await;
+        while gate.queued() != 1 {
+            tokio::task::yield_now().await;
+        }
         cancelled.abort();
         drop(cancelled.await);
 
