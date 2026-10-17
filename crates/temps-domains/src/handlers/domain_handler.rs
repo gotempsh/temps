@@ -4,8 +4,8 @@
 use super::types::{
     AcmeOrderResponse, CertStatusResponse, ChallengeError, ChallengeValidationStatus,
     CreateDomainRequest, DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState,
-    DomainChallengeResponse, DomainError, DomainResponse, HttpChallengeDebugResponse,
-    ListDomainsResponse, ListOnDemandCertsResponse, ListOrdersResponse,
+    DomainChallengeResponse, DomainError, DomainOrderResponse, DomainResponse,
+    HttpChallengeDebugResponse, ListDomainsResponse, ListOnDemandCertsResponse, ListOrdersResponse,
     ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
     RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
@@ -297,6 +297,12 @@ impl From<ProviderError> for Problem {
                 .title("Challenge Failed")
                 .detail(msg)
                 .build(),
+            error @ ProviderError::ChallengeInvalidated { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("ACME Challenge No Longer Valid")
+                    .detail(error.to_string())
+                    .build()
+            }
             ProviderError::ValidationFailed(msg) => ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .title("Validation Failed")
                 .detail(msg)
@@ -341,6 +347,12 @@ impl From<DomainServiceError> for Problem {
                 .title("Challenge Error")
                 .detail(msg)
                 .build(),
+            error @ DomainServiceError::ChallengeInvalidated { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("ACME Challenge No Longer Valid")
+                    .detail(error.to_string())
+                    .build()
+            }
             DomainServiceError::Tls(e) => Problem::from(e),
             DomainServiceError::Provider(e) => Problem::from(e),
             DomainServiceError::Repository(e) => Problem::from(e),
@@ -417,6 +429,7 @@ impl From<DomainServiceError> for Problem {
             ListDomainsResponse,
             DomainError,
             AcmeOrderResponse,
+            DomainOrderResponse,
             ListOrdersResponse,
             HttpChallengeDebugResponse,
             ChallengeValidationStatus,
@@ -1005,7 +1018,7 @@ async fn check_domain_status(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Domain or DNS provider permission denied"),
         (status = 404, description = "Domain or order not found"),
-        (status = 409, description = "Certificate issued but DNS cleanup requires operator action"),
+        (status = 409, description = "The ACME challenge was invalidated and cannot be retried (start a new order with POST /domains/{domain_id}/order), or the certificate was issued but DNS cleanup requires operator action"),
         (status = 502, description = "Certificate issued but DNS provider cleanup failed"),
         (status = 503, description = "Certificate issued but DNS provider service is unavailable"),
         (status = 500, description = "Internal server error")
@@ -2243,13 +2256,16 @@ async fn create_or_recreate_order(
 }
 
 /// Get ACME order for a domain
+///
+/// A domain without an ACME order (for example once its certificate is active)
+/// answers 200 with `order: null` and a `reason`; only an unknown domain is a 404.
 #[utoipa::path(
     get,
     path = "/domains/{domain_id}/order",
     responses(
-        (status = 200, description = "Order retrieved successfully", body = AcmeOrderResponse),
+        (status = 200, description = "Order lookup result; `order` is null when the domain has no ACME order", body = DomainOrderResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Order not found"),
+        (status = 404, description = "Domain not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2269,16 +2285,30 @@ async fn get_domain_order(
 
     info!("Getting ACME order for domain ID: {}", domain_id);
 
-    let order = app_state
-        .repository
-        .find_acme_order_by_domain(domain_id)
+    let domain = app_state
+        .domain_service
+        .get_domain_by_id(domain_id)
         .await?
         .ok_or_else(|| {
             ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Order not found")
-                .detail(format!("No ACME order found for domain ID {}", domain_id))
+                .title("Domain not found")
+                .detail(format!("Domain with ID {} not found", domain_id))
                 .build()
         })?;
+
+    let Some(order) = app_state
+        .repository
+        .find_acme_order_by_domain(domain_id)
+        .await?
+    else {
+        return Ok((
+            StatusCode::OK,
+            Json(DomainOrderResponse::without_order(
+                &domain.domain,
+                &domain.status,
+            )),
+        ));
+    };
 
     // Convert order to response
     let mut response = AcmeOrderResponse::from(order.clone());
@@ -2297,7 +2327,10 @@ async fn get_domain_order(
         }
     }
 
-    Ok((StatusCode::OK, Json(response)))
+    Ok((
+        StatusCode::OK,
+        Json(DomainOrderResponse::with_order(response)),
+    ))
 }
 
 /// List all ACME orders
@@ -3408,6 +3441,47 @@ mod tests {
         assert!(should_retry_dns_cleanup_without_issuance("active", true));
         assert!(!should_retry_dns_cleanup_without_issuance("pending", true));
         assert!(!should_retry_dns_cleanup_without_issuance("active", false));
+    }
+
+    #[test]
+    fn invalidated_challenge_maps_to_conflict_that_names_the_new_order_endpoint() {
+        let problem = Problem::from(DomainServiceError::ChallengeInvalidated {
+            domain: "app.example.com".to_string(),
+            domain_id: 17,
+            order_url: "https://acme.example.test/order/9".to_string(),
+            detail: "no TXT record found".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("ACME Challenge No Longer Valid")
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("app.example.com"));
+        assert!(detail.contains("ID 17"));
+        assert!(detail.contains("https://acme.example.test/order/9"));
+        assert!(detail.contains("no TXT record found"));
+        assert!(detail.contains("POST /domains/17/order"));
+    }
+
+    #[test]
+    fn provider_level_invalidation_also_maps_to_conflict() {
+        let problem = Problem::from(ProviderError::ChallengeInvalidated {
+            domain: "app.example.com".to_string(),
+            order_url: "https://acme.example.test/order/9".to_string(),
+            detail: "authorization is Invalid".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("ACME Challenge No Longer Valid")
+        );
     }
 
     #[test]

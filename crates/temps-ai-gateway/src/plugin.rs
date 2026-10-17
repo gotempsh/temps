@@ -216,6 +216,49 @@ fn parse_opencode_native_auth(
     Ok((canonical, providers))
 }
 
+/// Turn a saved credential into the bearer a sandbox model relay forwards.
+///
+/// A console sign-in is stored as an access-token snapshot whose token
+/// expires; resolve it to a token that stays valid for a long turn, letting the
+/// host CLI (the only holder of the refresh token) renew it when needed. Every
+/// other credential is already the bearer.
+async fn resolve_relay_bearer(
+    provider_id: &str,
+    format: temps_agents::ai_cli::catalog::CredentialFormat,
+    credential: String,
+) -> Result<String, temps_ai::AiError> {
+    /// Long enough to cover a normal workspace turn without a mid-turn expiry.
+    const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(30 * 60);
+    if provider_id == "claude_cli"
+        && format == temps_agents::ai_cli::catalog::CredentialFormat::OauthToken
+    {
+        return temps_agents::ai_cli::credential_snapshot::resolve_claude_oauth(
+            &credential,
+            MIN_TOKEN_VALIDITY,
+        )
+        .await
+        .map(|resolved| resolved.access_token)
+        .map_err(|error| temps_ai::AiError::Provider {
+            purpose: "chat.application.credentials".to_string(),
+            reason: error.to_string(),
+        });
+    }
+    if provider_id == "codex_cli"
+        && format == temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile
+    {
+        return temps_agents::ai_cli::credential_snapshot::resolve_codex_auth(
+            &credential,
+            MIN_TOKEN_VALIDITY,
+        )
+        .await
+        .map_err(|error| temps_ai::AiError::Provider {
+            purpose: "chat.application.credentials".to_string(),
+            reason: error.to_string(),
+        });
+    }
+    Ok(credential)
+}
+
 fn sandbox_harness_credentials(
     provider_id: &str,
     format: temps_agents::ai_cli::catalog::CredentialFormat,
@@ -523,6 +566,8 @@ impl TempsPlugin for AiGatewayPlugin {
                             }
                         })?;
                         let internal_api_url = config_service.resolve_internal_url().await;
+                        let credential =
+                            resolve_relay_bearer(&provider_id, flavor.format, credential).await?;
                         let credentials = sandbox_harness_credentials(
                             &provider_id,
                             flavor.format,
@@ -552,6 +597,8 @@ impl TempsPlugin for AiGatewayPlugin {
                                 reason: format!("authentication type '{auth_type}' is invalid for '{provider_id}'"),
                             })?;
                         let internal_api_url = config_service.resolve_internal_url().await;
+                        let credential =
+                            resolve_relay_bearer(&provider_id, flavor.format, credential).await?;
                         sandbox_harness_credentials(&provider_id, flavor.format, credential, internal_api_url)
                     })
                 })
@@ -614,13 +661,14 @@ impl TempsPlugin for AiGatewayPlugin {
             // Browser-supplied generic prompts are intentionally restricted to
             // tool-less gateway APIs. Host subscription CLIs can inspect the
             // host and are reserved for server-authored, purpose-specific jobs.
-            let structured_output_service = Arc::new(StructuredOutputService::new(
-                gateway_ai_service as Arc<dyn temps_ai::AiService>,
-            ));
-            context.register_service(structured_output_service.clone());
-
             let usage_service = Arc::new(UsageService::new(db.clone()));
             context.register_service(usage_service.clone());
+
+            let structured_output_service = Arc::new(StructuredOutputService::new(
+                gateway_ai_service as Arc<dyn temps_ai::AiService>,
+                usage_service.clone(),
+            ));
+            context.register_service(structured_output_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
             let project_access_checker =
@@ -661,6 +709,7 @@ impl TempsPlugin for AiGatewayPlugin {
         // only runs on this router, not the public one.
         let routes = handlers::configure_admin_routes()
             .merge(handlers::configure_usage_routes())
+            .merge(handlers::configure_limits_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_native_routes())
@@ -679,6 +728,8 @@ impl TempsPlugin for AiGatewayPlugin {
         schema.merge(admin_schema);
         let usage_schema = <handlers::usage::AiGatewayUsageApiDoc as OpenApiTrait>::openapi();
         schema.merge(usage_schema);
+        let limits_schema = <handlers::limits::AiGatewayLimitsApiDoc as OpenApiTrait>::openapi();
+        schema.merge(limits_schema);
         let pricing_schema = <handlers::pricing::AiGatewayPricingApiDoc as OpenApiTrait>::openapi();
         schema.merge(pricing_schema);
         let provider_status_schema =

@@ -5,7 +5,7 @@
 slug: browserless
 name: Browserless
 version: 1.0.0
-kind: service
+kind: app
 description: Remote Chromium for Playwright, Puppeteer, screenshots, PDFs, and browser automation. Review Browserless licensing for commercial or proprietary workloads.
 git:
   url: https://github.com/browserless/browserless.git

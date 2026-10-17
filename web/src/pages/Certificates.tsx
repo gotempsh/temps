@@ -123,7 +123,7 @@ export function Certificates() {
   )
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 px-4 sm:px-0">
       {/* Page header */}
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">Certificates</h1>
@@ -371,7 +371,10 @@ function CertificateDetailSheet({
               {row.attempt.error_chain && (
                 <DetailField label="Error chain">
                   <div className="relative">
-                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 pr-10 font-mono text-xs">
+                    <pre
+                      tabIndex={0}
+                      className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 pr-10 font-mono text-xs"
+                    >
                       {row.attempt.error_chain}
                     </pre>
                     <div className="absolute right-2 top-2">

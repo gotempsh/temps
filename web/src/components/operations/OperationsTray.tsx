@@ -6,11 +6,11 @@
  * promotions, restores, backups and autofix runs, backed by `GET /operations`
  * so it survives a refresh.
  *
- * In-flight work and finished history are two separately paged queries. The
+ * Active work, reviews and finished history are separately paged queries. The
  * badge count and the "Running" rows both come from the `status=running`
  * feed, so every operation the badge counts can be opened from the tray no
  * matter how much newer finished work exists. Each section shows one page at
- * a time (Newer/Older replace it) and closing the tray returns both to page
+ * a time (Newer/Older replace it) and closing the tray returns all to page
  * 1, so browsing history never accumulates rows -- see `operations-queries`
  * for the memory bound.
  *
@@ -37,6 +37,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import {
   finishedOperationsPageOptions,
   runningOperationsPageOptions,
+  waitingOperationsPageOptions,
 } from './operations-queries'
 import { OperationsTrayPanel } from './OperationsTrayPanel'
 import {
@@ -52,6 +53,7 @@ export function OperationsTray() {
   const localOperations = useLocalOperations()
   const runningPage = useOperationsTrayPage('running')
   const recentPage = useOperationsTrayPage('recent')
+  const waitingPage = useOperationsTrayPage('waiting')
   const [now, setNow] = useState(() => Date.now())
 
   const localCount = localOperations.length
@@ -82,19 +84,32 @@ export function OperationsTray() {
     refetchOnWindowFocus: true,
   })
 
+  const waitingQuery = useQuery({
+    ...waitingOperationsPageOptions(waitingPage),
+    refetchInterval: () =>
+      operationsPollInterval({
+        open,
+        runningCount: serverRunningCount,
+        localCount,
+      }),
+    refetchOnWindowFocus: true,
+  })
+
   const feed = useMemo(
     () =>
       operationsTrayFeed({
         runningPage: runningQuery.data,
         finishedPage: finishedQuery.data,
+        waitingPage: waitingQuery.data,
       }),
-    [runningQuery.data, finishedQuery.data]
+    [runningQuery.data, finishedQuery.data, waitingQuery.data]
   )
 
   // If a feed shrank under the user (work finished while they were on its
   // last page), step back to the last page that still has rows.
   const runningClamp = operationsClampPage(runningPage, runningQuery.data)
   const recentClamp = operationsClampPage(recentPage, finishedQuery.data)
+  const waitingClamp = operationsClampPage(waitingPage, waitingQuery.data)
   useEffect(() => {
     if (runningClamp !== runningPage) {
       setOperationsTrayPage('running', runningClamp)
@@ -104,11 +119,17 @@ export function OperationsTray() {
     if (recentClamp !== recentPage) setOperationsTrayPage('recent', recentClamp)
   }, [recentClamp, recentPage])
 
-  // When something leaves the running feed, pull history right away so the
-  // finished row is there without waiting for a poll (which may now be off).
+  useEffect(() => {
+    if (waitingClamp !== waitingPage)
+      setOperationsTrayPage('waiting', waitingClamp)
+  }, [waitingClamp, waitingPage])
+
+  // When something leaves the running feed, pull history and reviews so the
+  // row is there without waiting for a poll (which may now be off).
   // Only consecutive responses for the same page are compared, so paging
   // through running work does not look like work finishing.
   const { refetch: refetchFinished } = finishedQuery
+  const { refetch: refetchWaiting } = waitingQuery
   const previousRunning = useRef<{ page: number; ids: readonly string[] }>({
     page: 0,
     ids: [],
@@ -122,9 +143,10 @@ export function OperationsTray() {
       operationsLeftRunning(previous.ids, currentIds)
     ) {
       void refetchFinished()
+      void refetchWaiting()
     }
     previousRunning.current = { page: runningResponsePage, ids: currentIds }
-  }, [feed.running, runningResponsePage, refetchFinished])
+  }, [feed.running, runningResponsePage, refetchFinished, refetchWaiting])
 
   // Keep relative times fresh while the tray is visible.
   useEffect(() => {
@@ -180,6 +202,22 @@ export function OperationsTray() {
             isPaging: runningQuery.isPlaceholderData,
             pageSize: OPERATIONS_RUNNING_PAGE_SIZE,
             onPageChange: (page) => setOperationsTrayPage('running', page),
+          }}
+          waiting={{
+            operations: feed.waiting,
+            nav: feed.waitingNav,
+            isPending: waitingQuery.isPending,
+            isError: waitingQuery.isError,
+            errorMessage: waitingQuery.isError
+              ? problemDetail(
+                  waitingQuery.error,
+                  'Operations needing review are unavailable.'
+                )
+              : null,
+            onRetry: () => void waitingQuery.refetch(),
+            isPaging: waitingQuery.isPlaceholderData,
+            pageSize: OPERATIONS_HISTORY_PAGE_SIZE,
+            onPageChange: (page) => setOperationsTrayPage('waiting', page),
           }}
           recent={{
             operations: feed.recent,

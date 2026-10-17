@@ -12,6 +12,7 @@ import { httpStatusClass } from '@/lib/http-status-class'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -46,11 +47,7 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronRight as ChevronExpand,
-  ChevronsLeft,
-  ChevronsRight,
   Columns,
   ExternalLink,
   Filter,
@@ -643,7 +640,7 @@ export function ProxyLogsDataTable({
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span>Scoped to:</span>
           {scopedProjectId !== undefined && (
-            <Badge variant="outline">Project {scopedProjectId}</Badge>
+            <Badge variant="outline">Service {scopedProjectId}</Badge>
           )}
           {scopedEnvironmentId !== undefined && (
             <Badge variant="outline">Environment {scopedEnvironmentId}</Badge>
@@ -736,7 +733,7 @@ export function ProxyLogsDataTable({
 
       {/* Toolbar */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* Time range. The listing is always bounded (the API defaults to
               1h when no start_date is sent, and rejects a custom range wider
               than 7 days), so this control is the primary way to reach older
@@ -816,7 +813,7 @@ export function ProxyLogsDataTable({
               setPage(1)
             }}
           >
-            <SelectTrigger className="w-[100px]">
+            <SelectTrigger aria-label="Rows per page" className="w-[100px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -943,7 +940,7 @@ export function ProxyLogsDataTable({
                     <SelectItem value="routed">Routed</SelectItem>
                     <SelectItem value="failed">Failed</SelectItem>
                     <SelectItem value="not_found">Not Found</SelectItem>
-                    <SelectItem value="no_project">No Project</SelectItem>
+                    <SelectItem value="no_project">No service</SelectItem>
                     <SelectItem value="error">Error</SelectItem>
                   </SelectContent>
                 </Select>
@@ -1362,7 +1359,7 @@ export function ProxyLogsDataTable({
             </div>
 
             {/* Apply Filters Button */}
-            <div className="flex items-center justify-between pt-4 border-t mt-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-4 border-t mt-4">
               <Button variant="outline" onClick={clearFilters}>
                 Clear All Filters
               </Button>
@@ -1478,56 +1475,15 @@ export function ProxyLogsDataTable({
               </div>
 
               {/* Pagination */}
-              <div className="flex items-center justify-between px-4 py-4 border-t">
-                <div className="text-sm text-muted-foreground">
-                  Showing {(page - 1) * pageSize + 1} to{' '}
-                  {Math.min(page * pageSize, data.total)} of {data.total}{' '}
-                  results
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    aria-label="First page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(1)}
-                    disabled={page === 1}
-                  >
-                    <ChevronsLeft className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    aria-label="Previous page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(page - 1)}
-                    disabled={page === 1}
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                  </Button>
-                  <div className="flex items-center gap-2 px-2">
-                    <span className="text-sm">
-                      Page {page} of {data.total_pages}
-                    </span>
-                  </div>
-                  <Button
-                    aria-label="Next page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(page + 1)}
-                    disabled={page === data.total_pages}
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    aria-label="Last page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(data.total_pages)}
-                    disabled={page === data.total_pages}
-                  >
-                    <ChevronsRight className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
+              <ResponsivePagination
+                className="border-t px-4 py-4"
+                page={page}
+                pageSize={pageSize}
+                total={data.total}
+                totalPages={data.total_pages}
+                onPageChange={setPage}
+                ariaLabel="Proxy logs pagination"
+              />
             </>
           )}
         </CardContent>
@@ -1784,7 +1740,7 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
         )}
         <DetailField label="Referrer" value={log.referrer} mono />
 
-        <DetailField label="Project ID" value={log.project_id} />
+        <DetailField label="Service ID" value={log.project_id} />
         <DetailField label="Environment ID" value={log.environment_id} />
         <DetailField label="Deployment ID" value={log.deployment_id} />
         <DetailField label="Container" value={log.container_id} mono />

@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { beforeEach, describe, expect, test } from 'bun:test'
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from 'bun:test'
 
 /**
  * Regression coverage for the post-login 404.
@@ -21,7 +28,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
  */
 const store = new Map<string, string>()
 
-Object.defineProperty(globalThis, 'window', {
+const stubWindow = {
   configurable: true,
   value: {
     location: { pathname: '/', search: '', hash: '' },
@@ -32,9 +39,25 @@ Object.defineProperty(globalThis, 'window', {
       clear: () => store.clear(),
     },
   },
-})
+}
 
+// The stub is scoped to this file: `bun test` shares one global across files,
+// and a `window` left behind at load time changes how react-dom (evaluated by
+// later, interactive component tests) decides whether a DOM exists.
+const realWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+function restoreWindow() {
+  if (realWindow) Object.defineProperty(globalThis, 'window', realWindow)
+  else Reflect.deleteProperty(globalThis, 'window')
+}
+
+Object.defineProperty(globalThis, 'window', stubWindow)
 const { captureReturnTo, consumeReturnTo } = await import('./return-to')
+restoreWindow()
+
+beforeAll(() => {
+  Object.defineProperty(globalThis, 'window', stubWindow)
+})
+afterAll(restoreWindow)
 
 function setLocation(path: string) {
   const [pathAndSearch = '', hash = ''] = path.split('#')

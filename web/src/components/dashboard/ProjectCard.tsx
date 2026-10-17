@@ -56,6 +56,11 @@ interface ProjectCardProps {
   }
   latestDeploymentMediaLoading?: boolean
   latestDeploymentMediaError?: boolean
+  /**
+   * The service's public address, shown under its name in the dense layout.
+   * Text only: the card is itself a link to the service's page.
+   */
+  domain?: string | null
 }
 
 const HEALTH_TONE_STYLES: Record<
@@ -64,7 +69,7 @@ const HEALTH_TONE_STYLES: Record<
 > = {
   healthy: {
     dot: 'bg-emerald-500',
-    text: 'text-emerald-600 dark:text-emerald-400',
+    text: 'text-emerald-700 dark:text-emerald-400',
   },
   degraded: { dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-400' },
   down: { dot: 'bg-red-500', text: 'text-red-700 dark:text-red-400' },
@@ -127,17 +132,32 @@ function MetadataCell({
   )
 }
 
+/** The app runs outside Temps; Temps only receives its telemetry. */
+export function ExternalBadge() {
+  return (
+    <Badge
+      variant="outline"
+      className="h-4 shrink-0 px-1.5 text-[10px] font-medium text-muted-foreground"
+      title="Runs outside Temps. Temps receives its analytics, errors and traces but never deploys it."
+    >
+      External
+    </Badge>
+  )
+}
+
 function ProjectIdentitySubtitle({ project }: { project: ProjectResponse }) {
   const isServiceTemplate = project.project_type === 'service'
+  const isExternal = project.hosting === 'external'
   const showSlug = project.slug !== project.name
 
-  if (!showSlug && !isServiceTemplate) return null
+  if (!showSlug && !isServiceTemplate && !isExternal) return null
 
   return (
     <div className="flex min-w-0 items-center gap-2">
       {showSlug && (
         <p className="truncate text-xs text-muted-foreground">{project.slug}</p>
       )}
+      {isExternal && <ExternalBadge />}
       {isServiceTemplate && (
         <Badge
           variant="outline"
@@ -168,9 +188,14 @@ export function ProjectCard({
   latestDeploymentMedia,
   latestDeploymentMediaLoading = false,
   latestDeploymentMediaError = false,
+  domain,
 }: ProjectCardProps) {
   const repository = projectRepository(project)
   const buildSource = projectBuildSource(project)
+  // Temps never deploys an app that runs elsewhere, so "Not deployed" would
+  // read as something to fix.
+  const notDeployed =
+    project.hosting === 'external' ? 'Runs outside Temps' : 'Not deployed'
   const totalVisitors = analytics?.unique_visitors ?? 0
   const apiRequests = health?.total_requests ?? 0
   const healthIndicator = projectHealthIndicator({
@@ -231,6 +256,7 @@ export function ProjectCard({
           )}
         </div>
         <div
+          role="group"
           className="min-w-16 flex-1"
           title={trafficSparklineLabel}
           aria-label={trafficSparklineLabel}
@@ -248,13 +274,14 @@ export function ProjectCard({
     return (
       <Link
         to={`/projects/${project.slug}/project`}
-        className="group flex min-h-44 min-w-0 flex-col gap-4 rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="group flex min-w-0 flex-col gap-4 rounded-xl border bg-card p-4 transition-colors sm:min-h-44 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
           <span className="truncate font-semibold">{project.name}</span>
           <Badge variant="secondary">External</Badge>
         </div>
         <div
+          role="group"
           className="rounded-lg bg-muted/30 p-3"
           aria-label="Visitors in the last 24 hours"
         >
@@ -291,7 +318,7 @@ export function ProjectCard({
     return (
       <Link
         to={`/projects/${project.slug}`}
-        className="group flex min-h-44 flex-col rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="group flex flex-col rounded-xl border bg-card p-4 transition-colors sm:min-h-44 hover:border-foreground/20 hover:bg-accent/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex min-w-0 items-start justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-3">
@@ -335,11 +362,15 @@ export function ProjectCard({
           </div>
         </div>
 
-        <div className="mt-4 rounded-lg bg-muted/35 px-3 py-2.5">
+        {/* Traffic is the first thing to go on a phone: with it, every card is
+            ~190px tall and a screen shows two. Name, health and the latest
+            deployment are what identify a service; the full numbers are on
+            its overview. */}
+        <div className="mt-4 rounded-lg bg-muted/35 px-3 py-2.5 max-sm:hidden">
           {activityContent}
         </div>
 
-        <div className="mt-auto flex items-end justify-between gap-3 border-t pt-3">
+        <div className="mt-auto flex items-end justify-between gap-3 border-t pt-3 max-sm:mt-3">
           <div className="min-w-0">
             <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
               Latest deployment
@@ -349,7 +380,9 @@ export function ProjectCard({
                 <TimeAgo date={project.last_deployment} />
               </p>
             ) : (
-              <p className="mt-1 text-xs text-muted-foreground">Not deployed</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {notDeployed}
+              </p>
             )}
           </div>
           {project.last_deployment && deploymentBadge}
@@ -380,6 +413,14 @@ export function ProjectCard({
               <ProjectHealth indicator={healthIndicator} />
             </div>
             <ProjectIdentitySubtitle project={project} />
+            {domain && (
+              <p
+                className="truncate font-mono text-xs text-muted-foreground"
+                title={domain}
+              >
+                {domain}
+              </p>
+            )}
           </div>
         </div>
         <div className="flex min-w-0 items-center gap-2 text-sm">
@@ -402,7 +443,7 @@ export function ProjectCard({
               </span>
             </div>
           ) : (
-            <span className="text-muted-foreground">Not deployed</span>
+            <span className="text-muted-foreground">{notDeployed}</span>
           )}
         </div>
       </Link>
@@ -491,7 +532,7 @@ export function ProjectCard({
             </p>
           </div>
         ) : (
-          <span className="text-sm text-muted-foreground">Not deployed</span>
+          <span className="text-sm text-muted-foreground">{notDeployed}</span>
         )}
       </MetadataCell>
     </Link>

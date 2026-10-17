@@ -24,6 +24,19 @@ pub struct ExternalServiceUpdatedAudit {
     pub updated_parameter_names: Vec<String>,
 }
 
+/// Bucket data copied from one managed S3 service into another. The source is
+/// only read; the target gains the source's objects.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceS3MigratedAudit {
+    pub context: AuditContext,
+    pub target_service_id: i32,
+    pub target_name: String,
+    pub source_service_id: i32,
+    pub source_backend: String,
+    pub target_backend: String,
+    pub buckets: Vec<String>,
+}
+
 /// A deliberate, operator-initiated move of a service's continuous
 /// archiving process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) to
 /// a different S3 source. Audited both directions since it's consequential:
@@ -308,6 +321,29 @@ impl AuditOperation for ContinuousArchiveSourceRepointedAudit {
 impl AuditOperation for ExternalServiceUpdatedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceS3MigratedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_S3_MIGRATED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

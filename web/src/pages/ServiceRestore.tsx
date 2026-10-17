@@ -794,6 +794,7 @@ export function ServiceRestore() {
         <CardContent>
           {sourcesView.kind === 'loading' ? (
             <Skeleton
+              role="status"
               className="h-10 w-full max-w-md"
               aria-label="Loading storage sources"
             />
@@ -973,7 +974,11 @@ export function ServiceRestore() {
                       >
                         <TableCell>
                           <RadioGroup value={isSel ? 'on' : ''}>
-                            <RadioGroupItem value="on" checked={!!isSel} />
+                            <RadioGroupItem
+                              value="on"
+                              checked={!!isSel}
+                              aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
+                            />
                           </RadioGroup>
                         </TableCell>
                         <TableCell className="font-mono text-xs whitespace-nowrap">
@@ -1036,7 +1041,7 @@ export function ServiceRestore() {
                     disabled={backupsPage === 1}
                   >
                     <ChevronLeft className="h-4 w-4" />
-                    <span className="hidden sm:inline">Previous</span>
+                    <span className="max-sm:sr-only">Previous</span>
                   </Button>
                   <div className="hidden sm:flex items-center gap-1">
                     {backupsPageWindow.map((pageNum) => (
@@ -1061,7 +1066,7 @@ export function ServiceRestore() {
                     }
                     disabled={backupsPage === backupsTotalPages}
                   >
-                    <span className="hidden sm:inline">Next</span>
+                    <span className="max-sm:sr-only">Next</span>
                     <ChevronRight className="h-4 w-4" />
                   </Button>
                 </div>
@@ -1574,7 +1579,11 @@ function ServiceLoadError({
 /** Placeholder shaped like the restore steps while the database loads. */
 function RestorePageSkeleton() {
   return (
-    <div className="space-y-6" aria-label="Loading restore options">
+    <div
+      role="status"
+      className="space-y-6"
+      aria-label="Loading restore options"
+    >
       {[0, 1, 2].map((step) => (
         <div key={step} className="space-y-3 rounded-lg border p-6">
           <div className="flex items-center gap-2">
@@ -1592,6 +1601,7 @@ function RestorePageSkeleton() {
 function BackupsSkeleton() {
   return (
     <div
+      role="status"
       className="space-y-2 rounded-md border p-3"
       aria-label="Loading backups"
     >

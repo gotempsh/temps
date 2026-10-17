@@ -22,6 +22,8 @@ import {
   useLogHistoryInfinite,
 } from '@/hooks/useLogHistory'
 import { serviceLogAvailability } from '@/lib/service-log-availability'
+import { isVerifiedNotFound } from '@/lib/read-failure'
+import { PageState } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -35,14 +37,15 @@ import {
 import type { DateRange } from 'react-day-picker'
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
+import { useUrlSearchText } from '@temps-sdk/ds'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
 const LEVEL_CLASS: Record<LogLevel, string> = {
-  ERROR: 'text-red-500',
-  WARN: 'text-amber-500',
+  ERROR: 'text-red-700 dark:text-red-500',
+  WARN: 'text-amber-700 dark:text-amber-500',
   INFO: 'text-foreground',
   DEBUG: 'text-muted-foreground',
-  TRACE: 'text-muted-foreground/70',
+  TRACE: 'text-muted-foreground',
 }
 
 const LEVELS: LogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
@@ -99,10 +102,18 @@ export function ServiceLogs() {
   const { id } = useParams<{ id: string }>()
   const serviceId = id ? parseInt(id, 10) : NaN
 
-  const { data: service, isLoading: serviceLoading } = useQuery({
+  const {
+    data: service,
+    isLoading: serviceLoading,
+    error: serviceError,
+  } = useQuery({
     ...getServiceOptions({ path: { id: serviceId } }),
     enabled: !Number.isNaN(serviceId),
   })
+  // Only a verified 404 proves the service is gone; the log search is not
+  // sent for it, and the page says so instead of waiting on logs that
+  // cannot exist.
+  const serviceMissing = isVerifiedNotFound(serviceError)
 
   const {
     data: linkedProjects,
@@ -119,7 +130,7 @@ export function ServiceLogs() {
     linkedProjectCount: linkedProjects?.length,
   })
 
-  const [text, setText] = useState('')
+  const [text, setText] = useUrlSearchText('q')
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -182,6 +193,7 @@ export function ServiceLogs() {
       refreshKey,
     },
     !Number.isNaN(serviceId) &&
+      !serviceMissing &&
       startTime !== undefined &&
       logAvailability === 'available'
   )
@@ -272,6 +284,22 @@ export function ServiceLogs() {
           ? `From ${customRange.from.toLocaleDateString()}`
           : 'Custom range'
 
+  if (serviceMissing) {
+    return (
+      <PageState
+        variant="empty"
+        icon={ScrollText}
+        title="Service not found"
+        description={`No storage service has ID ${id ?? ''}, so there are no logs to show. It may have been deleted.`}
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
+      />
+    )
+  }
+
   return (
     <div className="flex-1 overflow-auto">
       <div className="p-4 space-y-6 md:p-6">
@@ -339,14 +367,14 @@ export function ServiceLogs() {
               <Link to={`/storage/${id}/monitoring`}>
                 <Button variant="outline" size="sm" className="gap-2">
                   <Server className="h-4 w-4" />
-                  <span className="hidden sm:inline">Monitoring</span>
+                  <span className="max-sm:sr-only">Monitoring</span>
                 </Button>
               </Link>
             ) : null}
             <Link to={`/storage/${id}/browse`}>
               <Button variant="outline" size="sm" className="gap-2">
                 <Database className="h-4 w-4" />
-                <span className="hidden sm:inline">Browse Data</span>
+                <span className="max-sm:sr-only">Browse Data</span>
               </Button>
             </Link>
             <Button
@@ -362,7 +390,7 @@ export function ServiceLogs() {
               <RefreshCw
                 className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
               />
-              <span className="hidden sm:inline">Refresh</span>
+              <span className="max-sm:sr-only">Refresh</span>
             </Button>
           </div>
         </div>
@@ -424,16 +452,17 @@ export function ServiceLogs() {
           <div className="rounded-md border border-dashed p-8 text-center">
             <Link2 className="mx-auto h-6 w-6 text-muted-foreground" />
             <p className="mt-3 text-sm font-medium">
-              Link this service to a project to view logs
+              Link this database to a service to view logs
             </p>
             <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
-              Service logs inherit project access controls. Link at least one
-              project before searching or retaining this service&apos;s logs.
+              These logs inherit the access controls of the services linked to
+              this database. Link at least one service before searching or
+              retaining its logs.
             </p>
             <Button asChild variant="outline" size="sm" className="mt-4">
               <Link to={`/storage/${id}`} state={{ openLinkedProjects: true }}>
                 <Link2 className="mr-2 h-4 w-4" />
-                Link a project
+                Link a service
               </Link>
             </Button>
           </div>
@@ -465,6 +494,7 @@ export function ServiceLogs() {
         ) : (
           <div className="rounded-md border bg-muted/30">
             <div
+              tabIndex={0}
               ref={scrollRef}
               onScroll={handleScroll}
               className="max-h-[calc(100vh-19rem)] overflow-auto [overflow-anchor:none]"
@@ -476,11 +506,11 @@ export function ServiceLogs() {
                   Loading older logs…
                 </div>
               ) : hasNextPage ? (
-                <div className="py-1.5 text-center text-xs text-muted-foreground/70">
+                <div className="py-1.5 text-center text-xs text-muted-foreground">
                   Scroll up to load older logs
                 </div>
               ) : (
-                <div className="py-1.5 text-center text-xs text-muted-foreground/50">
+                <div className="py-1.5 text-center text-xs text-muted-foreground">
                   Beginning of {rangeLabel.toLowerCase()}
                 </div>
               )}
@@ -490,7 +520,7 @@ export function ServiceLogs() {
                     key={`${line.container_id ?? ''}-${line.line_id}-${i}`}
                     className="flex gap-3 border-b border-border/40 py-0.5 last:border-0"
                   >
-                    <span className="shrink-0 text-muted-foreground/70">
+                    <span className="shrink-0 text-muted-foreground">
                       {formatTs(line.timestamp)}
                     </span>
                     <span

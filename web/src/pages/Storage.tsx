@@ -165,7 +165,7 @@ export function Storage() {
             className="self-start border-b pb-4 lg:border-b-0 lg:border-r lg:pr-4 lg:pb-0"
             aria-label="Databases navigation"
           >
-            <p className="mb-3 text-sm font-semibold">Databases</p>
+            <p className="mb-3 text-sm font-semibold max-lg:sr-only">Databases</p>
             <nav aria-label="Database pages" className="flex gap-1 lg:flex-col">
               {[
                 {
@@ -284,6 +284,7 @@ function HealthDot({
         : 'Down'
   return (
     <span
+      role="img"
       className={cn('inline-block size-2 rounded-full', tone, className)}
       title={label}
       aria-label={label}
@@ -557,7 +558,7 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
           <MemoryStick className="size-3.5" />
           <span>{formatBytes(memBytes, 1)}</span>
           {hasMemCap && (
-            <span className="text-muted-foreground/60">
+            <span className="text-muted-foreground">
               / {formatBytes(memLimitBytes!, 0)}
             </span>
           )}

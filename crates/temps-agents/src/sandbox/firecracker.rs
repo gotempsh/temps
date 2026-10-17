@@ -6,11 +6,14 @@
 //! Each sandbox is a KVM microVM: pinned guest kernel, an ext4 rootfs
 //! derived from the sandbox's Docker image (Docker is the image toolchain —
 //! pull/export happen through bollard, ADR-029 §4), and `temps-vm-agent`
-//! injected as PID 1 serving exec/fs RPCs over vsock (§5).
+//! injected as PID 1 serving exec/fs RPCs over vsock (§5). Interactive
+//! terminals reuse the Docker backend's `temps-pty-agent`: it is injected next
+//! to `temps-vm-agent`, supervised by it, and reached through a second vsock
+//! listener that relays bytes to the agent's unix socket (§5).
 //!
 //! On-disk layout under `<data_dir>/firecracker/` (provisioned by
 //! `temps firecracker setup`):
-//!   bin/{firecracker,jailer,temps-vm-agent}   pinned binaries
+//!   bin/{firecracker,jailer,temps-vm-agent,temps-pty-agent}   pinned binaries
 //!   kernel/vmlinux-<ver>                      pinned guest kernel
 //!   state.json                               setup outcome (smoke_ok gate)
 //!   rootfs-cache/<image-digest>.ext4          converted images, digest-keyed
@@ -33,12 +36,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use temps_vm_agent::{Request, Response, AGENT_PORT, MAX_FRAME_BYTES, WORK_DIR};
+use temps_vm_agent::{Request, Response, AGENT_PORT, MAX_FRAME_BYTES, PTY_PORT, WORK_DIR};
 
-use super::{KillSignal, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider};
+use super::{
+    KillSignal, PtyAttachment, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
+    SandboxProvider,
+};
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
 
@@ -57,9 +63,19 @@ const DEFAULT_DISK_MB: u64 = 1024;
 const CACHE_SLACK_MB: u64 = 64;
 
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long opening a terminal stream may take (socket connect plus the
+/// hybrid-vsock handshake). The guest answers in milliseconds; this only
+/// bounds a wedged VMM.
+const PTY_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bytes read per chunk from a terminal stream. One buffer per attachment.
+const PTY_READ_CHUNK_BYTES: usize = 16 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const SNAPSHOT_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How much of the extractor's stderr is kept for the failure message. The
+/// extractor parses an untrusted guest image, so its output is bounded rather
+/// than trusted to be short.
+const SNAPSHOT_EXTRACTOR_STDERR_BYTES: usize = 2048;
 const MIN_SNAPSHOT_STAGING_BYTES: u64 = CACHE_SLACK_MB * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +86,35 @@ enum SnapshotExtractorError {
     Wait(#[source] std::io::Error),
     #[error("sandboxed debugfs exceeded its {timeout_seconds} second timeout")]
     TimedOut { timeout_seconds: u64 },
+}
+
+/// Failure text for a non-zero extractor exit: the status, what the tool said
+/// (it is the only evidence of *why*), and the cause that status most often
+/// means on a host that passed `temps firecracker setup`.
+fn snapshot_export_failure_message(status: std::process::ExitStatus, stderr: &str) -> String {
+    let said = if stderr.is_empty() {
+        "it printed nothing".to_string()
+    } else {
+        format!("it said: {stderr}")
+    };
+    let hint = if stderr.contains("Unexpected capabilities but not setuid") {
+        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
+         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
+    } else if stderr.contains("No permissions to create new namespace") {
+        "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
+         sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
+         AppArmor profile, or set that sysctl to 0"
+    } else {
+        ""
+    };
+    format!("sandboxed debugfs snapshot export failed with status {status}; {said}{hint}")
+}
+
+#[derive(Debug)]
+struct SnapshotExtractorOutput {
+    status: std::process::ExitStatus,
+    /// Bounded head of the extractor's stderr; empty when it printed nothing.
+    stderr: String,
 }
 
 struct FuseSnapshotStaging {
@@ -182,14 +227,20 @@ impl FirecrackerSandboxConfig {
         }
     }
 
-    fn fc_root(&self) -> PathBuf {
+    pub(crate) fn fc_root(&self) -> PathBuf {
         self.data_dir.join("firecracker")
     }
     fn firecracker_bin(&self) -> PathBuf {
         self.fc_root().join("bin/firecracker")
     }
-    fn agent_bin(&self) -> PathBuf {
+    pub(crate) fn agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-vm-agent")
+    }
+    /// Static musl `temps-pty-agent`, injected next to the VM agent so the
+    /// guest can serve interactive terminals. Optional: a host without it
+    /// still creates sandboxes, just without terminals.
+    pub(crate) fn pty_agent_bin(&self) -> PathBuf {
+        self.fc_root().join("bin/temps-pty-agent")
     }
     fn kernel_glob_dir(&self) -> PathBuf {
         self.fc_root().join("kernel")
@@ -202,6 +253,22 @@ impl FirecrackerSandboxConfig {
     }
     fn vm_dir(&self, name: &str) -> PathBuf {
         self.vms_dir().join(name)
+    }
+}
+
+/// What a VMM-process check plus an agent ping say about a VM. No VMM process
+/// is proof the VM is down. A VMM that is running but whose guest agent missed
+/// a ping is *not* proof of anything (a VM that is booting, swapping or
+/// saturated misses pings), so it is an error, not `false`: callers that
+/// act on "not running" (the row reconciliation) must not act on it.
+fn liveness_verdict(vmm_running: bool, agent_answered: bool) -> Result<bool, &'static str> {
+    match (vmm_running, agent_answered) {
+        (false, _) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(
+            "the VMM process is running but its guest agent did not answer a ping within 3s \
+             (the VM may still be booting or be overloaded)",
+        ),
     }
 }
 
@@ -318,6 +385,114 @@ impl FirecrackerSandboxProvider {
         let _ = self.write_taps(&taps);
     }
 
+    /// [`SandboxProvider::attach_pty`] with an explicit handshake deadline,
+    /// so the timeout path is testable without waiting out the real one.
+    ///
+    /// A guest that does not answer in time is a
+    /// [`AgentError::SandboxTerminalTimeout`], not an exec failure: it is
+    /// stalled rather than missing terminal support, and callers answer the
+    /// two differently.
+    async fn attach_pty_within(
+        &self,
+        handle: &SandboxHandle,
+        handshake_timeout: Duration,
+    ) -> Result<PtyAttachment, AgentError> {
+        let name = handle.sandbox_name.as_str();
+        let sock = self.config.vm_dir(name).join("v.sock");
+
+        if !sock.exists() {
+            return Err(self.err(
+                name,
+                format!(
+                    "cannot attach a terminal: sandbox is not running (no vsock socket at {})",
+                    sock.display()
+                ),
+            ));
+        }
+
+        let stream =
+            match tokio::time::timeout(handshake_timeout, vsock_connect(&sock, PTY_PORT)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    // The VMM drops the connection when the guest has nothing
+                    // listening on the port, so a handshake failure here almost
+                    // always means this guest was built without the PTY agent.
+                    let terminal = firecracker_terminal_capability_for(&self.config);
+                    let remedy = if terminal.supported {
+                        "this sandbox was created before terminal support, or from a \
+                     snapshot taken before it; recreate the sandbox to get it"
+                            .to_string()
+                    } else {
+                        format!(
+                            "{} — run `{}`, then recreate the sandbox",
+                            terminal
+                                .reason
+                                .as_deref()
+                                .unwrap_or("the guest terminal agent is unusable"),
+                            PTY_AGENT_SETUP_COMMAND
+                        )
+                    };
+                    tracing::warn!(
+                        sandbox = %name,
+                        vsock_port = PTY_PORT,
+                        error = %e,
+                        "firecracker terminal attach failed"
+                    );
+                    return Err(self.err(
+                        name,
+                        format!(
+                            "no terminal listener answered on vsock port {} ({}): {}",
+                            PTY_PORT, e, remedy
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        sandbox = %name,
+                        vsock_port = PTY_PORT,
+                        timeout_secs = handshake_timeout.as_secs(),
+                        "firecracker terminal handshake timed out"
+                    );
+                    return Err(AgentError::terminal_timeout(
+                        name,
+                        format!("agent handshake on vsock port {}", PTY_PORT),
+                        handshake_timeout,
+                    ));
+                }
+            };
+
+        let (reader, writer) = stream.into_split();
+        let sandbox_id = handle.sandbox_id.clone();
+        // `None` after an error so a failed read ends the stream instead of
+        // being retried in a loop.
+        let output = futures::stream::unfold(Some(reader), move |state| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let mut reader = state?;
+                let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
+                match reader.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok(bytes::Bytes::from(buf)), Some(reader)))
+                    }
+                    Err(e) => Some((
+                        Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id,
+                            reason: format!("terminal stream read failed: {}", e),
+                        }),
+                        None,
+                    )),
+                }
+            }
+        });
+        Ok(PtyAttachment {
+            output: Box::pin(output),
+            input: Box::pin(writer),
+        })
+    }
+
     fn err(&self, sandbox_id: &str, reason: impl std::fmt::Display) -> AgentError {
         AgentError::SandboxExecFailed {
             run_id: 0,
@@ -374,6 +549,54 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// Fingerprint of the guest binaries injected into every rootfs.
+    ///
+    /// Part of the rootfs cache key: the agents are baked into the cached
+    /// ext4, so a cache entry converted before `temps firecracker setup`
+    /// staged a newer (or the first) `temps-pty-agent` must not be reused —
+    /// it would boot VMs that have no terminal support no matter what the
+    /// host has staged now.
+    fn guest_agent_fingerprint(&self) -> Result<String, AgentError> {
+        use sha2::{Digest, Sha256};
+
+        let vm_agent_path = self.config.agent_bin();
+        let vm_agent = Self::hash_file(&vm_agent_path).map_err(|e| {
+            self.err(
+                "-",
+                format!(
+                    "guest agent missing or unreadable at {} ({}) — run `temps firecracker setup`",
+                    vm_agent_path.display(),
+                    e
+                ),
+            )
+        })?;
+        // The terminal agent is optional, so nothing about it may fail
+        // sandbox creation. What is keyed is what will actually be injected:
+        // only an agent `ensure_rootfs_locked` accepts counts, and a missing,
+        // unreadable or unusable one is "absent" — the rootfs is converted
+        // without it and terminals report why they are unavailable.
+        let pty_agent_path = self.config.pty_agent_bin();
+        let terminal = firecracker_terminal_capability_for(&self.config);
+        let pty_agent = if terminal.supported {
+            match Self::hash_file(&pty_agent_path) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    tracing::warn!(
+                        pty_agent = %pty_agent_path.display(),
+                        error = %e,
+                        "terminal agent became unreadable while keying the rootfs cache; \
+                         converting without it"
+                    );
+                    "absent".to_string()
+                }
+            }
+        } else {
+            "absent".to_string()
+        };
+        let digest = Sha256::digest(format!("vm:{vm_agent}\npty:{pty_agent}").as_bytes());
+        Ok(hex::encode(&digest[..6]))
+    }
+
     // ── Rootfs conversion (ADR-029 §4, digest-keyed cache) ──────────
 
     /// Docker image → ext4 rootfs with the agent injected. Returns the
@@ -398,7 +621,11 @@ impl FirecrackerSandboxProvider {
         let image_id = inspect
             .id
             .ok_or_else(|| self.err("-", format!("image {} has no id", image)))?;
-        let cache_key = image_id.replace(':', "-");
+        let cache_key = format!(
+            "{}-g{}",
+            image_id.replace(':', "-"),
+            self.guest_agent_fingerprint()?
+        );
         let cached = self.config.cache_dir().join(format!("{}.ext4", cache_key));
         if cached.exists() {
             return Ok(cached);
@@ -455,15 +682,22 @@ impl FirecrackerSandboxProvider {
             .await;
 
         let rootfs_dir = staging.join("rootfs");
+        // `guest_agent_fingerprint` above already proved the VM agent is
+        // readable; the PTY agent is optional.
         let agent_src = self.config.agent_bin();
-        if !agent_src.exists() {
-            return Err(self.err(
-                "-",
-                format!(
-                    "guest agent missing at {} — run `temps firecracker setup`",
-                    agent_src.display()
-                ),
-            ));
+        // Inject only an agent the guest can run. A file that exists but is
+        // for another CPU or needs a loader would otherwise be baked into the
+        // cached rootfs and fail at the first terminal.
+        let terminal = firecracker_terminal_capability_for(&self.config);
+        let pty_agent_src = terminal.supported.then(|| self.config.pty_agent_bin());
+        if pty_agent_src.is_none() {
+            tracing::warn!(
+                pty_agent = %self.config.pty_agent_bin().display(),
+                reason = terminal.reason.as_deref().unwrap_or("unknown"),
+                "terminal agent not injected; sandboxes converted now will not support \
+                 interactive terminals — run `{}`",
+                PTY_AGENT_SETUP_COMMAND
+            );
         }
         let workdir_rel = WORK_DIR.trim_start_matches('/').to_string();
 
@@ -493,14 +727,34 @@ impl FirecrackerSandboxProvider {
                 }
             }
             let _ = std::fs::remove_file(&tar_path);
+            // Everything below touches paths *the image controls*: a custom
+            // image may make `etc`, `sbin` or the agent files themselves
+            // symlinks (absolute ones included) to host paths. Plain
+            // `join` + `remove_file`/`copy` would follow them out of the
+            // rootfs and delete or overwrite host files, so every path is
+            // resolved the way a chroot would and files are created
+            // exclusively (see `rootfs_resolve`).
             for artifact in [".dockerenv", "etc/resolv.conf", "etc/hostname", "etc/hosts"] {
-                let _ = std::fs::remove_file(rootfs_for_task.join(artifact));
+                let _ = rootfs_remove(&rootfs_for_task, Path::new(artifact));
             }
-            let sbin = rootfs_for_task.join("sbin");
-            std::fs::create_dir_all(&sbin).map_err(|e| e.to_string())?;
-            std::fs::copy(&agent_src, sbin.join("temps-vm-agent")).map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(rootfs_for_task.join(&workdir_rel))
+            rootfs_inject(
+                &rootfs_for_task,
+                Path::new("sbin/temps-vm-agent"),
+                &agent_src,
+            )
+            .map_err(|e| e.to_string())?;
+            if let Some(pty_src) = &pty_agent_src {
+                // Same directory as the VM agent; the staged file's
+                // executable bit is kept. The guest's PID 1 re-asserts root
+                // ownership of it at every boot (the rootfs is built
+                // unprivileged, so the file carries the host user's uid)
+                // before supervising it.
+                rootfs_inject(&rootfs_for_task, Path::new("sbin/temps-pty-agent"), pty_src)
+                    .map_err(|e| e.to_string())?;
+            }
+            let workdir = rootfs_resolve(&rootfs_for_task, Path::new(&workdir_rel))
                 .map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
             Ok(dir_size(&rootfs_for_task))
         })
         .await
@@ -643,39 +897,12 @@ impl FirecrackerSandboxProvider {
     ) -> Result<Response, AgentError> {
         let sock = self.config.vm_dir(name).join("v.sock");
         let fut = async {
-            let stream = UnixStream::connect(&sock).await?;
-            let mut stream = BufReader::new(stream);
-            stream
-                .get_mut()
-                .write_all(format!("CONNECT {}\n", AGENT_PORT).as_bytes())
-                .await?;
-            // Handshake ack: "OK <hostport>\n"
-            let mut ack = Vec::new();
-            loop {
-                let b = stream.read_u8().await?;
-                if b == b'\n' {
-                    break;
-                }
-                ack.push(b);
-                if ack.len() > 64 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "vsock handshake overflow",
-                    ));
-                }
-            }
-            if !ack.starts_with(b"OK") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!("vsock handshake: {}", String::from_utf8_lossy(&ack)),
-                ));
-            }
+            let mut stream = vsock_connect(&sock, AGENT_PORT).await?;
             let payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
             stream
-                .get_mut()
                 .write_all(&(payload.len() as u32).to_be_bytes())
                 .await?;
-            stream.get_mut().write_all(&payload).await?;
+            stream.write_all(&payload).await?;
             let len = stream.read_u32().await?;
             if len == 0 || len > MAX_FRAME_BYTES {
                 return Err(std::io::Error::new(
@@ -1238,11 +1465,38 @@ impl FirecrackerSandboxProvider {
     async fn run_snapshot_extractor(
         command: &mut tokio::process::Command,
         timeout: Duration,
-    ) -> Result<std::process::ExitStatus, SnapshotExtractorError> {
-        command.kill_on_drop(true);
+    ) -> Result<SnapshotExtractorOutput, SnapshotExtractorError> {
+        command
+            .kill_on_drop(true)
+            .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().map_err(SnapshotExtractorError::Start)?;
+        // Drain stderr concurrently so a chatty extractor cannot block on a
+        // full pipe, keeping only the first bytes: the cause of a failure is
+        // reported before any follow-on noise.
+        let stderr_task = child.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                let mut kept = Vec::with_capacity(SNAPSHOT_EXTRACTOR_STDERR_BYTES);
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stderr.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            let room = SNAPSHOT_EXTRACTOR_STDERR_BYTES - kept.len();
+                            kept.extend_from_slice(&chunk[..read.min(room)]);
+                        }
+                    }
+                }
+                String::from_utf8_lossy(&kept).trim().to_string()
+            })
+        });
         match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => Ok(status),
+            Ok(Ok(status)) => {
+                let stderr = match stderr_task {
+                    Some(task) => task.await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                Ok(SnapshotExtractorOutput { status, stderr })
+            }
             Ok(Err(error)) => Err(SnapshotExtractorError::Wait(error)),
             Err(_) => {
                 // `kill` waits for the child after sending SIGKILL. The
@@ -1256,8 +1510,42 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// Run the child without ambient capabilities.
+    ///
+    /// Unprivileged bubblewrap exits 1 with "Unexpected capabilities but not
+    /// setuid, old file caps config?" when it starts with any capability set.
+    /// A server started by systemd with `AmbientCapabilities=` (the standard
+    /// way to let a non-root `temps serve` bind port 80/443) passes that
+    /// capability to every child, so the snapshot export failed on exactly the
+    /// hosts that follow the install guide. The extractor needs no capability,
+    /// so the ambient set is cleared in the child before `exec`; the server
+    /// itself keeps its own.
+    #[cfg(target_os = "linux")]
+    fn without_ambient_capabilities(command: &mut tokio::process::Command) {
+        // SAFETY: the closure runs between fork and exec and calls only
+        // `prctl`, which is async-signal-safe. A kernel without ambient
+        // capabilities (< 4.3) answers EINVAL, which is ignored: such a
+        // child has none to clear.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn without_ambient_capabilities(_command: &mut tokio::process::Command) {}
+
     fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new("bwrap");
+        Self::without_ambient_capabilities(&mut command);
         command
             .args([
                 "--unshare-all",
@@ -1377,8 +1665,7 @@ impl FirecrackerSandboxProvider {
             let mut dump_command = Self::sandboxed_debugfs_command(&staging, source);
             dump_command
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                .stdout(std::process::Stdio::null());
             let dump = Self::run_snapshot_extractor(&mut dump_command, SNAPSHOT_EXTRACTION_TIMEOUT)
                 .await
                 .map_err(|error| {
@@ -1420,10 +1707,10 @@ impl FirecrackerSandboxProvider {
                     max_size_bytes,
                 });
             }
-            if !dump.success() {
+            if !dump.status.success() {
                 return Err(self.err(
                     sandbox_name,
-                    format!("sandboxed debugfs snapshot export failed with status {dump}"),
+                    snapshot_export_failure_message(dump.status, &dump.stderr),
                 ));
             }
 
@@ -1567,6 +1854,7 @@ impl FirecrackerSandboxProvider {
 #[async_trait]
 impl SandboxProvider for FirecrackerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
         let name = self.resolve_name(&config);
         let vm_dir = self.config.vm_dir(&name);
         let image = config
@@ -1669,14 +1957,15 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
-        if self.vm_pid(&handle.sandbox_name).is_none() {
-            return Ok(false);
-        }
-        Ok(matches!(
-            self.rpc(&handle.sandbox_name, &Request::Ping, Duration::from_secs(3))
-                .await,
-            Ok(Response::Pong)
-        ))
+        let vmm_running = self.vm_pid(&handle.sandbox_name).is_some();
+        let agent_answered = vmm_running
+            && matches!(
+                self.rpc(&handle.sandbox_name, &Request::Ping, Duration::from_secs(3))
+                    .await,
+                Ok(Response::Pong)
+            );
+        liveness_verdict(vmm_running, agent_answered)
+            .map_err(|reason| self.err(&handle.sandbox_name, reason))
     }
 
     async fn write_file(
@@ -2038,6 +2327,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         artifact: &super::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
         if artifact.backend != super::SandboxBackend::Firecracker {
             return Err(AgentError::SandboxCreationFailed {
                 run_id: config.run_id,
@@ -2100,6 +2390,17 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             &expected_digest[..expected_digest.len().min(12)]
         );
         self.finish_create(config, name, image, vm_rootfs).await
+    }
+
+    /// Bridge to the guest's `temps-pty-agent` over vsock port
+    /// [`PTY_PORT`] (ADR-029 §5).
+    ///
+    /// `temps-vm-agent` runs the PTY agent and relays this connection to its
+    /// unix socket, so no process is started per attach and the VM needs no
+    /// `socat`. Dropping the returned `input` closes the vsock connection;
+    /// the agent — and every tab — keeps running in the guest.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        self.attach_pty_within(handle, PTY_ATTACH_TIMEOUT).await
     }
 
     fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
@@ -2232,6 +2533,167 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     }
 }
 
+/// Open a stream to a guest vsock `port` through Firecracker's hybrid-vsock
+/// unix socket (`CONNECT <port>\n` → `OK <hostport>\n`).
+///
+/// The ack is read **one byte at a time from the unbuffered stream**. A
+/// buffered reader could pull bytes that follow the ack into its own buffer
+/// and lose them when the stream is handed on — harmless for the RPC (the
+/// guest only speaks after the request), fatal for a terminal, where the
+/// agent's first frame can arrive immediately behind the ack.
+async fn vsock_connect(sock: &Path, port: u32) -> std::io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(sock).await?;
+    stream
+        .write_all(format!("CONNECT {}\n", port).as_bytes())
+        .await?;
+    let mut ack = Vec::with_capacity(32);
+    loop {
+        let b = stream.read_u8().await?;
+        if b == b'\n' {
+            break;
+        }
+        ack.push(b);
+        if ack.len() > 64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vsock handshake overflow",
+            ));
+        }
+    }
+    if !ack.starts_with(b"OK") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("vsock handshake: {}", String::from_utf8_lossy(&ack)),
+        ));
+    }
+    Ok(stream)
+}
+
+/// Resolve `rel` inside `root` the way a chroot at `root` would, without
+/// ever leaving it, and return the real path under `root`.
+///
+/// Image contents are untrusted: any component may be a symlink, absolute
+/// targets included (`etc -> /etc`), and `..` may try to climb out. A plain
+/// `root.join(rel)` followed by a filesystem call follows those links onto
+/// the *host*. Here an absolute target restarts at `root`, `..` stops at
+/// `root`, and the walk is bounded so a link cycle fails instead of looping.
+/// Components that do not exist yet are kept as plain names.
+///
+/// The result is only symlink-free for the components that existed when it
+/// was computed, which is sufficient because extraction has finished and the
+/// tree is private to this process.
+fn rootfs_resolve(root: &Path, rel: &Path) -> std::io::Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    #[derive(Debug)]
+    enum Part {
+        Parent,
+        Name(OsString),
+    }
+
+    fn parts_of(path: &Path) -> Vec<Part> {
+        path.components()
+            .filter_map(|c| match c {
+                Component::ParentDir => Some(Part::Parent),
+                Component::Normal(name) => Some(Part::Name(name.to_os_string())),
+                // `/`, prefixes and `.` carry no name to resolve.
+                Component::RootDir | Component::Prefix(_) | Component::CurDir => None,
+            })
+            .collect()
+    }
+
+    let mut pending: VecDeque<Part> = parts_of(rel).into();
+    let mut resolved = PathBuf::new();
+    let mut hops = 0usize;
+    while let Some(part) = pending.pop_front() {
+        match part {
+            Part::Parent => {
+                // At the root `..` is the root, as in a real chroot.
+                resolved.pop();
+            }
+            Part::Name(name) => {
+                let candidate = root.join(&resolved).join(&name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "too many symbolic links resolving {} inside the image rootfs",
+                                    rel.display()
+                                ),
+                            ));
+                        }
+                        let target = std::fs::read_link(&candidate)?;
+                        if target.is_absolute() {
+                            resolved.clear();
+                        }
+                        for part in parts_of(&target).into_iter().rev() {
+                            pending.push_front(part);
+                        }
+                    }
+                    _ => resolved.push(name),
+                }
+            }
+        }
+    }
+    Ok(root.join(resolved))
+}
+
+/// Remove `rel` from the image rootfs without following symlinks out of it.
+/// A missing entry is not an error; a symlink at the final component is
+/// removed itself, never its target.
+fn rootfs_remove(root: &Path, rel: &Path) -> std::io::Result<()> {
+    let Some(name) = rel.file_name() else {
+        return Ok(());
+    };
+    let dir = rootfs_resolve(root, rel.parent().unwrap_or_else(|| Path::new("")))?;
+    let path = dir.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the host file `source` to `rel` inside the image rootfs, keeping its
+/// mode. Whatever the image had at that path (a file, a directory, a symlink
+/// to a host file) is replaced, never written through, and the new file is
+/// created exclusively so a racing link cannot redirect the write.
+fn rootfs_inject(root: &Path, rel: &Path, source: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let name = rel.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("injection path {} has no file name", rel.display()),
+        )
+    })?;
+    let dir = rootfs_resolve(root, rel.parent().unwrap_or_else(|| Path::new("")))?;
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(name);
+    rootfs_remove(root, rel)?;
+
+    let mut input = std::fs::File::open(source)?;
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        input.metadata()?.permissions().mode() & 0o777
+    };
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&dest)?;
+    std::io::copy(&mut input, &mut output)?;
+    Ok(())
+}
+
 /// Restrict a directory to the owner (0700). Best-effort — a failure is
 /// logged, not fatal, since it only weakens local isolation.
 fn set_dir_private(path: &Path) {
@@ -2299,6 +2761,26 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
         && firecracker_snapshot_host_available()
 }
 
+/// Whether Firecracker sandboxes created on this host can open interactive
+/// terminals: the static `temps-pty-agent` must be staged for injection.
+/// Reported next to [`is_firecracker_available`] so the console can onboard
+/// ("stage the terminal agent") instead of surfacing a bare 409 later.
+pub fn firecracker_terminal_capability(data_dir: &Path) -> super::TerminalCapability {
+    let config = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    firecracker_terminal_capability_for(&config)
+}
+
+/// The fix for a missing or unusable guest terminal agent. Names the flag:
+/// without a `temps-pty-agent` next to the running executable plain
+/// `temps firecracker setup` only warns.
+pub const PTY_AGENT_SETUP_COMMAND: &str = "temps firecracker setup --pty-agent-bin <path>";
+
+fn firecracker_terminal_capability_for(
+    config: &FirecrackerSandboxConfig,
+) -> super::TerminalCapability {
+    super::TerminalCapability::from_staged_binary(&config.pty_agent_bin(), PTY_AGENT_SETUP_COMMAND)
+}
+
 fn host_tool_available(tool: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
@@ -2323,6 +2805,14 @@ fn firecracker_snapshot_host_available() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_vmm_is_down_but_a_missed_ping_is_not_proof() {
+        assert_eq!(liveness_verdict(false, false), Ok(false));
+        assert_eq!(liveness_verdict(true, true), Ok(true));
+        let unknown = liveness_verdict(true, false).expect_err("a missed ping is unknown");
+        assert!(unknown.contains("did not answer a ping"), "{unknown}");
+    }
+
     use super::*;
 
     fn provider_at(data_dir: PathBuf) -> FirecrackerSandboxProvider {
@@ -2351,6 +2841,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -2359,6 +2850,400 @@ mod tests {
         assert_eq!(p.resolve_name(&config), "temps-fcsandbox-abc123");
         config.container_name_override = None;
         assert_eq!(p.resolve_name(&config), "temps-fcsandbox-7");
+    }
+
+    // ── Rootfs injection must stay inside the image (untrusted symlinks) ──
+
+    /// A scratch rootfs next to a "host" directory holding a file the image
+    /// must never be able to touch.
+    fn rootfs_with_host_file() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        let host_file = host.join("config");
+        std::fs::write(&host_file, b"host configuration").unwrap();
+        (dir, root, host, host_file)
+    }
+
+    fn staged_agent(dir: &Path, bytes: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let src = dir.join("agent-src");
+        std::fs::write(&src, bytes).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        src
+    }
+
+    #[test]
+    fn injection_replaces_a_symlinked_agent_path_instead_of_writing_through_it() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (dir, root, _host, host_file) = rootfs_with_host_file();
+        std::fs::create_dir_all(root.join("sbin")).unwrap();
+        // The attack: the image ships the agent path as a link to a host file.
+        symlink(&host_file, root.join("sbin/temps-pty-agent")).unwrap();
+        let src = staged_agent(dir.path(), b"\x7fELF-agent");
+
+        rootfs_inject(&root, Path::new("sbin/temps-pty-agent"), &src).unwrap();
+
+        assert_eq!(std::fs::read(&host_file).unwrap(), b"host configuration");
+        let injected = root.join("sbin/temps-pty-agent");
+        assert!(!std::fs::symlink_metadata(&injected)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&injected).unwrap(), b"\x7fELF-agent");
+        assert_eq!(
+            std::fs::metadata(&injected).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn injection_follows_directory_symlinks_only_inside_the_rootfs() {
+        use std::os::unix::fs::symlink;
+        let (dir, root, host, host_file) = rootfs_with_host_file();
+        // `sbin -> <absolute host dir>`: a real chroot would see it as
+        // `<root><host dir>`, so the file must land there, not on the host.
+        symlink(&host, root.join("sbin")).unwrap();
+        let src = staged_agent(dir.path(), b"\x7fELF-agent");
+
+        rootfs_inject(&root, Path::new("sbin/temps-vm-agent"), &src).unwrap();
+
+        assert!(!host.join("temps-vm-agent").exists(), "escaped to the host");
+        let contained = root
+            .join(host.strip_prefix("/").unwrap())
+            .join("temps-vm-agent");
+        assert_eq!(std::fs::read(contained).unwrap(), b"\x7fELF-agent");
+        assert_eq!(std::fs::read(&host_file).unwrap(), b"host configuration");
+    }
+
+    #[test]
+    fn dotdot_and_relative_links_cannot_climb_out_of_the_rootfs() {
+        use std::os::unix::fs::symlink;
+        let (dir, root, host, _host_file) = rootfs_with_host_file();
+        std::fs::create_dir_all(root.join("usr")).unwrap();
+        symlink("../../../../../../host", root.join("usr/escape")).unwrap();
+        symlink("usr/escape", root.join("sbin")).unwrap();
+        let src = staged_agent(dir.path(), b"agent");
+
+        let resolved = rootfs_resolve(&root, Path::new("sbin/temps-vm-agent")).unwrap();
+        assert!(resolved.starts_with(&root), "{}", resolved.display());
+
+        rootfs_inject(&root, Path::new("sbin/temps-vm-agent"), &src).unwrap();
+        assert!(!host.join("temps-vm-agent").exists());
+    }
+
+    #[test]
+    fn symlink_cycles_fail_instead_of_looping() {
+        use std::os::unix::fs::symlink;
+        let (dir, root, _host, _file) = rootfs_with_host_file();
+        symlink("b", root.join("a")).unwrap();
+        symlink("a", root.join("b")).unwrap();
+        let src = staged_agent(dir.path(), b"agent");
+        let err = rootfs_inject(&root, Path::new("a/temps-vm-agent"), &src).unwrap_err();
+        assert!(err.to_string().contains("too many symbolic links"), "{err}");
+    }
+
+    #[test]
+    fn scrubbing_artifacts_never_deletes_host_files() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root, host, host_file) = rootfs_with_host_file();
+        // `etc -> <host dir>` would make `remove_file(root/etc/config)`
+        // delete the host's file if followed.
+        symlink(&host, root.join("etc")).unwrap();
+        rootfs_remove(&root, Path::new("etc/config")).unwrap();
+        assert!(host_file.exists(), "a host file was deleted through a link");
+
+        // A symlink at the final component is removed itself, not followed.
+        let target = host.join("keep");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::create_dir_all(root.join("etc2")).unwrap();
+        symlink(&target, root.join("etc2/resolv.conf")).unwrap();
+        rootfs_remove(&root, Path::new("etc2/resolv.conf")).unwrap();
+        assert!(target.exists());
+        assert!(!root.join("etc2/resolv.conf").exists());
+        // Missing entries are fine.
+        rootfs_remove(&root, Path::new("etc2/hosts")).unwrap();
+    }
+
+    #[test]
+    fn injection_replaces_a_directory_squatting_on_the_agent_path() {
+        let (dir, root, _host, _file) = rootfs_with_host_file();
+        std::fs::create_dir_all(root.join("sbin/temps-vm-agent/nested")).unwrap();
+        let src = staged_agent(dir.path(), b"agent");
+        rootfs_inject(&root, Path::new("sbin/temps-vm-agent"), &src).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("sbin/temps-vm-agent")).unwrap(),
+            b"agent"
+        );
+    }
+
+    // ── Terminal attach (ADR-029 §5) ─────────────────────────────────
+    //
+    // These speak to a stand-in for Firecracker's hybrid-vsock socket, so
+    // they run anywhere — no KVM, no guest.
+
+    /// Provider whose VM `name` has a `v.sock` served by `serve`, which gets
+    /// each accepted connection. Returns the provider, its handle, and the
+    /// temp dir (kept alive by the caller).
+    fn provider_with_vsock<F, Fut>(
+        name: &str,
+        serve: F,
+    ) -> (FirecrackerSandboxProvider, SandboxHandle, tempfile::TempDir)
+    where
+        F: FnOnce(UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let vm_dir = provider.config.vm_dir(name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(vm_dir.join("v.sock")).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                serve(stream).await;
+            }
+        });
+        let handle = provider.handle_for(name);
+        (provider, handle, dir)
+    }
+
+    /// Read the `CONNECT <port>\n` line a client sends first.
+    async fn read_connect_line(stream: &mut UnixStream) -> String {
+        let mut line = Vec::new();
+        loop {
+            let b = stream.read_u8().await.unwrap();
+            if b == b'\n' {
+                break;
+            }
+            line.push(b);
+        }
+        String::from_utf8(line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn attach_pty_handshake_that_never_answers_is_a_timeout_not_an_exec_failure() {
+        // The VMM accepts the connection but the guest never acknowledges.
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            // Hold the connection open without answering.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .attach_pty_within(&handle, Duration::from_millis(150))
+            .await
+            .err()
+            .expect("an unanswered handshake must fail");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match error {
+            AgentError::SandboxTerminalTimeout {
+                sandbox_id,
+                operation,
+                ..
+            } => {
+                assert_eq!(sandbox_id, "sbx_test");
+                assert!(operation.contains("vsock port"), "{operation}");
+            }
+            other => panic!("expected a terminal timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_pty_connects_to_the_pty_port_and_relays_bytes() {
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            assert_eq!(
+                read_connect_line(&mut stream).await,
+                format!("CONNECT {}", PTY_PORT)
+            );
+            // The agent's first bytes land immediately behind the ack, in
+            // the same write — the case a buffered handshake reader loses.
+            stream.write_all(b"OK 1073741824\nhello").await.unwrap();
+            let mut got = [0u8; 4];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let mut attachment = provider.attach_pty(&handle).await.expect("attach");
+        attachment.input.write_all(b"ping").await.unwrap();
+        attachment.input.flush().await.unwrap();
+
+        let mut received = Vec::new();
+        while received.len() < "hellopong".len() {
+            let chunk = attachment
+                .output
+                .next()
+                .await
+                .expect("stream ended early")
+                .expect("stream error");
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, b"hellopong");
+        // Server closed: the stream ends cleanly rather than erroring.
+        assert!(attachment.output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_pty_without_a_running_vm_names_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let handle = provider.handle_for("sbx_test");
+
+        let err = provider.attach_pty(&handle).await.err().expect("must fail");
+        let message = err.to_string();
+        assert!(message.contains("sbx_test"), "{message}");
+        assert!(message.contains("not running"), "{message}");
+        assert!(message.contains("v.sock"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn attach_pty_explains_a_guest_that_has_no_terminal_listener() {
+        // The VMM drops a connection to a vsock port nobody listens on.
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            drop(stream);
+        });
+
+        let err = provider.attach_pty(&handle).await.err().expect("must fail");
+        let message = err.to_string();
+        assert!(message.contains("sbx_test"), "{message}");
+        assert!(message.contains(&PTY_PORT.to_string()), "{message}");
+        // No agent staged on this host: the remedy is the setup command.
+        assert!(message.contains("temps firecracker setup"), "{message}");
+        assert!(message.contains("--pty-agent-bin"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn attach_pty_on_an_older_guest_says_to_recreate_it() {
+        let (provider, handle, dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            drop(stream);
+        });
+        // The host has the agent staged now; this VM predates it.
+        let staged = provider.config.pty_agent_bin();
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, crate::sandbox::test_elf::static_for_host(b"")).unwrap();
+        let _keep = dir;
+
+        let message = provider
+            .attach_pty(&handle)
+            .await
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(message.contains("recreate the sandbox"), "{message}");
+        assert!(!message.contains("--pty-agent-bin"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn attach_pty_rejects_a_refused_handshake() {
+        let (provider, handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            let _ = read_connect_line(&mut stream).await;
+            stream.write_all(b"ERR connection refused\n").await.unwrap();
+        });
+        let err = provider.attach_pty(&handle).await.err().expect("must fail");
+        assert!(err.to_string().contains("handshake"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rpc_still_round_trips_through_the_shared_handshake() {
+        // `rpc` and `attach_pty` share `vsock_connect`; the refactor must
+        // leave the RPC path byte-identical on the wire.
+        let (provider, _handle, _dir) = provider_with_vsock("sbx_test", |mut stream| async move {
+            assert_eq!(
+                read_connect_line(&mut stream).await,
+                format!("CONNECT {}", AGENT_PORT)
+            );
+            stream.write_all(b"OK 1073741824\n").await.unwrap();
+            let len = stream.read_u32().await.unwrap() as usize;
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Request = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, Request::Ping));
+            let reply = serde_json::to_vec(&Response::Pong).unwrap();
+            stream
+                .write_all(&(reply.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&reply).await.unwrap();
+        });
+
+        let response = provider
+            .rpc("sbx_test", &Request::Ping, Duration::from_secs(5))
+            .await
+            .expect("rpc");
+        assert!(matches!(response, Response::Pong));
+    }
+
+    #[test]
+    fn an_unusable_optional_agent_never_blocks_sandbox_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider_at(dir.path().to_path_buf());
+        let bin = dir.path().join("firecracker/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("temps-vm-agent"), b"vm-1").unwrap();
+        let without_pty = p.guest_agent_fingerprint().unwrap();
+
+        // Unreadable (a root-owned 0600 file staged by sudo, say): the same
+        // key as "not staged", because it is injected in neither case.
+        let staged = bin.join("temps-pty-agent");
+        std::fs::write(&staged, crate::sandbox::test_elf::static_for_host(b"x")).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = p.guest_agent_fingerprint();
+        // Running as root bypasses file modes; there the file is simply read.
+        if std::fs::File::open(&staged).is_err() {
+            assert_eq!(unreadable.unwrap(), without_pty);
+        } else {
+            assert!(unreadable.is_ok());
+        }
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A foreign build (Mach-O) is not injected either, so it must not
+        // churn the cache key or fail creation.
+        std::fs::write(&staged, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        assert_eq!(p.guest_agent_fingerprint().unwrap(), without_pty);
+    }
+
+    #[test]
+    fn guest_fingerprint_tracks_both_injected_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider_at(dir.path().to_path_buf());
+        let bin = dir.path().join("firecracker/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // The VM agent is mandatory.
+        let err = p.guest_agent_fingerprint().unwrap_err().to_string();
+        assert!(err.contains("temps firecracker setup"), "{err}");
+
+        std::fs::write(bin.join("temps-vm-agent"), b"vm-1").unwrap();
+        let without_pty = p.guest_agent_fingerprint().unwrap();
+        assert_eq!(without_pty.len(), 12);
+
+        // Staging the PTY agent must change the cache key, or a rootfs
+        // converted before it existed would be reused with no terminals.
+        std::fs::write(
+            bin.join("temps-pty-agent"),
+            crate::sandbox::test_elf::static_for_host(b"pty-1"),
+        )
+        .unwrap();
+        let with_pty = p.guest_agent_fingerprint().unwrap();
+        assert_ne!(without_pty, with_pty);
+
+        std::fs::write(
+            bin.join("temps-pty-agent"),
+            crate::sandbox::test_elf::static_for_host(b"pty-2"),
+        )
+        .unwrap();
+        assert_ne!(with_pty, p.guest_agent_fingerprint().unwrap());
+
+        std::fs::write(bin.join("temps-vm-agent"), b"vm-2").unwrap();
+        assert_ne!(with_pty, p.guest_agent_fingerprint().unwrap());
     }
 
     #[tokio::test]
@@ -2494,6 +3379,73 @@ mod tests {
         assert!(matches!(error, SnapshotExtractorError::TimedOut { .. }));
     }
 
+    #[tokio::test]
+    async fn snapshot_extractor_reports_a_bounded_stderr_head() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo first-line >&2; head -c 100000 /dev/zero | tr '\\0' x >&2; exit 3");
+
+        let output = FirecrackerSandboxProvider::run_snapshot_extractor(
+            &mut command,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stderr.starts_with("first-line"), "{}", output.stderr);
+        assert!(output.stderr.len() <= SNAPSHOT_EXTRACTOR_STDERR_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn extractor_children_start_without_ambient_capabilities() {
+        // The hook must not break exec, and the child must report an empty
+        // ambient set. (The set is already empty under test; the systemd
+        // case is covered by the hook being applied to the bwrap command.)
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("grep -q '^CapAmb:[[:space:]]*0*$' /proc/self/status");
+        FirecrackerSandboxProvider::without_ambient_capabilities(&mut command);
+
+        let output = FirecrackerSandboxProvider::run_snapshot_extractor(
+            &mut command,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success(), "{:?}", output);
+    }
+
+    #[tokio::test]
+    async fn export_failure_message_carries_the_tool_output() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exit 1");
+        let status = command.status().await.unwrap();
+
+        let silent = snapshot_export_failure_message(status, "");
+        assert!(silent.contains("it printed nothing"), "{silent}");
+
+        let said = snapshot_export_failure_message(status, "debugfs: Bad magic number");
+        assert!(
+            said.contains("it said: debugfs: Bad magic number"),
+            "{said}"
+        );
+        assert!(!said.contains("AppArmor"), "{said}");
+
+        let userns = snapshot_export_failure_message(
+            status,
+            "bwrap: No permissions to create new namespace",
+        );
+        assert!(
+            userns.contains("apparmor_restrict_unprivileged_userns"),
+            "{userns}"
+        );
+    }
+
     #[test]
     fn disconnected_fuse_mount_errors_require_lazy_unmount() {
         for raw_error in [libc::ENOTCONN, libc::EIO] {
@@ -2616,6 +3568,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: Some(0),
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

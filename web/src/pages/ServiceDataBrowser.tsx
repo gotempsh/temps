@@ -134,7 +134,15 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from '@/components/ui/resizable'
-import { useNavigate, useParams, useSearchParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import { isVerifiedNotFound } from '@/lib/read-failure'
+import { ScrollRegion } from '@/components/ui/scroll-region'
+import {
+  containerPathLevel,
+  findTreeNode,
+  isExpectedNavigationRejection,
+  resolveNodeListing,
+} from './service-data-browser-tree'
 
 interface TreeNode {
   name: string
@@ -1136,21 +1144,21 @@ export function ServiceDataBrowser() {
       let containersData: ContainerResponse[] = []
       let entitiesData: EntityResponse[] = []
 
-      // Find the node to determine what it can contain based on hierarchy
-      const findNode = (nodes: TreeNode[], path: string): TreeNode | null => {
-        for (const node of nodes) {
-          if (node.path === path) return node
-          if (node.children) {
-            const found = findNode(node.children, path)
-            if (found) return found
-          }
-        }
-        return null
-      }
-
-      const currentNode = findNode(treeNodes, nodePath)
-      const canListContainers = currentNode?.canContainContainers ?? true
-      const canListEntities = currentNode?.canContainEntities ?? true
+      // Decide what this node can list. Read the LIVE tree: callers such as
+      // the warm-up and the URL-sync effect invoke this function from a
+      // closure created before the node's parent was loaded, so a lookup in
+      // the render-time `treeNodes` misses the node. Defaulting a missing node
+      // to "can contain everything" made the browser ask for the child
+      // containers of a schema, which has none. When the node still cannot be
+      // found, the hierarchy level of its path decides instead.
+      const currentNode = findTreeNode(treeNodesRef.current, nodePath)
+      const {
+        listContainers: canListContainers,
+        listEntities: canListEntities,
+      } = resolveNodeListing(
+        currentNode,
+        getHierarchyCapabilities(containerPathLevel(nodePath))
+      )
 
       // Only fetch containers if this node can contain them
       if (canListContainers) {
@@ -1164,9 +1172,10 @@ export function ServiceDataBrowser() {
           ) {
             containersData = containersResponse.data
           }
-        } catch (error: any) {
-          // Only show error if this was supposed to have containers
-          if (error?.detail && !error.detail.includes('only supports')) {
+        } catch (error: unknown) {
+          // A 400 means the path has no child containers; anything else is a
+          // real failure worth logging.
+          if (!isExpectedNavigationRejection(error)) {
             console.error('Error loading containers:', error)
           }
         }
@@ -1192,9 +1201,10 @@ export function ServiceDataBrowser() {
               entitiesData = entitiesResponse.data.entities
             }
           }
-        } catch (error: any) {
-          // Only show error if this was supposed to have entities
-          if (error?.detail && !error.detail.includes('requires path depth')) {
+        } catch (error: unknown) {
+          // A 400 means the path holds no entities; anything else is a real
+          // failure worth logging.
+          if (!isExpectedNavigationRejection(error)) {
             console.error('Error loading entities:', error)
           }
         }
@@ -1694,9 +1704,14 @@ export function ServiceDataBrowser() {
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
-              Failed to load service details. Please try again.
+              {serviceError && isVerifiedNotFound(serviceError)
+                ? `Storage service ${id ?? ''} does not exist or has been deleted.`
+                : 'Failed to load service details. Please try again.'}
             </AlertDescription>
           </Alert>
+          <Button asChild variant="outline" className="mt-4">
+            <Link to="/storage">All storage services</Link>
+          </Button>
         </div>
       </div>
     )
@@ -2004,7 +2019,7 @@ export function ServiceDataBrowser() {
                   </Button>
                 </div>
               )}
-              <div className="h-full overflow-auto px-4 pb-4 pt-2">
+              <div tabIndex={0} className="h-full overflow-auto px-4 pb-4 pt-2">
                 {getProcessedNodes().length > 0 ? (
                   <TreeView
                     nodes={getProcessedNodes()}
@@ -4175,7 +4190,10 @@ function EntityDataView({
           <div>
             {queryResult && queryResult.rows && queryResult.rows.length > 0 ? (
               <>
-                <div className="rounded-md border overflow-x-auto">
+                <ScrollRegion
+                  className="rounded-md border"
+                  regionLabel="Query results, scrollable"
+                >
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-muted/50">
@@ -4231,7 +4249,7 @@ function EntityDataView({
                       ))}
                     </tbody>
                   </table>
-                </div>
+                </ScrollRegion>
 
                 {/* Row detail. Opening a JSON cell previously showed that
                     value alone, stripped of the row it came from. This shows
@@ -4289,7 +4307,10 @@ function EntityDataView({
                                   null
                                 </span>
                               ) : isStructured ? (
-                                <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
+                                <pre
+                                  tabIndex={0}
+                                  className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all"
+                                >
                                   <HighlightedCode
                                     code={text}
                                     language="json"

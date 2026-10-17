@@ -48,6 +48,9 @@ pub struct ProjectUpdatedFields {
     /// Records that Compose routing, service selection, permissions, or the
     /// advanced override changed without persisting any secret-bearing YAML.
     pub compose_configuration_updated: Option<bool>,
+    /// `hosted` or `external`, when that changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosting: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

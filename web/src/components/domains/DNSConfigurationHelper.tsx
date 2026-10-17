@@ -170,7 +170,7 @@ export function DNSConfigurationHelper() {
     return (
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex items-start justify-between gap-2">
             <div className="space-y-1">
               <CardTitle className="flex items-center gap-2">
                 {getAccessModeIcon()}
@@ -188,7 +188,7 @@ export function DNSConfigurationHelper() {
         <CardContent className="space-y-4">
           {/* Public IP Display */}
           <div className="p-4 bg-muted/50 rounded-lg space-y-3">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span className="text-sm font-medium">DNS Target IP Address</span>
               <div className="flex items-center gap-2">
                 <code className="px-3 py-1 bg-background border rounded text-lg font-mono font-semibold">
@@ -221,7 +221,7 @@ export function DNSConfigurationHelper() {
                 <div className="flex items-center justify-between">
                   <div>
                     <div className="text-xs text-muted-foreground mb-1">
-                      Wildcard subdomain (for all projects)
+                      Wildcard subdomain (for all services)
                     </div>
                     <code className="text-sm font-mono">
                       A *.yourdomain.com {targetIP}

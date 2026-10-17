@@ -54,6 +54,44 @@ pub enum ProxyLogServiceError {
     ClickHouse { operation: String, reason: String },
 }
 
+/// Postgres SQLSTATE for `deadlock_detected`.
+const SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
+/// Postgres SQLSTATE for `serialization_failure`.
+const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
+
+impl ProxyLogServiceError {
+    /// `true` when Postgres rolled the statement back because of a lock or
+    /// serialization conflict (`40P01` deadlock detected, `40001`
+    /// serialization failure) and re-running the identical statement is the
+    /// documented remedy. Both leave no partial rows behind, so retrying
+    /// cannot duplicate entries. Every other error -- connection loss,
+    /// constraint violations, a ClickHouse failure -- is not retried: it will
+    /// not change on a second attempt, or a second attempt could duplicate
+    /// rows.
+    pub fn is_transient_write_conflict(&self) -> bool {
+        use sea_orm::{DbErr, RuntimeErr};
+
+        let error = match self {
+            ProxyLogServiceError::DatabaseError(
+                DbErr::Exec(RuntimeErr::SqlxError(error))
+                | DbErr::Query(RuntimeErr::SqlxError(error)),
+            ) => error,
+            ProxyLogServiceError::DatabaseError(_)
+            | ProxyLogServiceError::InvalidFilter(_)
+            | ProxyLogServiceError::TrafficAggregationRateLimited { .. }
+            | ProxyLogServiceError::TrafficAggregationTimeout { .. }
+            | ProxyLogServiceError::TrafficAggregationTooManyGroups { .. }
+            | ProxyLogServiceError::ClickHouse { .. } => return false,
+        };
+        error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .is_some_and(|code| {
+                code == SQLSTATE_DEADLOCK_DETECTED || code == SQLSTATE_SERIALIZATION_FAILURE
+            })
+    }
+}
+
 /// Response model for proxy logs
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProxyLogResponse {
@@ -733,9 +771,17 @@ impl ProxyLogService {
             _ => proxy_logs::Column::Timestamp,
         };
 
+        // `id` is the unique tiebreaker. Without it, rows that share the sort
+        // value (a status code, a method, a host) come back in an unspecified
+        // order, so LIMIT/OFFSET pages overlap or skip rows and "Next page"
+        // shows the same rows again.
         query = match filters.sort_order.as_deref() {
-            Some("asc") => query.order_by_asc(sort_col),
-            _ => query.order_by_desc(sort_col),
+            Some("asc") => query
+                .order_by_asc(sort_col)
+                .order_by_asc(proxy_logs::Column::Id),
+            _ => query
+                .order_by_desc(sort_col)
+                .order_by_desc(proxy_logs::Column::Id),
         };
 
         (query, has_filters)
@@ -3026,9 +3072,161 @@ impl ProjectHealthSummary {
     }
 }
 
+/// Test double for a Postgres error carrying a given SQLSTATE, shared with the
+/// batch writer's retry tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ProxyLogServiceError;
+    use sea_orm::sqlx::error::{DatabaseError, ErrorKind};
+    use sea_orm::{DbErr, RuntimeErr};
+    use std::borrow::Cow;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct FakePgError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl fmt::Display for FakePgError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{} ({})", self.message, self.code)
+        }
+    }
+
+    impl std::error::Error for FakePgError {}
+
+    impl DatabaseError for FakePgError {
+        fn message(&self) -> &str {
+            self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
+
+    fn sqlx_error(code: &'static str, message: &'static str) -> RuntimeErr {
+        RuntimeErr::SqlxError(sea_orm::sqlx::Error::Database(Box::new(FakePgError {
+            code,
+            message,
+        })))
+    }
+
+    /// A statement-level Postgres failure with the given SQLSTATE, shaped the
+    /// way sea-orm surfaces it from `execute`.
+    pub(crate) fn pg_exec_error(code: &'static str, message: &'static str) -> ProxyLogServiceError {
+        ProxyLogServiceError::DatabaseError(DbErr::Exec(sqlx_error(code, message)))
+    }
+
+    /// Same failure shaped the way sea-orm surfaces it from `query_*`.
+    pub(crate) fn pg_query_error(
+        code: &'static str,
+        message: &'static str,
+    ) -> ProxyLogServiceError {
+        ProxyLogServiceError::DatabaseError(DbErr::Query(sqlx_error(code, message)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{pg_exec_error, pg_query_error};
     use super::*;
+    use crate::handler::proxy_logs::ProxyLogsQuery;
+    use sea_orm::{DatabaseBackend, QueryTrait};
+
+    fn list_sql(sort_by: Option<&str>, sort_order: Option<&str>) -> String {
+        let filters = ProxyLogsQuery {
+            sort_by: sort_by.map(str::to_string),
+            sort_order: sort_order.map(str::to_string),
+            ..Default::default()
+        };
+        let (query, _) = ProxyLogService::build_list_query(None, None, filters);
+        query.build(DatabaseBackend::Postgres).to_string()
+    }
+
+    #[test]
+    fn list_order_breaks_ties_on_id_so_pages_do_not_overlap() {
+        // Sorting by a low-cardinality column must still be a total order,
+        // otherwise OFFSET pages repeat rows.
+        let sql = list_sql(Some("status_code"), Some("asc"));
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."status_code" ASC, "proxy_logs"."id" ASC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn list_order_tiebreaker_follows_the_requested_direction() {
+        let sql = list_sql(Some("method"), Some("desc"));
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."method" DESC, "proxy_logs"."id" DESC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn default_list_order_is_newest_first_with_id_tiebreaker() {
+        let sql = list_sql(None, None);
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."timestamp" DESC, "proxy_logs"."id" DESC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn deadlock_detected_is_a_transient_write_conflict() {
+        assert!(pg_exec_error("40P01", "deadlock detected").is_transient_write_conflict());
+    }
+
+    #[test]
+    fn serialization_failure_is_a_transient_write_conflict() {
+        assert!(pg_exec_error("40001", "could not serialize access").is_transient_write_conflict());
+    }
+
+    #[test]
+    fn query_path_deadlock_is_a_transient_write_conflict() {
+        assert!(pg_query_error("40P01", "deadlock detected").is_transient_write_conflict());
+    }
+
+    #[test]
+    fn other_database_errors_are_not_transient_write_conflicts() {
+        // foreign_key_violation, unique_violation, admin_shutdown,
+        // undefined_table: retrying cannot change the outcome.
+        for code in ["23503", "23505", "57P01", "42P01"] {
+            assert!(
+                !pg_exec_error(code, "other failure").is_transient_write_conflict(),
+                "SQLSTATE {code} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn non_database_errors_are_not_transient_write_conflicts() {
+        assert!(
+            !ProxyLogServiceError::DatabaseError(sea_orm::DbErr::Custom("boom".into()))
+                .is_transient_write_conflict()
+        );
+        assert!(!ProxyLogServiceError::ClickHouse {
+            operation: "write_batch (end)".to_string(),
+            reason: "40P01 deadlock detected".to_string(),
+        }
+        .is_transient_write_conflict());
+        assert!(
+            !ProxyLogServiceError::InvalidFilter("40P01".to_string()).is_transient_write_conflict()
+        );
+    }
 
     #[test]
     fn status_class_range_includes_1xx() {

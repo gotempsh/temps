@@ -4,6 +4,7 @@
 import type { MicrosandboxCapability } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { CopyButton } from '@/components/ui/copy-button'
+import { TerminalSupportNote } from './TerminalSupportNote'
 
 export type { MicrosandboxCapability }
 
@@ -78,6 +79,9 @@ export function MicrosandboxBackendOption({
             </p>
           )}
         </div>
+      )}
+      {!unavailable && (
+        <TerminalSupportNote capability={capability?.terminal} />
       )}
     </div>
   )

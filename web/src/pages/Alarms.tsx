@@ -10,6 +10,7 @@ import {
   listProjectAlarmsQueryKey,
   resolveAlarmMutation,
   silenceAlarmMutation,
+  unsilenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { bulkUpdateProjectAlarms } from '@/api/client'
 import type {
@@ -29,12 +30,14 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -153,7 +156,7 @@ function severityBadge(severity: string) {
       return <Badge variant="destructive">Critical</Badge>
     case 'warning':
       return (
-        <Badge className="border-transparent bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-400">
+        <Badge className="border-transparent bg-amber-500/15 text-amber-800 hover:bg-amber-500/25 dark:text-amber-400">
           Warning
         </Badge>
       )
@@ -182,8 +185,12 @@ function statusBadge(status: string) {
   }
 }
 
+// A silence only mutes an alarm that is still open: once it is resolved the
+// backend lets the next breach alarm again, so don't advertise a mute that no
+// longer applies.
 function isSilenced(alarm: AlarmResponse): boolean {
   return (
+    alarm.status !== 'resolved' &&
     !!alarm.silenced_until &&
     new Date(alarm.silenced_until).getTime() > Date.now()
   )
@@ -306,9 +313,13 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const [confirmAction, setConfirmAction] =
     useState<BulkAlarmActionRequest | null>(null)
 
-  const { data: projectsData, isLoading: projectsLoading } = useQuery(
-    getProjectsOptions({ query: { per_page: 100 } })
-  )
+  const {
+    data: projectsData,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+    isFetching: projectsFetching,
+  } = useQuery(getProjectsOptions({ query: { per_page: 100 } }))
   const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
   const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
   const effectiveProject = projects.find(
@@ -430,6 +441,15 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
   })
 
+  const unsilence = useMutation({
+    ...unsilenceAlarmMutation(),
+    onSuccess: () => {
+      toast.success('Alarm silence lifted')
+      invalidate()
+    },
+    onError: (err: Error) => toast.error(`Failed to unsilence: ${err.message}`),
+  })
+
   const bulk = useMutation({
     // The project is part of the variables so a project switch mid-request
     // can't redirect later rounds or the cache invalidation elsewhere.
@@ -538,6 +558,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     acknowledge.isPending ||
     resolve.isPending ||
     silence.isPending ||
+    unsilence.isPending ||
     bulk.isPending
   const hasSelection = selectionCount(selection) !== 0
   const pageSelectable = selectableIds(items).length > 0
@@ -603,7 +624,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           disabled={projectsLoading || projects.length === 0 || bulk.isPending}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
-            <SelectValue placeholder="Select a project…" />
+            <SelectValue placeholder="Select a service…" />
           </SelectTrigger>
           <SelectContent>
             {projects.map((p) => (
@@ -772,7 +793,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         )}
         <div className="overflow-x-auto">
-          <Table>
+          <Table className="min-w-[760px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[40px]">
@@ -799,12 +820,28 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               {!hasProject && !projectsLoading ? (
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={7} className="p-0">
-                    <EmptyState
-                      size="compact"
-                      icon={AlarmClock}
-                      title="No project selected"
-                      description="Select a project to view its alarm history."
-                    />
+                    {projectsError ? (
+                      <div className="p-4">
+                        <ReadFailure
+                          resource="Services"
+                          error={projectsError}
+                          onRetry={() => void refetchProjects()}
+                          retrying={projectsFetching}
+                        />
+                      </div>
+                    ) : (
+                      <EmptyState
+                        size="compact"
+                        icon={AlarmClock}
+                        title="No services yet"
+                        description="Alarms are raised per service. Deploy a service and its alarm history appears here."
+                        action={
+                          <Button asChild>
+                            <Link to="/projects/new">Deploy a service</Link>
+                          </Button>
+                        }
+                      />
+                    )}
                   </TableCell>
                 </TableRow>
               ) : alarmsLoading || (projectsLoading && !hasProject) ? (
@@ -843,7 +880,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       description={
                         hasFilters
                           ? 'Try adjusting your filters to see more results.'
-                          : 'Nothing has fired for this project yet.'
+                          : 'Nothing has fired for this service yet.'
                       }
                     />
                   </TableCell>
@@ -991,6 +1028,23 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                                   {opt.label}
                                 </DropdownMenuItem>
                               ))}
+                              {isSilenced(alarm) && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    onClick={() =>
+                                      unsilence.mutate({
+                                        path: {
+                                          project_id: effectiveProjectId ?? 0,
+                                          alarm_id: alarm.id,
+                                        },
+                                      })
+                                    }
+                                  >
+                                    Unsilence now
+                                  </DropdownMenuItem>
+                                </>
+                              )}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         )}
@@ -1054,8 +1108,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmAction === 'acknowledge'
-                ? 'Every firing alarm in this project that matches the current filters — including ones on other pages — will be marked acknowledged.'
-                : 'Every firing or acknowledged alarm in this project that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
+                ? 'Every firing alarm in this service that matches the current filters — including ones on other pages — will be marked acknowledged.'
+                : 'Every firing or acknowledged alarm in this service that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

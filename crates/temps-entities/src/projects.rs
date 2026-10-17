@@ -113,6 +113,10 @@ pub struct Model {
     /// (`drop`), so the same project can be shipped from git, a Docker image, or
     /// a local folder. NULL means off.
     pub allow_alternate_sources: Option<bool>,
+    /// `hosted`: Temps builds and runs the app. `external`: the app runs
+    /// elsewhere and only sends Temps its telemetry; it is never deployed.
+    #[sea_orm(default_value = "hosted")]
+    pub hosting: super::types::Hosting,
     /// Bounded template provenance: a reviewed bundled slug or the fixed
     /// `custom` marker. Service projects additionally persist their complete,
     /// immutable template release in `service_template`.
@@ -120,7 +124,12 @@ pub struct Model {
     pub template_slug: Option<String>,
     /// Immutable resolved service-template release. Stored as JSONB so an
     /// existing service remains deployable and editable without consulting the
-    /// mutable catalog. Only `project_type = service` may populate it.
+    /// mutable catalog. A `service` project always has one. A `server` or
+    /// `static` project has one only when it is a source-built service of an
+    /// app template (it then also has a non-blank `template_slug`, enforced
+    /// by `projects_service_template_identity`): the release holds its
+    /// managed-database bindings, but it is built and deployed like any
+    /// other project and is not upgradeable.
     #[serde(skip_serializing)]
     pub service_template: Option<Json>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
@@ -224,6 +233,44 @@ pub struct Model {
     /// `project_telemetry_write_intervals` (signal_group = 'analytics').
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
+    /// Which template instantiation created this project, and for which of
+    /// the template's services, so a resumed instantiation can tell its own
+    /// project from one that merely holds the planned slug. The row is
+    /// inserted with [`pending_instantiation_token`] and switched to the
+    /// final [`instantiation_token`] once its environment, variables and
+    /// service links exist: the final value therefore means "ours and
+    /// complete". NULL for every project created any other way. An internal
+    /// ownership marker: never serialized in API responses.
+    #[serde(skip_serializing)]
+    pub instantiation_token: Option<String>,
+}
+
+/// The ownership token stored in [`Model::instantiation_token`] for the
+/// project created for `template_service` by instantiation `instantiation_id`.
+///
+/// One token per (instantiation, service): the partial unique index on the
+/// column makes a second project for the same step impossible.
+pub fn instantiation_token(instantiation_id: i32, template_service: &str) -> String {
+    format!("instantiation:{instantiation_id}:service:{template_service}")
+}
+
+/// The value [`Model::instantiation_token`] holds while a project made for an
+/// instantiation is still being initialized (its environment, variables and
+/// service links are written after the row).
+///
+/// The row is inserted with this value and only switched to `token` once
+/// initialization finished, so the final token proves a *complete* project
+/// and this one proves "ours, not finished" -- which a resumed run discards
+/// and recreates instead of adopting. It is a different string from every
+/// final token (those start with `instantiation:`), so the one unique index
+/// covers both spellings and a service can never hold two projects.
+pub fn pending_instantiation_token(token: &str) -> String {
+    format!("pending:{token}")
+}
+
+/// Whether `token` is a value produced by [`pending_instantiation_token`].
+pub fn is_pending_instantiation_token(token: &str) -> bool {
+    token.starts_with("pending:")
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -278,5 +325,31 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_token_is_never_a_final_token() {
+        let token = instantiation_token(7, "backend");
+        let pending = pending_instantiation_token(&token);
+        assert_ne!(pending, token);
+        assert!(is_pending_instantiation_token(&pending));
+        assert!(!is_pending_instantiation_token(&token));
+    }
+
+    #[test]
+    fn a_service_cannot_spell_a_final_token_as_another_pending_one() {
+        // Final tokens all start with `instantiation:`, pending ones with
+        // `pending:`, whatever the service is called.
+        let tricky = instantiation_token(1, "pending:instantiation:1:service:x");
+        assert!(!is_pending_instantiation_token(&tricky));
+        assert_ne!(
+            pending_instantiation_token(&instantiation_token(1, "x")),
+            tricky
+        );
     }
 }

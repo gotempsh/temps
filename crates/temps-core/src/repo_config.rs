@@ -961,13 +961,13 @@ impl MetricAlertYamlConfig {
 
 impl TempsConfig {
     /// Parse configuration from YAML string
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, yaml_serde::Error> {
+        yaml_serde::from_str(yaml)
     }
 
     /// Serialize configuration to YAML string
-    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
-        serde_yaml::to_string(self)
+    pub fn to_yaml(&self) -> Result<String, yaml_serde::Error> {
+        yaml_serde::to_string(self)
     }
 
     /// Check if configuration has any cron jobs defined
@@ -1161,7 +1161,7 @@ prompt: |
 provider: claude_cli
 max_turns: 25
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.name, "error-fixer");
         assert_eq!(agent.slug(), "error-fixer");
         assert!(agent.on.error.as_ref().unwrap().new_issue);
@@ -1171,7 +1171,7 @@ max_turns: 25
     #[test]
     fn test_agent_yaml_defaults() {
         let yaml = "name: minimal-agent\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.provider, None);
         assert_eq!(agent.max_turns, 25);
         assert_eq!(agent.timeout_seconds, 600);
@@ -1181,7 +1181,7 @@ max_turns: 25
     #[test]
     fn test_agent_slug_normalizes_spaces_and_special_chars() {
         let yaml = "name: My Cool Agent!\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.slug(), "my-cool-agent");
     }
 
@@ -1203,7 +1203,7 @@ provider: claude_cli
 max_turns: 25
 deliverable: pull_request
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(workflow.name, "Error Autofix");
         assert_eq!(workflow.slug(), "error-autofix");
         assert!(workflow.on.error.as_ref().unwrap().new_issue);
@@ -1222,7 +1222,7 @@ on:
 prompt: Watch this deploy for regressions
 deliverable: report
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let deploy = workflow.on.deploy.as_ref().unwrap();
         assert!(deploy.production);
         assert!(!deploy.preview);
@@ -1240,7 +1240,7 @@ on:
 prompt: Investigate the downtime
 deliverable: report
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let monitoring = workflow.on.monitoring.as_ref().unwrap();
         assert!(monitoring.downtime);
         assert!(!monitoring.latency_spike);
@@ -1261,7 +1261,7 @@ on:
   manual: false
 prompt: Do something
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let json = workflow.trigger_config_json();
         assert_eq!(json["manual"], false);
         assert_eq!(json["error"]["new_issue"], true);
@@ -1275,7 +1275,7 @@ prompt: Do something
 name: minimal
 prompt: do something
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(workflow.provider, None);
         assert_eq!(workflow.max_turns, 25);
         assert_eq!(workflow.timeout_seconds, 600);
@@ -1295,7 +1295,7 @@ on:
     cron: "0 9 * * 1"
   manual: false
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let json = agent.trigger_config_json();
         assert_eq!(json["manual"], false);
         assert_eq!(json["error"]["new_issue"], true);
@@ -1313,7 +1313,7 @@ on:
 config_repo: myorg/claude-config
 config_repo_branch: develop
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.config_repo.as_deref(), Some("myorg/claude-config"));
         assert_eq!(agent.config_repo_branch.as_deref(), Some("develop"));
     }
@@ -1321,7 +1321,7 @@ config_repo_branch: develop
     #[test]
     fn test_agent_yaml_without_config_repo_defaults_to_none() {
         let yaml = "name: minimal-agent\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(agent.config_repo.is_none());
         assert!(agent.config_repo_branch.is_none());
     }
@@ -1333,7 +1333,7 @@ name: test-agent
 model: opencode
 provider: claude_cli
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_provider(), Some("opencode"));
     }
 
@@ -1344,7 +1344,7 @@ name: test-agent
 system: You are a system prompt
 prompt: You are a prompt
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_prompt(), Some("You are a system prompt"));
     }
 
@@ -1354,14 +1354,14 @@ prompt: You are a prompt
 name: test-agent
 prompt: You are a prompt
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_prompt(), Some("You are a prompt"));
     }
 
     #[test]
     fn test_agent_yaml_no_provider_returns_none() {
         let yaml = "name: test-agent\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_provider(), None);
     }
 
@@ -1377,7 +1377,7 @@ tools:
     server: my-server
     url: http://localhost:8080
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let tools = agent.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].tool_type, "web_search");
@@ -1409,7 +1409,7 @@ tools:
 deliverable: pull_request
 max_turns: 30
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.name, "Coding Assistant");
         assert_eq!(agent.resolved_provider(), Some("claude_cli"));
         assert!(agent
@@ -1454,7 +1454,7 @@ tools:
       required:
         - query
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.tools.as_ref().unwrap().len(), 2);
 
         let tools_json = agent.tools_config_json().unwrap();
@@ -1485,7 +1485,7 @@ name: content-writer
 skills: [blog-writer, seo-optimizer]
 mcp_servers: [browser, github]
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             agent.skills.as_ref().unwrap(),
             &["blog-writer", "seo-optimizer"]
@@ -1505,7 +1505,7 @@ mcp_servers: [browser, github]
     #[test]
     fn test_agent_yaml_no_skills_or_mcp_defaults_to_none() {
         let yaml = "name: minimal\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(agent.skills.is_none());
         assert!(agent.mcp_servers.is_none());
         assert!(agent.skills_config_json().is_none());
@@ -1710,7 +1710,7 @@ mod health_probe_tests {
         assert_eq!(config.kind(true), "http");
         assert_eq!(config.kind(false), "process");
         assert_eq!(config.stable_for, 15);
-        let legacy: HealthCheckConfig = serde_yaml::from_str("path: /ready").unwrap();
+        let legacy: HealthCheckConfig = yaml_serde::from_str("path: /ready").unwrap();
         assert_eq!(legacy.kind(true), "http");
         assert_eq!(legacy.path, "/ready");
     }
@@ -1718,7 +1718,7 @@ mod health_probe_tests {
     #[test]
     fn health_probe_yaml_accepts_each_kind_and_rejects_misconfiguration() {
         for kind in ["http", "tcp", "process", "exec"] {
-            let config: TempsConfig = serde_yaml::from_str(&format!("health:\n  type: {kind}\n  command: [redis-cli, ping]\n  stable_for: 15\n  timeout: 5\n")).unwrap();
+            let config: TempsConfig = yaml_serde::from_str(&format!("health:\n  type: {kind}\n  command: [redis-cli, ping]\n  stable_for: 15\n  timeout: 5\n")).unwrap();
             assert!(config.health.unwrap().validate().is_ok());
         }
         for yaml in [
@@ -1730,11 +1730,11 @@ mod health_probe_tests {
             "type: http\npath: ready",
             "interval: 0",
         ] {
-            let config: HealthCheckConfig = serde_yaml::from_str(yaml).unwrap();
+            let config: HealthCheckConfig = yaml_serde::from_str(yaml).unwrap();
             assert!(config.validate().is_err(), "{yaml}");
         }
         assert!(
-            serde_yaml::from_str::<HealthCheckConfig>("type: exec\ncommand: redis-cli ping")
+            yaml_serde::from_str::<HealthCheckConfig>("type: exec\ncommand: redis-cli ping")
                 .is_err()
         );
     }

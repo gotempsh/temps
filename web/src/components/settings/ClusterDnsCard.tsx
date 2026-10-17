@@ -13,6 +13,7 @@ import {
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Switch } from '@/components/ui/switch'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
@@ -228,11 +229,16 @@ function ClusterNetworkConfiguration({
             control-plane host to set the pool safely:
           </p>
           <div className="flex items-center gap-2 rounded-md bg-muted p-3">
-            <HighlightedCode
-              className="min-w-0 flex-1 overflow-x-auto text-xs"
-              code={setupCommand}
-              language="bash"
-            />
+            <ScrollRegion
+              className="min-w-0 flex-1"
+              regionLabel="Network setup command, scrollable"
+            >
+              <HighlightedCode
+                className="block w-max text-xs"
+                code={setupCommand}
+                language="bash"
+              />
+            </ScrollRegion>
             <CopyButton
               minimal
               value={setupCommand}

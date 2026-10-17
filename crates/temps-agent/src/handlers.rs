@@ -40,6 +40,9 @@ use crate::{NodeHealthReport, PullImageRequest, PullImageResponse, RegistryCrede
 pub(crate) const MAX_CONCURRENT_OUTPUT_CAPTURES: usize = 4;
 pub(crate) const MAX_CONCURRENT_EXEC_OPERATIONS: usize = 4;
 pub(crate) const MAX_CONCURRENT_IMAGE_IMPORTS: usize = 1;
+// Bound accepted requests (uploads, waiters and up to 32 executing builds).
+// Reserve before reading specs so queue pressure cannot allocate unbounded buffers.
+pub(crate) const MAX_BUILD_REQUESTS: usize = 96;
 const MAX_IMAGE_IMPORT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const IMAGE_IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const CONTAINER_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -96,6 +99,8 @@ pub struct AgentResourceLimits {
     exec_operation_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) image_import_slots: Arc<tokio::sync::Semaphore>,
     container_operations: ContainerOperationRegistry,
+    pub(crate) build_admission: Arc<crate::build_admission::BuildAdmission>,
+    pub(crate) build_request_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AgentResourceLimits {
@@ -109,6 +114,8 @@ impl AgentResourceLimits {
             )),
             image_import_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IMAGE_IMPORTS)),
             container_operations: ContainerOperationRegistry::default(),
+            build_admission: Arc::new(Default::default()),
+            build_request_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BUILD_REQUESTS)),
         }
     }
 
@@ -119,6 +126,8 @@ impl AgentResourceLimits {
             exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(operations)),
             image_import_slots: Arc::new(tokio::sync::Semaphore::new(imports)),
             container_operations: ContainerOperationRegistry::default(),
+            build_admission: Arc::new(Default::default()),
+            build_request_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BUILD_REQUESTS)),
         }
     }
 }
@@ -404,8 +413,10 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         import_image,
         pull_image,
         crate::build_handler::build_image,
+        crate::build_handler::fetch_registry_image,
         crate::build_handler::export_image,
         crate::build_handler::extract_image_path,
+        crate::build_handler::scan_image,
         crate::build_handler::inspect_image,
         health_check,
         crate::service_handlers::create_service,
@@ -415,6 +426,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::service_handlers::service_status,
         crate::service_handlers::service_exec,
         crate::service_handlers::runtime_env,
+        crate::service_handlers::revoke_s3_access,
         crate::service_handlers::health_probe,
         crate::service_handlers::list_services,
         crate::service_handlers::backup_service,
@@ -431,6 +443,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::stop_sandbox,
         crate::sandbox_handlers::start_sandbox,
         crate::sandbox_handlers::recover_sandbox,
+        crate::sandbox_handlers::release_orphaned_sandbox_resources,
         crate::sandbox_handlers::sandbox_status,
     ),
     components(schemas(
@@ -454,6 +467,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         PullImageResponse,
         RegistryCredentials,
         NodeHealthReport,
+        crate::build_handler::FetchRegistryImage,
         temps_deployer::DeployRequest,
         temps_deployer::DeployResult,
         temps_deployer::ContainerInfo,
@@ -472,6 +486,10 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_providers::remote_service_client::RemoteRuntimeEnvResponse,
         temps_providers::remote_service_client::RemoteHealthProbeRequest,
         temps_providers::remote_service_client::RemoteHealthProbeResponse,
+        temps_deployer::image_scan::ImageScanRequest,
+        temps_deployer::image_scan::ImageScanReport,
+        temps_deployer::image_scan::ImageScanFinding,
+        temps_deployer::ImageConfig,
         crate::ServiceBackupRequest,
         crate::ServiceBackupResponse,
         crate::ServiceRestoreRequest,
@@ -492,6 +510,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_agents::sandbox::remote::RemoteWriteDirectoryRequest,
         temps_agents::sandbox::remote::RemoteKillRequest,
         temps_agents::sandbox::remote::RemoteRecoverRequest,
+        temps_agents::sandbox::remote::RemoteReleaseOrphanedRequest,
         temps_agents::sandbox::remote::RemoteStatusRequest,
         temps_agents::sandbox::remote::RemoteAliveResponse,
         temps_agents::sandbox::remote::RemoteStatusResponse,
@@ -2227,13 +2246,19 @@ pub async fn pull_image(
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn health_check(State(state): State<Arc<AgentState>>) -> impl IntoResponse {
-    let report = collect_system_metrics(&state).await;
+pub async fn health_check(
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+) -> impl IntoResponse {
+    let report = collect_system_metrics(&state, &limits).await;
     AgentResponse::ok(report)
 }
 
 /// Collect real system metrics using sysinfo.
-async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
+async fn collect_system_metrics(
+    state: &AgentState,
+    limits: &AgentResourceLimits,
+) -> NodeHealthReport {
     use sysinfo::{Disks, System};
 
     let mut sys = System::new();
@@ -2269,6 +2294,16 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         // Empty means "not discovered yet" — the control plane treats a blank
         // platform as unknown rather than as a claim about this node.
         platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
+        build_slots_available: Some(
+            if limits.build_admission.serial() && limits.image_import_slots.available_permits() == 0
+            {
+                0
+            } else {
+                limits.build_admission.available()
+            },
+        ),
+        build_limits_supported: true,
+        build_concurrency_limit: Some(limits.build_admission.concurrency_limit()),
     }
 }
 

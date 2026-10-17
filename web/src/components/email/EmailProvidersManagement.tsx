@@ -41,6 +41,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -251,21 +252,11 @@ function ProviderCard({
   onEditClick,
 }: {
   provider: EmailProvider
-  onDelete: (id: number) => void
+  onDelete: (provider: EmailProvider) => void
   onTestClick: (id: number) => void
   onEditClick: (provider: EmailProvider) => void
 }) {
-  const [isDeleting, setIsDeleting] = useState(false)
   const navigate = useNavigate()
-
-  const handleDelete = () => {
-    setIsDeleting(true)
-    try {
-      onDelete(provider.id)
-    } finally {
-      setIsDeleting(false)
-    }
-  }
 
   return (
     <Card
@@ -313,10 +304,9 @@ function ProviderCard({
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-destructive"
-                onClick={handleDelete}
-                disabled={isDeleting}
+                onClick={() => onDelete(provider)}
               >
-                {isDeleting ? 'Deleting...' : 'Delete'}
+                Delete
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -934,6 +924,8 @@ export function EmailProvidersManagement() {
   const [editingProvider, setEditingProvider] = useState<EmailProvider | null>(
     null
   )
+  const [providerToDelete, setProviderToDelete] =
+    useState<EmailProvider | null>(null)
   const queryClient = useQueryClient()
 
   const { data: providers, isLoading } = useQuery({
@@ -952,11 +944,8 @@ export function EmailProvidersManagement() {
         description: error.message,
       })
     },
+    onSettled: () => setProviderToDelete(null),
   })
-
-  const handleDelete = (id: number) => {
-    deleteMutation.mutate(id)
-  }
 
   const handleTestClick = (id: number) => {
     setTestingProviderId(id)
@@ -972,7 +961,7 @@ export function EmailProvidersManagement() {
 
   return (
     <div className="space-y-4">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Email Providers</h2>
           <p className="text-muted-foreground">
@@ -1011,7 +1000,7 @@ export function EmailProvidersManagement() {
             <ProviderCard
               key={provider.id}
               provider={provider}
-              onDelete={handleDelete}
+              onDelete={setProviderToDelete}
               onTestClick={handleTestClick}
               onEditClick={handleEditClick}
             />
@@ -1034,6 +1023,20 @@ export function EmailProvidersManagement() {
         provider={editingProvider}
         onSuccess={() => {
           queryClient.invalidateQueries({ queryKey: ['email-providers'] })
+        }}
+      />
+
+      <ConfirmDeleteDialog
+        open={providerToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="email provider"
+        resourceName={providerToDelete?.name ?? ''}
+        consequences="Domains and sending that rely on it will stop working."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (providerToDelete) deleteMutation.mutate(providerToDelete.id)
         }}
       />
     </div>

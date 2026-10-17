@@ -119,7 +119,9 @@ test('empty databases offer all supported types and load errors do not look empt
     path: '/tmp/temps-databases-empty-cards.png',
     fullPage: true,
   })
-  await cards.getByRole('link', { name: 'Create mongodb', exact: true }).click()
+  // Each card is one link whose name is the type, its description and the
+  // "Create database" affordance, so match on the description.
+  await cards.getByRole('link', { name: /Create mongodb/ }).click()
   await expect(page).toHaveURL(new RegExp(`project_id=${project.id}`))
 })
 
@@ -149,7 +151,7 @@ for (const mode of ['project', 'custom'] as const) {
     await page.getByRole('button', { name: 'Link', exact: true }).click()
     await page
       .getByRole('radio', {
-        name: mode === 'custom' ? /Custom database/ : /Database per project/,
+        name: mode === 'custom' ? /Custom database/ : /Database per service/,
       })
       .click()
     if (mode === 'custom') {
@@ -179,7 +181,7 @@ for (const mode of ['project', 'custom'] as const) {
     })
     await expect(
       page
-        .getByText(mode === 'custom' ? /Custom database/ : /Per project/)
+        .getByText(mode === 'custom' ? /Custom database/ : /Per service/)
         .first()
     ).toBeVisible()
   })

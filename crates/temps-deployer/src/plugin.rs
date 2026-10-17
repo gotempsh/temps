@@ -437,16 +437,10 @@ impl TempsPlugin for DeployerPlugin {
             .with_extra_networks(server_config.docker_extra_networks.clone())
             .with_docker_socket_grant(docker_socket_grant.clone());
             if let Some(limits) = build_limits {
-                let resource_caps = if limits.cpu_limit_cores > 0.0 && limits.memory_limit_mb > 0 {
-                    Some(crate::docker::BuildResourceLimits {
-                        cpu_cores: limits.cpu_limit_cores,
-                        memory_mb: limits.memory_limit_mb,
-                    })
-                } else {
-                    None
-                };
-                docker_runtime =
-                    docker_runtime.with_build_limits(limits.max_concurrent, resource_caps);
+                docker_runtime = docker_runtime.with_build_limits(
+                    limits.max_concurrent,
+                    crate::docker::BuildResourceLimits::from_settings(&limits),
+                );
                 tracing::info!(
                     "DockerRuntime: build concurrency={}, per-build cpu={} cores, mem={} MB \
                      (0 = legacy 50%-of-host heuristic)",
@@ -455,6 +449,11 @@ impl TempsPlugin for DeployerPlugin {
                     limits.memory_limit_mb
                 );
             }
+            // Saving new limits in the console takes effect on the running
+            // gate; this also covers settings that could not be read above
+            // and a save in another process. The task ends with the config
+            // service.
+            docker_runtime.spawn_build_limits_watcher(config_service.subscribe_build_limits());
 
             // Reconcile the app network and its metadata-egress rules during
             // every server start, even when cluster DNS is disabled and no new

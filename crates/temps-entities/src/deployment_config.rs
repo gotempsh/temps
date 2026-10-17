@@ -289,6 +289,8 @@ pub enum BuildLocation {
     ControlPlane,
     /// Build on a worker node, falling back to the control plane.
     Node,
+    /// Dispatch source builds to the installation CI executor. Fail closed.
+    Ci,
 }
 
 /// Deployment configuration shared between projects and environments

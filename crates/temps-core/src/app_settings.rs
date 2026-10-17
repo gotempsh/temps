@@ -120,8 +120,21 @@ pub struct AppSettings {
     /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
 
-    // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
-    // auto-enabled by `temps setup` for QuickStart (sslip.io) installs.
+    /// Managed KV service (Redis container) settings. Owned by
+    /// `PATCH /kv/settings`; the generic settings update preserves the stored
+    /// value.
+    pub kv: KvSettings,
+
+    /// Managed Blob service (RustFS container) settings. Owned by
+    /// `PATCH /blob/settings`; the generic settings update preserves the
+    /// stored value.
+    pub blob: BlobSettings,
+
+    // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). On for new
+    // installations (see `AppSettings::default`); a stored row that predates the
+    // section stays off via `legacy_on_demand_tls_settings`, so an upgrade never
+    // starts issuing certificates the operator was not told about.
+    #[serde(default = "legacy_on_demand_tls_settings")]
     pub on_demand_tls: OnDemandTlsSettings,
 
     // AI configuration settings (global config repo for skills, MCP servers, etc.)
@@ -205,6 +218,19 @@ pub struct AppSettings {
     /// Retention windows for raw proxy and OpenTelemetry telemetry.
     /// TimescaleDB policies are updated at runtime by the Settings API.
     pub observability_retention: ObservabilityRetentionSettings,
+
+    /// Retention windows for product analytics data and for the personal
+    /// identifiers (visitors, client IP addresses) attached to it.
+    /// Applied by a background job, not at save time, so a change takes
+    /// effect within the job's interval.
+    #[serde(default)]
+    pub analytics_retention: AnalyticsRetentionSettings,
+
+    /// How Temps talks to the instance's ClickHouse server (wire compression
+    /// of query responses). Read once when the process starts, so a change
+    /// is applied by the next restart; the Settings API reports the mode the
+    /// running process actually uses next to the stored one.
+    pub clickhouse: ClickHouseSettings,
 
     /// Geolocation database refresh policy, MaxMind credential (encrypted at
     /// rest), and the self-recorded freshness metadata of the last refresh.
@@ -915,20 +941,27 @@ impl CeilingEnforcement {
 /// Control-plane build resource limits.
 ///
 /// Caps how many builds run concurrently AND how much CPU/memory each build
-/// is allowed to consume. A single global semaphore in the deployer crate
-/// gates every `DockerRuntime::build_image` call to `max_concurrent`. When
-/// the semaphore is full, additional builds queue and wait — they do not
-/// fail. Per-build CPU/memory caps are forwarded to Docker via
+/// is allowed to consume. A single global gate in the deployer crate
+/// admits at most `max_concurrent` `DockerRuntime::build_image` calls at a
+/// time. When the gate is full, additional builds queue and wait — they do
+/// not fail. Per-build CPU/memory caps are forwarded to Docker via
 /// `BuildImageOptions { memory, cpuquota, cpuperiod }`.
+///
+/// Changes apply live, with no restart. Builds already running finish with the
+/// limits they started with; queued and new builds use the new ones. Lowering
+/// `max_concurrent` never stops a running build: new builds wait until enough
+/// of them finish to get under the new limit.
 ///
 /// `cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means "no explicit cap"
 /// — fall back to the legacy 50%-of-host heuristic for backwards
 /// compatibility with operators who never visit the settings page.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct BuildLimitsSettings {
     /// Maximum number of `docker build` operations allowed to run at the
     /// same time on the control plane. Additional builds queue. Min 1.
+    /// Applies live: raising it starts queued builds right away; lowering it
+    /// lets running builds finish and holds new ones until they do.
     #[schema(minimum = 1, example = 2)]
     pub max_concurrent: u32,
 
@@ -936,14 +969,15 @@ pub struct BuildLimitsSettings {
     /// a core). 0 means "use the legacy 50%-of-host default". Applied only
     /// by Docker's legacy builder: BuildKit, the default since Docker 18.09,
     /// ignores the CPU and memory options of the image build API, so on
-    /// BuildKit hosts this has no effect. Read once at startup; a change
-    /// takes effect after `temps serve` restarts.
+    /// BuildKit hosts this has no effect. Applies live to builds that start
+    /// after the change; a running build keeps the cap it started with.
     #[schema(minimum = 0.0, example = 2.0)]
     pub cpu_limit_cores: f32,
 
     /// Memory allowed per build, in megabytes. 0 means "use the legacy
     /// 50%-of-host default". Same scope as `cpu_limit_cores`: applied only
-    /// by the legacy builder, ignored by BuildKit, read once at startup.
+    /// by the legacy builder, ignored by BuildKit, applied live to builds that
+    /// start after the change.
     /// Values above 2047 MB are reduced to 2047 MB, the most the build API
     /// accepts through the client, with a warning in the server log.
     #[schema(minimum = 0, example = 2048)]
@@ -1490,6 +1524,35 @@ impl Default for PreviewGatewaySettings {
     }
 }
 
+/// Settings of the managed KV service (the Redis container behind `/kv`).
+///
+/// The Docker container is named `redis-<service name>`, so two Temps
+/// instances sharing one Docker daemon collide unless each has its own name.
+/// An unset value follows the per-instance default (the pre-existing
+/// `redis-temps-kv` for an install that already enabled KV, a name derived
+/// from this instance otherwise).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct KvSettings {
+    /// Docker container name of the KV Redis container. Empty means the
+    /// per-instance default. A custom value must start with `redis-`.
+    #[schema(example = "redis-temps-kv-staging")]
+    pub container_name: String,
+}
+
+/// Settings of the managed Blob service (the RustFS container behind `/blob`).
+///
+/// Same reasoning as [`KvSettings`]: the container is named
+/// `rustfs-<service name>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BlobSettings {
+    /// Docker container name of the Blob RustFS container. Empty means the
+    /// per-instance default. A custom value must start with `rustfs-`.
+    #[schema(example = "rustfs-temps-blob-staging")]
+    pub container_name: String,
+}
+
 /// On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
 ///
 /// When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
@@ -1497,14 +1560,19 @@ impl Default for PreviewGatewaySettings {
 /// console host) that have no active cert, rather than silently failing the
 /// handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
 ///
-/// Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
-/// installs where `temps setup` auto-enables it and derives `zone`.
+/// New installations start with it on (`AppSettings::default`); the zone comes
+/// from `zone` or is derived from `external_url`/`preview_domain`, and nothing
+/// is issued while none can be derived or `external_url` is loopback. A settings
+/// row stored before this section existed stays off until the operator enables
+/// it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct OnDemandTlsSettings {
-    /// Master switch. When `false` (default) the proxy's on-demand cert gate
-    /// rejects every SNI and no issuance is ever triggered.
-    #[schema(example = false)]
+    /// Master switch. When `false` the proxy's on-demand cert gate rejects
+    /// every SNI and no issuance is ever triggered. New installations start
+    /// with it `true`; a stored settings row that predates this section keeps
+    /// `false`.
+    #[schema(example = true)]
     pub enabled: bool,
 
     /// Zone suffix for the allowlist gate. A hostname passes the gate only if
@@ -1533,6 +1601,13 @@ pub struct OnDemandTlsSettings {
     ///     which IS certed.
     #[schema(example = "http")]
     pub deployment_url_mode: String,
+}
+
+/// The value for a stored settings row that has no (or an unreadable)
+/// `on_demand_tls` section: feature off, exactly what such an install ran with
+/// before the section existed.
+fn legacy_on_demand_tls_settings() -> OnDemandTlsSettings {
+    OnDemandTlsSettings::default()
 }
 
 impl Default for OnDemandTlsSettings {
@@ -1604,6 +1679,83 @@ pub struct MonitoringSettings {
     pub clickhouse_url: Option<String>,
 }
 
+/// Wire compression used on the HTTP connection to the instance's ClickHouse
+/// server.
+///
+/// The `clickhouse` client asks for compressed responses (`compress=1`) and
+/// decodes exactly one codec, LZ4, but it never says which codec it wants, so
+/// it silently depends on the server's `network_compression_method` default.
+/// ClickHouse 26.9 changed that default to ZSTD, after which every response
+/// that carries rows fails with `decompression error: incorrect magic
+/// number`. Temps therefore makes the choice itself and never leaves it to the
+/// server default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickHouseCompression {
+    /// Ask for LZ4-compressed responses and pin the server's
+    /// `network_compression_method` to `lz4` on every query, so the server
+    /// default can never disagree with what the client decodes. Default.
+    #[default]
+    Lz4,
+    /// Ask for uncompressed responses. The escape hatch for a proxy or load
+    /// balancer between Temps and ClickHouse that re-encodes response bodies
+    /// and breaks the LZ4 framing.
+    None,
+}
+
+impl ClickHouseCompression {
+    /// Every mode, in the order the settings UI should offer them.
+    pub const ALL: [ClickHouseCompression; 2] =
+        [ClickHouseCompression::Lz4, ClickHouseCompression::None];
+
+    /// The stable lowercase name used in the API, logs and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClickHouseCompression::Lz4 => "lz4",
+            ClickHouseCompression::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for ClickHouseCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A value that is not one of the [`ClickHouseCompression`] modes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("'{value}' is not a valid ClickHouse compression mode; expected one of: lz4, none")]
+pub struct ParseClickHouseCompressionError {
+    pub value: String,
+}
+
+impl std::str::FromStr for ClickHouseCompression {
+    type Err = ParseClickHouseCompressionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lz4" => Ok(ClickHouseCompression::Lz4),
+            "none" => Ok(ClickHouseCompression::None),
+            _ => Err(ParseClickHouseCompressionError {
+                value: s.to_string(),
+            }),
+        }
+    }
+}
+
+/// Settings for the connection to the instance's ClickHouse server.
+///
+/// The connection itself (URL, database, user, password) is bootstrap
+/// configuration in `TEMPS_CLICKHOUSE_*`; only behaviour an operator may need
+/// to change at runtime lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(default)]
+pub struct ClickHouseSettings {
+    /// Wire compression for query responses. See [`ClickHouseCompression`].
+    pub compression: ClickHouseCompression,
+}
+
 /// TimescaleDB compression policy configuration for append-only observability
 /// tables. Values are expressed in hours so operators can choose sub-day
 /// windows while keeping the API representation unambiguous.
@@ -1667,6 +1819,137 @@ impl Default for ObservabilityRetentionSettings {
             otel_metrics_days: 90,
             container_logs_days: 30,
         }
+    }
+}
+
+/// Bounds every [`AnalyticsRetentionSettings`] window is validated against.
+pub const MIN_ANALYTICS_RETENTION_DAYS: u32 = 1;
+pub const MAX_ANALYTICS_RETENTION_DAYS: u32 = 3650;
+/// Default for [`AnalyticsRetentionSettings::events_days`]: the window the
+/// initial schema installs on the `events` hypertable.
+pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 90;
+/// Default for [`AnalyticsRetentionSettings::unreferenced_ip_days`].
+pub const DEFAULT_UNREFERENCED_IP_RETENTION_DAYS: u32 = 30;
+
+/// Days added to the proxy-log window before a stored IP address may be
+/// deleted. An address's `last_used_at` is refreshed at most every 12 hours
+/// and a cached lookup reuses its id for 6 more, so the last log that points
+/// at an address can be written up to ~18 hours after the timestamp the
+/// sweep reads. A whole day covers that lag and the delay before the proxy
+/// applies a newly saved window.
+pub const IP_REFERENCE_SLACK_DAYS: u32 = 1;
+
+/// How long product analytics data, and the identifiers attached to it, are
+/// kept.
+///
+/// `ip_geolocations` holds the full client IP address and is referenced by
+/// events, proxy logs, error events, visitors, performance metrics and audit
+/// logs. Before these settings existed nothing ever removed an IP once stored,
+/// and nothing removed visitors, so the retention of the referencing tables
+/// said nothing about how long an address was kept.
+///
+/// A job removes an IP row only when **no** table references it, so the
+/// effective retention of an address is the longest window among the data that
+/// still points at it. Audit logs keep their IP for as long as the audit
+/// record exists.
+///
+/// `None` on an optional window means "keep" -- the behaviour before the
+/// setting existed -- so upgrading never starts deleting data on its own,
+/// except for the unreferenced-IP cleanup, which only drops cache rows that
+/// nothing points at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AnalyticsRetentionSettings {
+    /// Retain analytics events (page views, custom events) for this many
+    /// days. Applied as the TimescaleDB retention policy of the `events`
+    /// hypertable. ClickHouse-backed analytics keep their own storage TTL.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub events_days: u32,
+
+    /// Retain captured error events for this many days. `null` keeps them
+    /// until the project is deleted. Error groups keep their counters.
+    #[schema(minimum = 1, maximum = 3650, nullable = true, example = 90)]
+    pub error_events_days: Option<u32>,
+
+    /// Delete visitors that have not been seen for this many days. Their
+    /// events, proxy logs and error events stay (until their own retention
+    /// ends) but are no longer linked to a visitor; session replays of the
+    /// visitor are deleted with it. `null` keeps visitors indefinitely.
+    #[schema(minimum = 1, maximum = 3650, nullable = true, example = 425)]
+    pub visitor_days: Option<u32>,
+
+    /// Delete a stored client IP address (and its derived location) once
+    /// nothing references it and it has not been looked up for this many
+    /// days. Never applied sooner than the proxy-log retention
+    /// (`observability_retention.proxy_logs_days`): request logs kept outside
+    /// PostgreSQL still point at the address. `null` keeps every address ever
+    /// seen.
+    #[schema(minimum = 1, maximum = 3650, nullable = true, example = 30)]
+    pub unreferenced_ip_days: Option<u32>,
+
+    /// Server-managed; a value sent by a client is replaced on save. Set when
+    /// `observability_retention.proxy_logs_days` is lowered: request logs
+    /// stored outside PostgreSQL keep the window they were written with, so
+    /// they can still point at an address for the previous window. Stored IP
+    /// addresses are not deleted until this moment has passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    pub ip_hold_until: Option<DateTime<Utc>>,
+}
+
+impl Default for AnalyticsRetentionSettings {
+    fn default() -> Self {
+        Self {
+            events_days: DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
+            error_events_days: None,
+            visitor_days: None,
+            unreferenced_ip_days: Some(DEFAULT_UNREFERENCED_IP_RETENTION_DAYS),
+            ip_hold_until: None,
+        }
+    }
+}
+
+impl AnalyticsRetentionSettings {
+    /// Recompute [`Self::ip_hold_until`] for a save that moves the proxy-log
+    /// retention from `previous_days` to `next_days`, starting from the value
+    /// that was stored (a client-supplied one is never trusted).
+    ///
+    /// Lowering the window means logs already written still live for up to
+    /// `previous_days`, so addresses are held until then; a later lowering can
+    /// only extend the hold. Raising or keeping it changes nothing, and a hold
+    /// that has passed is dropped.
+    pub fn with_ip_hold(
+        mut self,
+        stored_hold: Option<DateTime<Utc>>,
+        previous_days: u32,
+        next_days: u32,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut hold = stored_hold.filter(|until| *until > now);
+        if next_days < previous_days {
+            let until = now
+                + chrono::Duration::days(
+                    i64::from(previous_days) + i64::from(IP_REFERENCE_SLACK_DAYS),
+                );
+            hold = Some(hold.map_or(until, |existing| existing.max(until)));
+        }
+        self.ip_hold_until = hold;
+        self
+    }
+
+    /// The first window outside `1..=3650`, as `(field, value)`.
+    pub fn out_of_range(&self) -> Option<(&'static str, u32)> {
+        let windows = [
+            ("events_days", Some(self.events_days)),
+            ("error_events_days", self.error_events_days),
+            ("visitor_days", self.visitor_days),
+            ("unreferenced_ip_days", self.unreferenced_ip_days),
+        ];
+        windows.into_iter().find_map(|(field, days)| {
+            let days = days?;
+            (!(MIN_ANALYTICS_RETENTION_DAYS..=MAX_ANALYTICS_RETENTION_DAYS).contains(&days))
+                .then_some((field, days))
+        })
     }
 }
 
@@ -2032,7 +2315,16 @@ impl Default for AppSettings {
             multi_node: MultiNodeSettings::default(),
             agent_sandbox: AgentSandboxSettings::default(),
             preview_gateway: PreviewGatewaySettings::default(),
-            on_demand_tls: OnDemandTlsSettings::default(),
+            kv: KvSettings::default(),
+            blob: BlobSettings::default(),
+            // New installations opt in: stable environment URLs not covered by
+            // a wildcard certificate are ordered over HTTP-01 without any setup
+            // step. It still does nothing until a public zone can be derived and
+            // `external_url` is not loopback, so local installs are unaffected.
+            on_demand_tls: OnDemandTlsSettings {
+                enabled: true,
+                ..OnDemandTlsSettings::default()
+            },
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             trusted_private_networks: Vec::new(),
@@ -2046,6 +2338,8 @@ impl Default for AppSettings {
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
             observability_retention: ObservabilityRetentionSettings::default(),
+            analytics_retention: AnalyticsRetentionSettings::default(),
+            clickhouse: ClickHouseSettings::default(),
             geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
             setup_complete: false,
@@ -2262,8 +2556,28 @@ impl AppSettings {
                 Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
                 Some(_) => Some(false),
             };
+            // Same for the ClickHouse wire-compression mode: resetting a saved
+            // `none` to the LZ4 default would silently re-break a deployment
+            // whose proxy corrupts LZ4 framing, over an unrelated bad section.
+            let clickhouse = value
+                .get("clickhouse")
+                .and_then(|section| {
+                    serde_json::from_value::<ClickHouseSettings>(section.clone()).ok()
+                })
+                .unwrap_or_default();
+            // A stored section that does not parse falls back to the legacy
+            // (off) value rather than the new-install default, for the same
+            // reason `anonymous_telemetry_enabled` is preserved above.
+            let on_demand_tls = value
+                .get("on_demand_tls")
+                .and_then(|section| {
+                    serde_json::from_value::<OnDemandTlsSettings>(section.clone()).ok()
+                })
+                .unwrap_or_else(legacy_on_demand_tls_settings);
             Self {
                 anonymous_telemetry_enabled,
+                clickhouse,
+                on_demand_tls,
                 ..Self::default()
             }
         })
@@ -2385,6 +2699,57 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lowering_proxy_log_retention_holds_addresses_for_the_old_window() {
+        let now = Utc::now();
+        let settings = AnalyticsRetentionSettings::default().with_ip_hold(None, 90, 7, now);
+
+        assert_eq!(
+            settings.ip_hold_until,
+            Some(now + chrono::Duration::days(90 + i64::from(IP_REFERENCE_SLACK_DAYS))),
+            "logs written under the 90-day window can outlive the new 7-day one"
+        );
+    }
+
+    #[test]
+    fn a_client_supplied_hold_is_not_trusted() {
+        let now = Utc::now();
+        let forged = AnalyticsRetentionSettings {
+            ip_hold_until: Some(now + chrono::Duration::days(3000)),
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        let settings = forged.with_ip_hold(None, 30, 30, now);
+
+        assert_eq!(settings.ip_hold_until, None);
+    }
+
+    #[test]
+    fn raising_the_window_keeps_a_hold_and_a_second_lowering_only_extends_it() {
+        let now = Utc::now();
+        let later = now + chrono::Duration::days(60);
+
+        let kept = AnalyticsRetentionSettings::default().with_ip_hold(Some(later), 7, 30, now);
+        assert_eq!(kept.ip_hold_until, Some(later));
+
+        let extended = AnalyticsRetentionSettings::default().with_ip_hold(Some(later), 30, 7, now);
+        assert_eq!(
+            extended.ip_hold_until,
+            Some(later),
+            "a shorter hold never replaces a longer one"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_has_passed_is_dropped() {
+        let now = Utc::now();
+        let past = now - chrono::Duration::days(1);
+
+        let settings = AnalyticsRetentionSettings::default().with_ip_hold(Some(past), 30, 30, now);
+
+        assert_eq!(settings.ip_hold_until, None);
+    }
+
     use super::*;
 
     #[test]
@@ -3030,6 +3395,70 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_compression_defaults_to_lz4_for_legacy_settings_json() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com"
+        }));
+
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::Lz4);
+        assert_eq!(parsed.clickhouse, ClickHouseSettings::default());
+    }
+
+    #[test]
+    fn clickhouse_compression_round_trips_through_json_as_snake_case() {
+        let mut settings = AppSettings::default();
+        settings.clickhouse.compression = ClickHouseCompression::None;
+
+        let json = settings.to_json();
+        assert_eq!(json["clickhouse"]["compression"], "none");
+
+        let parsed = AppSettings::from_json(json);
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::None);
+    }
+
+    #[test]
+    fn clickhouse_compression_survives_an_unrelated_malformed_section() {
+        // `monitoring` is the wrong type, so the whole document fails to
+        // decode; the saved ClickHouse mode must not fall back to the default.
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "monitoring": "not an object",
+            "clickhouse": { "compression": "none" }
+        }));
+
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::None);
+    }
+
+    #[test]
+    fn clickhouse_compression_rejects_unknown_wire_values() {
+        let result: Result<ClickHouseSettings, _> =
+            serde_json::from_value(serde_json::json!({ "compression": "zstd" }));
+        assert!(result.is_err(), "zstd is not a supported client mode");
+    }
+
+    #[test]
+    fn clickhouse_compression_parses_names_case_insensitively() {
+        assert_eq!(
+            "LZ4".parse::<ClickHouseCompression>(),
+            Ok(ClickHouseCompression::Lz4)
+        );
+        assert_eq!(
+            " none ".parse::<ClickHouseCompression>(),
+            Ok(ClickHouseCompression::None)
+        );
+        let error = "zstd".parse::<ClickHouseCompression>().unwrap_err();
+        assert_eq!(error.value, "zstd");
+        assert!(error.to_string().contains("expected one of: lz4, none"));
+    }
+
+    #[test]
+    fn clickhouse_compression_display_matches_wire_name() {
+        for mode in ClickHouseCompression::ALL {
+            assert_eq!(mode.to_string(), mode.as_str());
+            assert_eq!(mode.as_str().parse::<ClickHouseCompression>(), Ok(mode));
+        }
+    }
+
+    #[test]
     fn legacy_settings_json_uses_observability_retention_defaults() {
         let parsed = AppSettings::from_json(serde_json::json!({
             "external_url": "https://paas.example.com",
@@ -3042,6 +3471,54 @@ mod tests {
         );
         assert_eq!(parsed.observability_retention.proxy_logs_days, 30);
         assert_eq!(parsed.observability_retention.otel_spans_days, 90);
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_analytics_retention_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com"
+        }));
+
+        assert_eq!(parsed.analytics_retention.events_days, 90);
+        // Upgrading must not start deleting visitors or error events.
+        assert_eq!(parsed.analytics_retention.visitor_days, None);
+        assert_eq!(parsed.analytics_retention.error_events_days, None);
+        assert_eq!(parsed.analytics_retention.unreferenced_ip_days, Some(30));
+    }
+
+    #[test]
+    fn analytics_retention_round_trips_and_null_means_keep() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "analytics_retention": {
+                "events_days": 30,
+                "visitor_days": 425,
+                "unreferenced_ip_days": null
+            }
+        }));
+
+        assert_eq!(parsed.analytics_retention.events_days, 30);
+        assert_eq!(parsed.analytics_retention.visitor_days, Some(425));
+        assert_eq!(parsed.analytics_retention.unreferenced_ip_days, None);
+
+        let again = AppSettings::from_json(parsed.to_json());
+        assert_eq!(again.analytics_retention, parsed.analytics_retention);
+    }
+
+    #[test]
+    fn analytics_retention_reports_the_first_window_out_of_range() {
+        assert_eq!(AnalyticsRetentionSettings::default().out_of_range(), None);
+
+        let zero = AnalyticsRetentionSettings {
+            visitor_days: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zero.out_of_range(), Some(("visitor_days", 0)));
+
+        let too_long = AnalyticsRetentionSettings {
+            events_days: 3651,
+            ..Default::default()
+        };
+        assert_eq!(too_long.out_of_range(), Some(("events_days", 3651)));
     }
 
     #[test]
@@ -3071,10 +3548,43 @@ mod tests {
     }
 
     #[test]
-    fn app_settings_default_includes_on_demand_tls_disabled() {
+    fn app_settings_default_enables_on_demand_tls_for_new_installations() {
         let s = AppSettings::default();
-        assert!(!s.on_demand_tls.enabled);
+        assert!(s.on_demand_tls.enabled);
+        assert_eq!(s.on_demand_tls.zone, None);
         assert_eq!(s.on_demand_tls.deployment_url_mode, "http");
+    }
+
+    #[test]
+    fn stored_section_without_enabled_stays_off() {
+        // A partial section written by an older build keeps its explicit shape;
+        // only a wholly absent section is treated as legacy-off too.
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "on_demand_tls": { "zone": "apps.example.com" }
+        }));
+        assert!(!parsed.on_demand_tls.enabled);
+        assert_eq!(
+            parsed.on_demand_tls.zone.as_deref(),
+            Some("apps.example.com")
+        );
+    }
+
+    #[test]
+    fn explicitly_stored_opt_out_survives_a_malformed_sibling_section() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "on_demand_tls": { "enabled": false },
+            "clickhouse": "not-an-object"
+        }));
+        assert!(!parsed.on_demand_tls.enabled);
+    }
+
+    #[test]
+    fn unreadable_on_demand_section_falls_back_to_legacy_off() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "on_demand_tls": "garbage",
+            "clickhouse": "not-an-object"
+        }));
+        assert!(!parsed.on_demand_tls.enabled);
     }
 
     #[test]

@@ -124,6 +124,20 @@ certificates:
 sudo ./scripts/install-agent-service.sh uninstall
 ```
 
+## Managed S3 End-to-End Check
+
+`test-managed-s3-e2e.sh` exercises the managed S3 backends (RustFS and Garage)
+against a running `temps serve`: per-environment credentials and bucket
+isolation, stop/start, migration in both directions with checksums,
+backup/restore and unlink revocation. It needs Docker, `curl`, `python3` and an
+admin API key, and cleans up what it creates (except the backup source, which
+Temps keeps while a backup record references it - use a scratch instance).
+
+```bash
+TEMPS_E2E_API=http://127.0.0.1:3001/api TEMPS_E2E_API_KEY=tk_... \
+  ./scripts/test-managed-s3-e2e.sh
+```
+
 ## Adding More Scripts
 
 When adding new scripts:

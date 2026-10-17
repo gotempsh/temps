@@ -6,7 +6,7 @@ use temps_core::AuditLogger;
 
 use super::provider_status::AiProviderStatusCache;
 use crate::services::{
-    GatewayService, NativeApiService, ProviderKeyService, ProviderModelService,
+    AiLimitsService, GatewayService, NativeApiService, ProviderKeyService, ProviderModelService,
     ProviderPreferenceService, StructuredOutputService, UsageService,
 };
 
@@ -17,6 +17,7 @@ pub struct AiGatewayAppState {
     pub provider_model_service: Arc<ProviderModelService>,
     pub provider_preference_service: Arc<ProviderPreferenceService>,
     pub usage_service: Arc<UsageService>,
+    pub limits_service: Arc<AiLimitsService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     pub provider_status_cache: Arc<AiProviderStatusCache>,
@@ -46,6 +47,7 @@ pub async fn create_ai_gateway_app_state(
         usage_service.clone(),
     ));
     NativeApiService::start_reconciler(&native_api_service);
+    let limits_service = Arc::new(AiLimitsService::new(db.clone(), usage_service.clone()));
     Arc::new(AiGatewayAppState {
         db,
         gateway_service,
@@ -53,6 +55,7 @@ pub async fn create_ai_gateway_app_state(
         provider_model_service,
         provider_preference_service,
         usage_service,
+        limits_service,
         audit_service,
         telemetry,
         provider_status_cache: Arc::new(AiProviderStatusCache::default()),

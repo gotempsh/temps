@@ -20,6 +20,9 @@ use crate::build_protocol::{
     MAX_BUILD_EVENT_BYTES, MAX_BUILD_SPEC_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
+use crate::image_scan::{
+    ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS, MAX_SCAN_REPORT_BYTES,
+};
 use crate::{
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ContainerDeployer,
     ContainerInfo, ContainerStats, DeployRequest, DeployResult, DeployerError, ImageBuilder,
@@ -34,9 +37,20 @@ const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// same reason as [`IMAGE_IMPORT_REQUEST_TIMEOUT`] — the control plane should
 /// see the worker's own timeout response rather than a client-side cutoff.
 const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
-const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Longest a worker build request stays open: the agent's 30-minute window to
+/// admit the build and receive its context (the queue wait is part of it),
+/// then a fresh 30-minute build deadline that starts once the build holds a
+/// slot, plus a minute so the agent's own timeout answer arrives before this
+/// client gives up. A build that queued must not lose build time to the time
+/// it spent queued.
+pub const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(61 * 60);
 /// Slightly exceeds the worker's 30-minute export deadline.
 const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// A node scan waits for an image-operation slot, then runs the scanner;
+/// the request outlasts both of the agent's deadlines.
+const IMAGE_SCAN_REQUEST_TIMEOUT: Duration = crate::image_scan::SCAN_REQUEST_TIMEOUT;
+/// How often a busy build node is asked again whether a slot is free.
+const BUILD_CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Longest agent error body quoted back into a deployment log.
 const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
 
@@ -44,15 +58,25 @@ async fn bounded_agent_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     operation: &str,
 ) -> Result<T, BuilderError> {
+    bounded_json(response, operation, MAX_BUILD_EVENT_BYTES).await
+}
+
+/// Read a JSON response body of at most `limit` bytes, stopping as soon as
+/// the limit is crossed rather than buffering what a node chooses to send.
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+    limit: usize,
+) -> Result<T, BuilderError> {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             BuilderError::Other(format!("{operation}: response stream failed: {error}"))
         })?;
-        if body.len().saturating_add(chunk.len()) > MAX_BUILD_EVENT_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(BuilderError::ResourceLimitExceeded(format!(
-                "{operation}: response exceeds {MAX_BUILD_EVENT_BYTES} bytes"
+                "{operation}: response exceeds {limit} bytes"
             )));
         }
         body.extend_from_slice(&chunk);
@@ -291,7 +315,7 @@ fn read_ignore_file(root: &Path, relative: &Path) -> Result<String, BuilderError
     Ok(contents)
 }
 
-fn prepare_build_context(
+pub fn prepare_build_context(
     request: &BuildRequest,
 ) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
     if !request.cache_from.is_empty() {
@@ -459,7 +483,7 @@ async fn dispatch_build_event(
 /// reason `import_image` below builds its own request rather than sharing a
 /// DTO type), so this struct only needs to serialize to the JSON body the
 /// agent handler already deserializes.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemotePullCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -519,6 +543,8 @@ pub struct RemoteNodeDeployer {
     /// filled in from the agent's health endpoint with
     /// [`Self::refresh_platform`].
     platform: std::sync::Arc<std::sync::OnceLock<String>>,
+    build_limits: crate::build_protocol::BuildLimits,
+    build_limits_version: u64,
 }
 
 impl RemoteNodeDeployer {
@@ -543,6 +569,8 @@ impl RemoteNodeDeployer {
             node_name,
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
+            build_limits_version: 0,
         })
     }
 
@@ -592,7 +620,22 @@ impl RemoteNodeDeployer {
             node_name,
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
+            build_limits_version: 0,
         })
+    }
+
+    pub fn with_build_limits_version(mut self, version: u64) -> Self {
+        self.build_limits_version = version;
+        self
+    }
+    pub fn with_build_limits(mut self, limits: crate::build_protocol::BuildLimits) -> Self {
+        self.build_limits = limits;
+        self
+    }
+
+    pub fn build_queue_wait(&self) -> Duration {
+        Duration::from_secs(u64::from(self.build_limits.queue_wait_seconds))
     }
 
     /// Record the node's container platform, as stored on its `nodes` row.
@@ -1154,8 +1197,156 @@ impl ContainerDeployer for RemoteNodeDeployer {
     }
 }
 
+/// Whether a build node has a free build slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildCapacity {
+    /// A slot is free, so a build starts at once.
+    Free,
+    /// The node did not say (an agent that predates the report, or one that
+    /// did not answer). Callers proceed: a build then reports its own failure.
+    Unknown,
+    /// Every slot stayed taken for the whole wait, so a build would queue.
+    Busy,
+}
+
+/// Poll `probe` (the node's free build slots, `None` when unknown) every
+/// `interval` until a slot is free or `max_wait` has passed. Returns the
+/// outcome and how long it waited.
+///
+/// `max_wait` bounds the whole call, probes included: once a probe has seen
+/// the node busy, a later probe still in flight when the window runs out is
+/// dropped and the node is reported busy. The first probe is always allowed
+/// to answer (it is what tells busy from unknown, so a zero window still
+/// checks once), bounded only by the probe's own timeout.
+pub async fn wait_for_free_build_slot<F, Fut>(
+    mut probe: F,
+    max_wait: Duration,
+    interval: Duration,
+) -> (BuildCapacity, Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<u32>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut seen_busy = false;
+    loop {
+        let answer = if seen_busy {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, probe()).await {
+                Ok(answer) => answer,
+                Err(_) => return (BuildCapacity::Busy, started.elapsed()),
+            }
+        } else {
+            probe().await
+        };
+        match answer {
+            None => return (BuildCapacity::Unknown, started.elapsed()),
+            Some(free) if free > 0 => return (BuildCapacity::Free, started.elapsed()),
+            Some(_) => seen_busy = true,
+        }
+        let waited = started.elapsed();
+        if waited >= max_wait {
+            return (BuildCapacity::Busy, waited);
+        }
+        tokio::time::sleep(interval.min(max_wait - waited)).await;
+    }
+}
+
+impl RemoteNodeDeployer {
+    /// Wait up to `max_wait` for this node to have a free build slot.
+    ///
+    /// The agent queues builds itself; this lets the caller decide what to do
+    /// with a node that stays busy (build elsewhere) before a context is
+    /// archived and uploaded to it.
+    pub async fn wait_for_build_capacity(&self, max_wait: Duration) -> (BuildCapacity, Duration) {
+        #[derive(Deserialize)]
+        struct HealthSlots {
+            #[serde(default)]
+            build_slots_available: Option<u32>,
+            #[serde(default)]
+            build_concurrency_limit: Option<u32>,
+        }
+        wait_for_free_build_slot(
+            || async {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.agent_get::<HealthSlots>("/agent/health"),
+                )
+                .await
+                {
+                    Ok(Ok(health)) => {
+                        match (health.build_slots_available, health.build_concurrency_limit) {
+                            // A settings change must not wait for a build to update
+                            // the agent before that build can pass this probe.
+                            (Some(free), Some(limit)) => Some(
+                                u32::from(self.build_limits.concurrency)
+                                    .saturating_sub(limit.saturating_sub(free)),
+                            ),
+                            (free, None) => free,
+                            (None, Some(_)) => None,
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            },
+            max_wait,
+            BUILD_CAPACITY_POLL_INTERVAL,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl ImageBuilder for RemoteNodeDeployer {
+    async fn fetch_registry_image(
+        &self,
+        reference: &str,
+        tag: &str,
+        credentials: Option<RemotePullCredentials>,
+    ) -> Result<(), BuilderError> {
+        #[derive(Serialize)]
+        struct Request<'a> {
+            reference: &'a str,
+            tag: &'a str,
+            credentials: Option<RemotePullCredentials>,
+        }
+        let response = self
+            .client
+            .post(format!("{}/agent/images/fetch", self.agent_url))
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT)
+            .json(&Request {
+                reference,
+                tag,
+                credentials,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Registry transfer on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = agent_error_detail(response).await;
+            return Err(BuilderError::Other(format!(
+                "Registry transfer on node '{}' returned HTTP {status}: {detail}",
+                self.node_name
+            )));
+        }
+        let response: AgentResponse<bool> =
+            bounded_agent_json(response, "Registry transfer").await?;
+        if !response.success || response.data != Some(true) {
+            return Err(BuilderError::Other(format!(
+                "Registry transfer on node '{}' did not confirm success",
+                self.node_name
+            )));
+        }
+        Ok(())
+    }
+
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
         self.build_image_with_callback(BuildRequestWithCallback {
             request,
@@ -1172,6 +1363,30 @@ impl ImageBuilder for RemoteNodeDeployer {
             request,
             log_callback,
         } = request;
+        if self.build_limits != crate::build_protocol::BuildLimits::default() {
+            #[derive(Deserialize)]
+            struct Support {
+                #[serde(default)]
+                build_limits_supported: bool,
+            }
+            let supported = matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.agent_get::<Support>("/agent/health")
+                )
+                .await,
+                Ok(Ok(Support {
+                    build_limits_supported: true
+                }))
+            );
+            if let Some(callback) = &log_callback {
+                callback(if supported {
+                    format!("Builder '{}': concurrency {}, queue wait {}s, build deadline {}s", self.node_name, self.build_limits.concurrency, self.build_limits.queue_wait_seconds, self.build_limits.build_timeout_seconds)
+                } else {
+                    format!("Builder '{}' has not confirmed custom limit support; an older agent retains fixed limits. Upgrade its Temps agent to enforce this node's settings", self.node_name)
+                }).await;
+            }
+        }
         let node_name = self.node_name.clone();
         let (archive, spec) = tokio::task::spawn_blocking(move || prepare_build_context(&request))
             .await
@@ -1214,7 +1429,27 @@ impl ImageBuilder for RemoteNodeDeployer {
             .client
             .post(&url)
             .bearer_auth(&self.token)
-            .timeout(IMAGE_BUILD_REQUEST_TIMEOUT)
+            .header("x-temps-build-concurrency", self.build_limits.concurrency)
+            .header("x-temps-build-limits-version", self.build_limits_version)
+            .header(
+                "x-temps-build-queue-seconds",
+                self.build_limits.queue_wait_seconds,
+            )
+            .header(
+                "x-temps-build-timeout-seconds",
+                self.build_limits.build_timeout_seconds,
+            )
+            // Older agents ignore the new headers and retain fixed deadlines.
+            // Keep their transport allowance while newer agents enforce shorter
+            // configured deadlines themselves.
+            .timeout(
+                Duration::from_secs(
+                    1800 + u64::from(self.build_limits.queue_wait_seconds)
+                        + u64::from(self.build_limits.build_timeout_seconds)
+                        + 60,
+                )
+                .max(IMAGE_BUILD_REQUEST_TIMEOUT),
+            )
             .multipart(form)
             .send()
             .await
@@ -1236,6 +1471,15 @@ impl ImageBuilder for RemoteNodeDeployer {
             } else {
                 ""
             };
+            // The agent answers 503 when no build slot became free within its
+            // queue window. Nothing was built, which is what lets a caller
+            // that can build elsewhere do so.
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return Err(BuilderError::Busy(format!(
+                    "Worker '{}' had no free build slot (HTTP {status}): {detail}",
+                    self.node_name
+                )));
+            }
             return Err(BuilderError::Other(format!(
                 "Worker '{}' refused image build (HTTP {status}): {detail}{upgrade}",
                 self.node_name
@@ -1458,6 +1702,73 @@ impl ImageBuilder for RemoteNodeDeployer {
                 "Path export stream from node '{node_name}' failed: {error}"
             ))
         })))
+    }
+
+    async fn scan_image_vulnerabilities(
+        &self,
+        image_name: &str,
+        expected_image_id: Option<&str>,
+    ) -> Result<Option<ImageScanReport>, BuilderError> {
+        let response = self
+            .client
+            .post(format!("{}/agent/images/scan", self.agent_url))
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_SCAN_REQUEST_TIMEOUT)
+            .json(&ImageScanRequest {
+                image: image_name.to_string(),
+                expected_image_id: expected_image_id.map(str::to_string),
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot scan image '{image_name}' on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            // An agent that predates the endpoint answers with the router's
+            // empty 404 or 405. A node that has the endpoint but not the
+            // image answers 404 with a problem body, which is a real failure.
+            let is_problem = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("json"));
+            let route_missing = matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ) && !is_problem;
+            let detail = agent_error_detail(response).await;
+            if route_missing {
+                tracing::debug!(
+                    node = %self.node_name,
+                    "Node does not serve /agent/images/scan (HTTP {status}); scanning locally"
+                );
+                return Ok(None);
+            }
+            return Err(match status {
+                reqwest::StatusCode::NOT_FOUND => BuilderError::ImageNotFound(format!(
+                    "Node '{}' has no image '{image_name}' to scan: {detail}",
+                    self.node_name
+                )),
+                _ => BuilderError::Other(format!(
+                    "Node '{}' could not scan image '{image_name}' (HTTP {status}): {detail}",
+                    self.node_name
+                )),
+            });
+        }
+        let operation = format!("Scan image '{image_name}' on node '{}'", self.node_name);
+        let report: ImageScanReport =
+            bounded_json(response, &operation, MAX_SCAN_REPORT_BYTES).await?;
+        if report.findings.len() > MAX_SCAN_FINDINGS {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "{operation}: report lists {} findings, more than the {MAX_SCAN_FINDINGS} limit",
+                report.findings.len()
+            )));
+        }
+        Ok(Some(report))
     }
 
     /// Extract from an image that lives on this worker.
@@ -2051,9 +2362,10 @@ mod tests {
     async fn spawn_one_shot_agent(
         status_line: &'static str,
         content_type: &'static str,
-        body: &'static [u8],
+        body: &[u8],
     ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = body.to_vec();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock agent");
@@ -2078,7 +2390,7 @@ mod tests {
                 body.len()
             );
             stream.write_all(head.as_bytes()).await.expect("write head");
-            stream.write_all(body).await.expect("write body");
+            stream.write_all(&body).await.expect("write body");
             let _ = stream.shutdown().await;
             String::from_utf8_lossy(&request).to_string()
         });
@@ -2264,6 +2576,279 @@ mod tests {
             .contains("authorization: bearer test-token"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_build_slot_returns_as_soon_as_one_frees() {
+        let answers = std::sync::Mutex::new(vec![Some(0), Some(0), Some(1)].into_iter());
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let next = answers.lock().unwrap().next().flatten();
+                async move { next }
+            },
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Free);
+        assert_eq!(waited, Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_stays_busy_is_reported_busy_after_the_whole_window() {
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Some(0) }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_final_probe_cannot_stretch_the_wait_past_its_window() {
+        // First probe answers busy at once; the second starts at 5s and
+        // would only answer at 14s, past the 12s window.
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let n = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n > 0 {
+                        tokio::time::sleep(Duration::from_secs(9)).await;
+                    }
+                    Some(0)
+                }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_does_not_report_capacity_is_never_waited_on() {
+        let (capacity, waited) = wait_for_free_build_slot(
+            || async { None },
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Unknown);
+        assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn wait_for_build_capacity_reads_the_health_report() {
+        let (url, server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"cpu_percent":1.0,"build_slots_available":0},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let (capacity, _) = remote.wait_for_build_capacity(Duration::ZERO).await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /agent/health "), "{request}");
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_applies_changed_limits_before_the_next_build() {
+        for (reported_cap, free, requested_cap, expected) in [
+            (1, 0, 2, BuildCapacity::Free),
+            (3, 1, 1, BuildCapacity::Busy),
+            (3, 1, 3, BuildCapacity::Free),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "success": true,
+                "data": {"build_slots_available": free, "build_concurrency_limit": reported_cap},
+                "error": null,
+            }))
+            .unwrap();
+            let (url, server) = spawn_one_shot_agent("200 OK", "application/json", &body).await;
+            let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder".into())
+                .unwrap()
+                .with_build_limits(crate::build_protocol::BuildLimits {
+                    concurrency: requested_cap,
+                    ..Default::default()
+                });
+            let (capacity, _) = remote.wait_for_build_capacity(Duration::ZERO).await;
+            assert_eq!(
+                capacity, expected,
+                "reported={reported_cap}, free={free}, requested={requested_cap}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_build_capacity_treats_an_older_agent_as_unknown() {
+        let (url, _server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"cpu_percent":1.0,"platform":"linux/amd64"},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let (capacity, _) = remote
+            .wait_for_build_capacity(Duration::from_secs(60))
+            .await;
+
+        assert_eq!(capacity, BuildCapacity::Unknown);
+    }
+
+    #[tokio::test]
+    async fn inspection_from_an_older_agent_reports_no_image_config() {
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":null}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        assert!(
+            info.config.is_none(),
+            "an agent that does not report the config must read as unknown, not as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_carries_the_image_config_the_node_reports() {
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":"/app","config":{"exposed_ports":[8080],"user":"app","env":["A=1"],"entrypoint":["/app/server"]}}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        let config = info.config.expect("reported");
+        assert_eq!(config.exposed_ports, vec![8080]);
+        assert_eq!(config.user.as_deref(), Some("app"));
+        assert_eq!(config.entrypoint, vec!["/app/server".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_posts_the_expected_image_id_to_the_owning_node() {
+        let body = serde_json::to_vec(&ImageScanReport {
+            image_id: "sha256:built".into(),
+            scanner: "trivy".into(),
+            scanner_version: Some("0.58.1".into()),
+            findings: Vec::new(),
+        })
+        .unwrap();
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let report = remote
+            .scan_image_vulnerabilities("app:1", Some("sha256:built"))
+            .await
+            .unwrap()
+            .expect("the node scanned");
+
+        assert_eq!(report.scanner_version.as_deref(), Some("0.58.1"));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /agent/images/scan "), "{request}");
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer node-token"));
+        assert!(request.contains(r#""image":"app:1""#), "{request}");
+        assert!(
+            request.contains(r#""expected_image_id":"sha256:built""#),
+            "{request}"
+        );
+    }
+
+    /// An agent that predates the endpoint answers with the router's bare
+    /// 404: the caller must scan another way, not report a failed scan.
+    #[tokio::test]
+    async fn scan_against_an_agent_without_the_endpoint_is_not_an_error() {
+        let (url, _server) = spawn_one_shot_agent("404 Not Found", "text/plain", b"").await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let outcome = remote.scan_image_vulnerabilities("app:1", None).await;
+
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+    }
+
+    /// A node that serves the endpoint but lacks the image is a real answer.
+    #[tokio::test]
+    async fn scan_of_an_image_the_node_lacks_is_image_not_found() {
+        let (url, _server) = spawn_one_shot_agent(
+            "404 Not Found",
+            "application/problem+json",
+            br#"{"title":"Image not found","status":404,"detail":"Image 'app:1' is not present on this node"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", None)
+            .await
+            .expect_err("missing image");
+
+        assert!(matches!(error, BuilderError::ImageNotFound(_)), "{error}");
+        assert!(error.to_string().contains("builder-1"), "{error}");
+    }
+
+    /// A node that now serves a different image under the tag is refused.
+    #[tokio::test]
+    async fn scan_identity_conflict_is_an_error_naming_the_node() {
+        let (url, _server) = spawn_one_shot_agent(
+            "409 Conflict",
+            "application/problem+json",
+            br#"{"title":"Image identity mismatch","status":409,"detail":"tag names another image"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", Some("sha256:built"))
+            .await
+            .expect_err("identity conflict");
+
+        assert!(matches!(error, BuilderError::Other(_)), "{error}");
+        assert!(error.to_string().contains("409"), "{error}");
+    }
+
+    /// A node cannot make the control plane buffer or store an arbitrary
+    /// number of findings.
+    #[tokio::test]
+    async fn scan_report_over_the_finding_limit_is_refused() {
+        let finding = serde_json::json!({
+            "vulnerability_id": "CVE-2000-0001",
+            "package_name": "p",
+            "installed_version": "1",
+            "severity": "LOW",
+            "title": "t",
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "image_id": "sha256:built",
+            "scanner": "trivy",
+            "findings": vec![finding; MAX_SCAN_FINDINGS + 1],
+        }))
+        .unwrap();
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", None)
+            .await
+            .expect_err("too many findings");
+
+        assert!(
+            matches!(error, BuilderError::ResourceLimitExceeded(_)),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn export_image_stream_maps_missing_image_to_image_not_found() {
         let (url, _server) = spawn_one_shot_agent(
@@ -2308,6 +2893,45 @@ mod tests {
             message.contains("absent from the uploaded context"),
             "{message}"
         );
+    }
+
+    /// A worker with no free build slot refuses with 503 before building
+    /// anything. That is a distinct, typed answer so a caller that can build
+    /// elsewhere may, instead of failing the deployment.
+    #[tokio::test]
+    async fn worker_build_with_no_free_slot_is_a_typed_busy_refusal() {
+        let (url, _server) = spawn_one_shot_agent(
+            "503 Service Unavailable",
+            "application/problem+json",
+            br#"{"title":"Image operation unavailable","status":503,"detail":"Builder is busy: no build slot became free within 600s"}"#,
+        )
+        .await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+
+        let error = deployer
+            .build_image(context_request(source.path(), None))
+            .await
+            .expect_err("agent was busy");
+
+        match error {
+            BuilderError::Busy(message) => {
+                assert!(message.contains("builder-1"), "{message}");
+                assert!(message.contains("Builder is busy"), "{message}");
+            }
+            other => panic!("expected Busy, got {other}"),
+        }
+    }
+
+    /// The agent may spend up to 30 minutes admitting a build (the queue wait
+    /// is part of that window) and then 30 more building it; the client must
+    /// not cut the request off before the worker's own deadlines.
+    #[test]
+    fn worker_build_request_outlasts_admission_plus_build() {
+        let admission_and_build = Duration::from_secs(2 * 30 * 60);
+        assert!(IMAGE_BUILD_REQUEST_TIMEOUT > admission_and_build);
     }
 
     #[test]

@@ -10,10 +10,12 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { Skeleton } from '@/components/ui/skeleton'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
+import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
@@ -94,6 +96,10 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead, isVerifiedNotFound } from '@/lib/read-failure'
+import { refetchUnlessRefused } from '@/lib/query-retry'
 import { Input } from '@/components/ui/input'
 import {
   AlertDialog,
@@ -339,6 +345,9 @@ function JoinTokenSection() {
     },
   })
   const [generatedToken, setGeneratedToken] = useState<string | null>(null)
+  const [confirmTokenAction, setConfirmTokenAction] = useState<
+    'revoke' | 'regenerate' | null
+  >(null)
 
   const handleGenerate = async () => {
     try {
@@ -359,6 +368,29 @@ function JoinTokenSection() {
       toast.error('Failed to revoke join token')
     }
   }
+
+  const confirmTokenDialog = (
+    <ConfirmDeleteDialog
+      open={confirmTokenAction !== null}
+      onOpenChange={(open) => {
+        if (!open) setConfirmTokenAction(null)
+      }}
+      resourceType="join token"
+      resourceName="for worker nodes"
+      verb={confirmTokenAction === 'regenerate' ? 'Regenerate' : 'Revoke'}
+      consequences={
+        confirmTokenAction === 'regenerate'
+          ? 'The current token stops working and a new one is shown once. Machines that have not joined yet must use the new token.'
+          : 'Without a join token, any machine that knows this endpoint can register as a worker node until you generate a new one.'
+      }
+      isPending={revokeToken.isPending || generateToken.isPending}
+      onConfirm={() => {
+        const action =
+          confirmTokenAction === 'regenerate' ? handleGenerate : handleRevoke
+        void action().finally(() => setConfirmTokenAction(null))
+      }}
+    />
+  )
 
   if (statusLoading) {
     return (
@@ -407,7 +439,7 @@ function JoinTokenSection() {
           <Button
             variant="destructive"
             size="sm"
-            onClick={handleRevoke}
+            onClick={() => setConfirmTokenAction('revoke')}
             disabled={revokeToken.isPending}
           >
             {revokeToken.isPending ? (
@@ -418,6 +450,7 @@ function JoinTokenSection() {
             Revoke Token
           </Button>
         </div>
+        {confirmTokenDialog}
       </div>
     )
   }
@@ -441,7 +474,7 @@ function JoinTokenSection() {
           <Button
             variant="outline"
             size="sm"
-            onClick={handleGenerate}
+            onClick={() => setConfirmTokenAction('regenerate')}
             disabled={generateToken.isPending}
           >
             {generateToken.isPending ? (
@@ -454,7 +487,7 @@ function JoinTokenSection() {
           <Button
             variant="destructive"
             size="sm"
-            onClick={handleRevoke}
+            onClick={() => setConfirmTokenAction('revoke')}
             disabled={revokeToken.isPending}
           >
             {revokeToken.isPending ? (
@@ -465,6 +498,7 @@ function JoinTokenSection() {
             Revoke Token
           </Button>
         </div>
+        {confirmTokenDialog}
       </div>
     )
   }
@@ -847,7 +881,7 @@ function MiniStat({
     accent === 'green'
       ? 'text-success-strong'
       : accent === 'yellow'
-        ? 'text-yellow-600 dark:text-yellow-400'
+        ? 'text-yellow-700 dark:text-yellow-400'
         : accent === 'blue'
           ? 'text-blue-600 dark:text-blue-400'
           : ''
@@ -901,6 +935,41 @@ export function NodeDetailPage() {
   )
 }
 
+/**
+ * What removing a node affects. Plain inline content only: the dialog wraps it
+ * in a paragraph, so the refusal lists are joined into the sentence.
+ */
+function removeNodeConsequences(
+  pinnedPlacements: NodePlacementReference[] | null,
+  unremovedContainers: UnremovedNodeContainers | null
+) {
+  if (pinnedPlacements) {
+    const targets = pinnedPlacements
+      .map((placement) =>
+        placement.environment_name
+          ? `${placement.project_name} / ${placement.environment_name}`
+          : `${placement.project_name} (project default)`
+      )
+      .join(', ')
+    return `The node was not removed: it is the only target node of ${targets}. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.`
+  }
+  if (unremovedContainers) {
+    return (
+      <>
+        Temps could not confirm that {unremovedContainers.count} container(s) it
+        placed on this node are gone, so the node was not removed:{' '}
+        <span className="font-mono text-xs break-all">
+          {unremovedContainers.lines.join(', ')}
+        </span>
+        . Start the agent on the node and try again, or remove them on that host
+        with docker rm -f. If the host is gone for good, remove the node anyway:
+        these containers are then recorded as orphaned and never touched again.
+      </>
+    )
+  }
+  return 'The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'
+}
+
 function NodeDetail({
   nodeId,
   onBack,
@@ -930,7 +999,13 @@ function NodeDetail({
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
-  const { data: node, isLoading: nodeLoading } = useQuery({
+  const {
+    data: node,
+    isLoading: nodeLoading,
+    error: nodeError,
+    refetch: refetchNode,
+    isFetching: nodeFetching,
+  } = useQuery({
     ...adminGetNodeOptions({ path: { node_id: nodeId } }),
     refetchInterval: 15_000,
   })
@@ -1137,12 +1212,30 @@ function NodeDetail({
   }
 
   if (!node) {
+    // Only a verified 404 says the node is gone; any other failed read is
+    // reported as what it is, with a way to replay it.
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Node not found.</AlertDescription>
-      </Alert>
+      <div className="space-y-4">
+        {nodeError && !isVerifiedNotFound(nodeError) ? (
+          <ReadFailure
+            resource="Node"
+            error={nodeError}
+            onRetry={() => void refetchNode()}
+            retrying={nodeFetching}
+          />
+        ) : (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Node not found</AlertTitle>
+            <AlertDescription>
+              No worker node has ID {nodeId}. It may have been removed.
+            </AlertDescription>
+          </Alert>
+        )}
+        <Button variant="outline" size="sm" onClick={onBack}>
+          Back to worker nodes
+        </Button>
+      </div>
     )
   }
 
@@ -1172,9 +1265,11 @@ function NodeDetail({
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <Server className="h-5 w-5 text-muted-foreground" />
-            <h3 className="text-lg font-semibold truncate">{node.name}</h3>
+            <h3 className="max-w-full min-w-0 text-lg font-semibold truncate">
+              {node.name}
+            </h3>
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />
@@ -1198,7 +1293,7 @@ function NodeDetail({
               ) : (
                 <Pause className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Drain</span>
+              <span className="max-sm:sr-only">Drain</span>
             </Button>
           )}
           {canUndrain && (
@@ -1213,7 +1308,7 @@ function NodeDetail({
               ) : (
                 <Play className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Undrain</span>
+              <span className="max-sm:sr-only">Undrain</span>
             </Button>
           )}
           {canRemove && (
@@ -1228,40 +1323,28 @@ function NodeDetail({
               ) : (
                 <Trash2 className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Remove</span>
+              <span className="max-sm:sr-only">Remove</span>
             </Button>
           )}
         </div>
       </div>
 
       {/* Drain confirmation dialog */}
-      <AlertDialog open={showDrainDialog} onOpenChange={setShowDrainDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Drain node “{node.name}”?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will stop scheduling new containers to this node and redeploy
-              existing workloads to other healthy nodes. The node will remain in
-              the cluster in a “draining” state until all containers are
-              migrated.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={drainPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction onClick={handleDrain} disabled={drainPending}>
-              {drainPending && (
-                <Loader2 className="h-4 w-4 animate-spin mr-1" />
-              )}
-              Drain Node
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={showDrainDialog}
+        onOpenChange={setShowDrainDialog}
+        resourceType="node"
+        resourceName={node.name}
+        verb="Drain"
+        confirmLabel="Drain node"
+        irreversible={false}
+        consequences="This stops scheduling new containers to this node and redeploys existing workloads to other healthy nodes. The node stays in the cluster in a “draining” state until all containers are migrated."
+        isPending={drainPending}
+        onConfirm={handleDrain}
+      />
 
       {/* Remove confirmation dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={showRemoveDialog}
         onOpenChange={(open) => {
           setShowRemoveDialog(open)
@@ -1270,55 +1353,17 @@ function NodeDetail({
             setPinnedPlacements(null)
           }
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {pinnedPlacements
-                ? 'The node was not removed: it is the only target node of the environments below. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.'
-                : unremovedContainers
-                  ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
-                  : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          {pinnedPlacements && (
-            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm">
-              {pinnedPlacements.map((placement) => (
-                <li
-                  key={`${placement.project_id}-${placement.environment_id ?? 'default'}`}
-                >
-                  {placement.environment_name
-                    ? `${placement.project_name} / ${placement.environment_name}`
-                    : `${placement.project_name} (project default)`}
-                </li>
-              ))}
-            </ul>
-          )}
-          {unremovedContainers && (
-            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all">
-              {unremovedContainers.lines.map((container) => (
-                <li key={container}>{container}</li>
-              ))}
-            </ul>
-          )}
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={removePending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => handleRemove(unremovedContainers !== null)}
-              disabled={removePending}
-              className="bg-destructive text-white hover:bg-destructive/90"
-            >
-              {removePending && (
-                <Loader2 className="h-4 w-4 animate-spin mr-1" />
-              )}
-              {unremovedContainers ? 'Remove Anyway' : 'Remove Node'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="node"
+        resourceName={node.name}
+        verb="Remove"
+        confirmLabel={unremovedContainers ? 'Remove anyway' : 'Remove node'}
+        consequences={removeNodeConsequences(
+          pinnedPlacements,
+          unremovedContainers
+        )}
+        isPending={removePending}
+        onConfirm={() => void handleRemove(unremovedContainers !== null)}
+      />
 
       {/* Undrain confirmation dialog */}
       <AlertDialog open={showUndrainDialog} onOpenChange={setShowUndrainDialog}>
@@ -1414,6 +1459,9 @@ function NodeDetail({
       <NodeDetailLabels labels={node.labels} />
 
       {node.role === 'worker' && <WorkerIngressCard node={node} />}
+      {node.role === 'worker' && (
+        <BuilderLimitsPanel key={node.id} node={node} />
+      )}
 
       {/* Metrics */}
       {metrics && (
@@ -1506,7 +1554,7 @@ function NodeDetail({
                         <TableHead>Container</TableHead>
                         <TableHead>Status</TableHead>
                         <TableHead className="hidden md:table-cell">
-                          Project
+                          Service
                         </TableHead>
                         <TableHead className="hidden md:table-cell">
                           Environment
@@ -1750,9 +1798,16 @@ function ClusterTrustCard() {
 
 export function NodesPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data, isLoading, error } = useQuery({
+  const {
+    data,
+    isLoading,
+    error,
+    refetch: refetchNodes,
+    isFetching: nodesFetching,
+  } = useQuery({
     ...adminListNodesOptions(),
-    refetchInterval: 30_000,
+    // A refused read (a role without settings:read) is not asked again.
+    refetchInterval: refetchUnlessRefused(30_000),
   })
   const { data: capability } = useNodeCapability()
   const {
@@ -1796,11 +1851,26 @@ export function NodesPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load worker nodes.</AlertDescription>
-      </Alert>
+      <div className="space-y-6">
+        <Card>
+          <CardHeader>
+            <CardTitle>Worker Nodes</CardTitle>
+            <CardDescription>
+              Distribute container deployments across multiple servers.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ReadFailure
+              resource="Worker nodes"
+              error={error}
+              onRetry={
+                isForbiddenRead(error) ? undefined : () => void refetchNodes()
+              }
+              retrying={nodesFetching}
+            />
+          </CardContent>
+        </Card>
+      </div>
     )
   }
 
@@ -1863,6 +1933,7 @@ export function NodesPage() {
         onRetry={() => void refetchMesh()}
         retrying={meshFetching}
       />
+      <CiBuilderPanel />
       <ClusterDnsCard />
       <ClusterTrustCard />
     </div>

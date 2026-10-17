@@ -11,7 +11,7 @@ import {
   type EmailStatsResponse,
   type PaginatedEmailsResponse,
 } from '@/api/client'
-import { Button } from '@/components/ui/button'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
 import {
@@ -36,8 +36,6 @@ import {
   AlertTriangle,
   Archive,
   CheckCircle2,
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Eye,
   Mail,
@@ -195,7 +193,7 @@ export function EmailsSentList() {
 
       {/* Stats Cards */}
       {stats && (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-7">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4 md:gap-4 xl:grid-cols-7">
           <StatsCard
             title="Total Emails"
             value={stats.total}
@@ -367,36 +365,14 @@ export function EmailsSentList() {
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="flex items-center justify-between">
-              <p className="text-sm text-muted-foreground">
-                Showing {(filters.page - 1) * filters.page_size + 1} to{' '}
-                {Math.min(filters.page * filters.page_size, emails.total)} of{' '}
-                {emails.total} emails
-              </p>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handleFilterChange('page', filters.page - 1)}
-                  disabled={filters.page === 1}
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                  Previous
-                </Button>
-                <span className="text-sm">
-                  Page {filters.page} of {totalPages}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handleFilterChange('page', filters.page + 1)}
-                  disabled={filters.page >= totalPages}
-                >
-                  Next
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
+            <ResponsivePagination
+              page={filters.page}
+              pageSize={filters.page_size}
+              total={emails.total}
+              totalPages={totalPages}
+              onPageChange={(next) => handleFilterChange('page', next)}
+              ariaLabel="Sent emails pagination"
+            />
           )}
         </>
       )}

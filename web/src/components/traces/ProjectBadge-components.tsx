@@ -18,10 +18,14 @@ export function ProjectBadge({
   return (
     <span
       className={cn(
-        'inline-flex max-w-[88px] shrink-0 items-center gap-1 truncate rounded px-1.5 py-0.5 text-[10px] font-medium',
+        'inline-flex max-w-[88px] shrink-0 items-center gap-1 truncate rounded px-1.5 py-0.5 text-[10px] font-medium text-foreground',
         className
       )}
-      style={{ backgroundColor: `${color}22`, color }}
+      // The hue only tints the surface and the dot. Rendering the name in the
+      // hue itself put pastel text (emerald, amber, ...) on its own 13% tint
+      // at ~2:1, so the text uses the foreground token and the dot carries
+      // the colour identity.
+      style={{ backgroundColor: `${color}22` }}
       title={name}
     >
       <span
@@ -60,7 +64,7 @@ export function ProjectDot({
       // role-less generic element is ignored by most screen readers, which
       // would leave the project unreadable once the slug text is gone.
       role="img"
-      aria-label={`Project: ${name}`}
+      aria-label={`Service: ${name}`}
     />
   )
 }
@@ -76,7 +80,7 @@ export function ProjectLegend({
   if (projects.length === 0) return null
   return (
     <div className={cn('flex flex-wrap items-center gap-2', className)}>
-      <span className="text-xs text-muted-foreground">Projects:</span>
+      <span className="text-xs text-muted-foreground">Services:</span>
       {projects.map((p) => (
         <ProjectBadge
           key={p.project_id}

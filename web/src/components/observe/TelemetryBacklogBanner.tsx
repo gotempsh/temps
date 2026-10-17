@@ -113,12 +113,12 @@ export function TelemetryBacklogBanner({
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>
-            This project’s spans are not going where its settings say
+            This service’s spans are not going where its settings say
           </AlertTitle>
           <AlertDescription className="space-y-2">
             <p>
               {data.effective_reason_message ??
-                'Temps Cloud is not accepting this project’s spans, so they are being stored on this instance instead.'}{' '}
+                'Temps Cloud is not accepting this service’s spans, so they are being stored on this instance instead.'}{' '}
               Traces from this period are read from this instance, not from
               Cloud.
             </p>
@@ -146,7 +146,7 @@ export function TelemetryBacklogBanner({
             {data.intervals[0]?.effective_from && (
               <>
                 {' '}
-                This project has been Cloud-primary{' '}
+                This service has been Cloud-primary{' '}
                 {formatDistanceToNow(
                   new Date(data.intervals[0].effective_from),
                   {

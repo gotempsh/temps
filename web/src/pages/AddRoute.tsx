@@ -19,6 +19,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -36,6 +37,10 @@ import {
   Router,
   Server,
 } from 'lucide-react'
+import {
+  DomainFieldHint,
+  type ManagedDomainsStatus,
+} from '@/components/routes/DomainFieldHint'
 import { useEffect, useMemo } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
@@ -50,7 +55,7 @@ const addRouteSchema = z
     subdomain: z.string().optional(),
     host: z.string().min(1, 'Host is required'),
     port: z
-      .number()
+      .number({ message: 'Port must be a number' })
       .min(1, 'Port must be at least 1')
       .max(65535, 'Port must be at most 65535'),
   })
@@ -81,7 +86,11 @@ export function AddRoute() {
   const { accessMode } = usePlatformCapabilities()
   const isLocalMode = useMemo(() => accessMode === 'local', [accessMode])
 
-  const { data: domainsData } = useQuery({
+  const {
+    data: domainsData,
+    isPending: domainsPending,
+    isError: domainsFailed,
+  } = useQuery({
     ...listDomainsOptions({
       query: { page_size: 1 },
     }),
@@ -91,6 +100,15 @@ export function AddRoute() {
     () => (domainsData?.total ?? 0) > 0,
     [domainsData]
   )
+
+  // A failed or running read must not be worded as "you have no domains".
+  const managedDomainsStatus: ManagedDomainsStatus = domainsPending
+    ? 'pending'
+    : domainsFailed
+      ? 'error'
+      : hasAvailableDomains
+        ? 'available'
+        : 'empty'
 
   useEffect(() => {
     setBreadcrumbs([
@@ -435,13 +453,11 @@ export function AddRoute() {
                         )}
                       </FormControl>
                       <FormDescription>
-                        {isLocalMode
-                          ? 'Manual entry required in local development mode'
-                          : !hasAvailableDomains
-                            ? 'No managed domains available - enter domain manually'
-                            : watchedDomainInputType === 'select'
-                              ? 'Choose from your managed domains with SSL certificates'
-                              : 'Enter the full domain name for this route'}
+                        <DomainFieldHint
+                          isLocalMode={isLocalMode}
+                          status={managedDomainsStatus}
+                          inputType={watchedDomainInputType}
+                        />
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
@@ -520,14 +536,17 @@ export function AddRoute() {
                       <FormItem>
                         <FormLabel>Port</FormLabel>
                         <FormControl>
-                          <Input
-                            type="number"
+                          <NumberInput
                             min={1}
                             max={65535}
+                            step={1}
                             placeholder="8080"
+                            name={field.name}
+                            ref={field.ref}
+                            onBlur={field.onBlur}
                             value={field.value}
-                            onChange={(e) =>
-                              field.onChange(Number(e.target.value) || 0)
+                            onValueChange={(value) =>
+                              field.onChange(value ?? Number.NaN)
                             }
                           />
                         </FormControl>

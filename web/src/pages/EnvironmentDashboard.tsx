@@ -126,7 +126,7 @@ export function EnvironmentDashboard({
                 Static site
               </p>
               <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
-                This project does not have running containers to manage.
+                This service does not have running containers to manage.
               </p>
             </div>
           ) : activeView === 'metrics' ? (
@@ -149,6 +149,7 @@ export function EnvironmentDashboard({
 export function EnvironmentDashboardSkeleton() {
   return (
     <div
+      role="status"
       className="grid min-w-0 flex-1 content-start lg:grid-cols-[200px_minmax(0,1fr)] lg:content-stretch"
       aria-label="Loading environment"
     >

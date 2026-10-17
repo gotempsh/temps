@@ -73,7 +73,7 @@ export function WorkspaceGitConnections({
           <GitBranch className="size-4" /> Git connections
         </h3>
         <p className="mt-1 text-sm text-muted-foreground">
-          Choose the account and repository for each project. Connections never
+          Choose the account and repository for each service. Connections never
           fall back to another account.
         </p>
       </div>
@@ -90,7 +90,7 @@ export function WorkspaceGitConnections({
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium">
                       {projects.find((item) => item.id === binding.projectId)
-                        ?.name ?? `Project ${binding.projectId}`}{' '}
+                        ?.name ?? `Service ${binding.projectId}`}{' '}
                       / <code>{binding.remoteName}</code>
                     </span>
                     <Button
@@ -99,7 +99,7 @@ export function WorkspaceGitConnections({
                       variant="ghost"
                       disabled={busy}
                       onClick={() => onDisconnect(binding.id)}
-                      aria-label={`Disconnect ${binding.remoteName} from project ${binding.projectId}`}
+                      aria-label={`Disconnect ${binding.remoteName} from service ${binding.projectId}`}
                     >
                       Disconnect
                     </Button>
@@ -143,7 +143,7 @@ export function WorkspaceGitConnections({
               }}
             >
               <div className="space-y-1">
-                <Label htmlFor={`${id}-project`}>Project</Label>
+                <Label htmlFor={`${id}-project`}>Service</Label>
                 <select
                   id={`${id}-project`}
                   className="h-9 w-full rounded-md border bg-background px-2 text-sm"
@@ -151,7 +151,7 @@ export function WorkspaceGitConnections({
                   disabled={busy}
                   onChange={(event) => setProjectId(event.target.value)}
                 >
-                  <option value="">Choose a project</option>
+                  <option value="">Choose a service</option>
                   {projects.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -192,7 +192,7 @@ export function WorkspaceGitConnections({
               </div>
               {duplicate && (
                 <p role="alert" className="text-sm text-destructive">
-                  This project already has that remote. Disconnect it before
+                  This service already has that remote. Disconnect it before
                   choosing another account.
                 </p>
               )}

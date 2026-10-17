@@ -15,6 +15,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   Table,
   TableBody,
@@ -118,9 +119,14 @@ function TlsStatusCell({
           HTTPS will fail — no cert authorized
         </span>
         <span className="flex items-start justify-between gap-1 rounded-md bg-muted px-1.5 py-1">
-          <code className="overflow-x-auto whitespace-nowrap font-mono text-[11px] leading-relaxed">
-            {requestCommand}
-          </code>
+          <ScrollRegion
+            className="min-w-0"
+            regionLabel="Request-certificate command, scrollable"
+          >
+            <code className="block w-max whitespace-nowrap font-mono text-[11px] leading-relaxed">
+              {requestCommand}
+            </code>
+          </ScrollRegion>
           <CopyButton
             value={requestCommand}
             minimal
@@ -163,7 +169,7 @@ function TlsStatusCell({
     return (
       <Badge
         variant="outline"
-        className="w-fit border-green-500 text-xs text-green-600 dark:text-green-400"
+        className="w-fit border-green-500 text-xs text-green-700 dark:text-green-400"
       >
         Authorized
       </Badge>
@@ -278,7 +284,7 @@ function SetupInstructions({
           console hostname.
         </p>
         <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
-          <pre className="overflow-x-auto text-xs leading-relaxed">
+          <pre tabIndex={0} className="overflow-x-auto text-xs leading-relaxed">
             <HighlightedCode code={EXAMPLE_LABELS} language="bash" />
           </pre>
           <CopyButton
@@ -334,7 +340,7 @@ function SetupInstructions({
         </dl>
 
         <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
-          <pre className="overflow-x-auto text-xs leading-relaxed">
+          <pre tabIndex={0} className="overflow-x-auto text-xs leading-relaxed">
             <HighlightedCode code={status.setup.example} language="bash" />
           </pre>
           <CopyButton
@@ -762,7 +768,10 @@ export function TraefikDiscoveryPage() {
                   container and it appears here on the next reconciliation.
                 </p>
                 <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
-                  <pre className="overflow-x-auto text-xs leading-relaxed">
+                  <pre
+                    tabIndex={0}
+                    className="overflow-x-auto text-xs leading-relaxed"
+                  >
                     <HighlightedCode code={EXAMPLE_LABELS} language="bash" />
                   </pre>
                   <CopyButton

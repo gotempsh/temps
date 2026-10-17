@@ -87,6 +87,11 @@ pub enum PublicStatusPageAction {
     Unpublished,
     UrlRotated,
     Deleted,
+    DomainAdded,
+    DomainVerified,
+    DomainVerificationAttempted,
+    DomainRenewalRequested,
+    DomainRemoved,
 }
 
 impl PublicStatusPageAction {
@@ -98,6 +103,11 @@ impl PublicStatusPageAction {
             Self::Unpublished => "STATUS_PAGE_UNPUBLISHED",
             Self::UrlRotated => "STATUS_PAGE_URL_ROTATED",
             Self::Deleted => "STATUS_PAGE_DELETED",
+            Self::DomainAdded => "STATUS_PAGE_DOMAIN_ADDED",
+            Self::DomainVerified => "STATUS_PAGE_DOMAIN_VERIFIED",
+            Self::DomainVerificationAttempted => "STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED",
+            Self::DomainRenewalRequested => "STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED",
+            Self::DomainRemoved => "STATUS_PAGE_DOMAIN_REMOVED",
         }
     }
 }
@@ -118,6 +128,13 @@ pub struct PublicStatusPageAudit {
     pub is_published: Option<bool>,
     /// Selected monitor ids, in display order, when the selection was set.
     pub monitor_ids: Option<Vec<i32>>,
+    /// Custom hostname added, verified or removed (#1412).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Result of a verification or renewal attempt: `verified`, `renewed`,
+    /// `pending` or the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 impl AuditOperation for PublicStatusPageAudit {
@@ -200,6 +217,8 @@ mod tests {
             title: Some("Public status".to_string()),
             is_published: Some(true),
             monitor_ids: Some(vec![3, 1]),
+            hostname: None,
+            outcome: None,
         };
         assert_eq!(audit.operation_type(), "STATUS_PAGE_PUBLISHED");
         let serialized = AuditOperation::serialize(&audit).expect("audit should serialize");

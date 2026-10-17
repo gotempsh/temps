@@ -1236,6 +1236,7 @@ async fn execute_plan(
         memory_limit: None,
         source_type: temps_entities::source_type::SourceType::Git,
         template_slug: None,
+        hosting: Default::default(),
     };
 
     let project = project_service

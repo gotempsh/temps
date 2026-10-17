@@ -431,7 +431,7 @@ function createdAgo(createdAt: number): string {
 /** Placeholder rows matching the loaded table, so the tab does not jump. */
 export function NodeSandboxesSkeleton() {
   return (
-    <Card aria-busy="true" aria-label="Loading sandboxes on this node">
+    <Card role="status" aria-busy="true" aria-label="Loading sandboxes on this node">
       <CardContent className="px-0 pb-0 pt-0">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
           <Skeleton className="h-4 w-56" />

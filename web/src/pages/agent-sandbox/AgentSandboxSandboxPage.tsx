@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -26,13 +28,25 @@ import {
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import {
+  CPU_LIMIT_RANGE,
+  MEMORY_LIMIT_RANGE,
+  WORKSPACE_FILE_LIMIT_FIELDS,
+  validateSandboxLimits,
+  type WorkspaceFileLimitsDraft,
+} from './sandbox-limits'
 import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
 import {
   MicrosandboxBackendOption,
   type MicrosandboxCapability,
 } from '@/components/sandboxes/MicrosandboxBackendOption'
+import {
+  TerminalSupportNote,
+  type TerminalCapability,
+} from '@/components/sandboxes/TerminalSupportNote'
 
 interface SandboxStatus {
   docker_available: boolean
@@ -40,6 +54,7 @@ interface SandboxStatus {
   image_name: string
   error: string | null
   firecracker_available: boolean
+  firecracker_terminal: TerminalCapability
   microsandbox: MicrosandboxCapability
 }
 
@@ -90,7 +105,7 @@ const RESOURCE_PRESETS = [
   { label: 'Custom', cpu: 0, memory: 0 },
 ]
 
-const DEFAULT_WORKSPACE_FILE_LIMITS = {
+const DEFAULT_WORKSPACE_FILE_LIMITS: WorkspaceFileLimitsDraft = {
   max_files_per_upload: 32,
   max_file_size_mb: 16,
   max_upload_size_mb: 32,
@@ -110,21 +125,20 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
 
 export function AgentSandboxSandboxPage() {
   usePageTitle('Sandbox Configuration')
-  const { data: settings, isLoading } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const [runtime, setRuntime] = useState('node')
   const [customImage, setCustomImage] = useState('')
-  const [cpuLimit, setCpuLimit] = useState(4)
-  const [memoryLimitMb, setMemoryLimitMb] = useState(8192)
+  const [cpuLimit, setCpuLimit] = useState<number | undefined>(4)
+  const [memoryLimitMb, setMemoryLimitMb] = useState<number | undefined>(8192)
   const [resourcePreset, setResourcePreset] = useState('Standard')
   const [globalConfigRepo, setGlobalConfigRepo] = useState('')
   const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
-  const [workspaceFileLimits, setWorkspaceFileLimits] = useState(
-    DEFAULT_WORKSPACE_FILE_LIMITS
-  )
+  const [workspaceFileLimits, setWorkspaceFileLimits] =
+    useState<WorkspaceFileLimitsDraft>(DEFAULT_WORKSPACE_FILE_LIMITS)
   const [isDirty, setIsDirty] = useState(false)
 
   const [rebuilding, setRebuilding] = useState(false)
@@ -232,6 +246,17 @@ export function AgentSandboxSandboxPage() {
   }
 
   const handleSave = async () => {
+    // The boxes may be empty while editing; check them here and say which
+    // one is wrong rather than rewriting what the user typed.
+    const limits = validateSandboxLimits({
+      cpuLimit,
+      memoryLimitMb,
+      workspaceFileLimits,
+    })
+    if (!limits.ok) {
+      toast.error(limits.message)
+      return
+    }
     try {
       // Per-provider credentials live on /agent-sandbox/providers/:id —
       // this mutation only touches platform-wide sandbox knobs. We pass
@@ -247,8 +272,8 @@ export function AgentSandboxSandboxPage() {
           enabled: true,
           runtime,
           custom_image: customImage,
-          cpu_limit: cpuLimit,
-          memory_limit_mb: memoryLimitMb,
+          cpu_limit: limits.cpuLimit,
+          memory_limit_mb: limits.memoryLimitMb,
           network_mode: settings?.agent_sandbox?.network_mode ?? 'full',
           api_key_saved: settings?.agent_sandbox?.api_key_saved ?? false,
           auth_type: settings?.agent_sandbox?.auth_type ?? '',
@@ -260,7 +285,7 @@ export function AgentSandboxSandboxPage() {
           config_repo: globalConfigRepo,
           config_repo_branch: globalConfigRepoBranch,
         },
-        ai_workspace_file_limits: workspaceFileLimits,
+        ai_workspace_file_limits: limits.workspaceFileLimits,
       })
       setIsDirty(false)
       toast.success('Workflow sandbox settings saved')
@@ -276,6 +301,15 @@ export function AgentSandboxSandboxPage() {
       <div className="flex justify-center py-12">
         <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
       </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
@@ -305,11 +339,15 @@ export function AgentSandboxSandboxPage() {
                   size="sm"
                   onClick={() => void fetchSandboxStatus()}
                   disabled={statusLoading}
+                  aria-label="Refresh Docker status"
                 >
                   {statusLoading ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <Loader2
+                      className="h-3.5 w-3.5 animate-spin"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <RefreshCw className="h-3.5 w-3.5" />
+                    <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                   )}
                 </Button>
               </div>
@@ -344,7 +382,7 @@ export function AgentSandboxSandboxPage() {
                     </div>
                   )}
                   {sandboxStatus.error && (
-                    <p className="text-xs text-red-400 mt-1">
+                    <p className="text-xs text-red-700 dark:text-red-400 mt-1">
                       {sandboxStatus.error}
                     </p>
                   )}
@@ -364,7 +402,10 @@ export function AgentSandboxSandboxPage() {
                         {rebuilding ? 'Rebuilding...' : 'Rebuild Image'}
                       </Button>
                       {buildLog.length > 0 && (
-                        <div className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5">
+                        <div
+                          tabIndex={0}
+                          className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5"
+                        >
                           {buildLog.map((line, i) => (
                             <div key={i}>{line}</div>
                           ))}
@@ -404,39 +445,22 @@ export function AgentSandboxSandboxPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {[
-              ['max_files_per_upload', 'Files per upload', 1, 100],
-              ['max_file_size_mb', 'File size (MB)', 1, 32],
-              ['max_upload_size_mb', 'Upload batch (MB)', 1, 32],
-              ['max_workspace_size_mb', 'Workspace size (MB)', 1, 2048],
-              ['max_workspace_entries', 'Workspace entries', 1, 50000],
-              ['max_text_preview_kb', 'Text preview (KB)', 1, 1024],
-              ['max_image_preview_size_mb', 'Image preview (MB)', 1, 16],
-              ['max_download_size_mb', 'Download size (MB)', 1, 32],
-            ].map(([key, label, min, max]) => (
+            {WORKSPACE_FILE_LIMIT_FIELDS.map(([key, label, min, max]) => (
               <div className="space-y-2" key={key}>
                 <Label htmlFor={`workspace-limit-${key}`}>{label}</Label>
-                <Input
+                <NumberInput
                   id={`workspace-limit-${key}`}
                   max={max}
                   min={min}
-                  onChange={(event) => {
-                    const value = Number.parseInt(event.target.value, 10)
+                  inputMode="numeric"
+                  onValueChange={(value) => {
                     setWorkspaceFileLimits((current) => ({
                       ...current,
-                      [key]: Number.isFinite(value)
-                        ? Math.min(
-                            max as number,
-                            Math.max(min as number, value)
-                          )
-                        : min,
+                      [key]: value,
                     }))
                     setIsDirty(true)
                   }}
-                  type="number"
-                  value={
-                    workspaceFileLimits[key as keyof typeof workspaceFileLimits]
-                  }
+                  value={workspaceFileLimits[key]}
                 />
               </div>
             ))}
@@ -508,6 +532,13 @@ export function AgentSandboxSandboxPage() {
                       : 'KVM microVM isolation — stronger security boundary.'}
                   </p>
                 </button>
+                {sandboxStatus?.firecracker_available && (
+                  <div className="mt-2">
+                    <TerminalSupportNote
+                      capability={sandboxStatus.firecracker_terminal}
+                    />
+                  </div>
+                )}
               </div>
               <MicrosandboxBackendOption
                 capability={sandboxStatus?.microsandbox}
@@ -627,30 +658,29 @@ export function AgentSandboxSandboxPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
                 <div className="space-y-2">
                   <Label htmlFor="cpu-limit">CPU cores</Label>
-                  <Input
+                  <NumberInput
                     id="cpu-limit"
-                    type="number"
-                    min={0.5}
-                    max={16}
+                    min={CPU_LIMIT_RANGE.min}
+                    max={CPU_LIMIT_RANGE.max}
                     step={0.5}
                     value={cpuLimit}
-                    onChange={(e) => {
-                      setCpuLimit(parseFloat(e.target.value) || 2)
+                    onValueChange={(value) => {
+                      setCpuLimit(value)
                       setIsDirty(true)
                     }}
                   />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="memory-limit">Memory (MB)</Label>
-                  <Input
+                  <NumberInput
                     id="memory-limit"
-                    type="number"
-                    min={256}
-                    max={32768}
+                    inputMode="numeric"
+                    min={MEMORY_LIMIT_RANGE.min}
+                    max={MEMORY_LIMIT_RANGE.max}
                     step={256}
                     value={memoryLimitMb}
-                    onChange={(e) => {
-                      setMemoryLimitMb(parseInt(e.target.value) || 8192)
+                    onValueChange={(value) => {
+                      setMemoryLimitMb(value)
                       setIsDirty(true)
                     }}
                   />
@@ -686,7 +716,7 @@ export function AgentSandboxSandboxPage() {
               />
               <p className="text-xs text-muted-foreground">
                 GitHub repo path. The repo must be accessible via the
-                project&apos;s git provider connection. Leave empty to disable.
+                service&apos;s git provider connection. Leave empty to disable.
               </p>
             </div>
             <div className="space-y-2">

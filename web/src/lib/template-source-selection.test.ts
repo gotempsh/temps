@@ -9,7 +9,7 @@ import {
 
 describe('template source selection', () => {
   test('service selections belong only to the Services source', () => {
-    const template = { kind: 'service' as const }
+    const template = { kind: 'app' as const }
 
     expect(templateSource(template)).toBe('services')
     expect(templateBelongsToSource(template, 'services')).toBe(true)

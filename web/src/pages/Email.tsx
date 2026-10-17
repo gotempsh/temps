@@ -44,7 +44,7 @@ export function Email() {
           />
 
           <Tabs value={activeTab} onValueChange={handleTabChange}>
-            <TabsList className="grid w-full grid-cols-5 lg:w-auto lg:grid-cols-none lg:inline-flex">
+            <TabsList className="w-full lg:w-auto">
               <TabsTrigger value="providers">Providers</TabsTrigger>
               <TabsTrigger value="domains">Domains</TabsTrigger>
               <TabsTrigger value="emails">Sent Emails</TabsTrigger>

@@ -10,7 +10,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
-import { LogLevelBadge } from '@temps-sdk/ds'
+import { LogLevelBadge, useUrlSearchText } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -355,7 +355,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   >('connecting')
   const [retryCount, setRetryCount] = useState(0)
   const [errorMessage, setErrorMessage] = useState('')
-  const [searchTerm, setSearchTerm] = useState('')
+  const [searchTerm, setSearchTerm] = useUrlSearchText('q')
   const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
   const [startDate, setStartDate] = useState<Date>()
   const [endDate, setEndDate] = useState<Date>()
@@ -1465,10 +1465,13 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     }
   }
 
-  const handleSearch = useCallback((value: string) => {
-    setSearchTerm(value)
-    setCurrentMatchIndex(0)
-  }, [])
+  const handleSearch = useCallback(
+    (value: string) => {
+      setSearchTerm(value)
+      setCurrentMatchIndex(0)
+    },
+    [setSearchTerm]
+  )
 
   const handleRetry = () => {
     handleRetryConnection()
@@ -1621,7 +1624,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                   aria-label="Toggle columns"
                 >
                   <Columns3 className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline text-xs">Columns</span>
+                  <span className="max-sm:sr-only text-xs">Columns</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44">

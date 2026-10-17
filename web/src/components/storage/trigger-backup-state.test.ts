@@ -6,7 +6,11 @@ import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import {
   DESTINATIONS_PERMISSION_EXPLANATION,
   DESTINATIONS_UNAVAILABLE_EXPLANATION,
+  RESTART_REASON_FALLBACK,
   canSubmitBackup,
+  confirmRestartParam,
+  deriveRestartGate,
+  restartGateAllowsSubmit,
   classifyDestinationError,
   deriveDestinationState,
   knownDestinations,
@@ -317,5 +321,58 @@ describe('deriveDestinationState with a real React Query observer', () => {
     expect(knownDestinations(state)).toEqual([primary, archive])
     expect(canSubmitBackup(state, archive.id)).toBe(true)
     unsubscribe()
+  })
+})
+
+describe('restart gate (#1415)', () => {
+  test('holds submit while the preflight is in flight', () => {
+    const gate = deriveRestartGate({ isPending: true, isError: false })
+    expect(gate.kind).toBe('checking')
+    expect(restartGateAllowsSubmit(gate, true)).toBe(false)
+  })
+
+  test('a backup that restarts the database needs an acknowledgement', () => {
+    const gate = deriveRestartGate({
+      data: { restarts_database: true, reason: 'WAL archiving is off' },
+      isPending: false,
+      isError: false,
+    })
+    expect(gate).toEqual({
+      kind: 'needs-confirmation',
+      reason: 'WAL archiving is off',
+    })
+    expect(restartGateAllowsSubmit(gate, false)).toBe(false)
+    expect(restartGateAllowsSubmit(gate, true)).toBe(true)
+    expect(confirmRestartParam(gate, true)).toBe(true)
+  })
+
+  test('a missing reason falls back to a plain explanation', () => {
+    const gate = deriveRestartGate({
+      data: { restarts_database: true, reason: null },
+      isPending: false,
+      isError: false,
+    })
+    expect(gate).toEqual({
+      kind: 'needs-confirmation',
+      reason: RESTART_REASON_FALLBACK,
+    })
+  })
+
+  test('no restart: submit freely and send nothing extra', () => {
+    const gate = deriveRestartGate({
+      data: { restarts_database: false },
+      isPending: false,
+      isError: false,
+    })
+    expect(gate.kind).toBe('not-needed')
+    expect(restartGateAllowsSubmit(gate, false)).toBe(true)
+    expect(confirmRestartParam(gate, false)).toBeUndefined()
+  })
+
+  test('a failed preflight does not block; the server still refuses an unacknowledged restart', () => {
+    const gate = deriveRestartGate({ isPending: false, isError: true })
+    expect(gate.kind).toBe('unknown')
+    expect(restartGateAllowsSubmit(gate, false)).toBe(true)
+    expect(confirmRestartParam(gate, false)).toBeUndefined()
   })
 })

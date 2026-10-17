@@ -176,6 +176,14 @@ impl ProjectIpGateSlot {
         }
     }
 
+    /// Whether a gate has already been installed (or is being installed).
+    ///
+    /// Lets a later registration step avoid constructing a gate -- and
+    /// starting its background work -- that `set` would only discard.
+    pub fn is_claimed(&self) -> bool {
+        self.registration.load(std::sync::atomic::Ordering::Acquire) != REGISTRATION_PENDING
+    }
+
     /// Complete plugin discovery, making the open default authoritative when
     /// no provider registered a gate. A provider already publishing its gate
     /// remains fail closed until its ArcSwap store completes.

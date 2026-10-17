@@ -61,6 +61,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -68,16 +69,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 interface ProjectMonitorsProps {
   project: ProjectResponse
@@ -91,7 +83,7 @@ const createMonitorSchema = z.object({
     error: 'Environment is required',
   }),
   check_interval_seconds: z
-    .number()
+    .number({ message: 'Check interval is required' })
     .min(30, 'Check interval must be at least 30 seconds'),
 })
 
@@ -218,12 +210,12 @@ function MonitorCard({
                   <div
                     className={`text-xs flex items-center gap-1 ${
                       currentMonitorStatus?.current_status === 'operational'
-                        ? 'text-green-500'
+                        ? 'text-green-700 dark:text-green-500'
                         : currentMonitorStatus?.current_status === 'degraded'
-                          ? 'text-yellow-500'
+                          ? 'text-yellow-700 dark:text-yellow-500'
                           : currentMonitorStatus?.current_status ===
                               'major_outage'
-                            ? 'text-red-500'
+                            ? 'text-red-700 dark:text-red-500'
                             : 'text-muted-foreground'
                     }`}
                   >
@@ -316,7 +308,8 @@ function MonitorCard({
 export function ProjectMonitors({ project }: ProjectMonitorsProps) {
   const queryClient = useQueryClient()
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
-  const [monitorToDelete, setMonitorToDelete] = useState<number | null>(null)
+  const [monitorToDelete, setMonitorToDelete] =
+    useState<MonitorResponse | null>(null)
 
   // Form with validation
   const form = useForm<CreateMonitorFormData>({
@@ -417,14 +410,14 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Monitors</h2>
           <p className="text-muted-foreground">
-            Monitor your project&apos;s uptime and performance
+            Monitor your service&apos;s uptime and performance
           </p>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" asChild>
             <Link to={`/projects/${project.slug}/status-pages`}>
               <Globe className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">Status pages</span>
+              <span className="max-sm:sr-only">Status pages</span>
             </Link>
           </Button>
           {monitors && monitors.length > 0 && (
@@ -439,7 +432,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             <DialogHeader>
               <DialogTitle>Create Monitor</DialogTitle>
               <DialogDescription>
-                Set up a new monitor to track your project&apos;s uptime and
+                Set up a new monitor to track your service&apos;s uptime and
                 performance.
               </DialogDescription>
             </DialogHeader>
@@ -532,12 +525,14 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                     <FormItem>
                       <FormLabel>Check Interval (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
-                          min="30"
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(parseInt(e.target.value) || 60)
+                        <NumberInput
+                          min={30}
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>
@@ -594,7 +589,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               key={monitor.id}
               monitor={monitor}
               projectSlug={project.slug}
-              onDelete={() => setMonitorToDelete(monitor.id)}
+              onDelete={() => setMonitorToDelete(monitor)}
               environment={environments?.find(
                 (env) => env.id === monitor.environment_id
               )}
@@ -606,7 +601,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
           size="compact"
           icon={Activity}
           title="No monitors yet"
-          description="Create a monitor to track this project's uptime and response time."
+          description="Create a monitor to track this service's uptime and response time."
           action={
             <Button onClick={() => setIsCreateDialogOpen(true)}>
               <Plus className="mr-2 size-4" />
@@ -616,32 +611,19 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         />
       )}
 
-      {/* Delete Confirmation Dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={monitorToDelete !== null}
-        onOpenChange={() => setMonitorToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete Monitor</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete this monitor? This action cannot
-              be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                monitorToDelete && handleDeleteMonitor(monitorToDelete)
-              }
-              className="bg-destructive hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setMonitorToDelete(null)
+        }}
+        resourceType="monitor"
+        resourceName={monitorToDelete?.name ?? ''}
+        consequences="Its uptime and response-time history is deleted with it and checks stop running."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (monitorToDelete) handleDeleteMonitor(monitorToDelete.id)
+        }}
+      />
     </div>
   )
 }

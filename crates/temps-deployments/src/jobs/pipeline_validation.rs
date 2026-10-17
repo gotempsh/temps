@@ -69,7 +69,6 @@ impl ImageBuilder for MockImageBuilder {
         image_name: &str,
     ) -> Result<temps_deployer::ImageInfo, BuilderError> {
         Ok(temps_deployer::ImageInfo {
-            exposed_ports: None,
             id: "sha256:mock123".to_string(),
             architecture: "amd64".to_string(),
             os: "linux".to_string(),
@@ -78,6 +77,7 @@ impl ImageBuilder for MockImageBuilder {
             tags: vec![image_name.to_string()],
             created: Some("2025-01-01T00:00:00Z".to_string()),
             working_dir: Some("/app".to_string()),
+            config: None,
         })
     }
 

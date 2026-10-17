@@ -4,7 +4,8 @@
 use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
-    EnvironmentVariablePromotedToSecretAudit, EnvironmentVariableValueRevealedAudit,
+    EnvironmentVariableDeletedAudit, EnvironmentVariablePromotedToSecretAudit,
+    EnvironmentVariableValueRevealedAudit, EnvironmentVariableWrittenAudit,
     ProjectSecretDeletedAudit, ProjectSecretWrittenAudit,
 };
 use super::types::AppState;
@@ -888,6 +889,7 @@ pub async fn create_environment_variable(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i32>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
@@ -917,6 +919,27 @@ pub async fn create_environment_variable(
         )
         .await
         .map_err(Problem::from)?;
+
+    // Never carries the value. An "Import .env" in the console calls this
+    // once per variable, so every imported variable is audited individually.
+    let audit = EnvironmentVariableWrittenAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        operation: "ENVIRONMENT_VARIABLE_CREATED",
+        project_id,
+        var_id: var.id,
+        key: var.key.clone(),
+        environment_ids: var.environments.iter().map(|env| env.id).collect(),
+        include_in_preview: var.include_in_preview,
+        is_secret: var.is_secret,
+        changed_fields: Vec::new(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
 
     let response = EnvironmentVariableResponse {
         id: var.id,
@@ -960,6 +983,7 @@ pub async fn delete_environment_variable(
     State(state): State<Arc<AppState>>,
     Path((project_id, var_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
         auth,
@@ -983,10 +1007,26 @@ pub async fn delete_environment_variable(
     )
     .await?;
 
-    state
+    let deleted = state
         .env_var_service
         .delete_environment_variable(project_id, var_id)
         .await?;
+
+    let audit = EnvironmentVariableDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        var_id: deleted.id,
+        key: deleted.key,
+        is_secret: deleted.is_secret,
+        environment_ids: deleted.environment_ids,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1043,6 +1083,27 @@ pub async fn update_environment_variable(
         )
         .await?;
     let var = outcome.var;
+
+    // Every update is audited; `changed_fields` names what changed and the
+    // value (old or new) is never recorded.
+    let updated_audit = EnvironmentVariableWrittenAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        operation: "ENVIRONMENT_VARIABLE_UPDATED",
+        project_id,
+        var_id,
+        key: var.key.clone(),
+        environment_ids: var.environments.iter().map(|env| env.id).collect(),
+        include_in_preview: var.include_in_preview,
+        is_secret: var.is_secret,
+        changed_fields: outcome.changed_fields,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&updated_audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
 
     // Converting a variable to a secret is irreversible and removes the value
     // from list responses — audit it explicitly.

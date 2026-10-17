@@ -19,6 +19,39 @@ const GEO_CACHE_MAX_ENTRIES: u64 = 100_000;
 /// How long a cached IP -> geolocation mapping stays valid. Geolocation is stable,
 /// so a long TTL collapses repeated lookups for the same IP into a single DB hit.
 const GEO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// How stale `last_used_at` may get before a lookup advances it.
+///
+/// The retention cleanup deletes an address only when `last_used_at` is older
+/// than its window (at least a day). A lookup that skips the write because
+/// the stored value is younger than this can therefore still count on the row
+/// surviving for at least `window - LAST_USED_REFRESH`, which must outlast
+/// the cache entry that lookup is about to create. Checked at compile time.
+///
+/// This is also what bounds the write on the lookup path: an address costs at
+/// most one single-row `UPDATE` per interval, and only on a cache miss, so the
+/// write load is O(distinct addresses per interval) rather than O(events).
+const LAST_USED_REFRESH: Duration = Duration::from_secs(12 * 60 * 60);
+const _: () = assert!(
+    GEO_CACHE_TTL.as_secs() + LAST_USED_REFRESH.as_secs() < 24 * 60 * 60,
+    "a cached IP id must not outlive the shortest retention window"
+);
+
+/// Why an address lookup could not return an id that is safe to store.
+#[derive(Debug, thiserror::Error)]
+pub enum IpAddressError {
+    /// The write that tells the retention cleanup this address is in use
+    /// failed, so the id is not protected from deletion.
+    #[error(
+        "Could not mark IP address record {ip_geolocation_id} ('{ip_address}') as in use, so \
+         its id is not returned: {source}"
+    )]
+    LastUsedWrite {
+        ip_geolocation_id: i32,
+        ip_address: String,
+        #[source]
+        source: DbErr,
+    },
+}
 
 /// Whether the GeoIP database is currently failing lookups it should be able
 /// to answer (a corrupt or truncated `.mmdb`, an undecodable record).
@@ -193,11 +226,52 @@ impl IpAddressService {
             .one(self.db.as_ref())
             .await?
         {
-            let info = self.refresh_if_stale(existing_ip, now).await;
-            self.cache
-                .insert(ip_address_str.to_string(), info.clone())
-                .await;
-            return Ok(info);
+            let id = existing_ip.id;
+            // Tell the retention cleanup this address is in use before
+            // anything else is done with the row. Without it the cleanup could
+            // delete the row between this lookup and the insert that stores
+            // the id, or while the id sits in the cache.
+            let touch = if last_used_needs_refresh(existing_ip.last_used_at, now) {
+                self.record_last_used(id, now).await.map_err(|source| {
+                    warn!(
+                        ip_geolocation_id = id,
+                        error = %source,
+                        "could not record that a stored IP address is in use; its id is \
+                         not handed out, so the next lookup retries"
+                    );
+                    // A failed write leaves the id unprotected: the cleanup
+                    // could delete the row before the caller stores the id,
+                    // and the insert would then fail its foreign key. Callers
+                    // already treat a failed lookup as "no geolocation" for
+                    // that one event, which is cheaper than losing it.
+                    IpAddressError::LastUsedWrite {
+                        ip_geolocation_id: id,
+                        ip_address: ip_address_str.to_string(),
+                        source,
+                    }
+                })?
+            } else {
+                LastUsedWrite::NotNeeded
+            };
+            match touch {
+                // Deleted by the cleanup after the read above: caching its id
+                // would hand out a dangling reference, so resolve the address
+                // again below and store it as a new row.
+                LastUsedWrite::RowGone => {
+                    debug!(
+                        ip_geolocation_id = id,
+                        ip_address = ip_address_str,
+                        "stored IP address was removed while being looked up; re-creating it"
+                    );
+                }
+                LastUsedWrite::Recorded | LastUsedWrite::NotNeeded => {
+                    let info = self.refresh_if_stale(existing_ip, now).await;
+                    self.cache
+                        .insert(ip_address_str.to_string(), info.clone())
+                        .await;
+                    return Ok(info);
+                }
+            }
         }
 
         let geo_data =
@@ -242,6 +316,7 @@ impl IpAddressService {
             is_hosting_provider: Set(geo_data.as_ref().and_then(|d| d.is_hosting_provider)),
             created_at: Set(now),
             updated_at: Set(now),
+            last_used_at: Set(Some(now)),
             ..Default::default()
         };
 
@@ -259,6 +334,24 @@ impl IpAddressService {
             .insert(ip_address_str.to_string(), info.clone())
             .await;
         Ok(info)
+    }
+
+    /// Advance `last_used_at` without touching `updated_at`, which is the
+    /// geolocation's verification clock.
+    async fn record_last_used(&self, id: i32, now: UtcDateTime) -> Result<LastUsedWrite, DbErr> {
+        let result = ip_geolocations::Entity::update_many()
+            .col_expr(
+                ip_geolocations::Column::LastUsedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(ip_geolocations::Column::Id.eq(id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(if result.rows_affected == 0 {
+            LastUsedWrite::RowGone
+        } else {
+            LastUsedWrite::Recorded
+        })
     }
 
     /// Re-resolve a stored row whose geolocation has outlived the configured
@@ -422,6 +515,27 @@ fn apply_geolocation(
     active.updated_at = Set(now);
 }
 
+/// What happened when `last_used_at` was advanced for a stored address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastUsedWrite {
+    /// The timestamp is recent enough that no write was attempted.
+    NotNeeded,
+    Recorded,
+    /// The statement ran but matched no row: the retention cleanup deleted it.
+    RowGone,
+}
+
+/// Whether `last_used_at` is missing or old enough to be worth rewriting.
+fn last_used_needs_refresh(last_used_at: Option<UtcDateTime>, now: UtcDateTime) -> bool {
+    match last_used_at {
+        None => true,
+        Some(at) => {
+            now.signed_duration_since(at)
+                >= chrono::Duration::from_std(LAST_USED_REFRESH).unwrap_or(chrono::Duration::MAX)
+        }
+    }
+}
+
 /// Does a fresh lookup disagree with what the row already holds?
 ///
 /// `country` is stored NOT NULL with `""` for "unknown", so the comparison
@@ -477,6 +591,7 @@ mod tests {
             is_hosting_provider: Some(false),
             created_at: now,
             updated_at: now,
+            last_used_at: None,
         }
     }
 
@@ -493,6 +608,20 @@ mod tests {
             asn_org: row.asn_org.clone(),
             is_hosting_provider: row.is_hosting_provider,
         }
+    }
+
+    #[test]
+    fn last_used_is_rewritten_only_when_missing_or_half_a_day_old() {
+        let now = Utc::now();
+        assert!(last_used_needs_refresh(None, now));
+        assert!(!last_used_needs_refresh(
+            Some(now - chrono::Duration::hours(11)),
+            now
+        ));
+        assert!(last_used_needs_refresh(
+            Some(now - chrono::Duration::hours(13)),
+            now
+        ));
     }
 
     #[test]
@@ -615,6 +744,7 @@ mod tests {
             is_hosting_provider: None,
             created_at: now - chrono::Duration::days(400),
             updated_at: now - chrono::Duration::days(400),
+            last_used_at: None,
         };
         let touched = ip_geolocations::Model {
             updated_at: now,
@@ -665,5 +795,83 @@ mod tests {
             service.stale_lookup_days().await,
             i64::from(temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS)
         );
+    }
+
+    /// The retention cleanup can delete a row between the lookup's read and
+    /// the `last_used_at` write. The write then matches nothing, and the
+    /// address must be stored again rather than served (and cached) under an
+    /// id that no longer exists.
+    #[tokio::test]
+    async fn a_row_deleted_mid_lookup_is_re_created_not_cached() {
+        let now = Utc::now();
+        let mut vanished = stored_row(now);
+        vanished.id = 41;
+        vanished.ip_address = "203.0.113.20".to_string();
+        vanished.last_used_at = None;
+        let recreated = ip_geolocations::Model {
+            id: 42,
+            ..vanished.clone()
+        };
+
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // find by address, then the INSERT ... RETURNING
+                .append_query_results([vec![vanished], vec![recreated]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(
+            db,
+            Arc::new(GeoIpService::Mock(crate::MockGeoIpService::new())),
+        );
+
+        let info = service.get_or_create_ip("203.0.113.20").await.unwrap();
+
+        assert_eq!(info.id, 42, "the deleted row's id must not be handed out");
+        let cached = service.cache.get("203.0.113.20").await.unwrap();
+        assert_eq!(cached.id, 42);
+    }
+
+    /// If the protecting write fails, the id must not be handed out: the
+    /// cleanup could delete the row before the caller inserts its event.
+    #[tokio::test]
+    async fn a_failed_last_used_write_does_not_hand_out_the_id() {
+        let now = Utc::now();
+        let mut row = stored_row(now);
+        row.id = 51;
+        row.ip_address = "203.0.113.30".to_string();
+        row.last_used_at = None;
+
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .append_exec_errors([sea_orm::DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(
+            db,
+            Arc::new(GeoIpService::Mock(crate::MockGeoIpService::new())),
+        );
+
+        let error = service
+            .get_or_create_ip("203.0.113.30")
+            .await
+            .expect_err("an unprotected id must not be returned");
+
+        match error.downcast_ref::<IpAddressError>() {
+            Some(IpAddressError::LastUsedWrite {
+                ip_geolocation_id,
+                source,
+                ..
+            }) => {
+                assert_eq!(*ip_geolocation_id, 51);
+                assert!(source.to_string().contains("connection reset"), "{source}");
+            }
+            None => panic!("expected a typed IpAddressError, got: {error}"),
+        }
+        assert!(service.cache.get("203.0.113.30").await.is_none());
     }
 }

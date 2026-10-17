@@ -148,7 +148,10 @@ export function AnomalyBacktest({
         <p className="mt-1 text-xs text-muted-foreground">
           {breach_count === 0 ? (
             <>
-              Would <span className="font-medium text-emerald-600">not</span>{' '}
+              Would{' '}
+              <span className="font-medium text-emerald-700 dark:text-emerald-600">
+                not
+              </span>{' '}
               have fired — no points left the band.
             </>
           ) : episodeCount === 1 ? (

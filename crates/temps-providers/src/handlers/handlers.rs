@@ -34,19 +34,19 @@ use super::audit::{
     ExternalServiceEnvironmentVariableRevealedAudit,
     ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
     ExternalServiceProjectLinkedAudit, ExternalServiceProjectUnlinkedAudit,
-    ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceStatusChangedAudit,
-    ExternalServiceUpdatedAudit, ServiceHealthChecked,
+    ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceS3MigratedAudit,
+    ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
     ClusterMemberHealthResponse, ContinuousArchiveSourceResponse, CreateExternalServiceRequest,
     EnvironmentVariableInfo, ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
-    ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RepointContinuousArchiveSourceRequest, RetryClusterRequest, RuntimeCredentialsResponse,
-    SensitiveValueResponse, ServiceDownAlertResponse, ServiceHealthResponse,
-    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
-    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
-    UpgradeExternalServiceRequest,
+    ImportExternalServiceRequest, LinkServiceRequest, MigrateS3ServiceRequest, ProjectServiceInfo,
+    ProviderMetadata, RepointContinuousArchiveSourceRequest, RetryClusterRequest,
+    RuntimeCredentialsResponse, SensitiveValueResponse, ServiceDownAlertResponse,
+    ServiceHealthResponse, ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse,
+    ServiceMemberInfo, ServiceParameter, ServiceTypeInfo, ServiceTypeParametersQuery,
+    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
 };
 use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
@@ -98,6 +98,7 @@ pub(crate) fn worker_node_required(
         | E::DatabaseError { .. }
         | E::ArchiveSourceDesynced { .. }
         | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
         | E::StartFailed { .. }
         | E::UpgradeInProgress { .. }
         | E::StopFailed { .. }
@@ -116,7 +117,8 @@ pub(crate) fn worker_node_required(
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -134,28 +136,33 @@ pub(crate) fn external_service_problem(
     detail: String,
 ) -> Problem {
     worker_node_required(error)
+        .or_else(|| data_safety_problem(error))
         .or_else(|| service_name_problem(error))
         .or_else(|| cluster_placement_problem(error))
         .unwrap_or_else(|| internal_server_error().detail(detail).build())
 }
 
-fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+/// A change refused because it would leave the service without its data
+/// (#1415): a 409 with the reason and the safe manual steps in `detail`.
+fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
     match error {
+        E::DataSafetyRefusal { service_id, .. } => Some(
+            conflict()
+                .title("Change Would Lose Data")
+                .detail(error.to_string())
+                .value("error_code", "DATA_SAFETY_REFUSAL")
+                .value("service_id", *service_id)
+                .build(),
+        ),
+        // Every other condition keeps its own classification.
         E::ServiceNameConflict { .. }
         | E::ServiceNameRestoreConflict { .. }
         | E::ServiceContainerRestoreConflict { .. }
         | E::AmbiguousServiceName { .. }
         | E::ServiceResourceConflict { .. }
-        | E::ServiceContainerConflict { .. } => Some(
-            conflict()
-                .title("Service Name Conflict")
-                .detail(error.to_string())
-                .value("error_code", "SERVICE_NAME_CONFLICT")
-                .build(),
-        ),
-        // Other conditions retain the worker, placement or handler classification.
-        E::ServiceNotFound { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
         | E::InitializationFailed { .. }
@@ -191,7 +198,66 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterMemberLimitExceeded { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. } => None,
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
+    }
+}
+
+fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. } => Some(
+            conflict()
+                .title("Service Name Conflict")
+                .detail(error.to_string())
+                .value("error_code", "SERVICE_NAME_CONFLICT")
+                .build(),
+        ),
+        // Other conditions retain the worker, placement or handler classification.
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. } => None,
     }
 }
 
@@ -213,6 +279,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterMemberProvisioning { .. } => "Cluster Member Still Provisioning",
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
+        E::LockTimeout { .. } => "Service Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(
@@ -246,6 +313,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DatabaseError { .. }
         | E::ArchiveSourceDesynced { .. }
         | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
         | E::StartFailed { .. }
         | E::UpgradeInProgress { .. }
         | E::StopFailed { .. }
@@ -514,6 +582,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             post(promote_cluster_member),
         )
         .route("/external-services/{id}/upgrade", post(upgrade_service))
+        .route("/external-services/{id}/migrate-s3", post(migrate_s3_service))
         .route(
             "/external-services/{id}/projects",
             post(link_service_to_project),
@@ -587,20 +656,22 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         (status = 500, description = "Internal server error")
     ),
     params(
-        ("service_type" = String, Path, description = "Service type")
+        ("service_type" = String, Path, description = "Service type"),
+        ServiceTypeParametersQuery
     )
 )]
 async fn get_service_type_parameters(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path(service_type): Path<String>,
+    Query(query): Query<ServiceTypeParametersQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
     match ServiceTypeRoute::from_str(&service_type) {
         Ok(service_type) => match app_state
             .external_service_manager
-            .get_service_type_schema(service_type.into())
+            .get_service_type_schema_for_backend(service_type.into(), query.backend.as_deref())
             .await
         {
             Ok(schema) => Ok((StatusCode::OK, Json(schema))),
@@ -1422,6 +1493,114 @@ async fn upgrade_service(
             }
         }
     }
+}
+
+/// Copy every bucket of another managed S3 service into this one
+///
+/// Plain S3 semantics, so data moves between any two backends (RustFS to
+/// Garage and back). The source is only read and existing target objects are
+/// kept. Re-run it after switching writers to pick up late writes.
+#[utoipa::path(
+    post,
+    path = "/external-services/{id}/migrate-s3",
+    tag = "External Services",
+    request_body = MigrateS3ServiceRequest,
+    responses(
+        (status = 200, description = "Buckets copied", body = crate::services::S3MigrationReport),
+        (status = 400, description = "Either service is not a migratable managed S3 service"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Target external service ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn migrate_s3_service(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<MigrateS3ServiceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    super::metrics_handlers::assert_service_owned_by_caller(
+        request.source_service_id,
+        &auth,
+        &app_state,
+    )
+    .await?;
+
+    // The copy can run for hours on large buckets. It runs on its own task so
+    // a client or proxy timeout that drops this handler cannot abandon it
+    // half-way, and the audit entry is written by that same task so a copy
+    // that finished is never unaudited.
+    let source_service_id = request.source_service_id;
+    let user_id = auth.user_id();
+    let task_state = app_state.clone();
+    let task = tokio::spawn(async move {
+        let report = task_state
+            .external_service_manager
+            .migrate_s3_service(id, source_service_id)
+            .await
+            .map_err(|e| {
+                error!(
+                    target_service_id = id,
+                    source_service_id, "Failed to migrate S3 data: {}", e
+                );
+                external_service_problem(&e, format!("Failed to migrate S3 data: {}", e))
+            })?;
+
+        let target_name = match task_state
+            .external_service_manager
+            .get_service_details(id)
+            .await
+        {
+            Ok(details) => details.service.name,
+            Err(e) => {
+                warn!(
+                    service_id = id,
+                    "Could not load service name for audit: {}", e
+                );
+                String::new()
+            }
+        };
+        let audit = ExternalServiceS3MigratedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            target_service_id: id,
+            target_name,
+            source_service_id: report.source_service_id,
+            source_backend: report.source_backend.clone(),
+            target_backend: report.target_backend.clone(),
+            buckets: report.buckets.clone(),
+        };
+        if let Err(e) = task_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+        Ok::<_, Problem>(report)
+    });
+    let report = task.await.map_err(|e| {
+        error!(
+            target_service_id = id,
+            source_service_id, "S3 migration task did not complete: {}", e
+        );
+        internal_server_error()
+            .title("S3 Migration Interrupted")
+            .detail(format!(
+                "The migration from service {} into service {} did not complete: {}",
+                source_service_id, id, e
+            ))
+            .build()
+    })??;
+
+    Ok((StatusCode::OK, Json(report)))
 }
 
 /// Delete external service
@@ -3627,6 +3806,7 @@ async fn update_service_resources(
         import_external_service,
         update_service,
         upgrade_service,
+        migrate_s3_service,
         delete_service,
         start_service,
         stop_service,
@@ -3699,6 +3879,8 @@ async fn update_service_resources(
         CreateExternalServiceRequest,
         UpdateExternalServiceRequest,
         UpgradeExternalServiceRequest,
+        MigrateS3ServiceRequest,
+        crate::services::S3MigrationReport,
         RepointContinuousArchiveSourceRequest,
         ContinuousArchiveSourceResponse,
         RetryClusterRequest,

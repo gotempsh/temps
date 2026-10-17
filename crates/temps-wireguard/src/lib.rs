@@ -7,6 +7,8 @@
 //! [`mesh`] uses kernel WireGuard through netlink instead: Linux 5.6+ (or the
 //! `wireguard` module) and CAP_NET_ADMIN, but no `wireguard-tools`.
 
+#[cfg(target_os = "linux")]
+mod link;
 pub mod mesh;
 pub mod pairing;
 

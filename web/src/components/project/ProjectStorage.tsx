@@ -31,6 +31,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
@@ -174,7 +175,7 @@ function ServiceRow({
                 {link?.database_provisioning_mode === 'custom'
                   ? 'Custom database'
                   : link?.database_provisioning_mode === 'project'
-                    ? 'Per project'
+                    ? 'Per service'
                     : 'Per environment'}
               </span>
             )}
@@ -216,7 +217,7 @@ function ServiceRow({
             }}
           >
             <Database className="size-3.5" />
-            <span className="hidden sm:inline">Browse</span>
+            <span className="max-sm:sr-only">Browse</span>
           </Button>
         ) : (
           <Button
@@ -298,7 +299,7 @@ function ServiceRow({
                 onSelect={() => void onToggle()}
               >
                 <Link2Off className="size-3.5" />
-                Unlink from project
+                Unlink from service
               </DropdownMenuItem>
             ) : (
               <DropdownMenuItem
@@ -306,7 +307,7 @@ function ServiceRow({
                 onSelect={() => void onToggle()}
               >
                 <Link2 className="size-3.5" />
-                Link to project
+                Link to service
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -330,6 +331,8 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   // The last link change, until the operator redeploys or dismisses it: the
   // running app only sees the new variables after its next deployment.
   const [linkChange, setLinkChange] = useState<ServiceLinkChange | null>(null)
+  const [serviceToUnlink, setServiceToUnlink] =
+    useState<ExternalServiceInfo | null>(null)
   const providers = useQuery({ ...getProvidersMetadataOptions(), retry: false })
 
   useEffect(() => {
@@ -365,13 +368,13 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
 
   const linkServiceMutation = useMutation({
     ...linkServiceToProjectMutation(),
-    meta: { errorTitle: 'Failed to link service to project' },
+    meta: { errorTitle: 'Failed to link database to service' },
     onSuccess: () => refetchServicesLinked(),
   })
 
   const unlinkServiceMutation = useMutation({
     ...unlinkServiceFromProjectMutation(),
-    meta: { errorTitle: 'Failed to unlink service from project' },
+    meta: { errorTitle: 'Failed to unlink database from service' },
     onSuccess: () => refetchServicesLinked(),
   })
 
@@ -396,37 +399,44 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     await refetchServicesLinked()
   }
 
-  const handleServiceToggle = async (serviceId: number) => {
-    const isLinked = servicesLinked?.some((s) => s.service.id === serviceId)
+  const unlinkService = async (serviceId: number) => {
+    const promise = unlinkServiceMutation.mutateAsync({
+      path: { id: serviceId, project_id: project.id },
+    })
+    toast.promise(promise, {
+      loading: 'Unlinking service...',
+      success: 'Service unlinked',
+      error: 'Failed to unlink service',
+    })
+    await promise.then(
+      () =>
+        setLinkChange({
+          kind: 'unlinked',
+          serviceName: serviceName(serviceId),
+        }),
+      () => {}
+    )
+    await refetchServicesLinked()
+  }
 
-    if (isLinked) {
-      const promise = unlinkServiceMutation.mutateAsync({
-        path: { id: serviceId, project_id: project.id },
-      })
-      toast.promise(promise, {
-        loading: 'Unlinking service...',
-        success: 'Service unlinked',
-        error: 'Failed to unlink service',
-      })
-      await promise.then(
-        () =>
-          setLinkChange({
-            kind: 'unlinked',
-            serviceName: serviceName(serviceId),
-          }),
-        () => {}
-      )
-    } else {
-      const service = services?.find((item) => item.id === serviceId)
-      if (
-        service &&
-        ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
-      ) {
-        setServicePendingLink(service)
-        return
-      }
-      await linkService(serviceId).catch(() => {})
+  const handleServiceToggle = async (serviceId: number) => {
+    const linked = servicesLinked?.find((s) => s.service.id === serviceId)
+
+    if (linked) {
+      // Unlinking is confirmed first; the request is sent from the dialog.
+      setServiceToUnlink(linked.service)
+      return
     }
+
+    const service = services?.find((item) => item.id === serviceId)
+    if (
+      service &&
+      ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
+    ) {
+      setServicePendingLink(service)
+      return
+    }
+    await linkService(serviceId).catch(() => {})
 
     await refetchServicesLinked()
   }
@@ -488,7 +498,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
             <Link
               key={provider.service_type}
               to={serviceCreateHref(provider.service_type, project.id)}
-              aria-label={`Create ${provider.display_name}`}
               className="group flex min-w-0 flex-col items-start rounded-lg border bg-background p-5 transition-colors hover:border-foreground/30 hover:bg-muted/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
             >
               <div className="mb-4 flex size-10 items-center justify-center">
@@ -523,7 +532,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           Databases
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Link an existing database or create a new one for this project.
+          Link an existing database or create a new one for this service.
           {totalCount > 0 ? (
             <span className="ml-1 tabular-nums">
               {linkedCount} of {totalCount} linked.
@@ -549,7 +558,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           <AlertDescription>
             {servicesError
               ? 'Could not load the available databases.'
-              : 'Could not determine which databases are linked to this project.'}
+              : 'Could not determine which databases are linked to this service.'}
             <Button
               variant="outline"
               size="sm"
@@ -619,7 +628,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
         <p className="text-sm text-muted-foreground">
           Choose an existing database below, or create a new database of any
           supported type. Linking makes its connection settings available to
-          this project from its next deployment.
+          this service from its next deployment.
         </p>
 
         <ServiceLinkRedeployPrompt
@@ -697,11 +706,25 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           </section>
         ) : (
           <p className="text-sm text-muted-foreground">
-            All existing databases are linked to this project. You can create
+            All existing databases are linked to this service. You can create
             another database above.
           </p>
         )}
         {databaseTypes}
+        <ConfirmDeleteDialog
+          open={serviceToUnlink !== null}
+          onOpenChange={(open) => {
+            if (!open) setServiceToUnlink(null)
+          }}
+          verb="Unlink"
+          resourceType="database service"
+          resourceName={serviceToUnlink?.name ?? ''}
+          consequences={`${project.slug} stops receiving its connection variables, and the running app loses access after its next deployment. The service itself and its data are kept.`}
+          irreversible={false}
+          onConfirm={() => {
+            if (serviceToUnlink) void unlinkService(serviceToUnlink.id)
+          }}
+        />
         {servicePendingLink && (
           <DatabaseProvisioningDialog
             key={servicePendingLink.id}

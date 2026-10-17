@@ -329,7 +329,7 @@ export function ProxyLogDetail({
           <CardContent className="space-y-4">
             {log.project_id && (
               <div>
-                <p className="text-sm font-medium">Project ID</p>
+                <p className="text-sm font-medium">Service ID</p>
                 <p className="text-sm text-muted-foreground">
                   {log.project_id}
                 </p>

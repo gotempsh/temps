@@ -65,7 +65,7 @@ const schema = z
     probeCommand: z.string(),
     healthPath: z.string().startsWith('/'),
     automaticDeploy: z.boolean(),
-    buildLocation: z.enum(['control_plane', 'node']),
+    buildLocation: z.enum(['control_plane', 'node', 'ci']),
   })
   .superRefine((values, ctx) => {
     if (
@@ -532,8 +532,17 @@ export function DeployDefaultsCard({
                         Build images on a worker node to keep build CPU and
                         memory away from the proxy and running apps on the
                         control plane. When no worker can take a build, it runs
-                        on the control plane and the build log says why.
-                        Environments can override this.
+                        on the control plane when local builds are enabled, and
+                        the build log says why. Environments can override this.
+                        CI builds use the configured GitHub Actions runner and
+                        stop if verification fails.{' '}
+                        <a
+                          href="/settings/nodes#ci-builder"
+                          className="underline"
+                        >
+                          Configure CI builder
+                        </a>
+                        .
                       </FormDescription>
                     </div>
                     <Select value={field.value} onValueChange={field.onChange}>
@@ -548,6 +557,9 @@ export function DeployDefaultsCard({
                         </SelectItem>
                         <SelectItem value="node">
                           {BUILD_LOCATION_LABELS.node}
+                        </SelectItem>
+                        <SelectItem value="ci">
+                          {BUILD_LOCATION_LABELS.ci}
                         </SelectItem>
                       </SelectContent>
                     </Select>

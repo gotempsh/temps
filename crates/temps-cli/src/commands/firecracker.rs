@@ -26,6 +26,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use temps_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
+
+use super::upgrade::{
+    fetch_guest_agents_from_release, guest_agent_needs_fetch, ReleaseGuestAgents,
+};
+
 use super::upgrade::{download_asset, download_asset_text, verify_checksum};
 
 /// Supported Firecracker release. Pinned deliberately (snapshot format and
@@ -51,6 +57,9 @@ const TAP_NAME_PREFIX: &str = "temps-fc-tap";
 const SMOKE_MARKER: &str = "TEMPS_FC_SMOKE_OK";
 const SMOKE_IMAGE: &str = "busybox:stable";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Command that stages the guest terminal agent, shown with the reason when
+/// it is missing.
+const PTY_AGENT_SETUP_HINT: &str = temps_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
 
 /// Manage the Firecracker microVM sandbox backend
 #[derive(Args)]
@@ -67,7 +76,10 @@ pub enum FirecrackerSubcommand {
 
 #[derive(Args)]
 pub struct FirecrackerSetupCommand {
-    /// Data directory for storing configuration and runtime files
+    /// Data directory for storing configuration and runtime files. Must be
+    /// the directory the server runs with (its `TEMPS_DATA_DIR`); when
+    /// omitted, `~/.temps` is used, or `~/.temps/data` on installs that keep
+    /// their keys there.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
@@ -115,6 +127,13 @@ pub struct FirecrackerSetupCommand {
     /// Defaults to a `temps-vm-agent` file next to the running executable.
     #[arg(long)]
     pub vm_agent_bin: Option<PathBuf>,
+
+    /// Path to the static musl `temps-pty-agent` guest binary to install.
+    /// It is what gives sandboxes interactive terminals
+    /// (`temps sandbox shell`). Defaults to a `temps-pty-agent` file next to
+    /// the running executable.
+    #[arg(long)]
+    pub pty_agent_bin: Option<PathBuf>,
 }
 
 /// Provisioned state, written only after stages succeed. The sandbox
@@ -160,6 +179,10 @@ impl Dirs {
 
     fn jailer_bin(&self) -> PathBuf {
         self.bin.join("jailer")
+    }
+
+    fn pty_agent_bin(&self) -> PathBuf {
+        self.bin.join(PTY_AGENT_BINARY_NAME)
     }
 
     fn kernel_file(&self) -> PathBuf {
@@ -225,7 +248,8 @@ impl FirecrackerSetupCommand {
     }
 
     async fn run(self) -> anyhow::Result<()> {
-        let data_dir = resolve_data_dir(&self.data_dir);
+        let resolved = resolve_data_dir(&self.data_dir);
+        let data_dir = resolved.dir.clone();
         let dirs = Dirs::new(&data_dir);
 
         if self.uninstall {
@@ -240,7 +264,35 @@ impl FirecrackerSetupCommand {
         };
         println!("{}", title.bright_white().bold());
         println!("{}", "  ===================================".bright_cyan());
-        info("Data directory", dirs.root.display().to_string());
+        info(
+            "Data directory",
+            format!("{} ({})", dirs.root.display(), resolved.source.describe()),
+        );
+        for warning in &resolved.warnings {
+            warn("Data directory", warning);
+        }
+        // The server reads this backend from *its* data directory. State
+        // under another candidate directory means setup went somewhere the
+        // server never looks.
+        if let Some(home) = dirs::home_dir() {
+            for other in super::doctor::other_data_dirs_with(
+                &data_dir,
+                &home,
+                std::path::Path::new("firecracker/state.json"),
+            ) {
+                warn(
+                    "Data directory",
+                    format!(
+                        "Firecracker is also provisioned under {}. A server started with \
+                         TEMPS_DATA_DIR={} uses that one, not this one; re-run with \
+                         `--data-dir {}` if that is the server's directory",
+                        other.join("firecracker").display(),
+                        other.display(),
+                        other.display()
+                    ),
+                );
+            }
+        }
 
         if self.network_only {
             let failures = self.stage_network(&dirs, false)?;
@@ -295,7 +347,9 @@ impl FirecrackerSetupCommand {
 
         section("Firecracker binaries");
         self.stage_binaries(&dirs).await?;
-        self.stage_vm_agent(&dirs)?;
+        let released = self.fetch_missing_guest_agents(&dirs).await;
+        self.stage_vm_agent(&dirs, released.as_ref())?;
+        self.stage_pty_agent(&dirs, released.as_ref())?;
 
         section("Guest kernel");
         self.stage_kernel(&dirs).await?;
@@ -526,6 +580,21 @@ impl FirecrackerSetupCommand {
             failures += 1;
         }
 
+        // Terminal agent: optional, so absence is a warning, not a failure.
+        match TerminalCapability::from_staged_binary(&dirs.pty_agent_bin(), PTY_AGENT_SETUP_HINT) {
+            TerminalCapability {
+                supported: true, ..
+            } => pass("Terminal agent", dirs.pty_agent_bin().display().to_string()),
+            TerminalCapability { reason, .. } => warn(
+                "Terminal agent",
+                format!(
+                    "{} — `temps sandbox shell` is unavailable on Firecracker sandboxes \
+                     until it is staged",
+                    reason.unwrap_or_default()
+                ),
+            ),
+        }
+
         // State / smoke
         match read_state(dirs) {
             Some(s) if s.smoke_ok => pass("Smoke test", "Passed on last setup"),
@@ -617,17 +686,85 @@ impl FirecrackerSetupCommand {
         Ok(())
     }
 
+    /// Fetch the guest agents from the release matching this binary when
+    /// neither a flag, the executable's directory nor an earlier setup
+    /// provides them. Announced, bounded to what is actually missing, and a
+    /// failure only produces the same warnings as before -- never a failed
+    /// setup.
+    async fn fetch_missing_guest_agents(&self, dirs: &Dirs) -> Option<ReleaseGuestAgents> {
+        let beside = |name: &str| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join(name)))
+        };
+        let mut missing: Vec<&str> = Vec::new();
+        if guest_agent_needs_fetch(
+            self.vm_agent_bin.as_deref(),
+            beside("temps-vm-agent").as_deref(),
+            &dirs.bin.join("temps-vm-agent"),
+        ) {
+            missing.push("temps-vm-agent");
+        }
+        if guest_agent_needs_fetch(
+            self.pty_agent_bin.as_deref(),
+            beside(PTY_AGENT_BINARY_NAME).as_deref(),
+            &dirs.pty_agent_bin(),
+        ) {
+            missing.push(PTY_AGENT_BINARY_NAME);
+        }
+        if missing.is_empty() {
+            return None;
+        }
+        println!(
+            "  Fetching {} from the release that matches this binary (checksum-verified)...",
+            missing.join(" and ")
+        );
+        match fetch_guest_agents_from_release(&missing).await {
+            Ok(agents) => {
+                for name in &missing {
+                    if agents.path(name).is_none() {
+                        warn(
+                            "Guest agent",
+                            format!(
+                                "release {} does not ship {}; upgrade with `temps upgrade` \
+                                 to a release that does, or pass its path explicitly",
+                                agents.tag(),
+                                name
+                            ),
+                        );
+                    }
+                }
+                Some(agents)
+            }
+            Err(e) => {
+                warn(
+                    "Guest agent",
+                    format!("could not fetch the guest agents from the release: {e}"),
+                );
+                None
+            }
+        }
+    }
+
     /// Install the static musl guest agent — the only transport into a VM,
     /// injected into every rootfs by the provider. Sourced from `--vm-agent-bin`
     /// or a `temps-vm-agent` file next to the running executable (release
     /// tarballs ship it there; CI publishes it alongside the temps binary).
-    fn stage_vm_agent(&self, dirs: &Dirs) -> anyhow::Result<()> {
-        let source = self.vm_agent_bin.clone().or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|d| d.join("temps-vm-agent")))
-                .filter(|p| p.exists())
-        });
+    fn stage_vm_agent(
+        &self,
+        dirs: &Dirs,
+        released: Option<&ReleaseGuestAgents>,
+    ) -> anyhow::Result<()> {
+        let source = self
+            .vm_agent_bin
+            .clone()
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.join("temps-vm-agent")))
+                    .filter(|p| p.exists())
+            })
+            .or_else(|| released.and_then(|r| r.path("temps-vm-agent")));
         let dest = dirs.bin.join("temps-vm-agent");
         match source {
             Some(src) if src.exists() => {
@@ -647,6 +784,61 @@ impl FirecrackerSetupCommand {
                     "temps-vm-agent binary not found (looked next to this executable). \
                      Firecracker sandboxes stay unavailable until it is installed — \
                      re-run with --vm-agent-bin <path>.",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Install the static musl PTY agent that powers interactive terminals.
+    /// Injected next to the VM agent into every rootfs converted afterwards
+    /// (the rootfs cache key includes its hash, so a changed binary
+    /// re-converts). Sourced from `--pty-agent-bin` or a `temps-pty-agent`
+    /// file next to the running executable.
+    ///
+    /// Optional by design: without it sandboxes still create and run
+    /// commands, they just cannot open terminals — so a missing binary is a
+    /// warning that says exactly how to fix it, never a failed setup.
+    fn stage_pty_agent(
+        &self,
+        dirs: &Dirs,
+        released: Option<&ReleaseGuestAgents>,
+    ) -> anyhow::Result<()> {
+        let source = self
+            .pty_agent_bin
+            .clone()
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+                    .filter(|p| p.exists())
+            })
+            .or_else(|| released.and_then(|r| r.path(PTY_AGENT_BINARY_NAME)));
+        let dest = dirs.pty_agent_bin();
+        match source {
+            Some(src) if src.exists() => {
+                stage_pty_agent_binary(&src, &dest)?;
+                pass(
+                    "Terminal agent",
+                    format!(
+                        "Installed from {} — sandboxes created from now on support \
+                         `temps sandbox shell`; recreate existing ones to add it",
+                        src.display()
+                    ),
+                );
+            }
+            Some(src) => {
+                anyhow::bail!("--pty-agent-bin {} does not exist", src.display());
+            }
+            None if dest.exists() => {
+                pass("Terminal agent", "Already installed");
+            }
+            None => {
+                warn(
+                    "Terminal agent",
+                    "temps-pty-agent binary not found (looked next to this executable). \
+                     Sandboxes work but cannot open terminals (`temps sandbox shell`) \
+                     until it is installed — re-run with --pty-agent-bin <path>.",
                 );
             }
         }
@@ -1233,16 +1425,11 @@ async fn build_smoke_rootfs(smoke_dir: &Path) -> anyhow::Result<PathBuf> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn resolve_data_dir(flag: &Option<PathBuf>) -> PathBuf {
-    if let Some(d) = flag {
-        d.clone()
-    } else if let Ok(d) = std::env::var("TEMPS_DATA_DIR") {
-        PathBuf::from(d)
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".temps")
-    }
+fn resolve_data_dir(flag: &Option<PathBuf>) -> super::data_dir_discovery::ResolvedDataDir {
+    let explicit = flag
+        .clone()
+        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from));
+    super::data_dir_discovery::resolve(explicit.as_deref(), dirs::home_dir().as_deref())
 }
 
 fn fc_arch() -> anyhow::Result<&'static str> {

@@ -19,6 +19,8 @@ export interface SettingsProps {
   /** Disables the save bar until something has actually changed. */
   dirty?: boolean
   onCancel?: () => void
+  /** The save button's label; name the outcome ("Save repository"). */
+  saveLabel?: ReactNode
   className?: string
 }
 
@@ -38,6 +40,7 @@ export function Settings({
   saving = false,
   dirty = true,
   onCancel,
+  saveLabel = 'Save changes',
   className,
 }: SettingsProps) {
   const canSave = dirty && !Object.values(errors).some(Boolean)
@@ -67,9 +70,11 @@ export function Settings({
             busy={saving}
             busyLabel="Saving…"
             aria-disabled={!canSave}
-            className={cn(!canSave && !saving && 'pointer-events-none opacity-50')}
+            className={cn(
+              !canSave && !saving && 'pointer-events-none opacity-50'
+            )}
           >
-            Save changes
+            {saveLabel}
           </Button>
         </div>
       </form>

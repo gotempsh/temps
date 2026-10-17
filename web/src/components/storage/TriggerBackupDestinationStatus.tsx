@@ -27,6 +27,7 @@ export const CREATE_S3_SOURCE_PATH = '/backups/s3-sources/new'
 export function DestinationsSkeleton() {
   return (
     <div
+      role="status"
       className="space-y-4"
       aria-busy="true"
       aria-label="Loading backup destinations"

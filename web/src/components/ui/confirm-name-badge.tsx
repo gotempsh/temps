@@ -18,7 +18,7 @@ export function ConfirmNameBadge({ value }: ConfirmNameBadgeProps) {
     <CopyButton
       value={value}
       label={`Copy "${value}"`}
-      className="mx-1 inline-flex items-center gap-1.5 rounded-md border border-dashed border-input bg-muted/40 px-2 py-0.5 align-middle font-mono font-semibold text-foreground hover:border-solid"
+      className="mx-1 inline-flex max-w-full break-all text-left items-center gap-1.5 rounded-md border border-dashed border-input bg-muted/40 px-2 py-0.5 align-middle font-mono font-semibold text-foreground hover:border-solid"
     >
       {value}
     </CopyButton>

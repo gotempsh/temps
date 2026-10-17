@@ -329,7 +329,10 @@ export function VisitorsList({ project }: VisitorsListProps) {
                   setCrawlerFilter(value)
                 }
               >
-                <SelectTrigger className="w-[120px] sm:w-[140px]">
+                <SelectTrigger
+                  aria-label="Visitor type"
+                  className="w-[120px] sm:w-[140px]"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -342,7 +345,10 @@ export function VisitorsList({ project }: VisitorsListProps) {
                 value={limit.toString()}
                 onValueChange={(value) => setLimit(parseInt(value))}
               >
-                <SelectTrigger className="w-[90px] sm:w-[100px]">
+                <SelectTrigger
+                  aria-label="Visitors per page"
+                  className="w-[90px] sm:w-[100px]"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -488,7 +494,7 @@ export function VisitorsList({ project }: VisitorsListProps) {
                       disabled={page === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
-                      <span className="hidden sm:inline">Previous</span>
+                      <span className="max-sm:sr-only">Previous</span>
                     </Button>
                     <div className="hidden sm:flex items-center gap-1">
                       {[...Array(Math.min(5, totalPages))].map((_, idx) => {
@@ -515,7 +521,7 @@ export function VisitorsList({ project }: VisitorsListProps) {
                       }
                       disabled={page === totalPages}
                     >
-                      <span className="hidden sm:inline">Next</span>
+                      <span className="max-sm:sr-only">Next</span>
                       <ChevronRight className="h-4 w-4" />
                     </Button>
                   </div>

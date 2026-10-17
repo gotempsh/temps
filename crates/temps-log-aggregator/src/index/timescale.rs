@@ -1318,7 +1318,13 @@ mod live_tests {
         let idx = TimescaleLineIndex::new(db.connection_arc());
         let project_id = 991_047;
         let labels = labels(project_id);
-        let base: DateTime<Utc> = "2026-09-20T12:00:00Z".parse().unwrap();
+        // Relative to now, never a calendar date: `set_retention_days(14)`
+        // below drops everything older than 14 days immediately, so a
+        // hard-coded timestamp turns this test red once the date passes.
+        // One day back stays well inside every retention window the test
+        // sets; whole seconds keep the keyset comparisons exact.
+        let base: DateTime<Utc> =
+            DateTime::from_timestamp(Utc::now().timestamp() - 86_400, 0).unwrap();
 
         // Two chunks, five lines each, distinct timestamps so the keyset is
         // unambiguous. Chunk 1 carries attributes, chunk 2 does not.

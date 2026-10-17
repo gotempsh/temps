@@ -8,5 +8,6 @@ pub mod handler;
 pub mod ip_access_control;
 pub mod password_wall;
 pub mod preview_wall;
+pub mod project_ip_access;
 pub mod proxy_logs;
 pub mod types;

@@ -528,6 +528,7 @@ pub(crate) mod admin_test_support {
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
             failover_at: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,

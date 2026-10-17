@@ -121,22 +121,26 @@ impl TokenSide {
 /// Mirror staged through a scratch directory so only the token side's `rc`
 /// call carries `-H`. Positional parameters (never interpolated into the
 /// script text): `$1` source, `$2` destination, `$3` `remove`|`keep`,
-/// `$4` which side carries the token (`source`|`destination`).
+/// `$4` which side carries the token (`source`|`destination`). Any further
+/// parameters are extra `rc mirror` flags (`--exclude <glob>` pairs) for the
+/// upload step.
 const STAGED_MIRROR_SCRIPT: &str = r#"set -e
 if [ -z "${TEMPS_REMOTE_SESSION_TOKEN:-}" ]; then
   echo 'staged mirror: TEMPS_REMOTE_SESSION_TOKEN is not set' >&2
   exit 2
 fi
+SRC=$1; DST=$2; MODE=$3; SIDE=$4
+shift 4
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 REMOVE=
-if [ "$3" = remove ]; then REMOVE=--remove; fi
-if [ "$4" = source ]; then
-  rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" mirror --overwrite "$1" "$stage/"
-  rc mirror --overwrite $REMOVE "$stage/" "$2"
+if [ "$MODE" = remove ]; then REMOVE=--remove; fi
+if [ "$SIDE" = source ]; then
+  rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" mirror --overwrite "$SRC" "$stage/"
+  rc mirror --overwrite $REMOVE "$@" "$stage/" "$DST"
 else
-  rc mirror --overwrite "$1" "$stage/"
-  rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" mirror --overwrite $REMOVE "$stage/" "$2"
+  rc mirror --overwrite "$SRC" "$stage/"
+  rc -H "x-amz-security-token: ${TEMPS_REMOTE_SESSION_TOKEN}" mirror --overwrite $REMOVE "$@" "$stage/" "$DST"
 fi"#;
 
 /// `rc ls --json "$1"` on the token-carrying side.
@@ -698,11 +702,11 @@ mod tests {
             "local step must not send the token: {}",
             lines[0]
         );
-        assert!(lines[0].contains(r#""$1" "$stage/""#));
+        assert!(lines[0].contains(r#""$SRC" "$stage/""#));
         assert!(lines[1].contains("-H \"x-amz-security-token:"));
-        assert!(lines[1].contains(r#""$stage/" "$2""#));
+        assert!(lines[1].contains(r#""$stage/" "$DST""#));
         let source_branch = script
-            .split("if [ \"$4\" = source ]; then")
+            .split("if [ \"$SIDE\" = source ]; then")
             .nth(1)
             .unwrap()
             .split("else")
@@ -712,8 +716,10 @@ mod tests {
             .lines()
             .filter(|l| l.contains("rc "))
             .collect();
-        assert!(lines[0].contains("-H \"x-amz-security-token:") && lines[0].contains(r#""$1""#));
-        assert!(!lines[1].contains("-H") && lines[1].contains(r#""$2""#));
+        assert!(lines[0].contains("-H \"x-amz-security-token:") && lines[0].contains(r#""$SRC""#));
+        assert!(!lines[1].contains("-H") && lines[1].contains(r#""$DST""#));
+        // Extra flags (exclusions) reach only the upload step.
+        assert!(lines[1].contains(r#""$@""#) && !lines[0].contains(r#""$@""#));
         assert!(script.contains("trap 'rm -rf \"$stage\"' EXIT"));
 
         let restore = mirror_command("bkp/p/b/", "dest/b/", true, TokenSide::Source);

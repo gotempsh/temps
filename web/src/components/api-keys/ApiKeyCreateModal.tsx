@@ -191,11 +191,17 @@ export function ApiKeyCreateModal({
                 <FormLabel>Your API Key</FormLabel>
                 <div className="flex gap-2">
                   <Input
+                    aria-label="Your API Key"
                     value={newKeySecret}
                     readOnly
                     className="font-mono text-sm"
                   />
-                  <Button size="sm" variant="outline" onClick={handleCopyKey}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    aria-label="Copy API key"
+                    onClick={handleCopyKey}
+                  >
                     {copiedKey ? (
                       <Check className="h-4 w-4" />
                     ) : (

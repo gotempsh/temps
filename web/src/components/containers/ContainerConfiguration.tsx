@@ -381,7 +381,7 @@ function Field({
 }) {
   return (
     <div className="flex flex-col gap-1 min-w-0">
-      <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+      <dt className="text-xs font-medium uppercase tracking-wide text-neutral-600 dark:text-neutral-400">
         {label}
       </dt>
       <dd

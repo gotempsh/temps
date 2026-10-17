@@ -25,17 +25,22 @@ use utoipa::OpenApi;
 use super::audit::{StatusPageMutationAction, StatusPageMutationAudit};
 use super::public::{__path_get_public_status_page, __path_get_public_status_page_json};
 use super::status_pages::{
-    __path_create_status_page, __path_delete_status_page, __path_get_status_page,
-    __path_list_status_pages, __path_publish_status_page, __path_rotate_status_page_url,
-    __path_unpublish_status_page, __path_update_status_page, create_status_page,
-    delete_status_page, get_status_page, list_status_pages, publish_status_page,
-    rotate_status_page_url, unpublish_status_page, update_status_page,
+    __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
+    __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
+    __path_publish_status_page, __path_remove_status_page_domain, __path_renew_status_page_domain,
+    __path_rotate_status_page_url, __path_unpublish_status_page, __path_update_status_page,
+    __path_verify_status_page_domain, add_status_page_domain, create_status_page,
+    delete_status_page, get_status_page, list_status_page_domains, list_status_pages,
+    publish_status_page, remove_status_page_domain, renew_status_page_domain,
+    rotate_status_page_url, unpublish_status_page, update_status_page, verify_status_page_domain,
 };
 use crate::services::public_pages::{
-    CreateStatusPageRequest, PublicComponentStatus, PublicDayStatus, PublicIncident,
-    PublicIncidentSeverity, PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent,
-    PublicStatusPageResponse, PublicUptimeDay, StatusPageListResponse, StatusPageMonitorInput,
-    StatusPageMonitorResponse, StatusPageResponse, UpdateStatusPageRequest,
+    AddStatusPageDomainRequest, CreateStatusPageRequest, DnsRecordInstruction,
+    PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
+    PublicUptimeDay, StatusPageDomainResponse, StatusPageDomainService, StatusPageDomainStatus,
+    StatusPageListResponse, StatusPageMonitorInput, StatusPageMonitorResponse, StatusPageResponse,
+    UpdateStatusPageRequest, VerificationMethod,
 };
 use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
@@ -50,6 +55,8 @@ pub trait StatusPageAppState: Send + Sync + 'static {
     fn status_page_service(&self) -> &StatusPageService;
     /// Publishable status pages (#1412).
     fn public_status_page_service(&self) -> &PublicStatusPageService;
+    /// Custom hostnames of status pages (#1412).
+    fn status_page_domain_service(&self) -> &StatusPageDomainService;
     fn telemetry(&self) -> &std::sync::Arc<dyn temps_core::TelemetryReporter>;
     fn audit_service(&self) -> &Arc<dyn AuditLogger>;
     /// Optional checker for team-based project access (human sessions only).
@@ -85,6 +92,11 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         unpublish_status_page,
         rotate_status_page_url,
         delete_status_page,
+        list_status_page_domains,
+        add_status_page_domain,
+        verify_status_page_domain,
+        renew_status_page_domain,
+        remove_status_page_domain,
         get_public_status_page,
         get_public_status_page_json,
     ),
@@ -121,6 +133,11 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             PublicIncidentSeverity,
             PublicIncidentStatus,
             PublicIncidentUpdate,
+            AddStatusPageDomainRequest,
+            StatusPageDomainResponse,
+            StatusPageDomainStatus,
+            DnsRecordInstruction,
+            VerificationMethod,
         )
     ),
     tags(
@@ -1372,6 +1389,22 @@ where
             "/status-pages/{status_page_id}/rotate-url",
             post(rotate_status_page_url),
         )
+        .route(
+            "/status-pages/{status_page_id}/domains",
+            get(list_status_page_domains).post(add_status_page_domain),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}",
+            delete(remove_status_page_domain),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}/verify",
+            post(verify_status_page_domain),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}/renew",
+            post(renew_status_page_domain),
+        )
 }
 
 pub(crate) fn map_error(error: StatusPageError) -> Problem {
@@ -1379,7 +1412,56 @@ pub(crate) fn map_error(error: StatusPageError) -> Problem {
         StatusPageError::NotFound => not_found().detail("Resource not found").build(),
         error @ (StatusPageError::StatusPageNotFound { .. }
         | StatusPageError::IncidentUpdateNotFound { .. }
-        | StatusPageError::ProjectNotFound { .. }) => not_found().detail(error.to_string()).build(),
+        | StatusPageError::ProjectNotFound { .. }
+        | StatusPageError::StatusPageDomainNotFound { .. }) => {
+            not_found().detail(error.to_string()).build()
+        }
+        error @ (StatusPageError::InvalidHostname { .. }
+        | StatusPageError::DomainVerificationFailed { .. }
+        | StatusPageError::AcmeEmailRequired { .. }) => {
+            bad_request().detail(error.to_string()).build()
+        }
+        error @ StatusPageError::DomainOperationsThrottled { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Too Many Domain Operations")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ (StatusPageError::HostnameInUse { .. }
+        | StatusPageError::StatusPageDomainLimitReached { .. }
+        | StatusPageError::HostnameBindingChanged { .. }
+        | StatusPageError::DomainRequiresPublishedPage { .. }) => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Hostname Unavailable")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::CertificateOperationInProgress { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Certificate Operation In Progress")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::DomainNotRenewable { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("No Certificate To Renew")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::HostnameUnverifiable { .. } => {
+            tracing::error!(error = %error, "status page hostname availability check failed");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Hostname Check Unavailable")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::CertificateOrder { .. } => {
+            tracing::error!(error = %error, "status page certificate order failed");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Certificate Order Failed")
+                .detail(error.to_string())
+                .build()
+        }
         error @ (StatusPageError::MonitorsNotInProject { .. }
         | StatusPageError::PublishWithoutMonitors { .. }
         | StatusPageError::SystemUpdateCannotBePublic { .. }) => {
@@ -1615,6 +1697,7 @@ mod tests {
     struct TestAppState {
         status_page_service: StatusPageService,
         public_status_page_service: PublicStatusPageService,
+        status_page_domain_service: StatusPageDomainService,
         telemetry: Arc<dyn TelemetryReporter>,
         audit_service: Arc<dyn AuditLogger>,
         project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
@@ -1627,6 +1710,10 @@ mod tests {
 
         fn public_status_page_service(&self) -> &PublicStatusPageService {
             &self.public_status_page_service
+        }
+
+        fn status_page_domain_service(&self) -> &StatusPageDomainService {
+            &self.status_page_domain_service
         }
 
         fn telemetry(&self) -> &Arc<dyn TelemetryReporter> {
@@ -1796,10 +1883,26 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
+        let snapshot_cache = Arc::new(crate::services::StatusSnapshotCache::new(db.clone()));
         let public_status_page_service = PublicStatusPageService::new(
             db.clone(),
             config_service.clone(),
-            Arc::new(crate::services::StatusSnapshotCache::new(db.clone())),
+            snapshot_cache.clone(),
+        );
+        let status_page_domain_service = StatusPageDomainService::new(
+            db.clone(),
+            config_service.clone(),
+            snapshot_cache,
+            Arc::new(
+                crate::services::public_pages::domains::test_support::FakeCertificates::new(
+                    db.clone(),
+                ),
+            ),
+            Arc::new(
+                crate::services::public_pages::domains::test_support::StubRouteTable {
+                    serving: Default::default(),
+                },
+            ),
         );
         let status_page_service = StatusPageService::new(db.clone(), config_service);
 
@@ -1839,6 +1942,7 @@ mod tests {
         let app_state = Arc::new(TestAppState {
             status_page_service,
             public_status_page_service,
+            status_page_domain_service,
             telemetry: Arc::new(NoopTelemetryReporter),
             audit_service,
             project_access_checker: make_checker(project.id),

@@ -49,6 +49,7 @@ pub use request::{
 };
 pub use service::AnalyticsIngestKeyService;
 pub use types::{
-    AnalyticsIngestKey, AnalyticsIngestKeyError, CreateAnalyticsIngestKeyRequest,
-    ResolvedIngestScope, UpdateAnalyticsIngestKeyRequest, ANALYTICS_INGEST_KEY_PREFIX,
+    AnalyticsIngestEndpoint, AnalyticsIngestKey, AnalyticsIngestKeyError,
+    CreateAnalyticsIngestKeyRequest, ResolvedIngestScope, UpdateAnalyticsIngestKeyRequest,
+    ANALYTICS_INGEST_KEY_PREFIX,
 };

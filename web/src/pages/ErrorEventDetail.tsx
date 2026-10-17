@@ -86,9 +86,9 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
     switch (level?.toLowerCase()) {
       case 'error':
       case 'fatal':
-        return 'text-red-600 bg-red-100 dark:bg-red-900/20'
+        return 'text-red-700 dark:text-red-600 bg-red-100 dark:bg-red-900/20'
       case 'warning':
-        return 'text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
+        return 'text-yellow-700 dark:text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
       case 'info':
         return 'text-blue-600 bg-blue-100 dark:bg-blue-900/20'
       default:
@@ -179,8 +179,8 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div className="flex-1">
-            <div className="flex items-center gap-3 mb-2">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-2">
               <Badge
                 className={cn(
                   getSeverityColor(sentryEvent?.sentry?.level || 'error')
@@ -188,13 +188,13 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
               >
                 {sentryEvent?.sentry?.level || 'error'}
               </Badge>
-              <h1 className="text-2xl font-semibold">
+              <h1 className="min-w-0 break-words text-lg font-semibold sm:text-2xl">
                 {sentryEvent?.sentry?.exception?.values?.[0]?.value ||
                   sentryEvent?.sentry?.logentry?.formatted ||
                   'Event Details'}
               </h1>
             </div>
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
               <Clock className="h-3 w-3" />
               <span>{format(new Date(event.timestamp), 'PPpp')}</span>
               {sentryEvent && (

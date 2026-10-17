@@ -21,6 +21,7 @@ temps-geo = { path = "../temps-geo" }
 temps-analytics = { path = "../temps-analytics" }
 temps-analytics-backend = { path = "../temps-analytics-backend" }
 temps-config = { path = "../temps-config" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 
 # ClickHouse Rust client. Always linked. The actual ClickHouse backend is
 # only constructed at runtime when ServerConfig::is_clickhouse_enabled()

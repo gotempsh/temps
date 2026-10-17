@@ -257,6 +257,32 @@ impl OnDemandManager {
         self.sleeping_domains.load().get(domain).cloned()
     }
 
+    /// Look up a sleeping environment by its ID rather than its domain.
+    /// Used by path-route wake-on-demand: the proxy knows the target
+    /// environment ID from the route table but not its hostname.
+    /// O(n) over the sleeping-domain count — acceptable because scale-to-zero
+    /// environments are rare and this path is only hit when `target` is `None`.
+    pub fn get_sleeping_environment_by_id(
+        &self,
+        environment_id: i32,
+    ) -> Option<SleepingEnvironmentInfo> {
+        let snapshot = self.sleeping_domains.load();
+        // Check exact domains first, then wildcard bases. Two separate borrows
+        // avoid lifetime conflicts in chained iterator closures.
+        if let Some(info) = snapshot
+            .exact
+            .values()
+            .find(|info| info.environment_id == environment_id)
+        {
+            return Some(info.clone());
+        }
+        snapshot
+            .wildcard_bases
+            .values()
+            .find(|info| info.environment_id == environment_id)
+            .cloned()
+    }
+
     /// Register a sleeping environment domain for wake-on-request lookup.
     pub fn register_sleeping_domain(&self, domain: String, info: SleepingEnvironmentInfo) {
         let mut snapshot = (*self.sleeping_domains.load_full()).clone();
@@ -1431,6 +1457,51 @@ mod tests {
                 .map(|info| info.environment_id),
             Some(2)
         );
+    }
+
+    #[test]
+    fn test_sleeping_environment_lookup_by_id() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
+
+        // Before registration: lookup by ID returns None.
+        assert!(manager.get_sleeping_environment_by_id(42).is_none());
+
+        manager.register_sleeping_domain(
+            "svc.example.com".to_string(),
+            SleepingEnvironmentInfo {
+                environment_id: 42,
+                project_id: 10,
+                deployment_id: 100,
+                wake_timeout_seconds: 30,
+            },
+        );
+        manager.register_sleeping_domain(
+            "*.preview.example.com".to_string(),
+            SleepingEnvironmentInfo {
+                environment_id: 99,
+                project_id: 20,
+                deployment_id: 200,
+                wake_timeout_seconds: 45,
+            },
+        );
+
+        // Exact domain lookup by ID.
+        let info = manager
+            .get_sleeping_environment_by_id(42)
+            .expect("environment 42 must be found by ID");
+        assert_eq!(info.environment_id, 42);
+        assert_eq!(info.project_id, 10);
+
+        // Wildcard domain lookup by ID.
+        let wildcard_info = manager
+            .get_sleeping_environment_by_id(99)
+            .expect("environment 99 (wildcard) must be found by ID");
+        assert_eq!(wildcard_info.environment_id, 99);
+
+        // Unknown ID returns None.
+        assert!(manager.get_sleeping_environment_by_id(999).is_none());
     }
 
     #[test]

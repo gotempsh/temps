@@ -13,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 # Core
 temps-core = { path = "../temps-core" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 
 # Database
 sea-orm = { workspace = true }

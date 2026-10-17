@@ -3,6 +3,17 @@
 
 use thiserror::Error;
 
+/// Render a microcent amount (1 USD = 1,000,000) as dollars for error text.
+/// Sub-cent amounts keep four decimals so a small budget never reads `$0.00`.
+fn format_usd(microcents: i64) -> String {
+    let usd = microcents as f64 / 1_000_000.0;
+    if usd != 0.0 && usd.abs() < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum AiGatewayError {
     #[error("Provider '{provider}' not found or not configured")]
@@ -50,7 +61,7 @@ pub enum AiGatewayError {
 
     #[error(
         "{endpoint} is only available for OpenAI models; model '{model}' is served by provider \
-         '{provider}'. Use /ai/v1/chat/completions for this model instead."
+         '{provider}'. Use /api/ai/v1/chat/completions for this model instead."
     )]
     UnsupportedEndpoint {
         endpoint: String,
@@ -63,6 +74,32 @@ pub enum AiGatewayError {
 
     #[error("AI batch upload capacity reached; retry when an upload finishes")]
     UploadCapacity,
+
+    #[error(
+        "Project {project_id} exceeded its AI gateway limit of {limit} requests per minute; \
+         retry in {retry_after_secs}s"
+    )]
+    RateLimited {
+        project_id: i32,
+        limit: u32,
+        retry_after_secs: u64,
+    },
+
+    #[error(
+        "Project {project_id} reached its monthly AI gateway budget of {} \
+         ({} used); it resets in {retry_after_secs}s",
+        format_usd(*limit_microcents),
+        format_usd(*used_microcents)
+    )]
+    BudgetExceeded {
+        project_id: i32,
+        limit_microcents: i64,
+        used_microcents: i64,
+        retry_after_secs: u64,
+    },
+
+    #[error("Project {project_id} not found; cannot configure AI gateway limits for it")]
+    ProjectNotFound { project_id: i32 },
 
     #[error("No {kind} with id '{id}' was created through this gateway by the caller")]
     ObjectNotFound { kind: String, id: String },
@@ -151,4 +188,31 @@ fn find_blocked_address(
         source = current.source();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_exceeded_message_is_in_dollars() {
+        let err = AiGatewayError::BudgetExceeded {
+            project_id: 7,
+            limit_microcents: 25_000_000,
+            used_microcents: 26_500_000,
+            retry_after_secs: 3600,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Project 7"), "{msg}");
+        assert!(msg.contains("$25.00"), "{msg}");
+        assert!(msg.contains("$26.50 used"), "{msg}");
+        assert!(msg.contains("3600s"), "{msg}");
+    }
+
+    #[test]
+    fn format_usd_keeps_precision_for_sub_cent_amounts() {
+        assert_eq!(format_usd(0), "$0.00");
+        assert_eq!(format_usd(4_200), "$0.0042");
+        assert_eq!(format_usd(1_234_567), "$1.23");
+    }
 }

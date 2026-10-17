@@ -112,6 +112,25 @@ jobs:
       # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core and
       #   pingora-load-balancing -> derivative (temps-proxy, temps-edge).
       #   Proc-macro only; the pinned Pingora 0.9 dependency includes it.
+      # - RUSTSEC-2024-0449 (unsafe-libyaml): workspace crates parse YAML
+      #   with `yaml_serde` (maintained serde_yaml fork on `libyaml-rs`), so
+      #   compose files, temps.yaml, Kamal and kubeconfig input never reach
+      #   unsafe-libyaml. The only remaining path is pingora-core 0.9 ->
+      #   serde_yaml, a non-optional dependency (also on Pingora main as of
+      #   2026-10-12) used solely by ServerConf's YAML conf-file loader.
+      #   Temps never gives Pingora a conf file: temps-proxy builds ServerConf
+      #   in code with `Opt { conf: None }` and temps-edge passes
+      #   `Opt::default()`, so the parser is linked but never fed input.
+      # - RUSTSEC-2025-0141 (bincode 2.0.1): no workspace crate uses bincode.
+      #   Its only dependents are microsandbox-filesystem, msb_krun_devices
+      #   and msb_krun_vmm, all under temps-agents' exact-pinned microsandbox
+      #   SDK (ADR-050), which is not linked on musl (the container image) or
+      #   Intel macOS. They encode/decode VM and filesystem state blobs the
+      #   microsandbox runtime writes itself. The latest releases checked on
+      #   2026-10-12 (microsandbox 0.7.8, msb_krun 0.1.41) still require
+      #   `bincode ^2.0.1` non-optionally, so no upgrade drops it. No
+      #   vulnerability is reported against bincode 2.0.1. A temps-core
+      #   Cargo.lock guard test fails if anything else starts depending on it.
       #
       # The three below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices), blocked on upstream fixes with no non-forking workaround.
@@ -174,13 +193,30 @@ jobs:
       #   consumer uses CacheKey(String), without a custom Drop, and calls
       #   get_or_insert_mut rather than pop. The advisory's panicking-key-Drop
       #   prerequisite is absent there. Re-review when the SDK changes.
+      # - RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 (zip 8.6.0:
+      #   SUID/SGID bits and symlink targets honoured by `ZipArchive::extract()`
+      #   / `ZipStreamReader::extract()`; fixed in zip >= 9.0.0). The workspace's
+      #   own `zip` dependency is already 9.x; the 8.6.0 copy is locked only by
+      #   two upstream crates whose latest releases still require `zip ^8`
+      #   (checked 2026-10-17: headless_chrome 1.0.22, utoipa-swagger-ui
+      #   10.0.1), so a version bump or [patch] cannot reach it:
+      #   * headless_chrome (temps-screenshots, `fetch` feature): unpacks the
+      #     Chromium build it downloads. It does not call `extract()`; it
+      #     iterates `by_index()`, takes `mangled_name()` for the output path and
+      #     sets modes itself (on macOS it shells out to `unzip` instead).
+      #   * utoipa-swagger-ui (build-dependency only): its build script reads the
+      #     pinned Swagger UI release archive via `by_index()`; never linked into
+      #     a Temps binary and never fed user input.
+      #   Neither path calls an advisory-affected function nor handles
+      #   attacker-controlled archives. Re-check and drop these three once
+      #   headless_chrome and utoipa-swagger-ui release with zip 9.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
       # dependency graph, which can fail independently of this repository's
       # Cargo.lock (for example, when an upstream build-only crate is broken).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-audit@0.22.2
           fallback: none
@@ -189,7 +225,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369
 
   web-audit:
     name: Web Dependency Audit (bun audit)

@@ -60,6 +60,7 @@ const node: PlacementNode = {
 
 function sandbox(id: string, extra: Partial<SandboxInner> = {}): SandboxInner {
   return {
+    allow_docker: false,
     id,
     name: id,
     status: 'running',

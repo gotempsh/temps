@@ -480,8 +480,14 @@ function AddAlertRuleDialog({
               </Select>
             </div>
             <div className="flex-1 space-y-1.5">
-              <label className="text-sm font-medium">Threshold</label>
+              <label
+                htmlFor="alert-rule-threshold"
+                className="text-sm font-medium"
+              >
+                Threshold
+              </label>
               <Input
+                id="alert-rule-threshold"
                 type="number"
                 value={threshold}
                 onChange={(e) => setThreshold(e.target.value)}
@@ -645,6 +651,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                           <TableCell>
                             {editing !== undefined ? (
                               <Input
+                                aria-label={`Threshold for ${rule.name}`}
                                 type="number"
                                 value={editing}
                                 className="h-7 w-24 px-2 text-sm"
@@ -1196,7 +1203,7 @@ export function MonitoringCard({
             ) : (
               <PowerOff className="h-4 w-4" />
             )}
-            <span className="ml-1.5 hidden sm:inline">Disable</span>
+            <span className="ml-1.5 max-sm:sr-only">Disable</span>
           </Button>
         </CardContent>
       </Card>
@@ -1234,7 +1241,7 @@ export function MonitoringCard({
             ) : (
               <PowerOff className="h-4 w-4" />
             )}
-            <span className="ml-1.5 hidden sm:inline">Disable</span>
+            <span className="ml-1.5 max-sm:sr-only">Disable</span>
           </Button>
         </CardTitle>
       </CardHeader>

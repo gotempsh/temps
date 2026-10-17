@@ -59,7 +59,7 @@ use crate::audit::{
     ConversationAttachmentUploadedAudit, ConversationCreatedAudit,
     ConversationPermissionModeChangedAudit, ConversationRenamedAudit, ConversationRestoredAudit,
     GlobalWorkspaceFilesWrittenAudit, GlobalWorkspacePreviewLinkCreatedAudit,
-    PermissionResolvedAudit, ThreadArtifactCreatedAudit,
+    PermissionResolvedAudit, ThreadArtifactCreatedAudit, WorkspaceTerminalAttachedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::sensitive::{
@@ -68,6 +68,10 @@ use crate::sensitive::{
 use crate::service::{
     decode_message_before_cursor, encode_message_before_cursor, PendingPermissionOrigin,
     PermissionResolution,
+};
+use crate::thread_kind::{
+    terminal_thread_tab, ThreadKind, ThreadKindError, DEFAULT_TERMINAL_THREAD_TITLE,
+    THREAD_KIND_TERMINAL,
 };
 use crate::{
     ApplicationError, ApplicationService, ApplicationWorkspaceService, ChatError,
@@ -99,6 +103,12 @@ pub struct AppState {
     pub source_drop_deployer: Option<Arc<dyn temps_core::SourceDropDeployer>>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// State handed to the sandbox terminal bridge. Resolved when routes are
+    /// assembled, because it needs the instance's sensitive-action policy,
+    /// which is not registered yet during service registration. `None` in
+    /// minimal wirings without the standalone sandbox plugin: the workspace
+    /// terminal then answers 503 instead of disappearing.
+    pub application_terminal: Option<Arc<temps_sandbox::handlers::SandboxAppState>>,
 }
 
 impl AppState {
@@ -116,6 +126,9 @@ impl AppState {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ConversationResponse {
     pub public_id: String,
+    /// `ai` (a conversation with an AI harness) or `terminal` (an interactive
+    /// shell in the workspace sandbox). Fixed at creation.
+    pub kind: String,
     pub project_id: Option<i32>,
     pub context_type: String,
     pub context_id: String,
@@ -187,6 +200,7 @@ impl From<ai_conversations::Model> for ConversationResponse {
         let context_usage = conversation_context_usage(m.metadata.as_ref());
         Self {
             public_id: m.public_id,
+            kind: m.kind,
             project_id: m.project_id,
             context_type: m.context_type,
             context_id: m.context_id,
@@ -336,12 +350,20 @@ pub struct ApplicationProjectDeploymentResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApplicationConversationRequest {
     /// A registered development harness (for example `claude_cli`).
-    /// Application threads never inherit an API-gateway provider.
+    /// Application threads never inherit an API-gateway provider. Ignored for
+    /// terminal threads, which have no harness.
     pub ai_provider: Option<String>,
+    /// `ai` (default) or `terminal`.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateGlobalConversationRequest {
+    /// `ai` (default) or `terminal`. A terminal thread has no harness, model
+    /// or turns.
+    #[serde(default)]
+    pub kind: Option<String>,
     /// A registered development harness. Global operator chats run inside a
     /// persistent Temps-managed sandbox rather than on the host filesystem.
     pub ai_provider: Option<String>,
@@ -602,6 +624,8 @@ pub struct GlobalConversationResponse {
     pub context_id: String,
     pub title: Option<String>,
     pub status: String,
+    /// `"ai"` for an agent conversation, `"terminal"` for a shell thread.
+    pub kind: String,
     pub created_at: String,
     pub last_activity_at: String,
     pub ai_provider: String,
@@ -1241,6 +1265,16 @@ impl From<ChatError> for Problem {
                     .with_title(failure.title)
                     .with_detail(failure.detail)
             }
+            error @ ChatError::StreamInterrupted { .. } => {
+                let failure = error.public_failure();
+                error!(
+                    failure_code = failure.code,
+                    "AI provider stream ended before a terminal chunk: {error}"
+                );
+                problemdetails::new(axum::http::StatusCode::BAD_GATEWAY)
+                    .with_title(failure.title)
+                    .with_detail(failure.detail)
+            }
             ChatError::PermissionKindMismatch { .. } => {
                 problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
                     .with_title("Permission Decision Mismatch")
@@ -1308,6 +1342,11 @@ impl From<PendingActionError> for Problem {
             PendingActionError::InvalidState { .. } => {
                 problemdetails::new(axum::http::StatusCode::CONFLICT)
                     .with_title("Invalid Action State")
+                    .with_detail(e.to_string())
+            }
+            PendingActionError::InlineApprovalRequired { .. } => {
+                problemdetails::new(axum::http::StatusCode::CONFLICT)
+                    .with_title("Inline Approval Required")
                     .with_detail(e.to_string())
             }
             PendingActionError::StepBlocked { .. } => {
@@ -2197,6 +2236,7 @@ async fn create_starter_project(
             memory_limit: None,
             source_type: SourceType::UploadedSource,
             template_slug: None,
+            hosting: Default::default(),
         })
         .await
 }
@@ -3428,6 +3468,36 @@ pub async fn create_application_conversation(
         application_public_id,
         uuid::Uuid::new_v4().simple()
     );
+    if requested_thread_kind(request.kind.as_deref())? == ThreadKind::Terminal {
+        // A terminal thread is a shell in the workspace sandbox: it needs what
+        // opening one needs, so a role that could never attach is refused here
+        // instead of being handed a thread that cannot connect.
+        permission_guard!(auth, SandboxesExec);
+        ensure_workspace_terminal_permissions(&auth, &state.project_access_checker, &project_ids)
+            .await?;
+        let conversation = state
+            .service
+            .create_terminal_conversation(
+                Some(application.application.id),
+                "application",
+                &context_id,
+                auth.user_id(),
+                DEFAULT_TERMINAL_THREAD_TITLE,
+            )
+            .await?;
+        state
+            .audit(&ConversationCreatedAudit {
+                context: audit_context(&auth, &metadata),
+                project_id: conversation_project_id,
+                conversation_id: conversation.public_id.clone(),
+                context_type: "application".to_string(),
+            })
+            .await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(ConversationResponse::from(conversation)),
+        ));
+    }
     let harness = require_application_harness(request.ai_provider.as_deref())?;
     let runtime = state
         .service
@@ -4403,8 +4473,14 @@ fn application_workspace_failure_detail(
                 "Temps could not start workspace compute. Try again; if it continues, contact your Temps administrator."
             }
         }
+        SandboxError::NetworkCapacityExhausted { .. } => {
+            "This Temps host has no private sandbox network capacity available. Contact your Temps administrator, then try again."
+        }
         SandboxError::Unavailable { .. } => {
             "The sandbox runtime is unavailable on this Temps host. Contact your Temps administrator, then try again."
+        }
+        SandboxError::ImageUnavailable { .. } => {
+            "The workspace image could not be pulled on this Temps host. Contact your Temps administrator to check registry access and that the image tag is published, then try again."
         }
         SandboxError::Timeout { .. } => {
             "The workspace did not become ready before the startup timeout. Try again; if it continues, contact your Temps administrator."
@@ -4431,7 +4507,9 @@ fn application_workspace_failure_problem(error: &temps_sandbox::error::SandboxEr
     use temps_sandbox::error::SandboxError;
 
     let status = match error {
-        SandboxError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        SandboxError::Unavailable { .. }
+        | SandboxError::ImageUnavailable { .. }
+        | SandboxError::NetworkCapacityExhausted { .. } => StatusCode::SERVICE_UNAVAILABLE,
         SandboxError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         SandboxError::InvalidState { .. } | SandboxError::RuntimeVariableConflict { .. } => {
             StatusCode::CONFLICT
@@ -4657,11 +4735,306 @@ async fn global_workspace_sandbox(
                 workspace_id,
                 "failed to prepare global AI workspace sandbox"
             );
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Global Workspace Failed")
-                .with_detail("Temps could not prepare the persistent global workspace.")
+            global_workspace_failure_problem(&error)
         })?;
     Ok((workspace_id, sandbox.public_id))
+}
+
+/// Problem returned when the persistent global workspace cannot be prepared.
+/// A sandbox image that cannot be pulled is reported as such (503, naming the
+/// image) instead of the generic 500, so the operator learns what to fix.
+fn global_workspace_failure_problem(error: &temps_sandbox::error::SandboxError) -> Problem {
+    use temps_sandbox::error::SandboxError;
+
+    // Only the image-pull failure gets its own response here. `SandboxError`
+    // is `#[non_exhaustive]` and owned by `temps-sandbox`, which maps every
+    // variant explicitly in its own `From<SandboxError> for Problem`; this
+    // workspace-preparation path deliberately returns one generic 500 for the
+    // rest so no sandbox internals reach the response.
+    if let SandboxError::ImageUnavailable { image, .. } = error {
+        return problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_type("https://temps.sh/probs/sandbox-image-unavailable")
+            .with_title("Global Workspace Image Unavailable")
+            .with_detail(format!(
+                "Temps could not pull the sandbox image '{image}' needed for the persistent \
+                 global workspace. Check that this host can reach the image registry and \
+                 that the image tag is published, then try again."
+            ));
+    }
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title("Global Workspace Failed")
+        .with_detail("Temps could not prepare the persistent global workspace.")
+}
+
+/// Query parameters of the workspace terminal.
+///
+/// Deliberately narrower than the sandbox terminal's own: no `cmd`, and no
+/// `tab`. A terminal is a thread of kind `terminal`; the thread owns its PTY
+/// tab, derived from the thread id on the server, so reconnecting the same
+/// thread always lands in the same shell and a client cannot open arbitrary
+/// tabs. The terminal always opens the user's login shell; running a
+/// specific program is what the CLI's `sandbox exec` is for.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+pub struct WorkspaceTerminalQuery {
+    /// Public id of the terminal thread to attach to.
+    pub thread: String,
+    /// Initial terminal width in columns (default 80).
+    pub cols: Option<u16>,
+    /// Initial terminal height in rows (default 24).
+    pub rows: Option<u16>,
+}
+
+/// The sandbox terminal's parameters for a workspace terminal request.
+fn workspace_terminal_params(
+    query: &WorkspaceTerminalQuery,
+    tab: String,
+) -> temps_sandbox::handlers::terminal::TerminalParams {
+    temps_sandbox::handlers::terminal::TerminalParams {
+        tab: Some(tab),
+        cmd: None,
+        cols: query.cols,
+        rows: query.rows,
+    }
+}
+
+/// Check that `thread` is a live terminal thread of the workspace being
+/// opened and return the PTY tab it owns.
+///
+/// `application_id` is the application's internal id, or `None` for the
+/// user's global workspace. A thread of another workspace is reported as
+/// missing rather than as forbidden, so thread ids do not leak across them.
+fn terminal_thread_attach_tab(
+    thread: &ai_conversations::Model,
+    application_id: Option<i64>,
+) -> Result<String, Problem> {
+    let in_workspace = match application_id {
+        Some(id) => thread.application_id == Some(id),
+        None => thread.application_id.is_none() && thread.context_type == "global",
+    };
+    if !in_workspace {
+        return Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Terminal Thread Not Found")
+            .with_detail(format!(
+                "Thread {} does not exist in this workspace.",
+                thread.public_id
+            )));
+    }
+    if thread.kind != THREAD_KIND_TERMINAL {
+        return Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Not a Terminal Thread")
+            .with_detail(format!(
+                "Thread {} is an AI thread; only terminal threads can attach a terminal.",
+                thread.public_id
+            )));
+    }
+    if thread.status != "active" {
+        return Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Conversation Is Archived")
+            .with_detail("Restore this terminal thread before attaching to it."));
+    }
+    Ok(terminal_thread_tab(&thread.public_id))
+}
+
+/// What opening a global workspace terminal needs. Creating a terminal thread
+/// is held to the same bar, so no role is handed a thread it can never attach
+/// to (an attach needs `projects:write` as well as the sandbox permissions).
+fn require_global_terminal_permissions(auth: &AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    permission_guard!(auth, SandboxesExec);
+    Ok(())
+}
+
+/// Require the permissions a shell inside the workspace needs, at both the
+/// instance and the linked-project level.
+///
+/// A shell can read and rewrite every file of every linked project and run
+/// anything, so it needs everything a workspace mutation needs, plus
+/// `sandboxes:exec`. `application_workspace_sandbox` re-checks the first two
+/// at project scope; this adds the third.
+async fn ensure_workspace_terminal_permissions(
+    auth: &AuthContext,
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_ids: &[i32],
+) -> Result<(), Problem> {
+    for required in [
+        Permission::ProjectsWrite,
+        Permission::SandboxesWrite,
+        Permission::SandboxesExec,
+    ] {
+        ensure_application_project_permission(auth, checker, project_ids, &required).await?;
+    }
+    Ok(())
+}
+
+/// Where an authorized workspace terminal request attaches.
+struct WorkspaceTerminalTarget {
+    /// `application` or `global`, recorded in the audit event.
+    scope: &'static str,
+    workspace_id: String,
+    sandbox_public_id: String,
+    /// The PTY tab the terminal thread owns.
+    tab: String,
+}
+
+/// Hand an authorized workspace terminal request to the sandbox terminal.
+///
+/// The generic `/v1/sandboxes/{id}/terminal` route cannot be used directly:
+/// managed workspaces are hidden from it on purpose, so that every access to
+/// one re-checks the linked projects. By this point the caller has done that,
+/// so the sandbox's own bridge — the same PTY relay, session caps, heartbeat
+/// and `attach_pty` provider call the standalone terminal uses — can run.
+async fn attach_workspace_terminal(
+    state: &AppState,
+    auth: AuthContext,
+    metadata: RequestMetadata,
+    target: WorkspaceTerminalTarget,
+    query: WorkspaceTerminalQuery,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, Problem> {
+    let WorkspaceTerminalTarget {
+        scope,
+        workspace_id,
+        sandbox_public_id,
+        tab,
+    } = target;
+    let terminal_state = state.application_terminal.clone().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Workspace Terminal Unavailable")
+            .with_detail("The instance sandbox service is not configured.")
+    })?;
+    let thread_id = query.thread.clone();
+    let params = workspace_terminal_params(&query, tab.clone());
+    let user_id = auth.user_id();
+    let response = temps_sandbox::handlers::terminal::terminal(
+        RequireAuth(auth),
+        State(terminal_state),
+        Path(sandbox_public_id.clone()),
+        Query(params),
+        ws,
+    )
+    .await?;
+    state
+        .audit(&WorkspaceTerminalAttachedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            scope: scope.to_string(),
+            workspace_id,
+            sandbox_id: sandbox_public_id,
+            thread_id,
+            tab,
+        })
+        .await;
+    Ok(response)
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications",
+    path = "/ai/applications/{application_public_id}/workspace/terminal",
+    operation_id = "attach_application_workspace_terminal",
+    summary = "Attach an interactive terminal to an application workspace",
+    description = "Upgrades to a WebSocket carrying a PTY in the application's persistent workspace sandbox. Binary frames are raw terminal bytes in both directions; text frames are JSON control (`{\"type\":\"resize\",\"cols\":N,\"rows\":N}`) and events (`ready`, `exit`, `error`). The `thread` query parameter names a terminal thread, which owns its shell: attaching the same thread again resumes the running program. Requires `sandboxes:exec`.",
+    params(("application_public_id" = String, Path,), WorkspaceTerminalQuery),
+    responses(
+        (status = 101, description = "WebSocket established; PTY attached"),
+        (status = 401), (status = 403), (status = 404),
+        (status = 409, description = "The workspace sandbox cannot be attached to right now"),
+        (status = 429, description = "Too many concurrent terminals"),
+        (status = 503)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn attach_application_workspace_terminal(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+    Query(query): Query<WorkspaceTerminalQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    permission_guard!(auth, SandboxesExec);
+    deny_deployment_token!(auth);
+    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_workspace_terminal_permissions(&auth, &state.project_access_checker, &project_ids)
+        .await?;
+    let thread = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &query.thread)
+        .await?;
+    let tab = terminal_thread_attach_tab(&thread, Some(application.application.id))?;
+    let (_, sandbox_public_id) =
+        application_workspace_sandbox(&state, &auth, &application_public_id).await?;
+    attach_workspace_terminal(
+        &state,
+        auth,
+        metadata,
+        WorkspaceTerminalTarget {
+            scope: "application",
+            workspace_id: application_public_id,
+            sandbox_public_id,
+            tab,
+        },
+        query,
+        ws,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get, tag = "AI Chat",
+    path = "/ai/workspace/terminal",
+    operation_id = "attach_global_workspace_terminal",
+    summary = "Attach an interactive terminal to the user's global workspace",
+    description = "Same protocol as the application workspace terminal, for a terminal thread of the signed-in user's private default workspace. Requires `sandboxes:exec`.",
+    params(WorkspaceTerminalQuery),
+    responses(
+        (status = 101, description = "WebSocket established; PTY attached"),
+        (status = 401), (status = 403),
+        (status = 409, description = "The workspace sandbox cannot be attached to right now"),
+        (status = 429, description = "Too many concurrent terminals"),
+        (status = 503)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn attach_global_workspace_terminal(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<WorkspaceTerminalQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, Problem> {
+    require_global_terminal_permissions(&auth)?;
+    deny_deployment_token!(auth);
+    let thread = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &query.thread)
+        .await?;
+    let tab = terminal_thread_attach_tab(&thread, None)?;
+    let (workspace_id, sandbox_public_id) = global_workspace_sandbox(&state, &auth).await?;
+    attach_workspace_terminal(
+        &state,
+        auth,
+        metadata,
+        WorkspaceTerminalTarget {
+            scope: "global",
+            workspace_id,
+            sandbox_public_id,
+            tab,
+        },
+        query,
+        ws,
+    )
+    .await
 }
 
 async fn run_workspace_command(
@@ -5623,6 +5996,7 @@ pub async fn list_all_conversations(
             context_id: item.conversation.context_id,
             title: item.conversation.title,
             status: item.conversation.status,
+            kind: item.conversation.kind,
             created_at: item.conversation.created_at.to_rfc3339(),
             last_activity_at: item.conversation.last_activity_at.to_rfc3339(),
             ai_provider: item.conversation.ai_provider,
@@ -5788,8 +6162,33 @@ pub async fn create_global_conversation(
     permission_guard!(auth, ProjectsRead);
     permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
-    let harness = require_application_harness(request.ai_provider.as_deref())?;
     let context_id = format!("global_{}", uuid::Uuid::new_v4().simple());
+    if requested_thread_kind(request.kind.as_deref())? == ThreadKind::Terminal {
+        require_global_terminal_permissions(&auth)?;
+        let conversation = state
+            .service
+            .create_terminal_conversation(
+                None,
+                "global",
+                &context_id,
+                auth.user_id(),
+                DEFAULT_TERMINAL_THREAD_TITLE,
+            )
+            .await?;
+        state
+            .audit(&ConversationCreatedAudit {
+                context: audit_context(&auth, &metadata),
+                project_id: None,
+                conversation_id: conversation.public_id.clone(),
+                context_type: "global".to_string(),
+            })
+            .await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(ConversationResponse::from(conversation)),
+        ));
+    }
+    let harness = require_application_harness(request.ai_provider.as_deref())?;
     // Global conversations are distinct, but their durable execution boundary
     // is user-scoped. Reusing one bounded workspace prevents a user from
     // allocating a new persistent container and volume for every thread.
@@ -6158,6 +6557,30 @@ fn application_workspace_state<'a>(
 
 fn workspace_may_retain_data_plane(status: &str) -> bool {
     matches!(status, "running" | "recovering")
+}
+
+/// Parse the `kind` of a thread-creation request.
+fn requested_thread_kind(kind: Option<&str>) -> Result<ThreadKind, Problem> {
+    ThreadKind::parse(kind).map_err(|error| match error {
+        ThreadKindError::Unknown { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Unknown Thread Kind")
+            .with_detail(error.to_string()),
+    })
+}
+
+/// A terminal thread runs a shell, not an AI turn: it never accepts messages.
+fn ensure_conversation_takes_messages(
+    conversation: &ai_conversations::Model,
+) -> Result<(), Problem> {
+    if conversation.kind == THREAD_KIND_TERMINAL {
+        return Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Terminal Threads Take No Messages")
+            .with_detail(format!(
+                "Thread {} is a terminal. Type into the terminal instead of sending a message.",
+                conversation.public_id
+            )));
+    }
+    ensure_conversation_is_active(conversation)
 }
 
 fn ensure_conversation_is_active(conversation: &ai_conversations::Model) -> Result<(), Problem> {
@@ -7571,7 +7994,7 @@ pub async fn send_message(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
-    ensure_conversation_is_active(&conv)?;
+    ensure_conversation_takes_messages(&conv)?;
     ensure_application_conversation_access(&state, &auth, &conv).await?;
     let effective_permission = req
         .ai_permission_mode
@@ -7705,7 +8128,7 @@ pub async fn send_user_message(
         .service
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
-    ensure_conversation_is_active(&conversation)?;
+    ensure_conversation_takes_messages(&conversation)?;
     ensure_user_conversation_mutation_access(&state, &auth, &conversation).await?;
     if conversation_context_requires_sandbox_write(&conversation.context_type) {
         // Starting an application/global turn grants the provider access to a
@@ -9551,6 +9974,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route("/ai/workspace/diff", get(get_global_workspace_diff))
         .route(
+            "/ai/workspace/terminal",
+            get(attach_global_workspace_terminal),
+        )
+        .route(
             "/ai/applications",
             get(list_applications).post(create_application),
         )
@@ -9589,6 +10016,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/ai/applications/{application_public_id}/workspace/actions",
             post(control_application_workspace),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/workspace/terminal",
+            get(attach_application_workspace_terminal),
         )
         .route(
             "/ai/applications/{application_public_id}/projects/{project_id}/workspace/source",
@@ -9801,6 +10232,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_global_workspace_directory,
         get_application_workspace_file,
         get_global_workspace_file,
+        attach_application_workspace_terminal,
+        attach_global_workspace_terminal,
         download_application_workspace_file,
         download_global_workspace_file,
         get_application_workspace_diff,
@@ -10372,7 +10805,13 @@ mod tests {
         let mut zip =
             zip::ZipArchive::new(archive.reopen().expect("open archive")).expect("valid zip");
         let names = (0..zip.len())
-            .map(|index| zip.by_index(index).expect("zip entry").name().to_string())
+            .map(|index| {
+                zip.by_index(index)
+                    .expect("zip entry")
+                    .name()
+                    .expect("zip entry name")
+                    .to_string()
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["package.json"]);
@@ -10583,6 +11022,50 @@ mod tests {
             "Temps could not start workspace compute. Try again; if it continues, contact your Temps administrator."
         );
         assert!(!detail.contains("temps-sandbox-secret-id"));
+    }
+
+    #[test]
+    fn global_workspace_image_pull_failure_is_a_503_naming_the_image() {
+        let error = temps_sandbox::error::SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_test".to_string(),
+            image: "registry.example.test/team/sandbox:1.2.3".to_string(),
+            reason: "manifest unknown".to_string(),
+        };
+
+        let problem = global_workspace_failure_problem(&error);
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(body.contains("Global Workspace Image Unavailable"));
+        assert!(body.contains("registry.example.test/team/sandbox:1.2.3"));
+    }
+
+    #[test]
+    fn global_workspace_other_failures_stay_generic_500s() {
+        let error = temps_sandbox::error::SandboxError::CreateFailed {
+            user_id: 7,
+            reason: "provider detail with container temps-sandbox-secret-id".to_string(),
+        };
+
+        let problem = global_workspace_failure_problem(&error);
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(!body.contains("temps-sandbox-secret-id"));
+    }
+
+    #[test]
+    fn application_workspace_image_pull_failure_is_a_503() {
+        let error = temps_sandbox::error::SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_test".to_string(),
+            image: "registry.example.test/team/sandbox:1.2.3".to_string(),
+            reason: "manifest unknown".to_string(),
+        };
+
+        let problem = application_workspace_failure_problem(&error);
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(application_workspace_failure_detail(&error).contains("image tag is published"));
     }
 
     #[test]
@@ -10889,6 +11372,7 @@ mod tests {
             context_id: "1".to_string(),
             title: None,
             status: "active".to_string(),
+            kind: "ai".to_string(),
             created_by: 1,
             metadata: None,
             created_at: now,
@@ -10922,6 +11406,7 @@ mod tests {
     fn global_conversation_response_exposes_durable_turn_status() {
         let mut conversation = conversation_with_runtime("codex_cli", "auto");
         conversation.turn_status = "failed".to_string();
+        conversation.kind = THREAD_KIND_TERMINAL.to_string();
         let response = GlobalConversationResponse {
             public_id: conversation.public_id,
             project_id: conversation.project_id,
@@ -10931,6 +11416,7 @@ mod tests {
             context_id: conversation.context_id,
             title: conversation.title,
             status: conversation.status,
+            kind: conversation.kind,
             created_at: conversation.created_at.to_rfc3339(),
             last_activity_at: conversation.last_activity_at.to_rfc3339(),
             ai_provider: conversation.ai_provider,
@@ -10944,6 +11430,9 @@ mod tests {
 
         let value = serde_json::to_value(response).expect("response serializes");
         assert_eq!(value["turn_status"], "failed");
+        // The cross-project switcher must know which threads are shells, or a
+        // terminal thread would open as an empty agent conversation.
+        assert_eq!(value["kind"], "terminal");
     }
 
     #[test]
@@ -11167,6 +11656,263 @@ mod tests {
         ensure_application_project_permission(&auth, &allowed, &[7], &Permission::SandboxesRead)
             .await
             .expect("scoped sandbox read allows workspace content access");
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_requires_scoped_sandbox_exec() {
+        let auth = custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]);
+        let without_exec: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsWrite.to_string(),
+                    Permission::SandboxesWrite.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+        let error = ensure_workspace_terminal_permissions(&auth, &without_exec, &[7])
+            .await
+            .expect_err("a project role without sandbox exec must not get a shell");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+
+        let allowed: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsWrite.to_string(),
+                    Permission::SandboxesWrite.to_string(),
+                    Permission::SandboxesExec.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+        ensure_workspace_terminal_permissions(&auth, &allowed, &[7])
+            .await
+            .expect("project write, sandbox write and sandbox exec allow a shell");
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_requires_project_sandbox_write_like_attach_does() {
+        // Create and attach share this check, so a project role that holds
+        // exec but not sandbox write cannot be handed a thread it can never
+        // open.
+        let auth = custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]);
+        let without_sandbox_write: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsWrite.to_string(),
+                    Permission::SandboxesExec.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+
+        let error = ensure_workspace_terminal_permissions(&auth, &without_sandbox_write, &[7])
+            .await
+            .expect_err("a project role without sandbox write must not get a terminal");
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_is_denied_when_one_linked_project_is_not_allowed() {
+        let auth = custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsWrite.to_string(),
+                    Permission::SandboxesWrite.to_string(),
+                    Permission::SandboxesExec.to_string(),
+                ]),
+                member: true,
+                denied_project_id: Some(9),
+            }));
+        let error = ensure_workspace_terminal_permissions(&auth, &checker, &[7, 9])
+            .await
+            .expect_err("access to one project must not authorize a shell over both");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_is_denied_without_instance_sandbox_exec() {
+        // Instance permissions are the ceiling, whatever a project role says.
+        let auth = custom_auth(vec![Permission::ProjectsWrite, Permission::SandboxesWrite]);
+        let error = ensure_workspace_terminal_permissions(&auth, &None, &[7])
+            .await
+            .expect_err("the instance permission is required first");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        let detail = error
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("sandboxes:exec"),
+            "the problem must name the missing permission: {detail}"
+        );
+    }
+
+    #[test]
+    fn global_terminal_needs_everything_an_attach_needs() {
+        // Creating a thread must not succeed for a role whose attach would be
+        // refused, so create and attach share one permission check.
+        for missing in [
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ] {
+            let held = [
+                Permission::ProjectsRead,
+                Permission::ProjectsWrite,
+                Permission::SandboxesWrite,
+                Permission::SandboxesExec,
+            ]
+            .into_iter()
+            .filter(|permission| *permission != missing)
+            .collect::<Vec<_>>();
+            let error = require_global_terminal_permissions(&custom_auth(held))
+                .expect_err("a role missing one terminal permission must be refused");
+            assert_eq!(error.status_code, StatusCode::FORBIDDEN, "{missing}");
+        }
+
+        require_global_terminal_permissions(&custom_auth(vec![
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]))
+        .expect("project write, sandbox write and sandbox exec open a global terminal");
+    }
+
+    fn terminal_thread(application_id: Option<i64>, context_type: &str) -> ai_conversations::Model {
+        let mut thread = conversation_with_runtime("terminal", "default");
+        thread.public_id = "0123456789abcdef0123456789abcdef".to_string();
+        thread.kind = "terminal".to_string();
+        thread.application_id = application_id;
+        thread.context_type = context_type.to_string();
+        thread
+    }
+
+    #[test]
+    fn workspace_terminal_never_forwards_a_command() {
+        let query = WorkspaceTerminalQuery {
+            thread: "0123456789abcdef0123456789abcdef".to_string(),
+            cols: Some(120),
+            rows: Some(40),
+        };
+        let params = workspace_terminal_params(&query, "t-abc".to_string());
+        assert_eq!(params.tab.as_deref(), Some("t-abc"));
+        assert_eq!(params.cols, Some(120));
+        assert_eq!(params.rows, Some(40));
+        assert!(
+            params.cmd.is_none(),
+            "the workspace terminal always opens the login shell"
+        );
+    }
+
+    #[test]
+    fn workspace_terminal_query_ignores_a_smuggled_command_and_tab() {
+        // Neither `cmd` nor `tab` is a field, so a client that sends them
+        // gets the thread's own shell, not an arbitrary program or tab.
+        let uri: Uri = "/ai/workspace/terminal?thread=abc&tab=main&cmd=rm%20-rf%20%2F&cols=80"
+            .parse()
+            .expect("uri");
+        let Query(query) =
+            Query::<WorkspaceTerminalQuery>::try_from_uri(&uri).expect("query should parse");
+        assert_eq!(query.thread, "abc");
+        let params = workspace_terminal_params(&query, "t-abc".to_string());
+        assert!(params.cmd.is_none());
+        assert_eq!(params.tab.as_deref(), Some("t-abc"));
+    }
+
+    #[test]
+    fn workspace_terminal_requires_a_thread() {
+        let uri: Uri = "/ai/workspace/terminal?cols=80".parse().expect("uri");
+        assert!(
+            Query::<WorkspaceTerminalQuery>::try_from_uri(&uri).is_err(),
+            "a terminal without a thread has no shell to attach to"
+        );
+    }
+
+    #[test]
+    fn a_terminal_thread_attaches_to_its_own_tab() {
+        let thread = terminal_thread(Some(7), "application");
+        let tab = terminal_thread_attach_tab(&thread, Some(7)).expect("attachable");
+        assert_eq!(tab, "t-0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn a_thread_of_another_workspace_is_not_found() {
+        let thread = terminal_thread(Some(7), "application");
+        let error = terminal_thread_attach_tab(&thread, Some(8))
+            .expect_err("a thread of another application must not attach");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+        // The global workspace cannot attach an application thread either.
+        let error = terminal_thread_attach_tab(&thread, None)
+            .expect_err("an application thread is not a global thread");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_global_terminal_thread_attaches_only_to_the_global_workspace() {
+        let thread = terminal_thread(None, "global");
+        assert!(terminal_thread_attach_tab(&thread, None).is_ok());
+        let error = terminal_thread_attach_tab(&thread, Some(7))
+            .expect_err("a global thread must not attach through an application");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn an_ai_thread_cannot_attach_a_terminal() {
+        let mut thread = terminal_thread(Some(7), "application");
+        thread.kind = "ai".to_string();
+        let error =
+            terminal_thread_attach_tab(&thread, Some(7)).expect_err("an AI thread has no shell");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn an_archived_terminal_thread_must_be_restored_first() {
+        let mut thread = terminal_thread(Some(7), "application");
+        thread.status = "archived".to_string();
+        let error = terminal_thread_attach_tab(&thread, Some(7))
+            .expect_err("archived threads are read-only");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn a_terminal_thread_takes_no_messages() {
+        let thread = terminal_thread(Some(7), "application");
+        let error =
+            ensure_conversation_takes_messages(&thread).expect_err("a terminal is not an AI turn");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+        let mut ai = thread;
+        ai.kind = "ai".to_string();
+        assert!(ensure_conversation_takes_messages(&ai).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_thread_kind_is_a_bad_request() {
+        let error = requested_thread_kind(Some("notebook")).expect_err("unknown kind");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            requested_thread_kind(None).expect("default"),
+            ThreadKind::Ai
+        );
+        assert_eq!(
+            requested_thread_kind(Some("terminal")).expect("terminal"),
+            ThreadKind::Terminal
+        );
     }
 
     #[tokio::test]
@@ -11444,6 +12190,22 @@ mod tests {
         .into();
         assert_eq!(p.status_code, StatusCode::CONFLICT);
         assert_eq!(title_of(&p).as_deref(), Some("Invalid Action State"));
+    }
+
+    #[test]
+    fn test_pending_action_inline_approval_required_maps_to_409_with_guidance() {
+        let p: Problem = PendingActionError::InlineApprovalRequired {
+            public_id: "abc".to_string(),
+        }
+        .into();
+        assert_eq!(p.status_code, StatusCode::CONFLICT);
+        assert_eq!(title_of(&p).as_deref(), Some("Inline Approval Required"));
+        let body = serde_json::to_string(&p.body).expect("problem body serializes");
+        assert!(
+            body.contains("inline approval in the chat conversation"),
+            "{body}"
+        );
+        assert!(!body.contains("concurrent"), "{body}");
     }
 
     #[test]
