@@ -501,9 +501,11 @@ library with a bounded node-local scheduler and a read-only runtime inspector
 interface. It supports process stability, HTTP and TCP checks, owner/container
 identity validation, explicit in-process lease renewal, project round-robin,
 four concurrent attempts, a 1,000-assignment bound, cancellation guards and
-sanitized observations. HTTP follows no redirects, reads at most a 128-byte
-status line and discards bodies. Exec is not representable in the probe
-contract; unknown kinds and address-bearing payloads are rejected.
+sanitized observations. HTTP follows no redirects and reads status lines of
+at most 128 bytes. It skips up to eight informational responses with a shared
+16 KiB status/header budget and the original attempt deadline; protocol
+upgrades fail closed. Response bodies are discarded. Exec is not representable
+in the probe contract; unknown kinds and address-bearing payloads are rejected.
 
 The existing lifecycle/resource monitor now requires a placement-aware
 resolver instead of a local deployer. It can process an initially empty

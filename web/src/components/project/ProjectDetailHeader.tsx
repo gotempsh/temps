@@ -7,6 +7,8 @@ import {
 } from '@/components/project-groups/ServiceGroupControl'
 import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import { listContainersOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useQuery } from '@tanstack/react-query'
 import { portlessWorkerHealth } from '@/components/containers/container-workload'
 import { Status } from '@temps-sdk/ds'
 import { useEffect, useRef } from 'react'
@@ -83,6 +85,8 @@ interface ProjectDetailHeaderProps {
   repositoryProviderType?: string | null
   lastDeployment?: DeploymentResponse
   lastDeploymentUrl?: string | null
+  /** Environment served by lastDeploymentUrl, independently of healthEnvironment. */
+  lastDeploymentEnvironmentId?: number
   isLoadingLastDeployment?: boolean
   onDeploy: () => void
 }
@@ -108,6 +112,7 @@ export function ProjectDetailHeader({
   repositoryProviderType,
   lastDeployment,
   lastDeploymentUrl,
+  lastDeploymentEnvironmentId,
   isLoadingLastDeployment = false,
   onDeploy,
 }: ProjectDetailHeaderProps) {
@@ -169,6 +174,53 @@ export function ProjectDetailHeader({
     ? portlessWorkerHealth(containersQuery.data?.containers)
     : null
   const isWorker = workerHealth !== null
+  // The site URL may belong to staging while project health follows production.
+  // Reuse the health query only when both surfaces refer to the same environment.
+  const siteEnvironmentId =
+    lastDeploymentEnvironmentId ?? lastDeployment?.environment_id
+  const siteEnvironment = environmentsQuery.data?.find(
+    (environment) => environment.id === siteEnvironmentId
+  )
+  const siteUsesHealthEnvironment =
+    siteEnvironmentId != null && siteEnvironmentId === healthEnvironment?.id
+  const siteContainersQuery = useQuery({
+    ...listContainersOptions({
+      path: { project_id: project.id, environment_id: siteEnvironmentId ?? 0 },
+    }),
+    enabled:
+      supportsWorker &&
+      !!lastDeploymentUrl &&
+      !siteUsesHealthEnvironment &&
+      siteEnvironment?.current_deployment_id != null &&
+      !siteEnvironment.sleeping,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    retry: false,
+  })
+  const siteCurrentDeploymentId = siteEnvironment?.current_deployment_id
+  const refetchSiteContainers = siteContainersQuery.refetch
+  useEffect(() => {
+    if (
+      supportsWorker &&
+      lastDeploymentUrl &&
+      !siteUsesHealthEnvironment &&
+      siteCurrentDeploymentId != null &&
+      !siteEnvironment?.sleeping
+    )
+      void refetchSiteContainers()
+  }, [
+    supportsWorker,
+    lastDeploymentUrl,
+    siteUsesHealthEnvironment,
+    siteCurrentDeploymentId,
+    siteEnvironment?.sleeping,
+    refetchSiteContainers,
+  ])
+  const siteIsWorker =
+    supportsWorker &&
+    (siteUsesHealthEnvironment
+      ? isWorker
+      : portlessWorkerHealth(siteContainersQuery.data?.containers) !== null)
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.
@@ -344,7 +396,7 @@ export function ProjectDetailHeader({
               </a>
             </Button>
           )}
-          {lastDeploymentUrl && !isLoadingLastDeployment && !isWorker && (
+          {lastDeploymentUrl && !isLoadingLastDeployment && !siteIsWorker && (
             <Button variant="outline" size="icon" className="size-9" asChild>
               <a
                 href={lastDeploymentUrl}

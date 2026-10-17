@@ -20,6 +20,8 @@ function renderHeader(
     containers,
     hosting = 'hosted',
     preset = 'dockerfile',
+    linkEnvironmentId = 1,
+    linkContainers,
   }: {
     activeVisitors?: number
     containers?: {
@@ -29,6 +31,12 @@ function renderHeader(
     }[]
     hosting?: ProjectResponse['hosting']
     preset?: string
+    linkEnvironmentId?: number | null
+    linkContainers?: {
+      status: string
+      container_port?: number | null
+      health_state?: string
+    }[]
   } = {}
 ) {
   const client = new QueryClient({
@@ -37,7 +45,24 @@ function renderHeader(
   if (currentId !== undefined) {
     client.setQueryData(getEnvironmentsQueryKey({ path: { project_id: 1 } }), [
       { id: 1, current_deployment_id: currentId, is_preview: false },
+      ...(linkEnvironmentId && linkEnvironmentId !== 1
+        ? [
+            {
+              id: linkEnvironmentId,
+              current_deployment_id: 3600,
+              is_preview: false,
+            },
+          ]
+        : []),
     ])
+  }
+  if (linkContainers && linkEnvironmentId) {
+    client.setQueryData(
+      listContainersQueryKey({
+        path: { project_id: 1, environment_id: linkEnvironmentId },
+      }),
+      { containers: linkContainers, total: linkContainers.length }
+    )
   }
   if (containers) {
     client.setQueryData(
@@ -69,7 +94,12 @@ function renderHeader(
             } as ProjectResponse
           }
           lastDeployment={
-            { id: 3513, status, is_current: false } as DeploymentResponse
+            {
+              id: 3513,
+              status,
+              is_current: false,
+              environment_id: linkEnvironmentId,
+            } as DeploymentResponse
           }
           onDeploy={() => {}}
           lastDeploymentUrl="https://app.example.com"
@@ -193,5 +223,54 @@ test('Compose header presentation is unchanged for an internal service without a
     ],
   })
   expect(html).not.toContain('Background worker')
+  expect(html).toContain('Visit deployed site')
+})
+
+test('a production worker does not hide a staging web site link', () => {
+  const html = renderHeader('completed', 3500, {
+    containers: [
+      { status: 'running', container_port: null, health_state: 'healthy' },
+    ],
+    linkEnvironmentId: 2,
+    linkContainers: [
+      { status: 'running', container_port: 8080, health_state: 'healthy' },
+    ],
+  })
+  expect(html).toContain('Background worker')
+  expect(html).toContain('Visit deployed site')
+  expect(html).toContain('href="https://app.example.com"')
+})
+
+test('a staging worker link is hidden even when production is a web service', () => {
+  const html = renderHeader('completed', 3500, {
+    containers: [
+      { status: 'running', container_port: 8080, health_state: 'healthy' },
+    ],
+    linkEnvironmentId: 2,
+    linkContainers: [
+      { status: 'running', container_port: null, health_state: 'healthy' },
+    ],
+  })
+  expect(html).not.toContain('Visit deployed site')
+})
+
+test('unknown staging workload metadata does not suppress its site link', () => {
+  const html = renderHeader('completed', 3500, {
+    containers: [
+      { status: 'running', container_port: null, health_state: 'healthy' },
+    ],
+    linkEnvironmentId: 2,
+    linkContainers: [{ status: 'running' }],
+  })
+  expect(html).toContain('Visit deployed site')
+})
+
+test('a missing link environment does not borrow production worker classification', () => {
+  const html = renderHeader('completed', 3500, {
+    containers: [
+      { status: 'running', container_port: null, health_state: 'healthy' },
+    ],
+    linkEnvironmentId: null,
+  })
   expect(html).toContain('Visit deployed site')
 })
