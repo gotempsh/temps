@@ -14,7 +14,6 @@ import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
-import { useIsMobile } from '@/components/hooks/use-mobile'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { ListToolbar } from '@/components/layout/ListToolbar'
@@ -73,7 +72,6 @@ function groupMatches(group: ProjectGroupResponse, needle: string): boolean {
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const isMobile = useIsMobile()
   const [searchParams, updateSearchParams] = useComposedSearchParams()
   const { page, pageSize } = readProjectPagination(searchParams)
   const projectSearch = searchParams.get('q') ?? ''
@@ -300,9 +298,10 @@ export function Projects() {
 
   // Announcements and the onboarding checklist are secondary to the list.
   // On a phone each one is a full card of its own, so stacked above the list
-  // they push every project off the first screen: there they follow the list
-  // (and its pagination) instead. Rendered once, in DOM order, so keyboard
-  // and screen-reader order matches what is on screen.
+  // they push every project off the first screen: below `md` they follow the
+  // list (and its pagination) instead. That reorder is CSS-only (`order` in
+  // the flex column below), so each card mounts exactly once and keeps its
+  // state (e.g. the selected onboarding step) across a rotate or resize.
   const groupingHint = !grouped &&
     groupsLoaded &&
     renameNoticeDismissed &&
@@ -310,23 +309,23 @@ export function Projects() {
     standaloneTotal >= 2 && (
       <GroupingHint onCreate={() => setCreatingGroup(true)} />
     )
-  const notices = (
-    <>
-      {serviceTotal > 0 && !renameNoticeDismissed && (
+  const notices = serviceTotal > 0 && (
+    <div className="flex flex-col gap-4 sm:gap-6 max-md:order-last">
+      {!renameNoticeDismissed && (
         <ServicesRenameNotice
           onCreateProject={() => setCreatingGroup(true)}
           onDismiss={dismissRenameNotice}
         />
       )}
 
-      {serviceTotal > 0 && <OnboardingNextStepCard />}
-    </>
+      <OnboardingNextStepCard />
+    </div>
   )
 
   return (
     <PageContainer
       className="max-sm:py-4"
-      innerClassName="space-y-4 sm:space-y-6"
+      innerClassName="flex flex-col gap-4 space-y-0 sm:gap-6"
     >
       {/* Header */}
       <ProjectsHeader
@@ -359,7 +358,7 @@ export function Projects() {
       {/* Nothing here can be built or deployed until something can run it. */}
       <WorkerNodeRequiredBanner />
 
-      {!isMobile && notices}
+      {notices}
 
       {groupsQuery.isError && (
         <div
@@ -464,7 +463,9 @@ export function Projects() {
         ) : null
       ) : (
         <>
-          {!isMobile && groupingHint}
+          {groupingHint && (
+            <div className="max-md:order-[9998]">{groupingHint}</div>
+          )}
           <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3">
             {listItems.map((item) =>
               item.kind === 'group' ? (
@@ -492,9 +493,6 @@ export function Projects() {
           onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
         />
       )}
-
-      {isMobile && !isLoading && listItems.length > 0 && groupingHint}
-      {isMobile && notices}
     </PageContainer>
   )
 }

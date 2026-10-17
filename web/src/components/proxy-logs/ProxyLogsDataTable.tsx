@@ -12,6 +12,7 @@ import { httpStatusClass } from '@/lib/http-status-class'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -46,11 +47,7 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronRight as ChevronExpand,
-  ChevronsLeft,
-  ChevronsRight,
   Columns,
   ExternalLink,
   Filter,
@@ -1478,56 +1475,15 @@ export function ProxyLogsDataTable({
               </div>
 
               {/* Pagination */}
-              <div className="flex flex-col items-center gap-3 px-4 py-4 border-t sm:flex-row sm:justify-between">
-                <div className="text-sm text-muted-foreground">
-                  Showing {(page - 1) * pageSize + 1} to{' '}
-                  {Math.min(page * pageSize, data.total)} of {data.total}{' '}
-                  results
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    aria-label="First page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(1)}
-                    disabled={page === 1}
-                  >
-                    <ChevronsLeft className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    aria-label="Previous page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(page - 1)}
-                    disabled={page === 1}
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                  </Button>
-                  <div className="flex items-center gap-2 px-2">
-                    <span className="text-sm">
-                      Page {page} of {data.total_pages}
-                    </span>
-                  </div>
-                  <Button
-                    aria-label="Next page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(page + 1)}
-                    disabled={page === data.total_pages}
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    aria-label="Last page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(data.total_pages)}
-                    disabled={page === data.total_pages}
-                  >
-                    <ChevronsRight className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
+              <ResponsivePagination
+                className="border-t px-4 py-4"
+                page={page}
+                pageSize={pageSize}
+                total={data.total}
+                totalPages={data.total_pages}
+                onPageChange={setPage}
+                ariaLabel="Proxy logs pagination"
+              />
             </>
           )}
         </CardContent>
