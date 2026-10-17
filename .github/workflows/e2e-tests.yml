@@ -384,6 +384,7 @@ jobs:
           echo "container-id=$CONTAINER_ID" >> "$GITHUB_OUTPUT"
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:5113/v2/; then exit 0; fi
+            printf 'Waiting for fixture registry (%s/30)\n' "$attempt"
             sleep 1
           done
           exit 1

@@ -382,7 +382,9 @@ The upgrade preserves the implicit port of existing web applications, including 
 }
 ```
 
-Environment overrides use `PUT /api/projects/{project_id}/environments/{id_or_slug}/settings`, with `health`, `exposed_port` and `health_check_timeout_seconds`. Omitted fields keep their current values; `health: null` clears that scope's health override. Clearing an environment override inherits the project setting. Both scopes' port overrides must be empty for an image without `EXPOSE` to become portless. On projects granted the host Docker socket, health changes require the existing instance-administrator authority and applicable step-up authentication.
+For project updates, send `"health": {}` to restore automatic probe selection and reset probe-specific fields. Omitting `health` or sending `"health": null` leaves the saved project probe unchanged.
+
+Environment overrides use `PUT /api/projects/{project_id}/environments/{id_or_slug}/settings`, with `health`, `exposed_port` and `health_check_timeout_seconds`. Omitted fields keep their current values; `"health": null` clears the environment's health override and inherits the project setting. An empty health object explicitly selects automatic probing at that scope. Both scopes' port overrides must be empty for an image without `EXPOSE` to become portless. On projects granted the host Docker socket, health changes require the existing instance-administrator authority and applicable step-up authentication.
 
 ---
 

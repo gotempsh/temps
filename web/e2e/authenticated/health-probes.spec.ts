@@ -15,6 +15,7 @@ import {
   getDeployment,
   getEnvironment,
   getEnvironments,
+  getProject,
   listContainerHistory,
   listContainers,
   promoteDeployment,
@@ -131,7 +132,7 @@ test.describe('live deployment health probes', () => {
       const envPath = { ...path, environment_id: env.id }
 
       const configure = async (
-        health: HealthCheckConfig | null,
+        health: HealthCheckConfig,
         port: number | null
       ) => {
         await updateProjectDeploymentConfig({
@@ -139,6 +140,19 @@ test.describe('live deployment health probes', () => {
           path,
           body: { health, exposedPort: port, healthCheckTimeoutSeconds: 30 },
         })
+        // The project PATCH leaves health unchanged for null. An empty
+        // object replaces a saved probe with automatic selection/defaults.
+        const { data: saved } = await getProject({
+          ...api,
+          path: { id: project.id },
+        })
+        expect(saved.deployment_config?.health?.type ?? null).toBe(
+          health.type ?? null
+        )
+        expect(saved.deployment_config?.health?.command).toEqual(
+          health.command ?? []
+        )
+        expect(saved.deployment_config?.exposedPort ?? null).toBe(port)
       }
       const deploy = async (ref: string, expected: 'completed' | 'failed') => {
         const { data: candidate } = await deployFromImage({
@@ -235,7 +249,7 @@ test.describe('live deployment health probes', () => {
       })
 
       await test.step('default HTTP and explicit TCP serve real proxy traffic', async () => {
-        await configure(null, 8080)
+        await configure({}, 8080)
         await deploy(image.web, 'completed')
         await expect.poll(webBody).toBe('temps-health-web')
         await configure({ type: 'tcp', interval: 1, timeout: 1 }, 8080)
@@ -324,7 +338,7 @@ test.describe('live deployment health probes', () => {
       })
 
       await test.step('portless default process records health and withdraws the old route', async () => {
-        await configure(null, null)
+        await configure({}, null)
         const worker = await deploy(image.worker, 'completed')
         await currentIs(worker.id)
         expect(worker.screenshot_location).toBeNull()
