@@ -4089,6 +4089,12 @@ mod tests {
             Deployer {}
             #[async_trait::async_trait]
             impl temps_deployer::ContainerDeployer for Deployer {
+        async fn exec_in_container(
+            &self, container_id: &str, _command: Vec<String>, _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed { container_id: container_id.to_string(), reason: "exec is not scripted by this test deployer".to_string() })
+        }
+
                 async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
                 async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
                 async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
@@ -4193,7 +4199,10 @@ mod tests {
                 deployment_id: 42,
                 container_id: "abc123".to_string(),
                 container_name: "app-42".to_string(),
-                container_port: 3000,
+                container_port: Some(3000),
+                health_state: "unknown".to_string(),
+                health_checked_at: None,
+                health_detail: None,
                 host_port: None,
                 image_name: None,
                 status: Some("retired".to_string()),
@@ -5556,7 +5565,10 @@ mod tests {
             deployment_id: 10,
             container_id: "abc123def".to_string(),
             container_name: "app-1".to_string(),
-            container_port: 8080,
+            container_port: Some(8080),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(30001),
             image_name: Some("myapp:latest".to_string()),
             status: Some("running".to_string()),
@@ -5580,7 +5592,10 @@ mod tests {
             deployment_id: 11,
             container_id: "ghost456def".to_string(),
             container_name: "app-2".to_string(),
-            container_port: 8080,
+            container_port: Some(8080),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(30002),
             image_name: Some("myapp:latest".to_string()),
             status: Some("running".to_string()),
@@ -5693,7 +5708,10 @@ mod tests {
             deployment_id: 10,
             container_id: "orphan-1".to_string(),
             container_name: "app-1".to_string(),
-            container_port: 8080,
+            container_port: Some(8080),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(30001),
             image_name: Some("myapp:latest".to_string()),
             status: Some("running".to_string()),

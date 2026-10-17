@@ -1044,8 +1044,8 @@ impl EnvironmentService {
         if let Some(memory_limit) = settings.memory_limit {
             deployment_config.memory_limit = memory_limit;
         }
-        if settings.exposed_port.is_some() {
-            deployment_config.exposed_port = settings.exposed_port;
+        if let Some(exposed_port) = settings.exposed_port {
+            deployment_config.exposed_port = exposed_port;
         }
         if let Some(replicas) = settings.replicas {
             deployment_config.replicas = replicas;
@@ -1127,6 +1127,12 @@ impl EnvironmentService {
             deployment_config.max_concurrent_connections = max_concurrent_connections;
         }
 
+        if let Some(health) = settings.health {
+            deployment_config.health = Some(health);
+        }
+        if let Some(timeout) = settings.health_check_timeout_seconds {
+            deployment_config.health_check_timeout_seconds = Some(timeout);
+        }
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
@@ -2012,6 +2018,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     branch: Some("main".to_string()),
                     cpu_request: None,
                     cpu_limit: None,
@@ -2119,6 +2127,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     branch: None,
                     cpu_request: None,
                     cpu_limit: None,
@@ -2176,6 +2186,8 @@ mod tests {
     /// can set exactly the one field it is about.
     fn empty_settings_request() -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
+            health: None,
+            health_check_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,
@@ -2291,6 +2303,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
@@ -2340,6 +2354,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
@@ -2857,6 +2873,8 @@ mod tests {
         target_nodes: Vec<i32>,
     ) -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
+            health: None,
+            health_check_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,

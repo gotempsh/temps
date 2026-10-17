@@ -225,6 +225,7 @@ pub(crate) mod fake {
                 .cloned()
                 .ok_or_else(|| temps_deployer::BuilderError::ImageNotFound(image_name.into()))?;
             Ok(temps_deployer::ImageInfo {
+                exposed_ports: None,
                 id,
                 architecture: "amd64".to_string(),
                 os: "linux".to_string(),

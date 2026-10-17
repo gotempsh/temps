@@ -2523,6 +2523,7 @@ impl WorkflowTask for BuildImageJob {
         let build_context_dir = &image_output.build_context;
         if let Some(temps_config) = self.load_temps_config(build_context_dir)? {
             if let Some(health) = &temps_config.health {
+                context.set_output(&self.job_id, "health", health)?;
                 context.set_output(&self.job_id, "health_check_path", &health.path)?;
                 context.set_output(&self.job_id, "health_check_timeout", health.timeout)?;
             }
@@ -3400,6 +3401,7 @@ mod tests {
             _image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, BuilderError> {
             Ok(temps_deployer::ImageInfo {
+                exposed_ports: None,
                 id: "sha256:test123".to_string(),
                 architecture: "amd64".to_string(),
                 os: "linux".to_string(),
@@ -5412,6 +5414,7 @@ mod tests {
             image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, BuilderError> {
             Ok(temps_deployer::ImageInfo {
+                exposed_ports: None,
                 id: format!("sha256:{}", self.platform.replace('/', "-")),
                 architecture: temps_deployer::platform::platform_arch(self.built_platform),
                 os: "linux".to_string(),

@@ -375,7 +375,9 @@ pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) ->
 fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
     match error {
         temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
-        temps_deployer::DeployerError::DeploymentFailed(_)
+        temps_deployer::DeployerError::ExecFailed { .. }
+        | temps_deployer::DeployerError::ExecTimeout { .. }
+        | temps_deployer::DeployerError::DeploymentFailed(_)
         | temps_deployer::DeployerError::ImageNotFound(_)
         | temps_deployer::DeployerError::NetworkError(_)
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)

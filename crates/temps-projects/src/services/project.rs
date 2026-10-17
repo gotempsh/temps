@@ -5142,7 +5142,7 @@ impl ProjectService {
             deployment_config.memory_limit = Some(memory_limit);
         }
         if let Some(exposed_port) = config.exposed_port {
-            deployment_config.exposed_port = Some(exposed_port);
+            deployment_config.exposed_port = exposed_port;
         }
         if let Some(automatic_deploy) = config.automatic_deploy {
             deployment_config.automatic_deploy = Some(automatic_deploy);
@@ -5182,6 +5182,10 @@ impl ProjectService {
         }
         if let Some(health_check_timeout_seconds) = config.health_check_timeout_seconds {
             deployment_config.health_check_timeout_seconds = Some(health_check_timeout_seconds);
+        }
+
+        if let Some(health) = config.health {
+            deployment_config.health = Some(health);
         }
 
         // Validate the deployment config

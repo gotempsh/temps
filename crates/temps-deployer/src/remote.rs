@@ -994,6 +994,35 @@ pub struct RemoteExecResult {
 
 #[async_trait]
 impl ContainerDeployer for RemoteNodeDeployer {
+    async fn exec_in_container(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> Result<crate::ExecResult, DeployerError> {
+        let result = tokio::time::timeout(
+            timeout,
+            self.exec_command(container_id, command, Some(timeout.as_secs().max(1))),
+        )
+        .await
+        .map_err(|_| DeployerError::ExecTimeout {
+            container_id: container_id.to_string(),
+            timeout_secs: timeout.as_secs(),
+        })??;
+        let exit_code = result.exit_code.ok_or_else(|| DeployerError::ExecFailed {
+            container_id: container_id.to_string(),
+            reason: "worker returned no exec exit code; upgrade the worker agent".to_string(),
+        })?;
+        let mut output = Vec::with_capacity(crate::MAX_EXEC_OUTPUT_BYTES);
+        let mut truncated = crate::append_exec_output(&mut output, result.stdout.as_bytes());
+        truncated |= crate::append_exec_output(&mut output, result.stderr.as_bytes());
+        Ok(crate::ExecResult {
+            exit_code,
+            output: crate::exec_output_string(&output),
+            truncated,
+        })
+    }
+
     async fn deploy_container(
         &self,
         request: DeployRequest,
@@ -2988,5 +3017,64 @@ mod tests {
             }
             other => panic!("Expected NetworkError, got {:?}", other),
         }
+    }
+    #[tokio::test]
+    async fn health_probe_remote_exec_passes_arguments_and_bounds_captured_output() {
+        let body: &'static [u8] = Box::leak(serde_json::to_vec(&serde_json::json!({"success": true, "data": { "exit_code": 0, "stdout": "x".repeat(8192), "stderr": "error context" }, "error": null})).unwrap().into_boxed_slice());
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        let result = remote
+            .exec_in_container(
+                "worker-container",
+                vec!["redis-cli".into(), "ping".into()],
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.truncated);
+        assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
+        let request = server.await.unwrap();
+        assert!(request.contains("/agent/containers/worker-container/exec"));
+        assert!(request.contains("redis-cli"));
+        assert!(request.contains("timeout_seconds"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_remote_exec_requires_an_exit_code_and_times_out() {
+        let (url, server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"exit_code":null,"stdout":"","stderr":""},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        assert!(remote
+            .exec_in_container(
+                "worker-container",
+                vec!["check".into()],
+                std::time::Duration::from_secs(2)
+            )
+            .await
+            .is_err());
+        server.await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        assert!(matches!(
+            remote
+                .exec_in_container(
+                    "worker-container",
+                    vec!["check".into()],
+                    std::time::Duration::from_millis(20)
+                )
+                .await,
+            Err(DeployerError::ExecTimeout { .. })
+        ));
+        server.abort();
     }
 }

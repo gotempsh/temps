@@ -86,7 +86,7 @@ fn build_backend_entry(
     }
     let address = build_container_backend_addr(
         &container.container_name,
-        container.container_port,
+        container.container_port?,
         container.host_port,
         node_private_address,
         runtime_context,
@@ -184,7 +184,7 @@ fn build_public_compose_backend_entry(
     let (recorded_container_port, recorded_host_port) = if container.exposes_port(target) {
         (target, container.host_port_for(target))
     } else {
-        (container.container_port, container.host_port)
+        (container.container_port?, container.host_port)
     };
     let address = build_public_compose_backend_addr(
         &container.container_name,
@@ -1515,6 +1515,7 @@ impl CachedPeerTable {
                                 // never had a status recorded yet.
                                 .filter(
                                     Condition::any()
+                                        .add(deployment_containers::Column::ContainerPort.is_null())
                                         .add(deployment_containers::Column::Status.is_null())
                                         .add(deployment_containers::Column::Status.eq("running")),
                                 )
@@ -1537,6 +1538,13 @@ impl CachedPeerTable {
                         let project = projects_cache.get(&environment.project_id);
 
                         // Determine backend type: static directory or upstream containers
+                        let portless = !containers.is_empty()
+                            && containers
+                                .iter()
+                                .all(|container| container.container_port.is_none());
+                        if portless && deployment.static_dir_location.is_none() {
+                            continue;
+                        }
                         let backend = if let Some(static_dir) = &deployment.static_dir_location {
                             // Static deployment - serve from directory
                             Some(BackendType::StaticDir {
@@ -1810,6 +1818,7 @@ impl CachedPeerTable {
                                 // never had a status recorded yet.
                                 .filter(
                                     Condition::any()
+                                        .add(deployment_containers::Column::ContainerPort.is_null())
                                         .add(deployment_containers::Column::Status.is_null())
                                         .add(deployment_containers::Column::Status.eq("running")),
                                 )
@@ -1843,6 +1852,13 @@ impl CachedPeerTable {
                             };
 
                         // Determine backend type: static directory or upstream containers
+                        let portless = !containers.is_empty()
+                            && containers
+                                .iter()
+                                .all(|container| container.container_port.is_none());
+                        if portless && deployment.static_dir_location.is_none() {
+                            continue;
+                        }
                         let backend = if let Some(static_dir) = &deployment.static_dir_location {
                             // Static deployment - serve from directory
                             Some(BackendType::StaticDir {
@@ -2054,6 +2070,7 @@ impl CachedPeerTable {
                             // deployment's containers don't keep serving live traffic.
                             .filter(
                                 Condition::any()
+                                    .add(deployment_containers::Column::ContainerPort.is_null())
                                     .add(deployment_containers::Column::Status.is_null())
                                     .add(deployment_containers::Column::Status.eq("running")),
                             )
@@ -2076,6 +2093,13 @@ impl CachedPeerTable {
                     let environment = environments_cache.get(&env.id);
 
                     // Determine backend type: static directory or upstream containers
+                    let portless = !containers.is_empty()
+                        && containers
+                            .iter()
+                            .all(|container| container.container_port.is_none());
+                    if portless && deployment.static_dir_location.is_none() {
+                        continue;
+                    }
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
                         // Static deployment - serve from directory
                         Some(BackendType::StaticDir {
@@ -2379,7 +2403,7 @@ impl CachedPeerTable {
                                         warn!(
                                             service = %public_port.service,
                                             configured_target = public_port.port,
-                                            recorded_target = c.container_port,
+                                            recorded_target = ?c.container_port,
                                             recorded_host_port = ?c.host_port,
                                             "Skipping public Compose route without a matching live Docker port mapping"
                                         );
@@ -2511,6 +2535,7 @@ impl CachedPeerTable {
                             // deployment's containers don't keep serving live traffic.
                             .filter(
                                 Condition::any()
+                                    .add(deployment_containers::Column::ContainerPort.is_null())
                                     .add(deployment_containers::Column::Status.is_null())
                                     .add(deployment_containers::Column::Status.eq("running")),
                             )
@@ -2520,6 +2545,13 @@ impl CachedPeerTable {
                     };
 
                     // Determine backend type: static directory or upstream containers
+                    let portless = !containers.is_empty()
+                        && containers
+                            .iter()
+                            .all(|container| container.container_port.is_none());
+                    if portless && deployment.static_dir_location.is_none() {
+                        continue;
+                    }
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
                         // Static deployment - serve from directory
                         Some(BackendType::StaticDir {
@@ -3918,7 +3950,10 @@ mod tests {
             deployment_id: 1,
             container_id: format!("container-{id}"),
             container_name: format!("container-{id}"),
-            container_port,
+            container_port: Some(container_port),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(10_000 + id),
             image_name: None,
             status: Some("running".to_string()),
@@ -3936,6 +3971,17 @@ mod tests {
             started_at: Some(now),
             cpu_limit_cores: None,
             port_bindings: None,
+        }
+    }
+
+    #[test]
+    fn health_probe_portless_container_has_no_backend_in_any_execution_mode() {
+        let mut container = route_test_container(1, None, 8080);
+        container.container_port = None;
+        container.host_port = Some(31000); // Even stale metadata cannot make a worker routable.
+        for runtime in [RuntimeContext::host(), RuntimeContext::docker()] {
+            assert!(build_backend_entry(&container, None, &runtime).is_none());
+            assert!(build_backend_entry(&container, Some("192.0.2.10"), &runtime).is_none());
         }
     }
 
@@ -4014,7 +4060,7 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].service_name.as_deref(), Some("web"));
-        assert_eq!(selected[0].container_port, 8080);
+        assert_eq!(selected[0].container_port, Some(8080));
     }
 
     #[test]
@@ -4424,7 +4470,7 @@ mod unavailable_route_tests {
             deployment_id: Set(deployment_id),
             container_id: Set(format!("container-{status}-{deployment_id}")),
             container_name: Set(format!("container-{status}-{deployment_id}")),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             host_port: Set(host_port),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some(status.to_string())),

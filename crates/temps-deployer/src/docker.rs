@@ -3703,6 +3703,19 @@ impl ImageBuilder for DockerRuntime {
             .filter(|w| !w.is_empty());
 
         Ok(crate::ImageInfo {
+            exposed_ports: Some({
+                let mut ports: Vec<u16> = inspect
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.exposed_ports.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|spec| spec.strip_suffix("/tcp").and_then(|port| port.parse().ok()))
+                    .collect();
+                ports.sort_unstable();
+                ports.dedup();
+                ports
+            }),
             id: inspect.id.unwrap_or_default(),
             architecture,
             os,
@@ -3729,6 +3742,96 @@ impl ImageBuilder for DockerRuntime {
 
 #[async_trait]
 impl ContainerDeployer for DockerRuntime {
+    async fn exec_in_container(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> Result<crate::ExecResult, DeployerError> {
+        let docker = self.require_docker()?;
+        let failure = |reason: String| DeployerError::ExecFailed {
+            container_id: container_id.to_string(),
+            reason,
+        };
+        if command.is_empty() || command[0].is_empty() || timeout.is_zero() {
+            return Err(failure(
+                "command and positive timeout are required".to_string(),
+            ));
+        }
+        let operation = async {
+            let exec = docker
+                .create_exec(
+                    container_id,
+                    bollard::models::ExecConfig {
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        cmd: Some(command),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| failure(e.to_string()))?;
+            let bollard::exec::StartExecResults::Attached { mut output, .. } = docker
+                .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+                .await
+                .map_err(|e| failure(e.to_string()))?
+            else {
+                return Err(failure("probe exec unexpectedly detached".to_string()));
+            };
+            let mut captured = Vec::with_capacity(crate::MAX_EXEC_OUTPUT_BYTES);
+            let mut truncated = false;
+            while let Some(frame) = output.next().await {
+                let frame = frame.map_err(|e| failure(e.to_string()))?;
+                truncated |= crate::append_exec_output(&mut captured, frame.as_ref());
+            }
+            let inspect = docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|e| failure(e.to_string()))?;
+            if inspect.running != Some(false) {
+                return Err(failure(
+                    "command completion could not be confirmed".to_string(),
+                ));
+            }
+            let exit_code = inspect
+                .exit_code
+                .ok_or_else(|| failure("completed command has no exit code".to_string()))?;
+            Ok(crate::ExecResult {
+                exit_code,
+                output: crate::exec_output_string(&captured),
+                truncated,
+            })
+        };
+        match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Docker has no kill-exec API. Stop this new candidate so a hung
+                // health command cannot survive and accumulate on retries.
+                let cleanup_container_id = container_id.to_string();
+                tokio::spawn(async move {
+                    let cleanup = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        docker.stop_container(
+                            &cleanup_container_id,
+                            Some(StopContainerOptions {
+                                t: Some(0),
+                                ..Default::default()
+                            }),
+                        ),
+                    )
+                    .await;
+                    if !matches!(cleanup, Ok(Ok(()))) {
+                        warn!(container_id = %cleanup_container_id, "Timed-out probe container stop could not be confirmed");
+                    }
+                });
+                Err(DeployerError::ExecTimeout {
+                    container_id: container_id.to_string(),
+                    timeout_secs: timeout.as_secs(),
+                })
+            }
+        }
+    }
+
     async fn deploy_container(
         &self,
         request: DeployRequest,
@@ -8065,5 +8168,236 @@ CMD ["cat", "/hello.txt"]
             }
             Err(_) => panic!("BuildKit build timed out"),
         }
+    }
+}
+
+#[cfg(test)]
+mod health_probe_exec_tests {
+    use super::*;
+    use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+    #[tokio::test]
+    async fn health_probe_local_exec_success_failure_output_limit_and_timeout(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(error) => {
+                eprintln!("Skipping exec integration test: Docker unavailable: {error}");
+                return Ok(());
+            }
+        };
+        if docker.ping().await.is_err() {
+            eprintln!("Skipping exec integration test: Docker unavailable");
+            return Ok(());
+        }
+        let container = GenericImage::new("alpine", "3.21")
+            .with_cmd(["sleep", "300"])
+            .start()
+            .await?;
+        let runtime = DockerRuntime::new(
+            docker.clone(),
+            false,
+            format!("health-probe-{}", uuid::Uuid::new_v4()),
+        );
+        let timeout = std::time::Duration::from_secs(5);
+        let result = runtime
+            .exec_in_container(container.id(), vec!["echo".into(), "ready".into()], timeout)
+            .await?;
+        assert_eq!(result.exit_code, 0);
+        assert!(result.output.contains("ready"));
+        assert!(!result.truncated);
+        let result = runtime
+            .exec_in_container(
+                container.id(),
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo unhealthy >&2; exit 1".into(),
+                ],
+                timeout,
+            )
+            .await?;
+        assert_eq!(result.exit_code, 1);
+        assert!(result.output.contains("unhealthy"));
+        let result = runtime
+            .exec_in_container(
+                container.id(),
+                vec!["sh".into(), "-c".into(), "head -c 8192 /dev/zero".into()],
+                timeout,
+            )
+            .await?;
+        assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
+        assert!(result.truncated);
+        assert!(runtime
+            .exec_in_container(
+                container.id(),
+                vec!["missing-health-command".into()],
+                timeout
+            )
+            .await
+            .is_err());
+        let result = runtime
+            .exec_in_container(
+                container.id(),
+                vec!["sleep".into(), "60".into()],
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert!(matches!(result, Err(DeployerError::ExecTimeout { .. })));
+        let mut running = true;
+        for _ in 0..20 {
+            let info = docker
+                .inspect_container(container.id(), None::<InspectContainerOptions>)
+                .await?;
+            running = info.state.and_then(|state| state.running).unwrap_or(false);
+            if !running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!running, "timed-out command must not be left running");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod health_probe_docker_protocol_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn runtime(
+        output: Vec<u8>,
+        exit_code: Option<i64>,
+        stall: bool,
+    ) -> (DockerRuntime, tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_server = stopped.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let output = output.clone();
+                let stopped = stopped_server.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    loop {
+                        let read = socket.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&request[..end]);
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_string();
+                    if path.contains("/start") {
+                        if stall {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            return;
+                        }
+                        socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n").await.unwrap();
+                        let mut frame = vec![1, 0, 0, 0];
+                        frame.extend_from_slice(&(output.len() as u32).to_be_bytes());
+                        frame.extend_from_slice(&output);
+                        socket.write_all(&frame).await.unwrap();
+                    } else {
+                        let body = if path.contains("/stop") {
+                            stopped.store(true, Ordering::Relaxed);
+                            String::new()
+                        } else if path.contains("/json") {
+                            serde_json::json!({"Running": false, "ExitCode": exit_code}).to_string()
+                        } else {
+                            "{\"Id\":\"health-exec\"}".to_string()
+                        };
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    }
+                    socket.shutdown().await.unwrap();
+                });
+            }
+        });
+        let docker =
+            Arc::new(Docker::connect_with_http(&address, 5, bollard::API_DEFAULT_VERSION).unwrap());
+        (
+            DockerRuntime::new(docker, false, "unused-test-network".into()),
+            task,
+            stopped,
+        )
+    }
+
+    #[tokio::test]
+    async fn health_probe_local_docker_protocol_captures_exit_status_and_truncates_output() {
+        for code in [0, 1, 127] {
+            let (runtime, server, _) = runtime(vec![b'x'; 8192], Some(code), false).await;
+            let result = runtime
+                .exec_in_container(
+                    "worker-container",
+                    vec!["check-worker".into()],
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.exit_code, code);
+            assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
+            assert!(result.truncated);
+            server.abort();
+        }
+        let (runtime, server, _) = runtime(b"ready".to_vec(), None, false).await;
+        assert!(runtime
+            .exec_in_container(
+                "worker-container",
+                vec!["check-worker".into()],
+                std::time::Duration::from_secs(2)
+            )
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn health_probe_local_docker_protocol_enforces_deadline_and_stops_candidate() {
+        let (runtime, server, stopped) = runtime(Vec::new(), Some(0), true).await;
+        let start = std::time::Instant::now();
+        let result = runtime
+            .exec_in_container(
+                "worker-container",
+                vec!["check-worker".into()],
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(result, Err(DeployerError::ExecTimeout { .. })));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        for _ in 0..20 {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "hung exec cleanup must target the candidate container"
+        );
+        server.abort();
     }
 }

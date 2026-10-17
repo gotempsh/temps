@@ -645,7 +645,7 @@ mod route_table_tests {
         // Update container to different port
         use temps_entities::deployment_containers;
         let mut container: deployment_containers::ActiveModel = container.into();
-        container.container_port = Set(9999);
+        container.container_port = Set(Some(9999));
         container.host_port = Set(Some(9999));
         let _container = container.update(test_db.db.as_ref()).await?;
 
@@ -751,7 +751,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-stopped-{}", deployment.id)),
             container_name: Set(format!("test-container-stopped-{}", deployment.id)),
-            container_port: Set(9500),
+            container_port: Set(Some(9500)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("stopped".to_string())),
             deployed_at: Set(chrono::Utc::now()),
@@ -802,7 +802,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-running-{}", deployment.id)),
             container_name: Set(format!("test-container-running-{}", deployment.id)),
-            container_port: Set(9600),
+            container_port: Set(Some(9600)),
             host_port: Set(Some(9600)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("running".to_string())),
@@ -815,7 +815,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-nullstatus-{}", deployment.id)),
             container_name: Set(format!("test-container-nullstatus-{}", deployment.id)),
-            container_port: Set(9601),
+            container_port: Set(Some(9601)),
             host_port: Set(Some(9601)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(None),
@@ -828,7 +828,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-stopped-{}", deployment.id)),
             container_name: Set(format!("test-container-stopped-{}", deployment.id)),
-            container_port: Set(9602),
+            container_port: Set(Some(9602)),
             host_port: Set(Some(9602)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("stopped".to_string())),

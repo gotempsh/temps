@@ -2544,6 +2544,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     ),
     components(
         schemas(
+            temps_core::repo_config::HealthCheckConfig,
             EnvironmentResponse,
             CreateEnvironmentRequest,
             UpdateEnvironmentSettingsRequest,

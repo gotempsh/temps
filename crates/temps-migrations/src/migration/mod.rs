@@ -12,6 +12,8 @@ pub mod m20260921_000003_detection_retry;
 pub mod m20260921_000004_credential_catalog;
 pub mod m20261002_000001_secret_checks_and_history;
 
+mod m20261017_000001_deployment_health_probes;
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -709,6 +711,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
             Box::new(m20261011_000001_create_public_status_pages::Migration),
             Box::new(m20261012_000001_ai_provider_keys_self_hosted::Migration),
+            Box::new(m20261017_000001_deployment_health_probes::Migration),
         ]
     }
 }

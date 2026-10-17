@@ -454,13 +454,19 @@ impl MarkDeploymentCompleteJob {
             .ok();
         }
 
+        let portless = context
+            .get_output::<bool>("deploy_container", "portless")?
+            .unwrap_or(false);
+        let gate_health = context
+            .get_output::<String>("deploy_container", "health_state")?
+            .unwrap_or_else(|| "unknown".to_string());
         if let Some(container_ids) = container_ids {
             let now = chrono::Utc::now();
             let container_port = context
                 .get_output::<i32>("deploy_container", "container_port")
                 .ok()
                 .flatten()
-                .unwrap_or(8080);
+                .or(if portless { None } else { Some(8080) });
 
             // Compose-specific: per-container data arrays (set by DeployComposeJob)
             let service_names: Option<Vec<String>> = context
@@ -514,7 +520,7 @@ impl MarkDeploymentCompleteJob {
                 let effective_port = container_ports_list
                     .as_ref()
                     .and_then(|ports| ports.get(index).copied())
-                    .unwrap_or(container_port);
+                    .or(container_port);
 
                 let host_port = host_ports
                     .as_ref()
@@ -551,7 +557,14 @@ impl MarkDeploymentCompleteJob {
                     container_id: Set(container_id.clone()),
                     container_name: Set(container_name.clone()),
                     container_port: Set(effective_port),
-                    host_port: Set(host_port),
+                    health_state: Set(gate_health.clone()),
+                    health_checked_at: Set((gate_health != "unknown").then_some(now)),
+                    health_detail: Set(None),
+                    host_port: Set(if effective_port.is_some() {
+                        host_port
+                    } else {
+                        None
+                    }),
                     port_bindings: Set(port_bindings_list
                         .as_ref()
                         .and_then(|bindings| bindings.get(index).cloned())),
@@ -789,14 +802,18 @@ impl MarkDeploymentCompleteJob {
         // environment_id + deployment_id. We wait here until we see the
         // matching event or timeout.
         const ROUTE_READY_TIMEOUT_SECS: u64 = 60;
-        let route_ready = Self::wait_for_route_ready(
-            &mut route_receiver,
-            self.db.as_ref(),
-            environment_id,
-            self.deployment_id,
-            std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
-        )
-        .await;
+        let route_ready = if portless {
+            Ok(())
+        } else {
+            Self::wait_for_route_ready(
+                &mut route_receiver,
+                self.db.as_ref(),
+                environment_id,
+                self.deployment_id,
+                std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
+            )
+            .await
+        };
 
         if let Err(ref reason) = route_ready {
             // ── Timeout / failure path ───────────────────────────────────
@@ -860,51 +877,56 @@ impl MarkDeploymentCompleteJob {
         // this check it would wait for an ACK that can structurally never
         // arrive and revert every single deployment after the full 10s,
         // regardless of whether routing actually propagated fine.
-        let cluster_dns_enabled = self
-            .cluster_dns_enabled_or_reject(environment_id, last_successful_deployment_id)
-            .await?;
-        if !cluster_dns_enabled {
-            self.log(
-                "Cluster DNS is disabled — skipping the DNS-generation propagation check \
+        let cluster_dns_enabled = if portless {
+            false
+        } else {
+            self.cluster_dns_enabled_or_reject(environment_id, last_successful_deployment_id)
+                .await?
+        };
+        if !portless {
+            if !cluster_dns_enabled {
+                self.log(
+                    "Cluster DNS is disabled — skipping the DNS-generation propagation check \
                  (only route propagation is verified). Enable it under Settings > Nodes if \
                  deployed containers need to resolve *.temps.local hostnames."
-                    .to_string(),
+                        .to_string(),
+                )
+                .await
+                .ok();
+            }
+            if let Err(reason) = Self::wait_for_worker_apply(
+                self.db.as_ref(),
+                std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+                cluster_dns_enabled,
             )
             .await
-            .ok();
-        }
-        if let Err(reason) = Self::wait_for_worker_apply(
-            self.db.as_ref(),
-            std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
-            cluster_dns_enabled,
-        )
-        .await
-        {
-            tracing::error!(
-                deployment_id = self.deployment_id,
-                environment_id,
-                "Worker propagation gate exceeded {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
-            );
-            self.log(format!(
+            {
+                tracing::error!(
+                    deployment_id = self.deployment_id,
+                    environment_id,
+                    "Worker propagation gate exceeded {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
+                );
+                self.log(format!(
                 "Worker propagation incomplete after {WORKER_APPLY_TIMEOUT_SECS}s ({reason}) — reverting to the last usable deployment"
             ))
             .await?;
-            let failure_reason = format!(
+                let failure_reason = format!(
                 "Worker route/DNS propagation did not complete within {WORKER_APPLY_TIMEOUT_SECS}s: {reason}"
             );
-            self.reject_unusable_deployment(
-                environment_id,
-                last_successful_deployment_id,
-                &failure_reason,
-                false,
-            )
-            .await?;
-            return Err(WorkflowError::JobExecutionFailed(format!(
-                "{failure_reason} — deployment rolled back"
-            )));
-        } else {
-            self.log("All workers acknowledged new route + DNS generations".to_string())
+                self.reject_unusable_deployment(
+                    environment_id,
+                    last_successful_deployment_id,
+                    &failure_reason,
+                    false,
+                )
                 .await?;
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "{failure_reason} — deployment rolled back"
+                )));
+            } else {
+                self.log("All workers acknowledged new route + DNS generations".to_string())
+                    .await?;
+            }
         }
 
         // ── Pre-completion staleness check ────────────────────────────────
@@ -989,7 +1011,7 @@ impl MarkDeploymentCompleteJob {
                     "Failed to reset sleeping state for environment {environment_id}: {error}"
                 ))
             })?;
-        if sleeping_reset.rows_affected > 0 {
+        if sleeping_reset.rows_affected > 0 && !portless {
             let wake_result: Result<(), String> = async {
                 self.queue
                     .send(Job::ForceRouteReload(temps_core::ForceRouteReloadJob {
@@ -1109,7 +1131,9 @@ impl MarkDeploymentCompleteJob {
         // Get deployment URL from environment: prefer custom host, fall back to preview domain.
         // Use the scheme from external_url so HTTP-only installs (sslip.io quick/local
         // modes) don't emit dead https:// links for custom-host environments.
-        let url = if !environment.host.is_empty() {
+        let url = if portless {
+            None
+        } else if !environment.host.is_empty() {
             let scheme = if let Some(ref cs) = self.config_service {
                 cs.get_url_scheme()
                     .await
@@ -3017,6 +3041,18 @@ mod teardown_tests {
 
     #[async_trait]
     impl ContainerDeployer for RecordingDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             request: DeployRequest,
@@ -3150,7 +3186,7 @@ mod teardown_tests {
             deployment_id: Set(deployment_id),
             container_id: Set(container_id.to_string()),
             container_name: Set(container_id.to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             status: Set(Some("running".to_string())),
             created_at: Set(chrono::Utc::now()),
             deployed_at: Set(chrono::Utc::now()),

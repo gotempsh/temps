@@ -568,9 +568,11 @@ impl DeployComposeJob {
                 deployment_id: Set(self.deployment_id),
                 container_id: Set(service.container_id.clone()),
                 container_name: Set(service.container_name.clone()),
-                container_port: Set(binding
-                    .map(|port| i32::from(port.container_port))
-                    .unwrap_or(0)),
+                container_port: Set(Some(
+                    binding
+                        .map(|port| i32::from(port.container_port))
+                        .unwrap_or(0),
+                )),
                 host_port: Set(binding.map(|port| i32::from(port.host_port))),
                 port_bindings: Set(Some(published_port_bindings(&service.ports))),
                 image_name: Set(Some(service.image_name.clone())),
@@ -2116,7 +2118,10 @@ mod tests {
             deployment_id: 6,
             container_id: "old-retained-id".to_string(),
             container_name: "temps-2-3-web-1".to_string(),
-            container_port: 8080,
+            container_port: Some(8080),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(18080),
             image_name: Some("example/web:old".to_string()),
             status: Some("retained:exited".to_string()),

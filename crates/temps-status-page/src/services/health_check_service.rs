@@ -1553,11 +1553,11 @@ impl HealthCheckService {
             return Ok(("no_container".to_string(), None));
         };
 
+        let Some(container_port) = container.container_port else {
+            return Ok(("unknown".to_string(), None));
+        };
         // Construct the check URL
-        let check_url = format!(
-            "http://{}:{}/",
-            container.container_name, container.container_port
-        );
+        let check_url = format!("http://{}:{}/", container.container_name, container_port);
 
         // Perform the check
         let start_time = std::time::Instant::now();

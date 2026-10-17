@@ -52,6 +52,13 @@ pub struct ResolvedContainerResourceLimits {
     pub memory_limit: Option<i32>,
 }
 
+/// Runtime inspection paired with the persisted deployment health and port state.
+#[derive(Debug)]
+pub struct EnvironmentContainer {
+    pub info: temps_deployer::ContainerInfo,
+    pub row: temps_entities::deployment_containers::Model,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerPresentationContext {
     pub node_names: HashMap<i32, String>,
@@ -1557,14 +1564,12 @@ impl DeploymentService {
     }
 
     /// List all containers for a specific environment.
-    /// Returns container info paired with the optional node_id each container runs on.
-    /// Returns (ContainerInfo, node_id, service_name) for each container
+    /// Includes persisted port and deploy-time health state for each inspection.
     pub async fn list_environment_containers(
         &self,
         project_id: i32,
         environment_id: i32,
-    ) -> Result<Vec<(temps_deployer::ContainerInfo, Option<i32>, Option<String>)>, DeploymentError>
-    {
+    ) -> Result<Vec<EnvironmentContainer>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
 
         // Verify project exists and is a server-type project
@@ -1610,7 +1615,6 @@ impl DeploymentService {
         let mut container_infos = Vec::new();
         for db_container in db_containers {
             let node_id = db_container.node_id;
-            let service_name = db_container.service_name.clone();
 
             let deployer = match self.deployer_for_node(node_id).await {
                 Ok(d) => d,
@@ -1627,7 +1631,10 @@ impl DeploymentService {
                 .get_container_info(&db_container.container_id)
                 .await
             {
-                Ok(info) => container_infos.push((info, node_id, service_name)),
+                Ok(info) => container_infos.push(EnvironmentContainer {
+                    info,
+                    row: db_container,
+                }),
                 Err(e) => {
                     warn!(
                         "Failed to get info for container {} on node {:?}: {}",
@@ -6524,6 +6531,7 @@ mod tests {
             image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
             Ok(temps_deployer::ImageInfo {
+                exposed_ports: None,
                 id: "sha256:test".to_string(),
                 architecture: "amd64".to_string(),
                 os: "linux".to_string(),
@@ -6650,6 +6658,7 @@ mod tests {
         ContainerDeployer {}
         #[async_trait::async_trait]
         impl temps_deployer::ContainerDeployer for ContainerDeployer {
+            async fn exec_in_container(&self, container_id: &str, command: Vec<String>, timeout: std::time::Duration) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError>;
             async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
             async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
             async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
@@ -8251,7 +8260,7 @@ mod tests {
             deployment_id: Set(target_deployment.id),
             container_id: Set("container-rollback-target".to_string()),
             container_name: Set("app-rollback-target".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:target".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -8281,7 +8290,7 @@ mod tests {
             deployment_id: Set(current_deployment.id),
             container_id: Set("container-rollback-current".to_string()),
             container_name: Set("app-rollback-current".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:current".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9180,7 +9189,7 @@ mod tests {
             deployment_id: Set(target_deployment.id),
             container_id: Set("container-rollback-stopped-target".to_string()),
             container_name: Set("app-rollback-stopped-target".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:target".to_string())),
             status: Set(Some("stopped".to_string())),
             created_at: Set(now),
@@ -9216,7 +9225,7 @@ mod tests {
             deployment_id: Set(current_deployment.id),
             container_id: Set("container-rollback-stopped-current".to_string()),
             container_name: Set("app-rollback-stopped-current".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:current".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9720,7 +9729,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container-1".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9733,7 +9742,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-456".to_string()),
             container_name: Set("test-container-2".to_string()),
-            container_port: Set(5432),
+            container_port: Set(Some(5432)),
             image_name: Set(Some("postgres:15".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9801,7 +9810,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("valid-container-id".to_string()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9873,7 +9882,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("retained-failed-container".to_string()),
             container_name: Set("temps-retained-app-1".to_string()),
-            container_port: Set(80),
+            container_port: Set(Some(80)),
             image_name: Set(Some("nginx:alpine".to_string())),
             status: Set(Some("retained:running".to_string())),
             service_name: Set(Some("app".to_string())),
@@ -10078,7 +10087,7 @@ mod tests {
                 deployment_id: Set(deployment_two.id),
                 container_id: Set(container_id.to_string()),
                 container_name: Set(format!("test-container-{}", idx + 2)),
-                container_port: Set(8080),
+                container_port: Set(Some(8080)),
                 image_name: Set(Some("nginx:latest".to_string())),
                 status: Set(Some("stopped".to_string())),
                 created_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
@@ -10296,7 +10305,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-789".to_string()),
             container_name: Set("test-container-3".to_string()),
-            container_port: Set(9090),
+            container_port: Set(Some(9090)),
             image_name: Set(Some("redis:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10373,7 +10382,7 @@ mod tests {
                 deployment_id: Set(deployment.id),
                 container_id: Set(format!("container-{}", i * 100)),
                 container_name: Set(format!("test-container-{}", i)),
-                container_port: Set(8000 + i),
+                container_port: Set(Some(8000 + i)),
                 image_name: Set(Some("nginx:latest".to_string())),
                 status: Set(Some("running".to_string())),
                 created_at: Set(now),
@@ -10473,7 +10482,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10578,7 +10587,7 @@ mod tests {
             deployment_id: Set(deployment1.id),
             container_id: Set("container-v1".to_string()),
             container_name: Set("app-container-v1".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("app:v1".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10591,7 +10600,7 @@ mod tests {
             deployment_id: Set(deployment2.id),
             container_id: Set("container-v2".to_string()),
             container_name: Set("app-container-v2".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("app:v2".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10604,7 +10613,7 @@ mod tests {
             deployment_id: Set(deployment3.id),
             container_id: Set("container-v3".to_string()),
             container_name: Set("app-container-v3".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("app:v3".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10753,7 +10762,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container-1".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),

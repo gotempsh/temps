@@ -758,10 +758,25 @@ impl ContainerHealthMonitor {
         container: &deployment_containers::Model,
         info: &temps_deployer::ContainerInfo,
     ) -> Result<(), DbErr> {
+        let Some(container_port) = container.container_port else {
+            if at_db_precision(container.started_at) != at_db_precision(info.started_at)
+                || container.cpu_limit_cores != info.cpu_limit_cores
+            {
+                deployment_containers::Entity::update(deployment_containers::ActiveModel {
+                    id: Set(container.id),
+                    started_at: Set(info.started_at),
+                    cpu_limit_cores: Set(info.cpu_limit_cores),
+                    ..Default::default()
+                })
+                .exec(self.db.as_ref())
+                .await?;
+            }
+            return Ok(());
+        };
         // A successful runtime inspection is authoritative. If the expected
         // TCP binding is absent, clear the recorded host port so the proxy
         // cannot keep dialing a port that Docker may have reassigned.
-        let host_port = published_tcp_host_port(container.container_port, &info.ports);
+        let host_port = published_tcp_host_port(container_port, &info.ports);
         // Every published port, from the same inspection as `host_port`.
         // This also backfills rows written before `port_bindings` existed, so
         // a public route added to an already-running Compose service gets a
@@ -1077,11 +1092,13 @@ impl ContainerHealthMonitor {
             txn.rollback().await?;
             return Ok(false);
         }
-        txn.execute(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT pg_notify('route_table_changes', '')".to_string(),
-        ))
-        .await?;
+        if container.container_port.is_some() {
+            txn.execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_notify('route_table_changes', '')".to_string(),
+            ))
+            .await?;
+        }
         txn.commit().await?;
         info!(
             container_id = container.id,
@@ -1732,6 +1749,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for MockDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             _request: DeployRequest,
@@ -1870,7 +1899,10 @@ mod tests {
             deployment_id: 10,
             container_id: "abc123".to_string(),
             container_name: "test-container".to_string(),
-            container_port: 3000,
+            container_port: Some(3000),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(8080),
             image_name: Some("test-image:latest".to_string()),
             status: Some("running".to_string()),
@@ -2413,7 +2445,7 @@ mod tests {
         // already correct, but a public route added later for another port
         // has no backend until the reconciler records every published port.
         let mut container = make_container_model(1);
-        container.container_port = 3000;
+        container.container_port = Some(3000);
         container.host_port = Some(32001);
         container.port_bindings = None;
         let mut updated = container.clone();
@@ -3171,7 +3203,7 @@ mod tests {
                 deployment_id: Set(deployment.id),
                 container_id: Set(format!("{}-container", deployment.slug)),
                 container_name: Set(deployment.slug.clone()),
-                container_port: Set(3000),
+                container_port: Set(Some(3000)),
                 status: Set(Some(status.to_string())),
                 created_at: Set(chrono::Utc::now()),
                 deployed_at: Set(chrono::Utc::now()),
@@ -3572,5 +3604,70 @@ mod tests {
             .await;
 
         assert_eq!(fixture.alarms().await.len(), 1);
+    }
+    #[tokio::test]
+    async fn health_probe_portless_runtime_skips_port_lookup_and_route_notification() {
+        let mut container = make_container_model(1);
+        container.container_port = None;
+        container.host_port = None;
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let mut info = deployer.get_container_info("worker").await.unwrap();
+        info.started_at = container.started_at;
+        info.cpu_limit_cores = container.cpu_limit_cores;
+        // Published side ports must never turn a portless worker into a route.
+        info.ports = vec![temps_deployer::PortMapping {
+            container_port: 9000,
+            host_port: 31000,
+            protocol: temps_deployer::Protocol::Tcp,
+            host_ip: None,
+        }];
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            deployer,
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        monitor
+            .persist_runtime_info(&container, &info)
+            .await
+            .unwrap();
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(
+            transactions.is_empty(),
+            "portless worker must not look up bindings, update ports, or notify routes"
+        );
+    }
+    #[tokio::test]
+    async fn health_probe_portless_runtime_keeps_metrics_metadata_without_notifying_routes() {
+        let mut container = make_container_model(1);
+        container.container_port = None;
+        container.host_port = None;
+        let mut updated = container.clone();
+        updated.cpu_limit_cores = Some(0.5);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .into_connection(),
+        );
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let mut info = deployer.get_container_info("worker").await.unwrap();
+        info.cpu_limit_cores = Some(0.5);
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            deployer,
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        monitor
+            .persist_runtime_info(&container, &info)
+            .await
+            .unwrap();
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("cpu_limit_cores"));
+        assert!(!sql.contains("pg_notify"));
+        assert!(!sql.contains("SET \"host_port\""));
     }
 }

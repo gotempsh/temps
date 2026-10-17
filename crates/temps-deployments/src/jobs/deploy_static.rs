@@ -425,6 +425,7 @@ mod tests {
             _image_name: &str,
         ) -> Result<temps_deployer::ImageInfo, BuilderError> {
             Ok(temps_deployer::ImageInfo {
+                exposed_ports: None,
                 id: "sha256:mock".to_string(),
                 architecture: "amd64".to_string(),
                 os: "linux".to_string(),

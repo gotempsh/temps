@@ -69,6 +69,7 @@ impl ImageBuilder for MockImageBuilder {
         image_name: &str,
     ) -> Result<temps_deployer::ImageInfo, BuilderError> {
         Ok(temps_deployer::ImageInfo {
+            exposed_ports: None,
             id: "sha256:mock123".to_string(),
             architecture: "amd64".to_string(),
             os: "linux".to_string(),
@@ -94,6 +95,18 @@ struct MockContainerDeployer;
 
 #[async_trait]
 impl ContainerDeployer for MockContainerDeployer {
+    async fn exec_in_container(
+        &self,
+        container_id: &str,
+        _command: Vec<String>,
+        _timeout: std::time::Duration,
+    ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+        Err(temps_deployer::DeployerError::ExecFailed {
+            container_id: container_id.to_string(),
+            reason: "exec is not scripted by this test deployer".to_string(),
+        })
+    }
+
     async fn deploy_container(
         &self,
         request: DeployRequest,

@@ -737,6 +737,14 @@ pub struct DeploymentJobsResponse {
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerInfoResponse {
+    #[serde(default)]
+    pub container_port: Option<i32>,
+    #[serde(default)]
+    pub health_state: String,
+    #[serde(default)]
+    pub health_checked_at: Option<String>,
+    #[serde(default)]
+    pub health_detail: Option<String>,
     pub container_id: String,
     pub container_name: String,
     pub image_name: String,
@@ -809,6 +817,13 @@ impl ContainerInfoResponse {
         service_urls: Vec<ServicePublicUrl>,
     ) -> Self {
         Self {
+            container_port: info
+                .ports
+                .first()
+                .map(|port| i32::from(port.container_port)),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             container_id: info.container_id,
             container_name: info.container_name,
             image_name: info.image_name,
@@ -863,7 +878,10 @@ pub struct ContainerDetailResponse {
     #[schema(nullable = true, example = "2025-10-12T12:16:47.609192Z")]
     pub ready_at: Option<String>,
     /// Port inside the container
-    pub container_port: i32,
+    pub container_port: Option<i32>,
+    pub health_state: String,
+    pub health_checked_at: Option<String>,
+    pub health_detail: Option<String>,
     /// Port on the host machine
     #[schema(nullable = true)]
     pub host_port: Option<i32>,
@@ -1085,4 +1103,29 @@ pub struct ActivityDay {
     /// 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
     #[schema(example = 2)]
     pub level: i32,
+}
+
+#[cfg(test)]
+mod health_probe_openapi_tests {
+    use utoipa::OpenApi;
+
+    #[test]
+    fn health_probe_openapi_contract() {
+        let doc = super::super::deployments::DeploymentsApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        for response in ["ContainerInfoResponse", "ContainerDetailResponse"] {
+            let properties = &json["components"]["schemas"][response]["properties"];
+            for field in [
+                "container_port",
+                "health_state",
+                "health_checked_at",
+                "health_detail",
+            ] {
+                assert!(
+                    !properties[field].is_null(),
+                    "{response}.{field} must be in OpenAPI"
+                );
+            }
+        }
+    }
 }
